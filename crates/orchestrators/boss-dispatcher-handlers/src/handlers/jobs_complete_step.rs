@@ -39,7 +39,7 @@
 use async_trait::async_trait;
 use boss_dispatcher::rules::expr::Value;
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
-use boss_jobs::step_registry::{Completion, StepRegistry, StepType};
+use boss_jobs::step_registry::{Completion, StepRegistry};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -77,9 +77,14 @@ impl JobsCompleteStep {
     /// A step kind is an auto-completable marker when its StepType says
     /// so (`StepType::is_marker` — the one definition, shared with the
     /// no-orphan-steps check since 67a58840). An unknown kind (not in
-    /// the registry) is conservatively not a marker.
+    /// the registry) is conservatively not a marker. Read only by the
+    /// tests since `should_auto_complete` reads
+    /// `StepType::completes_itself_when_ready` (backlog ee399c2c).
+    #[cfg(test)]
     fn is_marker(&self, kind: &str) -> bool {
-        self.registry.get(kind).is_some_and(StepType::is_marker)
+        self.registry
+            .get(kind)
+            .is_some_and(boss_jobs::step_registry::StepType::is_marker)
     }
 
     /// Whether the dispatcher should complete this step itself rather than
@@ -90,43 +95,18 @@ impl JobsCompleteStep {
     ///     a human shouldn't queue behind. Gates (an `outcome` enum the
     ///     Workflow forks on) are excluded — `gate.resolve` completes those
     ///     after computing the outcome from real stock.
-    /// A gate — an `outcome` enum the Workflow forks on. Never auto-completed
-    /// here even though it carries the marker shape (no role + 0 duration):
-    /// gate.resolve must compute its outcome from real stock first.
-    fn is_gate(&self, kind: &str) -> bool {
-        self.registry
-            .get(kind)
-            .is_some_and(|st| st.fields.iter().any(|f| f.name == "outcome"))
-    }
-
     fn should_auto_complete(&self, kind: &str) -> bool {
-        if self.is_gate(kind) {
-            return false;
-        }
-        // Triggers (`auto-on-materialize`) are resolved at Job
-        // materialization — the firing one is born `Completed`, its
-        // alternatives `Skipped` — so they never reach Ready and this
-        // handler must never complete them. Excluded explicitly: a
-        // trigger fits the marker shape (no role + 0 duration) but its
-        // completion authority says materialization owns it, not the
-        // step.ready path. (Outcome / milestone markers are NOT
-        // auto-on-materialize and still complete here when they go
-        // Ready.)
-        if self
-            .registry
-            .get(kind)
-            .is_some_and(|st| st.completion == Completion::AutoOnMaterialize)
-        {
-            return false;
-        }
-        // Structural markers (outcome / milestone) + agent action steps
-        // (order-intake / billing) advance at computer speed without an
-        // executor.
-        self.is_marker(kind)
-            || self
-                .registry
-                .get(kind)
-                .is_some_and(|st| st.completion == Completion::Agent)
+        // Structural markers (outcome / milestone) — never a gate, never a
+        // trigger, which materialization owns — are
+        // `StepType::completes_itself_when_ready`, the definition the
+        // readiness sweep reads too (backlog ee399c2c). Agent action
+        // steps (order-intake / billing) that are not gates also advance
+        // here at computer speed without an executor; the sweep does not
+        // complete those, because they are work, not a marker.
+        self.registry.get(kind).is_some_and(|st| {
+            st.completes_itself_when_ready()
+                || (st.completion == Completion::Agent && !st.is_gate())
+        })
     }
 }
 
@@ -201,11 +181,10 @@ impl Handler for JobsCompleteStep {
 }
 
 /// A 400 naming a missing required field is a step that owes a value
-/// only a person can supply — not a fault to retry. Pure, so the shape
-/// of the refusal this reads is pinned by a test.
-pub(crate) fn needs_a_person(status: u16, text: &str) -> bool {
-    status == 400 && text.contains("required field") && text.contains("is missing")
-}
+/// only a person can supply — not a fault to retry. Defined in boss-jobs
+/// since the readiness sweep reads it too (backlog ee399c2c); pinned by
+/// the test below.
+pub(crate) use boss_jobs::step_registry::needs_a_person;
 
 #[cfg(test)]
 mod tests {

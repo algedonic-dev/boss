@@ -128,6 +128,20 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // writes back through the jobs API as its own actor, so the
         // only emit this handler owns is the packet it creates.
         ("jobs.run-car-probes", vec!["jobs.job.created"]),
+        (
+            "jobs.reconcile-readiness",
+            vec!["jobs.step.updated", "step.ready.*"],
+        ),
+        // One fact per lapsed lease, written by the sweep door in the
+        // adapter's transaction (backlog 3aeaf08c); no rule reacts to it.
+        (
+            "jobs.sweep-resource-leases",
+            vec!["jobs.step.resource_lease_expired"],
+        ),
+        // A changed roster count is the pool's next version, published by
+        // the people door through the pool owner (backlog a6cb448a); no
+        // rule reacts to it.
+        ("pools.observe-rosters", vec!["jobs.pool.published"]),
         // Auto-park (898e41b1): on a gate-run's GREEN gate-verdict step
         // it files the ship-a-change car (`jobs.job.created`), completes
         // that car's three receipt steps (`jobs.step.completed`), and —
@@ -146,6 +160,19 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
             ],
         ),
         ("jobs.complete_step", vec!["jobs.step.completed"]),
+        // Ends a car admitted at build whose run or item ended before
+        // any gate: the gate-step claim and the evidence are step
+        // updates, the `abandoned` marker a job update, and the
+        // terminal's completion closes the car. None is an agent-run or
+        // backlog-item close, so it cannot re-enter its own rules.
+        (
+            "jobs.end_unlaunched_car",
+            vec![
+                "jobs.step.updated",
+                "jobs.job.updated",
+                "jobs.step.completed",
+            ],
+        ),
         // Clears waiting_on via PUT /api/jobs — the update emits
         // jobs.job.updated (and wakes metadata-gated steps in the
         // same write, aa9980c8).
@@ -211,6 +238,22 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
             "maintenance.chore.file_reds",
             vec!["jobs.job.created", "jobs.job.updated"],
         ),
+        // A verdict held on a chore's newest N runs files ONE
+        // backlog-item (`jobs.job.created`) and notes what it judged on
+        // the firing packet (`jobs.job.updated`), ada4d019. The run that
+        // ends the streak closes that item at its triage step, `stale`
+        // (`jobs.step.completed`), or notes on it that it recovered
+        // (`jobs.job.updated`), 3ff17da3. Every write is to a
+        // backlog-item or the chore's own note, never the chore kind's
+        // run step, so the chain ends at the operator's queue.
+        (
+            "maintenance.verdict.streak",
+            vec![
+                "jobs.job.created",
+                "jobs.job.updated",
+                "jobs.step.completed",
+            ],
+        ),
         ("jobs.subjob_resolve", vec!["jobs.step.completed"]),
         // Completes the open branch on the Job a declared edge names
         // (a merged car answering its feedback packet). The completion
@@ -231,6 +274,15 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // packet `live` (c34583cb). No rule this tree ships names it;
         // the rule is the tenant's.
         ("jobs.complete_step_matching", vec!["jobs.step.completed"]),
+        // The cluster-deploy-runner's mid-run `rolled` report completes
+        // `converged` on the train whose merge it rolled, once the
+        // running jobs API self-reports the same commit (090720c3). The
+        // completion opens the train's `arrived` outcome, whose marker
+        // rule closes it.
+        (
+            "jobs.converge_trains_on_rolled",
+            vec!["jobs.step.completed"],
+        ),
         // A clock rule completes an open step on every packet of a
         // kind that has gone silent past a bound (c87fb59b car 2: an
         // agent-run whose builder died). The completion carries the
@@ -282,6 +334,12 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
                 "jobs.step.completed",
             ],
         ),
+        // The unheld-review watch (f0e604dc): an hourly clock rule that
+        // files (`jobs.job.created`) one backlog-item alarm per station
+        // whose ready reviews nobody holds have passed their pinned
+        // bound, held while it stays open. It writes nothing else, so
+        // it cannot move what it watches.
+        ("jobs.unheld_review_watch", vec!["jobs.job.created"]),
         // The stale-flight watch (design c4c2a607, 73c31776): an hourly
         // clock rule that files (`jobs.job.created`) one backlog-item
         // alarm per flight past its observe period or decided and not
@@ -314,13 +372,84 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // again by the durable inbox's queue READ, not by an event, so
         // the loop ends at the board.
         ("jobs.reclaim_abandoned_step", vec!["jobs.step.updated"]),
+        // A pool that frees re-offers the oldest step waiting in its line
+        // (backlog 587f395a): one merge onto that step's `waiting_on`, so
+        // `jobs.step.updated` only. The step it writes is READY and holds
+        // no allocation, so the merge cannot release one and re-enter the
+        // rule; the step is then taken by a claim, an actor's act, so the
+        // loop ends at the board.
+        ("jobs.reoffer_waiting", vec!["jobs.step.updated"]),
+        // The same release for a hold the step's pinned executor
+        // declaration refuses (231cb747): the merge, then the status, so
+        // `jobs.step.updated` only. It listens on `step.assigned.*`, and
+        // a release assigns nobody, so it never announces the marker it
+        // reacts to; a lane nominating the holder back is met once and
+        // then named, not released again (the handler's loop guard).
+        ("jobs.release_executor_refused", vec!["jobs.step.updated"]),
+        // The stranded-review return (eb86a174): a stamp of the car's
+        // `built_by` when only its run named the builder
+        // (`jobs.job.updated`), then the step merge and the status
+        // (`jobs.step.updated`). Its twin listens on `step.assigned.*`
+        // (c9cbf382), and a return assigns nobody, so it never announces
+        // that marker; the returned step is taken by a pull, an actor's
+        // act.
+        (
+            "jobs.return_stranded_review",
+            vec!["jobs.job.updated", "jobs.step.updated"],
+        ),
+        // The urgent-item watch (9788e22d): the same release for an
+        // urgent item's build claimed with no open run and no car in
+        // flight (`jobs.step.updated`, the merge then the status), and
+        // one rescope alarm per long item (`jobs.job.created`). It never
+        // completes the item or the alarm; nothing listens on a step
+        // update, and the alarm waits for a person.
+        (
+            "jobs.urgent_item_watch",
+            vec!["jobs.step.updated", "jobs.job.created"],
+        ),
+        // The idle-actor watch (861360bc): one alarm per agent holding
+        // a ready urgent nomination with no run open or moved inside
+        // its bound (`jobs.job.created`), plus an immutable first-wait
+        // observation. Neither fact completes the nomination it watches.
+        (
+            "jobs.idle_actor_watch",
+            vec!["jobs.job.created", boss_jobs::events::STEP_FIRST_RECORDED],
+        ),
+        // The silent-session watch (628dc540): one alarm per agent
+        // holding claimed work whose open session has had no write of its
+        // own for the bound (`jobs.job.created`), withdrawn at the step
+        // its alarm waits on when the session is written again
+        // (`jobs.step.completed`), or told so on the packet
+        // (`jobs.job.updated`) once a person has routed it — the same
+        // three facts as the agent-step overdue alarm above. Every write
+        // is to its OWN alarm, never to a work-session, so it cannot
+        // clear the condition it watches.
+        (
+            "jobs.silent_session_watch",
+            vec![
+                "jobs.job.created",
+                "jobs.job.updated",
+                "jobs.step.completed",
+            ],
+        ),
         // A held car's reviewer verdict asks the release door
         // (0cfc57e6): a grant is the door's merge onto the car's review
         // step, a refusal the rule's `auto_release` note on the same
-        // step — both `jobs.step.updated`, on which no rule this tree
-        // ships acts for an open step. The car then boards by the
-        // conductor's read, not by an event, so the loop ends here.
+        // step — both `jobs.step.updated`. That topic wakes this same
+        // handler again through `release-a-held-car-when-its-review-
+        // hold-is-placed` (60993cda), and the loop ends on the second
+        // pass by construction: a grant leaves no hold, so nothing is
+        // asked, and a refusal finds itself already recorded and writes
+        // nothing. The car then boards by the conductor's read, not by
+        // an event.
         ("jobs.release_on_review", vec!["jobs.step.updated"]),
+        // The same verdict's CHANGES half (c2b21676): the item's build
+        // released to its station and its `returned_for_changes` note,
+        // both `jobs.step.updated` on a backlog-item's open `build`.
+        // The rules on that topic read a `review` step's hold, a `run`
+        // step, or a step ending, so none wakes; nothing re-enters this
+        // handler, whose trigger is a reviewer run's own write.
+        ("jobs.changes_return_the_build", vec!["jobs.step.updated"]),
         ("gate.resolve", vec!["jobs.step.completed"]),
         ("packaging.allocate", vec!["jobs.step.completed"]),
         // The packet-loss census (migration 152): reads the whole
@@ -596,6 +725,17 @@ pub fn system_edges() -> Vec<SystemEdge> {
             kind: "jobs-api",
             label: "completing a step readies its dependents",
         },
+        // A claimed step's exit returns its allocation in the same
+        // transaction (`flow_resources::exit_event`) — the event
+        // `jobs-reoffer-waiting-on-release` listens on (backlog
+        // 587f395a). Completion is the common exit; a release to ready, a
+        // skip and the packet's close or cancel record the same fact.
+        SystemEdge {
+            from: STEP_COMPLETED,
+            to: boss_jobs::flow_resources::RELEASED,
+            kind: "jobs-api",
+            label: "a claimed step's exit returns its pool allocation",
+        },
         // A Job PUT re-evaluates readiness against the pinned Workflow,
         // so a metadata write wakes a metadata-gated step in the same
         // transaction (`reevaluate_and_persist`, aa9980c8) — the edge
@@ -720,17 +860,40 @@ mod tests {
         a == b || one_way(a, b) || one_way(b, a)
     }
 
-    /// The event kinds boss-jobs declares, read from the one file that
-    /// declares them (`pub const NAME: &str = "..."` in events.rs).
+    /// The event kinds boss-jobs declares, read from the files that
+    /// declare them (`pub const NAME: &str = "..."`), plus the resource
+    /// facts, which their producer declares as one roster
+    /// (`flow_resources::FACT_KINDS`, read compiled rather than parsed:
+    /// that file's other string constants are metadata keys, not kinds).
+    /// `jobs.step.released` lives there, and the re-offer rule listens on
+    /// it (backlog 587f395a).
     fn jobs_declared_kinds() -> BTreeSet<String> {
-        let path = boss_testing::repo_root().join("crates/core/boss-jobs/src/events.rs");
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        // `events.rs` holds the packet and step kinds; the lease lifecycle
+        // kinds car 2b added live beside their contract in
+        // `resource_leases.rs`, and the sweep handler emits one of them
+        // (backlog 3aeaf08c).
         let re = regex::Regex::new(r#"(?m)^pub const [A-Z_]+: &str = "([^"]+)";"#).expect("regex");
-        let kinds: BTreeSet<String> = re.captures_iter(&src).map(|c| c[1].to_string()).collect();
+        let mut kinds: BTreeSet<String> = ["events.rs", "resource_leases.rs"]
+            .into_iter()
+            .flat_map(|file| {
+                let path = boss_testing::repo_root()
+                    .join("crates/core/boss-jobs/src")
+                    .join(file);
+                let src = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                re.captures_iter(&src)
+                    .map(|c| c[1].to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        kinds.extend(
+            boss_jobs::flow_resources::FACT_KINDS
+                .iter()
+                .map(|k| (*k).to_string()),
+        );
         assert!(
-            kinds.contains("jobs.job.closed"),
-            "events.rs parse found {kinds:?}"
+            kinds.contains("jobs.job.closed") && kinds.contains("jobs.step.resource_lease_expired"),
+            "events.rs + resource_leases.rs parse found {kinds:?}"
         );
         kinds
     }

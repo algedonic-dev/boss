@@ -134,7 +134,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
 use serde_json::{Map, Value, json};
 
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
@@ -369,6 +369,11 @@ pub struct Watched {
     /// The guard that can legitimately hold this cadence, when it has
     /// one. Only a clock rule has a guard; a timer has no `when`.
     pub guard: Option<Guard>,
+    /// When THIS cadence began counting, if its declaration says: a
+    /// clock rule's `schedule.anchor_date` at midnight UTC, the day
+    /// boundary its `clock.day` firings fall on. A timer arg has none.
+    /// See [`Watched::measured_from`].
+    pub anchor: Option<DateTime<Utc>>,
 }
 
 impl Watched {
@@ -382,6 +387,7 @@ impl Watched {
             declared,
             source: Source::Args,
             guard: None,
+            anchor: None,
         }
     }
 
@@ -394,7 +400,34 @@ impl Watched {
             declared: Declared::Minutes(c.interval_min),
             source: Source::ClockRule(c.rule.clone()),
             guard: c.guard.clone(),
+            anchor: Some(c.anchor_date.and_time(NaiveTime::MIN).and_utc()),
         }
+    }
+
+    /// The instant a NEVER-FILED cadence's silence is measured from: the
+    /// LATER of the kind's first workflow version (`kind_declared`, from
+    /// [`declared_at`]) and this cadence's own [`Watched::anchor`].
+    ///
+    /// THE DEFECT THIS ENDS (backlog 428be0b3). The kind alone stood in
+    /// for every subject on it, so a new clock rule on a long-lived kind
+    /// was measured from that kind's first version, and on its first due
+    /// day read NEVER FILED instead of not yet due. That happened twice:
+    /// `ops-request/node-trim` (anchor 2026-10-08) alarmed at
+    /// 2026-10-09T00:00:12Z as d1d8e97c, and
+    /// `ops-request/suspended-chores` (anchor 2026-11-11) alarmed at
+    /// 2026-11-12T00:01:49Z as e2302c79. Both were measured from the
+    /// kind's 2026-09-16T23:54:56Z, and in both the rule's first packet
+    /// arrived within the same second. The rule row carries no landing
+    /// stamp, but its anchor is the day the cadence counts from, which is
+    /// finer than the kind's first version whenever it is later.
+    ///
+    /// The LATER of the two, because an anchor older than the kind (one
+    /// copied from another rule) is no evidence the cadence existed then.
+    /// An unread kind (`None`) stays `None`, so it still gets the loud
+    /// judgement: a known anchor does not stand in for a kind that has no
+    /// readable version.
+    pub fn measured_from(&self, kind_declared: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+        kind_declared.map(|k| self.anchor.map_or(k, |a| k.max(a)))
     }
 
     /// The listing that answers "when did a packet of this identity last
@@ -409,9 +442,9 @@ impl Watched {
     /// The listing that answers "when was this kind declared?" — every
     /// version of its workflow, read only when no packet has ever
     /// arrived (see [`declared_at`]). A clock-rule cadence is identified
-    /// by subject as well, and its subject's rule row carries no landing
-    /// stamp, so the KIND's declaration stands in for it — the record
-    /// holds nothing finer.
+    /// by subject as well, and its rule row carries no landing stamp, so
+    /// the KIND's declaration is the floor and the rule's anchor raises
+    /// it ([`Watched::measured_from`], backlog 428be0b3).
     fn declaration_path(&self) -> String {
         format!("/api/workflows/{}/versions", self.kind)
     }
@@ -1275,7 +1308,10 @@ impl Handler for CadenceSilenceSweep {
                 )
                 .await
                 {
-                    Ok(versions) => declared_at(versions.as_array().map_or(&[], Vec::as_slice)),
+                    Ok(versions) => {
+                        let kind = declared_at(versions.as_array().map_or(&[], Vec::as_slice));
+                        w.measured_from(kind)
+                    }
                     Err(e) => {
                         errors.push(format!(
                             "declaration read for {} failed, so its silence is measured from \
@@ -1566,6 +1602,7 @@ mod tests {
     /// went nine days dead behind its own guard (cf0f5e2d).
     fn image_freshness_rule() -> RawRule {
         RawRule {
+            delivery_lane: None,
             name: "maintenance-sweep-image-freshness-daily".into(),
             on_event: None,
             schedule: Some(boss_dispatcher::rules::registry::RawSchedule {
@@ -1585,6 +1622,36 @@ mod tests {
             }],
             delay: None,
             version: 2,
+            why: None,
+        }
+    }
+
+    /// `check-suspended-chores-daily` as it landed in train #1685
+    /// (2026-11-11): a NEW daily clock rule, no guard, anchored
+    /// 2026-11-11, on the long-lived `ops-request` kind (backlog
+    /// 428be0b3's second recurrence).
+    fn suspended_chores_rule() -> RawRule {
+        RawRule {
+            delivery_lane: None,
+            name: "check-suspended-chores-daily".into(),
+            on_event: None,
+            schedule: Some(boss_dispatcher::rules::registry::RawSchedule {
+                cadence: boss_core::calendar::Cadence::Daily,
+                anchor_date: "2026-11-11".parse().expect("a date"),
+                business_calendar: None,
+            }),
+            when: None,
+            do_steps: vec![boss_dispatcher::rules::registry::RawDoStep {
+                handler: "jobs.spawn".into(),
+                args: [
+                    ("kind".to_string(), r#""ops-request""#.to_string()),
+                    ("subject".to_string(), r#""suspended-chores""#.to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            }],
+            delay: None,
+            version: 1,
             why: None,
         }
     }
@@ -1841,6 +1908,82 @@ mod tests {
         ];
         assert_eq!(declared_at(&versions), Some(at("2026-09-10T08:00:00Z")));
         assert_eq!(declared_at(&[]), None);
+    }
+
+    /// THE PIN of backlog 428be0b3: a new clock rule on an old kind is
+    /// measured from the LATER of the kind's first version and its own
+    /// anchor. `ops-request` was declared 2026-09-16T23:54:56Z;
+    /// `check-suspended-chores-daily` is anchored 2026-11-11 and was swept
+    /// at 2026-11-12T00:01:49Z with no packet yet. That is NOT YET DUE
+    /// (first slot by 11-12 00:00, silent at 11-14 00:00), not NEVER
+    /// FILED, and it raises once its own window has run out.
+    #[test]
+    fn a_new_clock_rule_on_an_old_kind_is_measured_from_its_anchor() {
+        let kind_declared = declared_at(&[json!({
+            "kind": "ops-request", "version": 1, "created_at": "2026-09-16T23:54:56Z"
+        })]);
+        let roster = watched_cadences(&[], &[suspended_chores_rule()]);
+        let w = &roster[0];
+        assert_eq!(w.label, "ops-request/suspended-chores");
+        let from = w.measured_from(kind_declared);
+        assert_eq!(from, Some(at("2026-11-11T00:00:00Z")));
+
+        let v = verdict(&w.declared, None, from, at("2026-11-12T00:01:49Z"));
+        assert_eq!(
+            v,
+            Verdict::NotYetDue {
+                interval_min: 1440,
+                declared_at: "2026-11-11T00:00:00+00:00".into(),
+                first_slot_by: "2026-11-12T00:00:00+00:00".into(),
+                silent_at: "2026-11-14T00:00:00+00:00".into(),
+                first_slot_passed: true,
+            }
+        );
+        assert!(!v.is_finding(), "the first due day is not a silence");
+
+        // Still never filed after its own window: raised, from the anchor.
+        assert_eq!(
+            verdict(&w.declared, None, from, at("2026-11-14T00:00:01Z")),
+            Verdict::NeverFiled {
+                interval_min: 1440,
+                declared_at: Some("2026-11-11T00:00:00+00:00".into()),
+            }
+        );
+    }
+
+    /// The anchor only ever RAISES the floor. A cadence with no anchor (a
+    /// timer arg) keeps today's judgement from the kind's first version;
+    /// an anchor older than the kind leaves the kind's instant; and an
+    /// unreadable kind stays unread, so its loud judgement is kept.
+    #[test]
+    fn a_cadence_without_a_later_anchor_keeps_the_kinds_declaration() {
+        let kind_declared = Some(at("2026-09-16T23:54:56Z"));
+        let now = at("2026-11-12T00:01:49Z");
+
+        let timer = watched("ops-request");
+        assert_eq!(timer.anchor, None);
+        assert_eq!(timer.measured_from(kind_declared), kind_declared);
+        assert_eq!(
+            verdict(
+                &timer.declared,
+                None,
+                timer.measured_from(kind_declared),
+                now
+            ),
+            Verdict::NeverFiled {
+                interval_min: 1440,
+                declared_at: Some("2026-09-16T23:54:56+00:00".into()),
+            }
+        );
+
+        // image-freshness is anchored 2026-08-14, before its kind.
+        let roster = watched_cadences(&[], &[image_freshness_rule()]);
+        let old_anchor = &roster[0];
+        assert_eq!(old_anchor.anchor, Some(at("2026-08-14T00:00:00Z")));
+        assert_eq!(old_anchor.measured_from(kind_declared), kind_declared);
+
+        let roster = watched_cadences(&[], &[suspended_chores_rule()]);
+        assert_eq!(roster[0].measured_from(None), None);
     }
 
     #[test]
@@ -2711,5 +2854,75 @@ mod tests {
             .expect_err("no anchor");
         assert!(err.is_permanent(), "{err}");
         assert_eq!(dark.writes(), Vec::<String>::new());
+    }
+
+    /// THE SECOND RECURRENCE of backlog 428be0b3, end to end, as the
+    /// record held it on 2026-11-12: `check-suspended-chores-daily`
+    /// (anchor 2026-11-11) on the long-lived `ops-request` kind (first
+    /// version 2026-09-16T23:54:56Z), swept at 00:01:49Z on its first due
+    /// day, 0.58 s before its first packet arrived. Measured from the
+    /// kind it raised urgent alarm e2302c79; measured from the rule's
+    /// anchor it owes nothing until 2026-11-14 and the pass writes
+    /// nothing. The control is the same kind declared by a timer arg,
+    /// which has no anchor and keeps today's judgement.
+    #[tokio::test]
+    async fn a_new_clock_rule_on_an_old_kind_raises_nothing_on_its_first_due_day() {
+        use crate::handlers::listing_stub::{empty_listing, serve};
+        let routes = || {
+            vec![
+                (
+                    "/api/jobs?kind=backlog-item&metadata_has=cadence_silence",
+                    empty_listing(),
+                ),
+                ("/api/jobs?kind=ops-request", empty_listing()),
+                (
+                    "/api/workflows/ops-request/versions",
+                    json!([{"kind": "ops-request", "version": 1,
+                            "created_at": "2026-09-16T23:54:56Z"}]),
+                ),
+            ]
+        };
+        let first_due_day = InvocationContext {
+            triggering_event_id: "clock-day:2026-11-12".into(),
+            triggering_topic: "clock.day".into(),
+            event_payload: json!({ "_at": "2026-11-12T00:01:49Z" }),
+            ..sweep_ctx()
+        };
+
+        let stub = serve(routes()).await;
+        let clock = CadenceSilenceSweep {
+            rules: vec![suspended_chores_rule()],
+            ..sweep(&stub.base)
+        };
+        clock
+            .invoke(&[], &first_due_day)
+            .await
+            .expect("a quiet pass");
+        assert_eq!(
+            stub.writes(),
+            Vec::<String>::new(),
+            "a clock rule anchored 2026-11-11 owes nothing on 2026-11-12"
+        );
+
+        let control = serve(routes()).await;
+        sweep(&control.base)
+            .invoke(
+                &[(format!("{ARG_PREFIX}ops-request"), ExprValue::Int(1440))],
+                &first_due_day,
+            )
+            .await
+            .expect("the timer cadence raises");
+        let posts: Vec<Value> = control
+            .sent()
+            .into_iter()
+            .filter(|(w, _)| w == "POST /api/jobs")
+            .map(|(_, b)| b)
+            .collect();
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        assert_eq!(
+            posts[0]["metadata"]["declared_at"],
+            json!("2026-09-16T23:54:56+00:00"),
+            "no anchor: still measured from the kind's first version"
+        );
     }
 }

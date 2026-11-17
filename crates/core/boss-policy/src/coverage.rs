@@ -272,7 +272,23 @@ pub struct HttpCoverageSources {
 
 impl HttpCoverageSources {
     pub fn new(people_base: impl Into<String>, jobs_base: impl Into<String>) -> Self {
-        let (people_base, http) = boss_core::http_client::base(people_base);
+        Self::with_timeout(
+            people_base,
+            jobs_base,
+            boss_core::http_client::CLIENT_TIMEOUT,
+        )
+    }
+
+    /// [`Self::new`] with a per-call timeout the caller owns, so a test
+    /// reading an in-process router over loopback waits on its own clock
+    /// rather than the drive's 5 s (backlog ac3a347c: gate 70ac6842 read
+    /// that expiry as a rule blinding the read).
+    pub fn with_timeout(
+        people_base: impl Into<String>,
+        jobs_base: impl Into<String>,
+        timeout: std::time::Duration,
+    ) -> Self {
+        let (people_base, http) = boss_core::http_client::base_with_timeout(people_base, timeout);
         let jobs_base = jobs_base.into().trim_end_matches('/').to_string();
         Self {
             people_base,
@@ -288,7 +304,7 @@ impl HttpCoverageSources {
             .header("x-boss-user", COVERAGE_READER)
             .send()
             .await
-            .map_err(|e| format!("GET {url}: {e}"))?;
+            .map_err(|e| format!("GET {url}: {}", with_causes(&e)))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(format!("GET {url} answered {status}"));
@@ -297,6 +313,17 @@ impl HttpCoverageSources {
             .await
             .map_err(|e| format!("GET {url} answered no JSON: {e}"))
     }
+}
+
+/// An error and every cause beneath it, `: `-joined. reqwest's own text
+/// stops at "error sending request for url (…)", so a read that timed
+/// out said only that it failed, and gate 70ac6842's red could not say
+/// which (backlog ac3a347c).
+fn with_causes(error: &dyn std::error::Error) -> String {
+    std::iter::successors(Some(error), |e| e.source())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 /// The rows of a listing that answers a bare array or `{"data": [...]}`;
@@ -566,6 +593,48 @@ mod tests {
             assert_eq!(status, 502, "{body}");
             assert!(body.get("rules").is_none());
         }
+    }
+
+    /// Backlog ac3a347c: the reader waits the timeout its caller gives
+    /// it, and a read that outlives it says it timed out. Gate 70ac6842
+    /// red on "error sending request for url (…)" alone — reqwest's outer
+    /// text, with the timeout one source below — while a 5 s wait no test
+    /// could change ran against a loaded drive.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_reader_waits_its_callers_timeout_and_names_the_expiry() {
+        let slow = std::time::Duration::from_millis(1500);
+        let app = axum::Router::new().route(
+            "/api/workflows",
+            axum::routing::get(move || async move {
+                tokio::time::sleep(slow).await;
+                axum::Json(serde_json::json!([]))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let jobs = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let short = std::time::Duration::from_millis(100);
+        let refused = HttpCoverageSources::with_timeout("http://127.0.0.1:9", &jobs, short)
+            .workflows()
+            .await;
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains("timed out")),
+            "a {short:?} wait on a {slow:?} jobs API must say it timed out; got {refused:?}"
+        );
+
+        let read = HttpCoverageSources::with_timeout(
+            "http://127.0.0.1:9",
+            &jobs,
+            std::time::Duration::from_secs(120),
+        )
+        .workflows()
+        .await;
+        assert!(
+            read.as_ref().is_ok_and(|w| w.is_empty()),
+            "the same {slow:?} jobs API inside the caller's wait answers; got {read:?}"
+        );
+        server.abort();
     }
 
     fn orphan_ids(body: &Value) -> Vec<String> {

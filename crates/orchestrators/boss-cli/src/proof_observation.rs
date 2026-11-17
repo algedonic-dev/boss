@@ -354,6 +354,7 @@ mod tests {
             stdout: positive().to_string() + "\n\n",
             stderr: "original stderr\n\n".into(),
             missing_tools: vec![],
+            timing: None,
         };
         let context = json!({"user":"boss-probe","uid":"997","cwd":"/view","tree_head":"b".repeat(40),"unreadable":[]});
         let (exit, body) = result("control-v1", &outcome, context);
@@ -387,6 +388,7 @@ mod tests {
             stdout: positive().to_string(),
             stderr: String::new(),
             missing_tools: vec![],
+            timing: None,
         };
         for context in [
             json!({}),

@@ -97,14 +97,17 @@ impl AgentsRegistry for FailingRegistry {
 
 fn agent(id: &str, login: &str, role: Option<&str>) -> AgentInput {
     AgentInput {
+        factory_rotation: Some(true),
         id: id.to_string(),
         display_name: id.to_string(),
         default_model: "opus-5".to_string(),
+        model_class: None,
         aliases: vec![login.to_string()],
         role: role.map(str::to_string),
         department: None,
         hourly_budget_usd_micros: None,
         max_concurrent_runs: None,
+        stations: None,
     }
 }
 

@@ -123,7 +123,10 @@ if [ "$mode" = "--check" ]; then
        echo "  description  tree=A run that died closes this packet failed.  live=<absent>"
        echo "publish-workflow: the tree moved ahead: live $kind v$ver is the row at 8cc7a03e:infra/platform/workflows.toml"
        echo "publish-workflow: --check ok: would publish $file over live v$ver at $BOSS_JOBS_URL (nothing written; packet ${OPS_REQUEST_ID:-none})"; exit 0 ;;
-    5) echo "publish-workflow: REFUSED — nothing to publish — the live $kind v$ver already says what $file says (label, description, category, subject_kinds and every step compared equal)."; exit 5 ;;
+    5) sha=""; [ -n "${STUB_CHECK_NO_SHA:-}" ] || sha="$(sha256sum "$BOSS_PUBLISH_WORKFLOW_REPO/$file" | cut -c1-64)"
+       [ -z "${STUB_CHECK_HOOK:-}" ] || bash -c "$STUB_CHECK_HOOK"
+       echo "publish-workflow: EQUAL: $kind v$ver; spec sha256 $sha"
+       echo "publish-workflow: REFUSED — nothing to publish — the live $kind v$ver already says what $file says (label, description, category, subject_kinds and every step compared equal)."; exit 5 ;;
     6) echo "publish-workflow: live $kind v$ver differs from $file:"
        echo "  steps[1].fields  tree=[[\"result\",\"string\",true]]  live=[[\"result\",\"string\",true],[\"proof\",\"string\",true]]"
        echo "  steps[1].metadata_defaults  tree=<absent>  live={\"procedure\":\"Observe the sweep working in production.\"}"
@@ -133,7 +136,13 @@ if [ "$mode" = "--check" ]; then
        echo "publish-workflow: REFUSED — the tree's $file does not lint clean"; exit 4 ;;
     8) echo "publish-workflow: REFUSED — '$kind' has no live active row at $BOSS_JOBS_URL — the seed admits a new kind"; exit 8 ;;
     9) echo "publish-workflow: HELD: '$kind' is HELD out of every unattended publish (declared in infra/platform/workflow-holds/$kind.toml)"
-       echo "publish-workflow: REFUSED — --check HELD: would NOT publish $file over live v$ver at $BOSS_JOBS_URL — the tree is ahead of live and the kind is held"; exit 9 ;;
+       echo "publish-workflow: live $kind v$ver differs from $file:"
+       echo "  description  tree=A row that turns on a refusal.  live=<absent>"
+       echo "publish-workflow: boss workflow: $kind lints clean (3 steps)"
+       sha=""; [ -n "${STUB_CHECK_NO_SHA:-}" ] || sha="; spec sha256 $(sha256sum "$BOSS_PUBLISH_WORKFLOW_REPO/$file" | cut -c1-64)"
+       # What a case does to the checkout AFTER the check read it.
+       [ -z "${STUB_CHECK_HOOK:-}" ] || bash -c "$STUB_CHECK_HOOK"
+       echo "publish-workflow: REFUSED — --check HELD: would NOT publish $file over live v$ver at $BOSS_JOBS_URL — the tree is ahead of live and the kind is held$sha"; exit 9 ;;
     75) echo "publish-workflow: could not read $BOSS_JOBS_URL/api/workflows/$kind — HTTP 000"
         echo "publish-workflow: cannot answer: nothing compared, nothing published"; exit 75 ;;
     *) echo "stub: unexpected rc $rc"; exit 99 ;;
@@ -988,11 +997,14 @@ fn a_hold_that_cannot_be_read_refuses_both_modes_and_publishes_nothing() {
             HOLD,
             "maintenance-beta.tml",
         ),
+        // Backlog a4b57aca retired the default holds, and with them the
+        // `released` state that answered one: a release file is a state
+        // the reader does not know, refused like any other.
         (
-            "release-of-nothing",
+            "released-state",
             "maintenance-beta.toml",
             "drift_publish = \"released\"\nwhy = 'This row was published by hand and its control passed.'\n",
-            "releases nothing",
+            "`drift_publish`",
         ),
     ];
     for (name, file, body, needle) in cases {
@@ -1063,102 +1075,95 @@ fn a_holds_path_that_is_not_a_directory_refuses_both_modes() {
     }
 }
 
-/// A ROW file that does not parse cannot say whether it declares a writer
-/// or an executor, so the default hold cannot be derived for it: a named
-/// problem, never a kind quietly read as open (same review, finding F4 —
-/// the branch had no test, and a mutant that skipped the row in silence
-/// survived).
+/// A row that declares a field `writer`, a step `executor` or a step
+/// `resources` bill — the three shapes that were held BY DEFAULT until
+/// backlog a4b57aca — is held by nothing now: whether its publish needs a
+/// person is the server's passkey rule, judged on the live row, and a
+/// hold is a timing hold an author declares. So all three ride the drift
+/// publish like any other row, and only a declared hold stops one.
 #[test]
-fn a_row_file_that_does_not_parse_refuses_both_modes() {
+fn a_writer_an_executor_or_a_bill_is_no_longer_held_by_default() {
     if !ready() {
         return;
     }
-    let c = Case::new("hold-bad-row");
-    c.verdicts(&[("maintenance-alpha", 0, 3), ("maintenance-beta", 0, 9)]);
-    c.row_file("maintenance-beta", "[[workflow]\nkind = \"maintenance-beta");
-    for mode in ["--check", "--for-real"] {
-        let (rc, out) = c.run(&[mode]);
-        assert_eq!(rc, 78, "{mode}: {out}");
-        contains_all(
-            &out,
-            &[
-                "infra/platform/workflows/maintenance-beta.toml could not be read",
-                "whether it declares a writer or an executor cannot be told",
-                "REFUSED",
-                "nothing published",
-            ],
-            mode,
-        );
-        assert!(
-            c.calls().is_empty(),
-            "{mode} asked or published: {:?}",
-            c.calls()
-        );
-    }
-}
-
-/// THE DEFAULT (backlog 083d240e, part 5). A row that declares a field
-/// `writer` or a step `executor` is a refusal row by construction, so it
-/// is held with NO file — forgetting the file cannot publish a refusal
-/// unattended. The file is the override in both directions: `held` adds
-/// the why and the lift, `released` hands the row back to this verb.
-#[test]
-fn a_row_declaring_a_writer_or_an_executor_is_held_by_default_and_a_release_file_frees_it() {
-    if !ready() {
-        return;
-    }
-    let c = Case::new("hold-default");
+    let c = Case::new("hold-no-default");
     c.verdicts(&[
         ("maintenance-alpha", 0, 3),
         ("maintenance-beta", 0, 9),
         ("maintenance-gamma", 0, 1),
+        ("maintenance-delta", 0, 4),
     ]);
     c.row_file("maintenance-beta", &writer_row("maintenance-beta"));
     c.row_file("maintenance-gamma", &executor_row("maintenance-gamma"));
+    c.row_file("maintenance-delta", &bill_row("maintenance-delta"));
     let (rc, out) = c.run(&["--for-real"]);
     assert_eq!(rc, 0, "{out}");
-    assert_eq!(c.publishes(), vec!["maintenance-alpha".to_string()]);
-    assert!(
-        verdict_line(&out)
-            .starts_with("publish-drift: published 1, skipped 0 equal, refused 0, held 2"),
-        "{out}"
-    );
-    contains_all(
-        &out,
-        &[
-            "publish-drift: held maintenance-beta (by default: step approve field decision declares writer signer)",
-            "publish-drift: held maintenance-gamma (by default: step execute declares executor runner:ops)",
-        ],
-        "the default names what it read",
-    );
-
-    // Released on the record: the row is this verb's again, and named.
-    c.clear_calls();
-    c.hold_file(
-        "maintenance-beta.toml",
-        "drift_publish = \"released\"\nwhy = 'Published by hand on 2026-10-07 and the positive control passed; later edits may ride the drift publish.'\n",
-    );
-    let (rc, out) = c.run(&["--for-real"]);
-    assert_eq!(rc, 0, "{out}");
+    let mut published = c.publishes();
+    published.sort();
     assert_eq!(
-        c.publishes(),
+        published,
         vec![
             "maintenance-alpha".to_string(),
-            "maintenance-beta".to_string()
+            "maintenance-beta".to_string(),
+            "maintenance-delta".to_string(),
+            "maintenance-gamma".to_string(),
         ]
-    );
-    contains_all(
-        &out,
-        &[
-            "publish-drift: released maintenance-beta (declared in infra/platform/workflow-holds/maintenance-beta.toml)",
-        ],
-        "a release is named every time too",
     );
     assert!(
         verdict_line(&out)
-            .starts_with("publish-drift: published 2, skipped 0 equal, refused 0, held 1"),
+            .starts_with("publish-drift: published 4, skipped 0 equal, refused 0, held 0"),
         "{out}"
     );
+    assert!(
+        !out.contains("by default"),
+        "no default hold is named: {out}"
+    );
+
+    // A declared hold still holds one of them.
+    c.clear_calls();
+    c.hold_file("maintenance-beta.toml", HOLD);
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(
+        !c.publishes().contains(&"maintenance-beta".to_string()),
+        "{out}"
+    );
+    assert!(
+        verdict_line(&out)
+            .starts_with("publish-drift: published 3, skipped 0 equal, refused 0, held 1"),
+        "{out}"
+    );
+}
+
+/// A row whose step declares a `resources` bill. `from-run` is the bill
+/// agent-run `building` carries.
+fn bill_row(kind: &str) -> String {
+    format!(
+        "[[workflow]]\nkind = \"{kind}\"\nlabel = \"{kind}\"\ncategory = \"platform\"\nsubject_kinds = [\"custom\"]\n\n[[workflow.step]]\ntitle = \"building\"\nkind = \"task\"\nready_when = \"true\"\nresources = {{ model = \"from-run\" }}\n"
+    )
+}
+
+/// The shipped tree holds only what it declares. agent-run was held by
+/// default for its bill until backlog a4b57aca, and is held again by a
+/// DECLARED timing hold (backlog db88f6a9; review 71005282 B1): its
+/// building bill's `workerless_profiles` turns on which runs the claim
+/// door refuses on host:w-1, so it goes live at David's deliberate
+/// publish, not on the next clean drift check after its car converges,
+/// and `publish-drift --file-held` opens the packet he signs.
+#[test]
+fn the_shipped_agent_run_bill_is_held_until_its_deliberate_publish() {
+    if !ready() {
+        return;
+    }
+    let (state, source, why, lifts) =
+        shipped_hold("agent-run").expect("agent-run carries a declared hold");
+    assert_eq!(state, "held");
+    assert_eq!(
+        source,
+        "declared in infra/platform/workflow-holds/agent-run.toml"
+    );
+    assert!(why.contains("workerless_profiles"), "{why}");
+    assert!(lifts.contains("db88f6a9"), "{lifts}");
 }
 
 /// The check that filed a `--for-real` may predate the hold, and a
@@ -1308,15 +1313,15 @@ fn shipped_hold(kind: &str) -> Option<(String, String, String, String)> {
 
 /// Row E's deliberate v13 publication, both negative controls, genuine
 /// forge approval/execution and amended signed GCP control are recorded
-/// in the release declaration. The parsed declaration and exact refusal
-/// roster are pinned together: a new refusal needs a new held car.
+/// in the release declaration, and the declaration is what holds the
+/// row (no default since backlog a4b57aca).
 #[test]
 fn the_shipped_proof_evidence_row_is_held_until_its_native_controls() {
     if !ready() {
         return;
     }
     let (state, source, why, _) = shipped_hold(SIGNER_KIND).unwrap_or_else(|| {
-        panic!("the shipped tree says nothing about {SIGNER_KIND}: a row that declares a writer is held by default, and the reader names it either way")
+        panic!("the shipped tree says nothing about {SIGNER_KIND}: its declared hold is gone")
     });
     assert_eq!(
         state, "held",
@@ -1338,83 +1343,20 @@ fn the_shipped_proof_evidence_row_is_held_until_its_native_controls() {
             "publication",
             "native",
             "6c9183de",
+            "046193a4",
+            "executed",
+            "204e27ba",
+            "plan_stderr",
         ],
-        "the why names the item, the design, what is reserved, whose publish puts it live, that a rollback sticks and when it may not run, and keeps the review row's half true",
-    );
-    let declared = shipped_refusal_declarations(SIGNER_KIND);
-    let mut expected: Vec<String> = [
-        ("approve", "args"),
-        ("approve", "host"),
-        ("approve", "plan"),
-        ("approve", "rendered_plan_sha256"),
-        ("approve", "review_run"),
-        ("approve", "verb"),
-        ("execute", "disposition"),
-        ("execute", "output"),
-        ("execute", "exit_code"),
-        ("nothing-to-do", "args"),
-        ("nothing-to-do", "host"),
-        ("nothing-to-do", "nothing_to_do"),
-        ("nothing-to-do", "plan"),
-        ("nothing-to-do", "plan_verb"),
-        ("nothing-to-do", "rendered_plan_sha256"),
-        ("nothing-to-do", "verb"),
-        ("review", "args"),
-        ("review", "host"),
-        ("review", "plan"),
-        ("review", "rendered_plan_sha256"),
-        ("review", "verb"),
-    ]
-    .iter()
-    .map(|(step, key)| format!("step {step} field {key} declares writer runner:ops"))
-    .chain([
-        "step approve field comment declares writer signer".to_string(),
-        "step approve field decision declares writer signer".to_string(),
-        "step execute declares executor runner:ops".to_string(),
-    ])
-    .collect();
-    expected.sort();
-    assert_eq!(
-        declared,
-        expected,
-        "infra/platform/workflows/{SIGNER_KIND}.toml declares a refusal beyond the two halves of row E. The release that follows this hold is written for these; a new one is a refusal nobody has published by hand or controlled, and its car says so in {HOLDS_REL}/{SIGNER_KIND}.toml and rewrites this test. The row declares (as {HOLDS_READER} reads it):\n{}",
-        declared.join("\n")
+        "the why names the item, the design, what is reserved, whose publish puts it live, that a rollback sticks and when it may not run, and keeps the review row's half true — and names console car 2c's executed envelope and item 204e27ba's plan_stderr, the refusals each adds",
     );
 }
 
-/// Every writer and executor the shipped row for `kind` declares, as the
-/// one hold reader derives them: `refusal_declarations` is called out of
-/// infra/gcp/workflow-holds.py itself, on the row as tomllib parses it,
-/// and its phrases come back sorted. Not a scan of the file's text — a
-/// second reading of the row is a second definition of "refusal", and
-/// the first one this file had missed three TOML spellings.
-fn shipped_refusal_declarations(kind: &str) -> Vec<String> {
-    let out = Command::new("python3")
-        .args([
-            "-c",
-            "import importlib.util, sys, tomllib\nspec = importlib.util.spec_from_file_location('workflow_holds', sys.argv[1])\nreader = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(reader)\nwith open(sys.argv[2], 'rb') as fh:\n    doc = tomllib.load(fh)\nfor phrase in sorted(reader.refusal_declarations(doc)):\n    print(phrase)\n",
-        ])
-        .arg(repo_root().join(HOLDS_READER))
-        .arg(repo_root().join(format!("infra/platform/workflows/{kind}.toml")))
-        .output()
-        .expect("python3 runs");
-    assert!(
-        out.status.success(),
-        "the reader's refusal_declarations could not be asked about the shipped {kind} row:\n{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::to_string)
-        .collect()
-}
-
-/// The shipped release reaches the drift road. An explicit rehold of
+/// A lifted hold reaches the drift road. An explicit rehold of
 /// the same native row blocks it after converge and after rollback, so
 /// restoring the hold before rollback keeps the rollback in place.
 #[test]
-fn for_real_publishes_the_released_row_but_a_rehold_preserves_the_rollback() {
+fn for_real_publishes_the_lifted_row_but_a_rehold_preserves_the_rollback() {
     if !ready() {
         return;
     }
@@ -1446,18 +1388,15 @@ fn for_real_publishes_the_released_row_but_a_rehold_preserves_the_rollback() {
         )],
         "new evidence source stays held",
     );
+    // Lifting the hold is deleting its file (backlog a4b57aca retired the
+    // `released` state with the default it answered): the row is this
+    // verb's again. Whether its publish then needs a passkey is the
+    // server's answer, judged on the live row, not this verb's.
     c.clear_calls();
-    c.hold_file(&format!("{SIGNER_KIND}.toml"),"drift_publish = 'released'\nwhy = 'Synthetic deliberate publication and controls; exercise the release mechanism only.'\n");
+    c.clear_holds();
     let (rc, out) = c.run(&["--for-real"]);
     assert_eq!(rc, 0, "{out}");
     assert_eq!(c.publishes(), vec!["maintenance-alpha", SIGNER_KIND]);
-    contains_all(
-        &out,
-        &[&format!(
-            "publish-drift: released {SIGNER_KIND} ({SIGNER_HOLD_SOURCE})"
-        )],
-        "the shipped release reaches the ordinary publish road",
-    );
 
     // A new refusal or rollback must rehold in its own car. The same
     // parsed native row remains held on both subsequent passes.
@@ -1502,6 +1441,8 @@ fn the_phrases_the_table_reads_are_the_sub_verbs_own() {
         "carries what the tree never said",
         "-> v",
         "--check HELD: would NOT publish",
+        // --file-held copies the dry-run receipt off this line.
+        "lints clean",
     ] {
         assert!(sub.contains(phrase), "{SUB_VERB} no longer says `{phrase}`");
         assert!(drift.contains(phrase), "{SCRIPT} does not read `{phrase}`");
@@ -1515,6 +1456,360 @@ fn the_phrases_the_table_reads_are_the_sub_verbs_own() {
             "{SCRIPT} has no case for sub-verb exit {code}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// --file-held: a held kind's publish is a packet on its owner (design
+// b1f319bc, David 2026-11-05; backlog 7955a488).
+// ---------------------------------------------------------------------------
+
+/// A stub curl that answers the reads and writes --file-held makes: the
+/// pr-train read, the known-answer ops-request listing, the
+/// publish-a-protocol listing (from STUB_ASKED), the POST that files a
+/// packet (body kept, compacted, one line each in STUB_POSTS) and the
+/// metadata PATCH that supersedes one (STUB_PATCHES).
+fn file_held_curl(c: &Case) {
+    write_exec(
+        &c.bin.join("curl"),
+        r#"#!/bin/sh
+url=""; out=""; code=0; method=GET; body=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift ;;
+    -w) code=1; shift ;;
+    -X) method="$2"; shift ;;
+    --data-binary) body="${2#@}"; shift ;;
+    -H|--max-time|-m) shift ;;
+    http*) url="$1" ;;
+  esac
+  shift
+done
+reply() {
+  if [ -n "$out" ]; then printf '%s' "$1" > "$out"; else printf '%s' "$1"; fi
+  [ "$code" = 1 ] && printf '%s' "$2"
+  exit 0
+}
+case "$method $url" in
+  "GET "*kind=pr-train*) reply "$(cat "$STUB_TRAINS")" 200 ;;
+  "GET "*kind=ops-request*) reply "{\"data\":[{}],\"total\":${STUB_CONTROL_TOTAL:-1}}" 200 ;;
+  "GET "*kind=publish-a-protocol*) reply "$(cat "$STUB_ASKED")" 200 ;;
+  "POST "*/api/jobs)
+    n=$(cat "$STUB_POSTS.n" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$STUB_POSTS.n"
+    jq -c . "$body" >> "$STUB_POSTS"
+    reply "{\"id\":\"00000000-0000-4000-8000-00000000000$n\"}" "${STUB_POST_CODE:-201}" ;;
+  "PATCH "*/metadata)
+    printf '%s %s\n' "$url" "$(jq -c . "$body")" >> "$STUB_PATCHES"
+    reply "" "${STUB_PATCH_CODE:-204}" ;;
+esac
+echo "stub curl: unexpected $method $url" >&2
+exit 22
+"#,
+    );
+}
+
+fn file_held_env(c: &Case, asked: &str) -> Vec<(&'static str, String)> {
+    let asked_f = c.root.join("asked.json");
+    write_file(&asked_f, asked);
+    for f in ["posts.jsonl", "posts.jsonl.n", "patches.txt"] {
+        let _ = std::fs::remove_file(c.root.join(f));
+    }
+    vec![
+        ("STUB_ASKED", asked_f.display().to_string()),
+        (
+            "STUB_POSTS",
+            c.root.join("posts.jsonl").display().to_string(),
+        ),
+        (
+            "STUB_PATCHES",
+            c.root.join("patches.txt").display().to_string(),
+        ),
+    ]
+}
+
+fn posts(c: &Case) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(c.root.join("posts.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("a posted body is JSON"))
+        .collect()
+}
+
+fn kind_sha(c: &Case, kind: &str) -> String {
+    let out = Command::new("sha256sum")
+        .arg(c.repo.join(format!("infra/platform/workflows/{kind}.toml")))
+        .output()
+        .expect("sha256sum runs");
+    String::from_utf8_lossy(&out.stdout)[..64].to_string()
+}
+
+fn file_held_line(out: &str) -> &str {
+    out.lines()
+        .find(|l| l.starts_with("publish-drift: filed "))
+        .unwrap_or_else(|| panic!("no --file-held verdict line in:\n{out}"))
+}
+
+/// THE TRIGGER'S VERB. A held kind whose tree is ahead of live gets ONE
+/// publish-a-protocol packet carrying every fact its owner will sign —
+/// the kind, its file, the file's sha256 at this checkout, the live
+/// version, the checkout sha, the sub-verb's dry-run line and its diff,
+/// copied. A held kind that is equal gets none; a kind that is not held
+/// is checked too, so an obsolete obligation can end; nothing is
+/// published; and the verdict never reads as a check or a publish.
+#[test]
+fn file_held_files_one_packet_for_each_held_kind_the_tree_moved_ahead_of() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("file-held");
+    c.verdicts(&[
+        ("maintenance-alpha", 0, 4),
+        ("maintenance-beta", 9, 13),
+        ("maintenance-gamma", 5, 2),
+    ]);
+    c.hold_file("maintenance-beta.toml", HOLD);
+    c.hold_file("maintenance-gamma.toml", HOLD);
+    file_held_curl(&c);
+    let env = file_held_env(&c, r#"{"data":[],"total":0}"#);
+    let (rc, out) = c.run_env(&["--file-held"], &env);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(
+        c.calls(),
+        vec![
+            "maintenance-alpha --check",
+            "maintenance-beta --check",
+            "maintenance-gamma --check"
+        ],
+        "all kinds are checked, including those whose hold was lifted"
+    );
+    let posted = posts(&c);
+    assert_eq!(
+        posted.len(),
+        1,
+        "one packet, for the held kind that is ahead: {out}"
+    );
+    let p = &posted[0];
+    assert_eq!(p["kind"], "publish-a-protocol");
+    assert_eq!(p["subject"]["id"], "maintenance-beta");
+    let md = &p["metadata"];
+    assert_eq!(md["protocol_kind"], "maintenance-beta");
+    // The registry-row keys the widened row's approve step requires of a
+    // filer (backlog f399458f); protocol_kind stays for v1 and the dedup.
+    assert_eq!(md["registry"], "workflow");
+    assert_eq!(md["row_name"], "maintenance-beta");
+    assert_eq!(
+        md["spec_path"],
+        "infra/platform/workflows/maintenance-beta.toml"
+    );
+    assert_eq!(
+        md["spec_sha256"],
+        serde_json::json!(kind_sha(&c, "maintenance-beta"))
+    );
+    assert_eq!(md["live_version"], "13");
+    assert_eq!(md["tree_sha"], serde_json::json!(c.head));
+    assert_eq!(
+        md["dry_run"],
+        "boss workflow: maintenance-beta lints clean (3 steps)"
+    );
+    assert!(
+        md["diff"]
+            .as_str()
+            .is_some_and(|d| d.contains("description  tree=A row that turns on a refusal.")),
+        "the diff is the sub-verb's, copied: {md}"
+    );
+    assert!(
+        file_held_line(&out).starts_with(
+            "publish-drift: filed 1 publish-a-protocol packet(s), already asked 0, superseded 0, not filed 0, held 2 ahead 1, not held 1"
+        ),
+        "{out}"
+    );
+    assert!(
+        !out.contains("publish-drift: would publish") && !out.contains("publish-drift: published"),
+        "a filing never reads as a check or a publish: {out}"
+    );
+    assert!(c.publishes().is_empty(), "{:?}", c.calls());
+}
+
+/// ONE PACKET PER SPEC, EVER: a packet for the same kind and bytes —
+/// declined here — files nothing, so a declined spec is not asked again
+/// on every converge; a newer edit (other bytes) is filed, and the open
+/// packet for the older bytes is marked superseded by it.
+#[test]
+fn file_held_asks_each_spec_once_and_a_newer_edit_supersedes_the_open_one() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("file-held-dedup");
+    c.verdicts(&[("maintenance-beta", 9, 13)]);
+    c.hold_file("maintenance-beta.toml", HOLD);
+    file_held_curl(&c);
+    let sha = kind_sha(&c, "maintenance-beta");
+
+    let declined = format!(
+        r#"{{"data":[{{"id":"11111111-0000-4000-8000-000000000001","status":"closed","metadata":{{"protocol_kind":"maintenance-beta","spec_sha256":"{sha}"}}}}],"total":1}}"#
+    );
+    let env = file_held_env(&c, &declined);
+    let (rc, out) = c.run_env(&["--file-held"], &env);
+    assert_eq!(rc, 0, "{out}");
+    assert!(
+        posts(&c).is_empty(),
+        "the same bytes are never asked twice: {out}"
+    );
+    contains_all(
+        &out,
+        &["already asked as publish-a-protocol 11111111-0000-4000-8000-000000000001 (closed)"],
+        "the dedup",
+    );
+    assert!(
+        file_held_line(&out)
+            .starts_with("publish-drift: filed 0 publish-a-protocol packet(s), already asked 1"),
+        "{out}"
+    );
+
+    let older = r#"{"data":[{"id":"22222222-0000-4000-8000-000000000002","status":"open","metadata":{"protocol_kind":"maintenance-beta","spec_sha256":"0000000000000000000000000000000000000000000000000000000000000000"}}],"total":1}"#;
+    let env = file_held_env(&c, older);
+    let (rc, out) = c.run_env(&["--file-held"], &env);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(posts(&c).len(), 1, "{out}");
+    let patches = std::fs::read_to_string(c.root.join("patches.txt")).unwrap_or_default();
+    assert!(
+        patches.starts_with(
+            "http://sor.invalid/api/jobs/22222222-0000-4000-8000-000000000002/metadata "
+        ) && patches.contains("\"superseded_by\":\"00000000-0000-4000-8000-000000000001\"")
+            && patches.contains("supersession_translation"),
+        "the open packet for older bytes is superseded by the new one: {patches}"
+    );
+    assert!(
+        file_held_line(&out).starts_with(
+            "publish-drift: filed 1 publish-a-protocol packet(s), already asked 0, superseded 1"
+        ),
+        "{out}"
+    );
+}
+
+/// A DARK READ IS NOT AN EMPTY LIST: when the known answer (the request
+/// this run answers is an ops-request) reads as none, nothing is filed
+/// and the run cannot answer (75); a refused POST is `not filed`, exit 1.
+#[test]
+fn file_held_files_nothing_on_a_dark_read_and_says_a_refused_filing() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("file-held-dark");
+    c.verdicts(&[("maintenance-beta", 9, 13)]);
+    c.hold_file("maintenance-beta.toml", HOLD);
+    file_held_curl(&c);
+    let mut env = file_held_env(&c, r#"{"data":[],"total":0}"#);
+    env.push(("STUB_CONTROL_TOTAL", "0".into()));
+    let (rc, out) = c.run_env(&["--file-held"], &env);
+    assert_eq!(rc, 75, "{out}");
+    assert!(posts(&c).is_empty(), "{out}");
+    contains_all(&out, &["cannot answer", "nothing filed"], "the dark read");
+
+    let mut env = file_held_env(&c, r#"{"data":[],"total":0}"#);
+    env.push(("STUB_POST_CODE", "403".into()));
+    let (rc, out) = c.run_env(&["--file-held"], &env);
+    assert_eq!(rc, 1, "{out}");
+    contains_all(
+        &out,
+        &[
+            "maintenance-beta NOT filed — POST /api/jobs answered HTTP 403",
+            "not filed 1",
+        ],
+        "the refused filing",
+    );
+}
+
+/// AN UNREADABLE LISTING IS NOT AN EMPTY ONE (review R2 of car 214ae147,
+/// Codex run 753b6bd7, its fixture first). A 200 whose `data` is null,
+/// absent, not an array, or carries a row that is not a job with an id
+/// cannot show that no packet already asks for these bytes; read as
+/// `.data // []` it filed a second packet for a declined spec and exited
+/// 0. Each refuses 75 with nothing filed; the canonical shape beside
+/// them still dedupes, and a genuine `data: []` still files (above).
+#[test]
+fn file_held_refuses_a_listing_it_cannot_read_as_rows() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("file-held-list-shape");
+    c.verdicts(&[("maintenance-beta", 9, 13)]);
+    c.hold_file("maintenance-beta.toml", HOLD);
+    file_held_curl(&c);
+    let sha = kind_sha(&c, "maintenance-beta");
+    let duplicate = format!(
+        r#"{{"data":[{{"id":"11111111-0000-4000-8000-000000000001","status":"closed","metadata":{{"protocol_kind":"maintenance-beta","spec_sha256":"{sha}"}}}}],"total":1}}"#
+    );
+    let env = file_held_env(&c, &duplicate);
+    let (rc, out) = c.run_env(&["--file-held"], &env);
+    assert_eq!(rc, 0, "canonical dedupe control: {out}");
+    assert!(posts(&c).is_empty(), "{out}");
+    for bad in [
+        r#"{"data":null,"total":0}"#,
+        r#"{"total":0}"#,
+        r#"{"data":{},"total":0}"#,
+        r#"{"data":[1],"total":1}"#,
+        r#"{"data":[{"status":"closed"}],"total":1}"#,
+    ] {
+        let env = file_held_env(&c, bad);
+        let (rc, out) = c.run_env(&["--file-held"], &env);
+        assert_eq!(rc, 75, "{bad} cannot prove an empty world: {out}");
+        assert!(
+            posts(&c).is_empty(),
+            "{bad}: an unreadable listing filed: {out}"
+        );
+        contains_all(&out, &["cannot answer", "nothing filed"], bad);
+    }
+}
+
+/// THE SIGNED SHA IS THE CHECKED BYTES' SHA (the source of review R1 of
+/// car 214ae147). The packet carries the sub-verb's diff and dry-run of
+/// the bytes it read, so its `spec_sha256` is the sha the sub-verb
+/// printed for those bytes — never a fresh hash of a checkout that may
+/// have moved since, which would have the owner sign one file's hash
+/// beside another file's diff. A check that prints no sha files nothing.
+#[test]
+fn file_held_signs_the_sha_the_check_read_not_the_checkout_now() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("file-held-sha");
+    c.verdicts(&[("maintenance-beta", 9, 13)]);
+    c.hold_file("maintenance-beta.toml", HOLD);
+    file_held_curl(&c);
+    let checked = kind_sha(&c, "maintenance-beta");
+    let file = c
+        .repo
+        .join("infra/platform/workflows/maintenance-beta.toml");
+    let mut env = file_held_env(&c, r#"{"data":[],"total":0}"#);
+    env.push((
+        "STUB_CHECK_HOOK",
+        format!("printf '# moved\\n' >> '{}'", file.display()),
+    ));
+    let (rc, out) = c.run_env(&["--file-held"], &env);
+    assert_eq!(rc, 0, "{out}");
+    assert_ne!(
+        kind_sha(&c, "maintenance-beta"),
+        checked,
+        "the hook moved the checkout"
+    );
+    let posted = posts(&c);
+    assert_eq!(posted.len(), 1, "{out}");
+    assert_eq!(
+        posted[0]["metadata"]["spec_sha256"],
+        serde_json::json!(checked),
+        "the packet signs the bytes the check read: {out}"
+    );
+
+    let mut env = file_held_env(&c, r#"{"data":[],"total":0}"#);
+    env.push(("STUB_CHECK_NO_SHA", "1".into()));
+    let (rc, out) = c.run_env(&["--file-held"], &env);
+    assert_eq!(rc, 1, "{out}");
+    assert!(posts(&c).is_empty(), "{out}");
+    contains_all(
+        &out,
+        &["maintenance-beta NOT filed", "not filed 1"],
+        "no sha",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1693,7 +1988,7 @@ fn the_verb_file_has_the_reviewed_shape() {
     assert_eq!(params[0]["name"], "mode");
     assert_eq!(
         params[0]["one_of"],
-        serde_json::json!(["--check", "--for-real"])
+        serde_json::json!(["--check", "--for-real", "--file-held"])
     );
     assert_eq!(
         params[0]["default"], "--check",
@@ -1714,4 +2009,88 @@ fn the_verb_file_has_the_reviewed_shape() {
         whole >= 4 * one,
         "publish-drift's timeout ({whole}s) must cover many sub-verb runs (one is {one}s)"
     );
+}
+
+#[test]
+fn file_held_reconciles_only_open_workflow_obligations_proven_live_equal() {
+    if !ready() {
+        return;
+    }
+    for held in [false, true] {
+        let c = Case::new(if held { "equal-held" } else { "equal-released" });
+        c.verdicts(&[("maintenance-alpha", 5, 14)]);
+        if held {
+            c.hold_file("maintenance-alpha.toml", HOLD);
+        }
+        file_held_curl(&c);
+        let env = file_held_env(
+            &c,
+            r#"{"data":[
+          {"id":"owed","status":"open","metadata":{"registry":"workflow","protocol_kind":"maintenance-alpha"}},
+          {"id":"legacy","status":"open","metadata":{"protocol_kind":"maintenance-alpha"}},
+          {"id":"closed","status":"closed","metadata":{"protocol_kind":"maintenance-alpha"}},
+          {"id":"pool","status":"open","metadata":{"registry":"pool","protocol_kind":"maintenance-alpha"}},
+          {"id":"other","status":"open","metadata":{"protocol_kind":"maintenance-beta"}}
+        ],"total":5}"#,
+        );
+        let (rc, out) = c.run_env(&["--file-held"], &env);
+        assert_eq!(rc, 0, "{out}");
+        let patches = std::fs::read_to_string(c.root.join("patches.txt")).unwrap_or_default();
+        assert_eq!(patches.lines().count(), 2, "{patches}\n{out}");
+        assert!(
+            patches.contains("/owed/metadata") && patches.contains("/legacy/metadata"),
+            "{patches}"
+        );
+        assert!(
+            patches.contains("workflow:maintenance-alpha:v14"),
+            "{patches}"
+        );
+        assert!(
+            patches.contains(&kind_sha(&c, "maintenance-alpha")),
+            "{patches}"
+        );
+        assert!(posts(&c).is_empty() && c.publishes().is_empty(), "{out}");
+    }
+}
+
+#[test]
+fn file_held_never_settles_equality_without_frozen_bytes_or_a_successful_write() {
+    if !ready() {
+        return;
+    }
+    for failure in ["missing-sha", "moved-file", "patch-refused"] {
+        let c = Case::new(failure);
+        c.verdicts(&[("maintenance-alpha", 5, 14)]);
+        file_held_curl(&c);
+        let mut env = file_held_env(
+            &c,
+            r#"{"data":[{"id":"owed","status":"open","metadata":{"protocol_kind":"maintenance-alpha"}}],"total":1}"#,
+        );
+        match failure {
+            "missing-sha" => env.push(("STUB_CHECK_NO_SHA", "1".into())),
+            "moved-file" => env.push((
+                "STUB_CHECK_HOOK",
+                format!(
+                    "echo '# changed' >> '{}/infra/platform/workflows/maintenance-alpha.toml'",
+                    c.repo.display()
+                ),
+            )),
+            _ => env.push(("STUB_PATCH_CODE", "409".into())),
+        }
+        let (rc, out) = c.run_env(&["--file-held"], &env);
+        assert_ne!(rc, 0, "{failure}: {out}");
+        assert!(
+            rc == 75 || file_held_line(&out).contains("superseded 0"),
+            "{out}"
+        );
+        if failure != "patch-refused" {
+            assert!(
+                std::fs::read_to_string(c.root.join("patches.txt"))
+                    .unwrap_or_default()
+                    .is_empty(),
+                "{out}"
+            );
+        }
+        assert!(c.publishes().is_empty(), "{out}");
+    }
 }

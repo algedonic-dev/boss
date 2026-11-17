@@ -51,6 +51,10 @@ class Delivery(unittest.TestCase):
                 'metadata':{'host':'forge','verb':'plan-dev-work-volume-expansion','args':['64Gi']},
                 'steps':[{'spec_slug':'execute','status':'completed','metadata':{'disposition':'answered','exit_code':'78','streams':{'stdout':stream(b''),'stderr':stream(stderr)}}}]}
         reference,carrier=E.from_packet(packet,REQUEST)
+        for requested in ('41Gi', '64Gi', '65Gi', '96Gi', '128Gi'):
+            packet['metadata']['args'] = [requested]
+            self.assertEqual(E.from_packet(packet, REQUEST)[1]['exit'], 78)
+        packet['metadata']['args'] = ['64Gi']
         self.assertEqual(reference,ref)
         self.assertEqual(carrier['exit'],78)
         self.assertFalse(carrier['plan_success'])
@@ -138,7 +142,7 @@ class Delivery(unittest.TestCase):
         output=io.StringIO()
         with mock.patch.object(planner,'Native',Native),mock.patch.dict(planner.os.environ,{'BOSS_DEV_WORK_KUBECTL':'unused-stub'}),contextlib.redirect_stdout(output):
             with self.assertRaisesRegex(ValueError,'complete evidence unavailable.*prerequisite refusal.*carrier refused'):
-                planner.main(['--plan','64Gi'])
+                planner.main(['--plan','96Gi'])
         self.assertEqual(output.getvalue(),'')
         self.assertEqual(observed,['synthetic original prerequisite refusal'])
 
@@ -272,6 +276,99 @@ class Delivery(unittest.TestCase):
             with self.subTest(change=change),self.assertRaises(ValueError):
                 ref=E.deliver(body,REQUEST,put)
                 E.restore(ref,REQUEST,blobs.__getitem__)
+
+
+class PlanCarrier(unittest.TestCase):
+    """Review 2814c3c5 (urgent 8a1d0c74): the plan's dev-build diagnostic line
+    rides the plan's own ops carrier. An indented multi-line diagnostic put a
+    '{' at the start of a stderr line whenever a worker existed, which is
+    always, and from_packet refused the whole carrier. These run the real
+    planner end to end over the native-shaped stub and read back its streams."""
+
+    def setUp(self):
+        spec=importlib.util.spec_from_file_location('volume_test',ROOT/'infra/forge/tests/dev-work-volume-test.py')
+        self.T=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.T)
+
+    def worker(self,data,joined):
+        T=self.T;name='dev-build-0123456789abcdef'
+        pod=T.obj('Pod',name+'-pod','boss-dev',spec={'volumes':[{'persistentVolumeClaim':{'claimName':name}}]},
+                  status={'phase':'Running'})
+        pod['metadata']['labels']={'boss.dev/purpose':'isolated-build','boss.dev/session':name}
+        data['pods']['items'].append(pod)
+        claim=json.loads(json.dumps(data['pvc']));claim['metadata'].update(name=name,uid='worker-claim-uid')
+        volume=json.loads(json.dumps(data['volume']));volume['status']['kubernetesStatus']['pvcName']=name
+        data['list:pvc']={'kind':'List','metadata':{},'items':[claim] if joined else []}
+        data['list:volumes.longhorn.io']={'kind':'List','metadata':{},'items':[volume]}
+        return data
+
+    def planned(self,data):
+        T=self.T
+        with tempfile.TemporaryDirectory(prefix='dev-work-fixture-') as directory:
+            probe=T.stubbed(directory,data)
+            env={'BOSS_DEV_WORK_KUBECTL':' '.join(probe.kubectl),'OPS_REQUEST_ID':REQUEST}
+            out,err=io.StringIO(),io.StringIO()
+            with mock.patch.dict(T.MODULE.os.environ,env),contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+                T.MODULE.main(['--plan','96Gi'])
+        return out.getvalue().encode(),err.getvalue().encode()
+
+    def packet(self,stdout,stderr):
+        def stream(body):return {'base64':base64.b64encode(body).decode(),'bytes':len(body),'retained_bytes':len(body),'sha256':E.sha(body),'complete':True}
+        return {'id':REQUEST,'kind':'ops-request','status':'closed','simulated':False,
+                'metadata':{'host':'forge','verb':'plan-dev-work-volume-expansion','args':['96Gi']},
+                'steps':[{'spec_slug':'execute','status':'completed','metadata':{'disposition':'answered','exit_code':'0',
+                          'streams':{'stdout':stream(stdout),'stderr':stream(stderr)}}}]}
+
+    def decoded(self,packet):
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/'packet.json';path.write_text(json.dumps(packet))
+            output=io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.T.MODULE.main(['--decode-evidence',str(path),temporary,REQUEST])
+        return json.loads(output.getvalue())
+
+    def diagnostic(self,stderr):
+        lines=[line for line in stderr.decode().splitlines() if line.startswith('dev-build-scheduling: ')]
+        self.assertEqual(len(lines),1,stderr)
+        return json.loads(lines[0][len('dev-build-scheduling: '):])
+
+    def test_observed_and_unknown_worker_rows_keep_the_plan_carrier_readable(self):
+        for joined,state in ((True,'OBSERVED'),(False,'UNKNOWN')):
+            with self.subTest(row=state):
+                stdout,stderr=self.planned(self.worker(self.T.inputs(),joined))
+                packet=self.packet(stdout,stderr)
+                reference,carrier=E.from_packet(packet,REQUEST)
+                self.assertEqual(self.diagnostic(stderr)['workers'][0]['state'],state)
+                self.assertTrue(carrier['plan_success'])
+                self.assertEqual(carrier['plan']['purpose'],'dev-work-volume')
+                self.assertEqual(reference['evidence_encoding'],'gzip+base64')
+                result=self.decoded(packet)
+                self.assertTrue(result['carrier']['plan_success'])
+                self.assertIsNone(result['failure'])
+
+    def test_a_failed_diagnostic_read_never_fails_a_successful_plan(self):
+        data=self.worker(self.T.inputs(),True);data['fail-list:pvc']='synthetic list refused\n'
+        stdout,stderr=self.planned(data)
+        packet=self.packet(stdout,stderr)
+        result=self.decoded(packet)
+        self.assertTrue(result['carrier']['plan_success'])
+        self.assertEqual(self.diagnostic(stderr)['state'],'UNKNOWN')
+        failed=[record for record in result['records'] if record['exit']!=0]
+        self.assertEqual([record['argv'][:2] for record in failed],[['get','pvc']])
+        self.assertTrue(failed[0]['diagnostic'])
+        # The control: a failed PRIMARY observation in a successful carrier
+        # still refuses. Re-encode the same originals with one read failed.
+        records=json.loads(json.dumps(result['records']))
+        primary=[record for record in records if not record.get('diagnostic')]
+        self.assertTrue(primary)
+        primary[0]['exit']=1
+        raw=json.dumps(records).encode()
+        envelope={'evidence_encoding':'gzip+base64','complete':True,'request_id':REQUEST,
+                  'original_bytes':len(raw),'original_sha256':hashlib.sha256(raw).hexdigest(),
+                  'data':base64.b64encode(gzip.compress(raw,mtime=0)).decode(),'failure':None}
+        kept=[line for line in stderr.decode().splitlines(keepends=True) if not line.lstrip().startswith('{')]
+        tampered=(json.dumps(envelope)+'\n'+''.join(kept)).encode()
+        with self.assertRaisesRegex(ValueError,'failed native observations'):
+            self.decoded(self.packet(stdout,tampered))
 
 
 if __name__=='__main__':unittest.main()

@@ -102,7 +102,11 @@ fn status(step: &Value) -> &str {
 
 /// Do two commit identifiers name the same commit — prefix containment,
 /// gated at 7 characters a side (the conductor's `commits_match`).
-fn same_commit(a: &str, b: &str) -> bool {
+/// Public since backlog 090720c3: the dispatcher's
+/// `jobs.converge_trains_on_rolled` asks the same question of a train's
+/// twelve-character `merge_ref` and the runner's full sha, and reads it
+/// here rather than writing another copy.
+pub fn same_commit(a: &str, b: &str) -> bool {
     let (a, b) = (a.trim(), b.trim());
     a.len() >= 7 && b.len() >= 7 && (a.starts_with(b) || b.starts_with(a))
 }

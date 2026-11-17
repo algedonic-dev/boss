@@ -1,0 +1,20 @@
+{
+  "about": "READ-ONLY: one namespace's postgres StatefulSet placement, live and as the converge renders it (infra/forge/postgres-placement.sh <namespace>; backlog eb7c4e0b). WHY: the review of the postgres-rollout forward fix (car 973c1488, backlog 9123d811) needs whether either live StatefulSet carries an affinity, nodeSelector or tolerations key its rendering lacks, because that fix removes such a key on its first converge and rolls the pod; dev-session is Forbidden a StatefulSet get in boss-playground, so no actor below David could read it. The param is one_of the script's own ALLOWED list (held equal by crates/core/boss-testing/tests/read_postgres_placement_sh.rs); any other word is refused before a door opens. Through the forge's ops_kubectl door, no RBAC widened: get sts/postgres, and inside the converge's own rendering (postgres-rollout.py rendered_postgres over the forge checkout's HEAD, imported, not copied) its client-side create --dry-run=client serialization, which sends no object to the server. It prints uid, resourceVersion, generation, observedGeneration, current/update revision, the three placement fields of spec.template.spec verbatim, the same three rendered, and each key that differs. Its last line is the verdict `READ — <ns> live=<keys> rendered=<keys> prune=<keys or none>`, prune naming each live placement key the rendering lacks as a JSON pointer under spec.template.spec. A read that could not look, an empty answer, or a rendering without postgres is CANNOT ANSWER (exit 1). Timeout 300: the live read at 30 s, the rendering's archive and renderer at 60 s each, its serialization, and, the first time, the door image's pull at 120 s.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/postgres-placement.sh",
+    "{1}"
+  ],
+  "params": [
+    {
+      "name": "namespace",
+      "one_of": [
+        "boss",
+        "boss-playground"
+      ]
+    }
+  ],
+  "timeout": 300
+}

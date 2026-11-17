@@ -138,7 +138,7 @@ checks for itself, not something authors have to remember.
    `steps.<slug>` reference resolves, the graph is acyclic,
    every step is reachable, and every fork point covers all
    values of its discriminating enum. Runs at author time
-   (`/system/workflows`), at publish, and at boot
+   (`/it/registry`), at publish, and at boot
    (boss-jobs-api refuses to start against a broken registry).
    The runtime metadata validator in `step_registry.rs` is the
    complement: it enforces a StepType's `required` fields when

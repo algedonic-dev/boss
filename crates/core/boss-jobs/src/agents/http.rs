@@ -36,6 +36,36 @@
 //! `classes: None` / `departments: None` skip them, the people
 //! adapter's posture for in-memory and test paths; the service binary
 //! always wires both.
+//!
+//! A declared `model_class` is the `<class>` of an active
+//! `robots:<class>` pool (factory taxonomy T2d, backlog 06d8988b):
+//! what a `model:<class>` step's claim reads to admit a robot. This door
+//! refuses a class no active pool declares, by agent, class and pool.
+//! `pools: None` does NOT skip it — a declared class with no registry to
+//! ask is refused (503), because the claim would read the recorded class
+//! as a fact somebody checked. A row that records NO class is not
+//! refused — a robot whose model no pool declares has none to give —
+//! but the answer names it (`no_model_class`, backlog 3317f4db), read
+//! back after the batch: since the dispatcher nominates a `model:` step
+//! by the same class, such a robot is one no `model:` step reaches.
+//!
+//! The class is also a fact a POOL states (backlog d088c248): since
+//! af5dd547 a model-slot pool lists the model ids it meters, and a
+//! `from-run` bill reads a run's class off that list. Two places can
+//! disagree, so this door refuses a declared class a pool contradicts —
+//! the agent's `default_model` listed by another class's pool, or the
+//! class's own pool listing models that do not include it — naming the
+//! agent, the model and each pool. A pin, not a collapse: deriving the
+//! class from the pools and retiring the declared column is the
+//! collapse, and it is a car of its own (the claim door, the dispatcher's
+//! roster and both adapters read the column).
+//!
+//! A declared seat — a name in `stations`, the ordered stations an
+//! executor serves (design 506e0a1c car 1, backlog 1a74c2bc) — is an
+//! ACTIVE station of the station registry, checked here the way the
+//! class is: an unknown or retired station refuses the whole batch by
+//! agent and station, and `stations: None` refuses a declared seat (503)
+//! rather than record one nobody checked.
 
 use std::sync::Arc;
 
@@ -51,6 +81,8 @@ use boss_core::publish::ModeQuery;
 use boss_policy_client::CurrentUser;
 
 use crate::department::registry::DepartmentRegistry;
+use crate::pools::PoolRegistry;
+use crate::stations::StationRegistry;
 use crate::trust::{can_read, is_trusted};
 
 use super::port::{AgentsError, AgentsRegistry};
@@ -67,6 +99,19 @@ pub struct AgentsApiState {
     /// c87e3d6d (it was an `(employee, department)` Class until then).
     /// `None` skips the check (test and in-memory paths).
     pub departments: Option<Arc<dyn DepartmentRegistry>>,
+    /// The pool registry an agent's `model_class` is checked against:
+    /// the class must be the `<class>` of an active `robots:<class>`
+    /// pool (T2d, backlog 06d8988b). Unlike the two above, `None` does
+    /// not skip: a row DECLARING a class is refused, since a class no
+    /// one could check is not a class recorded; a row declaring none
+    /// needs no pool.
+    pub pools: Option<Arc<dyn PoolRegistry>>,
+    /// The station registry an agent's seats (`stations`) are checked
+    /// against: each must name an ACTIVE station (design 506e0a1c car 1,
+    /// backlog 1a74c2bc). Like `pools`, `None` does not skip: a row
+    /// declaring a seat is refused, since a seat nobody checked is not a
+    /// seat recorded; a row declaring none, or `[]`, needs no registry.
+    pub stations: Option<Arc<dyn StationRegistry>>,
 }
 
 /// Why a declared department is refused: the code is not an active
@@ -123,6 +168,112 @@ async fn undeclared_class(
         }
     }
     Ok(None)
+}
+
+/// Why a declared model class is refused: no active `robots:<class>`
+/// pool declares it (T2d, backlog 06d8988b). `Ok(None)` when every
+/// declared class is held; `Err` when the registry could not answer.
+async fn undeclared_model_class(
+    pools: &dyn PoolRegistry,
+    rows: &[AgentInput],
+) -> Result<Option<String>, String> {
+    if rows.iter().all(|a| a.model_class.is_none()) {
+        return Ok(None);
+    }
+    let active = pools
+        .list_active()
+        .await
+        .map_err(|e| format!("pool registry: {e}"))?;
+    for a in rows {
+        let Some(class) = &a.model_class else {
+            continue;
+        };
+        let pool = crate::resources::robot_pool(class);
+        let Some(own) = active.iter().find(|p| p.name == pool) else {
+            return Ok(Some(format!(
+                "agent {}: model_class `{class}` names no active pool `{pool}` — a model class \
+                 is the <class> of a declared robot pool (infra/platform/pools/), never a \
+                 model id",
+                a.id
+            )));
+        };
+        if let Some(why) = contradicted_class(a, class, own, &active) {
+            return Ok(Some(why));
+        }
+    }
+    Ok(None)
+}
+
+/// Why a declared seat is refused: the station registry holds no ACTIVE
+/// row of that name (design 506e0a1c car 1, backlog 1a74c2bc) — a draft
+/// or a retired station queues nothing to pull. `Ok(None)` when every
+/// declared seat is held; `Err` when the registry could not answer.
+async fn unknown_station(
+    stations: &dyn StationRegistry,
+    rows: &[AgentInput],
+) -> Result<Option<String>, String> {
+    let active = stations
+        .list_active()
+        .await
+        .map_err(|e| format!("station registry: {e}"))?;
+    Ok(rows.iter().find_map(|a| {
+        let unknown = a
+            .stations
+            .as_deref()?
+            .iter()
+            .find(|seat| !active.iter().any(|s| &s.name == *seat))?;
+        Some(format!(
+            "agent {}: station `{unknown}` is not an active station in the station registry \
+             (GET /api/stations) — an executor is seated only where a station exists; declare \
+             the station first (infra/platform/stations/)",
+            a.id
+        ))
+    }))
+}
+
+/// Why a declared class is contradicted by the pools' `models` lists
+/// (backlog d088c248), or `None` when they agree. The pools that list the
+/// agent's `default_model` must be exactly the class's own; when none
+/// lists it, the class's own pool must list nothing, since a pool that
+/// lists its models and omits this one says this model is not its class.
+/// Pure, over the active rows one read returned.
+fn contradicted_class(
+    a: &AgentInput,
+    class: &str,
+    own: &crate::pools::PoolSpec,
+    active: &[crate::pools::PoolSpec],
+) -> Option<String> {
+    let listing: Vec<&str> = active
+        .iter()
+        .filter(|p| p.name.starts_with(crate::resources::ROBOTS_PREFIX))
+        .filter(|p| p.models.contains(&a.default_model))
+        .map(|p| p.name.as_str())
+        .collect();
+    let agrees = match listing.as_slice() {
+        [] => own.models.is_empty(),
+        [only] => *only == own.name,
+        _ => false,
+    };
+    (!agrees).then(|| {
+        format!(
+            "agent {}: model_class `{class}` disagrees with the pool registry — default_model `{}` \
+             is listed by {}, and `{}` meters {}; a model's class is the robot pool whose \
+             `models` lists it (backlog d088c248), so declare that class or correct the pool row",
+            a.id,
+            a.default_model,
+            if listing.is_empty() {
+                "no active robot pool".to_string()
+            } else {
+                listing.join(" and ")
+            },
+            own.name,
+            if own.models.is_empty() {
+                "no models".to_string()
+            } else {
+                own.models.join(", ")
+            },
+        )
+    })
 }
 
 pub fn router(state: AgentsApiState) -> Router {
@@ -205,6 +356,51 @@ async fn publish(
             Err(why) => return (StatusCode::INTERNAL_SERVER_ERROR, why).into_response(),
         }
     }
+    match (
+        &state.pools,
+        rows.iter().find_map(|a| a.model_class.as_ref()),
+    ) {
+        (_, None) => {}
+        (None, Some(class)) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "no pool registry is wired to this door, so model_class `{class}` cannot be \
+                     checked against an active robot pool and is not recorded"
+                ),
+            )
+                .into_response();
+        }
+        (Some(pools), Some(_)) => match undeclared_model_class(pools.as_ref(), &rows).await {
+            Ok(None) => {}
+            Ok(Some(why)) => return (StatusCode::UNPROCESSABLE_ENTITY, why).into_response(),
+            Err(why) => return (StatusCode::INTERNAL_SERVER_ERROR, why).into_response(),
+        },
+    }
+    // The seats, the same posture as the class: a seat with no registry
+    // to ask is refused, not recorded (design 506e0a1c car 1).
+    match (
+        &state.stations,
+        rows.iter()
+            .find_map(|a| a.stations.as_deref().and_then(<[String]>::first)),
+    ) {
+        (_, None) => {}
+        (None, Some(seat)) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "no station registry is wired to this door, so the seat at station `{seat}` \
+                     cannot be checked against an active station and is not recorded"
+                ),
+            )
+                .into_response();
+        }
+        (Some(stations), Some(_)) => match unknown_station(stations.as_ref(), &rows).await {
+            Ok(None) => {}
+            Ok(Some(why)) => return (StatusCode::UNPROCESSABLE_ENTITY, why).into_response(),
+            Err(why) => return (StatusCode::INTERNAL_SERVER_ERROR, why).into_response(),
+        },
+    }
     // Same envelope construction as the credentials door: the actor
     // the request signed with rides as `_actor` (and is named again
     // as `declared_by` on each inserted row's fact), the stamp is
@@ -214,9 +410,36 @@ async fn publish(
         .ambient_actor()
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
     let stamp = boss_core::publisher::EventStamp::new("jobs", actor);
-    match state.registry.publish(&rows, mode, &stamp).await {
-        Ok(out) => Json(out).into_response(),
-        Err(e) => err_response(e),
+    let mut out = match state.registry.publish(&rows, mode, &stamp).await {
+        Ok(out) => out,
+        Err(e) => return err_response(e),
+    };
+    // WHICH OF THESE ROBOTS NO MODEL STEP REACHES (backlog 3317f4db):
+    // each declared row that records no class once the batch is applied,
+    // read back — under the default a kept row keeps the class it holds
+    // whatever the declaration omits. The batch has landed, so a read
+    // that fails says so beside what landed rather than answer a clean
+    // list nobody read.
+    match state.registry.list().await {
+        Ok(held) => {
+            out.no_model_class = rows
+                .iter()
+                .filter(|a| held.iter().any(|h| h.id == a.id && h.model_class.is_none()))
+                .map(|a| a.id.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            Json(out).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "the batch landed ({}), but the registry could not be read back to name the \
+                 robots that record no model class: {e}",
+                out.summary()
+            ),
+        )
+            .into_response(),
     }
 }
 
@@ -296,6 +519,8 @@ mod tests {
             registry: registry.clone() as Arc<dyn AgentsRegistry>,
             classes: None,
             departments: None,
+            pools: None,
+            stations: None,
         })
     }
 
@@ -333,6 +558,8 @@ mod tests {
                     retired: false,
                 },
             ))),
+            pools: None,
+            stations: None,
         })
     }
 
@@ -669,6 +896,398 @@ mod tests {
         );
     }
 
+    /// The door with the pool registry wired: `robots:opus` active,
+    /// and no pool for any other class.
+    async fn app_with_pools(registry: &Arc<InMemoryAgents>) -> Router {
+        use crate::pools::{InMemoryPools, PoolRegistry, PoolSpec};
+        let pools = Arc::new(InMemoryPools::default());
+        let spec: PoolSpec = serde_json::from_value(json!({
+            "name": "robots:opus", "version": 1, "status": "active",
+            "unit": "slot", "kind": "flow", "capacity": { "state": "unknown" },
+        }))
+        .unwrap();
+        pools
+            .publish_declared(
+                spec,
+                &boss_core::actor::ActorId::Automation("test".into()),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        router(AgentsApiState {
+            registry: registry.clone() as Arc<dyn AgentsRegistry>,
+            classes: None,
+            departments: None,
+            pools: Some(pools as Arc<dyn PoolRegistry>),
+            stations: None,
+        })
+    }
+
+    /// A robot's model class is the `<class>` of an active
+    /// `robots:<class>` pool (factory taxonomy T2d, backlog
+    /// 06d8988b): a declared class the pool registry holds lands and
+    /// reads back; one it does not hold refuses the WHOLE batch, 422,
+    /// naming the agent, the class and the pool it lacks, and nothing
+    /// lands; and a door with no pool registry to ask refuses a declared
+    /// class rather than recording one nobody checked — no evidence is
+    /// not a pass. A declaration naming no class needs no pool.
+    #[tokio::test]
+    async fn a_model_class_is_checked_against_the_active_pools_at_the_door() {
+        let registry = Arc::new(InMemoryAgents::new());
+        let mut declared = batch();
+        declared[0]["model_class"] = json!("opus");
+        let (status, body) = send(
+            app_with_pools(&registry).await,
+            "POST",
+            "/api/agents/batch",
+            Some(declared.clone()),
+            seed(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, body) = send(app(&registry), "GET", "/api/agents", None, probe_reader()).await;
+        let listing: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(listing["data"][0]["model_class"], "opus", "{listing}");
+
+        let mut unpooled = declared.clone();
+        unpooled[0]["model_class"] = json!("haiku");
+        let (status, body) = send(
+            app_with_pools(&registry).await,
+            "POST",
+            "/api/agents/batch?mode=take",
+            Some(unpooled.clone()),
+            seed(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(
+            body.contains("agent-claude") && body.contains("robots:haiku"),
+            "{body}"
+        );
+        assert_eq!(
+            registry.list().await.unwrap()[0].model_class.as_deref(),
+            Some("opus"),
+            "a refused batch lands nothing"
+        );
+
+        // Nothing to ask: a declared class is refused, a bare row lands.
+        let (status, body) = send(
+            app(&registry),
+            "POST",
+            "/api/agents/batch?mode=take",
+            Some(declared),
+            seed(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains("opus") && body.contains("pool"), "{body}");
+        let (status, body) = send(
+            app(&Arc::new(InMemoryAgents::new())),
+            "POST",
+            "/api/agents/batch",
+            Some(batch()),
+            seed(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// The door with the station registry wired: `landed-review` and
+    /// `design-review` active, `retired-bench` retired, and no `build`.
+    fn app_with_stations(registry: &Arc<InMemoryAgents>) -> Router {
+        use crate::stations::{InMemoryStations, StationRegistry, StationSpec};
+        let stations = InMemoryStations::new();
+        for (name, status) in [
+            ("landed-review", "active"),
+            ("design-review", "active"),
+            ("retired-bench", "retired"),
+        ] {
+            let spec: StationSpec = serde_json::from_value(json!({
+                "name": name, "version": 1, "status": status, "title": name,
+                "kind": "group", "predicate": {}, "created_at": "2026-11-09T00:00:00Z",
+            }))
+            .unwrap();
+            stations.seed(spec).unwrap();
+        }
+        router(AgentsApiState {
+            registry: registry.clone() as Arc<dyn AgentsRegistry>,
+            classes: None,
+            departments: None,
+            pools: None,
+            stations: Some(Arc::new(stations) as Arc<dyn StationRegistry>),
+        })
+    }
+
+    /// AN EXECUTOR IS SEATED AT STATIONS THAT EXIST (design 506e0a1c car
+    /// 1, backlog 1a74c2bc). Seats the station registry holds active land
+    /// and read back in the order declared; a seat at a station it does
+    /// not hold — `build`, which no row declares yet, or a retired one —
+    /// refuses the WHOLE batch, 422, naming the agent and the station,
+    /// and nothing lands; a door with no station registry to ask refuses
+    /// a declared seat rather than record one nobody checked (no evidence
+    /// is not a pass). Under take, a declaration that names no seats
+    /// keeps the held ones, and `[]` unseats, naming the change.
+    #[tokio::test]
+    async fn a_seat_is_checked_against_the_active_stations_at_the_door() {
+        let registry = Arc::new(InMemoryAgents::new());
+        let mut seated = batch();
+        seated[0]["stations"] = json!(["landed-review", "design-review"]);
+        let (status, body) = send(
+            app_with_stations(&registry),
+            "POST",
+            "/api/agents/batch",
+            Some(seated.clone()),
+            seed(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, body) = send(app(&registry), "GET", "/api/agents", None, probe_reader()).await;
+        let listing: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            listing["data"][0]["stations"],
+            json!(["landed-review", "design-review"]),
+            "{listing}"
+        );
+
+        for unknown in ["build", "retired-bench"] {
+            let mut bad = seated.clone();
+            bad[0]["stations"] = json!(["landed-review", unknown]);
+            let (status, body) = send(
+                app_with_stations(&registry),
+                "POST",
+                "/api/agents/batch?mode=take",
+                Some(bad),
+                seed(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{unknown}: {body}"
+            );
+            assert!(
+                body.contains("agent-claude") && body.contains(&format!("`{unknown}`")),
+                "names the agent and the station: {body}"
+            );
+            assert_eq!(
+                registry.list().await.unwrap()[0].stations,
+                ["landed-review", "design-review"],
+                "a refused batch lands nothing"
+            );
+        }
+
+        // Nothing to ask: a declared seat is refused, 503.
+        let (status, body) = send(
+            app(&registry),
+            "POST",
+            "/api/agents/batch?mode=take",
+            Some(seated),
+            seed(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            body.contains("landed-review") && body.contains("station"),
+            "{body}"
+        );
+
+        // Omission keeps the seats, even under take; `[]` unseats and
+        // needs no registry, since it names no station to check.
+        let (status, body) = send(
+            app(&registry),
+            "POST",
+            "/api/agents/batch?mode=take",
+            Some(batch()),
+            seed(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            registry.list().await.unwrap()[0].stations,
+            ["landed-review", "design-review"],
+            "a declaration that names no seats unseats nobody"
+        );
+        let mut unseat = batch();
+        unseat[0]["stations"] = json!([]);
+        let (status, body) = send(
+            app(&registry),
+            "POST",
+            "/api/agents/batch?mode=take",
+            Some(unseat),
+            seed(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("stations"), "the change is named: {body}");
+        assert!(registry.list().await.unwrap()[0].stations.is_empty());
+    }
+
+    /// The door with the two model-slot pools wired, each listing the
+    /// model ids it meters (`PoolSpec::models`, backlog af5dd547).
+    async fn app_with_model_pools(
+        registry: &Arc<InMemoryAgents>,
+        listed: &[(&str, &[&str])],
+    ) -> Router {
+        use crate::pools::{InMemoryPools, PoolRegistry, PoolSpec};
+        let pools = Arc::new(InMemoryPools::default());
+        for (name, models) in listed {
+            let spec: PoolSpec = serde_json::from_value(json!({
+                "name": name, "version": 1, "status": "active",
+                "unit": "slot", "kind": "flow", "capacity": { "state": "unknown" },
+                "models": models,
+            }))
+            .unwrap();
+            pools
+                .publish_declared(
+                    spec,
+                    &boss_core::actor::ActorId::Automation("test".into()),
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap();
+        }
+        router(AgentsApiState {
+            registry: registry.clone() as Arc<dyn AgentsRegistry>,
+            classes: None,
+            departments: None,
+            pools: Some(pools as Arc<dyn PoolRegistry>),
+            stations: None,
+        })
+    }
+
+    /// THE MODEL-TO-CLASS FACT CANNOT DISAGREE WITH ITSELF (backlog
+    /// d088c248; CLAUDE.md 9a). An agents row says default_model ->
+    /// model_class, and since af5dd547 a model-slot pool says class ->
+    /// models, which is what a `from-run` bill reads a run's class by. A
+    /// declared class that a pool contradicts is refused, 422, naming the
+    /// agent, its model and every pool involved, and nothing lands: the
+    /// model listed by ANOTHER class's pool, or the class's own pool
+    /// listing models that do not include it. A class pool that lists no
+    /// models says nothing about the model, so the declaration stands as
+    /// before (every live pool until 35e9babf item 5 publishes).
+    #[tokio::test]
+    async fn a_declared_class_a_pool_contradicts_is_refused_naming_agent_and_pool() {
+        let listed: &[(&str, &[&str])] = &[
+            ("robots:opus", &["opus-5-5", "opus-5[1m]"]),
+            ("robots:sol", &["gpt-6.1-sol"]),
+        ];
+        let registry = Arc::new(InMemoryAgents::new());
+        let mut wrong = batch();
+        wrong[0]["model_class"] = json!("sol");
+        let (status, body) = send(
+            app_with_model_pools(&registry, listed).await,
+            "POST",
+            "/api/agents/batch",
+            Some(wrong),
+            seed(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        for named in ["agent-claude", "opus-5[1m]", "robots:opus", "robots:sol"] {
+            assert!(body.contains(named), "names {named}: {body}");
+        }
+        assert!(registry.list().await.unwrap().is_empty(), "nothing lands");
+
+        // The class's own pool lists models, and not this one.
+        let only_55: &[(&str, &[&str])] = &[("robots:opus", &["opus-5-5"])];
+        let mut unlisted = batch();
+        unlisted[0]["model_class"] = json!("opus");
+        let (status, body) = send(
+            app_with_model_pools(&registry, only_55).await,
+            "POST",
+            "/api/agents/batch",
+            Some(unlisted.clone()),
+            seed(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        for named in ["agent-claude", "opus-5[1m]", "robots:opus", "opus-5-5"] {
+            assert!(body.contains(named), "names {named}: {body}");
+        }
+
+        // Agreement lands, and a class pool listing nothing judges nothing.
+        let (status, body) = send(
+            app_with_model_pools(&registry, listed).await,
+            "POST",
+            "/api/agents/batch",
+            Some(unlisted.clone()),
+            seed(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = send(
+            app_with_model_pools(&Arc::new(InMemoryAgents::new()), &[("robots:opus", &[])]).await,
+            "POST",
+            "/api/agents/batch",
+            Some(unlisted),
+            seed(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// A ROBOT WITH NO CLASS IS NAMED, NOT SILENT (backlog 3317f4db). A
+    /// `model:<class>` step is claimed — and, since this item, nominated
+    /// — only by the class an agents row records, so a row recording
+    /// none is a robot no such step will ever reach. Every live robot
+    /// stood that way after T2d (read 2026-11-05: agent-claude,
+    /// agent-claude-b, agent-codex all `model_class: null`). The batch
+    /// is NOT refused for it: a class is the `<class>` of a declared
+    /// robot pool and agent-codex runs `gpt-6.1-sol`, which none
+    /// declares, so a refusal would refuse every tenant batch carrying
+    /// it. The answer names each declared row that records no class
+    /// once the batch is applied — read back from the registry, so a
+    /// kept row that already holds a class is not named for a
+    /// declaration that omits the key.
+    #[tokio::test]
+    async fn a_batch_names_each_robot_that_records_no_model_class() {
+        let registry = Arc::new(InMemoryAgents::new());
+        let mut declared = batch();
+        declared[0]["model_class"] = json!("opus");
+        declared.as_array_mut().unwrap().push(json!({
+            "id": "agent-codex", "display_name": "Codex", "default_model": "opus-5"
+        }));
+        let (status, body) = send(
+            app_with_pools(&registry).await,
+            "POST",
+            "/api/agents/batch",
+            Some(declared.clone()),
+            seed(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let out: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(out["no_model_class"], json!(["agent-codex"]), "{out}");
+
+        // The default keeps a held row: declaring agent-claude without a
+        // class leaves its `opus`, so only the row recording none is named.
+        let (status, body) = send(
+            app_with_pools(&registry).await,
+            "POST",
+            "/api/agents/batch",
+            Some(batch()),
+            seed(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let out: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(out["no_model_class"], json!([]), "{out}");
+
+        // A take that declares the class clears the name.
+        declared[1]["model_class"] = json!("opus");
+        let (status, body) = send(
+            app_with_pools(&registry).await,
+            "POST",
+            "/api/agents/batch?mode=take",
+            Some(declared),
+            seed(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let out: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(out["no_model_class"], json!([]), "{out}");
+    }
+
     /// A bad declaration refuses the WHOLE batch, 422, naming the row;
     /// nothing lands.
     #[tokio::test]
@@ -735,6 +1354,8 @@ mod tests {
             role: "platform-admin".into(),
             description: "the dispatcher".into(),
             signs_for: Some("automation:rule:".into()),
+            access_tier: None,
+            station: None,
         };
         let stamp = boss_core::publisher::EventStamp::new(
             "jobs",

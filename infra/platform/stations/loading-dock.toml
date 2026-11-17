@@ -10,26 +10,65 @@
 # seed`, and migrations newer than the cutover stamp in
 # infra/lint/migrations-declare-schema-only.sh declare schema only.
 #
-# WIP limit 24 = two full trains (David, 2026-08-15) — ADVISORY, never
-# enforced: the queue envelope reports `over_limit`, lenses warn.
+# Version 8 retires the advisory WIP limit. Allocation and bays remain
+# the admission constraints.
 # `metadata_unmarked = ["hold"]` reads the marker the way the whole
 # system reads markers (`stranded::marked`): a hold released by writing
 # `hold = false` is released here too, which `metadata_absent` would
-# have got wrong. The FEEDBACK upstream is where a dock that is emptier
-# than expected is diagnosed: at triage, one click up.
+# have got wrong. (A FEEDBACK upstream to triage stood here until
+# version 9, which derives the walk upstream from the tree instead.)
 #
 # To change this station, bump `version` — the seed refuses a row that
 # differs from the live active row of the same (name, version).
+#
+# Version 5 (item 0a78f8f8, factory taxonomy M2 and its Q1, decided
+# 2026-11-02; bumped from the LIVE newest, v4): kind batch -> equipment.
+# A batch station is an equipment station whose automaton's program is
+# a cadence, so the dock names the automaton that operates it — the
+# train conductor, which boards it — and its bays: ONE, because one
+# train boards at a time. Membership, discipline and the advisory WIP
+# limit are unchanged.
+#
+# Version 6 (pass item 4 of design ccfe87ff, backlog 1bb8c479; bumped
+# from the LIVE newest, v5): the station declares its edges. A car that
+# leaves the dock rides its train, and once the train merges the same
+# car stands at the probe shed and at landed-review: ship-a-change's
+# `proven` and `landed-review` steps are both ready on `steps.review.done
+# AND job.metadata.merged = "true"` (infra/platform/workflows/
+# ship-a-change.toml), and the hand-off `cadence:train-reconcile`,
+# pr-train@merged to ship-a-change@proven, writes that merged mark
+# (infra/platform/yard/handoffs.toml). Nothing else changed.
+#
+# Version 7 (T2 of design 4b27a65a, backlog 3f58c823; bumped from the
+# LIVE newest, v6): the station stands in the tree — its stable `id`, its
+# `parent` /algedonic/engineering (the dock), its mode, and its seats,
+# the same number as its bays (one train boards at a time; the advisory
+# WIP limit of 24 is unchanged). Nothing else changed.
+#
+# Version 9 (backlog a1c0a0ff, design deba3000; bumped from the tree's
+# v8): the hand-typed `[station.upstream]` is gone. It named a /system
+# route the IT consolidation retired on 2026-08-31, so the walk upstream
+# led to a not-found page. A station's upstream is now DERIVED from the
+# tree, as its parent station's page (`upstreamOf` in
+# apps/web/src/it/tree/station-page.ts), and the seed refuses a declared
+# one. The retired department label is removed with its floor reader
+# (backlog aa82eb11); the station's parent places it in the tree.
 # ---------------------------------------------------------------------------
 
 [[station]]
 name = "loading-dock"
-version = 3
+version = 10
+id = "22b829b6-30d0-42b4-acf4-85617326aa89"
+parent = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5"
+mode = "standing"
+capacity = 1
 status = "active"
 title = "Loading dock — parked ship-a-change cars"
-kind = "batch"
+kind = "equipment"
+automaton = "automation:train-conductor"
+bays = 1
 discipline = ["priority", "age"]
-wip_limit = 24
+edges = ["probe-shed", "landed-review"]
 
 [station.predicate]
 kind = "ship-a-change"
@@ -41,7 +80,3 @@ metadata_absent = ["train"]
 slug = "review"
 status_in = ["ready", "active"]
 metadata_unmarked = ["hold"]
-
-[station.upstream]
-label = "FEEDBACK"
-href = "/system/feedback"

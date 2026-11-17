@@ -35,8 +35,9 @@
 //! migrations seed no sensor, and both adapters start empty.
 
 use boss_jobs::sensors::{
-    BatchOutcome, InMemorySensors, NewReading, PgSensors, PollStamp, Reading, ReadingsWindow,
-    SensorInput, SensorRow, Sensors, SensorsError,
+    BatchOutcome, InMemorySensors, NewReading, PgSensors, PollRefusalClasses, PollRefusals,
+    PollStamp, Reading, ReadingsWindow, RefusedMessage, SensorInput, SensorRow, Sensors,
+    SensorsError,
 };
 use chrono::{DateTime, TimeZone, Utc};
 
@@ -62,6 +63,12 @@ boss_testing::adapters_agree! {
         a_window_on_no_sensor_is_refused_not_zero,
         a_poll_stamp_moves_the_cursor_only_forward,
         a_poll_stamp_on_no_sensor_is_refused,
+        poll_refusals_are_atomic_listed_and_concurrently_merged,
+        processed_cursor_witnesses_merge_and_expire_only_behind_the_cursor,
+        invalid_processed_witnesses_refuse_without_changing_the_poll,
+        a_latched_poll_requires_explicit_measured_clearing,
+        a_latched_poll_cannot_erase_a_witness_at_the_cursor,
+        a_mixed_class_summary_round_trips_and_clears_without_erasing_permanent_keys,
         the_sweep_keeps_what_is_owed_and_ages_out_the_rest,
     }
 }
@@ -163,6 +170,7 @@ async fn a_publish_is_insert_if_absent_and_keeps_the_held_row<S: Sensors>(s: &S,
         &PollStamp {
             polled_at: at(10, 0),
             cursor_at: Some(at(9, 0)),
+            refused: None,
         },
     )
     .await
@@ -205,6 +213,7 @@ async fn a_publish_is_insert_if_absent_and_keeps_the_held_row<S: Sensors>(s: &S,
                 published_at: at(0, 0),
                 last_polled_at: Some(at(10, 0)),
                 cursor_at: Some(at(9, 0)),
+                refused: None,
             },
             SensorRow {
                 id: "suite-b".into(),
@@ -219,6 +228,7 @@ async fn a_publish_is_insert_if_absent_and_keeps_the_held_row<S: Sensors>(s: &S,
                 published_at: at(0, 0),
                 last_polled_at: None,
                 cursor_at: None,
+                refused: None,
             },
         ],
         "{adapter}"
@@ -505,6 +515,7 @@ async fn a_poll_stamp_moves_the_cursor_only_forward<S: Sensors>(s: &S, adapter: 
             &PollStamp {
                 polled_at,
                 cursor_at,
+                refused: None,
             },
         )
         .await
@@ -518,6 +529,493 @@ async fn a_poll_stamp_moves_the_cursor_only_forward<S: Sensors>(s: &S, adapter: 
     }
 }
 
+fn refusal(key: &str) -> RefusedMessage {
+    RefusedMessage {
+        message_key: key.into(),
+        size_bytes: 42,
+        limit: boss_jobs::sensors::RefusalLimit::bytes(20, 42),
+        reason: "readings_post_413".into(),
+        at: at(10, 0),
+    }
+}
+
+async fn processed_cursor_witnesses_merge_and_expire_only_behind_the_cursor<S: Sensors>(
+    s: &S,
+    adapter: &str,
+) {
+    use boss_jobs::sensors::CursorWitness;
+    declare(s, &[polled("suite-processed")]).await;
+    let stamp = |key: &str, instant| PollStamp {
+        polled_at: at(11, 0),
+        cursor_at: Some(instant),
+        refused: Some(PollRefusals {
+            processed: vec![CursorWitness {
+                message_key: key.into(),
+                at: instant,
+            }],
+            entries: vec![],
+            truncated: 0,
+            cleared: None,
+            classes: None,
+        }),
+    };
+    s.mark_polled("suite-processed", &stamp("a", at(10, 0)))
+        .await
+        .unwrap();
+    assert_eq!(
+        list(s).await[0].refused.as_ref().unwrap().processed,
+        vec![CursorWitness {
+            message_key: "a".into(),
+            at: at(10, 0)
+        }],
+        "{adapter}"
+    );
+    let a = stamp("b", at(10, 0));
+    let b = stamp("c", at(10, 0));
+    let (a, b) = tokio::join!(
+        s.mark_polled("suite-processed", &a),
+        s.mark_polled("suite-processed", &b)
+    );
+    a.unwrap();
+    b.unwrap();
+    let keys = list(s).await[0]
+        .refused
+        .as_ref()
+        .unwrap()
+        .processed
+        .iter()
+        .map(|w| w.message_key.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        vec!["a", "b", "c"],
+        "{adapter}: concurrent marks conserve both witness sets"
+    );
+    s.mark_polled(
+        "suite-processed",
+        &PollStamp {
+            polled_at: at(11, 1),
+            cursor_at: Some(at(10, 0)),
+            refused: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        list(s).await[0].refused.as_ref().unwrap().processed.len(),
+        3,
+        "{adapter}"
+    );
+    s.mark_polled("suite-processed", &stamp("new", at(10, 1)))
+        .await
+        .unwrap();
+    assert_eq!(
+        list(s).await[0].refused.as_ref().unwrap().processed,
+        vec![CursorWitness {
+            message_key: "new".into(),
+            at: at(10, 1)
+        }],
+        "{adapter}: only strictly older cursor keys expire"
+    );
+}
+
+async fn invalid_processed_witnesses_refuse_without_changing_the_poll<S: Sensors>(
+    s: &S,
+    adapter: &str,
+) {
+    use boss_jobs::sensors::CursorWitness;
+    declare(s, &[polled("suite-invalid-processed")]).await;
+    let before = list(s).await;
+    for processed in [
+        (0..65)
+            .map(|i| CursorWitness {
+                message_key: i.to_string(),
+                at: at(10, 0),
+            })
+            .collect(),
+        vec![
+            CursorWitness {
+                message_key: "a".into(),
+                at: at(10, 0)
+            };
+            2
+        ],
+        vec![CursorWitness {
+            message_key: "bad\0".into(),
+            at: at(10, 0),
+        }],
+        vec![CursorWitness {
+            message_key: "future".into(),
+            at: at(10, 1),
+        }],
+    ] {
+        let result = s
+            .mark_polled(
+                "suite-invalid-processed",
+                &PollStamp {
+                    polled_at: at(11, 0),
+                    cursor_at: Some(at(10, 0)),
+                    refused: Some(PollRefusals {
+                        processed,
+                        entries: vec![],
+                        truncated: 0,
+                        cleared: None,
+                        classes: None,
+                    }),
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(SensorsError::BadRequest(_))),
+            "{adapter}: {result:?}"
+        );
+        assert_eq!(
+            list(s).await,
+            before,
+            "{adapter}: clock/cursor/witness remain atomic"
+        );
+    }
+}
+
+async fn a_latched_poll_cannot_erase_a_witness_at_the_cursor<S: Sensors>(s: &S, adapter: &str) {
+    declare(s, &[polled("suite-kept-witness")]).await;
+    s.mark_polled(
+        "suite-kept-witness",
+        &PollStamp {
+            polled_at: at(10, 0),
+            cursor_at: Some(at(10, 0)),
+            refused: Some(PollRefusals {
+                processed: Vec::new(),
+                entries: vec![refusal("old")],
+                truncated: 0,
+                cleared: None,
+                classes: None,
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    s.mark_polled(
+        "suite-kept-witness",
+        &PollStamp {
+            polled_at: at(10, 15),
+            cursor_at: None,
+            refused: Some(PollRefusals {
+                processed: Vec::new(),
+                entries: vec![refusal("new")],
+                truncated: 1,
+                cleared: None,
+                classes: None,
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    let row = list(s)
+        .await
+        .into_iter()
+        .find(|r| r.id == "suite-kept-witness")
+        .unwrap();
+    assert!(
+        row.refused
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .any(|e| e.message_key == "old"),
+        "{adapter}: a latch cannot erase a previously witnessed cursor key"
+    );
+    s.mark_polled(
+        "suite-kept-witness",
+        &PollStamp {
+            polled_at: at(10, 30),
+            cursor_at: None,
+            refused: Some(PollRefusals {
+                processed: Vec::new(),
+                entries: vec![],
+                truncated: 0,
+                cleared: Some("remeasured: source window empty".into()),
+                classes: None,
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    let row = list(s)
+        .await
+        .into_iter()
+        .find(|r| r.id == "suite-kept-witness")
+        .unwrap();
+    assert!(
+        row.refused
+            .unwrap()
+            .entries
+            .iter()
+            .any(|e| e.message_key == "old"),
+        "{adapter}: source absence at the cursor cannot erase a witnessed refusal"
+    );
+    s.mark_polled(
+        "suite-kept-witness",
+        &PollStamp {
+            polled_at: at(10, 45),
+            cursor_at: Some(at(10, 1)),
+            refused: None,
+        },
+    )
+    .await
+    .unwrap();
+    let row = list(s)
+        .await
+        .into_iter()
+        .find(|r| r.id == "suite-kept-witness")
+        .unwrap();
+    assert!(
+        row.refused.is_none_or(|w| w.entries.is_empty()),
+        "{adapter}: only strictly behind the cursor may be evicted"
+    );
+}
+
+async fn a_mixed_class_summary_round_trips_and_clears_without_erasing_permanent_keys<S: Sensors>(
+    s: &S,
+    adapter: &str,
+) {
+    declare(s, &[polled("suite-mixed-wrapper")]).await;
+    let permanent = refusal("permanent");
+    let summary = PollRefusalClasses {
+        source_count: 257,
+        permanent_413_count: 1,
+        union_count: None,
+    };
+    s.mark_polled(
+        "suite-mixed-wrapper",
+        &PollStamp {
+            polled_at: at(10, 0),
+            cursor_at: Some(at(10, 0)),
+            refused: Some(PollRefusals {
+                processed: Vec::new(),
+                entries: vec![permanent.clone()],
+                truncated: 0,
+                cleared: None,
+                classes: Some(summary.clone()),
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    let before = list(s)
+        .await
+        .into_iter()
+        .find(|r| r.id == "suite-mixed-wrapper")
+        .unwrap();
+    assert_eq!(
+        before.refused.as_ref().unwrap().classes,
+        Some(summary),
+        "{adapter}: preserve exact class counts and UNKNOWN union"
+    );
+    assert!(
+        before.refused.as_ref().unwrap().is_latched(),
+        "{adapter}: UNKNOWN is not a measured zero"
+    );
+    s.mark_polled(
+        "suite-mixed-wrapper",
+        &PollStamp {
+            polled_at: at(10, 15),
+            cursor_at: None,
+            refused: Some(PollRefusals {
+                processed: Vec::new(),
+                entries: vec![permanent.clone()],
+                truncated: 0,
+                cleared: Some("source certified readable; permanent key remains witnessed".into()),
+                classes: None,
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    let row = list(s)
+        .await
+        .into_iter()
+        .find(|r| r.id == "suite-mixed-wrapper")
+        .unwrap();
+    assert_eq!(row.cursor_at, before.cursor_at, "{adapter}");
+    let witness = row.refused.unwrap();
+    assert_eq!(
+        witness.entries,
+        vec![permanent],
+        "{adapter}: measured source clearing retains permanent boundary keys"
+    );
+    assert!(
+        witness.classes.is_none() && !witness.is_latched(),
+        "{adapter}"
+    );
+}
+
+async fn poll_refusals_are_atomic_listed_and_concurrently_merged<S: Sensors>(s: &S, adapter: &str) {
+    declare(s, &[polled("suite-refused")]).await;
+    let stamp = |key: &str| PollStamp {
+        polled_at: at(10, 15),
+        cursor_at: Some(at(10, 0)),
+        refused: Some(PollRefusals {
+            processed: Vec::new(),
+            classes: None,
+            entries: vec![refusal(key)],
+            truncated: 0,
+            cleared: None,
+        }),
+    };
+    let a = stamp("a");
+    let b = stamp("b");
+    let (a, b) = tokio::join!(
+        s.mark_polled("suite-refused", &a),
+        s.mark_polled("suite-refused", &b)
+    );
+    a.unwrap();
+    b.unwrap();
+    let before = list(s)
+        .await
+        .into_iter()
+        .find(|r| r.id == "suite-refused")
+        .unwrap();
+    assert_eq!(
+        before
+            .refused
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.message_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "b"],
+        "{adapter}"
+    );
+    let mut conflict = stamp("a");
+    conflict.polled_at = at(11, 0);
+    conflict.cursor_at = Some(at(11, 0));
+    // Conflicting same-boundary evidence must fail atomically, rather than
+    // merely failing after moving the poll clock or source cursor.
+    conflict.cursor_at = Some(at(10, 0));
+    conflict.refused.as_mut().unwrap().entries[0].size_bytes = 99;
+    assert!(
+        s.mark_polled("suite-refused", &conflict).await.is_err(),
+        "{adapter}"
+    );
+    assert_eq!(
+        list(s)
+            .await
+            .into_iter()
+            .find(|r| r.id == "suite-refused")
+            .unwrap(),
+        before,
+        "{adapter}"
+    );
+    let mut invalid = stamp("c");
+    invalid.refused.as_mut().unwrap().entries =
+        (0..65).map(|i| refusal(&format!("key{i}"))).collect();
+    assert!(
+        s.mark_polled("suite-refused", &invalid).await.is_err(),
+        "{adapter}"
+    );
+    assert_eq!(
+        list(s)
+            .await
+            .into_iter()
+            .find(|r| r.id == "suite-refused")
+            .unwrap(),
+        before,
+        "{adapter}"
+    );
+    s.mark_polled(
+        "suite-refused",
+        &PollStamp {
+            polled_at: at(10, 30),
+            cursor_at: Some(at(10, 0)),
+            refused: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        list(s)
+            .await
+            .into_iter()
+            .find(|r| r.id == "suite-refused")
+            .unwrap()
+            .refused,
+        before.refused,
+        "{adapter}"
+    );
+}
+
+async fn a_latched_poll_requires_explicit_measured_clearing<S: Sensors>(s: &S, adapter: &str) {
+    declare(s, &[polled("suite-latched")]).await;
+    let latch = PollRefusals {
+        processed: Vec::new(),
+        classes: None,
+        entries: vec![refusal("a")],
+        truncated: 3,
+        cleared: None,
+    };
+    s.mark_polled(
+        "suite-latched",
+        &PollStamp {
+            polled_at: at(10, 0),
+            cursor_at: None,
+            refused: Some(latch.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    s.mark_polled(
+        "suite-latched",
+        &PollStamp {
+            polled_at: at(10, 15),
+            cursor_at: None,
+            refused: None,
+        },
+    )
+    .await
+    .unwrap();
+    let before = list(s)
+        .await
+        .into_iter()
+        .find(|r| r.id == "suite-latched")
+        .unwrap();
+    assert_eq!(before.refused, Some(latch), "{adapter}");
+    let mut clear = PollStamp {
+        polled_at: at(10, 30),
+        cursor_at: None,
+        refused: Some(PollRefusals {
+            processed: Vec::new(),
+            classes: None,
+            entries: vec![],
+            truncated: 0,
+            cleared: None,
+        }),
+    };
+    assert!(
+        s.mark_polled("suite-latched", &clear).await.is_err(),
+        "{adapter}"
+    );
+    assert_eq!(
+        list(s)
+            .await
+            .into_iter()
+            .find(|r| r.id == "suite-latched")
+            .unwrap(),
+        before,
+        "{adapter}"
+    );
+    clear.refused.as_mut().unwrap().cleared = Some("remeasured: no refused keys remain".into());
+    s.mark_polled("suite-latched", &clear).await.unwrap();
+    let row = list(s)
+        .await
+        .into_iter()
+        .find(|r| r.id == "suite-latched")
+        .unwrap();
+    assert_eq!(row.cursor_at, None, "{adapter}");
+    assert!(row.refused.unwrap().cleared.is_some(), "{adapter}");
+}
+
 /// A poll stamp on a sensor the registry does not hold is
 /// `UnknownSensor`, not an update of nothing.
 async fn a_poll_stamp_on_no_sensor_is_refused<S: Sensors>(s: &S, adapter: &str) {
@@ -527,6 +1025,7 @@ async fn a_poll_stamp_on_no_sensor_is_refused<S: Sensors>(s: &S, adapter: &str) 
             &PollStamp {
                 polled_at: at(10, 0),
                 cursor_at: None,
+                refused: None,
             },
         )
         .await

@@ -83,7 +83,11 @@ pub fn station_claim(
     .map_err(|error| error.to_string())?;
     let step: boss_core::job::Step = serde_json::from_value(
         receipt
-            .get("claimed_step")
+            .get(if ev.kind == crate::events::STATION_RESOURCE_REFUSED {
+                "refused_step"
+            } else {
+                "claimed_step"
+            })
             .cloned()
             .ok_or("station claim lacks claimed state")?,
     )
@@ -114,8 +118,17 @@ pub fn station_claim(
         || selected_at.timestamp_micros() != ev.ts.timestamp_micros()
         || receipt.pointer("/selected/step_id") != Some(&serde_json::json!(step.id))
         || receipt.pointer("/selected/job_id") != Some(&serde_json::json!(step.job_id))
-        || step.status != boss_core::job::StepStatus::Active
-        || step.assignee_id.as_deref() != receipt.get("actor").and_then(serde_json::Value::as_str)
+        || (if ev.kind == crate::events::STATION_RESOURCE_REFUSED {
+            receipt["outcome"] != "resource-refused"
+                || receipt.get("claimed_step").is_some()
+                || step.metadata.pointer("/waiting_on/resource") != receipt.pointer("/refusal/pool")
+                || step.metadata.pointer("/waiting_on/reason") != receipt.pointer("/refusal/reason")
+        } else {
+            receipt.get("outcome").is_some()
+                || step.status != boss_core::job::StepStatus::Active
+                || step.assignee_id.as_deref()
+                    != receipt.get("actor").and_then(serde_json::Value::as_str)
+        })
     {
         return Err(
             "station selection receipt disagrees with its immutable event or owned step".into(),

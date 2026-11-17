@@ -1,0 +1,54 @@
+# An owed proof that does not prove files loudly (backlog b9005734,
+# approved by David 2026-09-24: the obligation "re-runs the probe when
+# the event fires and files loudly if it fails").
+#
+# WHY A RULE IS NEEDED AT ALL. A car that closed LANDED with its proof
+# owed (`metadata.proof_owed = "true"`) is off every surface that reads
+# open cars: the shed counts cars standing at `proven`, and
+# recheck-failing-probes-hourly reads open cars only. When the event it
+# declared fires, rerun-owed-proofs-on-job-closed files the forge's
+# probe run, and the forge door (`boss prove --from-car --unattended`)
+# writes the verdict on the CLOSED car — a pass as `proof_owed =
+# "paid"`, anything else as `proof_attempt` with the proof still owed.
+# Until this rule nothing read the second kind. A false proof would
+# have sat on a closed packet, which is the silent failure the
+# correctness protocol forbids, from the day the exit that closes such
+# a car is published (still owed by the plan; see the header of
+# rerun-owed-proofs-on-job-closed).
+#
+# THE TRIGGER IS THE CAR'S OWN ATTEMPT. The forge door writes
+# `proof_attempt` through the job metadata door, whose
+# `jobs.job.updated` carries the whole post-merge row, so the verdict
+# is in the payload and no read is needed to judge it. `not_yet =
+# false` is every attempt that is not a wait: the probe judged the
+# claim false, crashed, or could not run for a tool the forge lacks —
+# none of which anything retries on a closed car. A not-yet stays
+# quiet: the obligation is still waiting for its event, as designed.
+# A paid debt reads `proof_owed = "paid"`, so it never matches; nor
+# does an open car, which the shed already shows red; nor a car
+# disproved or unlanded since, whose own terminal said what happened.
+#
+# ONCE PER OPEN ITEM. `NOT open_job_exists` keys on the car's subject
+# (its branch), the subject the item is filed about, so a later write
+# to the car while the item is open files nothing more. Once the item
+# is closed, the next write to a car that still owes a failing proof —
+# in practice the next run of its probe — files again, which is the
+# point: the debt is still unpaid and the probe still says so.
+[[rule]]
+name = "file-a-backlog-item-when-an-owed-proof-fails"
+why = """
+A CROSS-PROTOCOL REACTOR: a closed ship-a-change car's owed proof,
+run on its declared event and NOT proven, opens a backlog-item — two
+protocols, and the car is closed, so its own Workflow has no step left
+to say it. Measured on origin/main df9307fa (backlog b9005734): the
+forge door records a failing owed proof only as proof_attempt on the
+closed car, which neither the shed nor the hourly recheck reads. No
+authority widened: the only write is one standard backlog-item on the
+queue the kind's owner_role already answers for, about the car's own
+subject, and triage decides the remedy.
+"""
+on_event = "jobs.job.updated"
+when = 'kind = "ship-a-change" AND status = "closed" AND metadata.proof_owed = "true" AND metadata.proof_attempt.not_yet = false AND NOT (metadata.disproved = "true") AND NOT (metadata.unlanded = "true") AND NOT open_job_exists("backlog-item", subject.id)'
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"backlog-item\"", subject_kind = "\"custom\"", subject = "subject.id", title = "\"A landed car's owed proof ran on its event and did not prove it\"", "metadata.input_channel" = "\"telemetry/monitoring\"", "metadata.area" = "\"platform\"", "metadata.car" = "id", "metadata.branch" = "metadata.branch", "metadata.why" = "metadata.proof_attempt.why", "metadata.probe" = "metadata.proof_attempt.probe", "metadata.exit" = "metadata.proof_attempt.exit", "metadata.attempt_at" = "metadata.proof_attempt.at", "metadata.description" = "\"A ship-a-change car closed landed with its proof owed (proof_owed = true): its recorded probe was waiting on a rare event, so the car left the shed and the proof became an obligation keyed to that event. The event fired, the forge ran the probe, and it did not prove the claim: the car named in car records the run under proof_attempt, with what the probe said in why, the probe itself in probe and its exit code in exit (null when it could not run). The car is closed, so no surface that reads open cars shows this. Decide at triage whether the change or its probe is wrong; either way the remedy is new work that names this car.\"" }

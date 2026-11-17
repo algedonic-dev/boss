@@ -58,6 +58,10 @@
 #     first so a line for it proves the container saw inside: without
 #     it the answer is the door's refusal, not two absences;
 #   - `--network none`, and the image ops_kubectl already pulls;
+#   - `--log-driver=none`: it mounts the whole credential directory, so
+#     it is held to the rule every credential-mounting container is
+#     (backlog ff957587) — what it prints, docker's refusals with it,
+#     is never also kept in the daemon's container log;
 #   - `sudo -n`, so a reader on a timer never waits at a prompt;
 #   - bounded twice, because this runs inside the forge's OWN host
 #     reading, the one the boarding check reads and the one a stalled
@@ -67,8 +71,9 @@
 #     a CLI wedged on its daemon can outlive it; and `timeout 10` on stat
 #     INSIDE the container, as ops_talosctl bounds talosctl, because
 #     killing the host-side client leaves a container running (review
-#     of 058b1ef1, M1). The directory's mode is never touched (design
-#     835c0c9c).
+#     of 058b1ef1, M1). The answer goes to a file, so neither bound can
+#     be outlived by a process timeout's KILL does not reach (c44ba179,
+#     below). The directory's mode is never touched (design 835c0c9c).
 # Names are the CONTAINER's reading of /etc/passwd, so the numbers ride
 # beside them and are what is judged: uid 0 is root on both sides, and a
 # file owned by any other host account is named by its uid, not by a
@@ -88,9 +93,24 @@ ops_credentials_state() {
     _oc_dir="${BOSS_OPS_DIR:-/etc/boss-ops}"
     _oc_door=""
     if [ -d "$_oc_dir" ] && [ ! -x "$_oc_dir" ]; then
-        _oc_door="$(timeout -k 5 "${BOSS_OPS_DOOR_TIMEOUT_S:-30}" sudo -n docker run --rm --network none \
+        # The door answers into a FILE, never a `$(…)` pipe (backlog
+        # c44ba179, 2026-11-16). A command substitution waits for EOF
+        # from every process holding its pipe, not for timeout, so the
+        # bound above held only as far as timeout's KILL reached: a real
+        # sudo runs docker in a new session on a pty, outside timeout's
+        # process group, and on the public mirror's Ubuntu 26 a stand-in
+        # door's TERM-ignoring child kept the pipe — and the reading —
+        # for its full 30s. Redirected, the shell waits for timeout
+        # alone; a survivor writes to a file nobody reads again.
+        _oc_out="$(mktemp 2>&1)" || {
+            echo "unmeasured: $_oc_dir is not searchable by $(id -un 2>/dev/null || id -u), and no scratch file could hold the privileged door's answer: $_oc_out"
+            return 0
+        }
+        timeout -k 5 "${BOSS_OPS_DOOR_TIMEOUT_S:-30}" sudo -n docker run --rm --log-driver=none --network none \
             --mount "type=bind,src=$_oc_dir,dst=/ops,readonly" alpine/k8s:1.33.3 \
-            timeout 10 stat -c '%n %U:%G %a %u:%g' /ops/. /ops/talosconfig /ops/kubeconfig 2>&1)" || :
+            timeout 10 stat -c '%n %U:%G %a %u:%g' /ops/. /ops/talosconfig /ops/kubeconfig >"$_oc_out" 2>&1 || :
+        _oc_door="$(cat "$_oc_out")" || :
+        rm -f "$_oc_out"
         if [ -z "$(printf '%s\n' "$_oc_door" | sed -n '/^\/ops\/\. /p')" ]; then
             _oc_why="$(printf '%s\n' "$_oc_door" | awk 'NF { l = $0 } END { print l }')"
             echo "unmeasured: $_oc_dir is not searchable by $(id -un 2>/dev/null || id -u), and the privileged door refused: ${_oc_why:-no answer}"

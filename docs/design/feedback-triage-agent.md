@@ -8,9 +8,11 @@
 
 ## Why this doc exists
 
-The triage board at `/system/feedback` has an agent slot: "Hand to
-agent" writes `agent_requested_at` on the triage step and the card
-moves to **With an agent**. Nothing consumes that record yet. The
+The feedback triage board had an agent slot when this was written
+(2026-08-18; the board is now one of the receiving station's panels
+on the Department Map at `/it`, design `e765b3fc`): "Hand to agent"
+wrote `agent_requested_at` on the triage step and the card moved to
+**With an agent**. Nothing consumed that record. The
 question is what should — a handful of deterministic rules, or a
 language model.
 
@@ -52,6 +54,13 @@ in the feedback text.
 One row per hand-processed item. `Rule?` asks the load-bearing
 question: could a deterministic rule with access to the Job, the route
 catalog, and the open-PR list have reached the same disposition?
+
+`Route` is the address each item was filed from, kept as filed. The
+`/system` addresses retired on 2026-08-31 (packet `1f6d55e0`): the
+landing moved to `/it`, the workflow and monitoring pages to
+`/it/registry` and `/it/operate`; the flow page folded into Atlas
+(`/it/operate/atlas`); and the feedback board is a panel on the
+Department Map at `/it`.
 
 | Item | Route | Class | Disposition | Rule? |
 |---|---|---|---|---|

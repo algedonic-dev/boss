@@ -64,6 +64,7 @@ impl Sensors for InMemorySensors {
                 published_at: boss_clock_client::wall_now(),
                 last_polled_at: None,
                 cursor_at: None,
+                refused: None,
             });
             inserted += 1;
         }
@@ -176,7 +177,15 @@ impl Sensors for InMemorySensors {
         let Some(r) = rows.iter_mut().find(|r| r.id == sensor_id) else {
             return Err(SensorsError::UnknownSensor(sensor_id.to_string()));
         };
+        let refused = super::types::merge_poll_refusals(
+            r.refused.as_ref(),
+            stamp.refused.as_ref(),
+            r.cursor_at,
+            stamp.cursor_at,
+        )
+        .map_err(SensorsError::BadRequest)?;
         r.last_polled_at = Some(stamp.polled_at);
+        r.refused = refused;
         if let Some(c) = stamp.cursor_at {
             r.cursor_at = Some(r.cursor_at.map_or(c, |held| held.max(c)));
         }
@@ -240,6 +249,7 @@ mod tests {
             &PollStamp {
                 polled_at: now,
                 cursor_at: Some(now),
+                refused: None,
             },
         )
         .await
@@ -299,6 +309,7 @@ mod tests {
             &PollStamp {
                 polled_at: now,
                 cursor_at: Some(now),
+                refused: None,
             },
         )
         .await
@@ -308,6 +319,7 @@ mod tests {
             &PollStamp {
                 polled_at: now + Duration::minutes(15),
                 cursor_at: Some(now - Duration::days(1)),
+                refused: None,
             },
         )
         .await

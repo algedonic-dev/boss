@@ -965,6 +965,7 @@ fn merge_commit_paths(merge_ref: &str) -> Option<Vec<String>> {
     let out = std::process::Command::new("git")
         .args([
             "show",
+            "--no-renames",
             "--name-only",
             "--format=",
             "--first-parent",
@@ -1077,6 +1078,7 @@ pub(crate) fn changed_paths_for(branch: &str) -> Option<Vec<String>> {
     let out = std::process::Command::new("git")
         .args([
             "diff",
+            "--no-renames",
             "--name-only",
             &format!("origin/main...origin/{branch}"),
         ])

@@ -1,0 +1,25 @@
+# people:platform-admin — the people who hold the platform-admin role, a
+# root pool of the station tree (T5 of design 4b27a65a, backlog 3f58c823;
+# handoff section 5: "1, from the roster"). Its capacity is a ROSTER READ,
+# never hand-set: the declaration binds the Class it counts, and
+# boss_jobs::pools::refresh_roster publishes the observed count as the
+# next version. The people service's roster-capacity door calls that
+# observation, fired every five minutes by the dispatcher rule
+# roster-pools-are-observed-every-five-minutes (backlog a6cb448a), so the
+# observed versions stand above this declared one; until the first
+# observation the capacity is unknown — unknown, not zero, and not one
+# either. The executive station allocates none of it yet.
+# v2 (backlog 84f570a1): `capacity_from` says where the capacity number
+# comes from, for the console to show beside it (station-tree.md section 3).
+[[pool]]
+name = "people:platform-admin"
+version = 2
+status = "active"
+unit = "people"
+kind = "flow"
+shape = "capacity"
+capacity = { state = "unknown" }
+capacity_from = 'The roster, never set by hand: the count of employees holding the platform-admin role Class (the employees.json of the tenant, published to boss-people), observed by boss_jobs::pools::refresh_roster and published as the next version of this row. Unknown until something calls that observation.'
+
+[pool.roster]
+eligibility = [{ attribute = "role", codes = ["platform-admin"] }]

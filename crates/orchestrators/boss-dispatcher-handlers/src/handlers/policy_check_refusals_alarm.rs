@@ -386,13 +386,15 @@ pub fn unreadable_body(error: &str, owner: &str, now: &str, rule: &str) -> Json 
          read.",
         window = window_path(),
     );
-    body(
+    let mut unreadable = body(
         UNREADABLE,
         "POLICY CHECK TALLY UNREADABLE: nobody can see a lapsed service grant".to_string(),
         detail,
         json!({"last_error": error, "measured_at": now}),
         owner,
-    )
+    );
+    unreadable["priority"] = json!("standard");
+    unreadable
 }
 
 /// Every OPEN alarm this handler filed, keyed by its finding.
@@ -570,36 +572,55 @@ impl Handler for PolicyCheckRefusalsAlarm {
         );
         let owner = owner_for_filing(self.owner.as_ref(), rule).await;
 
-        let before = self.wall.now();
-        let read = match super::gate_window_read::read(
-            &self.client,
-            &format!("{}{}", self.evidence_base, window_path()),
-            &dispatcher_actor_header(rule),
-        )
-        .await
-        {
-            Ok(body) => {
-                judge_durable(&body, before, self.wall.now()).map_err(HandlerError::Downstream)
+        let read = super::backstop_read::retry_once(|| async {
+            let before = self.wall.now();
+            match super::gate_window_read::read(
+                &self.client,
+                &format!("{}{}", self.evidence_base, window_path()),
+                &dispatcher_actor_header(rule),
+            )
+            .await
+            {
+                Ok(body) => {
+                    judge_durable(&body, before, self.wall.now()).map_err(HandlerError::Downstream)
+                }
+                Err(e) => Err(HandlerError::Downstream(e)),
             }
-            Err(e) => Err(HandlerError::Downstream(e)),
-        };
+        })
+        .await;
         let judged = match read {
             Ok(judged) => judged,
             Err(e) => {
                 let body = unreadable_body(&e.to_string(), &owner, &now, rule);
-                self.raise(UNREADABLE, body, &filed, rule).await?;
+                super::backstop_read::raise_unreadable(
+                    &self.client,
+                    &self.jobs_base,
+                    filed.get(UNREADABLE),
+                    body,
+                    ctx,
+                )
+                .await?;
                 return Err(e);
             }
         };
-        let whole = format!("{HANDLER} read {} whole at {now}", window_path());
-        self.withdraw(
-            UNREADABLE,
-            &filed,
-            &format!("{whole}: the lapsed-grant watch judges again."),
-            &now,
-            rule,
+        let may_withdraw_unreadable = super::backstop_read::recovered(
+            &self.client,
+            &self.jobs_base,
+            filed.get(UNREADABLE),
+            ctx,
         )
         .await?;
+        let whole = format!("{HANDLER} read {} whole at {now}", window_path());
+        if may_withdraw_unreadable {
+            self.withdraw(
+                UNREADABLE,
+                &filed,
+                &format!("{whole}: the lapsed-grant watch judges again."),
+                &now,
+                rule,
+            )
+            .await?;
+        }
 
         if judged.mode == "off" {
             tracing::info!(
@@ -1297,6 +1318,77 @@ mod tests {
                 .iter()
                 .any(|r| r.do_steps.iter().any(|d| d.handler == HANDLER)),
             "a shipped rule invokes this handler"
+        );
+    }
+
+    #[test]
+    fn d894_contract_first_unreadable_tick_is_standard() {
+        let body = unreadable_body(
+            "fixture read unavailable",
+            "emp-owner",
+            "2026-10-31T19:00:00Z",
+            "fixture-rule",
+        );
+        assert_eq!(
+            body["priority"], "standard",
+            "one failed backstop tick is not a sustained failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn d894_contract_one_failed_read_gets_one_retry_before_any_alarm() {
+        let good = window_fixture(tally("report", vec![], 0));
+        let stub = listing_stub::serve_sequence(
+            vec![(ALARMS, listing(vec![]))],
+            vec![(
+                WINDOW_PATH,
+                vec![json!({"error":"transient fixture read"}), good],
+            )],
+        )
+        .await;
+        let result = handler(&stub).invoke(&[], &ctx()).await;
+        assert_eq!(
+            stub.read_count(WINDOW_PATH),
+            2,
+            "the actual HTTP read must retry exactly once"
+        );
+        assert!(
+            result.is_ok(),
+            "the retry judges the second complete answer: {result:?}"
+        );
+        assert!(
+            stub.sent().is_empty(),
+            "a recovered first tick files nothing: {:?}",
+            stub.sent()
+        );
+    }
+
+    #[tokio::test]
+    async fn d894_contract_second_failed_tick_promotes_the_existing_alarm() {
+        let mut alarm = alarm_row(UNREADABLE);
+        alarm["priority"] = json!("standard");
+        alarm["metadata"]["backstop_unreadable"] = json!({"rule":ctx().rule_name,"last_failed_tick":(ctx().firing_instant().unwrap() - chrono::Duration::hours(1)).to_rfc3339(),"consecutive_failed_ticks":1});
+        let stub = listing_stub::serve(vec![(ALARMS, listing(vec![alarm]))]).await;
+        assert!(handler(&stub).invoke(&[], &ctx()).await.is_err());
+        assert_eq!(
+            stub.read_count(WINDOW_PATH),
+            2,
+            "still only one short retry"
+        );
+        assert!(
+            stub.sent()
+                .iter()
+                .any(|(method, body)| method == "PUT /api/jobs/al-1/priority"
+                    && body["priority"] == "urgent"),
+            "two distinct failed ticks must become urgent through the priority door: {:?}",
+            stub.sent()
+        );
+        assert!(
+            !stub
+                .sent()
+                .iter()
+                .any(|(method, _)| method == "POST /api/jobs"),
+            "the second tick never duplicates the alarm"
         );
     }
 }

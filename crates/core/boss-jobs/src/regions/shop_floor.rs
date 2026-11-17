@@ -1,21 +1,36 @@
 //! THE SHOP FLOOR (backlog 94c6ffd0): the region upstream of the dock,
 //! where a car is still being built — the runs in flight against the
-//! agents registry's capacity.
+//! `robots:<model>` pools' capacity.
 
 use super::*;
 
-/// THE FLOOR'S BOUND: how many runs may be in flight at once, summed
-/// over the agents registry's `max_concurrent_runs`. `None` when ANY
-/// row declares no cap — an agent without one is unbounded
-/// (`agent_budget`'s own rule), so a total that ignored it would draw
-/// a bound the claim door does not enforce — and `None` for an empty
-/// registry, which bounds nothing either.
-pub fn run_capacity(rows: &[crate::agents::AgentRow]) -> Option<usize> {
-    if rows.is_empty() {
+/// THE FLOOR'S BOUND: how many runs may be BUILDING at once — the
+/// configured capacity of every active `robots:<model>` pool, summed,
+/// because a run's `building` claim reserves one slot of its pool and
+/// nothing else bounds a robot (backlog 3e927996; David, design a3c5e58a
+/// Q3). It summed the agents rows' `max_concurrent_runs` until that cap
+/// was retired. `None` when no robots pool is active, or when any has a
+/// capacity that is not a configured whole number of slots: a total that
+/// ignored one would draw a bound the claim door does not enforce.
+pub fn run_capacity(pools: &[crate::pools::PoolSpec]) -> Option<usize> {
+    let robots: Vec<_> = pools
+        .iter()
+        .filter(|p| {
+            p.status == crate::registry::WorkflowStatus::Active
+                && p.name.starts_with(crate::resources::ROBOTS_PREFIX)
+        })
+        .collect();
+    if robots.is_empty() {
         return None;
     }
-    rows.iter()
-        .map(|r| r.max_concurrent_runs.and_then(|n| usize::try_from(n).ok()))
+    robots
+        .iter()
+        .map(|p| match &p.capacity {
+            crate::pools::PoolCapacity::Configured { amount } => {
+                amount.to_string().parse::<usize>().ok()
+            }
+            crate::pools::PoolCapacity::Unknown {} => None,
+        })
         .sum()
 }
 
@@ -75,9 +90,36 @@ pub(super) fn shop_floor(inputs: &RegionInputs<'_>, w: &Windows, out: &[OutRail]
         .filter(|(_, steps)| {
             step_done_at(find_step(steps, "reported", "Report recorded")).is_none()
         })
-        .filter_map(|(_, steps)| step_done_at(find_step(steps, "building", "Building")))
+        .filter_map(|(_, steps)| {
+            // A run HANDED to its gate (backlog 87d1ae40) finished its
+            // build and gave its slot back at the hand-off; it is waiting
+            // on the gate, not unreported. Its work is finished when its
+            // verdict is recorded, so that is its onset.
+            let building = find_step(steps, "building", "Building");
+            let handed = building.is_some_and(|b| {
+                b.metadata.get("result").and_then(|r| r.as_str())
+                    == Some(crate::gate_handoff::HANDED)
+            });
+            if handed {
+                step_done_at(find_step(
+                    steps,
+                    crate::gate_handoff::VERDICT_SLUG,
+                    "Awaiting the gate's verdict",
+                ))
+            } else {
+                step_done_at(building)
+            }
+        })
         .collect();
     let unreported = finished_at.len();
+    // HOLDING A SLOT: an open run whose `building` is not done. That
+    // claim is the one a `robots:<model>` pool counts, so it is what the
+    // bound is read against; a run handed to its gate, or finished and
+    // unreported, has given its slot back (backlog 3e927996).
+    let building: Vec<&&(Job, Vec<Step>)> = in_flight
+        .iter()
+        .filter(|(_, steps)| step_done_at(find_step(steps, "building", "Building")).is_none())
+        .collect();
     // A crew count is only stated where the sessions were READ: an
     // unread session list is not a floor with nobody on it, and the
     // clause is left off rather than printed as a zero.
@@ -112,11 +154,11 @@ pub(super) fn shop_floor(inputs: &RegionInputs<'_>, w: &Windows, out: &[OutRail]
     // bounds nothing, so the rule says nothing without one.
     if let Some(cap) = inputs.run_capacity {
         findings.extend(at_capacity(
-            count,
+            building.len(),
             cap,
             &what,
             onset_of_count(
-                in_flight.iter().filter_map(|(j, _)| opened_at(j)).collect(),
+                building.iter().filter_map(|(j, _)| opened_at(j)).collect(),
                 cap,
             ),
             out,
@@ -134,7 +176,7 @@ pub(super) fn shop_floor(inputs: &RegionInputs<'_>, w: &Windows, out: &[OutRail]
         count_value(count),
         "runs",
         match inputs.run_capacity {
-            Some(cap) => format!("{count} of {cap} runs in flight"),
+            Some(cap) => format!("{} of {cap} robot slots building", building.len()),
             None => format!(
                 "{} (no cap declared)",
                 plural(count, "run in flight", "runs in flight")
@@ -278,7 +320,7 @@ mod tests {
         assert_eq!(band.held_minutes, Some(60));
         assert!(f.why.starts_with("2 runs in flight"), "{}", f.why);
         assert!(bands::BANDS.iter().all(|b| b.id != "shop-floor-at-cap"));
-        assert_eq!(f.kpi[0].text, "2 of 2 runs in flight");
+        assert_eq!(f.kpi[0].text, "2 of 2 robot slots building");
         assert_eq!(
             f.kpi[1].text, "1 session silent past 60 minutes",
             "the crew board's idle line, in minutes"
@@ -389,6 +431,60 @@ mod tests {
         );
     }
 
+    /// A run HANDED to its gate (backlog 87d1ae40) ended `building` at
+    /// the hand-off and waits on its verdict holding no slot: waiting on
+    /// the gate, not finished-and-unreported. Once the verdict is
+    /// recorded green and the handback has not come, it is unreported
+    /// like any other, from the verdict's instant.
+    #[test]
+    fn a_run_waiting_on_its_gate_verdict_is_not_unreported() {
+        let status = empty_status();
+        let handed_run = |verdict: Step| {
+            let j = run(true, "2026-09-19T09:00:00Z", None);
+            let mut building = step(
+                &j,
+                "building",
+                StepStatus::Completed,
+                Some("2026-09-19T10:00:00Z"),
+            );
+            building.metadata = serde_json::json!({"result": "handed"});
+            let mut verdict = verdict;
+            verdict.job_id = j.id;
+            let steps = vec![
+                building,
+                verdict,
+                step(&j, "reported", StepStatus::Pending, None),
+            ];
+            vec![(j, steps)]
+        };
+        let j = run(true, "2026-09-19T09:00:00Z", None);
+        let sessions = Vec::new();
+        let waiting = handed_run(step(&j, "verdict", StepStatus::Ready, None));
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let f = by_name(
+            &regions(&floor(base, &waiting, &sessions, Some(6))),
+            "shop-floor",
+        )
+        .clone();
+        assert_eq!(f.state, RegionState::Clear, "{}", f.why);
+        assert!(!f.why.contains("not reported"), "{}", f.why);
+
+        let green = handed_run(step(
+            &j,
+            "verdict",
+            StepStatus::Completed,
+            Some("2026-09-19T10:30:00Z"),
+        ));
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let f = by_name(
+            &regions(&floor(base, &green, &sessions, Some(6))),
+            "shop-floor",
+        )
+        .clone();
+        assert_eq!(f.state, RegionState::Troubled, "{}", f.why);
+        assert!(f.why.contains("not reported"), "{}", f.why);
+    }
+
     /// An unread floor is troubled, never an empty one: a map that drew
     /// nobody building would read as a quiet shop rather than an unread
     /// one (the rule every region here keeps).
@@ -450,22 +546,60 @@ mod tests {
         );
     }
 
-    /// The bound is the registry's, and an agent with no declared cap is
-    /// unbounded — so the total is, too (the claim door's own rule).
+    /// THE BOUND IS THE ROBOT POOLS' (backlog 3e927996): their configured
+    /// slots summed, never an agents row's retired `max_concurrent_runs`.
+    /// Any other pool is not a robot's; a robots pool of unknown capacity,
+    /// or none at all, draws no bound.
     #[test]
-    fn the_run_capacity_is_the_registrys_sum_and_an_undeclared_cap_is_unbounded() {
-        let row = |cap: Option<i32>| crate::agents::AgentRow {
-            id: "agent-claude".to_string(),
-            display_name: "Claude".to_string(),
-            default_model: "opus-5".to_string(),
-            role: None,
-            department: None,
-            hourly_budget_usd_micros: None,
-            max_concurrent_runs: cap,
-            aliases: vec![],
+    fn the_run_capacity_is_the_robot_pools_sum_and_an_unknown_pool_is_unbounded() {
+        let pool = |name: &str, capacity: serde_json::Value| -> crate::pools::PoolSpec {
+            serde_json::from_value(json!({"name": name, "version": 1, "status": "active",
+                "unit": "slot", "kind": "flow", "capacity": capacity}))
+            .unwrap()
         };
-        assert_eq!(run_capacity(&[row(Some(6)), row(Some(2))]), Some(8));
-        assert_eq!(run_capacity(&[row(Some(6)), row(None)]), None);
+        let six = json!({"state": "configured", "amount": "6"});
+        let two = json!({"state": "configured", "amount": "2"});
+        let unknown = json!({"state": "unknown"});
+        assert_eq!(
+            run_capacity(&[
+                pool("robots:opus", six.clone()),
+                pool("robots:sol", two),
+                pool("vcpu", json!({"state": "configured", "amount": "64"})),
+            ]),
+            Some(8)
+        );
+        assert_eq!(
+            run_capacity(&[pool("robots:opus", six), pool("robots:sol", unknown)]),
+            None
+        );
+        assert_eq!(
+            run_capacity(&[pool("vcpu", json!({"state": "unknown"}))]),
+            None
+        );
         assert_eq!(run_capacity(&[]), None);
+    }
+
+    /// A run that handed its car to the gate finished building and gave
+    /// its robots slot back, so the floor reads it against the pool bound
+    /// as free — one of two building, not two of two.
+    #[test]
+    fn a_run_whose_building_is_done_holds_no_slot_against_the_pool_bound() {
+        let status = empty_status();
+        let mut done = Step::new(boss_core::job::JobId::new(), "task", "Building", 0);
+        done.spec_slug = Some("building".into());
+        done.status = StepStatus::Completed;
+        done.completed_at = Some(t("2026-09-19T11:10:00Z"));
+        done.metadata = json!({"result": crate::gate_handoff::HANDED});
+        let runs = vec![
+            (run(true, "2026-09-19T11:00:00Z", None), Vec::new()),
+            (run(true, "2026-09-19T11:00:00Z", None), vec![done]),
+        ];
+        let sessions = Vec::new();
+        let base = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let r = regions(&floor(base, &runs, &sessions, Some(2)));
+        let f = by_name(&r, "shop-floor");
+        assert_eq!(f.count, Some(2), "both runs are still open");
+        assert_eq!(f.kpi[0].text, "1 of 2 robot slots building");
+        assert_ne!(f.state, RegionState::Full, "{}", f.why);
     }
 }

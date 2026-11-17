@@ -17,6 +17,7 @@ const AUTHOR: &str = "emp-test";
 
 fn rule(name: &str, on_event: &str, when: Option<&str>) -> RawRule {
     RawRule {
+        delivery_lane: None,
         name: name.to_string(),
         on_event: Some(on_event.to_string()),
         schedule: None,

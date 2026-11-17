@@ -299,6 +299,12 @@ fn the_door_reads_metadata_only_through_a_readonly_mount() {
         .iter()
         .position(|a| *a == "alpine/k8s:1.33.3")
         .unwrap_or_else(|| panic!("the image ops_kubectl pulls, not a second one: {docker:?}"));
+    // It mounts the whole credential directory, so it keeps no container
+    // log — docker's option, before the image (backlog ff957587).
+    assert!(
+        docker[..image_at].contains(&"--log-driver=none"),
+        "no daemon log of what the door prints: {docker:?}"
+    );
     // `timeout 10` INSIDE the container: killing the host-side client
     // leaves a container running (review of 058b1ef1, M1).
     assert_eq!(
@@ -440,10 +446,49 @@ fn a_door_that_ignores_term_is_killed_and_the_reading_goes_on() {
     // stand-in here ignores TERM outright, so only the host-side
     // `timeout -k` KILL ends it (review of 058b1ef1, M1). Without the
     // bound, or without its -k, this takes the stand-in's full 30s.
-    let Some(dir) = sealed("ops-creds-hang") else {
+    a_hung_door_costs_seconds("ops-creds-hang", false);
+}
+
+#[test]
+fn a_door_whose_command_leaves_the_timeouts_group_cannot_hold_the_reading() {
+    // THE SAME BOUND, WITH THE HOLDER OUT OF timeout's REACH (backlog
+    // c44ba179, 2026-11-16). The test above passed on every forge gate
+    // and held the full 30s on the public mirror's ubuntu-latest, which
+    // moved to Ubuntu 26 on 2026-10-19: a door that ignores TERM keeps a
+    // child, and that child still had the command substitution's pipe
+    // open after timeout had gone. `$(…)` waits for EOF from EVERY
+    // holder of its pipe, not for timeout, so the bound held only as far
+    // as the host's timeout happens to KILL its whole process group —
+    // and a real door leaves that group anyway: sudo runs its command in
+    // a new session on a pty (use_pty, the default on current sudo, and
+    // sudo-rs), where timeout's group KILL never arrives and docker's
+    // sig-proxy catches the hangup. So the stand-in sudo here puts the
+    // command in a new session itself, which makes the escape this
+    // test's own fixture rather than a property of whichever timeout and
+    // sudo the host carries.
+    a_hung_door_costs_seconds("ops-creds-hang-session", true);
+}
+
+/// A sealed directory read through a door that ignores TERM and keeps a
+/// child holding its output for 30s; the reading must still end inside
+/// the 1s bound plus `-k 5`, say `unmeasured`, and let the caller go on.
+/// `new_session` makes the stand-in sudo run the door the way a real
+/// sudo on a pty does, outside timeout's process group.
+fn a_hung_door_costs_seconds(name: &str, new_session: bool) {
+    let Some(dir) = sealed(name) else {
         return;
     };
-    let d = stand_in("ops-creds-hang-bin", false, "trap '' TERM\nsleep 30\n");
+    let d = stand_in(&format!("{name}-bin"), false, "trap '' TERM\nsleep 30\n");
+    if new_session {
+        let record = format!(
+            "for a in \"$0\" \"$@\"; do printf '%s\\n' \"$a\" >> '{}'; done\n",
+            d.log.display()
+        );
+        boss_testing::write_exec(
+            &d.bin.join("sudo"),
+            &format!("#!/bin/sh\n{record}[ \"$1\" = -n ] && shift\nexec setsid \"$@\"\n"),
+        );
+    }
     let started = std::time::Instant::now();
     let (rc, out) = observe_shaped(&dir, Some(&d.bin), Some("1"));
     let took = started.elapsed();

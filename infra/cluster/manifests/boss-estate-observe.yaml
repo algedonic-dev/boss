@@ -444,7 +444,7 @@ spec:
                     done
                     start=$(date +%s)
                     while :; do
-                      rc=0; out=$(curl -m "$SEND_MAX_S" ${hdr:+-H "$hdr"} "$@") || rc=$?
+                      rc=0; out=$(curl -q -m "$SEND_MAX_S" ${hdr:+-H "$hdr"} "$@") || rc=$?
                       case "$rc" in
                         0) printf '%s' "$out"; return 0 ;;
                         6|7) ;;
@@ -602,7 +602,7 @@ spec:
                   DISPATCHER_API="${DISPATCHER_API:-http://boss-dispatcher-internal.boss.svc.cluster.local:7950}"
                   dispatcher=null
                   dispatcher_unread=""
-                  if curl -sSf -m 10 "$DISPATCHER_API/api/dispatcher/readyz" >"$WORK/readyz.json" 2>"$WORK/readyz.err"; then
+                  if curl -q -sSf -m 10 "$DISPATCHER_API/api/dispatcher/readyz" >"$WORK/readyz.json" 2>"$WORK/readyz.err"; then
                     counters=$(jq -c 'select(type == "object")
                       | select((.dead_letters_unrecorded | type) == "number")
                       | {ready, dead_letters, dead_letters_unrecorded,
@@ -618,6 +618,23 @@ spec:
                     dispatcher_unread="$DISPATCHER_API/api/dispatcher/readyz unreachable: $(cat "$WORK/readyz.err")"
                   fi
                   [ -z "$dispatcher_unread" ] || echo "no dispatcher reading: $dispatcher_unread"
+                  # Lag is a cached read-only JetStream observation on health;
+                  # readyz retains its numeric/boolean-only public contract.
+                  if curl -q -sSf -m 10 "$DISPATCHER_API/api/dispatcher/health" >"$WORK/dispatcher-health.json" 2>"$WORK/dispatcher-health.err"; then
+                    if lag=$(jq -c '.dispatcher | select(type == "object")
+                      | select(.rules_consumer_lag | type == "object")
+                      | {rules_consumer_lag, rules_phase_costs, rules_delivery_lanes}' "$WORK/dispatcher-health.json" 2>"$WORK/dispatcher-health-parse.err"); then
+                      if [ -n "$lag" ]; then
+                        dispatcher=$(jq -cn --argjson prior "$dispatcher" --argjson lag "$lag" '($prior // {}) + $lag')
+                      else
+                        echo 'dispatcher lag unread: health carries no lag observation'
+                      fi
+                    else
+                      echo "dispatcher lag unread: invalid health JSON: $(cat "$WORK/dispatcher-health-parse.err")"
+                    fi
+                  else
+                    echo "dispatcher lag unread: $(cat "$WORK/dispatcher-health.err")"
+                  fi
                   # jq, not python: directive 26d61c97 retired python
                   # from the estate's shell, and infra/estate/observe-host.sh
                   # (the host-scope sibling) is the shape to match.

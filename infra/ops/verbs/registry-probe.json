@@ -1,0 +1,18 @@
+{
+  "about": "MUTATING — prove ONE worker pulls from the forge registry by running the tree's one-shot Job on it, then removing that Job (infra/forge/registry-probe.sh <node>; backlog 01927489, filed from join-a-node aca68557, whose verify-registry step asks for `image_pulled`). w-2's join 829f75a8 answered that step with a Job David wrote and applied by hand (w2-registry-probe); under David's standing rule (2026-10-18) that every infra act is a website-approved verb and a CLI line handed to him is a coverage gap, that Job is now infra/forge/registry-probe.yaml and this is its door. WHAT IT DOES: through the forge's ops_kubectl door it creates Job boss-dev/registry-probe from THIS checkout's manifest with two words filled in — the node and the registry host (BOSS_FORGE_REGISTRY_HOST from /etc/boss/sor.env) — pinned to the node, imagePullPolicy Always, the mirrored kubectl image named by sha256 digest; the container mounts nothing, holds no token, runs as 65534 and prints one line naming the node it ran on. The verb waits (the Job's 180 s deadline plus 60 s), prints the pod's WHOLE log and the kubelet's Pulling/Pulled events, deletes the Job with DeleteOptions preconditions.uid set to the uid the create returned and reads the name back gone — whatever the outcome — and only then judges: the effect line PULLED <image> on <node> is printed only when the Job is Complete, its pod exited 0 on the named node, the kubelet reports the image by the manifest's digest, the log carries the probe's one line naming that node, and the Job is read back gone. Anything else is FAILED, exit 1, with the log above it. THE BOUND IS THE SCRIPT'S (cluster-node-lib.sh) AND REFUSES, CREATING NOTHING (exit 78): the node must be one DNS label, a talos-worker the estate registry declares once, and the cluster must agree (no control-plane label, the registry's address) — a control plane is refused before any door opens; the node must not be cordoned; the registry host must be one host[:port]; and no UNFINISHED Job named registry-probe may stand — a running probe is never touched. IT REMOVES ONLY Job boss-dev/registry-probe, by uid: the one it made, and a FINISHED previous probe (after printing that Job's whole log onto this run), so a run that died before its delete does not hold the name for its hour of ttlSecondsAfterFinished (every_job_bounds_its_finished_history.rs's floor, the backstop). NO PASSKEY, for prove-gate-volume's reasons: one bounded write of the tree's own Job whose only caller-supplied word is a node the registry and the cluster bound; it adds no capability — `boss gate` creates Jobs in boss-dev many times a day unattended, with more access than this pod has; and a plan would render nothing an approver could judge beyond the node. A precedent for the PROCESS, not a loosened default. TIMEOUT 900: the Job's deadline (180 s, read by the script from the manifest) and the wait's 60 s margin, the door's first-time image pull (120 s), a dozen kubectl reads bounded at 20-30 s, and up to two deletes each with six read-backs of the name. Pinned by crates/core/boss-testing/tests/join_a_node_verbs_sh.rs.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/registry-probe.sh",
+    "{1}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    }
+  ],
+  "timeout": 900,
+  "effect": "^registry-probe: PULLED [^ ]+ on [a-z0-9-]+ — pod [a-z0-9.-]+ pulled it from [^ ]+ and exited 0 on [a-z0-9-]+ \\(imageID [^ ]+\\); Job [a-z0-9-]+/[a-z0-9-]+ \\(uid [0-9a-f-]+\\) removed and read back gone$"
+}

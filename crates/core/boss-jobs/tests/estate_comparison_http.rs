@@ -15,79 +15,60 @@
 //!   — a comparison that cannot say what it compared or what it found
 //!   is not a comparison.
 
-use boss_policy_client::types::{AccessTier, User};
-use std::sync::Arc;
-
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use boss_core::port::EventBus;
-use boss_core::publisher::DomainPublisher;
+use axum::http::StatusCode;
 use boss_jobs::InMemoryJobs;
-use boss_jobs::http::{JobsApiState, router};
-use boss_policy_client::{FakePolicyClient, PolicyClient};
-use boss_testing::RecordingEventBus;
-use tower::ServiceExt;
-
-// SERIALISE THE REAL TYPE, never a copy of its wire shape (7c3649e2).
-fn user_header(id: &str, tier: &str) -> String {
-    serde_json::to_string(&User {
-        id: id.to_string(),
-        role: "platform-admin".to_string(),
-        access_tier: serde_json::from_value::<AccessTier>(serde_json::Value::String(
-            tier.to_string(),
-        ))
-        .expect("unknown access tier"),
-        territory_account_ids: Vec::new(),
-        direct_report_ids: Vec::new(),
-        department: Some("platform".to_string()),
-    })
-    .expect("a User always serialises")
-}
+use std::sync::Arc;
+#[path = "estate_comparison_http/common.rs"]
+mod common;
+use common::{
+    app_with, comparison_body, exercise_observation_identity_boundary, post_comparison, user_header,
+};
 
 fn app() -> (axum::Router, Arc<InMemoryJobs>) {
     let jobs = Arc::new(InMemoryJobs::new());
-    let policy: Arc<dyn PolicyClient> = Arc::new(FakePolicyClient::builder().build());
-    let bus = RecordingEventBus::new();
-    let bus_dyn: Arc<dyn EventBus> = bus.clone();
-    let state = JobsApiState::minimal(
-        jobs.clone(),
-        bus,
-        DomainPublisher::new(bus_dyn, "jobs"),
-        policy,
-        Arc::new(boss_clock_client::WallClockClient),
+    (app_with(jobs.clone()), jobs)
+}
+
+#[tokio::test]
+async fn replay_of_one_observation_records_one_comparison() {
+    let (app, jobs) = app();
+    let user = user_header("rule:estate-compare-on-observation", "operator");
+    let mut body: serde_json::Value = serde_json::from_str(&comparison_body()).unwrap();
+    body["observation_id"] = serde_json::json!("a56cb17b-00ba-4f61-9dc3-01c48871968a");
+    let body = body.to_string();
+    let (a, b) = tokio::join!(
+        post_comparison(&app, Some(&user), &body),
+        post_comparison(&app, Some(&user), &body)
     );
-    (router(state), jobs)
+    assert_eq!((a, b), (StatusCode::ACCEPTED, StatusCode::ACCEPTED));
+    assert_eq!(
+        jobs.recorded_events()
+            .iter()
+            .filter(|e| e.kind == "jobs.estate.compared")
+            .count(),
+        1,
+        "a redelivered observation must not manufacture persistence"
+    );
 }
 
-async fn post_comparison(app: &axum::Router, user: Option<&str>, body: &str) -> StatusCode {
-    let mut req = Request::builder()
-        .method("POST")
-        .uri("/api/estate/comparison")
-        .header("content-type", "application/json");
-    if let Some(u) = user {
-        req = req.header("x-boss-user", u);
-    }
-    let resp = app
-        .clone()
-        .oneshot(req.body(Body::from(body.to_string())).unwrap())
-        .await
-        .unwrap();
-    resp.status()
-}
-
-fn comparison_body() -> String {
-    serde_json::json!({
-        "scope": "kubernetes-nodes",
-        "observed_at": "2026-08-30T10:20:00Z",
-        "observer": "boss-estate-observe",
-        "counts": { "observed": 5, "observed_not_declared": 1 },
-        "findings": {
-            "observed_not_declared": [{"id": "w-1"}],
-            "declared_not_observed": [],
-            "drift": [],
-        },
-    })
-    .to_string()
+#[tokio::test]
+async fn canonical_identity_deduplicates_one_fact_but_preserves_distinct_facts_in_memory() {
+    let (app, jobs) = app();
+    exercise_observation_identity_boundary(&app).await;
+    let events = jobs.recorded_events();
+    let compared: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == "jobs.estate.compared")
+        .collect();
+    assert_eq!(compared.len(), 2);
+    assert_eq!(
+        compared[0].payload["observation_id"],
+        "a56cb17b-00ba-4f61-9dc3-01c48871968a"
+    );
+    assert_eq!(
+        compared[1].payload["observation_id"],
+        "a56cb17b-00ba-4f61-9dc3-01c48871968b"
+    );
 }
 
 #[tokio::test]

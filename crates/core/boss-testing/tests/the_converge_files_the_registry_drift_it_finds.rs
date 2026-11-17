@@ -199,7 +199,8 @@ fn git(dir: &Path, date: &str, args: &[&str]) {
     );
 }
 
-/// The bundle's kinds, sorted — the three the plants use are the first three.
+/// The bundle's kinds, sorted, held ones included: the live registry
+/// renders every one. The plants pick from [`unheld_kinds`].
 fn bundle_kinds() -> Vec<String> {
     let mut kinds: Vec<String> = std::fs::read_dir(repo_root().join("infra/platform/workflows"))
         .unwrap()
@@ -209,6 +210,43 @@ fn bundle_kinds() -> Vec<String> {
         .collect();
     kinds.sort();
     assert!(kinds.len() >= 4, "the bundle carries fewer than four kinds");
+    kinds
+}
+
+/// The bundle's kinds the TREE does not hold, sorted — the ones a plant
+/// picks. A held kind drifts in another voice (a held tree-ahead edit is
+/// not filed, a held both-moved item names the hold and no publish), so a
+/// plant on one tests the hold, not the case it was planted for. The
+/// plants took the first kinds blind until backlog-item, fourth in the
+/// sort and so the both-moved plant, became held by default when its
+/// build step declared an `executor` (backlog 446ab559): the plain case
+/// then read the held voice. Which kinds are held is asked of the one
+/// reader both voices ask, never re-derived here, and a reader that
+/// cannot answer stops the test rather than reading as "none held".
+fn unheld_kinds() -> Vec<String> {
+    let out = Command::new("python3")
+        .arg(repo_root().join(HOLDS_READER))
+        .arg(repo_root())
+        .output()
+        .expect("python3 runs the holds reader");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "the holds reader reads the tree whole:\n{text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let held: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("held\t")?.split('\t').next())
+        .collect();
+    let kinds: Vec<String> = bundle_kinds()
+        .into_iter()
+        .filter(|k| !held.contains(&k.as_str()))
+        .collect();
+    assert!(
+        kinds.len() >= 6,
+        "six plants need six kinds the tree does not hold: {kinds:?}"
+    );
     kinds
 }
 
@@ -237,7 +275,7 @@ struct Plants {
 }
 
 fn plants() -> Plants {
-    let k = bundle_kinds();
+    let k = unheld_kinds();
     Plants {
         tree_ahead: k[0].clone(),
         live_ahead: k[1].clone(),
@@ -852,8 +890,8 @@ fn a_held_kind_is_never_advised_the_hand_publish() {
         return;
     }
     let mut p = plants();
-    p.never_admitted = Some(bundle_kinds()[4].clone());
-    p.undated = Some(bundle_kinds()[5].clone());
+    p.never_admitted = Some(unheld_kinds()[4].clone());
+    p.undated = Some(unheld_kinds()[5].clone());
     let unadmitted = p.never_admitted.clone().unwrap();
     let undated = p.undated.clone().unwrap();
     let held = [
@@ -1061,13 +1099,14 @@ fn a_kind_that_is_not_held_reads_as_before_beside_one_that_is() {
     );
 }
 
-/// The signer row's case (review 8d088b41, F7): a row that DECLARES A
-/// WRITER is held by default, with no file under workflow-holds — and
-/// both voices honour that hold exactly as they do a declared one. The
-/// tree is ahead of live by an edit here, so nothing is filed, and the
-/// source each voice names is the declaration the reader found.
+/// The signer row's case (review 8d088b41, F7), turned round by backlog
+/// a4b57aca: a row that DECLARES A WRITER, with no file under
+/// workflow-holds, was held by default until that car. Nothing is held by
+/// default now — whether its publish needs a person is the server's
+/// passkey rule — so the converge files it like any kind the tree moved
+/// ahead of, and neither voice calls it held.
 #[test]
-fn a_row_that_declares_a_writer_is_held_with_no_hold_file() {
+fn a_row_that_declares_a_writer_is_not_held_without_a_hold_file() {
     if !has_tools() {
         eprintln!("skipping: needs python3, git and curl");
         return;
@@ -1089,41 +1128,16 @@ fn a_row_that_declares_a_writer_is_held_with_no_hold_file() {
     let kind = &p.tree_ahead;
     assert_eq!(
         posts.len(),
-        5,
-        "six disagreements, the held one unfiled:\n{out}\n{err}"
-    );
-    let said = every_voice(&out, &err, &posts);
-    assert!(
-        !said.contains(&format!("{HAND_PUBLISH} {kind}")),
-        "a default-held kind is never the object of a publish command:\n{said}"
-    );
-    let line = out
-        .lines()
-        .find(|l| {
-            l.starts_with(&format!(
-                "registry-drift: protocol:{kind} — HELD, not filed"
-            ))
-        })
-        .unwrap_or_else(|| panic!("no held line for {kind} in:\n{out}"));
-    assert!(
-        line.contains("by default: step ") && line.contains("declares writer signer"),
-        "the held line names the declaration that holds it: {line}"
+        6,
+        "six disagreements, every one filed:\n{out}\n{err}"
     );
     assert!(
-        err.lines()
-            .any(|l| l.contains(&format!("{kind} — by default: step "))
-                && l.contains("declares writer signer")),
-        "the lint names {kind} as held by default:\n{err}"
+        !out.contains(&format!("registry-drift: protocol:{kind} — HELD")),
+        "a writer is no default hold:\n{out}"
     );
-    let scope = err
-        .lines()
-        .find(|l| l.contains("is for the kind(s) that are NOT held"))
-        .unwrap_or_else(|| panic!("the lint does not scope its command:\n{err}"));
-    assert!(!scope.contains(kind.as_str()), "{scope}");
     assert!(
-        last_line(&out).contains(&format!("1 held and not filed ({kind})")),
-        "{}",
-        last_line(&out)
+        !err.contains("by default: step "),
+        "the lint names no default hold:\n{err}"
     );
 }
 
@@ -1149,7 +1163,7 @@ fn an_open_item_for_a_held_kind_loses_its_publish_remedy() {
         return;
     }
     let p = plants();
-    let quiet = bundle_kinds()[5].clone();
+    let quiet = unheld_kinds()[5].clone();
     let held = [p.tree_ahead.clone(), p.both_moved.clone(), quiet.clone()];
     let repo = fixture_repo_with("stale-item", &p, |dir| {
         held.iter().for_each(|k| hold(dir, k))

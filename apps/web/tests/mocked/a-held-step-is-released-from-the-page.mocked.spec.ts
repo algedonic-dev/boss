@@ -99,7 +99,9 @@ test('an active held step is released from the page, with its reason, and read b
 
   // The writes `boss step release` makes: the run edge cleared and the
   // `released` stamp recorded through the merge door (#2), then the
-  // release — ready, nobody's.
+  // release — ready, nobody's. The stamp names the holder it was taken
+  // `from`, so the dispatcher does not hash the step straight back to
+  // it (backlog ff0f0ff5).
   await expect.poll(() => writes.length).toBe(2);
   expect(asked).toMatch(/why/i);
   expect(writes).toEqual([
@@ -108,7 +110,13 @@ test('an active held step is released from the page, with its reason, and read b
       path: `/api/jobs/${JOB_ID}/steps/s1/metadata`,
       body: {
         agent_run: null,
-        released: { why: WHY, by: OPERATOR.id, at: expect.any(String), from_run: null },
+        released: {
+          why: WHY,
+          by: OPERATOR.id,
+          at: expect.any(String),
+          from_run: null,
+          from: 'agent-claude',
+        },
       },
     },
     {

@@ -8,7 +8,7 @@ point** in BOSS:
 
 | Want to add… | Build… | Code? |
 |---|---|---|
-| A new workflow that composes existing steps | A Workflow row at `/system/workflows` | No |
+| A new workflow that composes existing steps | A Workflow row at `/it/registry` | No |
 | A new step kind with its own UX surface | A StepPlugin (this directory) | JS only |
 | A new domain entity (Subject kind) | A new crate | Rust |
 
@@ -271,7 +271,7 @@ A row can also be published live — `POST /api/jobs/step-plugins`
 then `.../{kind}/publish` — which is how `sign-off` v2 arrived on
 2026-08-19. The seed never rewrites a live row: an operator's later
 version supersedes the file's, and the seed reports it.
-`/system/step-plugins` lists the active rows.
+`/it/registry/step-plugins` lists the active rows.
 
 ### 4. Deploy
 
@@ -287,7 +287,7 @@ re-reads a file on the next request.
 ### 5. Use it
 
 Author or update a Workflow that includes a step of
-`kind=pour-quality-check` (via `/system/workflows`), open a Job of
+`kind=pour-quality-check` (via `/it/registry`), open a Job of
 that kind, and the step renders your plugin's surface instead of
 the generic typed-fields form.
 

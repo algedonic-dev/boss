@@ -11,6 +11,14 @@ import { describe, expect, test } from 'bun:test';
 import { notFoundBack, parseRoute } from './router';
 import { RETIRED_ROUTES } from '../tests/mocked/_routes';
 
+test('the flat company map is gone; the root station view is the company index', () => {
+  // '/map' is now one more unclaimed segment: the department catch-all
+  // takes it, and the registry check (sections.ts withRoster) finds no
+  // department `map`, so the page renders not-found.
+  expect(parseRoute('/map')).toEqual({ kind: 'department', code: 'map' });
+  expect(parseRoute('/it/tree').kind).toBe('systemTree');
+});
+
 // No window is planted here. parseRoute takes the query string as its
 // second argument; it read `window.location.search` until backlog
 // cb211b39, and this file planted a window for it that it never took
@@ -33,7 +41,7 @@ describe('parseRoute reads no global', () => {
     };
     try {
       expect(parseRoute('/ux/products', '?q=ipa')).toEqual({ kind: 'products', q: 'ipa' });
-      expect(parseRoute('/ux/finance', '?tab=invoices')).toEqual({
+      expect(parseRoute('/finance', '?tab=invoices')).toEqual({
         kind: 'finance',
         view: { tab: 'invoices', entry: '', fact: '' },
       });
@@ -52,7 +60,7 @@ describe('parseRoute reads no global', () => {
   });
 
   test('an omitted query is no query', () => {
-    expect(parseRoute('/ux/finance')).toEqual({
+    expect(parseRoute('/finance')).toEqual({
       kind: 'finance',
       view: { tab: 'overview', entry: '', fact: '' },
     });
@@ -80,12 +88,21 @@ describe('parseRoute — every specific path matches its specific case', () => {
     ['/ux/parts/SKU-1', { kind: 'part', partSku: 'SKU-1' }],
     ['/ux/products', { kind: 'products' }],
     ['/ux/products/FP-IPA-1-2-BBL', { kind: 'product', productSku: 'FP-IPA-1-2-BBL' }],
-    // Finance — the regression nest. Specific cases MUST win over
-    // the catch-all `/finance/(.+)` → invoice route.
-    ['/ux/finance', { kind: 'finance' }],
-    ['/ux/finance/new', { kind: 'newInvoice' }],
-    ['/ux/finance/journal-entries/new', { kind: 'newJournalEntry' }],
-    ['/ux/finance/inv-step-12345678', { kind: 'invoice', invoiceId: 'inv-step-12345678' }],
+    // Finance — its own address since car 4 of design 8c3e9599 (backlog
+    // c7ef4728). The regression nest: /invoices/new MUST win over the
+    // `/finance/invoices/:id` wildcard.
+    ['/finance', { kind: 'finance' }],
+    ['/finance/invoices/new', { kind: 'newInvoice' }],
+    ['/finance/journal-entries/new', { kind: 'newJournalEntry' }],
+    ['/finance/invoices/inv-step-12345678', { kind: 'invoice', invoiceId: 'inv-step-12345678' }],
+    ['/finance/vendors', { kind: 'vendors' }],
+    ['/finance/vendors/v-1', { kind: 'vendor', vendorLookup: 'v-1' }],
+    // Engineering's station page at its own top-level address (backlog
+    // 950ad972, David 2026-11-12: "As a test, I would love to see this
+    // under /engineering too"; design deba3000). /it/tree/engineering
+    // stays; both parse to the one station page.
+    ['/engineering', { kind: 'systemStation', station: 'engineering' }],
+    ['/it/tree/engineering', { kind: 'systemStation', station: 'engineering' }],
     // Shipping / shipments / support
     ['/ux/shipping', { kind: 'shipping' }],
     ['/ux/shipments/ship-1', { kind: 'shipmentDetail', shipmentId: 'ship-1' }],
@@ -159,9 +176,9 @@ describe('parseRoute — every specific path matches its specific case', () => {
     ['/ux/watchlist', { kind: 'watchlist' }],
     ['/ux/shop', { kind: 'shop' }],
     ['/ux/shop/FP-IPA-1-2-BBL', { kind: 'shopProduct', sku: 'FP-IPA-1-2-BBL' }],
-    // PO + purchase orders
-    ['/ux/purchase-orders/po-1', { kind: 'po', poId: 'po-1' }],
-    ['/ux/vendor-invoices/vi-1', { kind: 'vendorInvoice', vendorInvoiceId: 'vi-1' }],
+    // PO + vendor invoices — Finance's, under its address.
+    ['/finance/purchase-orders/po-1', { kind: 'po', poId: 'po-1' }],
+    ['/finance/vendor-invoices/vi-1', { kind: 'vendorInvoice', vendorInvoiceId: 'vi-1' }],
     // HR + QA + ops
     ['/ux/hr', { kind: 'hr' }],
     ['/ux/qa', { kind: 'qa' }],
@@ -239,8 +256,9 @@ describe('a department is addressed by its code', () => {
   });
 
   test('/<code>/jobs wins over a family wildcard that would read "jobs" as an id', () => {
-    // /finance/:invoiceId, /sales/:jobId, /service/:jobId and
-    // /people/:empId each take one segment, and "jobs" is not an id.
+    // /sales/:jobId, /service/:jobId and /people/:empId each take one
+    // segment, and "jobs" is not an id. (/finance/:invoiceId was the
+    // fourth until its invoices moved under /finance/invoices, c7ef4728.)
     expect(parseRoute('/finance/jobs')).toEqual({ kind: 'department', code: 'finance' });
     expect(parseRoute('/sales/jobs')).toEqual({ kind: 'department', code: 'sales' });
     expect(parseRoute('/service/jobs')).toEqual({ kind: 'department', code: 'service' });
@@ -270,6 +288,50 @@ describe('a department is addressed by its code', () => {
   });
 });
 
+// FINANCE'S PAGES LIVE AT FINANCE'S ADDRESS (backlog c7ef4728, car 4 of
+// design 8c3e9599; design deba3000: the URL is the address of the station
+// that hosts the page). Every old spelling — the /ux one and the
+// unprefixed one the router also answered — retired with no alias and no
+// redirect (David, 2026-09-25): each is a not-found naming the path as it
+// was asked for, never a page that quietly works.
+describe("Finance's pages are under /finance, and their old spellings answer nothing", () => {
+  const retired = [
+    '/ux/finance',
+    '/ux/finance/new',
+    '/ux/finance/journal-entries/new',
+    '/ux/finance/inv-1',
+    '/ux/vendors',
+    '/ux/vendors/v-1',
+    '/ux/purchase-orders/po-1',
+    '/ux/vendor-invoices/vi-1',
+    // The unprefixed forms the /ux strip let through.
+    '/finance/new',
+    '/finance/inv-1',
+    '/purchase-orders/po-1',
+    '/vendor-invoices/vi-1',
+    '/vendors/v-1',
+  ];
+  for (const path of retired) {
+    test(`${path} is not found`, () => {
+      expect(parseRoute(path)).toEqual({ kind: 'notFound', path });
+    });
+  }
+
+  test('/finance is the landing and /finance/jobs its jobs view', () => {
+    expect(parseRoute('/finance').kind).toBe('finance');
+    expect(parseRoute('/dashboard/finance/')).toEqual({
+      kind: 'finance',
+      view: { tab: 'overview', entry: '', fact: '' },
+    });
+    expect(parseRoute('/finance/jobs')).toEqual({ kind: 'department', code: 'finance' });
+  });
+
+  test('an id holding a slash is one encoded segment under its slug', () => {
+    expect(parseRoute('/finance/invoices/a%2Fb')).toEqual({ kind: 'invoice', invoiceId: 'a/b' });
+    expect(parseRoute('/finance/vendors/acme%20co')).toEqual({ kind: 'vendor', vendorLookup: 'acme co' });
+  });
+});
+
 // The single-id wildcards were greedy `(.+)`, so a deeper path under a
 // list became a convincing "missing X": /ux/accounts/agreements/<id>
 // rendered the ACCOUNT page for accountId "agreements/<id>", and
@@ -282,9 +344,9 @@ describe('a single-id wildcard takes one segment', () => {
   });
 
   const families = [
-    '/ux/accounts', '/ux/vendors', '/ux/people', '/ux/parts', '/ux/products', '/ux/finance',
-    '/ux/shipments', '/ux/catalog', '/ux/assets', '/ux/marketing-assets', '/ux/purchase-orders',
-    '/ux/vendor-invoices', '/ux/shop', '/ux/service', '/ux/sales', '/ux/jobs',
+    '/ux/accounts', '/finance/vendors', '/ux/people', '/ux/parts', '/ux/products', '/finance/invoices',
+    '/ux/shipments', '/ux/catalog', '/ux/assets', '/ux/marketing-assets', '/finance/purchase-orders',
+    '/finance/vendor-invoices', '/ux/shop', '/ux/service', '/ux/sales', '/ux/jobs',
     '/it/registry', '/it/registry/authoring', '/it/registry/step-plugins', '/it/registry/rules',
   ];
   for (const f of families) {
@@ -315,17 +377,17 @@ describe('a single-id wildcard takes one segment', () => {
 });
 
 describe('parseRoute — wildcard does not shadow specific cases', () => {
-  // Pins the canonical fix for the `/finance/(.+)` wildcard
-  // precedence bug: specific cases MUST be declared before the
-  // wildcard or they resolve as `{ kind: 'invoice', invoiceId: ... }`.
-  // Any new `/finance/X` case the SPA introduces should be added to
-  // the table above + a regression assertion here.
-  test('/ux/finance/new → newInvoice, NOT invoice', () => {
-    const r = parseRoute('/ux/finance/new');
+  // Pins the canonical fix for the invoice wildcard's precedence bug:
+  // specific cases MUST be declared before the wildcard or they resolve
+  // as `{ kind: 'invoice', invoiceId: ... }`. Any new
+  // `/finance/invoices/X` case the SPA introduces should be added to the
+  // table above + a regression assertion here.
+  test('/finance/invoices/new → newInvoice, NOT invoice', () => {
+    const r = parseRoute('/finance/invoices/new');
     expect(r.kind).toBe('newInvoice');
   });
-  test('/ux/finance/journal-entries/new → newJournalEntry, NOT invoice', () => {
-    const r = parseRoute('/ux/finance/journal-entries/new');
+  test('/finance/journal-entries/new → newJournalEntry, NOT invoice', () => {
+    const r = parseRoute('/finance/journal-entries/new');
     expect(r.kind).toBe('newJournalEntry');
   });
   test('/it/registry/authoring/X → workflowDesign, NOT workflowDetail', () => {
@@ -364,11 +426,11 @@ describe('products list search from the query string', () => {
   });
 });
 
-// /ux/finance's tab, entry and fact ride in the query (backlog
+// /finance's tab, entry and fact ride in the query (backlog
 // 2ab44d55): NewJournalEntryPage lands on ?entry=<id> after a post, and
 // the route must hand that to the page rather than drop it.
 describe('finance view from the query string', () => {
-  const at = (search: string) => parseRoute('/ux/finance', search);
+  const at = (search: string) => parseRoute('/finance', search);
 
   test('a posted entry is carried through, onto the Trial Balance', () => {
     expect(at('?entry=ent-1')).toEqual({
@@ -388,12 +450,12 @@ describe('finance view from the query string', () => {
     });
   });
 
-  test('a bare /ux/finance is the Overview', () => {
+  test('a bare /finance is the Overview', () => {
     expect(at('')).toEqual({ kind: 'finance', view: { tab: 'overview', entry: '', fact: '' } });
   });
 
   test('an invoice page does not read the finance query', () => {
-    expect(parseRoute('/ux/finance/inv-1', '?entry=ent-1')).toEqual({
+    expect(parseRoute('/finance/invoices/inv-1', '?entry=ent-1')).toEqual({
       kind: 'invoice',
       invoiceId: 'inv-1',
     });

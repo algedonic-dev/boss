@@ -10,7 +10,7 @@ import { FINANCE_TABS, entrySearch, financeSearch, readFinanceView, type Finance
 const view = (tab: FinanceView['tab'], entry = '', fact = ''): FinanceView => ({ tab, entry, fact });
 
 describe('readFinanceView', () => {
-  test('a bare /ux/finance is the Overview', () => {
+  test('a bare /finance is the Overview', () => {
     expect(readFinanceView('')).toEqual(view('overview'));
   });
 

@@ -30,8 +30,8 @@ use tracing::{debug, warn};
 /// (2026-10-09) a host that accepted the connection and never answered
 /// held every rule behind it for as long as it chose — "must never wedge
 /// the dispatcher's durable queue", above, held only for a host that
-/// refused. Ten seconds is the dispatcher's own client bound
-/// (`boss_dispatcher::dispatcher`); the one receiver that exists, a
+/// refused. Ten seconds was the dispatcher's own client bound (the
+/// matchmaker's, retired by backlog e1eaf72b); the one receiver that exists, a
 /// regen's callback server, answers as soon as it has read the body.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 

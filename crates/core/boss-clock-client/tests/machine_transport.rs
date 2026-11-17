@@ -2,7 +2,6 @@
 //! test runner's global machine source, and no estate credential material.
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use boss_clock_client::{ClockClient, ClockClientError, ReqwestClockClient, subscribe_ticks};
@@ -28,23 +27,28 @@ fn exercise(mode: &str, listed: bool, token: bool) -> Vec<String> {
     let base = format!("http://{host}:{}", listener.local_addr().unwrap().port());
     let server_mode = mode.to_owned();
     let server_dir = dir.clone();
+    // The stub waits for the child's connects for as long as the child
+    // lives, not for a clock that started before its spawn: that clock
+    // charged the start of this test binary to the transport (backlog
+    // 7e30ddb0). The child's own work is bounded below, from its ready().
+    let child_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gone = child_gone.clone();
     let server = std::thread::spawn(move || {
         let count = if matches!(server_mode.as_str(), "http-rotate" | "sse-rotate") {
             2
         } else {
             1
         };
-        let deadline = Instant::now() + Duration::from_secs(20);
         let mut requests = Vec::new();
         for index in 0..count {
             let mut socket = loop {
+                // Read BEFORE the accept: a child that ended had already
+                // connected, so this accept still takes its connection.
+                let ended = gone.load(std::sync::atomic::Ordering::SeqCst);
                 match listener.accept() {
                     Ok((socket, _)) => break socket,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(
-                            Instant::now() < deadline,
-                            "public clock transport did not connect"
-                        );
+                        assert!(!ended, "public clock transport did not connect");
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     Err(error) => panic!("accept: {error}"),
@@ -108,9 +112,10 @@ fn exercise(mode: &str, listed: bool, token: bool) -> Vec<String> {
     // reqwest reads a proxy from the environment, which would carry the
     // request (and the token the rule admitted) past the stub; the one
     // list of variables is boss_testing's (backlog 50708d76, F-b).
-    let output = boss_testing::without_proxy(
-        Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "child_driver", "--nocapture"])
+    let mut child = boss_testing::reexec::ReExec::new("child_driver");
+    boss_testing::without_proxy(
+        child
+            .command()
             .env("CLOCK_TRANSPORT_CHILD", mode)
             .env("CLOCK_TRANSPORT_URL", base)
             .env("BOSS_MACHINE_TOKEN_DIR", dir)
@@ -122,17 +127,21 @@ fn exercise(mode: &str, listed: bool, token: bool) -> Vec<String> {
                     "unrelated.invalid"
                 },
             ),
-    )
-    .output()
-    .unwrap();
-    let requests = server.join().unwrap();
-    assert!(
-        output.status.success(),
-        "public transport child failed: {}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
     );
-    requests
+    let output = child.spawn().finish(Duration::from_secs(60));
+    child_gone.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Joined before the child's verdict is read, so a stub that saw no
+    // request does not hide what the child said.
+    let served = server.join();
+    assert!(
+        output.succeeded(),
+        "public transport child failed (start {:?}, work {:?}): {}{}",
+        output.start,
+        output.work,
+        output.stdout,
+        output.stderr
+    );
+    served.unwrap()
 }
 
 fn header(request: &str) -> Option<&str> {
@@ -202,6 +211,7 @@ async fn child_driver() {
     let Ok(mode) = std::env::var("CLOCK_TRANSPORT_CHILD") else {
         return;
     };
+    boss_testing::reexec::ready();
     let url = std::env::var("CLOCK_TRANSPORT_URL").unwrap();
     if mode.starts_with("sse") {
         let stream = subscribe_ticks(url);

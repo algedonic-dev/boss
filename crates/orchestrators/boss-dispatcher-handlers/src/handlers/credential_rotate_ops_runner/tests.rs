@@ -1695,6 +1695,66 @@ async fn a_named_token_file_that_cannot_be_presented_mints_nothing() {
     }
 }
 
+/// The promotion's own token check, BEFORE it touches the Secret (review
+/// of 25fff647, F5, the guard it said matters most; backlog 3ecb415b).
+/// The promotion writes `current` and blanks `previous` — which kills the
+/// host's old value — and only then posts `revoked`, presenting the token.
+/// Were the token read only at that post, a token file that went
+/// unpresentable between the stage and the delivery would kill the old
+/// value with no `revoked` on the record. So it promotes nothing: the
+/// Secret is unwritten, the old value still resolves, and no phase posts.
+/// The test above covers the scope firing's check only.
+#[tokio::test]
+async fn a_token_file_unpresentable_at_the_delivery_promotes_nothing_and_the_old_value_lives() {
+    for (name, content) in [
+        ("absent", None),
+        ("empty", Some(String::new())),
+        ("two-lines", Some(format!("{STAGE_TOKEN}\nsecond-line"))),
+    ] {
+        let secrets = MountedSecret::new(&format!("promote-token-{name}"));
+        secrets.seed("forge.current", OLD);
+        let token_file = boss_testing::scratch_dir("broker-stage-promote-token").join("token");
+        boss_testing::write_file(&token_file, STAGE_TOKEN);
+        let jobs = jobs(secrets.dir.clone(), FRESH).await;
+        presenting(&jobs, &secrets, &token_file)
+            .invoke(&args(), &scope())
+            .await
+            .expect("staged with a presentable token");
+        let value = secrets.get("forge.next").expect("a value staged");
+        acknowledge(&jobs, &secrets, JOB, &value).await;
+        match &content {
+            None => std::fs::remove_file(&token_file).unwrap(),
+            Some(content) => boss_testing::write_file(&token_file, content),
+        }
+        let (writes, phases) = (secrets.writes(), jobs.phases());
+
+        let error = presenting(&jobs, &secrets, &token_file)
+            .invoke(&args(), &delivered(last_eight(&value)))
+            .await
+            .expect_err(name);
+        let said = format!("{error:?}");
+        assert!(said.contains("broker-stage token"), "{name}: {said}");
+        assert!(
+            !said.contains(STAGE_TOKEN),
+            "{name}: the error carries the token"
+        );
+        assert_eq!(secrets.writes(), writes, "{name}: the Secret was written");
+        assert_eq!(secrets.get("forge.current").as_deref(), Some(OLD), "{name}");
+        assert_eq!(
+            secrets.get("forge.next").as_deref(),
+            Some(value.as_str()),
+            "{name}"
+        );
+        assert_eq!(
+            door(&secrets, OLD),
+            resolved("forge", "current"),
+            "{name}: the old value died with no revoked recorded"
+        );
+        assert_eq!(jobs.phases(), phases, "{name}: a phase was posted");
+        assert_ne!(jobs.status("revoke"), "completed", "{name}");
+    }
+}
+
 /// The workload token travels no further than the estate token does: a
 /// jobs URL that is not one of the estate's own hosts gets neither.
 #[test]

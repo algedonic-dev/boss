@@ -30,6 +30,13 @@ pub enum WorkflowStatus {
     Draft,
     Active,
     Retired,
+    /// A draft that met traffic and lost (backlog 50ded63d): an
+    /// experiment admitted packets to it, so it cannot be discarded —
+    /// they run its text — and it must never go live. Kept as history,
+    /// served by `get_version` like any row, and invisible to `publish`,
+    /// which promotes only a `Draft`. Workflow rows only: the other
+    /// registries sharing this enum keep a three-word CHECK.
+    Rejected,
 }
 
 impl WorkflowStatus {
@@ -38,7 +45,18 @@ impl WorkflowStatus {
             Self::Draft => "draft",
             Self::Active => "active",
             Self::Retired => "retired",
+            Self::Rejected => "rejected",
         }
+    }
+
+    /// Did this row ever pass the publish gate? Active and retired
+    /// rows did; a draft never has, and a rejected row is a draft that
+    /// never will (backlog 50ded63d). Every reader asking "was this
+    /// version published" asks here, so a rejected row answers exactly
+    /// as the draft it was — the live write path and a later replay
+    /// read the same answer for a row that changed status in between.
+    pub fn was_published(&self) -> bool {
+        matches!(self, Self::Active | Self::Retired)
     }
 }
 
@@ -49,6 +67,7 @@ impl std::str::FromStr for WorkflowStatus {
             "draft" => Ok(Self::Draft),
             "active" => Ok(Self::Active),
             "retired" => Ok(Self::Retired),
+            "rejected" => Ok(Self::Rejected),
             other => Err(format!("unknown job kind status: {other}")),
         }
     }
@@ -107,6 +126,10 @@ pub struct StepSpec {
     /// Workflow edit, not a deploy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_hours: Option<f64>,
+    /// Optional protocol-authored resource demand. Missing means zero demand;
+    /// pool capacity remains a separate registry fact (console design D1/D2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<crate::resources::ResourceBill>,
     /// The split of `duration_hours` into its two real meanings
     /// (d64fe2d2, David's Q2: "we can split those two times").
     ///
@@ -1743,7 +1766,14 @@ pub(crate) fn merge_metadata(defaults: &serde_json::Value, step: &StepSpec) -> s
     if let serde_json::Value::Object(m) = &mut merged {
         // The declaration comes from the schema, never metadata_defaults.
         m.remove(crate::credential_executor::KEY);
-        if let Some(executor) = &step.executor {
+        // Only a PRINCIPAL is the credential door's (design f623e425): an
+        // executor KIND (`role:`/`model:`/`equipment:`, factory taxonomy
+        // M3) projected here would admit no caller at all.
+        if let Some(executor) = step
+            .executor
+            .as_ref()
+            .filter(|e| !crate::step_executor::names_a_kind(e))
+        {
             m.insert(
                 crate::credential_executor::KEY.into(),
                 serde_json::Value::String(executor.clone()),
@@ -1824,8 +1854,46 @@ pub enum WorkflowError {
 // Port
 // ---------------------------------------------------------------------------
 
+/// A caller's last word on a publish, asked by the adapter inside the
+/// write that flips the row: `(baseline rows, candidate)`. The baseline
+/// rows are every kind's active row or, for a kind with none active, the
+/// row it last published (retired) — [`crate::publish_passkey::baselines`],
+/// read under the lock the flip holds, so a kind retired out of the live
+/// set is not mistaken for one that never published (review R2 of car
+/// 8715776d). The candidate is the row about to go live. An `Err`
+/// refuses the publish and nothing flips. See
+/// [`WorkflowRegistry::publish_guarded`].
+///
+/// ASYNC, AND ASKED INSIDE THE PASSKEY-EDGES FENCE (review R3 of car
+/// 8715776d). The passkey judge also reads the dispatcher's rule graph,
+/// and a graph read BEFORE the write was a snapshot a concurrent rule
+/// publish could outdate: add parent -> protected-child after the read,
+/// and the publish wrote the parent unsigned though it was protected by
+/// the time it committed. So the guard reads what it needs itself, and
+/// the Postgres adapter calls it holding the lock every rule write into
+/// that graph takes (`passkey_edges_fence`) — no rule write commits
+/// between the guard's read and the flip.
+pub type PublishGuard<'a> =
+    &'a (dyn Fn(Vec<WorkflowSpec>, WorkflowSpec) -> PublishVerdict + Send + Sync);
+
+/// What a [`PublishGuard`] answers, once it has read what it needs. It
+/// owns what it reads with, so the guard's borrow and its answer need
+/// no shared lifetime.
+pub type PublishVerdict = futures::future::BoxFuture<'static, Result<(), WorkflowError>>;
+
+/// The guard that admits every publish — what `publish` and
+/// `publish_authored` ask, so the seed and the tests keep their meaning.
+pub fn no_guard(_: Vec<WorkflowSpec>, _: WorkflowSpec) -> PublishVerdict {
+    Box::pin(async { Ok(()) })
+}
+
 pub trait WorkflowSelectionRows {
     fn rows(&self) -> &[WorkflowSpec];
+    /// Historical protocol bodies consumed by a pinned packet, read while
+    /// this same guard still excludes their actual writers.
+    fn version(&self, _kind: &str, _version: i32) -> Option<&WorkflowSpec> {
+        None
+    }
 }
 
 struct LockedWorkflowSelectionRows<'a> {
@@ -1836,6 +1904,9 @@ struct LockedWorkflowSelectionRows<'a> {
 impl WorkflowSelectionRows for LockedWorkflowSelectionRows<'_> {
     fn rows(&self) -> &[WorkflowSpec] {
         &self.active
+    }
+    fn version(&self, kind: &str, version: i32) -> Option<&WorkflowSpec> {
+        self._guard.get(&(kind.to_owned(), version))
     }
 }
 
@@ -1886,6 +1957,18 @@ pub trait WorkflowRegistry: Send + Sync {
     /// and retired rows.
     async fn list_versions(&self, kind: &str) -> Result<Vec<WorkflowSpec>, WorkflowError>;
 
+    /// Every kind this registry has ever held a row of, any status,
+    /// sorted byte for byte — what the recovery export walks
+    /// (`crate::registry_export`, backlog c26aacaa), so a kind an
+    /// operator RETIRED, which `list_active` cannot see, is exported
+    /// with the rest. An adapter that cannot enumerate refuses rather
+    /// than answering a short list: a short export reads as complete.
+    async fn lineage_names(&self) -> Result<Vec<String>, WorkflowError> {
+        Err(WorkflowError::Storage(
+            "workflow adapter cannot enumerate its lineages".into(),
+        ))
+    }
+
     /// Append a new version with `status = Draft`, numbered one above
     /// every version this kind has SPENT — its live rows and every
     /// draft ever discarded — so a number, once handed out, names one
@@ -1915,6 +1998,22 @@ pub trait WorkflowRegistry: Send + Sync {
     async fn publish(
         &self,
         kind: &str,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<WorkflowSpec, WorkflowError> {
+        self.publish_guarded(kind, &no_guard, actor, now).await
+    }
+
+    /// [`Self::publish`], with the caller's [`PublishGuard`] asked INSIDE
+    /// the write — after the draft and the active rows are read under
+    /// the lock the flip holds, before anything flips — so what it judges
+    /// is exactly what the publish replaces and promotes (backlog
+    /// a4b57aca: the passkey rule judges the LIVE row, and a judgement
+    /// made before the lock could be raced by another publish or draft).
+    async fn publish_guarded(
+        &self,
+        kind: &str,
+        guard: PublishGuard<'_>,
         actor: &boss_core::actor::ActorId,
         now: DateTime<Utc>,
     ) -> Result<WorkflowSpec, WorkflowError>;
@@ -1951,6 +2050,33 @@ pub trait WorkflowRegistry: Send + Sync {
     /// counted if it locked the row first, refused `VersionDiscarded`
     /// if it waited (part 4; see `JobsRepository::create_job_with_steps_at`).
     async fn discard_draft(
+        &self,
+        kind: &str,
+        version: i32,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<(), WorkflowError>;
+
+    /// Set a DRAFT that met traffic and lost to `Rejected` (backlog
+    /// 50ded63d). The discard refuses a draft a packet is pinned to,
+    /// rightly — the packet runs that text — so before this an
+    /// experiment's losing candidate stayed a draft forever: publish
+    /// would promote it (it takes the newest draft and no body), and
+    /// `boss workflow publish` refused every later spec because a
+    /// draft that was not its own existed. A rejected row keeps its
+    /// text and its number, is served by `get_version`, and is never
+    /// promoted: `publish` takes only a `Draft`.
+    ///
+    /// For that case and no other. An active or retired row is history
+    /// and refuses `Conflict`; a missing row is `NotFound`; a draft no
+    /// packet is pinned to admitted nothing and refuses `Conflict`
+    /// naming the discard, its resolution — so `rejected` always means
+    /// "packets ran it and it lost", never a guess at an author's
+    /// intent. Rejecting a rejected row is a silent no-op, like a
+    /// second retire. Records `jobs.kind.draft_rejected` (payload =
+    /// the rejected spec) iff a row flipped. Pins are counted under
+    /// the same hold the flip takes, as the discard counts them.
+    async fn reject_draft(
         &self,
         kind: &str,
         version: i32,
@@ -2010,6 +2136,21 @@ pub trait WorkflowRegistry: Send + Sync {
         &self,
         spec: WorkflowSpec,
         authoring_job_id: JobId,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<WorkflowSpec, WorkflowError> {
+        self.publish_authored_guarded(spec, authoring_job_id, &no_guard, actor, now)
+            .await
+    }
+
+    /// [`Self::publish_authored`], with the guard asked inside the write
+    /// as [`Self::publish_guarded`] asks it; the candidate it judges is
+    /// the authored spec.
+    async fn publish_authored_guarded(
+        &self,
+        spec: WorkflowSpec,
+        authoring_job_id: JobId,
+        guard: PublishGuard<'_>,
         actor: &boss_core::actor::ActorId,
         now: DateTime<Utc>,
     ) -> Result<WorkflowSpec, WorkflowError>;
@@ -2216,6 +2357,17 @@ pub struct InMemoryWorkflows {
     /// count and spend happen under that store's lock, which is what
     /// orders them against an admission (backlog ce8b7d66, part 4).
     packets: Option<Arc<crate::in_memory::InMemoryJobs>>,
+    /// How many times each kind's `get_version` was read, failed reads
+    /// included, for [`InMemoryWorkflows::version_reads`].
+    version_reads: Arc<Mutex<HashMap<String, usize>>>,
+    /// How many more `get_version` reads of a kind answer before every
+    /// later one fails, set by [`InMemoryWorkflows::fail_version_read_after`].
+    version_reads_left: Arc<Mutex<HashMap<String, usize>>>,
+    /// The in-memory publication fence: held across a guarded publish,
+    /// whose guard is async and so runs with `rows` unlocked (review R3
+    /// of car 8715776d), so two publishes still judge and flip one at a
+    /// time, as they do under the Pg adapter's table lock.
+    publishing: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for InMemoryWorkflows {
@@ -2242,7 +2394,44 @@ impl InMemoryWorkflows {
             discarded_high_water: Arc::new(Mutex::new(HashMap::new())),
             packets: None,
             publication_coverage: PublicationCoverage::Unconfigured,
+            version_reads: Arc::new(Mutex::new(HashMap::new())),
+            version_reads_left: Arc::new(Mutex::new(HashMap::new())),
+            publishing: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// Let the next `reads` `get_version` reads of `kind` answer, and
+    /// fail every one after them with a storage error until
+    /// [`InMemoryWorkflows::restore_version_read`] — the registry twin
+    /// of `InMemoryJobs::fail_steps_read_after`. A step write reads its
+    /// packet's pinned version more than once (the readiness pass, the
+    /// declared-terminal close, the catch-all's outcome), and the two
+    /// reads behind the first read a failure as "no terminal" and "no
+    /// outcome" (backlog 0887d2a9), so only a counted failure reaches
+    /// them.
+    pub fn fail_version_read_after(&self, kind: &str, reads: usize) {
+        if let Ok(mut left) = self.version_reads_left.lock() {
+            left.insert(kind.to_string(), reads);
+        }
+    }
+
+    /// Restore `get_version` reads of `kind` after
+    /// [`InMemoryWorkflows::fail_version_read_after`].
+    pub fn restore_version_read(&self, kind: &str) {
+        if let Ok(mut left) = self.version_reads_left.lock() {
+            left.remove(kind);
+        }
+    }
+
+    /// How many times `kind`'s versions have been read through
+    /// `get_version`, failed reads included — what a sweep over
+    /// [`InMemoryWorkflows::fail_version_read_after`] counts its
+    /// positions from.
+    pub fn version_reads(&self, kind: &str) -> usize {
+        self.version_reads
+            .lock()
+            .map(|reads| reads.get(kind).copied().unwrap_or(0))
+            .unwrap_or(0)
     }
 
     /// Explicit unjudged fixture setup, never an operational API adapter.
@@ -2408,6 +2597,16 @@ impl WorkflowRegistry for InMemoryWorkflows {
             }
         }
         let snapshot = self.publication_coverage.read().await?;
+        // The publication fence, as every other writer of an Active row
+        // takes it — the guarded publishes, `retire` and
+        // `bootstrap_reconcile`, the last two since backlog c00f305a
+        // (backlog d5c59e57): a guarded publish runs its guard
+        // with `rows` unlocked and refuses if the baselines moved, so an
+        // Active v1 written in that window refused an ordinary publish
+        // and flaked gate d71bd165. The Pg adapter's conditional insert
+        // already takes the same SHARE ROW EXCLUSIVE table lock its
+        // guarded publish holds across the guard.
+        let _publishing = self.publishing.lock().await;
         let mut rows = self.rows.lock().map_err(|_| {
             WorkflowError::Storage("conditional workflow row lock is poisoned".into())
         })?;
@@ -2462,6 +2661,19 @@ impl WorkflowRegistry for InMemoryWorkflows {
     }
 
     async fn get_version(&self, kind: &str, version: i32) -> Result<WorkflowSpec, WorkflowError> {
+        if let Ok(mut reads) = self.version_reads.lock() {
+            *reads.entry(kind.to_string()).or_default() += 1;
+        }
+        if let Ok(mut left) = self.version_reads_left.lock()
+            && let Some(n) = left.get_mut(kind)
+        {
+            if *n == 0 {
+                return Err(WorkflowError::Storage(format!(
+                    "{kind}@v{version} unreadable (injected by fail_version_read_after)"
+                )));
+            }
+            *n -= 1;
+        }
         let rows = self.rows.lock().unwrap();
         rows.get(&(kind.to_string(), version))
             .cloned()
@@ -2492,6 +2704,12 @@ impl WorkflowRegistry for InMemoryWorkflows {
         Ok(rows)
     }
 
+    async fn lineage_names(&self) -> Result<Vec<String>, WorkflowError> {
+        let names: std::collections::BTreeSet<String> =
+            self.snapshot().into_iter().map(|r| r.kind).collect();
+        Ok(names.into_iter().collect())
+    }
+
     async fn create_draft(
         &self,
         mut spec: WorkflowSpec,
@@ -2513,37 +2731,56 @@ impl WorkflowRegistry for InMemoryWorkflows {
         Ok(spec)
     }
 
-    async fn publish(
+    async fn publish_guarded(
         &self,
         kind: &str,
+        guard: PublishGuard<'_>,
         actor: &boss_core::actor::ActorId,
         _now: DateTime<Utc>,
     ) -> Result<WorkflowSpec, WorkflowError> {
         let snapshot = self.publication_coverage.read().await?;
-        let mut rows = self.rows.lock().unwrap();
+        let _publishing = self.publishing.lock().await;
+        let latest = |rows: &HashMap<(String, i32), WorkflowSpec>| {
+            rows.values()
+                .filter(|r| r.kind == kind && r.status == WorkflowStatus::Draft)
+                .max_by_key(|r| r.version)
+                .cloned()
+        };
+        let (latest_draft, judged) = {
+            let rows = self.rows.lock().unwrap();
 
-        // Find the latest draft for this kind.
-        let latest_draft = rows
-            .values()
-            .filter(|r| r.kind == kind && r.status == WorkflowStatus::Draft)
-            .max_by_key(|r| r.version)
-            .cloned()
-            .ok_or_else(|| {
+            // Find the latest draft for this kind.
+            let latest_draft = latest(&rows).ok_or_else(|| {
                 WorkflowError::NotFound(format!("no draft to publish for kind: {kind}"))
             })?;
 
-        // The publish gate — refuse before any row flips.
-        crate::workflow_lint::gate_active(&latest_draft).map_err(WorkflowError::Unviable)?;
+            // The publish gate — refuse before any row flips.
+            crate::workflow_lint::gate_active(&latest_draft).map_err(WorkflowError::Unviable)?;
 
-        judge_publication(
-            snapshot.as_ref(),
-            &rows
+            let active = rows
                 .values()
                 .filter(|s| s.status == WorkflowStatus::Active)
                 .cloned()
-                .collect::<Vec<_>>(),
-            &latest_draft,
-        )?;
+                .collect::<Vec<_>>();
+            judge_publication(snapshot.as_ref(), &active, &latest_draft)?;
+            (
+                latest_draft,
+                crate::publish_passkey::baselines(rows.values()),
+            )
+        };
+        // The guard is async (it may read), so it runs with the row lock
+        // released — and the flip below goes ahead only over exactly the
+        // rows it judged (review R3 of car 8715776d).
+        guard(judged.clone(), latest_draft.clone()).await?;
+        let mut rows = self.rows.lock().unwrap();
+        if latest(&rows).as_ref() != Some(&latest_draft)
+            || crate::publish_passkey::baselines(rows.values()) != judged
+        {
+            return Err(WorkflowError::Conflict(format!(
+                "the {kind} rows moved while its publish was judged — nothing was retired or \
+                 published; publish again"
+            )));
+        }
 
         // Demote any currently-active row for this kind.
         for ((k, _), row) in rows.iter_mut() {
@@ -2572,6 +2809,11 @@ impl WorkflowRegistry for InMemoryWorkflows {
         actor: &boss_core::actor::ActorId,
         _now: DateTime<Utc>,
     ) -> Result<(), WorkflowError> {
+        // The publication fence (backlog c00f305a): flipping an Active
+        // row to Retired moves that kind's passkey baseline, which a
+        // guarded publish compares around its unlocked guard, so a retire
+        // landing in that window refused the publish as "rows moved".
+        let _publishing = self.publishing.lock().await;
         let mut rows = self.rows.lock().unwrap();
         let any_active = rows
             .values()
@@ -2668,10 +2910,68 @@ impl WorkflowRegistry for InMemoryWorkflows {
         Ok(())
     }
 
-    async fn publish_authored(
+    async fn reject_draft(
+        &self,
+        kind: &str,
+        version: i32,
+        actor: &boss_core::actor::ActorId,
+        _now: DateTime<Utc>,
+    ) -> Result<(), WorkflowError> {
+        // One hold over judge, count and flip, as the discard takes it
+        // (rows, then jobs). Nothing here awaits.
+        let mut rows = self
+            .rows
+            .lock()
+            .map_err(|_| WorkflowError::Storage("workflow row lock is poisoned".into()))?;
+        let key = (kind.to_string(), version);
+        let Some(status) = rows.get(&key).map(|r| r.status) else {
+            return Err(WorkflowError::NotFound(format!("{kind} v{version}")));
+        };
+        match status {
+            WorkflowStatus::Rejected => return Ok(()),
+            WorkflowStatus::Draft => {}
+            other => {
+                return Err(WorkflowError::Conflict(
+                    crate::port::PinnedJobs::reject_history(kind, version, other.as_str()),
+                ));
+            }
+        }
+        // No packets handed to this adapter is a world where nothing is
+        // pinned (`with_packets`), so every reject there refuses.
+        let pinned = match &self.packets {
+            Some(p) => {
+                p.workflow_version_pins(kind, version)
+                    .ok_or_else(|| {
+                        WorkflowError::Storage("the jobs store lock is poisoned".into())
+                    })?
+                    .count
+            }
+            None => 0,
+        };
+        if pinned == 0 {
+            return Err(WorkflowError::Conflict(
+                crate::port::PinnedJobs::reject_needs_traffic(kind, version),
+            ));
+        }
+        let Some(row) = rows.get_mut(&key) else {
+            return Err(WorkflowError::NotFound(format!("{kind} v{version}")));
+        };
+        row.status = WorkflowStatus::Rejected;
+        let rejected = row.clone();
+        drop(rows);
+        self.record(crate::events::workflow_registry_event(
+            crate::events::WORKFLOW_DRAFT_REJECTED,
+            actor,
+            &rejected,
+        ));
+        Ok(())
+    }
+
+    async fn publish_authored_guarded(
         &self,
         mut spec: WorkflowSpec,
         authoring_job_id: JobId,
+        guard: PublishGuard<'_>,
         actor: &boss_core::actor::ActorId,
         now: DateTime<Utc>,
     ) -> Result<WorkflowSpec, WorkflowError> {
@@ -2680,16 +2980,28 @@ impl WorkflowRegistry for InMemoryWorkflows {
         // with no draft ever existing, so it needs its own check.
         crate::workflow_lint::gate_active(&spec).map_err(WorkflowError::Unviable)?;
 
-        let mut rows = self.rows.lock().unwrap();
-        judge_publication(
-            snapshot.as_ref(),
-            &rows
+        let _publishing = self.publishing.lock().await;
+        let judged = {
+            let rows = self.rows.lock().unwrap();
+            let active = rows
                 .values()
                 .filter(|s| s.status == WorkflowStatus::Active)
                 .cloned()
-                .collect::<Vec<_>>(),
-            &spec,
-        )?;
+                .collect::<Vec<_>>();
+            judge_publication(snapshot.as_ref(), &active, &spec)?;
+            crate::publish_passkey::baselines(rows.values())
+        };
+        // As `publish_guarded`: the async guard runs unlocked, and the
+        // write goes ahead only over the rows it judged.
+        guard(judged.clone(), spec.clone()).await?;
+        let mut rows = self.rows.lock().unwrap();
+        if crate::publish_passkey::baselines(rows.values()) != judged {
+            return Err(WorkflowError::Conflict(format!(
+                "the {} rows moved while its publish was judged — nothing was published; \
+                 publish again",
+                spec.kind
+            )));
+        }
         let next = spent_high_water(&rows, &self.discarded_high_water, &spec.kind).unwrap_or(0) + 1;
         spec.version = next;
         spec.status = WorkflowStatus::Active;
@@ -2734,6 +3046,10 @@ impl WorkflowRegistry for InMemoryWorkflows {
         // drop.
         let mut events: Vec<boss_core::event::Event> = Vec::new();
         let step_types = crate::step_registry::StepRegistry::v1();
+        // The publication fence, as `retire` takes it (backlog c00f305a):
+        // an inserted or republished Active row moves the passkey
+        // baselines a guarded publish compares around its unlocked guard.
+        let _publishing = self.publishing.lock().await;
         let mut rows = self.rows.lock().unwrap();
         let mut owned = self.bootstrap_owned.lock().unwrap();
 
@@ -2960,6 +3276,40 @@ mod pg {
         rows.into_iter().map(row_to_spec).collect()
     }
 
+    /// THE PASSKEY-EDGES FENCE (review R3 of car 8715776d): one
+    /// transaction-scoped advisory lock, taken by every write that can
+    /// change whether a kind is passkey-protected — a guarded workflow
+    /// publish, before its guard reads the dispatcher's rule graph, and
+    /// each HTTP dispatcher rule publish or retire, before it judges the
+    /// edges it would remove. The two registries live in one database,
+    /// so holding it means no rule write commits between a publish's
+    /// graph read and its flip, and no publish commits between a rule
+    /// write's baseline read and its own. One function, so the key
+    /// cannot drift between the two crates that take it.
+    pub async fn passkey_edges_fence(conn: &mut sqlx::PgConnection) -> Result<(), WorkflowError> {
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('dispatcher_rules: the passkey edges'))",
+        )
+        .execute(conn)
+        .await
+        .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Every kind's passkey BASELINE ([`crate::publish_passkey::baselines`]):
+    /// its active row, or, with none active, the row it last published —
+    /// read in the publish's own transaction, under its fence. Public so
+    /// the dispatcher's rule doors judge an edge against the same rows
+    /// the publish judge reads (review R1 of car 8715776d), with this
+    /// crate still the one reader of the `workflows` schema.
+    pub async fn passkey_baselines(
+        conn: &mut sqlx::PgConnection,
+    ) -> Result<Vec<WorkflowSpec>, WorkflowError> {
+        let rows: Vec<Row> = sqlx::query_as("SELECT DISTINCT ON (kind) kind, version, status, label, description, category, subject_kinds, steps, metadata_schema, entitlements, metadata, on_complete_create, owning_team, authoring_job_id, created_at FROM workflows WHERE status IN ('active', 'retired') ORDER BY kind, (status = 'active') DESC, version DESC")
+            .fetch_all(conn).await.map_err(|e| WorkflowError::Storage(e.to_string()))?;
+        rows.into_iter().map(row_to_spec).collect()
+    }
+
     /// The next version of `kind`: one above every number it has
     /// SPENT — its live rows and its discarded drafts
     /// (`workflow_discarded_versions`). Every allocation path asks
@@ -3033,7 +3383,7 @@ mod pg {
         description: Option<String>,
         category: String,
         subject_kinds: serde_json::Value,
-        steps: serde_json::Value,
+        steps: sqlx::types::Json<Box<serde_json::value::RawValue>>,
         metadata_schema: serde_json::Value,
         entitlements: serde_json::Value,
         metadata: serde_json::Value,
@@ -3046,7 +3396,7 @@ mod pg {
     fn row_to_spec(r: Row) -> Result<WorkflowSpec, WorkflowError> {
         let subject_kinds: Vec<String> = serde_json::from_value(r.subject_kinds)
             .map_err(|e| WorkflowError::Storage(format!("subject_kinds decode: {e}")))?;
-        let steps: Vec<StepSpec> = serde_json::from_value(r.steps)
+        let steps = crate::resource_history::steps(r.steps.0.get())
             .map_err(|e| WorkflowError::Storage(format!("steps decode: {e}")))?;
         let on_complete_create: Vec<JobTrigger> = serde_json::from_value(r.on_complete_create)
             .map_err(|e| WorkflowError::Storage(format!("on_complete_create decode: {e}")))?;
@@ -3237,6 +3587,15 @@ mod pg {
             rows.into_iter().map(row_to_spec).collect()
         }
 
+        async fn lineage_names(&self) -> Result<Vec<String>, WorkflowError> {
+            sqlx::query_scalar(
+                "SELECT kind FROM workflows GROUP BY kind ORDER BY kind COLLATE \"C\"",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| WorkflowError::Storage(e.to_string()))
+        }
+
         async fn create_draft(
             &self,
             mut spec: WorkflowSpec,
@@ -3326,9 +3685,10 @@ mod pg {
             Ok(spec)
         }
 
-        async fn publish(
+        async fn publish_guarded(
             &self,
             kind: &str,
+            guard: PublishGuard<'_>,
             actor: &boss_core::actor::ActorId,
             _now: DateTime<Utc>,
         ) -> Result<WorkflowSpec, WorkflowError> {
@@ -3379,7 +3739,14 @@ mod pg {
             // a caller happened to hand us.
             crate::workflow_lint::gate_active(&promoted).map_err(WorkflowError::Unviable)?;
 
-            judge_publication(snapshot.as_ref(), &active_in_tx(&mut tx).await?, &promoted)?;
+            // The guard reads the same rows, under the same table lock
+            // (`publication_fence`), so no publish can move the live row
+            // between its judgement and this flip.
+            let active = active_in_tx(&mut tx).await?;
+            judge_publication(snapshot.as_ref(), &active, &promoted)?;
+            let baselines = passkey_baselines(&mut tx).await?;
+            passkey_edges_fence(&mut tx).await?;
+            guard(baselines, promoted.clone()).await?;
 
             // Retire any currently-active row.
             sqlx::query(
@@ -3465,6 +3832,9 @@ mod pg {
             };
             let mut spec = row_to_spec(row)?;
 
+            // Fenced only implicitly (backlog c00f305a): this UPDATE's ROW
+            // EXCLUSIVE lock conflicts with `publication_fence`'s SHARE ROW
+            // EXCLUSIVE, so it waits out a guarded publish's guard window.
             sqlx::query(
                 "UPDATE workflows SET status = 'retired'
                  WHERE kind = $1 AND status = 'active'",
@@ -3617,10 +3987,102 @@ mod pg {
             Ok(())
         }
 
-        async fn publish_authored(
+        async fn reject_draft(
+            &self,
+            kind: &str,
+            version: i32,
+            actor: &boss_core::actor::ActorId,
+            _now: DateTime<Utc>,
+        ) -> Result<(), WorkflowError> {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+
+            // The discard's order: the table fence publication takes,
+            // then the row. A publish waiting behind this reads the row
+            // rejected and finds nothing to promote; one ahead of it
+            // leaves the row active, and this refuses it as history.
+            publication_fence(&mut tx).await?;
+            let found: Option<Row> = sqlx::query_as(
+                "SELECT kind, version, status, label, description, category,
+                        subject_kinds, steps, metadata_schema, entitlements, metadata,
+                        on_complete_create, owning_team, authoring_job_id, created_at
+                 FROM workflows
+                 WHERE kind = $1 AND version = $2
+                 FOR UPDATE",
+            )
+            .bind(kind)
+            .bind(version)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            let Some(row) = found else {
+                return Err(WorkflowError::NotFound(format!("{kind} v{version}")));
+            };
+            let mut spec = row_to_spec(row)?;
+            match spec.status {
+                // Idempotent — nothing to do, so nothing to record.
+                WorkflowStatus::Rejected => return Ok(()),
+                WorkflowStatus::Draft => {}
+                other => {
+                    return Err(WorkflowError::Conflict(
+                        crate::port::PinnedJobs::reject_history(kind, version, other.as_str()),
+                    ));
+                }
+            }
+
+            // Counted inside this transaction, under the row lock an
+            // admission's `FOR KEY SHARE` waits on, as the discard's
+            // count is (backlog ce8b7d66, part 4).
+            let pinned = crate::postgres::pinned_to_workflow(&mut *tx, kind, version)
+                .await
+                .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            if pinned.count == 0 {
+                return Err(WorkflowError::Conflict(
+                    crate::port::PinnedJobs::reject_needs_traffic(kind, version),
+                ));
+            }
+
+            let flipped = sqlx::query(
+                "UPDATE workflows SET status = 'rejected'
+                 WHERE kind = $1 AND version = $2 AND status = 'draft'",
+            )
+            .bind(kind)
+            .bind(version)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            if flipped.rows_affected() != 1 {
+                // Unreachable under the row lock; refused rather than
+                // recorded, as the discard's and the publish's are.
+                return Err(WorkflowError::Conflict(format!(
+                    "{kind} v{version} was not a draft when the reject reached it"
+                )));
+            }
+            spec.status = WorkflowStatus::Rejected;
+
+            let event = crate::events::workflow_registry_event(
+                crate::events::WORKFLOW_DRAFT_REJECTED,
+                actor,
+                &spec,
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(WorkflowError::Storage)?;
+
+            tx.commit()
+                .await
+                .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            Ok(())
+        }
+
+        async fn publish_authored_guarded(
             &self,
             mut spec: WorkflowSpec,
             authoring_job_id: JobId,
+            guard: PublishGuard<'_>,
             actor: &boss_core::actor::ActorId,
             now: DateTime<Utc>,
         ) -> Result<WorkflowSpec, WorkflowError> {
@@ -3637,7 +4099,11 @@ mod pg {
                 .map_err(|e| WorkflowError::Storage(e.to_string()))?;
             publication_fence(&mut tx).await?;
 
-            judge_publication(snapshot.as_ref(), &active_in_tx(&mut tx).await?, &spec)?;
+            let active = active_in_tx(&mut tx).await?;
+            judge_publication(snapshot.as_ref(), &active, &spec)?;
+            let baselines = passkey_baselines(&mut tx).await?;
+            passkey_edges_fence(&mut tx).await?;
+            guard(baselines, spec.clone()).await?;
 
             // Compute next version inside the transaction so a
             // concurrent publish can't race us into a duplicate.
@@ -3693,7 +4159,7 @@ mod pg {
                 description: Option<String>,
                 category: String,
                 subject_kinds: serde_json::Value,
-                steps: serde_json::Value,
+                steps: sqlx::types::Json<Box<serde_json::value::RawValue>>,
                 metadata_schema: serde_json::Value,
                 entitlements: serde_json::Value,
                 metadata: serde_json::Value,
@@ -3706,6 +4172,9 @@ mod pg {
 
             let mut stats = KindReconcileStats::default();
             let step_types = crate::step_registry::StepRegistry::v1();
+            // Fenced only implicitly (backlog c00f305a): each INSERT and
+            // UPDATE below takes ROW EXCLUSIVE on `workflows`, which waits
+            // out `publication_fence`'s SHARE ROW EXCLUSIVE.
 
             for default in defaults {
                 // Platform seeding sets rows ACTIVE, so it answers to
@@ -3926,9 +4395,9 @@ mod pg {
 }
 
 #[cfg(feature = "postgres")]
-pub use pg::PgWorkflows;
-#[cfg(feature = "postgres")]
 pub(crate) use pg::active_rows_in as active_workflow_rows_in;
+#[cfg(feature = "postgres")]
+pub use pg::{PgWorkflows, passkey_baselines, passkey_edges_fence};
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -4255,8 +4724,17 @@ mod tests {
                  must carry it",
                 want.kind
             );
+            // `owner` is the station tree's (T6, backlog baac0b65): the
+            // stable id of the station that owns the protocol, a tenant
+            // fact the bundle row carries and the replaced literal never
+            // did, judged by station_tree::validate_protocol_owners and
+            // pinned in tests/station_tree.rs. Every other key matches.
+            let mut got_metadata = got.metadata.clone();
+            if let Some(m) = got_metadata.as_object_mut() {
+                m.remove(crate::station_tree::OWNER_KEY);
+            }
             assert_eq!(
-                got.metadata, want.metadata,
+                got_metadata, want.metadata,
                 "{}: metadata (owner_role lives here)",
                 want.kind
             );
@@ -4294,7 +4772,23 @@ mod tests {
             // Compared as JSON rather than by PartialEq so the failure
             // names the offending step and shows both sides, which is
             // what a transcription error needs in order to be fixable.
-            let got_steps = serde_json::to_value(&got.steps).expect("bundle steps serialize");
+            //
+            // A step's placement is the station tree's, as `owner` is
+            // (sweep 2 of design c0ae096f, backlog baac0b65): `at` names
+            // the station a step stands at and `fulfilled_by` its
+            // hand-off, tenant facts the replaced literal never carried,
+            // judged by station_tree::validate_protocol_subtree and pinned
+            // in tests/station_tree.rs. Every other default matches.
+            let mut got_steps = serde_json::to_value(&got.steps).expect("bundle steps serialize");
+            for step in got_steps.as_array_mut().into_iter().flatten() {
+                if let Some(defaults) = step
+                    .get_mut("metadata_defaults")
+                    .and_then(|d| d.as_object_mut())
+                {
+                    defaults.remove(crate::station_tree::AT_KEY);
+                    defaults.remove(crate::station_tree::FULFILLED_BY_KEY);
+                }
+            }
             let want_steps = serde_json::to_value(&want.steps).expect("spec steps serialize");
             assert_eq!(
                 got_steps, want_steps,
@@ -6655,6 +7149,166 @@ mod tests {
         }
     }
 
+    /// THE CONDITIONAL INSERT WAITS FOR A PUBLISH IN JUDGEMENT (backlog
+    /// d5c59e57, 2026-11-10). A guarded publish runs its guard with the
+    /// rows unlocked and refuses if the passkey baselines moved meanwhile
+    /// (since b474a9281). The conditional insert wrote its Active v1
+    /// without the publishing fence, so one landing in that window turned
+    /// an ordinary publish into a "rows moved" Conflict: the test above
+    /// flaked on it and turned gate d71bd165 red on a car that never
+    /// touched this file. The guard here IS the window — it polls the
+    /// conditional insert once while the publish holds its fence — so the
+    /// interleaving is forced rather than hoped for.
+    #[tokio::test]
+    async fn a_conditional_insert_waits_for_a_publish_in_judgement() {
+        use futures::FutureExt;
+        let registry = InMemoryWorkflows::for_fixture();
+        let kind = "conditional-in-the-window";
+        let wrote_in_window = std::sync::Mutex::new(None);
+        let guard = |_: Vec<WorkflowSpec>, _: WorkflowSpec| -> PublishVerdict {
+            let inside = registry
+                .publish_authored_if_absent(
+                    reconcile_spec(kind, "Conditional insertion"),
+                    JobId::new(),
+                    &test_actor(),
+                    Utc::now(),
+                )
+                .now_or_never();
+            *wrote_in_window.lock().unwrap() = Some(inside.is_some());
+            Box::pin(async { Ok(()) })
+        };
+        let published = registry
+            .publish_authored_guarded(
+                reconcile_spec(kind, "Ordinary publish"),
+                JobId::new(),
+                &guard,
+                &test_actor(),
+                Utc::now(),
+            )
+            .await
+            .expect("a conditional insert in the guard's window must not refuse the publish");
+        assert_eq!(published.version, 1);
+        assert_eq!(
+            *wrote_in_window.lock().unwrap(),
+            Some(false),
+            "the conditional insert finished while a publish held its fence"
+        );
+        // Run after the publish, it finds history and refuses, as it does
+        // under the Pg adapter's table lock.
+        let after = registry
+            .publish_authored_if_absent(
+                reconcile_spec(kind, "Conditional insertion"),
+                JobId::new(),
+                &test_actor(),
+                Utc::now(),
+            )
+            .await;
+        assert!(
+            matches!(after, Err(WorkflowError::Conflict(_))),
+            "{after:?}"
+        );
+        assert_eq!(registry.list_versions(kind).await.unwrap().len(), 1);
+    }
+
+    /// A RETIRE WAITS FOR A PUBLISH IN JUDGEMENT (backlog c00f305a,
+    /// 2026-11-11). The follow-up the test above promised: retire flips
+    /// an Active row to Retired, which moves that kind's passkey
+    /// baseline, and it did so without the publishing fence — so a
+    /// retire of ANY kind landing in a guarded publish's guard window
+    /// refused that publish as "rows moved". The guard polls the retire
+    /// once while the publish holds the fence, forcing the interleaving.
+    #[tokio::test]
+    async fn a_retire_waits_for_a_publish_in_judgement() {
+        use futures::FutureExt;
+        let registry = InMemoryWorkflows::for_fixture();
+        let kind = "publish-beside-a-retire";
+        let other = "retired-in-the-window";
+        registry
+            .bootstrap_reconcile(
+                &[reconcile_spec(other, "Live until retired")],
+                &test_actor(),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let retired_in_window = std::sync::Mutex::new(None);
+        let guard = |_: Vec<WorkflowSpec>, _: WorkflowSpec| -> PublishVerdict {
+            let inside = registry
+                .retire(other, &test_actor(), Utc::now())
+                .now_or_never();
+            *retired_in_window.lock().unwrap() = Some(inside.is_some());
+            Box::pin(async { Ok(()) })
+        };
+        let published = registry
+            .publish_authored_guarded(
+                reconcile_spec(kind, "Ordinary publish"),
+                JobId::new(),
+                &guard,
+                &test_actor(),
+                Utc::now(),
+            )
+            .await
+            .expect("a retire in the guard's window must not refuse the publish");
+        assert_eq!(published.version, 1);
+        assert_eq!(
+            *retired_in_window.lock().unwrap(),
+            Some(false),
+            "the retire finished while a publish held its fence"
+        );
+        // Run after the publish, the retire goes ahead.
+        registry
+            .retire(other, &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        assert!(registry.get_active(other).await.is_err());
+    }
+
+    /// A BOOTSTRAP RECONCILE WAITS FOR A PUBLISH IN JUDGEMENT (backlog
+    /// c00f305a, 2026-11-11). The reconcile inserts Active rows and
+    /// republishes drifted ones, both of which move the passkey
+    /// baselines a guarded publish compares around its unlocked guard,
+    /// and it took no publishing fence. Forced as above: the guard polls
+    /// a reconcile that would insert a new kind.
+    #[tokio::test]
+    async fn a_bootstrap_reconcile_waits_for_a_publish_in_judgement() {
+        use futures::FutureExt;
+        let registry = InMemoryWorkflows::for_fixture();
+        let kind = "publish-beside-a-reconcile";
+        let seeded = "seeded-in-the-window";
+        let defaults = vec![reconcile_spec(seeded, "Seeded by the reconcile")];
+        let reconciled_in_window = std::sync::Mutex::new(None);
+        let guard = |_: Vec<WorkflowSpec>, _: WorkflowSpec| -> PublishVerdict {
+            let inside = registry
+                .bootstrap_reconcile(&defaults, &test_actor(), Utc::now())
+                .now_or_never();
+            *reconciled_in_window.lock().unwrap() = Some(inside.is_some());
+            Box::pin(async { Ok(()) })
+        };
+        let published = registry
+            .publish_authored_guarded(
+                reconcile_spec(kind, "Ordinary publish"),
+                JobId::new(),
+                &guard,
+                &test_actor(),
+                Utc::now(),
+            )
+            .await
+            .expect("a reconcile in the guard's window must not refuse the publish");
+        assert_eq!(published.version, 1);
+        assert_eq!(
+            *reconciled_in_window.lock().unwrap(),
+            Some(false),
+            "the reconcile finished while a publish held its fence"
+        );
+        // Run after the publish, the reconcile seeds its kind.
+        let stats = registry
+            .bootstrap_reconcile(&defaults, &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(stats.inserted, 1);
+        assert_eq!(registry.get_active(seeded).await.unwrap().version, 1);
+    }
+
     #[tokio::test]
     async fn reviewer_discard_never_exposes_absence_before_spending_identity() {
         let registry = Arc::new(InMemoryWorkflows::for_fixture());
@@ -7521,6 +8175,54 @@ mod tests {
         );
         assert_eq!(retired[0].payload["kind"], "repair");
         assert_eq!(retired[0].payload["status"], "retired");
+    }
+
+    /// Backlog 50ded63d: a rejection is on the record once, carrying
+    /// the row it rejected; a second reject touches nothing and records
+    /// nothing, as a second retire does.
+    #[tokio::test]
+    async fn reject_records_once_and_stays_silent_when_already_rejected() {
+        let jobs = Arc::new(crate::in_memory::InMemoryJobs::new());
+        let reg = InMemoryWorkflows::for_fixture().with_packets(jobs.clone());
+        let actor = test_actor();
+        let d = reg
+            .create_draft(seed_spec("repair"), &actor, Utc::now())
+            .await
+            .unwrap();
+        let mut pinned = boss_core::job::Job::new(
+            "repair",
+            Subject::new("account", "acct-1"),
+            "a candidate packet",
+            "emp-1",
+            boss_core::job::Priority::Standard,
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 18).unwrap(),
+        )
+        .with_workflow_version(d.version);
+        pinned.status = boss_core::job::JobStatus::Open;
+        crate::port::JobsRepository::create_job(jobs.as_ref(), &pinned)
+            .await
+            .unwrap();
+
+        reg.reject_draft("repair", d.version, &actor, Utc::now())
+            .await
+            .unwrap();
+        reg.reject_draft("repair", d.version, &actor, Utc::now())
+            .await
+            .unwrap();
+
+        let rejected: Vec<_> = reg
+            .recorded_events()
+            .into_iter()
+            .filter(|e| e.kind == crate::events::WORKFLOW_DRAFT_REJECTED)
+            .collect();
+        assert_eq!(
+            rejected.len(),
+            1,
+            "an idempotent reject must not record a second event"
+        );
+        assert_eq!(rejected[0].payload["kind"], "repair");
+        assert_eq!(rejected[0].payload["version"], d.version);
+        assert_eq!(rejected[0].payload["status"], "rejected");
     }
 
     #[tokio::test]

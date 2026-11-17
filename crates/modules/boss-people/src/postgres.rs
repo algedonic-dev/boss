@@ -39,6 +39,19 @@ pub struct PgPeople {
     coverage: Option<Arc<dyn crate::coverage_guard::CoverageRead>>,
 }
 
+#[async_trait]
+impl boss_core::roster_capacity::RosterCapacitySnapshot for PgPeople {
+    async fn snapshot(
+        &self,
+        eligibility: &[boss_core::roster_capacity::ClassRequirement],
+    ) -> Result<
+        boss_core::roster_capacity::RosterSnapshot,
+        boss_core::roster_capacity::RosterSnapshotError,
+    > {
+        crate::roster_capacity::snapshot(&self.pool, eligibility).await
+    }
+}
+
 impl PgPeople {
     /// Construct a PgPeople with no registry clients wired. Used by
     /// in-memory / test paths; production binaries always wire both

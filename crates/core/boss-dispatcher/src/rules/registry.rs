@@ -52,6 +52,9 @@ pub struct RawRegistry {
 #[serde(deny_unknown_fields)]
 pub struct RawRule {
     pub name: String,
+    /// Independent event delivery, not a different handler or authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_lane: Option<String>,
     /// The NATS topic this rule listens for. Mutually exclusive with
     /// `schedule`. Optional so a schedule-triggered rule can omit it;
     /// `from_raw` requires exactly one of `on_event` / `schedule`.
@@ -461,13 +464,14 @@ pub async fn load_active_rules(pool: &sqlx::PgPool) -> Result<RawRegistry, Regis
 /// one list, read by [`load_active_rules`] and by the seed's
 /// same-version comparison (`super::seed`, backlog 732c3cf9), so the two
 /// cannot disagree about what "the row" is.
-pub(crate) const RULE_COLUMNS: &str = "name, on_event, when_expr, do_steps, delay, version, \
+pub(crate) const RULE_COLUMNS: &str = "name, delivery_lane, on_event, when_expr, do_steps, delay, version, \
      schedule_cadence, schedule_anchor, schedule_calendar";
 
 /// One `dispatcher_rules` row as [`RULE_COLUMNS`] selects it.
 #[derive(sqlx::FromRow)]
 pub(crate) struct RuleRow {
     pub(crate) name: String,
+    delivery_lane: Option<String>,
     // Nullable now: a schedule-triggered rule has no `on_event`.
     on_event: Option<String>,
     when_expr: Option<String>,
@@ -514,6 +518,7 @@ impl RuleRow {
             }
         };
         Ok(RawRule {
+            delivery_lane: r.delivery_lane,
             name: r.name,
             on_event: r.on_event,
             schedule,
@@ -574,6 +579,7 @@ impl Schedule {
 #[derive(Debug, Clone)]
 pub struct Rule {
     pub name: String,
+    pub delivery_lane: Option<String>,
     /// What fires this rule — an event topic or a schedule.
     pub trigger: Trigger,
     pub when: Option<Expr>,
@@ -753,6 +759,20 @@ impl Registry {
 
 impl Rule {
     pub fn from_raw(r: RawRule) -> Result<Self, RegistryError> {
+        if let Some(lane) = &r.delivery_lane
+            && (r.on_event.is_none()
+                || lane.is_empty()
+                || lane.len() > 48
+                || !lane
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+                || lane == "dispatcher-rules")
+        {
+            return Err(RegistryError::Storage(format!(
+                "rule {:?}: invalid event delivery_lane {:?}",
+                r.name, lane
+            )));
+        }
         // A rule is triggered by EXACTLY ONE of `on_event` / `schedule`.
         let trigger = match (&r.on_event, &r.schedule) {
             (Some(topic), None) => Trigger::Event(TopicPattern::parse(topic)?),
@@ -801,6 +821,7 @@ impl Rule {
         }
         Ok(Rule {
             name: r.name,
+            delivery_lane: r.delivery_lane,
             trigger,
             when,
             do_steps,
@@ -850,6 +871,33 @@ pub enum RegistryError {
          `:`-separated segments of letters, digits and `-`, none empty"
     )]
     NotAFamilyMember { rule: String, family: String },
+    /// A rule declaring a `delay` (backlog 84a010cb). The field parses
+    /// and is stored, but nothing executes it: the matcher drops it and
+    /// the runner dispatches at once, so accepting it would publish a
+    /// timing claim the system does not keep. Refused until the durable
+    /// delayed-admission contract (design f1d66249) is built.
+    #[error(
+        "rule {rule:?} declares delay {delay:?}, which is refused: no delayed admission is \
+         implemented, and the dispatcher would run its handlers immediately on the triggering \
+         event (backlog 84a010cb, design f1d66249) — remove the delay"
+    )]
+    UnsupportedDelay { rule: String, delay: String },
+    /// A rule declaring a `delay` the delayed-admission contract would
+    /// refuse even once it executes (backlog 84a010cb, car 1 of design
+    /// f1d66249's finish line): malformed, zero, signed or overflowing,
+    /// or a shape it does not support — periodic, several effects, a
+    /// handler other than `jobs.spawn`. Named apart from
+    /// [`Self::UnsupportedDelay`] so the author learns the declaration
+    /// itself is wrong, not merely early.
+    #[error(
+        "rule {rule:?} declares delay {delay:?}, which is refused: {reason} (backlog 84a010cb, \
+         design f1d66249)"
+    )]
+    MalformedDelay {
+        rule: String,
+        delay: String,
+        reason: super::delayed::DelayRefusal,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +940,23 @@ pub fn match_event(
             continue;
         };
         if !pattern.matches(topic) {
+            continue;
+        }
+        // A delayed rule never fires at match time (backlog 84a010cb).
+        // `authoring::validate` refuses a `delay`, but an active row is
+        // loaded through `Rule::from_raw`, which does not call it — and
+        // matching used to drop the delay and hand the runner its
+        // handlers on the triggering event. Until the durable admission
+        // contract (design f1d66249) executes the delay, refuse the rule
+        // loudly here, before its predicate, so nothing fires.
+        if let Some(delay) = &rule.delay {
+            skipped.push(SkippedRule {
+                rule: rule.name.clone(),
+                err: MatchError::UnsupportedDelay {
+                    rule: rule.name.clone(),
+                    delay: delay.clone(),
+                },
+            });
             continue;
         }
         if let Some(when) = &rule.when {
@@ -1042,6 +1107,13 @@ pub enum MatchError {
         arg: String,
         err: expr::EvalError,
     },
+    /// A rule declaring a `delay` reached the matcher (backlog 84a010cb):
+    /// nothing executes the delay yet, so it is refused, never fired.
+    #[error(
+        "rule {rule:?} declares delay {delay:?}, which nothing executes: refused and not fired \
+         (backlog 84a010cb, design f1d66249) — remove the delay"
+    )]
+    UnsupportedDelay { rule: String, delay: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -1562,6 +1634,7 @@ handler = "h"
         // structurally — a schedule rule must omit `on_event` and carry
         // `schedule`, an event rule the reverse. Guard both shapes.
         let raw_sched = RawRule {
+            delivery_lane: None,
             name: "s".into(),
             on_event: None,
             schedule: Some(RawSchedule {
@@ -1580,6 +1653,7 @@ handler = "h"
         assert_eq!(v["schedule"]["cadence"], "weekly");
 
         let raw_event = RawRule {
+            delivery_lane: None,
             name: "e".into(),
             on_event: Some("step.done.x".into()),
             schedule: None,

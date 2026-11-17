@@ -39,6 +39,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
+use crate::car_retire::Door;
 use crate::gate;
 use crate::park;
 
@@ -103,13 +104,9 @@ fn select_car(cars: &[Value], given: &str) -> Result<(Value, String)> {
 /// carries no such branch. Asked of the REMOTE, not of a local ref, so
 /// it is true without a fetch — `--finish` never fetches.
 fn forge_head(branch: &str) -> Result<Option<String>> {
-    Ok(git(
-        ".",
-        &["ls-remote", "origin", &format!("refs/heads/{branch}")],
-    )?
-    .lines()
-    .find_map(|l| l.split_whitespace().next())
-    .map(str::to_string))
+    let reference = format!("refs/heads/{branch}");
+    let output = git(".", &["ls-remote", "origin", &reference])?;
+    Ok(crate::receipt::exact_ref_head(&output, &reference))
 }
 
 /// Does the forge already carry this branch? The one probe both the
@@ -160,16 +157,18 @@ fn finish_target<'a>(car_branch: &'a str, derived: &'a str, derived_on_forge: bo
 fn repoint_note(old_branch: &str, new_branch: &str) -> String {
     if old_branch == new_branch {
         format!(
-            "receipt refreshed in place by boss rerail --finish: {new_branch}'s head moved \
-             (rebase, re-rail or a renumbered migration), so the current green gate-run's \
-             receipt was machine-copied to regate_receipt and the stale skip cleared (the \
-             frozen gate step stays as the original head's record)"
+            "receipt refreshed in place by boss rerail --finish: a current green vouches for \
+             {new_branch}'s head, so its receipt was machine-copied to regate_receipt and \
+             the stale skip cleared (the \
+             completed gate step stays as the original head's record; an unfinished gate \
+             is completed with the current green)"
         )
     } else {
         format!(
             "rerailed from {old_branch} by boss rerail: new branch cut from \
              origin/main, re-gated, receipt machine-copied to regate_receipt \
-             (the frozen gate step stays as the original head's record)"
+             (a completed gate step stays as the original head's record; an unfinished \
+             gate is completed with the current green)"
         )
     }
 }
@@ -223,29 +222,30 @@ fn origins_after(
     Some(out)
 }
 
-/// Repoint the car at the re-gated branch: `branch` moves, the fresh
-/// receipt rides `regate_receipt` VERBATIM, and the skip_reason is
-/// deleted (a PATCH key set to null is removed — the metadata door's
-/// documented contract) so the next boarding no longer sees a skip.
+/// The metadata-door body that repoints the car at the re-gated branch:
+/// `branch` moves, the fresh receipt rides `regate_receipt` VERBATIM,
+/// and the skip_reason is deleted (a PATCH key set to null is removed —
+/// the metadata door's documented contract) so the next boarding no
+/// longer sees a skip. Built, not sent: `finish` sends it, or — under
+/// `--dry-run` — prints it (backlog 1e9aeea9).
 ///
 /// `old_branch == new_branch` is the refresh-in-place case: the branch
 /// write is a no-op and only the receipt and the skip move.
-async fn repoint(
-    http: &crate::machine_http::MachineClient,
-    car_id: &str,
+fn repoint_patch(
+    tree: &dyn Tree,
     new_branch: &str,
     receipt: &boss_jobs::car::Receipt,
     old_branch: &str,
     origins: Option<Vec<Value>>,
     proof: serde_json::Map<String, Value>,
-) -> Result<()> {
+) -> Value {
     // The regate write itself — receipt verbatim, skip cleared — is
     // core's builder, shared with `boss park` and the auto-park handler
     // (a re-gate of a still-parked car refreshes it the same way); the
     // repoint is what rerail adds, because here the branch moved too.
     // The branch moved, so re-classify the channel from the new branch's
     // diff (None if it won't resolve — safe, the key is then left as-is).
-    let dc = crate::channels::delivery_channel_for(new_branch);
+    let dc = tree.channel(new_branch);
     let mut patch = boss_jobs::car::regate_patch(
         receipt,
         &repoint_note(old_branch, new_branch),
@@ -256,7 +256,7 @@ async fn repoint(
     // the channel — empty when the diff will not resolve, so nothing is
     // stripped.
     if let Some(m) = patch.as_object_mut() {
-        m.extend(crate::channels::tier_stamps_for(new_branch));
+        m.extend(tree.tiers(new_branch));
         // The probe the green states, when it states one — the same
         // copy the auto-park refresh makes (79a17c7a). Empty for a bare
         // re-gate, which leaves the car's own proof keys where they are.
@@ -267,14 +267,53 @@ async fn repoint(
     if let Some(origins) = origins {
         patch["rerail_origins"] = json!(origins);
     }
-    crate::sor_client::api(
-        http,
-        reqwest::Method::PATCH,
-        &format!("/api/jobs/{car_id}/metadata"),
-        Some(patch),
-    )
-    .await?;
-    Ok(())
+    patch
+}
+
+/// What `--finish` reads from git and the forge, apart from what it
+/// reads from the system of record (backlog 1e9aeea9). Split out so the
+/// whole finishing half — every read it makes and every write it would
+/// make — runs against fixtures, which is what lets a test prove that
+/// `--dry-run` sends no write at all rather than trust that it does.
+/// [`Checkout`] is the live one: the checkout the verb runs in.
+trait Tree {
+    /// The head the forge carries for `branch` (`gate::resolve_sha`).
+    fn head(&self, branch: &str) -> Result<String>;
+    /// The forge's head for `branch`, `None` when it has no such branch.
+    fn forge_head(&self, branch: &str) -> Result<Option<String>>;
+    /// The ops-verb judgement of the diff `head` carries on `branch`.
+    fn judge(&self, branch: &str, head: &str) -> crate::mutating_verb::Judgement;
+    /// The delivery channel `branch`'s diff classifies as.
+    fn channel(&self, branch: &str) -> Option<String>;
+    /// The tier stamps `branch`'s diff earns.
+    fn tiers(&self, branch: &str) -> serde_json::Map<String, Value>;
+    /// Does `rev`'s tree still hold the kept probe's needle?
+    fn holds(&self, rev: &str, n: &crate::kept_probe::Needle) -> Option<bool>;
+}
+
+/// The checkout `boss rerail` runs in, and the forge its `origin` names.
+struct Checkout;
+
+impl Tree for Checkout {
+    fn head(&self, branch: &str) -> Result<String> {
+        gate::resolve_sha(branch)
+    }
+    fn forge_head(&self, branch: &str) -> Result<Option<String>> {
+        forge_head(branch)
+    }
+    fn judge(&self, branch: &str, head: &str) -> crate::mutating_verb::Judgement {
+        let base = crate::freshness::observe(std::path::Path::new("."), branch).base;
+        crate::mutating_verb::judge(std::path::Path::new("."), &base, head)
+    }
+    fn channel(&self, branch: &str) -> Option<String> {
+        crate::channels::delivery_channel_for(branch)
+    }
+    fn tiers(&self, branch: &str) -> serde_json::Map<String, Value> {
+        crate::channels::tier_stamps_for(branch)
+    }
+    fn holds(&self, rev: &str, n: &crate::kept_probe::Needle) -> Option<bool> {
+        crate::kept_probe::holds(".", rev, n)
+    }
 }
 
 /// The stamps that record a rerail on the gate-run packets, so the
@@ -321,6 +360,8 @@ pub(crate) fn rerail_stamps(
 enum Retired {
     /// Clean, and removed.
     Removed(String),
+    /// Clean, and left in place: `--dry-run` only says it would go.
+    WouldRemove(String),
     /// Uncommitted changes: kept, because they may be the only copy of
     /// a resolution.
     KeptDirty(String),
@@ -333,9 +374,9 @@ enum Retired {
 impl PartialEq for Retired {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Removed(a), Self::Removed(b)) | (Self::KeptDirty(a), Self::KeptDirty(b)) => {
-                a == b
-            }
+            (Self::Removed(a), Self::Removed(b))
+            | (Self::WouldRemove(a), Self::WouldRemove(b))
+            | (Self::KeptDirty(a), Self::KeptDirty(b)) => a == b,
             (Self::Absent, Self::Absent) => true,
             (Self::Unreadable(a, _), Self::Unreadable(b, _)) => a == b,
             _ => false,
@@ -351,14 +392,16 @@ impl PartialEq for Retired {
 /// verb adds itself ([`temporary_worktree`]) — an actor's own worktree
 /// is never taken. A worktree with uncommitted changes is never removed
 /// — it may hold the only copy of a resolution — and an unreadable one
-/// is left and named.
-fn retire_rerail_worktree(wt: &str) -> Retired {
+/// is left and named. Under `--dry-run` a clean one is only named
+/// ([`Retired::WouldRemove`]): a dry run removes nothing (1e9aeea9).
+fn retire_rerail_worktree(wt: &str, dry: bool) -> Retired {
     let wt = wt.to_string();
     if !std::path::Path::new(&wt).exists() {
         return Retired::Absent;
     }
     match git(&wt, &["status", "--porcelain"]) {
         Ok(s) if !s.trim().is_empty() => Retired::KeptDirty(wt),
+        Ok(_) if dry => Retired::WouldRemove(wt),
         Ok(_) => match git(&wt, &["worktree", "remove", "--force", &wt]) {
             Ok(_) => Retired::Removed(wt),
             Err(e) => Retired::Unreadable(wt, e),
@@ -539,7 +582,7 @@ enum Picked {
 /// would have fired at two trains and not after. A wrong drop boards a car
 /// silently without its change; a named twin costs a human seconds.
 fn pick_onto(wt: &str, base: &str, tip: &str) -> Result<Picked> {
-    use crate::freshness::Dropped;
+    use crate::freshness::{Dropped, DroppedHow};
     // The committer is this verb, set explicitly as `boss gate --rebase`
     // sets it: a gate runner's or a test's environment has no identity.
     let run = |args: &[&str]| -> Result<std::process::Output> {
@@ -564,13 +607,41 @@ fn pick_onto(wt: &str, base: &str, tip: &str) -> Result<Picked> {
     // moves HEAD: a twin is looked for there, never among the car's own
     // replayed commits.
     let onto = git(wt, &["rev-parse", "HEAD"])?;
-    let mut out = run(&["cherry-pick", &range])?;
+    // A predecessor landed as a squash of a SERIES conflicts at its first
+    // commit instead of replaying empty (backlog 48bb0b42): main holds the
+    // series' final state blob for blob, so that prefix is skipped and
+    // named by the one rule `boss gate --rebase` uses, and only the
+    // commits after it are picked.
+    let listed = git(wt, &["rev-list", "--reverse", &range])?;
+    let commits: Vec<&str> = listed.lines().filter(|l| !l.is_empty()).collect();
+    let skip = crate::freshness::landed_prefix(&|args: &[&str]| run(args), &onto, base, &commits)?;
     let mut dropped: Vec<Dropped> = Vec::new();
+    for c in &commits[..skip] {
+        let title = git(wt, &["log", "-1", "--format=%s", c])
+            .unwrap_or_else(|_| "(title unreadable)".to_string());
+        dropped.push(Dropped {
+            sha: c.to_string(),
+            title,
+            how: DroppedHow::LandedPrefix { len: skip },
+        });
+    }
+    if skip == count {
+        return Ok(Picked::Landed { dropped });
+    }
+    let range = if skip > 0 {
+        format!("{}..{tip}", commits[skip - 1])
+    } else {
+        range
+    };
+    let mut out = run(&["cherry-pick", &range])?;
     while !out.status.success() {
         let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        let files = git(wt, &["diff", "--name-only", "--diff-filter=U"])
-            .unwrap_or_default()
-            .replace('\n', ", ");
+        let files = git(
+            wt,
+            &["diff", "--no-renames", "--name-only", "--diff-filter=U"],
+        )
+        .unwrap_or_default()
+        .replace('\n', ", ");
         let picking = git(wt, &["rev-parse", "--verify", "-q", "CHERRY_PICK_HEAD"]).ok();
         if !files.is_empty() {
             return Ok(Picked::Conflict {
@@ -589,7 +660,11 @@ fn pick_onto(wt: &str, base: &str, tip: &str) -> Result<Picked> {
             return Ok(Picked::Failed { said });
         };
         let title = git(wt, &["log", "-1", "--format=%s", &sha]).unwrap_or_default();
-        dropped.push(Dropped { sha, title });
+        dropped.push(Dropped {
+            sha,
+            title,
+            how: DroppedHow::EmptyReplay,
+        });
         out = run(&["cherry-pick", "--skip"])?;
     }
     Ok(if dropped.len() == count {
@@ -599,35 +674,25 @@ fn pick_onto(wt: &str, base: &str, tip: &str) -> Result<Picked> {
     })
 }
 
-/// What main holds that matches a stopped commit's patch text.
-#[derive(Debug, PartialEq, Eq)]
-enum TwinFound {
-    /// The same change: equal `git diff-tree --raw` — every path, mode,
-    /// old blob and new blob — so main took THIS change once.
-    Same,
-    /// Only the same patch TEXT (`patch-id --verbatim` equal, raw
-    /// diff-tree not): patch-id drops the @@ line numbers, so the hunk
-    /// may sit elsewhere in the file — a repeated stanza in a TOML
-    /// registry, a YAML manifest, a test (review 0a5496cb, finding 1).
-    Elsewhere,
-}
-
-/// Single-quote `s` for a shell, so a printed command pastes as printed
-/// whatever the path holds (review 0a5496cb, finding 6).
-fn sh_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
-
 /// What a conflict stop on `sha` says about main's twin of it, or `None`
 /// when main never took its patch text. A twin proves main took the
 /// change ONCE, never that it holds it now — so this names the twin and
 /// the read that shows what main did since, and the decision stays with
 /// the human. Only an identical change is offered `--skip`: a twin of the
-/// text alone is named as such, and the stop is the ordinary one. A
+/// text alone is named as a match that may or may not be this change,
+/// and the stop is the ordinary one. A
 /// lookup that fails says so: the stop is the one that was always there.
+/// The lookup is [`crate::twin`]'s, shared with `boss gate --rebase`
+/// (backlog 6e38a79e); the words are this verb's own.
 fn twin_note(wt: &str, onto: &str, tip: &str, sha: &str) -> Option<String> {
+    use crate::twin::{Twin, TwinFound, sh_quote, twin_on_main};
     let short = |s: &str| s[..12.min(s.len())].to_string();
-    let (found, twin, subject, files) = match twin_on_main(wt, onto, tip, sha) {
+    let Twin {
+        found,
+        sha: twin,
+        subject,
+        files,
+    } = match twin_on_main(wt, onto, tip, sha) {
         Ok(found) => found?,
         Err(e) => {
             return Some(format!(
@@ -637,12 +702,17 @@ fn twin_note(wt: &str, onto: &str, tip: &str, sha: &str) -> Option<String> {
         }
     };
     let title = git(wt, &["log", "-1", "--format=%s", sha]).unwrap_or_default();
+    // Not "it is not this commit's twin" (backlog 2f2caa8e, review
+    // 22073d6e): main's commit IS the twin when it landed on files main
+    // had already changed outside the hunk, and that is likely the common
+    // shape, so the note says what the match shows and no more.
     if found == TwinFound::Elsewhere {
         return Some(format!(
             "  Main's {} \"{subject}\" carries the same patch text as the stopped commit {} \
-             \"{title}\", but not the same change: its files end differently, so the text \
-             may sit at another place in them. It is not this commit's twin — resolve the \
-             conflict as usual, and read it first if it bears on how:\n    \
+             \"{title}\", but not the same blobs (git diff-tree --raw). So it may be this \
+             commit's twin, landed on files main had already changed outside the hunk, or \
+             the same text at another place in them; the patch text alone cannot tell which. \
+             Read it, then resolve the conflict as usual:\n    \
              git -C {wt} show {}",
             short(&twin),
             short(sha),
@@ -655,14 +725,20 @@ fn twin_note(wt: &str, onto: &str, tip: &str, sha: &str) -> Option<String> {
     let last = git(wt, &["rev-list", "--count", &format!("{sha}..{tip}")]).is_ok_and(|n| n == "0");
     let nothing_replayed = git(wt, &["rev-parse", "HEAD"]).is_ok_and(|h| h == onto);
     let branch = tip.strip_prefix("origin/").unwrap_or(tip);
+    // The read above is the evidence that main still holds the change.
+    // `boss merged` is not: it answers MERGED off `git cherry` once main
+    // took the patch, a later revert or not (merged.rs), so offering it
+    // as confirmation offered a check that cannot fail (backlog 2f2caa8e).
     let skip = if last && nothing_replayed {
         format!(
             "  If main holds it, this is the only change the car still carries, so the car \
              carries nothing main lacks:\n    \
              git -C {wt} cherry-pick --skip\n  \
              ends the replay with HEAD at main. Then push nothing and gate nothing — none of \
-             the steps below apply; confirm with `boss merged {branch}` and close the car as \
-             landed."
+             the steps below apply; close the car as landed, citing the read above. That \
+             read is what shows main still holds the change: `boss merged {branch}` answers \
+             MERGED once main has taken the patch, even if a later commit took it back out, \
+             so it cannot."
         )
     } else {
         format!(
@@ -692,166 +768,12 @@ fn twin_note(wt: &str, onto: &str, tip: &str, sha: &str) -> Option<String> {
     ))
 }
 
-/// `git diff-tree --raw` of one commit, its lines sorted: every path,
-/// mode, old blob and new blob, which two commits share only when they
-/// make the same change.
-fn raw_change(wt: &str, sha: &str) -> Result<Vec<String>> {
-    let raw = git(
-        wt,
-        &[
-            "diff-tree",
-            "-r",
-            "--no-commit-id",
-            "--raw",
-            "--no-abbrev",
-            "--no-renames",
-            sha,
-        ],
-    )?;
-    let mut lines: Vec<String> = raw.lines().map(String::from).collect();
-    lines.sort();
-    Ok(lines)
-}
-
-/// Main's newest commit (`onto`, since it parted from `tip`) whose patch
-/// text is `sha`'s byte for byte — preferring one that makes the SAME
-/// change ([`TwinFound::Same`]) over one that only shares the text — as
-/// (which, twin, its subject, `sha`'s files).
-///
-/// `--verbatim`, NOT `git cherry` (review 9b231beb, finding 2): `git
-/// cherry` and `--stable` strip ALL whitespace, so a key a car nests
-/// under `a:` and one main adds at the top level of the same YAML file
-/// would be named as a twin. `--full-diff`: the path limit picks main's
-/// commits, never trims their patches — a train that carried this change
-/// AND another is not this commit's twin.
-fn twin_on_main(
-    wt: &str,
-    onto: &str,
-    tip: &str,
-    sha: &str,
-) -> Result<Option<(TwinFound, String, String, Vec<String>)>> {
-    // An empty or merge commit has no patch to match.
-    let Some((forward, _)) = verbatim_ids(wt, &["-1", sha])?.into_iter().next() else {
-        return Ok(None);
-    };
-    let names = git(
-        wt,
-        &[
-            "diff-tree",
-            "--no-commit-id",
-            "--name-only",
-            "-r",
-            "-z",
-            sha,
-        ],
-    )?;
-    let files: Vec<String> = names
-        .split('\0')
-        .filter(|f| !f.is_empty())
-        .map(String::from)
-        .collect();
-    let not_car = format!("^{tip}");
-    let mut args = vec!["--no-merges", "--full-diff", onto, not_car.as_str(), "--"];
-    let literal: Vec<String> = files.iter().map(|f| format!(":(literal){f}")).collect();
-    args.extend(literal.iter().map(String::as_str));
-    let texts: Vec<String> = verbatim_ids(wt, &args)?
-        .into_iter()
-        .filter(|(id, _)| *id == forward)
-        .map(|(_, commit)| commit)
-        .collect();
-    let Some(newest) = texts.first() else {
-        return Ok(None);
-    };
-    let change = raw_change(wt, sha)?;
-    let mut same = None;
-    for c in &texts {
-        if raw_change(wt, c)? == change {
-            same = Some(c.clone());
-            break;
-        }
-    }
-    let (found, twin) = match same {
-        Some(c) => (TwinFound::Same, c),
-        None => (TwinFound::Elsewhere, newest.clone()),
-    };
-    let subject = git(wt, &["log", "-1", "--format=%s", &twin]).unwrap_or_default();
-    Ok(Some((found, twin, subject, files)))
-}
-
-/// `git patch-id --verbatim` of each commit `git log -p <log_args>`
-/// prints, in log order, as (patch-id, commit). Both sides of a match
-/// are read through this one command, so a diff setting reaches both.
-fn verbatim_ids(wt: &str, log_args: &[&str]) -> Result<Vec<(String, String)>> {
-    use std::io::Write;
-    use std::process::Stdio;
-    let log = crate::git_auth::command()
-        .arg("-C")
-        .arg(wt)
-        .args([
-            "log",
-            "-p",
-            "--no-color",
-            "--no-ext-diff",
-            // A diff driver's textconv would compare converted text while
-            // the note says byte for byte (review 0a5496cb, finding 5).
-            "--no-textconv",
-            "--format=commit %H",
-        ])
-        .args(log_args)
-        .output()
-        .with_context(|| format!("running git log -p {log_args:?} in {wt}"))?;
-    if !log.status.success() {
-        bail!(
-            "git log -p {log_args:?} failed: {}",
-            String::from_utf8_lossy(&log.stderr).trim()
-        );
-    }
-    let mut child = crate::git_auth::command()
-        .arg("-C")
-        .arg(wt)
-        .args(["patch-id", "--verbatim"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("running git patch-id --verbatim")?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("git patch-id has no stdin"))?;
-    // Written from a thread: patch-id answers as it reads, and a long
-    // main would fill its stdout pipe while this side still writes.
-    let patch = log.stdout;
-    let writer = std::thread::spawn(move || stdin.write_all(&patch));
-    let out = child
-        .wait_with_output()
-        .context("reading git patch-id --verbatim")?;
-    let wrote = writer
-        .join()
-        .map_err(|_| anyhow!("writing to git patch-id panicked"))?;
-    // patch-id's own word first (review 3f14cf26, finding 5): when it
-    // dies early the write fails with a broken pipe, which names the
-    // symptom and loses the cause.
-    if !out.status.success() {
-        bail!(
-            "git patch-id --verbatim failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    wrote.context("writing to git patch-id")?;
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.split_once(' '))
-        .map(|(id, commit)| (id.to_string(), commit.trim().to_string()))
-        .collect())
-}
-
 /// Main's newest commit touching the files `branch` changed since
 /// `base`, as (sha, subject) — for a landed car, the train that landed
 /// it, or one that has touched its files since. `None` when git cannot
 /// say, which the caller prints as nothing rather than a guess.
 fn landed_by(repo: &str, base: &str, branch: &str, main: &str) -> Option<(String, String)> {
-    let changed = git(repo, &["diff", "--name-only", base, branch]).ok()?;
+    let changed = git(repo, &["diff", "--no-renames", "--name-only", base, branch]).ok()?;
     let files: Vec<&str> = changed.lines().filter(|l| !l.is_empty()).collect();
     if files.is_empty() {
         return None;
@@ -905,15 +827,13 @@ fn standing_refusal(car: &Value) -> Option<String> {
 
 /// The car as it stands NOW, refused if it has left the dock. `finish`
 /// asks this before it repoints anything (b3c2bfb6, third instance).
-async fn car_still_at_the_dock(
-    http: &crate::machine_http::MachineClient,
-    car: &Value,
-) -> Result<Value> {
+async fn car_still_at_the_dock(door: &dyn Door, car: &Value) -> Result<Value> {
     let id = car
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("car has no id"))?;
-    let now = crate::sor_client::api(http, reqwest::Method::GET, &format!("/api/jobs/{id}"), None)
+    let now = door
+        .send(reqwest::Method::GET, &format!("/api/jobs/{id}"), None)
         .await?
         .ok_or_else(|| anyhow!("re-reading car {id} answered with no body"))?;
     if let Some(why) = standing_refusal(&now) {
@@ -922,37 +842,209 @@ async fn car_still_at_the_dock(
     Ok(now)
 }
 
+type GateFinish = (boss_jobs::car::StepWrite, serde_json::Map<String, Value>);
+
+/// The car's `gate` step, by slug or title.
+fn gate_step(car: &Value) -> Option<&Value> {
+    car.get("steps")
+        .and_then(Value::as_array)
+        .and_then(|steps| {
+            steps.iter().find(|s| {
+                s.get("spec_slug").and_then(Value::as_str) == Some(boss_jobs::car::GATE_SLUG)
+                    || s.get("title").and_then(Value::as_str) == Some(boss_jobs::car::GATE)
+            })
+        })
+}
+
+/// The gate-run an unfinished gate step names as its holder, if any.
+fn gate_holder_id(car: &Value) -> Option<&str> {
+    gate_step(car)
+        .filter(|s| {
+            !matches!(
+                s.get("status").and_then(Value::as_str),
+                Some("completed" | "skipped")
+            )
+        })
+        .and_then(|s| s.pointer(&format!("/metadata/{}", boss_jobs::car::GATE_RUN)))
+        .and_then(Value::as_str)
+        .filter(|h| !h.trim().is_empty())
+}
+
+/// The packet of the gate-run holding the car's unfinished gate step:
+/// off the list already read, or by id when it has fallen off that page.
+/// `None` when the step names no holder.
+async fn gate_holder(door: &dyn Door, car: &Value, gate_runs: &[Value]) -> Result<Option<Value>> {
+    let Some(holder) = gate_holder_id(car) else {
+        return Ok(None);
+    };
+    if let Some(p) = gate_runs
+        .iter()
+        .find(|p| p.get("id").and_then(Value::as_str) == Some(holder))
+    {
+        return Ok(Some(p.clone()));
+    }
+    door.send(reqwest::Method::GET, &format!("/api/jobs/{holder}"), None)
+        .await
+}
+
+/// A copied green must also finish an unfinished gate (773bad26).
+/// Completed steps stay frozen; a pending gate still owes its build.
+///
+/// NOT A GATE THAT IS STILL RUNNING (backlog 545d9c02, review 08805508
+/// N1). `holder` is the packet of the gate-run the step names. While
+/// that run has recorded no verdict, the step is its to move: an older
+/// green at the same head would complete it, the expectation below
+/// would match (the holder still holds it), and the holder's own later
+/// verdict — a red included — would then change nothing, because the
+/// hand-back moves only an active step. So it is refused, by name. An
+/// unreadable holder is refused the same way: no evidence is not a pass.
+/// A holder that has a verdict (`lost` is the 773bad26 case) or has
+/// closed will never move the step again, and the green finishes it.
+fn gate_finish_plan(
+    car: &Value,
+    receipt: &boss_jobs::car::Receipt,
+    holder: Option<&Value>,
+) -> Result<Option<GateFinish>> {
+    let Some(gate) = gate_step(car) else {
+        return Ok(None);
+    };
+    match gate.get("status").and_then(Value::as_str) {
+        Some("completed" | "skipped") => return Ok(None),
+        Some("ready" | "active") => {}
+        other => {
+            bail!("boss rerail: the gate is {other:?}; finish its build before copying a green")
+        }
+    }
+    let step_id = gate
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("the unfinished gate has no id"))?;
+    if boss_jobs::car::ending_of(car).is_some() {
+        bail!("boss rerail: this car's ending already claimed the unfinished gate");
+    }
+    if let Some(held_by) = gate_holder_id(car) {
+        let short = &held_by[..8.min(held_by.len())];
+        let running = match holder {
+            None => true,
+            Some(p) => {
+                !matches!(
+                    p.get("status").and_then(Value::as_str),
+                    Some("closed" | "cancelled")
+                ) && crate::gate::own_verdict(held_by, p)?.is_none()
+            }
+        };
+        if running {
+            bail!(
+                "boss rerail: REFUSED — the gate step is held by gate-run {short}, which has \
+                 recorded no verdict yet; a green copied now would finish its step and its own \
+                 verdict would then move nothing. Wait for it (`boss gate --wait`), then finish."
+            );
+        }
+    }
+    let mut expect = boss_jobs::car::unbound_gate();
+    for key in [boss_jobs::car::GATE_RUN, "gated_head"] {
+        let value = gate
+            .get("metadata")
+            .and_then(|md| md.get(key))
+            .cloned()
+            .unwrap_or(Value::Null);
+        expect.insert(key.into(), value);
+    }
+    let (_, title, metadata) = boss_jobs::car::step_fields(
+        "",
+        "",
+        "",
+        "Current green receipt machine-copied by boss rerail --finish",
+        receipt,
+        boss_clock_client::wall_now(),
+    )[2]
+    .clone();
+    Ok(Some((
+        boss_jobs::car::StepWrite {
+            step_id: step_id.into(),
+            title,
+            metadata,
+            status_body: json!({"status": "completed"}),
+        },
+        expect,
+    )))
+}
+
+async fn finish_gate(door: &dyn Door, car: &str, plan: Option<GateFinish>) -> Result<()> {
+    let Some((write, expect)) = plan else {
+        return Ok(());
+    };
+    for (method, path, body) in [
+        (
+            reqwest::Method::PATCH,
+            write.merge_path(car),
+            write.metadata.clone(),
+        ),
+        (
+            reqwest::Method::PUT,
+            write.status_path(car),
+            write.status_body,
+        ),
+    ] {
+        door.send_expecting(method, &path, Some(body), &expect).await
+            .context("finishing the recovered gate only while its launch binding is unchanged; receipt copied, but recovery must be retried if another launch took the gate")?;
+    }
+    Ok(())
+}
+
 /// The finishing half, standalone: the new branch exists and has a
 /// GREEN gate; transcribe its receipt and repoint the car. Split out
 /// so a conflict-interrupted rerail (human resolves, pushes, gates)
 /// completes through the same code as the happy path — one definition
 /// of the transcription, which is where the hand-typed-sha trap lived.
 async fn finish(
-    http: &crate::machine_http::MachineClient,
+    door: &dyn Door,
+    tree: &dyn Tree,
     car: &Value,
     old_branch: &str,
     new_branch: &str,
+    dry: bool,
 ) -> Result<()> {
     // The car as it stands now, not as it stood before the gate
     // (b3c2bfb6): a closed or boarded car is refused, never repointed.
-    let car = &car_still_at_the_dock(http, car).await?;
+    let car = &car_still_at_the_dock(door, car).await?;
     let car_id = car
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("car has no id"))?;
-    let head = gate::resolve_sha(new_branch);
+    let id = &car_id[..8.min(car_id.len())];
+    let head = tree.head(new_branch)?;
     let gate_runs = crate::train::rows(
-        crate::sor_client::api(
-            http,
+        door.send(
             reqwest::Method::GET,
             "/api/jobs?kind=gate-run&limit=100&full=true",
             None,
         )
         .await?,
     )?;
-    // Machine-copied, green-preferring, head-matched — every property
+    // Machine-copied, newest-verdict-at-the-head (81e5fee6) — every property
     // the by-hand transcription kept getting wrong, in one call.
     let receipt = park::receipt_for(&gate_runs, new_branch, &head)?;
+    let holder = gate_holder(door, car, &gate_runs).await?;
+    let gate_finish = gate_finish_plan(car, &receipt, holder.as_ref())?;
+    // Plan the brake before opening review. This is only a planning
+    // view: the pending review's status is NEVER written here. The gate
+    // completion opens it through the protocol, with its hold already on.
+    let mut hold_car = car.clone();
+    if gate_finish.is_some()
+        && let Some(review) = hold_car
+            .get_mut("steps")
+            .and_then(Value::as_array_mut)
+            .and_then(|steps| {
+                steps.iter_mut().find(|s| {
+                    s.get("spec_slug").and_then(Value::as_str) == Some(boss_jobs::car::REVIEW_SLUG)
+                        || s.get("title").and_then(Value::as_str) == Some(boss_jobs::car::REVIEW)
+                })
+            })
+        && review.get("status").and_then(Value::as_str) == Some("pending")
+    {
+        review["status"] = json!("ready");
+    }
     // The head the branch we are LEAVING carries right now — read from
     // the forge, before anything else touches it, because that is the
     // content the rerail carries away and the only evidence the sweep
@@ -960,7 +1052,7 @@ async fn finish(
     // unreadable head must not fail a rerail that is otherwise done,
     // and an origin recorded without one is refused by name at the
     // sweep rather than deleted on a guess.
-    let old_head = match forge_head(old_branch) {
+    let old_head = match tree.forge_head(old_branch) {
         Ok(h) => h,
         Err(e) => {
             eprintln!(
@@ -977,58 +1069,179 @@ async fn finish(
     // land stops the finish: a bare re-gate carries no park intent, so
     // no gate-side hold ever reached this car. Judged off the diff the
     // receipt vouches for, by the one predicate `boss gate` reads.
-    let base = crate::freshness::observe(std::path::Path::new("."), new_branch).base;
-    let judged = crate::mutating_verb::judge(std::path::Path::new("."), &base, &head);
+    let judged = tree.judge(new_branch, &head);
     // A finding binds the hold to the head it read (`hold_sha`), so only
     // a review releases it; an unread diff does not (backlog b7b02024,
     // review F1) — it is judged again once cleared.
     let bound = judged.is_finding().then_some(head.as_str());
-    if let Some(reason) = judged.hold_reason() {
-        match crate::mutating_verb::review_hold_write(car, &reason, bound)
+    let hold = match judged.hold_reason() {
+        None => None,
+        Some(reason) => match crate::mutating_verb::review_hold_write(&hold_car, &reason, bound)
             .map_err(|e| anyhow!("boss rerail: REFUSED — {new_branch} {reason}, and {e}"))?
         {
-            None => println!(
-                "boss rerail: {new_branch} {reason} — the car is held already; that hold stands"
-            ),
-            Some((path, body)) => {
-                crate::sor_client::api(http, reqwest::Method::PATCH, &path, Some(body))
-                    .await
-                    .context("holding the car for its review before repointing it")?;
+            None => {
                 println!(
-                    "boss rerail: HELD — {new_branch} {reason}. It boards only after `boss \
-                     release`"
+                    "boss rerail: {new_branch} {reason} — the car is held already; that hold \
+                     stands"
                 );
+                None
             }
-        }
-    }
+            Some(write) => Some((reason, write)),
+        },
+    };
+    // A REFRESH MOVES A LIVE REVIEW HOLD'S HEAD (backlog 6b12a70f). When
+    // this green brings no hold write of its own, a car already held for
+    // a review keeps that hold, now bound to the head the green vouches
+    // for, so the review of that head releases it. Car eb86ac0c was
+    // refreshed onto df139b70 with its hold left at 29943365, and the
+    // review of df139b70 was refused at both doors. The decider is
+    // `boss_jobs::car::hold_follows_head`, which the auto-park refresh
+    // asks too. The write carries the hold and head it was decided on
+    // (`hold_as_judged`, backlog cd1f68c6): this read is several calls
+    // old by the time it lands, and a hold released or replaced in that
+    // window must not have its head moved for it.
+    let moved = match &hold {
+        Some(_) => None,
+        None => crate::steps::holdable(&hold_car).ok().and_then(|step| {
+            let md = step.get("metadata").unwrap_or(&Value::Null);
+            let step_id = step.get("id").and_then(Value::as_str).unwrap_or_default();
+            boss_jobs::car::hold_follows_head(md, &head)
+                .filter(|_| !step_id.is_empty())
+                .map(|body| {
+                    (
+                        step_id.to_string(),
+                        body,
+                        boss_jobs::car::hold_as_judged(md),
+                    )
+                })
+        }),
+    };
     let origins = origins_after(car, old_branch, old_head.as_deref(), new_branch);
     // THE PROBE MOVES WITH THE GREEN THAT STATES ONE (backlog 79a17c7a).
     // Read before the repoint, off the car as it stood: a green with
     // park intent replaces the car's probe; a bare one keeps it, and
     // the kept probe is replayed against the head it now vouches for.
     let proof = proof_carried(&gate_runs, new_branch, &receipt.raw);
+    // AND A BARE GREEN ON A CAR WITH NO PROBE IS REFUSED (backlog
+    // 031a3ca9): this finish can complete an unfinished gate, so it is a
+    // park door, and the car it would leave at the dock could never be
+    // proven. Before the dry-run stop, so a rehearsal says it too.
+    if let Some(why) = boss_jobs::car::unproven_park(Some(car), &proof) {
+        bail!("boss rerail --finish: car {id} on {new_branch}: {why}");
+    }
     let kept = proof
         .is_empty()
-        .then(|| kept_probe_note(car, &car_id[..8.min(car_id.len())], &receipt.head))
+        .then(|| kept_probe_note(tree, car, id, &receipt.head))
         .flatten();
     let took_probe = proof.contains_key(boss_jobs::car::PROOF_PROBE)
         || proof.contains_key(boss_jobs::car::PROOF_EVENT);
-    repoint(
-        http, car_id, new_branch, &receipt, old_branch, origins, proof,
-    )
-    .await?;
+    let repoint = (
+        format!("/api/jobs/{car_id}/metadata"),
+        repoint_patch(tree, new_branch, &receipt, old_branch, origins, proof),
+    );
+    let stamps = rerail_stamps(&gate_runs, old_branch, new_branch);
+
+    // A DRY RUN STOPS HERE, BEFORE THE FIRST WRITE (backlog 1e9aeea9).
+    // Everything above reads; everything below writes. `--finish
+    // --dry-run` used to refresh the car for real: `run` read `dry` only
+    // on the cut path, after this branch had returned, so a dry run
+    // followed by the real call printed the refresh twice, for two
+    // different kept-probe heads (car bb81467a, 2026-10-17). It now
+    // prints each write it would send, verbatim, and sends none.
+    if dry {
+        if let Some((write, _)) = &gate_finish {
+            println!(
+                "boss rerail: DRY — would finish gate {} with the current green, preserving its review hold",
+                write.step_id
+            );
+        }
+        if let Some((reason, (path, body))) = &hold {
+            println!("boss rerail: DRY — would HOLD {new_branch} {reason}: PATCH {path} {body}");
+        }
+        if let Some((step_id, body, judged)) = &moved {
+            println!(
+                "boss rerail: DRY — would carry {new_branch}'s review hold to {}: PATCH \
+                 /api/jobs/{car_id}/steps/{step_id}/metadata {body}, only while it reads {}",
+                &head[..12.min(head.len())],
+                Value::Object(judged.clone())
+            );
+        }
+        let (path, patch) = &repoint;
+        println!(
+            "boss rerail: DRY — would {} {id}: PATCH {path} {patch}",
+            if old_branch == new_branch {
+                format!("refresh {new_branch} in place on car")
+            } else {
+                format!("repoint {old_branch} -> {new_branch} on car")
+            }
+        );
+        for (packet, patch) in &stamps {
+            println!(
+                "boss rerail: DRY — would stamp gate-run {}: {patch}",
+                &packet[..8.min(packet.len())]
+            );
+        }
+        if took_probe {
+            println!("boss rerail: DRY — {id} would carry the re-gate's probe");
+        }
+        if let Some(note) = kept {
+            eprintln!("{note}");
+        }
+        println!("boss rerail: DRY — nothing written; car {id} is as it was");
+        return Ok(());
+    }
+
+    // Every write is decided above and made below, in this order: the
+    // hold first (a hold that cannot land stops the finish), then the
+    // repoint, then the best-effort stamps.
+    if let Some((reason, (path, body))) = hold {
+        door.send(reqwest::Method::PATCH, &path, Some(body))
+            .await
+            .context("holding the car for its review before repointing it")?;
+        println!(
+            "boss rerail: HELD — {new_branch} {reason}. It boards only after `boss \
+             release`"
+        );
+    }
+    if let Some((step_id, body, judged)) = moved {
+        let carried =
+            crate::car_retire::patch_step_metadata_expecting(door, car_id, &step_id, body, &judged)
+                .await
+                .context(
+                    "carrying the car's review hold to the refreshed head before repointing it",
+                )?;
+        if carried == crate::car_retire::Judged::Moved {
+            bail!(
+                "boss rerail: REFUSED — car {id}'s review step changed after this refresh read \
+                 it: its hold or hold_sha is no longer the one judged, so the hold was not \
+                 carried to {} and the car was not repointed. Nothing was written. Run `boss \
+                 rerail {new_branch} --finish` again to judge the hold it carries now (backlog \
+                 cd1f68c6).",
+                &head[..12.min(head.len())]
+            );
+        }
+        println!(
+            "boss rerail: HELD — {new_branch}'s review hold stands, now at {}: a review of that \
+             head releases it (`boss review`, then `boss release --review`)",
+            &head[..12.min(head.len())]
+        );
+    }
+    let (path, patch) = repoint;
+    door.send(reqwest::Method::PATCH, &path, Some(patch))
+        .await?;
+    finish_gate(door, car_id, gate_finish).await?;
     // Record the rerail on the gate-runs themselves, so the original
     // branch's green stops reading as stranded. Best effort, after the
     // repoint: the car is already correct, and a missed stamp costs one
     // false amber row, not a car.
-    for (packet, patch) in rerail_stamps(&gate_runs, old_branch, new_branch) {
-        if let Err(e) = crate::sor_client::api(
-            http,
-            reqwest::Method::PATCH,
-            &format!("/api/jobs/{packet}/metadata"),
-            Some(patch),
-        )
-        .await
+    for (packet, patch) in stamps {
+        if let Err(e) = door
+            .send(
+                reqwest::Method::PATCH,
+                &format!("/api/jobs/{packet}/metadata"),
+                Some(patch),
+            )
+            .await
         {
             eprintln!(
                 "boss rerail: could not stamp gate-run {}: {e:#}",
@@ -1036,16 +1249,15 @@ async fn finish(
             );
         }
     }
-    let id = &car_id[..8.min(car_id.len())];
     if old_branch == new_branch {
         println!(
             "boss rerail: {id} refreshed {new_branch} in place — current green receipt \
-             copied, skip cleared; the next boarding takes it"
+             copied, skip cleared; review holds still brake boarding"
         );
     } else {
         println!(
             "boss rerail: {id} repointed {old_branch} -> {new_branch} — receipt copied, \
-             skip cleared; the next boarding takes it"
+             skip cleared; review holds still brake boarding"
         );
     }
     if took_probe {
@@ -1068,7 +1280,7 @@ async fn finish(
 /// probe, so every car it refreshed kept its FIRST gate's probe
 /// whatever the re-gate said: 11 of 11 on 2026-09-27/28, one of them
 /// (bfb219b4) proven FAILING on correct code.
-fn proof_carried(
+pub(crate) fn proof_carried(
     gate_runs: &[Value],
     branch: &str,
     receipt_raw: &str,
@@ -1095,7 +1307,7 @@ fn proof_carried(
 /// its tree needles replayed against the head the car's receipt named
 /// (what the probe was written for) and the head the fresh receipt names,
 /// in the checkout the verb runs in. See `kept_probe`.
-fn kept_probe_note(car: &Value, id: &str, new_head: &str) -> Option<String> {
+fn kept_probe_note(tree: &dyn Tree, car: &Value, id: &str, new_head: &str) -> Option<String> {
     let probe = car
         .pointer(&format!("/metadata/{}", boss_jobs::car::PROOF_PROBE))
         .and_then(Value::as_str);
@@ -1106,10 +1318,8 @@ fn kept_probe_note(car: &Value, id: &str, new_head: &str) -> Option<String> {
         .unwrap_or_default()
         .into_iter()
         .map(|n| {
-            let was = written_for
-                .as_deref()
-                .and_then(|h| crate::kept_probe::holds(".", h, &n));
-            let now = crate::kept_probe::holds(".", new_head, &n);
+            let was = written_for.as_deref().and_then(|h| tree.holds(h, &n));
+            let now = tree.holds(new_head, &n);
             (n, was, now)
         })
         .collect();
@@ -1124,6 +1334,7 @@ pub async fn run(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let http = crate::sor_client::machine_client()?;
+    let door = crate::car_retire::Http(&http);
     let (car, old_branch) = find_car(&http, given).await?;
     let new_branch = format!("{old_branch}-rerail");
     // Before anything is cut, fetched or finished (b3c2bfb6): a car a
@@ -1144,7 +1355,7 @@ pub async fn run(
                  from its current green receipt instead"
             );
         }
-        finish(&http, &car, &old_branch, &target).await?;
+        finish(&door, &Checkout, &car, &old_branch, &target, dry).await?;
         // The worktree a conflict left behind, taken back now the car
         // no longer needs it (backlog 3129d98a). Only ever the one the
         // verb ADDED — an in-place rerail ran in the actor's own
@@ -1154,8 +1365,11 @@ pub async fn run(
         // not guessed at.
         match git(".", &["rev-parse", "--git-common-dir"]) {
             Ok(common) => {
-                match retire_rerail_worktree(&temporary_worktree(common.trim(), &new_branch)) {
+                match retire_rerail_worktree(&temporary_worktree(common.trim(), &new_branch), dry) {
                     Retired::Removed(wt) => println!("boss rerail: removed its worktree {wt}"),
+                    Retired::WouldRemove(wt) => {
+                        println!("boss rerail: DRY — would remove its worktree {wt}")
+                    }
                     Retired::KeptDirty(wt) => eprintln!(
                         "boss rerail: kept {wt} — it has uncommitted changes, which may be the \
                          only copy of a resolution; remove it by hand once they are safe"
@@ -1361,15 +1575,23 @@ pub async fn run(
         // the base is still current.
         true,
         None,
+        // No `--despite-hold`: under a gates hold a rerail is refused like
+        // any other gate and waits for the release (backlog 95401d82).
+        None,
         now,
     )
     .await?;
 
-    finish(&http, &car, &old_branch, &new_branch).await
+    finish(&door, &Checkout, &car, &old_branch, &new_branch, dry).await
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    pub(crate) fn head_for_exact_ref_test(branch: &str) -> anyhow::Result<Option<String>> {
+        let head = super::forge_head(branch)?;
+        assert_eq!(super::on_forge(branch)?, head.is_some());
+        Ok(head)
+    }
     use super::*;
     use std::path::Path;
 
@@ -1409,8 +1631,15 @@ mod tests {
 
         let clean = format!("{common}/rerail-wt/fix/clean-rerail");
         git(r, &["worktree", "add", "-q", "--detach", &clean, "main"]).expect("add clean");
+        // `--finish --dry-run` says it would take the worktree back and
+        // leaves it exactly where it was (backlog 1e9aeea9).
         assert_eq!(
-            retire_rerail_worktree(&clean),
+            retire_rerail_worktree(&clean, true),
+            Retired::WouldRemove(clean.clone())
+        );
+        assert!(Path::new(&clean).exists(), "a dry run removes no worktree");
+        assert_eq!(
+            retire_rerail_worktree(&clean, false),
             Retired::Removed(clean.clone())
         );
         assert!(!Path::new(&clean).exists(), "the clean worktree is gone");
@@ -1419,7 +1648,7 @@ mod tests {
         git(r, &["worktree", "add", "-q", "--detach", &dirty, "main"]).expect("add dirty");
         std::fs::write(Path::new(&dirty).join("half-resolved.txt"), "x").expect("dirty it");
         assert_eq!(
-            retire_rerail_worktree(&dirty),
+            retire_rerail_worktree(&dirty, false),
             Retired::KeptDirty(dirty.clone())
         );
         assert!(
@@ -1428,7 +1657,7 @@ mod tests {
         );
 
         let never = format!("{common}/rerail-wt/fix/never-conflicted-rerail");
-        assert_eq!(retire_rerail_worktree(&never), Retired::Absent);
+        assert_eq!(retire_rerail_worktree(&never, false), Retired::Absent);
     }
 
     /// The rerail stamps: the old branch's gate-runs (every one — a
@@ -1669,6 +1898,778 @@ mod tests {
             rerail_stamps(&gate_runs, "feat/x-rerail", "feat/x-rerail").is_empty(),
             "the branch did not move — nothing was superseded"
         );
+    }
+
+    /// The jobs API as `finish` meets it, from fixtures: it answers the
+    /// two reads `finish` makes (the car re-read, the gate-run list) and
+    /// RECORDS every call, whatever its method. A write is answered and
+    /// recorded, never applied — the record of what was sent is the
+    /// evidence, so nothing here can make a write look like a read.
+    struct Recording {
+        car: Value,
+        gate_runs: Vec<Value>,
+        calls: std::sync::Mutex<Vec<(reqwest::Method, String)>>,
+        /// Every write's body, beside its path, in the order sent.
+        bodies: std::sync::Mutex<Vec<(String, Value)>>,
+    }
+
+    impl Recording {
+        fn new(car: Value, gate_runs: Vec<Value>) -> Self {
+            Self {
+                car,
+                gate_runs,
+                calls: std::sync::Mutex::new(Vec::new()),
+                bodies: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Door for Recording {
+        async fn send(
+            &self,
+            method: reqwest::Method,
+            path: &str,
+            body: Option<Value>,
+        ) -> Result<Option<Value>> {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push((method.clone(), path.to_string()));
+            if method != reqwest::Method::GET {
+                if let Some(body) = body {
+                    self.bodies
+                        .lock()
+                        .expect("bodies")
+                        .push((path.to_string(), body));
+                }
+                return Ok(None);
+            }
+            let car_id = self.car["id"].as_str().unwrap_or_default();
+            if path == format!("/api/jobs/{car_id}") {
+                Ok(Some(self.car.clone()))
+            } else if path.starts_with("/api/jobs?kind=gate-run") {
+                Ok(Some(
+                    json!({ "data": self.gate_runs, "total": self.gate_runs.len() }),
+                ))
+            } else {
+                bail!("the fixture has no answer for GET {path}")
+            }
+        }
+
+        /// A judged write is recorded like any other; this fixture judges
+        /// nothing (the race tests below serve the real merge door).
+        async fn send_expecting(
+            &self,
+            method: reqwest::Method,
+            path: &str,
+            body: Option<Value>,
+            _expect: &serde_json::Map<String, Value>,
+        ) -> Result<Option<Value>> {
+            self.send(method, path, body).await
+        }
+    }
+
+    /// The git half, fixed: the forge carries `head` for every branch and
+    /// the diff judges as `judged`. No process is spawned and no network
+    /// is touched, so the whole finish runs anywhere a test runs.
+    struct Fixed {
+        head: String,
+        judged: crate::mutating_verb::Judgement,
+    }
+
+    #[tokio::test]
+    async fn a_finish_completes_an_unfinished_gate_and_keeps_its_pending_review_hold() {
+        let head = "abcdef1234567890000000000000000000000000";
+        let receipt = json!({"head": head, "mode": "auto", "verdict": "green"}).to_string();
+        for (dry, held) in [(true, true), (false, true), (false, false)] {
+            let review_md = if held {
+                json!({"hold": "waits for its adversarial review", "hold_sha": head})
+            } else {
+                json!({})
+            };
+            let door = Recording::new(
+                json!({"id": "car", "kind": "ship-a-change", "status": "open",
+                "metadata": {"branch": "fix/x", "proof_event": "event-bound — a lost gate"},
+                "steps": [
+                    {"id": "gate", "spec_slug": "gate", "title": boss_jobs::car::GATE,
+                     "status": "ready", "metadata": {"gate_run": "lost", "gated_head": head}},
+                    {"id": "review", "spec_slug": "review", "title": boss_jobs::car::REVIEW,
+                     "status": "pending", "metadata": review_md}
+                ]}),
+                vec![
+                    json!({"id": "green", "metadata": {"branch": "fix/x"},
+                    "steps": [{"metadata": {"verdict": "green", "receipt": receipt}}]}),
+                    lost_holder(),
+                ],
+            );
+            let tree = Fixed {
+                head: head.into(),
+                judged: crate::mutating_verb::Judgement::Touches {
+                    paths: vec!["infra/ops/verbs/x.toml".into()],
+                    mutating: Vec::new(),
+                },
+            };
+            finish(&door, &tree, &door.car, "fix/x", "fix/x", dry)
+                .await
+                .unwrap();
+            let bodies = door.bodies.lock().unwrap();
+            if dry {
+                assert!(bodies.is_empty());
+                continue;
+            }
+            assert!(
+                bodies
+                    .iter()
+                    .any(|(p, b)| p == "/api/jobs/car/steps/gate/metadata"
+                        && b["receipt"] == receipt)
+            );
+            assert!(
+                bodies.iter().any(|(p, b)| p == "/api/jobs/car/steps/gate"
+                    && b == &json!({"status": "completed"}))
+            );
+            assert!(!bodies.iter().any(|(p, b)| p.contains("review")
+                && (b.get("hold").is_some_and(Value::is_null) || b.get("status").is_some())));
+            if !held {
+                let brake = bodies
+                    .iter()
+                    .position(|(p, b)| p.contains("review") && b.get("hold").is_some())
+                    .unwrap();
+                let finish = bodies
+                    .iter()
+                    .position(|(p, _)| p == "/api/jobs/car/steps/gate")
+                    .unwrap();
+                assert!(
+                    brake < finish,
+                    "the new hold lands before the gate opens review"
+                );
+            }
+        }
+    }
+
+    /// `--finish` IS A PARK DOOR TOO (backlog 031a3ca9). It can complete
+    /// an unfinished gate and so put a car `boss car open` filed — which
+    /// carries no probe — at the dock on a bare green that states none.
+    /// That car could never be proven, so the finish refuses it, before
+    /// any write and in a dry run too, with the text every park door says.
+    #[tokio::test]
+    async fn a_finish_refuses_to_leave_a_car_with_no_proof_at_the_dock() {
+        let head = "abcdef1234567890000000000000000000000000";
+        let receipt = json!({"head": head, "mode": "auto", "verdict": "green"}).to_string();
+        for dry in [true, false] {
+            let door = Recording::new(
+                json!({"id": "car", "kind": "ship-a-change", "status": "open",
+                "metadata": {"branch": "fix/x"}, "steps": [
+                    {"id": "gate", "spec_slug": "gate", "title": boss_jobs::car::GATE,
+                     "status": "ready", "metadata": {"gate_run": "lost", "gated_head": head}},
+                    {"id": "review", "spec_slug": "review", "title": boss_jobs::car::REVIEW,
+                     "status": "pending", "metadata": {}}
+                ]}),
+                vec![
+                    json!({"id": "green", "metadata": {"branch": "fix/x"},
+                    "steps": [{"metadata": {"verdict": "green", "receipt": receipt}}]}),
+                    lost_holder(),
+                ],
+            );
+            let tree = Fixed {
+                head: head.into(),
+                judged: crate::mutating_verb::Judgement::Clear,
+            };
+            let refused = finish(&door, &tree, &door.car, "fix/x", "fix/x", dry)
+                .await
+                .expect_err("a car with no proof must not reach the dock");
+            let said = format!("{refused:#}");
+            assert!(said.contains(boss_jobs::car::UNPROVEN_PARK), "{said}");
+            assert!(door.bodies.lock().unwrap().is_empty(), "nothing is written");
+        }
+    }
+
+    /// Backlog 545d9c02 (review 08805508, N1): a gate step ACTIVE under a
+    /// gate-run N that is still running at head H must not be completed
+    /// with an OLDER green G at the same H. The conditional write matches
+    /// (it expects N, and N still holds the step), so only a refusal here
+    /// keeps N's later verdict — a red included — from being lost: the
+    /// hand-back moves only an active step.
+    #[tokio::test]
+    async fn a_finish_refuses_a_gate_step_held_by_a_gate_that_is_still_running() {
+        let head = "abcdef1234567890000000000000000000000000";
+        let running = "4e4e4e4e-0000-4000-8000-000000000001";
+        let receipt = json!({"head": head, "mode": "auto", "verdict": "green"}).to_string();
+        let door = Recording::new(
+            json!({"id": "car", "kind": "ship-a-change", "status": "open",
+            "metadata": {"branch": "fix/x"}, "steps": [
+                {"id": "gate", "spec_slug": "gate", "title": boss_jobs::car::GATE,
+                 "status": "active", "metadata": {"gate_run": running, "gated_head": head}}
+            ]}),
+            vec![
+                json!({"id": running, "status": "open", "metadata": {"branch": "fix/x"},
+                    "steps": [{"spec_slug": "record-verdict", "status": "ready",
+                               "metadata": {}}]}),
+                json!({"id": "47474747-0000-4000-8000-000000000002", "status": "closed",
+                    "metadata": {"branch": "fix/x"},
+                    "steps": [{"spec_slug": "record-verdict", "status": "completed",
+                               "metadata": {"verdict": "green", "receipt": receipt}}]}),
+            ],
+        );
+        let tree = Fixed {
+            head: head.into(),
+            judged: crate::mutating_verb::Judgement::Clear,
+        };
+        let refused = finish(&door, &tree, &door.car, "fix/x", "fix/x", false)
+            .await
+            .expect_err("an older green must not finish a running gate's step");
+        let said = format!("{refused:#}");
+        assert!(said.contains("4e4e4e4e"), "names the running gate: {said}");
+        assert!(door.bodies.lock().unwrap().is_empty(), "nothing is written");
+    }
+
+    /// Backlog 81e5fee6 (finding 1): the holder N has RECORDED a red at
+    /// head H and been handed back to ready, and an older green G exists
+    /// at the same H. N is done, so `gate_finish_plan` lets it pass; the
+    /// receipt chosen must be the newest verdict for H — N's — so the
+    /// finish refuses, names N, and writes nothing.
+    #[tokio::test]
+    async fn a_finish_refuses_when_the_newest_verdict_at_the_head_is_red() {
+        let head = "abcdef1234567890000000000000000000000000";
+        let red_run = "4e4e4e4e-0000-4000-8000-000000000003";
+        let green = json!({"head": head, "mode": "auto", "verdict": "green"}).to_string();
+        let red = json!({"head": head, "mode": "auto", "verdict": "failed", "fails": ["test"]})
+            .to_string();
+        let door = Recording::new(
+            json!({"id": "car", "kind": "ship-a-change", "status": "open",
+            "metadata": {"branch": "fix/x"}, "steps": [
+                {"id": "gate", "spec_slug": "gate", "title": boss_jobs::car::GATE,
+                 "status": "ready", "metadata": {"gate_run": red_run, "gated_head": head}}
+            ]}),
+            vec![
+                json!({"id": red_run, "status": "closed", "opened_at": "2026-11-11T11:00:00Z",
+                    "metadata": {"branch": "fix/x"},
+                    "steps": [{"spec_slug": "record-verdict", "status": "completed",
+                               "metadata": {"verdict": "failed", "receipt": red}}]}),
+                json!({"id": "47474747-0000-4000-8000-000000000004", "status": "closed",
+                    "opened_at": "2026-11-11T10:00:00Z", "metadata": {"branch": "fix/x"},
+                    "steps": [{"spec_slug": "record-verdict", "status": "completed",
+                               "metadata": {"verdict": "green", "receipt": green}}]}),
+            ],
+        );
+        let tree = Fixed {
+            head: head.into(),
+            judged: crate::mutating_verb::Judgement::Clear,
+        };
+        let refused = finish(&door, &tree, &door.car, "fix/x", "fix/x", false)
+            .await
+            .expect_err("an older green must not override the newer red at the same head");
+        let said = format!("{refused:#}");
+        assert!(said.contains(red_run), "names the red gate-run: {said}");
+        assert!(door.bodies.lock().unwrap().is_empty(), "nothing is written");
+    }
+
+    /// The packet of gate-run `lost` as the 773bad26 recovery meets it:
+    /// its verdict recorded, so it will never move the step again.
+    fn lost_holder() -> Value {
+        json!({"id": "lost", "status": "closed", "metadata": {"branch": "fix/x"},
+            "steps": [{"spec_slug": "record-verdict", "status": "completed",
+                       "metadata": {"verdict": "lost"}}]})
+    }
+
+    /// CHANGED DELIBERATELY (backlog 545d9c02). This test used to hand
+    /// `gate_finish_plan` the car alone and pinned that a READY or ACTIVE
+    /// step always yields a plan — which is the defect: an ACTIVE step is
+    /// normally held by a gate still running, and finishing it with an
+    /// older green loses that gate's verdict. A plan now needs the
+    /// holder's own packet to say it is done (a recorded verdict, `lost`
+    /// here, or a closed packet); a holder still without a verdict, or one
+    /// that cannot be read, is refused by name in either status.
+    #[test]
+    fn gate_recovery_preserves_frozen_steps_and_expects_the_launch_it_read() {
+        let receipt = boss_jobs::car::Receipt {
+            raw: "verbatim".into(),
+            head: "abc1234".into(),
+            mode: "full".into(),
+        };
+        let lost = lost_holder();
+        let running = json!({"id": "lost", "status": "open",
+            "steps": [{"spec_slug": "record-verdict", "status": "ready", "metadata": {}}]});
+        for status in ["pending", "ready", "active", "completed", "skipped"] {
+            let car = json!({"steps": [{"id": "gate", "spec_slug": "gate", "status": status,
+                "metadata": {"gate_run": "lost", "gated_head": "old1234", "receipt": "old"}}]});
+            let plan = gate_finish_plan(&car, &receipt, Some(&lost));
+            match status {
+                "pending" => assert!(plan.is_err()),
+                "completed" | "skipped" => assert!(plan.unwrap().is_none()),
+                _ => {
+                    for holder in [Some(&running), None] {
+                        let refused = gate_finish_plan(&car, &receipt, holder).unwrap_err();
+                        assert!(format!("{refused}").contains("gate-run lost"), "{refused}");
+                    }
+                    let (write, expect) = plan.unwrap().unwrap();
+                    assert_eq!(write.metadata["receipt"], "verbatim");
+                    assert_eq!(
+                        Value::Object(expect),
+                        json!({"gate_run": "lost", "gated_head": "old1234", "ended_before_gate": null})
+                    );
+                }
+            }
+        }
+        let ended = json!({"steps": [{"id": "gate", "spec_slug": "gate", "status": "ready",
+            "metadata": {"ended_before_gate": {"by": "item", "outcome": "withdrawn"}}}]});
+        assert!(gate_finish_plan(&ended, &receipt, None).is_err());
+    }
+
+    impl Tree for Fixed {
+        fn head(&self, _: &str) -> Result<String> {
+            Ok(self.head.clone())
+        }
+        fn forge_head(&self, _: &str) -> Result<Option<String>> {
+            Ok(Some(self.head.clone()))
+        }
+        fn judge(&self, _: &str, _: &str) -> crate::mutating_verb::Judgement {
+            self.judged.clone()
+        }
+        fn channel(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn tiers(&self, _: &str) -> serde_json::Map<String, Value> {
+            serde_json::Map::new()
+        }
+        fn holds(&self, _: &str, _: &crate::kept_probe::Needle) -> Option<bool> {
+            None
+        }
+    }
+
+    /// Run `finish` for `old -> new` against the fixtures and hand back
+    /// every call it sent. The car stands at the dock with an open review
+    /// and a kept probe; both branches carry a green for `HEAD`; the diff
+    /// touches an ops verb, so a real finish holds, repoints and stamps —
+    /// every write `finish` can make.
+    async fn calls_of_finish(old: &str, new: &str, dry: bool) -> Vec<(reqwest::Method, String)> {
+        const HEAD: &str = "845c5896f5b4aaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let receipt = json!({ "head": HEAD, "mode": "auto" }).to_string();
+        let green = |id: &str, branch: &str| {
+            json!({ "id": id, "metadata": { "branch": branch },
+                    "steps": [{ "metadata": { "verdict": "green", "receipt": receipt } }] })
+        };
+        let door = Recording::new(
+            json!({
+                "id": "bb81467a-b213-4b23-92d6-4b90da170826",
+                "kind": "ship-a-change",
+                "status": "open",
+                "metadata": {
+                    "branch": old,
+                    "proof_probe": "git show HEAD:a.rs | grep -c 'pub fn a'",
+                    "proof_expect": "1",
+                },
+                "steps": [{ "id": "step-review", "spec_slug": "review",
+                            "title": "Open for review", "status": "ready", "metadata": {} }],
+            }),
+            vec![green("g-old", old), green("g-new", new)],
+        );
+        let tree = Fixed {
+            head: HEAD.to_string(),
+            judged: crate::mutating_verb::Judgement::Touches {
+                paths: vec!["infra/ops/verbs/x.toml".to_string()],
+                mutating: Vec::new(),
+            },
+        };
+        finish(&door, &tree, &door.car.clone(), old, new, dry)
+            .await
+            .expect("the fixture finishes");
+        door.calls.into_inner().expect("calls")
+    }
+
+    fn writes(calls: &[(reqwest::Method, String)]) -> Vec<String> {
+        calls
+            .iter()
+            .filter(|(m, _)| *m != reqwest::Method::GET)
+            .map(|(m, p)| format!("{m} {p}"))
+            .collect()
+    }
+
+    /// `--finish --dry-run` SENDS NO WRITE AT ALL (backlog 1e9aeea9).
+    /// Measured 2026-10-17 on car bb81467a: a dry run followed by the
+    /// real `--finish` printed the refresh twice, the dry one naming a
+    /// kept probe written for 3e10f85cbb47 and the real one, straight
+    /// after, for 845c5896f5b4 — the dry run had already refreshed the
+    /// car. `run` passed `dry` only to the cut path; the finish branch
+    /// returned before it was read. Asserted over EVERY method, not the
+    /// one write that was seen, so a write added to `finish` later is
+    /// caught too; and the control below proves this fixture sees each
+    /// write a real finish makes, so the empty list is not a blind one.
+    #[tokio::test]
+    async fn a_dry_finish_sends_no_write_and_a_real_one_sends_each() {
+        let car = "bb81467a-b213-4b23-92d6-4b90da170826";
+        for (old, new) in [("fix/x", "fix/x-rerail"), ("fix/x", "fix/x")] {
+            let dry = calls_of_finish(old, new, true).await;
+            assert_eq!(
+                writes(&dry),
+                Vec::<String>::new(),
+                "a dry {old} -> {new} finish wrote"
+            );
+            assert_eq!(
+                dry.iter().map(|(_, p)| p.as_str()).collect::<Vec<_>>(),
+                [
+                    format!("/api/jobs/{car}").as_str(),
+                    "/api/jobs?kind=gate-run&limit=100&full=true"
+                ],
+                "a dry finish still reads what it would write from"
+            );
+        }
+        // The control: the same fixture, run for real, sends every write.
+        assert_eq!(
+            writes(&calls_of_finish("fix/x", "fix/x-rerail", false).await),
+            [
+                format!("PATCH /api/jobs/{car}/steps/step-review/metadata"),
+                format!("PATCH /api/jobs/{car}/metadata"),
+                "PATCH /api/jobs/g-old/metadata".to_string(),
+                "PATCH /api/jobs/g-new/metadata".to_string(),
+            ]
+        );
+        assert_eq!(
+            writes(&calls_of_finish("fix/x", "fix/x", false).await),
+            [
+                format!("PATCH /api/jobs/{car}/steps/step-review/metadata"),
+                format!("PATCH /api/jobs/{car}/metadata"),
+            ],
+            "a refresh in place holds and repoints, and stamps nothing"
+        );
+    }
+
+    /// A REFRESH THAT MOVES THE CAR'S HEAD MOVES ITS HOLD'S HEAD (backlog
+    /// 6b12a70f). The sequence measured on car eb86ac0c, 2026-11-05: a
+    /// RELEASE at R (2b1591c1), a rerail by merge to A (29943365), the
+    /// conductor's re-judge holding the car "waits for a review of this
+    /// head" bound to A, then `boss rerail --finish` refreshing the car in
+    /// place onto a green at B (df139b70) whose diff the judge clears. The
+    /// finish wrote the receipt and left `hold_sha` at A, so the review of
+    /// B was refused by the release rule and by `boss release --review`
+    /// ("run 7cb2438c reviewed df139b70, and the car's head is
+    /// 29943365"), and no supported door moved it. Asked here as the yard
+    /// and the release rule ask it: at the head the hold names.
+    #[tokio::test]
+    async fn a_refresh_carries_the_review_hold_to_the_head_it_refreshed() {
+        const R: &str = "2b1591c1983f0000000000000000000000000000";
+        const A: &str = "299433653fb10000000000000000000000000000";
+        const B: &str = "df139b701abb0000000000000000000000000000";
+        const CAR: &str = "eb86ac0c-1361-4aa1-8bbc-a3633b70852b";
+        let branch = "feat/binding-plate-claims-lamps-car5";
+        let hold = format!(
+            "conductor re-judge at {}: released at {}, head is {} (no dock replay records this \
+             head as a replay of that one): waits for a review of this head; boss review, then \
+             boss release --review (backlog b7b02024)",
+            &A[..12],
+            &R[..12],
+            &A[..12]
+        );
+        let held = json!({
+            "id": CAR,
+            "kind": "ship-a-change",
+            "status": "open",
+            "metadata": { "branch": branch, "proof_probe": "echo ok", "proof_expect": "ok" },
+            "steps": [{ "id": "step-review", "spec_slug": "review",
+                        "title": "Open for review", "status": "ready",
+                        "metadata": {
+                            "hold": hold,
+                            boss_jobs::car::HOLD_SHA: A,
+                            boss_jobs::car::RELEASE: { "sha": R, "review": "2c4bad6a" },
+                            "agent_run": "7cb2438c-0000-4000-8000-000000000000",
+                        } }],
+        });
+        let receipt = json!({ "head": B, "mode": "auto" }).to_string();
+        let door = Recording::new(
+            held.clone(),
+            vec![json!({ "id": "g-b", "metadata": { "branch": branch },
+                         "steps": [{ "metadata": { "verdict": "green", "receipt": receipt } }] })],
+        );
+        let tree = Fixed {
+            head: B.to_string(),
+            judged: crate::mutating_verb::Judgement::Clear,
+        };
+        finish(&door, &tree, &held, branch, branch, false)
+            .await
+            .expect("the refresh finishes");
+        // The reviewer's verdict, recorded at B.
+        let run = json!({
+            "id": "7cb2438c-0000-4000-8000-000000000000",
+            "kind": "agent-run",
+            "metadata": { "review": { "car": CAR, "verdict": "release", "reviewed_sha": B } },
+        });
+        // The control: on the car as it stood, the review of B is refused
+        // at the head the hold names, in the words the conductor quoted.
+        let stale = boss_jobs::car_release::hold_sha(&held).expect("held at A");
+        let why = boss_jobs::car_release::vouches(&run, &held, stale).expect_err("held at A");
+        assert!(why.contains("and the car's head is 29943365"), "{why}");
+        // The car as the finish left it: every review-step write merged
+        // onto the review step's metadata, as the merge door would.
+        let step_path = format!("/api/jobs/{CAR}/steps/step-review/metadata");
+        let mut after = held.clone();
+        for (path, body) in door.bodies.into_inner().expect("bodies") {
+            if path == step_path {
+                let md = after["steps"][0]["metadata"].as_object_mut().expect("md");
+                for (k, v) in body.as_object().expect("a merge body") {
+                    md.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        assert_eq!(
+            boss_jobs::car_release::hold_sha(&after),
+            Some(B),
+            "the hold that waits for a review of this head names the head the car now carries"
+        );
+        assert_eq!(
+            boss_jobs::stranded::marked(&after["steps"][0]["metadata"], "hold").as_deref(),
+            Some(hold.as_str()),
+            "the hold's reason stands: the car still waits for its review"
+        );
+        boss_jobs::car_release::vouches(
+            &run,
+            &after,
+            boss_jobs::car_release::hold_sha(&after).expect("bound"),
+        )
+        .expect("the review of B releases the car refreshed to B");
+    }
+
+    // -- the refresh writes only on the hold it judged (cd1f68c6) -------
+    //
+    // `finish` reads the car, then makes several more calls (the gate-run
+    // list, the forge, the judge) before it carries the hold to the new
+    // head. The REAL jobs router over an in-memory store serves the car,
+    // so the merge door itself judges the write; the gate-run list is a
+    // fixture, and answering it is where a concurrent writer moves the
+    // review step — Codex's injection (review 5d605949), placed after the
+    // judged read and before the write.
+
+    const HELD_AT: &str = "299433653fb10000000000000000000000000000";
+    const REFRESHED_TO: &str = "df139b701abb0000000000000000000000000000";
+    const REVIEW_HOLD: &str = "conductor re-judge at 299433653fb1 — waits for a review of this \
+                               head; boss review, then boss release --review (backlog b7b02024)";
+
+    /// The real door over the real router, answering the gate-run list
+    /// from a fixture and, the first time it does, landing `race` on the
+    /// review step through the same router.
+    struct Racing {
+        wire: crate::steps::Wire,
+        gate_runs: Vec<Value>,
+        race: Option<(String, Value)>,
+        raced: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl Door for Racing {
+        async fn send(
+            &self,
+            method: reqwest::Method,
+            path: &str,
+            body: Option<Value>,
+        ) -> Result<Option<Value>> {
+            if method == reqwest::Method::GET && path.starts_with("/api/jobs?kind=gate-run") {
+                if let Some((step_path, write)) = &self.race
+                    && !self.raced.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.wire
+                        .call(reqwest::Method::PATCH, step_path, Some(write.clone()))
+                        .await?;
+                }
+                return Ok(Some(
+                    json!({ "data": self.gate_runs, "total": self.gate_runs.len() }),
+                ));
+            }
+            self.wire.call(method, path, body).await
+        }
+
+        async fn send_expecting(
+            &self,
+            method: reqwest::Method,
+            path: &str,
+            body: Option<Value>,
+            expect: &serde_json::Map<String, Value>,
+        ) -> Result<Option<Value>> {
+            self.wire.call_expecting(method, path, body, expect).await
+        }
+    }
+
+    /// A held car at the dock, seeded into a fresh store behind the real
+    /// router; the base, its id, and its review step's id.
+    async fn served_held_car(review_md: Value) -> (String, String, String) {
+        use boss_jobs::JobsRepository as _;
+        use boss_policy_client::{Action, FakePolicyClient, PolicyClient, Resource, Scope};
+        use std::sync::Arc;
+        let jobs = Arc::new(boss_jobs::InMemoryJobs::new());
+        let mut job = boss_core::job::Job::new(
+            "ship-a-change",
+            boss_core::job::Subject::new("custom", "feat/binding-plate-claims-lamps-car5"),
+            "A held car",
+            "emp-bootstrap-admin",
+            boss_core::job::Priority::Standard,
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 5).unwrap(),
+        );
+        job.metadata = json!({
+            "branch": "feat/binding-plate-claims-lamps-car5",
+            "proof_probe": "echo ok", "proof_expect": "ok",
+        });
+        job.status = boss_core::job::JobStatus::Open;
+        jobs.create_job(&job).await.unwrap();
+        let mut step = boss_core::job::Step::new(job.id, "task", boss_jobs::car::REVIEW, 4);
+        step.spec_slug = Some(boss_jobs::car::REVIEW_SLUG.into());
+        step.status = boss_core::job::StepStatus::Ready;
+        step.metadata = review_md;
+        jobs.add_step(&step).await.unwrap();
+        let mut policy = FakePolicyClient::builder();
+        for (action, resource) in [
+            (Action::Read, Resource::job()),
+            (Action::Update, Resource::job()),
+            (Action::Update, Resource::step()),
+        ] {
+            policy = policy.allow("platform-admin", action, resource, Scope::All);
+        }
+        let policy: Arc<dyn PolicyClient> = Arc::new(policy.build());
+        let bus = boss_testing::RecordingEventBus::new();
+        let bus_dyn: Arc<dyn boss_core::port::EventBus> = bus.clone();
+        let app = boss_jobs::http::router(boss_jobs::http::JobsApiState::minimal(
+            jobs.clone(),
+            bus,
+            boss_core::publisher::DomainPublisher::new(bus_dyn, "jobs"),
+            policy,
+            Arc::new(boss_clock_client::WallClockClient),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, job.id.to_string(), step.id.to_string())
+    }
+
+    fn held_review_md() -> Value {
+        json!({
+            "hold": REVIEW_HOLD,
+            boss_jobs::car::HOLD_SHA: HELD_AT,
+            boss_jobs::car::RELEASE: { "sha": "2b1591c1983f", "review": "2c4bad6a" },
+        })
+    }
+
+    fn signed_wire(base: String) -> crate::steps::Wire {
+        crate::steps::Wire::at(
+            base,
+            Some(crate::identity::Caller {
+                id: "claude@algedonic.dev".into(),
+                source: crate::identity::Source::Env,
+            }),
+        )
+        .unwrap()
+    }
+
+    /// `finish` refreshing the held car in place onto a clear green at
+    /// [`REFRESHED_TO`], with `race` landing after its read. Its answer,
+    /// the review step's metadata and the car's own metadata after.
+    async fn finish_racing(race: Option<Value>) -> (Result<()>, Value, Value) {
+        let branch = "feat/binding-plate-claims-lamps-car5";
+        let (base, car_id, step_id) = served_held_car(held_review_md()).await;
+        let receipt = json!({ "head": REFRESHED_TO, "mode": "auto" }).to_string();
+        let door = Racing {
+            wire: signed_wire(base),
+            gate_runs: vec![json!({ "id": "g-b", "metadata": { "branch": branch },
+                "steps": [{ "metadata": { "verdict": "green", "receipt": receipt } }] })],
+            race: race.map(|w| (format!("/api/jobs/{car_id}/steps/{step_id}/metadata"), w)),
+            raced: std::sync::atomic::AtomicBool::new(false),
+        };
+        let judged = crate::car_retire::read_via(&door, &car_id).await.unwrap();
+        let tree = Fixed {
+            head: REFRESHED_TO.to_string(),
+            judged: crate::mutating_verb::Judgement::Clear,
+        };
+        let answer = finish(&door, &tree, &judged, branch, branch, false).await;
+        let after = crate::car_retire::read_via(&door, &car_id).await.unwrap();
+        let review = boss_jobs::car_release::review_step(&after)
+            .and_then(|s| s.get("metadata"))
+            .cloned()
+            .unwrap_or_default();
+        (answer, review, after["metadata"].clone())
+    }
+
+    /// The control: nothing moved after the read, so the refresh carries
+    /// the hold to the head it refreshed (6b12a70f) and repoints the car.
+    #[tokio::test]
+    async fn a_refresh_on_the_hold_it_judged_carries_it_and_repoints_the_car() {
+        let (answer, review, car) = finish_racing(None).await;
+        answer.expect("the row reads as judged");
+        assert_eq!(review[boss_jobs::car::HOLD_SHA], REFRESHED_TO);
+        assert_eq!(review["hold"], REVIEW_HOLD);
+        assert!(car.get("regate_receipt").is_some(), "repointed: {car}");
+    }
+
+    /// The race: the hold the refresh read was released, or replaced by a
+    /// person's, before it wrote. The refresh is refused in words and
+    /// NOTHING is written — not the hold's head, and not the repoint
+    /// behind it — so no `hold_sha` is left beside no hold, and no
+    /// person's hold is bound to a head a reviewer could release.
+    #[tokio::test]
+    async fn a_refresh_does_not_rebind_a_hold_that_moved_after_its_read() {
+        for race in [
+            json!({ "hold": null,
+                    boss_jobs::car::RELEASE: { "sha": HELD_AT, "review": "7cb2438c" } }),
+            json!({ "hold": "David reads this one first" }),
+        ] {
+            let mut expected = held_review_md();
+            let md = expected.as_object_mut().unwrap();
+            md.extend(race.as_object().unwrap().clone());
+            md.retain(|_, v| !v.is_null());
+            let (answer, review, car) = finish_racing(Some(race.clone())).await;
+            let said = format!("{:#}", answer.expect_err("the hold moved since the read"));
+            assert!(
+                said.contains("changed") && said.contains("Nothing was written"),
+                "{said}"
+            );
+            assert_eq!(
+                review, expected,
+                "{race}: the review step is as the race left it"
+            );
+            assert!(
+                car.get("regate_receipt").is_none(),
+                "{race}: the car is not repointed: {car}"
+            );
+        }
+    }
+
+    /// THE HELPER EVERY JUDGED HOLD WRITE ADOPTS (backlog cd1f68c6) —
+    /// the strike release's `lift_struck_hold` next, with
+    /// `car_release::release_write_expectation` as its judgement. Against
+    /// the real merge door: a judgement the step no longer holds answers
+    /// `Moved` and writes nothing; one it holds answers `Written`; and a
+    /// hold reason's em-dash survives the header both ways.
+    #[tokio::test]
+    async fn a_judged_hold_write_answers_moved_and_writes_nothing_when_the_hold_moved() {
+        let (base, car_id, step_id) = served_held_car(held_review_md()).await;
+        let wire = signed_wire(base);
+        let review = |car: Value| {
+            boss_jobs::car_release::review_step(&car)
+                .and_then(|s| s.get("metadata"))
+                .cloned()
+                .unwrap_or_default()
+        };
+        let lift = json!({ "hold": null, "hold_released": { "strike_release": true } });
+        let stale = boss_jobs::car::hold_as_judged(&json!({ "hold": "red train #1571",
+            boss_jobs::car::HOLD_SHA: null }));
+        let answer = crate::car_retire::patch_step_metadata_expecting(
+            &wire,
+            &car_id,
+            &step_id,
+            lift.clone(),
+            &stale,
+        )
+        .await
+        .expect("a moved hold is an answer, not an error");
+        assert_eq!(answer, crate::car_retire::Judged::Moved);
+        let stored = review(crate::car_retire::read_via(&wire, &car_id).await.unwrap());
+        assert_eq!(stored, held_review_md(), "nothing written");
+
+        let judged = boss_jobs::car::hold_as_judged(&held_review_md());
+        let answer = crate::car_retire::patch_step_metadata_expecting(
+            &wire, &car_id, &step_id, lift, &judged,
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer, crate::car_retire::Judged::Written);
+        let stored = review(crate::car_retire::read_via(&wire, &car_id).await.unwrap());
+        assert!(stored.get("hold").is_none(), "{stored}");
+        assert_eq!(stored["hold_released"]["strike_release"], true);
     }
 
     /// A git fixture: a repo on `main` with one base commit, committer
@@ -1915,6 +2916,43 @@ mod tests {
         assert_eq!(
             git(&r, &["log", "-1", "--format=%s"]).expect("head"),
             "this car: second.txt"
+        );
+    }
+
+    /// A predecessor landed by squash as a SERIES (backlog 48bb0b42): its
+    /// first commit conflicts with main's sum instead of replaying empty.
+    /// Main holds the series' final state blob for blob, so the prefix is
+    /// skipped as landed, named, and the car's own commit replays.
+    #[test]
+    fn a_squash_landed_series_before_the_car_is_skipped_not_a_conflict() {
+        let r = fixture_repo("rerail-series-pick");
+        git(&r, &["checkout", "-q", "-b", "fix/s"]).expect("branch");
+        write_commit(&r, "first.txt", "1\n", "first car: add first.txt");
+        write_commit(&r, "first.txt", "1\n2\n", "first car: second line");
+        write_commit(&r, "second.txt", "2\n", "this car: second.txt");
+        git(&r, &["checkout", "-q", "main"]).expect("main");
+        write_commit(&r, "first.txt", "1\n2\n", "train: first car lands");
+        let base = git(&r, &["merge-base", "main", "fix/s"]).expect("base");
+        git(&r, &["checkout", "-q", "--detach", "main"]).expect("detach");
+
+        match pick_onto(&r, &base, "fix/s").expect("pick") {
+            Picked::Clean { dropped } => {
+                assert_eq!(
+                    dropped.iter().map(|d| d.title.as_str()).collect::<Vec<_>>(),
+                    ["first car: add first.txt", "first car: second line"]
+                );
+            }
+            other => panic!("expected the landed series skipped and a clean replay, got {other:?}"),
+        }
+        assert_eq!(
+            git(&r, &["log", "-1", "--format=%s"]).expect("head"),
+            "this car: second.txt"
+        );
+        assert!(
+            git(&r, &["status", "--porcelain"])
+                .expect("status")
+                .is_empty(),
+            "nothing is left mid-cherry-pick"
         );
     }
 
@@ -2211,7 +3249,9 @@ mod tests {
                 ],
                 // Review 0a5496cb, finding 1: the same patch TEXT in the
                 // other block is not this change — its blobs differ — so
-                // no twin is named and no skip offered (checked below).
+                // no byte-for-byte twin is named and no skip offered; the
+                // stop names main's commit as a text-only match that may
+                // or may not be this one (checked below; backlog 2f2caa8e).
                 None,
             ),
         ];
@@ -2230,9 +3270,12 @@ mod tests {
                 (None, None) => {}
                 // A twin of the text alone is said as such: never "byte
                 // for byte", never a skip, and the stop is the ordinary one.
+                // Never "not this commit's twin" either: from the text
+                // alone the stop cannot tell (backlog 2f2caa8e).
                 (None, Some(note)) if name == "twin-in-another-block" => {
                     assert!(note.contains(&shas[0][..12]), "{name}: {note}");
-                    assert!(note.contains("not this commit's twin"), "{name}: {note}");
+                    assert!(note.contains("cannot tell which"), "{name}: {note}");
+                    assert!(!note.contains("not this commit's twin"), "{name}: {note}");
                     assert!(!note.contains("byte for byte"), "{name}: {note}");
                     assert!(!note.contains("--skip"), "{name}: {note}");
                 }
@@ -2297,18 +3340,66 @@ mod tests {
             // `--continue` and a gate (review 0a5496cb, finding 3).
             "the car carries nothing main lacks",
             "push nothing and gate nothing",
-            "`boss merged fix/c`",
+            // `boss merged` answers MERGED off one past cherry (merged.rs,
+            // `git cherry`), so the read above is the evidence, and the
+            // note says why the verb is not (backlog 2f2caa8e).
+            "close the car as landed, citing the read above",
+            "`boss merged fix/c` answers MERGED once main has taken the patch, even if a \
+             later commit took it back out, so it cannot",
         ] {
             assert!(note.contains(want), "missing {want:?} in: {note}");
         }
+        assert!(!note.contains("confirm with `boss merged"), "{note}");
         assert!(!note.contains("leave the commit out"), "{note}");
     }
 
-    /// A path with a space or a quote is quoted in the printed read.
+    /// A TEXT-ONLY TWIN MAY BE THIS COMMIT'S TWIN (backlog 2f2caa8e,
+    /// review 22073d6e of car fd13ddf2). Main took the car's very change,
+    /// but on a file it had already changed outside the hunk's context:
+    /// the blobs differ, so only the patch text matches — the ordinary way
+    /// a stale copy's twin lands. The stop called main's commit "not this
+    /// commit's twin", which here is false; it now says it cannot tell,
+    /// and names the read that can.
     #[test]
-    fn a_printed_path_is_shell_quoted() {
-        assert_eq!(sh_quote("a b.txt"), "'a b.txt'");
-        assert_eq!(sh_quote("it's"), r"'it'\''s'");
+    fn a_text_only_twin_on_a_moved_preimage_is_not_called_no_twin() {
+        const NINE: &str = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n";
+        const NINE_F: &str = "l1\nl2\nl3\nl4\nFEATURE\nl6\nl7\nl8\nl9\n";
+        let (r, base, shas) = shaped(
+            "rerail-twin-moved-preimage",
+            &[(&[("base.txt", NINE)], "nine")],
+            &[(&[("base.txt", NINE_F)], "car: feature")],
+            &[
+                (
+                    &[("base.txt", "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nL9X\n")],
+                    "train: l9 (#1)",
+                ),
+                (
+                    &[("base.txt", "l1\nl2\nl3\nl4\nFEATURE\nl6\nl7\nl8\nL9X\n")],
+                    "train: feature (#2)",
+                ),
+                (
+                    &[("base.txt", "l1\nl2\nl3\nl4\nFEATURE2\nl6\nl7\nl8\nL9X\n")],
+                    "train: amend (#3)",
+                ),
+            ],
+        );
+        let Picked::Conflict {
+            twin: Some(note), ..
+        } = pick_onto(&r, &base, "fix/c").expect("pick")
+        else {
+            panic!("expected a conflict naming main's commit");
+        };
+        let landed = &shas[1][..12];
+        assert!(note.contains(landed), "names train #2: {note}");
+        assert!(!note.contains("not this commit's twin"), "{note}");
+        assert!(note.contains("may be this commit's twin"), "{note}");
+        assert!(note.contains("cannot tell which"), "{note}");
+        assert!(
+            note.contains(&format!("git -C {r} show {landed}")),
+            "{note}"
+        );
+        assert!(!note.contains("byte for byte"), "{note}");
+        assert!(!note.contains("--skip"), "{note}");
     }
 
     /// A CLOSED OR BOARDED CAR IS NOT REROUTED (b3c2bfb6, second and

@@ -57,6 +57,9 @@ rows() {
 
 git_can_answer "$LINT" || exit $?
 
+# The public mirror declares it has no per-car trunk (BOSS_TRUNK=none,
+# lib/trunk-ref.sh; backlog 2d28df78): the forge ratcheted each car.
+lint_no_trunk "$LINT" "which rows this change added to $LIST" && exit 0
 BASE=$(resolve_trunk_ref "$LINT"); rc=$?
 if [ "$rc" -eq "$LINT_CANNOT_ANSWER" ]; then
     exit "$LINT_CANNOT_ANSWER"

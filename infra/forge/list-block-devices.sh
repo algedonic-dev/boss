@@ -152,6 +152,19 @@ for k in $knames; do
     fi
     # What an operator needs to tell one drive from another.
     size=$(lsblk -dno SIZE "$DEV") || { size=""; unread="${unread} size"; }
+    # A080411 / a0a6ac8e: the human size is rounded, so it cannot seed
+    # the estate's exact capacity. Read bytes for USED disks too, without
+    # sending an inventory question through the commission plan's refusal.
+    if size_bytes=$(lsblk -bdno SIZE "$DEV"); then
+        size_bytes=$(trim "$size_bytes")
+        if [[ ! "$size_bytes" =~ ^[0-9]+$ || ! "$size_bytes" =~ [1-9] ]]; then
+            size_bytes=UNREADABLE
+            unread="${unread} size_bytes"
+        fi
+    else
+        size_bytes=UNREADABLE
+        unread="${unread} size_bytes"
+    fi
     model=$(lsblk -dno MODEL "$DEV") || { model=""; unread="${unread} model"; }
     serial=$(lsblk -dno SERIAL "$DEV") || { serial=""; unread="${unread} serial"; }
     size=$(trim "$size"); model=$(trim "$model"); serial=$(trim "$serial")
@@ -181,6 +194,7 @@ for k in $knames; do
     say "== $k =="
     say "  type:        ${dtype:-UNREADABLE}"
     say "  size:        ${size:-unknown}"
+    say "  size_bytes:  $size_bytes"
     say "  model:       ${model:-none}"
     say "  serial:      ${serial:-none}"
     if [ -n "$names" ]; then

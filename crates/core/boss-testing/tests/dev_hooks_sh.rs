@@ -13,7 +13,10 @@
 //! - `prompt-submit.sh` writes the heartbeat (`boss job patch`:
 //!   `last_active_at`, `prompt_count`) and NEVER the prompt text —
 //!   the one privacy rule this car ships, pinned below by planting a
-//!   sentence and asserting it reaches nothing.
+//!   sentence and asserting it reaches nothing. Then it prints the
+//!   session's working window, read off the packet by `boss session
+//!   window` (backlog 37e3295c) — the one line it puts on the model's
+//!   context, so the session's end comes from the record.
 //! - `agent-start.sh` pipes a PreToolUse payload into `boss dispatch
 //!   <session> --from-hook`, prints the verb's stdout (the updatedInput
 //!   answer) and nothing else, and stores the run id the verb names
@@ -46,6 +49,10 @@ const HOOKS: &str = "infra/dev/hooks";
 const SETTINGS: &str = ".claude/settings.json";
 const SESSION: &str = "7a1e2b3c-0000-4000-8000-00000000abcd";
 const RUN: &str = "5b1d2c3e-0000-4000-8000-000000000001";
+/// What the stub `boss session window` answers: the verb's own one line,
+/// which the prompt hook hands to the model's context verbatim.
+const WINDOW_LINE: &str =
+    "work-session 7a1e2b3c window: until 2026-10-19T20:00:00Z (in 7h46m) — set by agent-claude";
 
 struct Fixture {
     root: PathBuf,
@@ -83,6 +90,7 @@ impl Fixture {
                  {exit_early}\n\
                  case \"$1 $2\" in\n\
                    'job file') echo 'boss job: filed {SESSION}  \"Session: emp-david on boss-dev-0\" — confirmed by reading it back' ;;\n\
+                   'session window') echo '{WINDOW_LINE}' ;;\n\
                    'dispatch {SESSION}'|'dispatch -') \n\
                       if grep -q Packet: \"$d/stdin\"; then\n\
                         echo 'agent_run={RUN}' >&2\n\
@@ -405,15 +413,36 @@ fn prompt_submit_heartbeats_without_the_prompt_text() {
     for _ in 0..2 {
         let (code, out, err) = f.run("prompt-submit.sh", &payload, true);
         assert_eq!(code, 0, "{err}");
-        assert_eq!(out, "", "stdout would be added to the model's context");
+        // THE WINDOW, FROM THE PACKET (backlog 37e3295c): stdout here is
+        // added to the model's context, so the ONE thing printed is the
+        // window verb's own line — the session takes its end from its
+        // packet on every prompt, never from an hour said in chat.
+        assert_eq!(
+            out,
+            format!("{WINDOW_LINE}\n"),
+            "stdout is the window verb's answer and nothing else"
+        );
         assert!(!err.contains(secret));
     }
     let calls = f.calls("boss-calls");
-    assert_eq!(calls.len(), 2, "{calls:?}");
-    for (i, (argv, _)) in calls.iter().enumerate() {
+    assert_eq!(
+        calls.len(),
+        4,
+        "a heartbeat and a window read per prompt: {calls:?}"
+    );
+    let (heartbeats, windows): (Vec<_>, Vec<_>) =
+        calls.iter().partition(|(argv, _)| argv[0] == "job");
+    for (argv, _) in &windows {
+        assert_eq!(
+            argv,
+            &["session", "window", SESSION],
+            "read the session's own packet"
+        );
+    }
+    for (i, (argv, body)) in heartbeats.iter().enumerate() {
         assert_eq!(&argv[..3], ["job", "patch", SESSION]);
         let patch: serde_json::Value =
-            serde_json::from_str(&calls[i].1).expect("the patch file handed to the verb is JSON");
+            serde_json::from_str(body).expect("the patch file handed to the verb is JSON");
         assert_eq!(patch["prompt_count"], (i + 1) as u64);
         assert!(
             patch["last_active_at"]

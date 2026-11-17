@@ -1,0 +1,38 @@
+{
+  "about": "MUTATING — suspend (true) or resume (false) ONE cluster chore by setting its CronJob's spec.suspend (infra/forge/chore-suspend.sh <namespace> <cronjob> <true|false> <plan_sha256>) through the forge's ops_kubectl door (the admin kubeconfig David placed, infra/estate/ops-credentials.sh). Built for backlog d28c0051: on 2026-11-11 ~05:02Z the hourly boss/boss-search-reindex was spilling ~13 GB of temp per run onto a degraded pgdata volume (832386eb), spec.suspend=true was the safe lever, no verb pulled it, and David ran kubectl patch from his workstation; every infra act should be a website-approved verb (David, 2026-10-18). Both directions are this verb. AUTHORISED PER RUN BY DAVID'S PASSKEY in design 17835005's shape, as set-longhorn-drain-policy is: it declares requires_approval with the read-only plan-a-chore-suspend (this script's --plan) as its plan_verb, so the runner renders the plan onto the request's approve step, runs this only after a passkey on the approvers list signs those bytes, and hands the script sha256 of the SIGNED plan; the script re-renders and patches nothing unless today's plan hashes to it. The value before is in the bytes and a plan that changes nothing is refused, so a second run of an applied plan is refused: at most once. THE BOUND IS THE SCRIPT'S, NEVER A PARAM: the CronJob must be declared by this checkout's infra/cluster/manifests in that namespace as the converge renders them for every instance, with the label boss-chore=true; the live object must carry that label and a boolean spec.suspend; and a chore whose spec the converge itself writes is refused (boss-break-glass-deposit: the deposit configuration replaces its /spec on every train, which would undo a suspension in silence) — or nothing is done (exit 78). Every other chore's suspension stands across converges, because no manifest declares spec.suspend and the apply leaves an undeclared field alone; so a suspended chore stays suspended until this verb runs with false. THE WRITE is one kubectl patch --type=json that TESTS /spec/suspend is still the planned value and replaces it — a compare-and-set on the one field. A Job already running is not stopped; the write prints the chore's active Jobs and last schedule time on its record as it patches. THE EFFECT IS READ BACK: the CronJob is read again, and only when its spec.suspend reads the new value is the effect line printed; otherwise the run exits 1 saying it is NOT proven, naming what it read. Timeout 120: the render, the reads (20 s each at worst), the patch and the read-back.",
+  "hosts": [
+    "forge"
+  ],
+  "requires_approval": true,
+  "plan_verb": "plan-a-chore-suspend",
+  "approvers": [
+    "emp-david"
+  ],
+  "argv": [
+    "infra/forge/chore-suspend.sh",
+    "{1}",
+    "{2}",
+    "{3}",
+    "{4}"
+  ],
+  "params": [
+    {
+      "name": "namespace",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    {
+      "name": "cronjob",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,50}[a-z0-9])?$"
+    },
+    {
+      "name": "suspend",
+      "pattern": "^(true|false)$"
+    },
+    {
+      "name": "plan_sha256",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  ],
+  "timeout": 120,
+  "effect": "^suspend-a-chore: cronjob [a-z0-9-]+/[a-z0-9-]+ reads back spec\\.suspend (true|false) \\(was (true|false); schedule [^;]+; active Jobs at the read-back: [0-9]+\\)$"
+}

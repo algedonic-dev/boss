@@ -18,9 +18,8 @@
 // design-review/queue` makes the registry row the single definition.
 //
 // The page's own identity (header, which panels it carries) comes from
-// the same envelope, off `stations.lens` — the shape `upstream` proved
-// in 119: the row declares it, the queue echoes it, the lens renders
-// whatever the row says.
+// the same envelope, off `stations.lens`: the row declares it, the
+// queue echoes it, the lens renders whatever the row says.
 
 import { readEnvelope } from '../../data/shape';
 

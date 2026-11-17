@@ -8,8 +8,8 @@ use uuid::Uuid;
 use crate::error::ContentError;
 use crate::port::ContentRepository;
 use crate::types::{
-    Audience, Bulletin, BulletinDraft, BulletinPatch, BulletinPriority, ManualPatch, ManualSection,
-    ManualSectionDraft, ManualSectionVersion, UserContext,
+    Audience, Bulletin, BulletinDraft, BulletinPatch, BulletinPriority, ManualIndexEntry,
+    ManualPatch, ManualSection, ManualSectionDraft, ManualSectionVersion, UserContext,
 };
 
 pub struct PgContent {
@@ -351,6 +351,44 @@ impl ContentRepository for PgContent {
         Ok(())
     }
 
+    async fn manual_index(
+        &self,
+        user: &UserContext,
+    ) -> Result<Vec<ManualIndexEntry>, ContentError> {
+        // Select headers only: an unpublished draft never crosses this boundary.
+        let rows = sqlx::query(
+            "SELECT id, slug, parent_slug, title, sort_order, published, audience, \
+                    owner_station, authoring_job_id FROM manual_sections \
+             ORDER BY parent_slug COLLATE \"C\" NULLS FIRST, sort_order, \
+                      title COLLATE \"C\", slug COLLATE \"C\"",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let audience = Audience(row.try_get("audience").map_err(store)?);
+            if crate::port::matches_observed(
+                self.audience_observer.as_deref(),
+                "content-manual-index-audience",
+                &audience,
+                user,
+            ) {
+                out.push(ManualIndexEntry {
+                    id: row.try_get("id").map_err(store)?,
+                    slug: row.try_get("slug").map_err(store)?,
+                    parent_slug: row.try_get("parent_slug").map_err(store)?,
+                    title: row.try_get("title").map_err(store)?,
+                    sort_order: row.try_get("sort_order").map_err(store)?,
+                    published: row.try_get("published").map_err(store)?,
+                    owner_station: row.try_get("owner_station").map_err(store)?,
+                    authoring_job_id: row.try_get("authoring_job_id").map_err(store)?,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     async fn manual_tree(&self, user: &UserContext) -> Result<Vec<ManualSection>, ContentError> {
         // Byte order (`COLLATE "C"`), the only order the in-memory
         // adapter's `String::cmp` can hold: the database's locale
@@ -360,7 +398,7 @@ impl ContentRepository for PgContent {
         // class). The unique slug settles a shared title.
         let rows = sqlx::query(
             "SELECT id, slug, parent_slug, title, body, sort_order, audience, \
-                    current_version, published, created_at, updated_at \
+                    current_version, published, created_at, updated_at, owner_station, authoring_job_id \
              FROM manual_sections \
              WHERE published = true \
              ORDER BY parent_slug COLLATE \"C\" NULLS FIRST, sort_order, \
@@ -390,7 +428,7 @@ impl ContentRepository for PgContent {
     ) -> Result<Option<ManualSection>, ContentError> {
         let row = sqlx::query(
             "SELECT id, slug, parent_slug, title, body, sort_order, audience, \
-                    current_version, published, created_at, updated_at \
+                    current_version, published, created_at, updated_at, owner_station, authoring_job_id \
              FROM manual_sections WHERE slug = $1",
         )
         .bind(slug)
@@ -429,8 +467,8 @@ impl ContentRepository for PgContent {
         sqlx::query(
             "INSERT INTO manual_sections \
                 (id, slug, parent_slug, title, body, sort_order, audience, \
-                 current_version, published, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9, $9)",
+                 current_version, published, created_at, updated_at, owner_station, authoring_job_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9, $9, $10, $11)",
         )
         .bind(id)
         .bind(&draft.slug)
@@ -441,6 +479,8 @@ impl ContentRepository for PgContent {
         .bind(&draft.audience.0)
         .bind(draft.published)
         .bind(stamp.timestamp)
+        .bind(&draft.owner_station)
+        .bind(draft.authoring_job_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| section_insert_refused(e, &draft))?;
@@ -475,7 +515,7 @@ impl ContentRepository for PgContent {
         let mut tx = self.pool.begin().await.map_err(store)?;
         let row = sqlx::query(
             "SELECT id, slug, parent_slug, title, body, sort_order, audience, \
-                    current_version, published, created_at, updated_at \
+                    current_version, published, created_at, updated_at, owner_station, authoring_job_id \
              FROM manual_sections WHERE slug = $1 FOR UPDATE",
         )
         .bind(slug)
@@ -496,6 +536,8 @@ impl ContentRepository for PgContent {
         let audience = patch.audience.unwrap_or(current.audience.clone());
         let sort_order = patch.sort_order.unwrap_or(current.sort_order);
         let published = patch.published.unwrap_or(current.published);
+        let owner_station = patch.owner_station.or(current.owner_station);
+        let authoring_job_id = patch.authoring_job_id.or(current.authoring_job_id);
         let new_version = current
             .current_version
             .checked_add(1)
@@ -504,7 +546,8 @@ impl ContentRepository for PgContent {
         sqlx::query(
             "UPDATE manual_sections SET \
                 title = $2, body = $3, audience = $4, sort_order = $5, \
-                published = $6, current_version = $7, updated_at = $8 \
+                published = $6, current_version = $7, updated_at = $8, \
+                owner_station = $9, authoring_job_id = $10 \
              WHERE id = $1",
         )
         .bind(current.id)
@@ -515,6 +558,8 @@ impl ContentRepository for PgContent {
         .bind(published)
         .bind(new_version)
         .bind(stamp.timestamp)
+        .bind(owner_station)
+        .bind(authoring_job_id)
         .execute(&mut *tx)
         .await
         .map_err(store)?;
@@ -678,6 +723,8 @@ fn row_to_section(row: &sqlx::postgres::PgRow) -> Result<ManualSection, ContentE
         audience: Audience(audience_value),
         current_version: row.try_get("current_version").map_err(store)?,
         published: row.try_get("published").map_err(store)?,
+        owner_station: row.try_get("owner_station").map_err(store)?,
+        authoring_job_id: row.try_get("authoring_job_id").map_err(store)?,
         created_at: row.try_get("created_at").map_err(store)?,
         updated_at: row.try_get("updated_at").map_err(store)?,
     })

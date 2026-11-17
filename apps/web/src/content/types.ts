@@ -35,3 +35,11 @@ export type ManualSection = {
   created_at: string;
   updated_at: string;
 };
+
+/** Navigation names unfinished work without receiving its draft body. */
+export type ManualIndexEntry = Pick<ManualSection,
+  'id' | 'slug' | 'parent_slug' | 'title' | 'sort_order' | 'published'
+> & Readonly<{
+  owner_station?: string | null;
+  authoring_job_id?: string | null;
+}>;

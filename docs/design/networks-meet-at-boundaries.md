@@ -116,7 +116,8 @@ deleted merely because a field's vocabulary arose in the device shop.
 The Equipment KB (`boss-catalog`, `boss-assets`) was built with
 device refurb in mind and is genuinely generic — the brewery uses it
 for vessels and mechanics use it for failure modes. Should some of
-`examples/used-device-shop/DOMAIN.md` be rewritten as a *platform*
+the device shop's domain doc (deleted with that tenant on 2026-09-24)
+be rewritten as a *platform*
 document about equipment-bearing work, or does it all go and the
 brewery becomes the only worked example?
 

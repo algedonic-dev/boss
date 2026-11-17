@@ -26,6 +26,63 @@ fn firing(rule: &str, event: &str, fired_at: chrono::DateTime<Utc>) -> Firing {
     }
 }
 
+/// Count actual SQL statements at the adapter boundary, not calls to a
+/// fake port. Per-statement delay models a slow database round trip;
+/// it does not establish the cause of the production backlog.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_event_records_all_its_rules_in_one_insert() {
+    let db = TestDb::new().await;
+    sqlx::raw_sql(
+        "CREATE TABLE firing_insert_calls (n integer NOT NULL); \
+         INSERT INTO firing_insert_calls VALUES (0); \
+         CREATE FUNCTION count_firing_insert() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN UPDATE firing_insert_calls SET n = n + 1; \
+         PERFORM pg_sleep(0.02); RETURN NULL; END $$; \
+         CREATE TRIGGER count_firing_insert AFTER INSERT ON dispatcher_firings \
+         FOR EACH STATEMENT EXECUTE FUNCTION count_firing_insert();",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let sink = PgFirings::new(db.pool.clone());
+    let at = Utc::now();
+    let rows = vec![
+        firing("r1", "evt", at),
+        firing("r2", "evt", at),
+        firing("r3", "evt", at),
+    ];
+    let start = std::time::Instant::now();
+    sink.record(&rows).await.unwrap();
+    let elapsed = start.elapsed();
+    let calls: i32 = sqlx::query_scalar("SELECT n FROM firing_insert_calls")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM dispatcher_firings WHERE firing_id = ANY($1)")
+            .bind(rows.iter().map(|r| r.firing_id.clone()).collect::<Vec<_>>())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    println!(
+        "MEASURE rules=3 inserted_rows={count} actual_insert_statements={calls} injected_per_statement_ms=20 elapsed_ns={} (isolated fixture, not production cause)",
+        elapsed.as_nanos()
+    );
+    assert_eq!(count, 3);
+    assert_eq!(
+        calls, 1,
+        "one event must pay one INSERT round trip, not one per rule"
+    );
+    sink.record(&rows).await.unwrap();
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM dispatcher_firings WHERE firing_id = ANY($1)")
+            .bind(rows.iter().map(|r| r.firing_id.clone()).collect::<Vec<_>>())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 3, "redelivery preserves deterministic firing IDs");
+}
+
 /// 4b175523: a dead-letter on a topic that names no packet lands as an
 /// `outcome = 'dead-letter'` row, beside — never instead of — a firing
 /// of the same rule on the same event.

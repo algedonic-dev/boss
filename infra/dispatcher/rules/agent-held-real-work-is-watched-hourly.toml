@@ -27,6 +27,9 @@
 # platform protocol. ~200 agent-held backlog builds were days old on
 # 2026-09-24; an alarm per build would be the flat list again, shouted.
 # The shipped-rule test refuses a `backlog-item` declaration by name.
+# URGENT items are watched elsewhere, scoped by priority and not by
+# wait: `an-urgent-item-is-released-when-unrun-and-rescoped-when-long`
+# (backlog 9788e22d), which the same test requires to exist.
 #
 # ONE PLATFORM STEP, NARROWED (version 2, backlog c851ed24): `hours.
 # ship-a-change.landed-review`, 24h. Since option A (bd331d38, David

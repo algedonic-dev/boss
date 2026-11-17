@@ -12,3 +12,5 @@
 id = "automation:prune-registry-versions"
 role = "audit-readonly"
 description = 'The registry-version prune reading which trains landed before it deletes a container version from the forge (infra/forge/prune-registry-versions.sh, through infra/forge/landed-train-shas.lib.sh). Reads only.'
+# Host station: estate (backlog 6ecb5480, station-tree.md section 6).
+station = "134464a5-0b56-4386-86cb-d354c7448fdf"

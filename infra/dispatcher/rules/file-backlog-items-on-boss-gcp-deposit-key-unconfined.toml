@@ -26,11 +26,33 @@
 # something. The chore judge reads the packet from `job_id` when the
 # marker is a step's (chore_file_reds.rs).
 #
-# ONE ITEM WHILE IT IS OPEN. The judge dedups by route, so a finding
-# that stands for days is one backlog-item, and a closed item files
-# again, because a recurrence after a fix is a new fact. An UNVERIFIED
+# ONE ITEM PER LINE WHILE IT IS OPEN. Every finding prints under the
+# one route above, so a judge deduping by route filed the first line
+# and then nothing for a second, different line found while that item
+# was open (backlog d1b03874): the item named one line of two, and
+# removing a line is David's hand act, done from what the item says.
+# `one_item_per = "finding"` keys each item on its RED line instead, so
+# a finding that stands for days is one backlog-item, a new line is its
+# own, and a closed item files again, because a recurrence after a fix
+# is a new fact. An UNVERIFIED
 # audit (a file it could not read, a NUL byte, the 60 s bound) files
-# nothing: it reads `unverified` on the packet, never `unconfined`.
+# nothing HERE: it reads `unverified` on the packet, never `unconfined`.
+# Three unverified ticks in a row are
+# file-backlog-items-on-boss-gcp-deposit-key-unverified's (ada4d019).
+#
+# A FINDING IS ITS KEY, AND A TICK THAT DROPS IT CLOSES IT (backlog
+# 52534a15). Keyed on the whole RED line, a removed EARLIER line shifted
+# every later finding's file:line and a reworded audit changed every
+# finding's text, and each re-filed beside its stale item, which only a
+# hand closed. Now the judge keys a finding on the key fingerprint it
+# names (chore_file_reds.rs `finding_key`), refreshes an open item's
+# words to the line as it stands, and judges every tick whole: a CLEAN
+# tick (clean_field / clean_value below) or a finding tick that no longer
+# prints an item's key closes that item `stale` at triage, citing the
+# tick — or, if a person has acted on it, tells it and leaves it theirs.
+# So `clean` ticks now reach this rule too; one with nothing to close
+# writes nothing. `unverified` still never does: no evidence is not a
+# pass, and it closes nothing.
 [[rule]]
 name = "file-backlog-items-on-boss-gcp-deposit-key-unconfined"
 why = """
@@ -45,11 +67,19 @@ authority widened: the handler is the chore judge
 (maintenance.chore.file_reds) the forge converge and the machine token
 push already use, its only writes are standard backlog-items owned by
 the platform owner and one `judged` note on the converge's own packet,
-and the dedup key is the route the converge prints. Nothing on the host
+and the dedup key is the key fingerprint each finding names (one_item_per =
+finding, backlog d1b03874; keyed on the key by 52534a15). It closes only
+items it filed itself (their `reporter` is this rule), at `triage` and
+only while nobody has acted on one. Nothing on the host
 is touched: removing a line from authorized_keys stays David's hand act.
 """
+# v2 (backlog d1b03874): one_item_per = finding. v3 (backlog 52534a15):
+# clean ticks reach the judge, which closes what a tick no longer prints.
+# Without the bump the seed keeps the old row and the edit never goes
+# live (732c3cf9).
+version = 3
 on_event = "step.done.task"
-when = 'workflow_kind = "maintenance-boss-gcp-converge" AND spec_slug = "run" AND metadata.deposit_key_verdict = "unconfined"'
+when = 'workflow_kind = "maintenance-boss-gcp-converge" AND spec_slug = "run" AND (metadata.deposit_key_verdict = "unconfined" OR metadata.deposit_key_verdict = "clean")'
 [[rule.do]]
 handler = "maintenance.chore.file_reds"
-args = { step = "\"run\"", design = "\"bdc60b65\"", area = "\"credentials\"" }
+args = { step = "\"run\"", design = "\"bdc60b65\"", area = "\"credentials\"", one_item_per = "\"finding\"", clean_field = "\"deposit_key_verdict\"", clean_value = "\"clean\"" }

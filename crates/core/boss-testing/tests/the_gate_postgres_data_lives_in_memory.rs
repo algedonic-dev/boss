@@ -62,7 +62,10 @@ use boss_testing::repo_root;
 const RUNNER: &str = "infra/gate-runner/gate-runner.yaml";
 const DEV: &str = "infra/cluster/manifests/boss-dev.yaml";
 const CONSIST: &str = "infra/consist-worker/job.json";
-const POLICY: &str = "infra/platform/delivery-policy/train-conductor.toml";
+/// Where the gate capacity lives since item 0a78f8f8: the `gates`
+/// equipment station's bays (it was the delivery policy's
+/// gate_max_concurrent).
+const GATES: &str = "infra/platform/stations/gates.toml";
 
 /// The largest gate Postgres data directory measured (see the header):
 /// 2,072,238,410 bytes, 126 databases, on gate-run for
@@ -293,8 +296,8 @@ fn the_postgres_container_is_sized_for_the_memory_its_volumes_take() {
 
 /// THE BAYS FIT w-1's MEMORY, BY REQUEST AND AT THE WORST CASE. The same
 /// arithmetic `a_gate_requests_what_the_new_layout_uses_and_the_bays_fit`
-/// pins for disk: the policy's bays plus the train gate, which launches
-/// outside the bay bound (0f4224bc).
+/// pins for disk: the gates station's bays plus the train gate, which
+/// launches outside the bay bound (0f4224bc).
 #[test]
 fn the_bays_and_the_train_gate_fit_the_build_nodes_memory() {
     let pod = runner_pod();
@@ -302,13 +305,13 @@ fn the_bays_and_the_train_gate_fit_the_build_nodes_memory() {
         .into_iter()
         .map(|c| memory(c, "requests"))
         .sum();
-    let bays: f64 = read(POLICY)
+    let bays: f64 = read(GATES)
         .lines()
-        .find_map(|l| l.trim().strip_prefix("gate_max_concurrent ="))
-        .expect("train-conductor.toml declares gate_max_concurrent")
+        .find_map(|l| l.trim().strip_prefix("bays ="))
+        .expect("gates.toml declares bays")
         .trim()
         .parse()
-        .expect("gate_max_concurrent is a number");
+        .expect("bays is a number");
     let dev_docs = rbac::parse_stream(DEV, &read(DEV)).unwrap_or_else(|e| panic!("{e}"));
     let dev: f64 = dev_docs
         .iter()
@@ -329,12 +332,12 @@ fn the_bays_and_the_train_gate_fit_the_build_nodes_memory() {
          MemTotal, standing in for an allocatable the dev session cannot read, and only \
          this namespace's pods are counted.)"
     );
-    // WHAT THIS PIN DOES NOT HOLD, said where it is computed: one more
-    // gate than the policy's bays plus the train gate. A dock re-gate
-    // beside all four is a fifth, and the manifest's comment says it
-    // would sit Pending. That sentence is held to the numbers here, so it
-    // cannot outlive a resize in either direction.
-    let fifth = (gates + 1.0) * gate_pod + dev;
+    // The manifest's fixed FIFTH-gate claim is about five gate pods,
+    // independently of the policy's configured bay count. Policy v11's
+    // two bays made `gates + 1` count FOUR while calling it fifth
+    // (9a460e74). Keep the admitted and worst-case budgets above/below,
+    // and hold this literal five-pod claim to its own request arithmetic.
+    let fifth = 5.0 * gate_pod + dev;
     let says_pending = read(RUNNER).contains("a FIFTH concurrent gate");
     assert_eq!(
         says_pending,

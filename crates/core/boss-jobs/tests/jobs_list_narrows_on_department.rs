@@ -97,13 +97,20 @@ fn registry() -> Arc<InMemoryWorkflows> {
 }
 
 fn app(kinds: Option<Arc<InMemoryWorkflows>>) -> (Router, Arc<InMemoryJobs>) {
+    app_with_scope(kinds, Scope::All)
+}
+
+fn app_with_scope(
+    kinds: Option<Arc<InMemoryWorkflows>>,
+    scope: Scope,
+) -> (Router, Arc<InMemoryJobs>) {
     let jobs = Arc::new(InMemoryJobs::new());
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let publisher = DomainPublisher::new(bus_dyn, "jobs");
     let policy: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
-            .allow("ceo", Action::Read, Resource::job(), Scope::All)
+            .allow("ceo", Action::Read, Resource::job(), scope)
             .build(),
     );
     let clock: Arc<dyn ClockClient> = Arc::new(FixedClockClient::new(ClockNow {
@@ -123,6 +130,63 @@ fn app(kinds: Option<Arc<InMemoryWorkflows>>) -> (Router, Arc<InMemoryJobs>) {
         ..JobsApiState::minimal(jobs.clone(), bus, publisher, policy, clock)
     };
     (router(state), jobs)
+}
+
+#[tokio::test]
+async fn the_human_view_preserves_department_status_scope_and_registry_refusal() {
+    let kinds = registry();
+    kinds
+        .seed(spec("it-work", serde_json::json!({"department": "it"})))
+        .unwrap();
+    let (app, jobs) = app_with_scope(Some(kinds), Scope::Self_);
+    for (number, kind, department, open, mine) in [
+        (1, "it-work", None, true, true),
+        (2, "receive-an-inquiry", None, true, true),
+        (3, "receive-an-inquiry", Some("it"), true, true),
+        (4, "it-work", None, false, true),
+        (5, "it-work", None, true, false),
+    ] {
+        let mut job = packet(number, kind, "work");
+        job.owner_id = if mine { "emp-ceo" } else { "someone-else" }.into();
+        if !open {
+            job.status = JobStatus::Closed;
+        }
+        if let Some(department) = department {
+            job = with_department(job, department);
+        }
+        jobs.create_job(&job).await.unwrap();
+        for status in [
+            boss_core::job::StepStatus::Ready,
+            boss_core::job::StepStatus::Completed,
+        ] {
+            let mut step = boss_core::job::Step::new(job.id, "task", "human action", 0);
+            step.status = status;
+            step.assignee_id = Some("another-holder".into());
+            step.metadata = serde_json::json!({"human_only": if number == 3 { serde_json::json!("true") } else { serde_json::json!(true) }});
+            jobs.add_step(&step).await.unwrap();
+        }
+    }
+    let body = list(&app, "status=open&department=it&human_required_view=true").await;
+    assert_eq!(body["human_required_view"], 1);
+    assert_eq!(
+        body["total"], 2,
+        "non-IT, closed and unread-by-policy jobs stay outside the view: {body}"
+    );
+    for job in body["data"].as_array().unwrap() {
+        assert_eq!(
+            job["steps"].as_array().unwrap().len(),
+            1,
+            "completed steps are not human work: {job}"
+        );
+        assert_eq!(job["steps"][0]["human_required"], true);
+    }
+    let (unread, _) = app_with_scope(None, Scope::All);
+    let (status, _) = get(
+        &unread,
+        "status=open&department=it&human_required_view=true",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
 fn ceo() -> User {

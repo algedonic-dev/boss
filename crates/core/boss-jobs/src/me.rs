@@ -64,13 +64,16 @@ mod tests {
 
     fn agent(id: &str, aliases: &[&str], role: Option<&str>) -> AgentRow {
         AgentRow {
+            factory_rotation: true,
             id: id.into(),
             display_name: id.into(),
             default_model: "opus-5".into(),
+            model_class: None,
             role: role.map(str::to_string),
             department: None,
             hourly_budget_usd_micros: None,
             max_concurrent_runs: None,
+            stations: vec![],
             aliases: aliases.iter().map(|a| a.to_string()).collect(),
         }
     }

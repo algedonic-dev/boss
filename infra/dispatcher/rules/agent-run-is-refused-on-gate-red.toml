@@ -1,0 +1,53 @@
+# An agent's run ENDS when the gate it launched goes red (backlog
+# e5cec272), as it lands when that gate goes green
+# (`agent-run-lands-on-gate-green`, whose edge and guards this rule
+# reads the same way).
+#
+# WHY A RED ENDS THE RUN. Since agent-run v11 a run's `building` holds a
+# robots:<model> claim, and the step PUT frees it only on an exit that
+# names it (backlog 7b5195ea). A green's landing names it; a red landed
+# nothing on the run, so a red run held its slot until `lease_until`
+# (~2h), the same way a died run did before `jobs.age_out_step` named
+# the claim. And a red has nowhere else to go: the hand-off to the gate
+# retires the run's worker, and a red restarts as a FRESH run with a
+# fresh claim (decided 20261106_1507Z (2), backlog 0c55e31d) — so the
+# old run is finished the moment its verdict is red, and holding its
+# slot past that moment only refuses the next dispatch.
+#
+# WHAT IT WRITES. `building` is completed with `result = refused` (the
+# run's own terminal for an agent that stopped without delivering) and
+# the gate-run's id and branch as evidence under `gate_run`, through
+# `jobs.complete_linked_step`, whose completion names the claim the step
+# held as read (`common::complete_read_step`). `done_metadata` fills
+# absent keys only, and a completed `building` is every writer's first
+# no-op, so a builder that already ended its run by hand, or a silence
+# death, is untouched.
+#
+# ONLY `failed`. A gate-run's `lost` and `refused` terminals mean the
+# run produced no evidence about the branch (gate-run.toml); this rule
+# says nothing about them, and they keep today's ending (the builder's
+# hand or the silence clock).
+#
+# TWO STEPS, ONE OPEN (backlog 87d1ae40). A run admitted under agent-run
+# with a `verdict` step completes `building` as `handed` when `boss gate`
+# hands its car over, freeing its robots:<class> slot at the hand-off, and
+# waits on `verdict` with no claim. `steps` names both, and the handler
+# completes whichever is open: `building` on a run admitted before that
+# version, `verdict` on one handed to its gate. Never both — a run's
+# `verdict` opens only once `building` is done.
+[[rule]]
+name = "agent-run-is-refused-on-gate-red"
+why = """
+A CROSS-PROTOCOL REACTOR, the red twin of `agent-run-lands-on-gate-green`:
+a `gate-run` packet's FAILED verdict ends an `agent-run` packet — two
+protocols, so no single Workflow definition can declare it. Measured
+2026-11-08 (backlog e5cec272, from the 7b5195ea build): a red gate
+landed nothing on its run, so the run's robots:<model> claim held its
+slot until the lease expired, refusing dispatches in the meantime.
+"""
+version = 2
+on_event = "jobs.job.closed"
+when = "kind = \"gate-run\" AND outcome = \"failed\""
+[[rule.do]]
+handler = "jobs.complete_linked_step"
+args = { link = "\"agent_run\"", steps = "\"building,verdict\"", evidence_key = "\"gate_run\"", done_metadata = '"{\"result\": \"refused\"}"', metadata_envelope = '"gate_submission"', metadata_pointer = '"/source"', metadata_version = '"1"', metadata_equal = '"branch,sha,agent_run,worktree"' }

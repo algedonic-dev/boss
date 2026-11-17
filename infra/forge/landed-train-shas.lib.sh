@@ -166,7 +166,7 @@ train_sha_sets() {
     # a host the decision never saw.
     local mt_hdr=""
     [ "$jobs_url" != "$LTS_MT_FOR" ] || mt_hdr="${LTS_MT_HDR:-}"
-    reply="$("$curl_cmd" -fsS --max-time 20 \
+    reply="$("$curl_cmd" -q -fsS --max-time 20 \
         -H "x-boss-user: $boss_user" \
         ${mt_hdr:+-H "$mt_hdr"} \
         "$jobs_url/api/jobs?kind=pr-train&limit=$lookback&full=true" 2>&1)" || rc=$?

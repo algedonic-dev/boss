@@ -58,7 +58,7 @@ describe('the roster is the catalog', () => {
     const by = new Map(catalogRoutes().map((r) => [r.route, r.department]));
     expect(by.get('/ux/support')).toBe('support');
     expect(by.get('/ux/sales')).toBe('sales');
-    expect(by.get('/ux/vendors')).toBe('finance');
+    expect(by.get('/finance/vendors')).toBe('finance');
     expect(by.get('/it/design')).toBe('it');
     // f7f515ee: retiring Views removes it from the audit march too;
     // it is neither a relocated Home page nor an alias.

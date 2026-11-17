@@ -35,6 +35,98 @@ fn reading(id: &str, at: DateTime<Utc>) -> NewReading {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn historical_poll_witness_reads_without_inventing_measurement_and_keeps_stored_evidence() {
+    let db = TestDb::new().await;
+    let repo = PgSensors::new(db.pool.clone());
+    repo.publish("acme", &[input("historical-poll")])
+        .await
+        .unwrap();
+    // Pre-existing storage fixture, not an old-shaped public write.
+    let old = serde_json::json!({"entries":[{"message_key":"old","size_bytes":80,
+        "limit_bytes":64,"reason":"readings_post_413:v1","at":t(0)}],"truncated":0});
+    sqlx::query("UPDATE sensors SET cursor_at=$2,refused=$3 WHERE id=$1")
+        .bind("historical-poll")
+        .bind(t(0))
+        .bind(&old)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let before = repo.list().await.unwrap().remove(0);
+    let listed = serde_json::to_value(&before).unwrap();
+    assert_eq!(
+        listed["refused"]["entries"][0]["limit"],
+        serde_json::json!({"unit":"bytes","value":64})
+    );
+    repo.mark_polled(
+        "historical-poll",
+        &PollStamp {
+            polled_at: t(15),
+            cursor_at: Some(t(0)),
+            refused: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(repo.list().await.unwrap()[0].refused, before.refused);
+    let stored: serde_json::Value = sqlx::query_scalar("SELECT refused FROM sensors WHERE id=$1")
+        .bind("historical-poll")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored["entries"], old["entries"],
+        "read-only compatibility must not rewrite historical evidence as a new unmeasured witness"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_poll_write_conserves_clock_cursor_and_refusal_witness_together() {
+    use boss_jobs::sensors::{PollRefusals, RefusedMessage};
+    let db = TestDb::new().await;
+    let repo = PgSensors::new(db.pool.clone());
+    repo.publish("acme", &[input("poll-atomic")]).await.unwrap();
+    repo.mark_polled(
+        "poll-atomic",
+        &PollStamp {
+            polled_at: t(0),
+            cursor_at: Some(t(-5)),
+            refused: None,
+        },
+    )
+    .await
+    .unwrap();
+    let before = repo.list().await.unwrap();
+    // The adapter has issued its UPDATE when this owning database trigger
+    // refuses. No clock/cursor/witness part of that transaction may survive.
+    sqlx::raw_sql("CREATE FUNCTION refuse_poll_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled poll write failure'; END $$; CREATE TRIGGER refuse_poll_write AFTER UPDATE ON sensors FOR EACH ROW EXECUTE FUNCTION refuse_poll_write();")
+        .execute(&db.pool).await.unwrap();
+    let result = repo
+        .mark_polled(
+            "poll-atomic",
+            &PollStamp {
+                polled_at: t(15),
+                cursor_at: Some(t(10)),
+                refused: Some(PollRefusals {
+                    processed: Vec::new(),
+                    classes: None,
+                    entries: vec![RefusedMessage {
+                        message_key: "refused".into(),
+                        size_bytes: 50,
+                        limit: boss_jobs::sensors::RefusalLimit::bytes(20, 50),
+                        reason: "readings_post_413".into(),
+                        at: t(10),
+                    }],
+                    truncated: 0,
+                    cleared: None,
+                }),
+            },
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(repo.list().await.unwrap(), before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_registry_is_insert_if_absent_and_keeps_its_cursor() {
     let db = TestDb::new().await;
     let repo = PgSensors::new(db.pool.clone());
@@ -48,6 +140,7 @@ async fn the_registry_is_insert_if_absent_and_keeps_its_cursor() {
         &PollStamp {
             polled_at: t(0),
             cursor_at: Some(t(-5)),
+            refused: None,
         },
     )
     .await
@@ -132,7 +225,8 @@ async fn readings_dedup_by_external_id_and_the_first_stamp_wins() {
             "nobody",
             &PollStamp {
                 polled_at: t(0),
-                cursor_at: None
+                cursor_at: None,
+                refused: None,
             }
         )
         .await,
@@ -151,6 +245,7 @@ async fn the_cursor_never_moves_backwards_and_the_sweep_keeps_what_is_owed() {
             &PollStamp {
                 polled_at: polled,
                 cursor_at: cursor,
+                refused: None,
             },
         )
         .await

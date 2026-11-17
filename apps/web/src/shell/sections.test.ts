@@ -181,9 +181,9 @@ describe('the module gate a route answers to', () => {
     const off = { kind: 'ready' as const, modules: { warehouse: false }, labels: {} };
     const on = { ...off, modules: { warehouse: true } };
     const vendors: Route = { kind: 'vendors' };
-    expect(withManifest(vendors, '/ux/vendors', off)).toEqual({ kind: 'notFound', path: '/ux/vendors' });
-    expect(withManifest({ kind: 'vendor', vendorLookup: 'v' }, '/ux/vendors/v', off)).toEqual({ kind: 'notFound', path: '/ux/vendors/v' });
-    expect(withManifest(vendors, '/ux/vendors', on)).toEqual(vendors);
+    expect(withManifest(vendors, '/finance/vendors', off)).toEqual({ kind: 'notFound', path: '/finance/vendors' });
+    expect(withManifest({ kind: 'vendor', vendorLookup: 'v' }, '/finance/vendors/v', off)).toEqual({ kind: 'notFound', path: '/finance/vendors/v' });
+    expect(withManifest(vendors, '/finance/vendors', on)).toEqual(vendors);
     for (const route of [{ kind: 'po', poId: 'p' }, { kind: 'vendorInvoice', vendorInvoiceId: 'b' }] as const) {
       expect(appForRoute(route)).toBe('finance');
       expect(moduleForRoute(route)).toBeNull();
@@ -194,7 +194,7 @@ describe('the module gate a route answers to', () => {
 
   test('manifest loading and failure never normalize a known route to absent', () => {
     for (const manifest of [{ kind: 'loading' }, { kind: 'error' }] as const) {
-      expect(withManifest({ kind: 'vendors' }, '/ux/vendors', manifest)).toEqual({ kind: 'vendors' });
+      expect(withManifest({ kind: 'vendors' }, '/finance/vendors', manifest)).toEqual({ kind: 'vendors' });
     }
     const absent: Route = { kind: 'notFound', path: '/missing' };
     expect(withManifest(absent, '/missing', { kind: 'ready', modules: {}, labels: {} })).toEqual(absent);

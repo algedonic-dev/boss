@@ -74,6 +74,13 @@ fn the_steps_agents_execute_today_declare_their_agent_block() {
         // are reads and a verdict, no car — the analyst setting.
         "backlog-item/triage analyst $2.00 medium",
         "backlog-item/measure analyst $2.00 medium",
+        // The back of the item (backlog d9588961, 2026-11-12): about 27
+        // delivered items stood at `prove-delivery` named to
+        // agent-claude while `boss dispatch` refused the step by name
+        // and orient printed it UNDISPATCHABLE, each able to raise the
+        // idle-actor alarm again. A live read-back and two fields, no
+        // car — the analyst setting `triage` and `measure` carry.
+        "backlog-item/prove-delivery analyst $2.00 medium",
         "user-feedback/build builder $5.00 high",
         "user-feedback/draft-design analyst $2.00 medium",
         "protocol-retro/collect analyst $2.00 medium",
@@ -148,6 +155,18 @@ fn the_steps_agents_execute_today_declare_their_agent_block() {
         // setting, at medium — the cars that need a high-effort read
         // before boarding are exactly the ones still held for one.
         "ship-a-change/landed-review reviewer $3.00 medium",
+        // The dev pod roll (backlog e505b3dc, 2026-10-29): the
+        // conductor's steps — asks, reads and records, no car — at the
+        // analyst setting, medium where it judges (the ask, the act, the
+        // review) and low where it copies a reading. The factory's
+        // steps declare none: they run on a model no block may name.
+        "roll-the-dev-pod/quiesce analyst $2.00 medium",
+        "roll-the-dev-pod/quiet-conductor analyst $1.00 low",
+        "roll-the-dev-pod/roll analyst $2.00 medium",
+        "roll-the-dev-pod/rolled analyst $1.00 low",
+        "roll-the-dev-pod/conductor-up analyst $1.00 low",
+        "roll-the-dev-pod/resumed-conductor analyst $1.00 low",
+        "roll-the-dev-pod/review analyst $2.00 medium",
     ]
     .into_iter()
     .map(str::to_string)

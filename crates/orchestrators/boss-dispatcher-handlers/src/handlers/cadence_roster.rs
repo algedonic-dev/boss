@@ -178,6 +178,11 @@ pub struct ClockCadence {
     pub subject: String,
     /// Minutes between expected packets, from the schedule's cadence.
     pub interval_min: i64,
+    /// The schedule's `anchor_date`: the day the rule's cadence counts
+    /// from, and the one instant on its own row that says when THIS
+    /// cadence began. The sweep measures a never-filed rule from it when
+    /// it is later than the kind's first version (backlog 428be0b3).
+    pub anchor_date: chrono::NaiveDate,
     /// The guard that can suppress the firing, if the rule has one.
     pub guard: Option<Guard>,
 }
@@ -373,6 +378,7 @@ pub fn clock_cadences(rules: &[RawRule]) -> (Vec<ClockCadence>, Vec<NotACadence>
             kind,
             subject,
             interval_min,
+            anchor_date: schedule.anchor_date,
             guard: rule.when.as_deref().map(parse_guard),
         });
     }
@@ -398,6 +404,7 @@ mod tests {
 
     fn daily(name: &str, when: Option<&str>, steps: Vec<RawDoStep>) -> RawRule {
         RawRule {
+            delivery_lane: None,
             name: name.to_string(),
             on_event: None,
             schedule: Some(RawSchedule {
@@ -440,6 +447,7 @@ mod tests {
                 kind: "maintenance-sweep".into(),
                 subject: "image-freshness".into(),
                 interval_min: 1440,
+                anchor_date: "2026-08-14".parse().expect("a date"),
                 guard: Some(Guard::OpenPacket {
                     kind: "maintenance-sweep".into(),
                     subject: "image-freshness".into(),
@@ -485,6 +493,7 @@ mod tests {
                 kind: "protocol-retro".into(),
                 subject: "infra/protocol-retro".into(),
                 interval_min: 10_080,
+                anchor_date: "2026-08-14".parse().expect("a date"),
                 guard: None,
             }]
         );
@@ -691,6 +700,7 @@ mod tests {
     #[test]
     fn an_event_rule_declares_no_cadence() {
         let rule = RawRule {
+            delivery_lane: None,
             name: "spawn-restock-on-low-inventory".into(),
             on_event: Some("jobs.inventory.low".into()),
             schedule: None,

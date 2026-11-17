@@ -136,8 +136,8 @@ const HIGH = 'rev-high';
 const BARE = 'rev-bare';
 const FRESH = 'rev-fresh';
 const queue = () => ({
-  station: 'design-review', kind: 'batch', discipline: ['priority', 'age'],
-  wip_limit: null, over_limit: false, terminal_window_days: null,
+  station: 'design-review', kind: 'group', discipline: ['priority', 'age'],
+  terminal_window_days: null,
   lens: LENS,
   total: 3,
   data: [
@@ -159,8 +159,8 @@ const W_READY = 'w-ready';
 const W_ACTIVE = 'w-active';
 const O_DONE = 'o-done';
 const decided = () => ({
-  station: 'design-decided', kind: 'batch', discipline: ['recency'],
-  wip_limit: null, over_limit: false, terminal_window_days: 7,
+  station: 'design-decided', kind: 'group', discipline: ['recency'],
+  terminal_window_days: 7,
   lens: { eyebrow: 'System Model · Design review', title: 'Decided designs', panels: [], with_steps: true },
   total: 3,
   data: [

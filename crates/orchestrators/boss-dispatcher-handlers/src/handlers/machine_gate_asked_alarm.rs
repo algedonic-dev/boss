@@ -65,8 +65,8 @@ use serde_json::{Value as Json, json};
 
 use super::common::{
     RECOVERED_AT, Retraction, api_client, complete_step, dispatcher_actor_header, jobs_where,
-    owner_for_filing, post_json, recovery_note, relapse_patch, retraction, with_lane,
-    withdrawal_fields, write_json,
+    owner_for_filing, post_json, recovery_note, retraction, with_lane, withdrawal_fields,
+    write_json,
 };
 
 /// The handler's registered name.
@@ -562,55 +562,63 @@ impl Handler for MachineGateAskedAlarm {
         let owner = owner_for_filing(self.owner.as_ref(), rule).await;
 
         let before = self.wall.now();
-        let read = match super::gate_window_read::read(
-            &self.client,
-            &format!("{}{}", self.evidence_base, window_path()),
-            &dispatcher_actor_header(rule),
-        )
-        .await
-        {
-            Ok(snapshot) => super::gate_window_read::observation(
-                &snapshot,
-                Gate::MachineGate,
-                &self.roster,
-                Duration::minutes(LOOKBACK_MINUTES),
-                before,
-                self.wall.now(),
+        let read = super::backstop_read::retry_once(|| async {
+            let before = self.wall.now();
+            match super::gate_window_read::read(
+                &self.client,
+                &format!("{}{}", self.evidence_base, window_path()),
+                &dispatcher_actor_header(rule),
             )
-            .and_then(|obs| judge(obs, &depositors).map(|s| (s, obs.now.to_rfc3339()))),
-            Err(e) => Err(e),
-        };
+            .await
+            {
+                Ok(snapshot) => super::gate_window_read::observation(
+                    &snapshot,
+                    Gate::MachineGate,
+                    &self.roster,
+                    Duration::minutes(LOOKBACK_MINUTES),
+                    before,
+                    self.wall.now(),
+                )
+                .and_then(|obs| judge(obs, &depositors).map(|s| (s, obs.now.to_rfc3339()))),
+                Err(e) => Err(e),
+            }
+            .map_err(HandlerError::Downstream)
+        })
+        .await;
         let (strangers, now) = match read {
             Ok(judged) => judged,
             Err(e) => {
                 let now = before.to_rfc3339();
-                match filed.get(UNREADABLE) {
-                    Some(alarm)
-                        if alarm
-                            .pointer(&format!("/metadata/{RECOVERED_AT}"))
-                            .is_some_and(|v| !v.is_null()) =>
-                    {
-                        self.patch(alarm, &relapse_patch(), rule).await?;
-                    }
-                    Some(_) => {}
-                    None => {
-                        self.file(&unreadable_body(&e, &owner, &now, rule), rule)
-                            .await?;
-                    }
-                }
-                return Err(HandlerError::Downstream(e));
+                super::backstop_read::raise_unreadable(
+                    &self.client,
+                    &self.jobs_base,
+                    filed.get(UNREADABLE),
+                    unreadable_body(&e.to_string(), &owner, &now, rule),
+                    ctx,
+                )
+                .await?;
+                return Err(e);
             }
         };
-        self.withdraw_unreadable(
-            &filed,
-            &format!(
-                "{HANDLER} read {} whole at {now}: the watch on asks judges again.",
-                window_path()
-            ),
-            &now,
-            rule,
+        let may_withdraw_unreadable = super::backstop_read::recovered(
+            &self.client,
+            &self.jobs_base,
+            filed.get(UNREADABLE),
+            ctx,
         )
         .await?;
+        if may_withdraw_unreadable {
+            self.withdraw_unreadable(
+                &filed,
+                &format!(
+                    "{HANDLER} read {} whole at {now}: the watch on asks judges again.",
+                    window_path()
+                ),
+                &now,
+                rule,
+            )
+            .await?;
+        }
 
         if strangers.is_empty() {
             tracing::info!(rule, "{HANDLER}: no ask from a caller nobody expects");
@@ -1061,11 +1069,27 @@ mod tests {
             );
             assert_eq!(sent[0].1["metadata"][FINDING_KEY], UNREADABLE, "{case}");
         }
-        // Already open: said once, not once an hour.
+        // An existing alarm is not duplicated; its first observed failed tick is recorded.
         let stub =
             listing_stub::serve(vec![(ALARMS, listing(vec![alarm_row(UNREADABLE, vec![])]))]).await;
         assert!(handler(&stub).invoke(&args(), &ctx()).await.is_err());
-        assert!(stub.writes().is_empty(), "{:?}", stub.writes());
+        let sent = stub.sent();
+        assert!(
+            !sent.iter().any(|(method, _)| method == "POST /api/jobs"),
+            "no duplicate alarm: {sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|(method, body)| method == "PATCH /api/jobs/al-1/metadata"
+                    && body["backstop_unreadable"]["consecutive_failed_ticks"] == 1),
+            "a legacy alarm starts with one observed failed tick: {sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|(method, body)| method == "PUT /api/jobs/al-1/priority"
+                    && body["priority"] == "standard"),
+            "unknown continuity is not urgent: {sent:?}"
+        );
     }
 
     #[tokio::test]
@@ -1092,5 +1116,72 @@ mod tests {
         let res = handler(&stub).invoke(&[], &ctx()).await;
         assert!(matches!(res, Err(HandlerError::Permanent(_))), "{res:?}");
         assert!(stub.writes().is_empty());
+    }
+
+    #[test]
+    fn d894_contract_first_unreadable_tick_is_standard() {
+        let body = unreadable_body(
+            "fixture read unavailable",
+            "emp-owner",
+            "2026-10-31T19:00:00Z",
+            "fixture-rule",
+        );
+        assert_eq!(
+            body["priority"], "standard",
+            "one failed backstop tick is not a sustained failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn d894_contract_one_failed_read_gets_one_retry_before_any_alarm() {
+        let good = serde_json::to_value(window(vec![], tally("jobs", vec![], vec![]))).unwrap();
+        let stub = listing_stub::serve_sequence(
+            vec![(ALARMS, listing(vec![]))],
+            vec![(
+                WINDOW,
+                vec![json!({"error":"transient fixture read"}), good],
+            )],
+        )
+        .await;
+        let result = handler(&stub).invoke(&args(), &ctx()).await;
+        assert_eq!(
+            stub.read_count(WINDOW),
+            2,
+            "the actual HTTP read must retry exactly once"
+        );
+        assert!(
+            result.is_ok(),
+            "the retry judges the second complete answer: {result:?}"
+        );
+        assert!(
+            stub.sent().is_empty(),
+            "a recovered first tick files nothing: {:?}",
+            stub.sent()
+        );
+    }
+
+    #[tokio::test]
+    async fn d894_contract_second_failed_tick_promotes_the_existing_alarm() {
+        let mut alarm = alarm_row(UNREADABLE, vec![]);
+        alarm["priority"] = json!("standard");
+        alarm["metadata"]["backstop_unreadable"] = json!({"rule":ctx().rule_name,"last_failed_tick":(ctx().firing_instant().unwrap() - chrono::Duration::hours(1)).to_rfc3339(),"consecutive_failed_ticks":1});
+        let stub = listing_stub::serve(vec![(ALARMS, listing(vec![alarm]))]).await;
+        assert!(handler(&stub).invoke(&args(), &ctx()).await.is_err());
+        assert_eq!(stub.read_count(WINDOW), 2, "still only one short retry");
+        assert!(
+            stub.sent()
+                .iter()
+                .any(|(method, body)| method == "PUT /api/jobs/al-1/priority"
+                    && body["priority"] == "urgent"),
+            "two distinct failed ticks must become urgent through the priority door: {:?}",
+            stub.sent()
+        );
+        assert!(
+            !stub
+                .sent()
+                .iter()
+                .any(|(method, _)| method == "POST /api/jobs"),
+            "the second tick never duplicates the alarm"
+        );
     }
 }

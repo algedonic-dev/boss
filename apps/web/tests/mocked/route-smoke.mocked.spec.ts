@@ -31,7 +31,7 @@ import { scaled } from '../../src/dev-load';
 // read parses its shape in src/exec/exec.ts and answers a wrong one as
 // a failed read, so the catch-all paints a failure line, not a crash.
 //
-// /ux/finance LEFT THIS GROUP on 2026-09-25 (page audit 3f964c57): its
+// /ux/finance (now /finance) LEFT THIS GROUP on 2026-09-25 (page audit 3f964c57): its
 // statements have faithful fixtures in _smokeMocks.ts (COMMERCE_SUMMARY,
 // AP_AGING, LEDGER_STATEMENTS), so it is crawled from ROUTES.
 //

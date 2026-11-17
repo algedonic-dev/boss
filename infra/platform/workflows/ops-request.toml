@@ -42,7 +42,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "A host-side debug read, as a packet instead of an ssh session. The requester names a host (the Subject: custom/<estate node id>) and an allowlisted read-only verb in job metadata (`host`, `verb`, `args`); the runner on that host polls about once a minute, executes the verb from infra/ops/verbs.json — never a packet-supplied string — and completes `execute` with the output and exit code. `answered` is the output arriving in the system of record with provenance; `refused` is the runner declining a verb outside the allowlist or an arg outside its pattern, with the reason in `output`. Phase 1 is read-only; mutating verbs are phase 2, behind per-verb policy. The operator stops being the transport."
-metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
+metadata = { owner = "9660c60f-eb47-4405-ae08-fcbb30c71e5f", department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
 
 [[workflow.step]]
 title = "filed"
@@ -184,7 +184,7 @@ assurance_required = "presence"
 sign_offs_required = ["platform-admin"]
 title_template = "Approve the plan: {metadata.verb} on {metadata.host}"
 authority_role = "platform-admin"
-metadata_defaults = { procedure = "READ THE PLAN ON THIS STEP AND NOTHING ELSE. `plan` holds the document rendered on the host itself: the target named by-id, the kernel name it resolved to AT PLAN TIME, what was observed about it, and the argv that would run. The kernel name is shown because it is the thing that moves — it is evidence about when the plan was made, never the target.\n\nYOUR PASSKEY SIGNS THESE EXACT BYTES. If anything about the plan changes after you sign, the signature stops matching and the runner refuses. If the plan looks wrong, do not approve it and say why — a plan that needs an operator to eyeball which thing is meant is a verb that should not be on this path at all (q3)." }
+metadata_defaults = { human_only = true, human_presentation = { ask = "Authorize this exact operational request", why_person = "Your passkey authorizes the reviewed operation and its bound plan.", action = "Read the plan and approve or reject", after = "Approval permits the existing executor path; it does not prove the operation ran.", evidence = "current-step" }, procedure = "READ THE PLAN ON THIS STEP AND NOTHING ELSE. `plan` holds the document rendered on the host itself: the target named by-id, the kernel name it resolved to AT PLAN TIME, what was observed about it, and the argv that would run. The kernel name is shown because it is the thing that moves — it is evidence about when the plan was made, never the target.\n\nYOUR PASSKEY SIGNS THESE EXACT BYTES. If anything about the plan changes after you sign, the signature stops matching and the runner refuses.\n\n`plan_stderr`, WHEN PRESENT, IS NOT PART OF THE PLAN. It is what the plan verb printed beside the plan when it rendered it: its `plan-sha256:` line and the live figures behind its verdicts, kept out of the plan's bytes because they move. Your passkey signs it with the rest of this step, exactly as shown, but `rendered_plan_sha256` does not cover it, and before the write runs the runner compares only the plan's bytes: the write still runs when these figures have moved since you read them, and records the ones it saw on its execute step. Read them as evidence for the verdicts, as of when the plan was rendered.\n\nIf the plan looks wrong, do not approve it and say why — a plan that needs an operator to eyeball which thing is meant is a verb that should not be on this path at all (q3)." }
 # EVERY KEY THE RUNNER RENDERS HERE IS A FIELD (backlog 6c9183de, review
 # S4 of car 1e603cfd, 2026-09-26). The runner writes the plan with the
 # request it was rendered for, in one patch (ops-runner.sh render_plan),
@@ -291,6 +291,18 @@ fields = [
     # the runner with the plan in the same patch, so the passkey signs it;
     # absent on every request whose verb asks for no review.
     { name = "review_run", field_type = "string", required = false, writer = "runner:ops" },
+    # What the plan verb printed on stderr beside the plan (backlog
+    # 204e27ba): the volatile figures ten plan verbs keep OUT of the signed
+    # bytes so that a moving figure cannot void an unchanged verdict, and
+    # which reached nobody before the decision. Written by the runner in
+    # the same patch as the plan, and ONLY onto a step that declares it
+    # here (ops-runner.sh plan_stderr_of), so it is never on a step
+    # unreserved. It is inside the shape the passkey signs, like every key
+    # on this step, and OUTSIDE the plan bytes `rendered_plan_sha256` binds,
+    # which are all the execute-time re-render compares; the procedure
+    # above says both to the approver. Not required: a request rendered
+    # by a runner from before it completes without it.
+    { name = "plan_stderr", field_type = "string", required = false, writer = "runner:ops" },
 ]
 
 [[workflow.step]]
@@ -363,6 +375,14 @@ writer = "runner:ops"
 [[workflow.step.fields]]
 name = "exit_code"
 field_type = "string"
+required = false
+writer = "runner:ops"
+[[workflow.step.fields]]
+# 2c: what the credentialed runner actually executed, never request metadata.
+# Optional because a refusal before execution has no argv. Older pinned
+# versions cannot qualify physical returns; David publishes this held row.
+name = "executed"
+field_type = "object"
 required = false
 writer = "runner:ops"
 

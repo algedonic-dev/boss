@@ -129,7 +129,7 @@ mod tests {
         let mut s = StationSpec::draft(
             name,
             format!("Station {name}"),
-            StationKind::Batch,
+            StationKind::Group,
             StationPredicate {
                 kind: Some("ship-a-change".into()),
                 ..Default::default()
@@ -195,7 +195,6 @@ mod tests {
     async fn a_row_edited_without_a_version_bump_is_refused_by_field() {
         let registry = seeded(&[spec("dock", 3), spec("repair", 1)]).await;
         let mut edited = spec("dock", 3);
-        edited.wip_limit = Some(24);
         edited.title = "Renamed".into();
         let mut also = spec("repair", 1);
         also.discipline = vec![crate::station_queue::DisciplineKey::Age];
@@ -207,7 +206,7 @@ mod tests {
         };
         assert_eq!(refusals.len(), 2, "every offending row is named at once");
         assert_eq!(refusals[0].name, "dock");
-        assert_eq!(refusals[0].fields, vec!["title", "wip_limit"]);
+        assert_eq!(refusals[0].fields, vec!["title"]);
         assert_eq!(refusals[1].fields, vec!["discipline"]);
         assert_eq!(
             registry.get_active("dock").await.expect("dock").title,
@@ -219,8 +218,7 @@ mod tests {
     #[tokio::test]
     async fn a_version_bump_publishes_over_the_lower_live_row() {
         let registry = seeded(&[spec("dock", 3)]).await;
-        let mut bumped = spec("dock", 4);
-        bumped.wip_limit = Some(24);
+        let bumped = spec("dock", 4);
         let report = seed_stations(&registry, &[bumped], &actor(), now(), false)
             .await
             .expect("seed");

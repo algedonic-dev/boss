@@ -108,7 +108,6 @@ export type NavGroup = Readonly<{ label: string; items: ReadonlyArray<NavItem> }
 // here until car N1 of design e765b3fc (2026-09-25): each was a sidebar
 // row onto a station of the map, and the map's one row replaced them.
 export type UngatedSurfaceId =
-  | 'company-map'
   | 'system-incidents'
   | 'system-performance'
   | 'system-atlas'
@@ -145,7 +144,7 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavIte
   sales:     { id: 'sales',     label: 'Sales pipeline',   path: '/ux/sales',     permKey: 'sales',     owner: 'sales' },
   service:   { id: 'service',   label: 'Service queue',    path: '/ux/service',   permKey: 'service',   module: 'support', owner: 'service' },
   qa:        { id: 'qa',        label: 'QA',               path: '/ux/qa',        permKey: 'qa',        module: 'qa',      owner: 'qa' },
-  finance:   { id: 'finance',   label: 'Finance',          path: '/ux/finance',   permKey: 'finance',   module: 'finance', owner: 'finance' },
+  finance:   { id: 'finance',   label: 'Finance',          path: '/finance',      permKey: 'finance',   module: 'finance', owner: 'finance' },
   warehouse: { id: 'warehouse', label: 'Inventory',        path: '/ux/warehouse', permKey: 'warehouse', module: 'warehouse', owner: 'warehouse' },
   shipping:  { id: 'shipping',  label: 'Shipments',        path: '/ux/shipping',  permKey: 'shipping',  module: 'shipping', owner: 'distribution' },
   support:   { id: 'support',   label: 'Support',          path: '/ux/support',   permKey: 'support',   module: 'support', owner: 'support' },
@@ -155,12 +154,12 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavIte
   parts:     { id: 'parts',     label: 'Ingredients & parts', path: '/ux/parts',  permKey: 'parts',     module: 'parts',   owner: 'warehouse' },
   products:  { id: 'products',  label: 'Products',         path: '/ux/products',  permKey: 'parts',     module: 'parts',   owner: 'production' },
   accounts:  { id: 'accounts',  label: 'Accounts',         path: '/ux/accounts',  permKey: 'accounts',  owner: 'sales' },
-  vendors:   { id: 'vendors',   label: 'Vendors',          path: '/ux/vendors',   permKey: 'vendors',   owner: 'finance', module: 'warehouse', whenDisabled: 'absent' },
+  vendors:   { id: 'vendors',   label: 'Vendors',          path: '/finance/vendors', permKey: 'vendors',   owner: 'finance', module: 'warehouse', whenDisabled: 'absent' },
   // Design45fad3bb preserves financial details when the vendor register
   // is absent. Separate unlisted declarations keep their existing gate
   // and Finance ownership without adding sidebar rows (6d6f88bd).
-  'purchase-order': { id: 'purchase-order', label: 'Purchase order', path: '/ux/purchase-orders/:poId', permKey: 'vendors', owner: 'finance', unlisted: true },
-  'vendor-invoice': { id: 'vendor-invoice', label: 'Vendor invoice', path: '/ux/vendor-invoices/:vendorInvoiceId', permKey: 'vendors', owner: 'finance', unlisted: true },
+  'purchase-order': { id: 'purchase-order', label: 'Purchase order', path: '/finance/purchase-orders/:poId', permKey: 'vendors', owner: 'finance', unlisted: true },
+  'vendor-invoice': { id: 'vendor-invoice', label: 'Vendor invoice', path: '/finance/vendor-invoices/:vendorInvoiceId', permKey: 'vendors', owner: 'finance', unlisted: true },
   people:    { id: 'people',    label: 'Employees',        path: '/ux/people',    permKey: 'people',    owner: 'people' },
   assets:    { id: 'assets',    label: 'Assets',           path: '/ux/assets',    permKey: 'assets',    module: 'equipment', owner: 'maintenance' },
   shop:      { id: 'shop',      label: 'Shop',             path: '/ux/shop',      permKey: 'shop',      module: 'shop',    owner: 'sales' },
@@ -169,7 +168,6 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavIte
   hr:        { id: 'hr',        label: 'HR',               path: '/hr',           permKey: 'people',    owner: 'people', unlisted: true },
   watchlist: { id: 'watchlist', label: 'Churn watchlist',  path: '/watchlist',    permKey: 'accounts',  owner: 'sales', unlisted: true },
   manual:    { id: 'manual',    label: 'Manual',           path: '/manual',       owner: 'home' },
-  'company-map': { id: 'company-map', label: 'System Network Map', path: '/map', owner: 'home' },
 
   // The IT department — SIX surfaces (the 2026-08-31 consolidation,
   // packet 1f6d55e0; was 17 pages, four of them dual-routed). The

@@ -306,6 +306,36 @@ pub fn convertibility(from: &WorkflowSpec, to: &WorkflowSpec) -> Convertibility 
         )));
     }
 
+    // A field the packet's protocol binds once — `immutable_fields` or
+    // `guarded_fields` in its `metadata_schema` — is judged against the
+    // PINNED version on every write (`metadata_immutability`). A target
+    // that no longer declares it would make the binding writable by the
+    // next ordinary PUT or PATCH, so the move would undo the protection
+    // rather than carry it: a delayed admission's `envelope` is the case
+    // that asked (backlog 84a010cb, design f1d66249). Structural, so it
+    // bites wherever the packet stands.
+    for declaration in ["immutable_fields", "guarded_fields"] {
+        let declared = |spec: &WorkflowSpec| -> BTreeSet<String> {
+            spec.metadata_schema
+                .get(declaration)
+                .and_then(serde_json::Value::as_array)
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .filter_map(|f| f.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let kept = declared(to);
+        for dropped in declared(from).difference(&kept) {
+            obstacles.push(Obstacle::workflow(format!(
+                "`{dropped}` is no longer in metadata_schema.{declaration} — a pinned \
+                 packet's binding would become writable by any later write"
+            )));
+        }
+    }
+
     let from_steps: BTreeMap<&str, &StepSpec> =
         from.steps.iter().map(|s| (s.title.as_str(), s)).collect();
     let to_steps: BTreeMap<&str, &StepSpec> =
@@ -390,6 +420,17 @@ pub fn convertibility(from: &WorkflowSpec, to: &WorkflowSpec) -> Convertibility 
         let Some(t) = to_steps.get(slug) else {
             continue;
         };
+
+        // A new typed judgment cannot become evidence of work already done.
+        // Unfinished rows acquire the target declaration through the repin.
+        let before = f.metadata_defaults.get("completion_contract");
+        let after = t.metadata_defaults.get("completion_contract");
+        if after.is_some() && before != after {
+            obstacles.push(Obstacle::step_if_done(
+                slug,
+                "completion evidence contract added or changed — completed work did not run under that judgment",
+            ));
+        }
 
         // A STEP'S KIND CARRIES A COMPLETION CONTRACT THIS FUNCTION
         // CANNOT SEE.
@@ -559,6 +600,7 @@ mod tests {
             sign_offs_required: Vec::new(),
             assurance_required: None,
             duration_hours: None,
+            resources: None,
             labor_hours: None,
             wall_clock_hours: None,
             fields: Vec::new(),
@@ -595,6 +637,28 @@ mod tests {
         // strand its own packets.
         let a = wf(vec![step("review")]);
         assert_eq!(convertibility(&a, &a), Convertibility::Automatic);
+    }
+
+    /// A binding declaration the target drops is a structural obstacle;
+    /// one it keeps, or one it adds, is not (backlog 84a010cb).
+    #[test]
+    fn dropping_a_bound_metadata_declaration_does_not_convert() {
+        let declaring = |schema: serde_json::Value| {
+            let mut w = wf(vec![step("review")]);
+            w.metadata_schema = schema;
+            w
+        };
+        let both = declaring(serde_json::json!({
+            "immutable_fields": ["envelope"], "guarded_fields": ["attempt"]
+        }));
+        let only_immutable = declaring(serde_json::json!({"immutable_fields": ["envelope"]}));
+        let v = convertibility(&both, &only_immutable);
+        let reasons: Vec<&str> = v.obstacles().iter().map(|o| o.reason.as_str()).collect();
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(reasons[0].contains("`attempt`") && reasons[0].contains("guarded_fields"));
+        assert_eq!(v.obstacles()[0].bites, Bites::Always);
+        assert!(convertibility(&both, &both).is_automatic());
+        assert!(convertibility(&only_immutable, &both).is_automatic());
     }
 
     #[test]

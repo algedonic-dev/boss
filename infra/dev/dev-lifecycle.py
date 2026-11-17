@@ -53,6 +53,17 @@ class DeleteTransport:
             raw = response.read()
             receipt.update(http_status=response.status, completion="observed",
                            response_base64=base64.b64encode(raw).decode("ascii"))
+            # Backlog cae3b25b (2026-10-20): a delete whose answer was lost
+            # leaves a retry that meets 404, and refusing it left a worker
+            # whose Job was already gone with no working `stop`. The API's
+            # own NotFound for exactly this Job name is handed back, not
+            # raised, and the controller records it as the retirement, on
+            # any attempt (backlog 3165dc62: a Job its TTL removed refused
+            # its first stop). Any other 404 (another name, an unserved
+            # route) still refuses.
+            absent = job_absent(raw, name) if response.status == 404 else None
+            if absent is not None:
+                return absent
             if not 200 <= response.status < 300:
                 raise RuntimeError("UID-conditioned Job retirement refused by API; no unconditioned fallback")
             return json.loads(raw)
@@ -66,6 +77,20 @@ class DeleteTransport:
             if connection is not None:
                 connection.close()
             record(receipt)
+
+
+def job_absent(raw, name):
+    """The API's NotFound Status for exactly this batch Job name, else None."""
+    try:
+        status = json.loads(raw)
+    except ValueError:
+        return None
+    details = status.get("details") if isinstance(status, dict) else None
+    if (isinstance(details, dict) and status.get("kind") == "Status" and status.get("code") == 404
+            and status.get("reason") == "NotFound" and details.get("name") == name
+            and details.get("group") == "batch" and details.get("kind") == "jobs"):
+        return status
+    return None
 
 
 def existing_session(read):

@@ -52,7 +52,7 @@ use boss_core::calendar::BusinessCalendar;
 use chrono::{DateTime, Days, NaiveDate, Utc};
 use futures::StreamExt;
 use serde_json::json;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::firings::{Firing, FiringSink, Outcome, fired_rules, firing_id};
 use super::handler::{self, HandlerRegistry};
@@ -464,6 +464,17 @@ impl ScheduleRunner {
                 continue;
             };
             if !selects(sched) {
+                continue;
+            }
+            // A periodic rule with a `delay` is refused, never fired
+            // (backlog 84a010cb): design f1d66249 rejects periodic+delay,
+            // and an active row reaches here without the validator.
+            if let Some(delay) = &rule.delay {
+                error!(
+                    rule = %rule.name, day = %day, delay = %delay,
+                    "RULE-SKIPPED: schedule rule declares a delay nothing executes; \
+                     it did not fire (backlog 84a010cb — remove the delay)"
+                );
                 continue;
             }
             let cal = sched
@@ -1020,6 +1031,39 @@ handler = "h"
 
         // 2026-01-16: only daily fires.
         let (matched, _) = ScheduleRunner::matched_for_day(&reg, &cals, d(2026, 1, 16), &NoHelpers);
+        let names: Vec<&str> = matched.iter().map(|m| m.rule_name.as_str()).collect();
+        assert_eq!(names, vec!["daily-sweep"]);
+    }
+
+    /// A periodic rule carrying a `delay` is refused, not fired on its
+    /// day (backlog 84a010cb): the design rejects periodic+delay
+    /// combinations, and an active row reaches here without the
+    /// authoring validator. Positive control: its undelayed neighbour.
+    #[test]
+    fn a_delayed_schedule_rule_never_fires_on_its_day() {
+        let toml = r#"
+[[rule]]
+name = "daily-delayed"
+delay = "1d"
+[rule.schedule]
+cadence = "daily"
+anchor_date = "2026-01-01"
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"bank-sweep\"", subject_kind = "\"account\"", subject = "_day" }
+
+[[rule]]
+name = "daily-sweep"
+[rule.schedule]
+cadence = "daily"
+anchor_date = "2026-01-01"
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"bank-sweep\"", subject_kind = "\"account\"", subject = "_day" }
+"#;
+        let reg = Registry::from_toml(toml).unwrap();
+        let (matched, _) =
+            ScheduleRunner::matched_for_day(&reg, &HashMap::new(), d(2026, 1, 15), &NoHelpers);
         let names: Vec<&str> = matched.iter().map(|m| m.rule_name.as_str()).collect();
         assert_eq!(names, vec!["daily-sweep"]);
     }

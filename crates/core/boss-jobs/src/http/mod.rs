@@ -29,15 +29,21 @@ use crate::step_registry::StepRegistry;
 
 mod borders;
 mod census;
+mod claims_console;
+mod file_an_ops_request;
+mod file_the_request;
 mod flights;
 mod jobs;
 mod kinds;
+mod lease_sweep;
 mod move_admission;
 mod move_corrections;
 mod moves;
 mod plugins;
+mod pools;
 mod presence;
 mod queue_age;
+mod readiness;
 mod refusals;
 mod regions;
 mod release;
@@ -48,6 +54,7 @@ mod signer;
 mod sim_clock;
 mod stations;
 mod steps;
+mod stock_return;
 pub mod tenant;
 mod terminal_report;
 mod yard;
@@ -73,7 +80,12 @@ use yard::*;
 
 pub use jobs::{ESTATE_PAGE_CEILING, ESTATE_PAGE_DEFAULT, FAILED_VERB_KEYS};
 pub use moves::{MOVER_ACTOR, run_mover};
+#[cfg(test)]
+mod flow_gate;
+mod map_warmer;
+pub use map_warmer::{MapReadings, run_map_warmer};
 pub use presence::PresenceKey;
+pub use regions::MapReading;
 
 const DEFAULT_LIMIT: i64 = 100;
 const MAX_LIMIT: i64 = 1000;
@@ -85,6 +97,13 @@ const BULK_ASSIGNED_LIMIT: i64 = 50_000;
 /// Shared state for jobs API handlers.
 pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     pub jobs: Arc<R>,
+    pub claims_history: Option<Arc<dyn crate::claims_console::ClaimsHistory>>,
+    /// Record-time retention is operational, independent of tenant business time.
+    pub claims_history_clock: Arc<dyn boss_clock_client::ClockClient>,
+    /// Evidence adapters selected only by declarations on the pinned protocol.
+    /// The ones this API carries itself are added by
+    /// [`JobsApiState::contracts_in_force`]; judge through that, never this.
+    pub completion_contracts: crate::completion_contract::Contracts,
     pub bus: Arc<B>,
     pub publisher: DomainPublisher,
     pub step_registry: Arc<StepRegistry>,
@@ -98,6 +117,15 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// caller wires the adapter in; endpoints respond with 503 in that
     /// case to keep the seam explicit.
     pub kind_registry: Option<Arc<dyn WorkflowRegistry>>,
+    /// The live dispatcher rule registry, read by the workflow publish
+    /// to draw the admission edges of the passkey rule
+    /// ([`crate::publish_passkey`], backlog a4b57aca). None is a
+    /// deployment that runs no dispatcher, where no rule admits anything,
+    /// so only a row's own presence steps and `on_complete_create` count.
+    pub publish_rules: Option<Arc<dyn crate::department::rules::DispatcherRules>>,
+    /// Native identity aliases for reserved releases. Missing refuses aliases;
+    /// an exact named releaser remains independent of this registry.
+    pub release_actors: Option<Arc<dyn crate::agents::AgentsRegistry>>,
     /// Step UX plugin registry — authored via /api/jobs/step-plugins.
     /// Same optionality semantics as `kind_registry`.
     pub plugin_registry: Option<Arc<dyn StepPluginRegistry>>,
@@ -109,6 +137,10 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// `kind_registry`: None → 503 on the /api/stations routes and
     /// the claim path's station gate.
     pub stations: Option<Arc<dyn crate::stations::StationRegistry>>,
+    /// Resource-pool registry — the live pools door (`/api/pools`,
+    /// backlog f399458f). Same optionality as `stations`: None → 503 on
+    /// the /api/pools routes, after policy has answered.
+    pub pools: Option<Arc<dyn crate::pools::PoolRegistry>>,
     /// Cross-service client for the global calendar primitive
     /// (`docs/architecture-decisions.md` §Calendar). When set, scheduling
     /// steps that transition `ready → active` with full
@@ -166,6 +198,12 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// `None` is a wiring without a database, where health reports no
     /// schema at all — absent, not `null`: nothing was tried.
     pub schema_ledger: Option<Arc<dyn crate::schema_level::SchemaLedger>>,
+    /// How long health waits for that ledger before answering `null`.
+    /// Every wiring sets [`crate::schema_level::READ_TIMEOUT`]; it is a
+    /// field only so a test whose subject is the ledger's ANSWER can
+    /// hand a backstop instead, and stop measuring the gate's database
+    /// load (f10419f9).
+    pub schema_read_timeout: std::time::Duration,
     /// The key presence tickets are verified with — the gateway's
     /// session key, read from the file it signs with (backlog 72fe3640).
     /// `None` grants presence to nothing: an `x-boss-presence` header is
@@ -190,6 +228,33 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// `GET /api/dispatcher/schedule`, read as the viewer. `None` → the
     /// scheduled rules show as unread on the board.
     pub dispatcher_schedule: Option<Arc<dyn crate::dispatcher_schedule::DispatcherSchedule>>,
+    pub map_readings: Arc<MapReadings>,
+}
+
+impl<R: JobsRepository + 'static, B: EventBus> JobsApiState<R, B> {
+    /// The completion contracts every completion door judges: the
+    /// binary's adapters, plus the ones this API carries itself because
+    /// they read nothing but its own repository — so no deployment, and
+    /// no test state built on [`JobsApiState::minimal`], can serve a row
+    /// that declares one while lacking its adapter (backlog 81dc0c39:
+    /// `item-awaits-its-car-v1`, declared by `backlog-item`'s `build`).
+    ///
+    /// Only beside a protocol reader, as the binary's own adapters are:
+    /// without one no declaration can be read, and a non-empty set with
+    /// no reader refuses every completion (`completion_contract::validate`).
+    pub(crate) fn contracts_in_force(&self) -> crate::completion_contract::Contracts {
+        let mut contracts = self.completion_contracts.clone();
+        if self.kind_registry.is_some() {
+            contracts
+                .entry(crate::item_awaits_its_car::NAME.into())
+                .or_insert_with(|| {
+                    Arc::new(crate::item_awaits_its_car::ItemAwaitsItsCar {
+                        jobs: self.jobs.clone(),
+                    })
+                });
+        }
+        contracts
+    }
 }
 
 impl<R: JobsRepository, B: EventBus> JobsApiState<R, B> {
@@ -227,6 +292,9 @@ impl<R: JobsRepository, B: EventBus> JobsApiState<R, B> {
     ) -> Self {
         Self {
             jobs,
+            claims_history: None,
+            claims_history_clock: clock.clone(),
+            completion_contracts: Default::default(),
             bus,
             publisher,
             step_registry: Arc::new(crate::step_registry::StepRegistry::v1()),
@@ -234,9 +302,12 @@ impl<R: JobsRepository, B: EventBus> JobsApiState<R, B> {
             role_guards: None,
             clock,
             kind_registry: None,
+            publish_rules: None,
+            release_actors: None,
             plugin_registry: None,
             job_edges: None,
             stations: None,
+            pools: None,
             calendar: None,
             subject_kinds: None,
             subject_existence: None,
@@ -246,11 +317,13 @@ impl<R: JobsRepository, B: EventBus> JobsApiState<R, B> {
             delivery: None,
             agent_budget: None,
             schema_ledger: None,
+            schema_read_timeout: crate::schema_level::READ_TIMEOUT,
             presence_key: None,
             yard_moves: None,
             credentials: None,
             sensors: None,
             dispatcher_schedule: None,
+            map_readings: Arc::new(MapReadings::new()),
         }
     }
 }
@@ -293,12 +366,30 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
     let refusals =
         axum::middleware::from_fn_with_state(shared.clone(), record_step_write_refusals::<R, B>);
     Router::new()
+        .route("/api/claims", get(claims_console::read::<R, B>))
+        .route("/api/claims/cuts", get(claims_console::cuts::<R, B>))
+        .route("/api/claims/waiting", get(claims_console::waiting::<R, B>))
+        .route(
+            "/api/claims/{acquisition}/return",
+            post(stock_return::return_stock::<R, B>),
+        )
         .route("/api/jobs/health", get(health::<R, B>))
         .route(
             "/api/jobs/step-write-refusals",
             get(list_step_write_refusals::<R, B>),
         )
         .route("/api/jobs/summary", get(jobs_summary::<R, B>))
+        .route(
+            "/api/jobs/readiness",
+            get(readiness::audit::<R, B>).post(readiness::reconcile::<R, B>),
+        )
+        // The clock rule's door to car 2b's lease sweep (backlog
+        // 3aeaf08c): a lapsed lease releases FLOW and leaves STOCK as an
+        // obligation. See http/lease_sweep.rs.
+        .route(
+            "/api/jobs/resource-leases/sweep",
+            post(lease_sweep::sweep::<R, B>),
+        )
         .route("/api/jobs/live", get(jobs_live::<R, B>))
         // Per kind: packets ever, open by version, newest terminal —
         // scoped to the caller, unlike the public window above
@@ -389,6 +480,9 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
         // Top-level metadata merge — the atomic alternative to the
         // GET → spread → full PUT read-modify-write. `null` removes.
         .route("/api/jobs/{id}/metadata", patch(patch_job_metadata::<R, B>))
+        // Move ONE envelope field, with a reason, on the record — the
+        // narrow alternative to a full-body PUT (backlog eb26059d).
+        .route("/api/jobs/{id}/priority", put(set_job_priority::<R, B>))
         .route(
             "/api/jobs/{id}/metadata/conditional",
             post(conditional_job_metadata::<R, B>),
@@ -411,6 +505,26 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
         // the one door `boss release --review` and the yard's Release
         // control share (backlog ed8e5c85, `car_release`).
         .route("/api/jobs/{id}/release", post(release_car::<R, B>))
+        // A rendered plan files its mutating request, read off the plan
+        // packet, as the caller (POST); or says what it would file (GET)
+        // — backlog 7aef2405, the website's filing half of every
+        // passkey-approved ops verb.
+        .route(
+            "/api/jobs/{id}/file-the-request",
+            get(file_the_request::preview_file_the_request::<R, B>)
+                .post(file_the_request::file_the_request::<R, B>),
+        )
+        // …and a person files any allowlisted verb from the verb list —
+        // the reshape's other half (backlog 7aef2405, 2026-11-07): the
+        // allowlist as a filer fills it in (GET), and the filing (POST).
+        .route(
+            "/api/jobs/ops-verbs",
+            get(file_an_ops_request::list_ops_verbs::<R, B>),
+        )
+        .route(
+            "/api/jobs/file-an-ops-request",
+            post(file_an_ops_request::file_an_ops_request::<R, B>),
+        )
         .route("/api/estate/nodes", get(list_estate_nodes::<R, B>))
         // The instance's hosting edit level, off the tenant manifest
         // (a479faf7): the word the dispatch door and the gate's
@@ -456,11 +570,11 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
         .route("/api/network/census", post(record_network_census::<R, B>))
         .route("/api/stations/load", get(stations_load::<R, B>))
         // The drain rate `load` says it is missing: arrivals and
-        // departures per station over a wall-clock window, counted
-        // from the log's own step transitions.
+        // departures per station over a window, counted from the
+        // steps' own ready and completion stamps (design 7b8ed079).
         .route("/api/stations/flow", get(stations_flow::<R, B>))
         // Author-time dry run: lint a spec without persisting, so the
-        // editor surfaces the same `station_lint::gate_active` the
+        // editor surfaces the same `stations::gate_publish` the
         // publish path enforces.
         .route("/api/stations/_validate", post(validate_station::<R, B>))
         .route("/api/stations/{name}/queue", get(station_queue::<R, B>))
@@ -481,6 +595,20 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
             post(publish_station::<R, B>),
         )
         .route("/api/stations/{name}/retire", post(retire_station::<R, B>))
+        // The live pools door (backlog f399458f): a pool row changes
+        // through a publish, never a code car — append-only, versioned,
+        // every write one fact, gated on `pool`.
+        .route("/api/pools", get(pools::list_pools::<R, B>))
+        .route("/api/pools/_validate", post(pools::validate_pool::<R, B>))
+        .route(
+            "/api/pools/{name}/versions",
+            get(pools::list_pool_versions::<R, B>),
+        )
+        .route(
+            "/api/pools/{name}/publish",
+            post(pools::publish_pool::<R, B>),
+        )
+        .route("/api/pools/{name}/retire", post(pools::retire_pool::<R, B>))
         .route("/api/jobs/{id}/steps", get(list_steps::<R, B>))
         .route("/api/jobs/{id}/steps", post(add_step::<R, B>))
         .route("/api/jobs/{id}/steps/{step_id}", put(update_step::<R, B>))
@@ -515,9 +643,19 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
             "/api/jobs/{id}/steps/{step_id}/corrections",
             post(post_step_correction::<R, B>),
         )
+        // A classification of one frozen value for an executor's START —
+        // the one writer of `input_classifications` (design e72dc7c9).
+        .route(
+            "/api/jobs/{id}/input-classifications",
+            post(post_input_classification::<R, B>),
+        )
         .route(
             "/api/jobs/{id}/steps/{step_id}/claim",
             post(claim_step::<R, B>),
+        )
+        .route(
+            "/api/jobs/{id}/steps/{step_id}/resource-identity",
+            post(bind_step_resource_identity::<R, B>),
         )
         .route(
             "/api/jobs/{id}/steps/{step_id}/sign-offs",
@@ -545,6 +683,11 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
         .route(
             "/api/workflows/{kind}/versions/{version}",
             get(get_kind_version::<R, B>).delete(discard_kind_version::<R, B>),
+        )
+        // A draft that met traffic and lost (backlog 50ded63d).
+        .route(
+            "/api/workflows/{kind}/versions/{version}/reject",
+            post(reject_kind_version::<R, B>),
         )
         // Experiments Tier 1 (the network-experiments decision in docs/architecture-decisions.md):
         // the per-version terminal report — measurement of what
@@ -620,7 +763,7 @@ async fn health<R: JobsRepository, B: EventBus>(
     let capabilities = match state.schema_ledger.as_ref() {
         Some(ledger) => response
             .capabilities
-            .with_schema(crate::schema_level::read(ledger).await),
+            .with_schema(crate::schema_level::read_within(ledger, state.schema_read_timeout).await),
         None => response.capabilities,
     };
     Json(boss_core::startup::HealthResponse {

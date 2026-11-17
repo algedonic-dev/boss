@@ -156,6 +156,67 @@ test('active packets and the archive both render, archive newest first', async (
   await expect(oldest.getByText('Declared by', { exact: true })).toBeVisible();
 });
 
+/// A closed packet in the v3 shape (a65ba21e, read 2026-11-15): the job
+/// carries bookkeeping, and every forcing-question answer is STEP
+/// metadata. The fixtures above pin the retired job-metadata shape only,
+/// so the archive passed while it rendered this one with none of its 23
+/// step findings (backlog 434b6e0d, gap 1 of page-audit 9b9849f5).
+const CLOSED_V3 = {
+  id: 'inc-v3-closed',
+  kind: 'incident',
+  workflow_version: 3,
+  subject: { subject_kind: 'custom', id: 'incident-2026-09-26-mirror' },
+  title: 'Incident: the push mirror wiped a branch',
+  owner_id: 'emp-david',
+  status: 'closed',
+  priority: 'urgent',
+  opened_on: '2026-09-26',
+  due_on: null,
+  closed_on: '2026-09-26',
+  tags: [],
+  metadata: { severity: 'outage', opened_at: '2026-09-26T00:58:00Z' },
+  steps: [
+    { id: 's-v3-0', job_id: 'inc-v3-closed', kind: 'trigger', title: 'Incident raised', assignee_id: null, status: 'completed', sort_order: 0, blocked_by: [], completed_on: '2026-09-26', metadata: { trigger_kind: 'operator', trigger_name: 'raise-an-incident' } },
+    { id: 's-v3-2', job_id: 'inc-v3-closed', kind: 'task', title: 'Establish the timeline from evidence', assignee_id: 'agent-claude', status: 'completed', sort_order: 2, blocked_by: ['s-v3-0'], completed_on: '2026-09-26', metadata: { authority_role: 'platform-admin', detected_at: '2026-09-26T01:10:00Z', timeline: '01:00 the mirror force-synced; 01:10 the branch was gone' } },
+    { id: 's-v3-7', job_id: 'inc-v3-closed', kind: 'task', title: 'File the actions', assignee_id: 'agent-claude', status: 'completed', sort_order: 7, blocked_by: ['s-v3-2'], completed_on: '2026-09-26', metadata: { authority_role: 'platform-admin', action_packets: ['21d54f4a remove the push mirror', 'an item to add: a credentialed rehearsal'] } },
+    { id: 's-v3-8', job_id: 'inc-v3-closed', kind: 'incident-review', title: 'Human review of the findings', assignee_id: null, status: 'completed', sort_order: 8, blocked_by: ['s-v3-7'], completed_on: '2026-09-26', metadata: { authority_role: 'platform-admin', human_only: true } },
+    { id: 's-v3-9', job_id: 'inc-v3-closed', kind: 'outcome', title: 'Closed', assignee_id: null, status: 'completed', sort_order: 9, blocked_by: ['s-v3-8'], completed_on: '2026-09-26', metadata: { outcome_kind: 'completed' } },
+  ],
+};
+
+test('a closed v3 packet renders what each step found, labelled by field, packet refs linked', async ({ page }) => {
+  await mocks(page);
+  await page.route(LIST, (r) => json(r, { data: [CLOSED_V3], total: 1 }));
+
+  await page.goto('/it/operate');
+
+  const doc = page.locator('.inc-archive .inc-doc');
+  await expect(doc).toHaveCount(1);
+  await expect(doc.getByText(/This packet closed without recorded findings/)).toHaveCount(0);
+
+  const steps = doc.locator('.inc-step');
+  // Two steps recorded findings; the raise, the review and the terminal
+  // recorded only plumbing, and draw nothing.
+  await expect(steps).toHaveCount(2);
+  await expect(steps.nth(0).locator('.inc-step-title')).toContainText('Establish the timeline from evidence');
+  await expect(steps.nth(0).getByText('Timeline', { exact: true })).toBeVisible();
+  await expect(steps.nth(0).getByText(/the mirror force-synced/)).toBeVisible();
+  await expect(steps.nth(0).getByText('Detected at', { exact: true })).toBeVisible();
+  await expect(steps.nth(1).locator('.inc-step-title')).toContainText('File the actions');
+  await expect(steps.nth(1).getByText('Action packets', { exact: true })).toBeVisible();
+
+  // The ref is a link into the packet; the line without one stays prose.
+  await expect(steps.nth(1).locator('a.inc-ref')).toHaveCount(1);
+  await expect(steps.nth(1).locator('a.inc-ref')).toHaveText('21d54f4a');
+  await expect(steps.nth(1).locator('a.inc-ref')).toHaveAttribute('href', /\/jobs\/21d54f4a$/);
+  await expect(steps.nth(1).getByText(/a credentialed rehearsal/)).toBeVisible();
+
+  // Plumbing never reads as a finding.
+  await expect(doc.getByText('Authority role', { exact: true })).toHaveCount(0);
+  await expect(doc.getByText('Human only', { exact: true })).toHaveCount(0);
+  await expect(doc.getByText('Outcome kind', { exact: true })).toHaveCount(0);
+});
+
 test('a failed fetch renders as a failure with Retry — never as an empty page', async ({ page }) => {
   await mocks(page);
   let up = false;
@@ -307,6 +368,55 @@ test('an unreadable registry is a failure, not an empty queue', async ({ page })
   up = true;
   await page.getByRole('button', { name: 'Retry' }).click();
   await expect(page.getByText('Post-mortem: cp-2 etcd degradation')).toBeVisible();
+});
+
+// The page could raise nothing: 0 writes, 0 forms and no way to the
+// generic new-job form (gap 6 of page-audit 9b9849f5, backlog
+// f703dfb7). Decided 2026-09-24: one link to that form, seeded with
+// kind=incident, never a bespoke form, because filing a work type is
+// registry-driven. It waited on backlog a8844a57, until which the form
+// sent a custom subject with no `id` and the jobs API refused every
+// incident it filed; the POST below pins the shape that fix landed.
+test('Raise an incident opens the generic new-job form on kind incident, and its create sends a custom subject with an id', async ({ page }) => {
+  const INCIDENT_SPEC = {
+    ...INCIDENT_ROW,
+    description: 'An outage or degradation, worked as a packet.',
+    category: null,
+    steps: [{ kind: 'task', title_template: 'Stabilize the live system', sign_offs_required: [], authority_role: 'platform-admin' }],
+  };
+  const posts: unknown[] = [];
+  await mocks(page, [INCIDENT_SPEC, DECOY_ROW]);
+  await page.route(/\/api\/session$/, (r) =>
+    json(r, { username: 'ceo@demo', employee_id: 'emp-001', role: 'ceo' }));
+  await page.route(/\/api\/jobs(\?|$)/, (r) => {
+    if (r.request().method() === 'POST') {
+      posts.push(r.request().postDataJSON());
+      return json(r, { id: 'inc-raised-1' }, 201);
+    }
+    return json(r, { data: [], total: 0 });
+  });
+
+  await page.goto('/it/operate');
+  const raise = page.getByRole('link', { name: 'Raise an incident →' });
+  await expect(raise).toBeVisible();
+  await raise.click();
+
+  await expect.poll(() => new URL(page.url()).pathname).toBe('/ux/jobs');
+  const params = new URL(page.url()).searchParams;
+  expect(params.get('new')).toBe('1');
+  expect(params.get('kind')).toBe('incident');
+  const form = page.locator('form.new-job-form');
+  const field = (label: string) => form.locator(`label:has(> span:text-is("${label}"))`);
+  await expect(field('Kind').locator('select')).toHaveValue('incident');
+  await expect(field('Subject kind').locator('select')).toHaveValue('custom');
+
+  await field('Subject id').locator('input').fill('incident-2026-11-15-gate-bay');
+  await page.getByRole('button', { name: 'Create Job', exact: true }).click();
+
+  await expect.poll(() => posts.length).toBe(1);
+  const body = posts[0] as Record<string, unknown>;
+  expect(body['kind']).toBe('incident');
+  expect(body['subject']).toEqual({ subject_kind: 'custom', id: 'incident-2026-11-15-gate-bay' });
 });
 
 test('a registry declaring no incident protocol says so, not "no incidents"', async ({ page }) => {

@@ -103,6 +103,10 @@ COPY infra/postgres ./infra/postgres
 COPY infra/estate/observe-lib.sh ./infra/estate/observe-lib.sh
 COPY infra/forge/host-absent-tools.txt ./infra/forge/host-absent-tools.txt
 COPY infra/forge/delivery-plan.py ./infra/forge/delivery-plan.py
+COPY infra/forge/gate-storage.py ./infra/forge/gate-storage.py
+COPY infra/forge/volume-snapshots.py ./infra/forge/volume-snapshots.py
+COPY infra/forge/worker-teardown-witness.py ./infra/forge/worker-teardown-witness.py
+COPY infra/forge/worker-teardown-witness.sh ./infra/forge/worker-teardown-witness.sh
 COPY infra/forge/probe-bin/boss-gateway-read ./infra/forge/probe-bin/boss-gateway-read
 # boss-core `include_str!`s the tiers registry (ba429e7f). The runtime
 # stage copies all of infra/platform for the services to READ at run
@@ -128,11 +132,17 @@ COPY infra/platform/automations/dispatcher.toml ./infra/platform/automations/dis
 # judges a tenant's sensor references offline, with no registry to ask
 # (b8d8c928).
 COPY infra/platform/workflows ./infra/platform/workflows
+# The attended qualifier compiles the fixed public asset/suite contract;
+# its owning equality tests read the same whole public bundle bytes.
+COPY infra/step-plugins ./infra/step-plugins
 # boss-jobs `include_str!`s the IT map's declared hand-offs — the one
 # file every rule, cadence and verb that turns one packet into another
 # declares its route in (design e765b3fc car R2) — so the routes it
 # serves need no file at run time.
 COPY infra/platform/yard/handoffs.toml ./infra/platform/yard/handoffs.toml
+# boss-jobs `include_str!`s the department wire's precedence row — the
+# order a department's region states roll to its factory tile's one
+# wire (conductor_decision_20261104_2022Z on backlog 809872c9).
 # boss-dispatcher-handlers' estate.compare `include_str!`s the estate
 # declaration for its [ops_credentials.<host>] tables — which credentials
 # each cluster-operator holds and who brings each into being — the same

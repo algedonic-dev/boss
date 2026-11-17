@@ -241,7 +241,7 @@ fn build_app_with_station(selection: bool) -> (Router, Arc<InMemoryJobs>, Arc<He
     let mut station = StationSpec::draft(
         "visits",
         "Visits",
-        StationKind::Batch,
+        StationKind::Group,
         boss_jobs::station_queue::StationPredicate {
             kind: Some("service-visit".into()),
             step: Some(boss_jobs::station_queue::StepMatch {

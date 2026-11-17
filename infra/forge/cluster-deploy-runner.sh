@@ -73,6 +73,9 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 # actually exits.
 STAGE="start"
 OUTCOME=""
+# A later PostgreSQL failure overrides only its own convergence outcome;
+# unrelated verification keeps the already-recorded source roll semantics.
+POSTGRES_FAILURE=""
 # The image repo this converge pushes (REGISTRY), its stamp (STAMP_FILE
 # — the last build rolled and verified), the quarantine stamp for a head
 # whose BOOT failed (FAILED_FILE — "proven unbootable; do not re-roll
@@ -111,7 +114,9 @@ _stage_done() { # <field>  — seconds since the previous stage boundary
 }
 _finish() {
     local rc=$?
-    if [ -n "$OUTCOME" ]; then
+    if [ "$rc" -ne 0 ] && [ -n "${POSTGRES_FAILURE:-}" ]; then
+        answer_converge_requests "$CONVERGE_STATE" converge_failed "$STAGE (exit $rc)" || true
+    elif [ -n "$OUTCOME" ]; then
         answer_converge_requests "$CONVERGE_STATE" "${OUTCOME%%=*}" "${OUTCOME#*=}" || true
     elif [ "$rc" -ne 0 ]; then
         answer_converge_requests "$CONVERGE_STATE" converge_failed "$STAGE (exit $rc)" || true
@@ -132,7 +137,7 @@ trap _finish EXIT
 # view it hands over to below; both carry the functions the trap uses,
 # which is why they live in the lib and not in this file.
 . "$REPO/infra/forge/cluster-deploy-lib.sh"
-take_converge_requests "$CONVERGE_STATE" || true
+take_converge_requests "$CONVERGE_STATE" "$CONVERGE_REQUESTS" || true
 # What an earlier tick's alert door kept, filed now (the lib says why
 # this is the converge's own job since backlog a604a35b).
 replay_kept_alerts || true
@@ -567,7 +572,7 @@ SOURCE_NAME=""; SOURCE_TENANT_REPO=""; SOURCE_TENANT_REF=""; SOURCE_TENANT_DIR="
 STAGE="preserve dev work volume request"
 $K get pvc boss-dev-work -n boss-dev --ignore-not-found=true -o json --request-timeout=20s \
     > "$APPLY_DIR/dev-work-claim.json"
-python3 "$REPO/infra/forge/dev-work-volume.py" --render-converge \
+python3 -B "$REPO/infra/forge/dev-work-volume.py" --render-converge \
     "$RENDER_DIR/$SOURCE_NS/boss-dev.yaml" "$APPLY_DIR/dev-work-claim.json"
 if [ -s "$APPLY_DIR/dev-work-claim.json" ]; then
     run_summary_json dev_work_claim "$(cat "$APPLY_DIR/dev-work-claim.json")"
@@ -593,7 +598,6 @@ while IFS="$IFS_ROW" read -r iname ins_ns tdir _s _h _share trepo tref site; do
         SOURCE_NAME="$iname"; SOURCE_TENANT_DIR="$tdir"; SOURCE_TENANT_REPO="$trepo"; SOURCE_TENANT_REF="$tref"; SOURCE_SITE="$site"
     fi
 done <<< "$(instance_rows "$INSTANCES")"
-rm -rf "$RENDER_DIR"
 KM=$(kubectl_seeing "$APPLY_DIR")
 # Client-only conversion of the image-pinned, reviewed source. No live
 # Secret values are read, and this is not an API create. Both config
@@ -609,25 +613,63 @@ deposit_config_apply "$KAPPLY" "$SOURCE_NS" "$APPLY_DIR/$SOURCE_NS/boss-break-gl
 run_summary_json deposit_config "$(cat "$APPLY_DIR/deposit-config.json")"
 [ "$deposit_apply_rc" -eq 0 ] || exit "$deposit_apply_rc"
 # apply_instance NAMESPACE — the rendered directory for one instance.
-# The files that declare a Namespace go FIRST: `kubectl apply -f DIR`
+# Namespace documents go FIRST: `kubectl apply -f DIR`
 # walks files alphabetically, so on a namespace's first converge every
 # CronJob sorted before boss.yaml would meet "namespace not found",
 # the apply would exit 1 after creating the namespace, and only the
-# NEXT converge would succeed. A second apply of an unchanged file is
-# a no-op, so prod pays nothing for the same ordering.
-# apply_namespaces NAMESPACE — the Namespace files alone. Also what
+# NEXT converge would succeed. Mixed files must not write a PVC here.
+# apply_namespaces NAMESPACE — Namespace-only document copies. Also what
 # provisioning runs before it creates an instance's Secrets IN that
 # namespace (dc1bc724): the one definition of "the Namespace first".
 apply_namespaces() {
-    local ns="$1" f
-    for f in $(grep -l '^kind: Namespace$' "$APPLY_DIR/$ns"/*.yaml); do
-        $KM apply -f "/manifests/$ns/${f##*/}"
+    local ns="$1" f stage="$APPLY_DIR/namespace-first-$1"
+    python3 -B "$REPO/infra/forge/standalone-pvc.py" "$APPLY_DIR/$ns" --namespaces "$stage"
+    for f in "$stage"/*.yaml; do
+        [ -f "$f" ] || continue
+        $KM apply -f "/manifests/namespace-first-$ns/${f##*/}"
     done
 }
 apply_instance() {
     local ns="$1"
     apply_namespaces "$ns"
-    $KM apply -f "/manifests/$ns"
+    standalone_pvc_preserve "$K" "$APPLY_DIR/$ns" "$APPLY_DIR/standalone-pvc-$ns.receipt.json"
+    # Converge creates missing claims only. Existing claims are audit-only:
+    # storage expansion belongs to its separately approved operation.
+    python3 -B "$REPO/infra/forge/standalone-pvc.py" "$APPLY_DIR/$ns" \
+        --create-new "$KM" --mounted "/manifests/$ns" \
+        --receipt "$APPLY_DIR/standalone-pvc-$ns.receipt.json"
+    if jq -s 'add' "$APPLY_DIR"/standalone-pvc-*.receipt.json > "$APPLY_DIR/standalone-pvc-all.json"; then
+        run_summary_json_file standalone_pvc "$APPLY_DIR/standalone-pvc-all.json"
+    else
+        echo 'standalone-pvc: combined receipt unread; per-instance receipts retained' >&2
+    fi
+    local pg_receipt pg_result=0
+    pg_receipt=$(mktemp "$CONVERGE_STATE/postgres-attempt-$HEAD_FULL-$ns.XXXXXX.json")
+    python3 -B "$REPO/infra/forge/postgres-rollout.py" \
+        --directory "$APPLY_DIR/$ns" --namespace "$ns" --read "$K" --write "$KAPPLY" \
+        --apply "$KM" --mounted "/manifests/$ns" \
+        --repo "$REPO" --last "$LAST" --head "$HEAD_FULL" --state "$CONVERGE_STATE" \
+        --receipt "$pg_receipt" || pg_result=$?
+    run_summary_json_file "postgres_$ns" "$pg_receipt" || true
+    if [ "$pg_result" -ne 0 ]; then
+        # Only an explicitly non-PG failure retains the old post-source
+        # outcome. Missing/unread PG evidence cannot certify convergence.
+        if ! python3 - "$pg_receipt" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as source:
+        receipt = json.load(source)
+    non_pg = isinstance(receipt, dict) and receipt.get('postgres_failure') is False
+except (OSError, ValueError) as error:
+    print('PostgreSQL receipt unread; failing closed: ' + str(error), file=sys.stderr)
+    non_pg = False
+raise SystemExit(0 if non_pg else 1)
+PY
+        then
+            POSTGRES_FAILURE="$ns"
+        fi
+        return "$pg_result"
+    fi
 }
 # A generic image ships an explicit empty declaration. This estate's
 # declaration is delivered separately, without baking it into the SPA.
@@ -846,9 +888,43 @@ apply_instance "$SOURCE_NS"
 KP="docker run --rm --log-driver=none --network host -v $KUBECONFIG_PATH:/kc:ro -v $REPO/infra/step-plugins:/plugins:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
 # The generated ConfigMap is piped into $KAPPLY — the `-i` kubectl
 # defined above the prod apply, where its comment records the bug.
+#
+# SERVER-SIDE, because a client-side apply caps a derived ConfigMap at
+# an annotation's size, not a ConfigMap's (backlog 73b14b64, 2026-10-21).
+# `kubectl apply` client-side writes the WHOLE object, JSON-encoded, into
+# metadata.annotations[kubectl.kubernetes.io/last-applied-configuration],
+# and the API refuses annotations over 262,144 bytes. Train #1312 took
+# the step-plugins data from 226,184 to 253,710 bytes, the escaped copy
+# crossed the limit, and every converge from 15:23Z died here with "The
+# ConfigMap "step-plugins" is invalid: metadata.annotations: Too long"
+# — in the journal only. A server-side apply stores no such annotation;
+# its own field manager (not `kubectl`, which the API server would keep
+# syncing the old annotation for) owns the keys, and --force-conflicts
+# takes them over from the client-side manager that wrote them before.
+# gate-runner-script goes the same way: it is the same derived shape,
+# ~158 KB escaped and growing with run.sh, at 60% of the same limit.
+#
+# WHAT KUBECTL SAID REACHES THE PACKET. The three failed converges
+# carried `failed_stage: configmaps` and nothing else, so the cause was
+# read off the forge journal through an ops-request. A refused apply now
+# records kubectl's own output, verbatim and named, as
+# `failed_stage_output` beside `failed_stage` (CLAUDE.md §Diagnosis: a
+# verdict must name what failed).
+apply_derived_configmap() { # <name>  — the generated ConfigMap on stdin
+    local out rc=0
+    out="$(mktemp -t cluster-deploy-configmap.XXXXXX)"
+    $KAPPLY apply --server-side --field-manager=cluster-deploy-runner --force-conflicts -f - \
+        > "$out" 2>&1 || rc=$?
+    cat "$out"
+    if [ "$rc" -ne 0 ]; then
+        run_summary_field failed_stage_output "$1 (kubectl apply exit $rc): $(cat "$out")"
+    fi
+    rm -f "$out"
+    return "$rc"
+}
 STAGE="configmaps"
 PLUGIN_ARGS=""
-for f in "$REPO"/infra/step-plugins/*.js; do
+for f in "$REPO"/infra/step-plugins/*.js "$REPO"/infra/step-plugins/*.json; do
     [ -e "$f" ] || continue
     PLUGIN_ARGS="$PLUGIN_ARGS --from-file=$(basename "$f")=/plugins/$(basename "$f")"
 done
@@ -860,7 +936,7 @@ converge_step_plugins() { # NAMESPACE
         echo "cluster-deploy-runner: converging the step-plugins ConfigMap in $ns"
         # shellcheck disable=SC2086
         $KP create configmap step-plugins -n "$ns" $PLUGIN_ARGS \
-            --dry-run=client -o yaml | $KAPPLY apply -f -
+            --dry-run=client -o yaml | apply_derived_configmap "step-plugins in $ns"
     else
         echo "cluster-deploy-runner: no bundles in infra/step-plugins — leaving the ConfigMap in $ns alone"
     fi
@@ -889,18 +965,26 @@ converge_step_plugins "$SOURCE_NS"
 # part a gate pod starts: it fetches the run.sh of the sha being gated and
 # execs it, so a run.sh car is gated by its OWN script; `run.sh` is main's
 # copy, which the bootstrap falls back to (named on the receipt) and which
-# a manifest still naming /repo-script/run.sh runs directly. The key set
-# is pinned equal to apply-script-configmap.sh's and to the manifest's
-# command by gate_runner_manifests.rs.
+# a manifest still naming /repo-script/run.sh runs directly. THREE since
+# 3e2c8ddc: `seed-refresh.sh` is the seed housekeeping both layouts run
+# and the judged-init layout's whole helper container (design b4bf8bba).
+# The key set is pinned equal to apply-script-configmap.sh's and to the
+# manifest's command by gate_runner_manifests.rs. The fourth key,
+# forge-repository, is derived from the estate (8456a6cc), not a second
+# repository default in either script.
 KG="docker run --rm --log-driver=none --network host -v $KUBECONFIG_PATH:/kc:ro -v $REPO/infra/gate-runner:/gate:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
-if [ -f "$REPO/infra/gate-runner/run.sh" ] && [ -f "$REPO/infra/gate-runner/bootstrap.sh" ]; then
+if [ -f "$REPO/infra/gate-runner/run.sh" ] && [ -f "$REPO/infra/gate-runner/bootstrap.sh" ] \
+    && [ -f "$REPO/infra/gate-runner/seed-refresh.sh" ]; then
+    GATE_FORGE_REPOSITORY=$(python3 -B "$REPO/infra/gate-runner/forge-repository.py" "$REPO/infra/estate/estate.toml")
     echo "cluster-deploy-runner: converging the gate-runner-script ConfigMap"
     $KG create configmap gate-runner-script -n boss-dev \
         --from-file=run.sh=/gate/run.sh \
         --from-file=bootstrap.sh=/gate/bootstrap.sh \
-        --dry-run=client -o yaml | $KAPPLY apply -f -
+        --from-file=seed-refresh.sh=/gate/seed-refresh.sh \
+        --from-literal=forge-repository="$GATE_FORGE_REPOSITORY" \
+        --dry-run=client -o yaml | apply_derived_configmap "gate-runner-script in boss-dev"
 else
-    echo "cluster-deploy-runner: infra/gate-runner/run.sh or bootstrap.sh missing — leaving the ConfigMap alone" >&2
+    echo "cluster-deploy-runner: infra/gate-runner/run.sh, bootstrap.sh or seed-refresh.sh missing — leaving the ConfigMap alone" >&2
 fi
 
 # ONE patch, ONE revision. This used to be `set image` (main container)
@@ -937,9 +1021,16 @@ echo "$HEAD" > "$STAMP_FILE"
 rm -f "$FAILED_FILE"
 echo "cluster-deploy-runner: cluster on $REGISTRY:$HEAD"
 _stage_done roll_s
+# THE TRAIN HEARS IT NOW (backlog 090720c3): the source instance serves
+# $HEAD, so say so on this run's packet before the stages below, rather
+# than in the summary its ExecStopPost delivers when the run ends. The
+# dispatcher rule complete-train-converged-on-runner-rolled converges
+# the train that merged it (cluster-deploy-lib.sh report_rolled).
+report_rolled "$REPO/infra/boss-step.sh" "$HEAD_FULL"
 # The roll is real from here; a failed verification below is a finding
 # about it, not a failed converge — the request reads converged either
-# way, and the maintenance packet carries the verification verdict.
+# way for unrelated verification, and the maintenance packet carries that
+# verdict. A PostgreSQL failure has its own explicit failure override.
 OUTCOME="converged=$HEAD"
 
 # THE DECLARED BROKER SECRETS EXIST, EMPTY, before anything reads them
@@ -1087,6 +1178,15 @@ if [ -n "$INSTANCES_SKIPPED" ]; then
     echo "cluster-deploy-runner: instances skipped: $INSTANCES_SKIPPED"
 fi
 _stage_done instances_s
+# The rendered roster goes the moment the LAST apply_instance (the loop
+# above) has staged its claims from it: every instance's staging reads
+# the whole render through cluster-deploy-lib.sh's --rendered (review
+# c7d877d8 F1: removed right after image staging, every converge held
+# every claim, exit 0). Here, and not beside the APPLY_DIR removal
+# below, because nothing after this line reads the render, and the
+# tunnel stages run as one extracted block under their own pin, where
+# RENDER_DIR is never set (gate 772e6a8f: "RENDER_DIR: unbound").
+rm -rf "$RENDER_DIR"
 
 # THE TUNNEL INGRESS IS RE-RENDERED AFTER THE SECRET GATE, so a SKIPPED
 # instance's hostname is served by the source instance until it is

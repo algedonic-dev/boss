@@ -1,0 +1,103 @@
+# ---------------------------------------------------------------------------
+# delayed-admission — the durable packet a delayed rule's pending work
+# rides in (car 2 of the finish line on backlog 84a010cb; design
+# f1d66249, folded into docs/architecture-decisions.md "Durable
+# source-relative guarded admission").
+#
+# WHY A PACKET. A dispatcher rule's `delay` used to be parsed, stored and
+# then dropped before effects, so a seven-day follow-up would have fired
+# at once. The design rejects an in-memory sleep, a clock cursor and the
+# advisory firings table as the pending queue: none survives a restart
+# with its source, and none is the system of record. Pending work is a
+# Job of this kind instead — the log witnesses its capture, its attempts
+# and its one terminal, and a rebuild reproduces it.
+#
+# THE ENVELOPE IS IMMUTABLE. One job-metadata key, `envelope`, holds what
+# the intent was captured with: the complete committed source event and
+# its original timestamp, the source Job, the rule's name, version and
+# bytes, the handler ordinal, the checked delay and the fixed due
+# instant, the complete child request with its pinned workflow version
+# and partition, the guard, and the intent and child ids
+# (boss_dispatcher::rules::delayed::IntentKey). `metadata_schema`
+# declares it in `immutable_fields`, so every job write door — the PUT,
+# the metadata merge, the close, the conditional door itself — judges it
+# against this packet's PINNED version and refuses to replace or delete
+# it, and admission refuses a body carrying it: it enters only through
+# the conditional metadata door's first-write binding. A move onto a
+# version that drops the declaration is refused by the conversion
+# verdict. Pinned by crates/core/boss-jobs/tests/platform_bundle_delayed_admission.rs.
+#
+# ONE EXECUTION STEP, THREE WAYS OUT. `due` is the dispatcher's step: it
+# stays open across HELD attempts (a guard it could not read, a policy
+# outage), each recorded on the step, and completes once with `result`
+# naming the terminal. `admitted` means the child graph was created
+# with the child id the envelope names; `suppressed` means the guard
+# held false (the inquiry was answered, the source closed); `cancelled`
+# means an operator withdrew the intent. Lateness is recorded in
+# `evaluated_at`, never used to move the anchor.
+#
+# `metadata.department` stays beside the owner because a live reader
+# still reads it: boss_jobs::department::kinds_declaring, the join behind
+# a department's readiness and GET /api/jobs?department=<code>, pinned by
+# every_platform_protocol_names_its_department.rs (README, "Every
+# protocol names its owner station").
+#
+# NOT YET: nothing files a packet of this kind. Capture, the due drain,
+# the guarded admission port and the read surfaces are cars 3-6 of the
+# same finish line, and until the last of them the shared rule
+# validator still refuses every rule declaring a delay.
+# ---------------------------------------------------------------------------
+
+[[workflow]]
+kind = "delayed-admission"
+label = "Delayed admission"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "Work a dispatcher rule declared for later, held as a packet until it is due. The packet's envelope pins the source event and its original timestamp, the rule and its version, the fixed due instant and the child it will admit, and no write may change it. At or after the due instant the dispatcher evaluates the rule's guard against current state and records one result: admitted (the child exists, under the id the envelope names), suppressed (the guard is false), or cancelled. An attempt that cannot read its guard is held on the due step and retried, never guessed."
+metadata = { owner = "00b04483-90c6-46b9-b911-8e19d2a0b410", department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
+metadata_schema = { type = "object", immutable_fields = ["envelope"] }
+
+[[workflow.step]]
+title = "captured"
+kind = "trigger"
+ready_when = "true"
+title_template = "Delayed work captured"
+metadata_defaults = { trigger_kind = "event", trigger_name = "a-delayed-rule-matched" }
+
+[[workflow.step]]
+title = "due"
+kind = "task"
+ready_when = "steps.captured.done"
+title_template = "Admit when due"
+authority_role = "platform-admin"
+metadata_defaults = { procedure = "The dispatcher completes this step, never a person: at or after the envelope's due_at it evaluates the guard against current state and records the result. An attempt that cannot read the guard stays open here with its diagnostics." }
+fields = [
+  { name = "result", field_type = "admitted|suppressed|cancelled", required = true },
+  { name = "evaluated_at", field_type = "string", required = true },
+  { name = "observed", field_type = "string", required = true },
+]
+
+[[workflow.step]]
+title = "admitted"
+kind = "outcome"
+ready_when = "steps.due.done AND steps.due.metadata.result = \"admitted\""
+title_template = "Admitted"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "admitted" }
+
+[[workflow.step]]
+title = "suppressed"
+kind = "outcome"
+ready_when = "steps.due.done AND steps.due.metadata.result = \"suppressed\""
+title_template = "Suppressed"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "suppressed" }
+
+[[workflow.step]]
+title = "cancelled"
+kind = "outcome"
+ready_when = "steps.due.done AND steps.due.metadata.result = \"cancelled\""
+title_template = "Cancelled"
+metadata_defaults = { outcome_kind = "aborted" }
+terminal = { outcome = "cancelled" }

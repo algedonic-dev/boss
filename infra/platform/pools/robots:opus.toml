@@ -1,0 +1,25 @@
+# robots:opus — the robots that run an opus model, a root pool of the
+# station tree (docs/design/station-tree.md section 3: "Robots are
+# robots:<model> at the root"). T5 renamed it from model-slot:opus
+# (backlog 84f570a1, 2026-11-07); the <model> is the model FAMILY, the
+# token an agents-registry row's `model_class` holds, so agent-claude and
+# agent-claude-b (model_class opus, read live on GET /api/agents
+# 2026-11-07) are admitted by it and a `model:opus` step executor names
+# it. resources.rs `robot_pool` is the one spelling.
+#
+# CONCURRENCY: a claim reserves 1 slot of it, against a SET limit of 6 (4
+# until v2, 2026-11-08, backlog 89b17d21; allocation item 5 of backlog
+# 35e9babf landed the limit and the `models` list on model-slot:opus v2; T5
+# carries both onto this name). What a
+# run SPENDS draws on budget:robots, the rate pool. `models` is every
+# run-model id this pool meters, as item 5 read them.
+[[pool]]
+name = "robots:opus"
+version = 2
+status = "active"
+unit = "slot"
+kind = "flow"
+shape = "capacity"
+capacity = { state = "configured", amount = 6 }
+models = ["opus-5-5", "opus-5[1m]"]
+capacity_from = 'A SET concurrency limit, not a measurement: David approved the starting limit 4 in decided_plan_20261106_1457Z on design 012822ea (allocation item 5 of backlog 35e9babf), and Q1 of that design decided a set per-model limit, never derived from any robot max_concurrent_runs. This row is where it changes. Spend draws on budget:robots. David raised it from 4 to 6 on 2026-11-08 (~05:12Z, backlog 89b17d21), after the pool read 4 of 4 and refused a fifth builder, so it matches the dev-build worker-volume budget of 6.'

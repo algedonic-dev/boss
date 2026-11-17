@@ -125,20 +125,22 @@ pub fn router(state: HttpState) -> Router {
         .with_state(state)
 }
 
-async fn health() -> Json<boss_core::startup::HealthResponse> {
-    Json(boss_core::startup::health_response(
+async fn health(State(state): State<HttpState>) -> Json<serde_json::Value> {
+    let mut response = serde_json::json!(boss_core::startup::health_response(
         "boss-dispatcher",
         env!("CARGO_PKG_VERSION"),
         "nats-subscriber",
-    ))
+    ));
+    response["dispatcher"] = state.live.observation();
+    Json(response)
 }
 
-/// Real readiness: are both durable consumers bound + draining? Returns
-/// `{ready, assigning, assignment_events, rules_running, rules_events,
+/// Real readiness: are the durable consumers bound + draining? Returns
+/// `{ready, rules_running, rules_events, schedule_running, schedule_events,
 /// last_event_unix, dead_letters, dead_letters_unrecorded,
 /// last_dead_letter_unix, last_unrecorded_dead_letter_unix}`. `ready=false`
-/// while health is 200 is the exact "process up, but assigning nothing, so
-/// Jobs never close" failure. The dead-letter counters are the read the
+/// while health is 200 is the exact "process up, but reacting to nothing,
+/// so Jobs never close" failure. The dead-letter counters are the read the
 /// cluster estate observer (`boss-estate-observe.yaml`) carries into its
 /// observation (8834804a): this surface owes nothing to the jobs API, so a
 /// dead-letter that could not be annotated — or whose annotation write was
@@ -590,6 +592,8 @@ fn authoring_err(e: AuthoringError) -> Response {
         // load as a Rule. Same posture as the Workflow and station
         // registries' publish refusals.
         AuthoringError::Unviable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        // The row is fine; the registry it would leave strips a passkey.
+        AuthoringError::PasskeyEdge(_) => StatusCode::CONFLICT,
         AuthoringError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (code, e.to_string()).into_response()
@@ -621,6 +625,12 @@ fn split_draft_body(body: serde_json::Value) -> Result<(RawRule, Option<String>)
     };
     let rule: RawRule = serde_json::from_value(serde_json::Value::Object(obj))
         .map_err(|e| format!("the rule did not parse: {e}"))?;
+    if rule.delivery_lane.is_some() {
+        return Err(
+            "delivery_lane is restricted to reviewed seed/car publication, not HTTP authoring"
+                .into(),
+        );
+    }
     Ok((rule, source))
 }
 
@@ -799,7 +809,7 @@ async fn publish_rule(
         Ok(publisher) => publisher,
         Err(refusal) => return refusal,
     };
-    match authoring::publish(&state.pool, &name, &publisher).await {
+    match authoring::publish_from_http(&state.pool, &name, &publisher).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => authoring_err(e),
     }
@@ -875,6 +885,7 @@ mod tests {
 
     fn rule(name: &str) -> RawRule {
         RawRule {
+            delivery_lane: None,
             name: name.into(),
             on_event: Some("step.done.task".into()),
             schedule: None,
@@ -1117,6 +1128,7 @@ mod tests {
 
     fn scheduled(name: &str, cadence: &str, anchor: &str, calendar: Option<&str>) -> RawRule {
         RawRule {
+            delivery_lane: None,
             name: name.into(),
             on_event: None,
             schedule: Some(crate::rules::registry::RawSchedule {
@@ -1288,5 +1300,25 @@ mod tests {
         insert_cascade(&mut out, &cascade::Cascade::default());
         assert_eq!(out["handler_emits"], serde_json::json!({}));
         assert_eq!(out["system_edges"], serde_json::json!([]));
+    }
+}
+
+#[cfg(test)]
+mod lane_authoring_boundary_tests {
+    use super::split_draft_body;
+    #[test]
+    fn http_authoring_cannot_enable_a_delivery_lane_even_with_a_claimed_seed_source() {
+        for source in [serde_json::Value::Null, serde_json::json!("platform")] {
+            let mut body = serde_json::json!({"name":"watch", "on_event":"jobs.estate.observed", "do":[{"handler":"record"}], "source":source});
+            assert!(
+                split_draft_body(body.clone()).is_ok(),
+                "ordinary authoring remains valid"
+            );
+            body["delivery_lane"] = serde_json::json!("estate-watch");
+            assert!(
+                split_draft_body(body).is_err(),
+                "HTTP must not enable an independent consumer lane"
+            );
+        }
     }
 }

@@ -20,9 +20,12 @@
 //! locks him out of approving anything. So the road back is driven end
 //! to end: publish the declared row, watch the signer's own write be
 //! refused under each failure, publish the no-writer row back with
-//! NOTHING an approval supplies (no cookie, no passkey, no sign-off, no
+//! nothing the ops-request approval supplies (no cookie, no sign-off, no
 //! ops-request), and watch a freshly filed request take the decision
-//! again. A request admitted under the declared row stays under it —
+//! again. Since backlog a4b57aca that publish names a signed
+//! publish-a-protocol packet: the live ops-request row carries a
+//! passkey, and the server publishes over a passkey row only for bytes
+//! an approver signed (tests/signed_publish). A request admitted under the declared row stays under it —
 //! packets are pinned — so it is cancelled and refiled, never converted.
 //!
 //! Nothing here touches a live system of record: every app is an
@@ -39,6 +42,7 @@
 //! signer row, and what they hold is the signer's half and nothing else.
 
 mod ops_request_rows;
+mod signed_publish;
 
 use std::sync::Arc;
 
@@ -405,11 +409,17 @@ fn assert_names_the_door(status: StatusCode, body: &Value, key: &str, door: &str
 // Publishing, through the routes `boss workflow publish` calls
 // ---------------------------------------------------------------------
 
-/// Draft then publish `row`, asking the registry for nothing but the
-/// caller's `publish` authority on `workflow`: the request carries no
-/// cookie, no presence ticket and no sign-off, and files no packet.
+/// Draft then publish `row` over the live ops-request row. The request
+/// carries no cookie, no presence ticket and no ops-request sign-off.
+/// It does name a SIGNED publish-a-protocol packet: the live row's
+/// approve step carries a passkey, so since backlog a4b57aca the server
+/// publishes over it only for bytes a named approver signed with one.
 /// Answers the version that went live, read back from the active row.
-async fn publish(app: &axum::Router, row: &WorkflowSpec) -> i64 {
+async fn publish(app: &axum::Router, jobs: &InMemoryJobs, row: &WorkflowSpec) -> i64 {
+    let was_live = active_row(app).await["version"]
+        .as_i64()
+        .expect("a live version");
+    let signed = signed_publish::signed_body(jobs, row, was_live).await;
     let (status, draft) = send(
         app,
         "PUT",
@@ -429,7 +439,7 @@ async fn publish(app: &axum::Router, row: &WorkflowSpec) -> i64 {
         "/api/workflows/ops-request/publish",
         "emp-david",
         None,
-        None,
+        Some(signed),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "publish: {published}");
@@ -796,10 +806,10 @@ async fn the_approvers_own_session_writes_the_decision_as_the_surfaces_send_it()
 /// there was none would present a value anyone wrote as the signer's.
 #[tokio::test]
 async fn a_request_in_flight_keeps_the_row_it_was_admitted_under() {
-    let Fixture { app, .. } = fixture(no_writer_row(), HEALTHY);
+    let Fixture { app, jobs } = fixture(no_writer_row(), HEALTHY);
     let in_flight = file_request(&app).await;
 
-    let declared_version = publish(&app, &declared_row()).await;
+    let declared_version = publish(&app, &jobs, &declared_row()).await;
     let filed_after = file_request(&app).await;
 
     // In flight: a machine caller still writes the decision, and so does
@@ -875,7 +885,7 @@ async fn a_request_in_flight_keeps_the_row_it_was_admitted_under() {
 // ---------------------------------------------------------------------
 
 /// IF THE DECLARATION IS WRONG FOR THE ESTATE, DAVID CANNOT APPROVE —
-/// AND THE ROAD BACK DOES NOT PASS THROUGH AN APPROVAL.
+/// AND THE ROAD BACK DOES NOT PASS THROUGH AN OPS-REQUEST APPROVAL.
 ///
 /// Two ways the signer path can fail on a live estate, each driven
 /// against the declared row: the jobs API cannot read the gateway's
@@ -883,15 +893,22 @@ async fn a_request_in_flight_keeps_the_row_it_was_admitted_under() {
 /// missing. In both his own write is refused 409 with the reason, which
 /// is the lockout: no decision, so no approval of any mutating verb.
 ///
-/// The road back is then walked with exactly what a locked-out operator
-/// still has — `publish` on `workflow`, presented on the machine door.
-/// No cookie, no passkey, no sign-off, no ops-request: so it cannot be
-/// circular. It restores the no-writer row; a request filed after it is
+/// The road back is then walked with `publish` on `workflow`, presented
+/// on the machine door: no cookie, no ops-request sign-off, no
+/// ops-request. It names a publish-a-protocol packet signed with a
+/// passkey for the no-writer row's bytes (backlog a4b57aca: the live
+/// ops-request row carries a passkey, so an unsigned publish over it is
+/// refused). That signature is a record judged at the publish, not a
+/// session this fixture verifies — but MINTING it needs a presence
+/// stamp on publish-a-protocol's approve, which the same dark session
+/// key or missing platform-admin sign-off grant would also refuse; so on
+/// such an estate the signature must already exist or come through
+/// another door. It restores the no-writer row; a request filed after it is
 /// approved the old way; and the request that was admitted under the
 /// declared row stays refused and is not convertible, which is why the
 /// rule is cancel and refile.
 #[tokio::test]
-async fn a_locked_out_approver_publishes_the_no_writer_row_back_without_an_approval() {
+async fn a_locked_out_approver_publishes_the_no_writer_row_back_with_a_signed_publish() {
     for (estate, why) in [
         (
             Estate {
@@ -909,11 +926,11 @@ async fn a_locked_out_approver_publishes_the_no_writer_row_back_without_an_appro
         ),
     ] {
         // The estate as it is today: the no-writer row is live.
-        let Fixture { app, .. } = fixture(no_writer_row(), estate);
+        let Fixture { app, jobs } = fixture(no_writer_row(), estate);
         let was_live = active_row(&app).await["version"].as_i64().unwrap();
 
         // THE PUBLISH. From here the refusal is live.
-        let declared_version = publish(&app, &declared_row()).await;
+        let declared_version = publish(&app, &jobs, &declared_row()).await;
         assert!(declared_version > was_live);
         let writers = approve_writers(&active_row(&app).await);
         for key in SIGNER_KEYS {
@@ -946,10 +963,10 @@ async fn a_locked_out_approver_publishes_the_no_writer_row_back_without_an_appro
             "no decision landed"
         );
 
-        // THE ROAD BACK. `publish` sends no cookie on either request,
-        // and this fixture has no key or no grant, so nothing an
-        // approval supplies could have helped it.
-        let restored_version = publish(&app, &no_writer_row()).await;
+        // THE ROAD BACK. `publish` sends no cookie on either request
+        // and no ops-request sign-off; it names a signed
+        // publish-a-protocol packet, judged from the record.
+        let restored_version = publish(&app, &jobs, &no_writer_row()).await;
         assert!(restored_version > declared_version);
         let live = active_row(&app).await;
         assert!(
@@ -1016,9 +1033,9 @@ async fn a_locked_out_approver_publishes_the_no_writer_row_back_without_an_appro
 /// refused); publish the no-writer row back; the old behaviour returns.
 #[tokio::test]
 async fn publish_then_both_controls_then_the_road_back() {
-    let Fixture { app, .. } = fixture(no_writer_row(), HEALTHY);
+    let Fixture { app, jobs } = fixture(no_writer_row(), HEALTHY);
 
-    publish(&app, &declared_row()).await;
+    publish(&app, &jobs, &declared_row()).await;
     let guarded = file_request(&app).await;
     let (status, body) = send(
         &app,
@@ -1049,7 +1066,7 @@ async fn publish_then_both_controls_then_the_road_back() {
         "the positive control: {body}"
     );
 
-    publish(&app, &no_writer_row()).await;
+    publish(&app, &jobs, &no_writer_row()).await;
     let open_again = file_request(&app).await;
     let (status, body) = send(
         &app,

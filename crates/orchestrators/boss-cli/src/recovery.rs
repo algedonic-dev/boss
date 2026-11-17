@@ -2214,8 +2214,10 @@ mod tests {
         };
         assert_eq!(
             exec,
-            "sudo docker run --rm -it --network host -v /etc/boss-ops/kubeconfig:/kc:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc -n boss-dev exec -it deploy/boss-dev -c dev -- /work/dev-session.sh"
+            "sudo docker run --rm --log-driver=none -it --network host -v /etc/boss-ops/kubeconfig:/kc:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc -n boss-dev exec -it deploy/boss-dev -c dev -- /work/dev-session.sh"
         );
+        // ff957587: no container log, or the forge's json-file default
+        // keeps the whole recovery session on its disk.
         // R2-1: the admin credential is the forge's alone; the bastion's
         // is the scoped one, at the same path, on the next road.
         assert_eq!(fact(admin, "On the host"), &Value::Text("forge".into()));
@@ -2242,15 +2244,19 @@ mod tests {
             fact(backups, "Offsite dumps kept"),
             &Value::Text("21".into())
         );
-        // The figure is find's own -mtime N, so the label says what N
-        // is: a dump is deleted once its age in WHOLE days passes it.
-        // It said "kept (days)" and printed 14 while fifteen nights were
-        // kept; at 2 it would have read "two" over a volume holding
-        // three (estate alarm 3be7e44e, review 298f7808 B1).
+        // 06fea058 retains the verified anchor independently of this
+        // count of OTHER candidates. The sheet must not call it days
+        // or count the protected copy twice.
         assert_eq!(
-            fact(backups, "In-cluster dumps deleted once older than"),
-            &Value::Text("2".into())
+            fact(
+                backups,
+                "Other existing dump candidates retained beside verified .latest"
+            ),
+            &Value::Text("1".into())
         );
+        let text = r.facts_text();
+        assert!(text.contains("protected until the new dump verifies and is published"));
+        assert!(!text.contains("In-cluster dumps deleted once older than"));
     }
 
     /// Backlog 4bf7bdd1 (David, 2026-10-01: "boss-gcp doesn't need to be
@@ -2301,6 +2307,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_backup_retention_read_follows_the_count_and_refuses_a_moved_line() {
+        let root = boss_testing::repo_root();
+        let sheet = parse_sheet(&std::fs::read_to_string(root.join(SOURCE)).unwrap()).unwrap();
+        let line = sheet
+            .road
+            .iter()
+            .find(|road| road.id == "restore-the-record")
+            .unwrap()
+            .line
+            .iter()
+            .find(|line| {
+                line.label.as_deref()
+                    == Some("Other existing dump candidates retained beside verified .latest before next dump (maximum count)")
+            })
+            .expect("the recovery fact names the count's protected-anchor semantics");
+        let pattern = line.pattern.as_deref().unwrap();
+        let manifest = std::fs::read_to_string(root.join(line.file.as_ref().unwrap())).unwrap();
+        assert_eq!(capture(&manifest, pattern).unwrap(), "1");
+        let counting_line = manifest
+            .lines()
+            .find(|line| line.contains("if [ \"$kept\" -lt 1 ]; then"))
+            .unwrap();
+        assert_eq!(
+            capture(
+                &manifest.replace(counting_line, &counting_line.replace("-lt 1", "-lt 3")),
+                pattern
+            )
+            .unwrap(),
+            "3",
+            "the recovery sheet reads the owning source's count, not a copied value"
+        );
+        let moved = manifest.replace(counting_line, &format!("# {counting_line}"));
+        assert!(
+            capture(&moved, pattern)
+                .unwrap_err()
+                .contains("matches nothing"),
+            "a commented-out or moved owning line must fail, not read a prose decoy"
+        );
+    }
+
     /// Review F8: the workspace roads say the cluster must be up, and the
     /// bastion comes before the door that is reached through it.
     #[test]
@@ -2342,7 +2389,7 @@ mod tests {
                  '{{\"data\":{{\"policy-check\":\"report\"}}}}'"
             )
         };
-        let door = "sudo docker run --rm --network host -v /etc/boss-ops/kubeconfig:/kc:ro ";
+        let door = "sudo docker run --rm --log-driver=none --network host -v /etc/boss-ops/kubeconfig:/kc:ro ";
         for (label, ns) in [
             ("On the forge, the operating instance", "boss"),
             ("On the forge, the playground", "boss-playground"),
@@ -3496,7 +3543,7 @@ prose = "p"
             panic!("a command is one line")
         };
         assert!(
-            delete.starts_with("sudo docker run --rm --network host -v ")
+            delete.starts_with("sudo docker run --rm --log-driver=none --network host -v ")
                 && delete.contains("/kubeconfig:/kc:ro alpine/k8s:")
                 && delete.ends_with(&format!(
                     " kubectl --kubeconfig=/kc delete validatingadmissionpolicybinding {binding}"

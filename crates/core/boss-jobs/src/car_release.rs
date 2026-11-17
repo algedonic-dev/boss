@@ -23,8 +23,8 @@
 //!   head it read is the head the release is given at ([`vouches`]);
 //! - the shell releasing is not the car's builder run
 //!   ([`may_release_identity`]);
-//! - an automation (the release rule, design 393bdef6 Q1) does not
-//!   release a car whose review step reserves it for a named actor
+//! - only the named actor and its registered aliases release a car
+//!   whose review step reserves it (design 6fa9c790 Q1)
 //!   ([`may_release_by`]);
 //! - the pinned executor requirement is met ([`read_executor_eligibility`]);
 //! - the review step records no release by this same review at that
@@ -276,6 +276,11 @@ fn vouches_inner(run: &Value, car: &Value, head: &str) -> Result<(), String> {
 /// answer over HTTP.
 #[async_trait::async_trait]
 pub trait ExecutorRecordReader: Sync {
+    /// One complete native agents/aliases snapshot. A missing adapter refuses
+    /// alias-based authority; exact named identity needs no lookup.
+    async fn release_actor_rows(&self) -> Result<Vec<Value>> {
+        bail!("the agents registry is not configured for release aliases")
+    }
     /// The protocol row `kind` v`version`, as `GET
     /// /api/workflows/{kind}/versions/{version}` serves it.
     async fn protocol_version(&self, kind: &str, version: i64) -> Result<Option<Value>>;
@@ -667,28 +672,15 @@ pub fn may_release_identity(car: &Value, releaser: Option<&str>) -> Result<(), S
 /// The actor a car's release is reserved for, when its review step names
 /// one ([`crate::car::RELEASER`], written by `boss hold --releaser`). A
 /// blank or non-string value names no one here, and [`may_release_by`]
-/// refuses every automation on it (fail closed, review 3af8f7e2 N1).
+/// refuses every actor on it (fail closed, design 6fa9c790 Q1).
 pub fn reserved_for(car: &Value) -> Option<&str> {
     review_step(car)
         .map(|s| str_at(s, &format!("/metadata/{}", crate::car::RELEASER)))
         .filter(|r| !r.is_empty())
 }
 
-/// Is `by` an automation rather than a person or an agent: the recorded
-/// `automation:<slug>` spelling, or a rule's wire spelling `rule:<name>`
-/// (the same actor, `boss_policy_client::automation_slug`).
-fn is_automation(by: &str) -> bool {
-    let by = by.trim();
-    by.starts_with("automation:") || by.starts_with("rule:")
-}
-
-/// PURE: may `by` release `car` given the car's own-release mark (design
-/// 393bdef6 Q1, backlog 0cfc57e6)? A car reserved for a named actor
-/// waits for a person: an AUTOMATION is refused, which is how the
-/// release rule leaves David's cars to him, through this door and not
-/// around it. A person's or an agent's release is not refused by the
-/// mark — that is the road "as today", and the reviewer's verdict is
-/// still the rule every release rests on.
+/// PURE: only the named actor releases a reserved car (design 6fa9c790 Q1).
+/// The judge separately admits aliases bound by the native agents registry.
 pub fn may_release_by(car: &Value, by: &str) -> Result<(), String> {
     let id = str_at(car, "/id");
     let branch = str_at(car, "/metadata/branch");
@@ -697,12 +689,12 @@ pub fn may_release_by(car: &Value, by: &str) -> Result<(), String> {
         // FAIL CLOSED (review 3af8f7e2 N1): a mark PRESENT in a shape
         // that names no one — a list, an object, a bool, null, a blank
         // string — is a hand-written merge whose intent cannot be read,
-        // so no automation releases the car. Only an absent mark leaves
+        // so no actor releases the car. Only an absent mark leaves
         // it unreserved. `boss hold --releaser` writes a string.
         let mark = review_step(car)
             .and_then(|s| s.pointer(&format!("/metadata/{}", crate::car::RELEASER)));
         return match mark {
-            Some(mark) if is_automation(by) => Err(format!(
+            Some(mark) => Err(format!(
                 "car {} {target} carries {}={mark} on its review step, which names no actor, so \
                  its release cannot be read as unreserved and {} does not release it (review \
                  3af8f7e2 N1). Nothing was written; the car stays held for a person, who \
@@ -715,18 +707,47 @@ pub fn may_release_by(car: &Value, by: &str) -> Result<(), String> {
             _ => Ok(()),
         };
     };
-    if !is_automation(by) || by.trim() == reserved {
+    if by.trim() == reserved {
         return Ok(());
     }
     Err(format!(
         "car {} {target} is reserved for {reserved}'s own release ({} on its review step, \
-         written by boss hold --releaser), so {} does not release it (design 393bdef6 Q1). \
+         written by boss hold --releaser), so {} does not release it (design 6fa9c790 Q1). \
          Nothing was written; the car stays held for {reserved}, who releases it on its review: \
          `boss release {target} --review <the reviewer's run, full id>`, or the yard's Release.",
         short(id),
         crate::car::RELEASER,
         by.trim()
     ))
+}
+
+pub async fn may_release_as(
+    reader: &impl ExecutorRecordReader,
+    car: &Value,
+    by: &str,
+) -> Result<(), String> {
+    let Err(why) = may_release_by(car, by) else {
+        return Ok(());
+    };
+    let Some(reserved) = reserved_for(car).filter(|_| !by.trim().is_empty()) else {
+        return Err(why);
+    };
+    let rows = reader
+        .release_actor_rows()
+        .await
+        .map_err(|e| format!("{why} Release alias lookup refused: {e:#}"))?;
+    // Aliases grant authority FROM the reserved registry row, never TO
+    // a person whom an unrelated agent lists as its alias (7c5487ae F2).
+    let mut owners = rows.iter().filter(|row| row["id"] == reserved);
+    let owner = owners.next();
+    let unique_owner = owner.is_some() && owners.next().is_none();
+    let canonical = crate::agents::identity::canonical_actor(&rows, by.trim())
+        .map_err(|e| format!("{why} Release alias lookup refused: {e:#}"))?;
+    if unique_owner && canonical == reserved {
+        Ok(())
+    } else {
+        Err(why)
+    }
 }
 
 /// The release record on the review step (`crate::car::RELEASE`).
@@ -940,6 +961,10 @@ pub fn safe_line(run: &Value) -> Option<String> {
 pub struct ReleaseAsk {
     /// The reviewer's agent-run, as a full id.
     pub review: String,
+    /// The hold the asker judged, as it read the car ([`JudgedHold::of`]).
+    /// REQUIRED: the door lifts only this hold, and refuses a car that
+    /// carries another (review 792b871a N1, [`judged_hold_stands`]).
+    pub hold: JudgedHold,
     /// The car head the release is given at, read by the caller from the
     /// forge. When it is absent, the head the hold was placed at
     /// (`hold_sha`) is used.
@@ -958,21 +983,96 @@ pub struct ReleaseAsk {
     pub agent_shell: bool,
 }
 
+/// THE HOLD A RELEASE WAS ASKED ABOUT (review 792b871a N1). Every asker
+/// judges a car as it READ it — the release rule judges when the hold
+/// was placed against the verdict, the yard shows the row a person
+/// clicks, `boss release` reads the packet — and the door reads the car
+/// again when the POST arrives. A `boss hold` landing in between keeps
+/// `hold_sha` (a hand hold over a review hold is still a review hold),
+/// so a door asked with the review alone judged the NEW hold good on the
+/// OLD verdict and lifted it. The ask now names the hold it judged, and
+/// the door lifts that hold or nothing.
+///
+/// `reason` is the hold as every reader shows it
+/// ([`crate::stranded::marked`]: trimmed, a bare `true` read "no
+/// reason recorded"), and `None` when the asker read no hold; `sha` is
+/// the head it was placed at ([`hold_sha`]). A hold rewritten with the
+/// same text at the same head is the same hold to the record — the
+/// release rule's own placement read says so too — so it is not refused.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JudgedHold {
+    pub reason: Option<String>,
+    pub sha: Option<String>,
+}
+
+impl JudgedHold {
+    /// The hold `car` carries on its review step, as the door compares
+    /// it. The one reader every asker sends and the door judges with.
+    pub fn of(car: &Value) -> Self {
+        let md = review_step(car)
+            .and_then(|s| s.get("metadata"))
+            .unwrap_or(&Value::Null);
+        Self {
+            reason: crate::stranded::marked(md, "hold"),
+            sha: hold_sha(car).map(str::to_string),
+        }
+    }
+
+    fn normal(&self) -> (Option<&str>, Option<&str>) {
+        (normal(&self.reason), normal(&self.sha))
+    }
+}
+
+/// A judged-hold field as compared: trimmed, and empty read as none.
+fn normal(v: &Option<String>) -> Option<&str> {
+    v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// PURE: refuse unless the hold `car` carries now is the hold the asker
+/// judged ([`JudgedHold`], review 792b871a N1). Nothing is written on a
+/// refusal; the road is to judge the car as it stands and ask again.
+pub fn judged_hold_stands(car: &Value, asked: &JudgedHold) -> Result<(), String> {
+    let now = JudgedHold::of(car);
+    if now.normal() == asked.normal() {
+        return Ok(());
+    }
+    let say = |h: &JudgedHold| match h.normal() {
+        (None, _) => "no hold".to_string(),
+        (Some(r), None) => format!("the hold {r:?} at no head"),
+        (Some(r), Some(sha)) => format!("the hold {r:?} at {}", short(sha)),
+    };
+    Err(format!(
+        "car {}'s review step carries {} now, and this release was asked about {} — the hold \
+         changed after the asker read the car, so the verdict it rests on never judged what \
+         holds the car now (review 792b871a N1). Nothing was written. Read the car again and \
+         judge the hold it carries.",
+        short(str_at(car, "/id")),
+        say(&now),
+        say(asked),
+    ))
+}
+
 /// A release the rule grants: the review step it is written on, and the
 /// one merge body that writes the record and lifts the hold in one act.
+/// `expect` is the review step's `hold` and `hold_sha` exactly as the
+/// judge read them: the write lands only while the row still carries
+/// them, judged under the row's lock, so a hold written between the
+/// door's read and its write is not lifted either.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Granted {
     pub step_id: String,
     pub head: String,
     pub record: Value,
     pub patch: Value,
+    pub expect: Value,
 }
 
 /// THE RULE, as the door asks it: may `ask` release `car` on `run`'s
 /// review, and what is written if so. Every refusal is the whole
 /// sentence a reader needs. The checks run in the CLI's order: the step
-/// is open, the shell is not the builder, an automation is not releasing
-/// a car reserved for a person ([`may_release_by`]), there is a head, no release is
+/// is open, the shell is not the builder, the actor honors a named
+/// reservation ([`may_release_by`]), there is a head, no release is
 /// recorded at it already, the executor is eligible, and the review
 /// vouches.
 pub async fn judge(
@@ -992,7 +1092,7 @@ pub async fn judge(
     }
     let step = holdable(car)?;
     may_release_identity(car, ask.run.as_deref())?;
-    may_release_by(car, by)?;
+    may_release_as(reader, car, by).await?;
     let head = ask
         .head
         .as_deref()
@@ -1002,10 +1102,12 @@ pub async fn judge(
         .ok_or_else(|| unbound(car, step))?
         .to_string();
     released_already(car, step, &head, review)?;
+    judged_hold_stands(car, &ask.hold)?;
     let executor = read_executor_eligibility(reader, run, car, &head)
         .await
         .map_err(|e| format!("pinned executor eligibility refused: {e:#}"))?;
     vouches_with_executor(run, car, &head, &executor)?;
+    let source = crate::release_window::judge_source_window(reader, car, run, &head, at).await?;
     let main = ask
         .main_sha
         .as_deref()
@@ -1018,18 +1120,32 @@ pub async fn judge(
     if let Some(binding) = executor.record_binding() {
         rec["executor_binding"] = binding;
     }
+    rec["review_source"] = source;
     rec[REVIEWER_MODEL_KEY] = reviewer_model(run, &launch_record(reader, run).await);
     if let Some(r) = ask.run.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
         rec["run"] = json!(r);
     }
     rec["agent_shell"] = json!(ask.agent_shell);
     let patch = json!({ "hold": Value::Null, crate::car::RELEASE: rec.clone() });
+    let expect = Value::Object(release_write_expectation(car));
     Ok(Granted {
         step_id: str_at(step, "/id").to_string(),
         head,
         record: rec,
         patch,
+        expect,
     })
+}
+
+/// The raw authority every hold-clearing write compares under the row lock.
+pub fn release_write_expectation(car: &Value) -> serde_json::Map<String, Value> {
+    let md = review_step(car)
+        .and_then(|s| s.get("metadata"))
+        .unwrap_or(&Value::Null);
+    ["hold", crate::car::HOLD_SHA, crate::car::RELEASER]
+        .into_iter()
+        .map(|key| (key.to_string(), md.get(key).cloned().unwrap_or(Value::Null)))
+        .collect()
 }
 
 /// PURE: why a request that names no head is refused when the hold
@@ -1043,7 +1159,7 @@ fn unbound(car: &Value, step: &Value) -> String {
     let id = str_at(car, "/id");
     let md = step.get("metadata").unwrap_or(&Value::Null);
     let release = md.get(crate::car::RELEASE).filter(|r| r.is_object());
-    let (Some(release), Some(hold)) = (release, crate::stranded::hold_reason(md)) else {
+    let (Some(release), Some(hold)) = (release, crate::stranded::marked(md, "hold")) else {
         return format!(
             "car {} records no head its hold was judged at (hold_sha), and the request named \
              none — release it with boss release, which reads the forge",
@@ -1115,7 +1231,7 @@ fn released_already(car: &Value, step: &Value, head: &str, review: &str) -> Resu
     let id = str_at(car, "/id");
     let branch = str_at(car, "/metadata/branch");
     let target = if branch.is_empty() { short(id) } else { branch };
-    let Some(hold) = crate::stranded::hold_reason(md) else {
+    let Some(hold) = crate::stranded::marked(md, "hold") else {
         // N2 (re-review 6c1788dc): no hold remains, so name none.
         return Err(format!(
             "car {} {target}: already released at {} on review {}; nothing to do (by {}, at \
@@ -1174,6 +1290,18 @@ pub async fn decision(
     reader: &impl ExecutorRecordReader,
     car: &Value,
     run: Result<&Value, String>,
+    at: &str,
+) -> Decision {
+    decision_for(reader, car, run, "", at).await
+}
+
+/// The same judgement for the actual signed-in viewer of the yard.
+pub async fn decision_for(
+    reader: &impl ExecutorRecordReader,
+    car: &Value,
+    run: Result<&Value, String>,
+    by: &str,
+    at: &str,
 ) -> Decision {
     let review = dispatched_reviewer(car).map(str::to_string);
     let head = hold_sha(car).map(str::to_string);
@@ -1188,11 +1316,15 @@ pub async fn decision(
         ),
         (Some(_), Err(why)) => (None, None, None, Value::Null, Err(why)),
         (Some(id), Ok(run)) => {
+            // The row judges the hold it shows; its control sends the
+            // same one back, so a hold rewritten before the click is
+            // refused at the door (review 792b871a N1).
             let ask = ReleaseAsk {
                 review: id.clone(),
+                hold: JudgedHold::of(car),
                 ..ReleaseAsk::default()
             };
-            let outcome = judge(reader, car, run, &ask, "", "").await.map(|_| ());
+            let outcome = judge(reader, car, run, &ask, by, at).await.map(|_| ());
             (
                 opt(str_at(run, &format!("/metadata/{REVIEW_KEY}/verdict"))),
                 opt(str_at(run, &format!("/metadata/{REVIEW_KEY}/reviewed_sha"))),
@@ -1240,6 +1372,27 @@ mod tests {
                                        "agent_run": REVIEWER}}]})
     }
 
+    #[test]
+    fn malformed_gate_envelope_preserves_reheld_release_refusal_reasons() {
+        for poison in [json!({}), json!(null)] {
+            let mut car = held_car();
+            car["steps"][0]["metadata"][crate::car::RELEASE] =
+                json!({"sha":H1,"review":REVIEWER,"by":"emp-david","at":"t"});
+            car["steps"][0]["metadata"]["gate_submission"] = poison;
+            let step = review_step(&car).unwrap();
+            let why = released_already(&car, step, H1, REVIEWER).unwrap_err();
+            assert!(
+                why.contains("area policy"),
+                "same-head refusal must name the raw hold: {why}"
+            );
+            let why = unbound(&car, step);
+            assert!(
+                why.contains("area policy"),
+                "unbound refusal must name the raw hold: {why}"
+            );
+        }
+    }
+
     fn review_at(sha: &str, verdict: &str, findings: &str) -> Value {
         json!({"car": CAR, "branch": "feat/x", "reviewed_sha": sha, "verdict": verdict,
                "findings": findings, "at": "2026-10-09T13:00:00Z"})
@@ -1271,6 +1424,188 @@ mod tests {
         ) -> Result<Option<crate::first_record::FirstRecord>> {
             Ok(None)
         }
+    }
+
+    struct SourceFixture<'a, R> {
+        reader: &'a R,
+        record: crate::first_record::FirstRecord,
+    }
+    #[async_trait::async_trait]
+    impl<R: ExecutorRecordReader> ExecutorRecordReader for SourceFixture<'_, R> {
+        async fn release_actor_rows(&self) -> Result<Vec<Value>> {
+            self.reader.release_actor_rows().await
+        }
+        async fn protocol_version(&self, kind: &str, version: i64) -> Result<Option<Value>> {
+            self.reader.protocol_version(kind, version).await
+        }
+        async fn executor_original(
+            &self,
+            job: uuid::Uuid,
+            step: uuid::Uuid,
+            key: &str,
+        ) -> Result<Option<crate::first_record::FirstRecord>> {
+            if key == crate::release_window::SOURCE_KEY {
+                return Ok(Some(self.record.clone()));
+            }
+            self.reader.executor_original(job, step, key).await
+        }
+    }
+    fn attested_source(
+        car: &Value,
+        run: &Value,
+        head: &str,
+    ) -> (Value, crate::first_record::FirstRecord) {
+        let mut run = run.clone();
+        if !steps(&run).iter().any(|s| s["spec_slug"] == BUILDING_SLUG) {
+            run["steps"] = json!([{"id":BUILDING,"spec_slug":BUILDING_SLUG}]);
+        }
+        let building = steps(&run)
+            .into_iter()
+            .find(|s| s["spec_slug"] == BUILDING_SLUG)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let record = crate::first_record::FirstRecord::new(
+            boss_core::job::JobId::from_uuid(run["id"].as_str().unwrap().parse().unwrap()),
+            boss_core::job::StepId::from_uuid(building),
+            crate::release_window::SOURCE_KEY,
+            &json!({"car":car["id"],"head":head,"main":H1,"base":H1,"path":crate::release_window::MANIFEST_PATH,"mode":"100644","base_mode":"100644","base_manifest":"kind: ConfigMap\nmetadata:\n  name: boss-machine-gate\ndata:\n  mode: report\n","manifest":"kind: ConfigMap\nmetadata:\n  name: boss-machine-gate\ndata:\n  mode: report\n","diff":""}),
+            &boss_core::publisher::EventStamp::new(
+                "test",
+                boss_core::actor::ActorId::automation("review"),
+            ),
+            uuid::Uuid::from_u128(78),
+        );
+        if run
+            .pointer("/metadata/review")
+            .is_some_and(Value::is_object)
+        {
+            run["metadata"]["review"]["source_binding"] =
+                json!({"digest":record.digest,"event_id":record.event_id});
+        }
+        (run, record)
+    }
+    async fn decision(
+        reader: &impl ExecutorRecordReader,
+        car: &Value,
+        run: Result<&Value, String>,
+    ) -> Decision {
+        let Ok(run) = run else {
+            return super::decision(reader, car, run, "t").await;
+        };
+        let (run, record) = attested_source(car, run, hold_sha(car).unwrap_or(H1));
+        super::decision(&SourceFixture { reader, record }, car, Ok(&run), "t").await
+    }
+
+    /// [`super::judge`] asked by a caller that read `car` as it stands:
+    /// the ask names the hold the car carries ([`JudgedHold::of`]), as
+    /// every live asker's does. Every test of another rule asks this way;
+    /// the tests of the hold rule itself call [`super::judge`] with the
+    /// hold they mean.
+    async fn judge(
+        reader: &impl ExecutorRecordReader,
+        car: &Value,
+        run: &Value,
+        ask: &ReleaseAsk,
+        by: &str,
+        at: &str,
+    ) -> Result<Granted, String> {
+        let ask = ReleaseAsk {
+            hold: JudgedHold::of(car),
+            ..ask.clone()
+        };
+        let (run, record) = attested_source(
+            car,
+            run,
+            ask.head.as_deref().or_else(|| hold_sha(car)).unwrap_or(H1),
+        );
+        super::judge(&SourceFixture { reader, record }, car, &run, &ask, by, at).await
+    }
+
+    /// THE DOOR LIFTS ONLY THE HOLD ITS ASKER JUDGED (review 792b871a
+    /// N1). A hold rewritten after the asker read the car — another
+    /// reason at the same head (a person's `boss hold` keeps `hold_sha`),
+    /// the same reason at another head, or no hold at all — is refused,
+    /// naming both; the hold as read is granted, and the grant carries
+    /// what it read so the write is judged against it too.
+    #[tokio::test]
+    async fn a_release_lifts_only_the_hold_its_asker_judged() {
+        let run = reviewer(review_at(
+            H1,
+            RELEASE,
+            "SAFE TO RELEASE WITHOUT DAVID: yes.",
+        ));
+        let car = held_car();
+        let (run, record) = attested_source(&car, &run, H1);
+        let reader = SourceFixture {
+            reader: &Advisory,
+            record,
+        };
+        let as_read = ReleaseAsk {
+            review: REVIEWER.into(),
+            hold: JudgedHold::of(&car),
+            ..ReleaseAsk::default()
+        };
+        assert_eq!(
+            as_read.hold,
+            JudgedHold {
+                reason: Some("area policy".into()),
+                sha: Some(H1.into())
+            }
+        );
+        let granted = super::judge(&reader, &car, &run, &as_read, "d", "t")
+            .await
+            .expect("the hold as read is granted");
+        assert_eq!(
+            granted.expect,
+            json!({"hold": "area policy", "hold_sha": H1, crate::car::RELEASER: null}),
+            "the write is judged against the hold as read"
+        );
+        let rewrite = |hold: Value, sha: Value| {
+            let mut c = held_car();
+            c["steps"][0]["metadata"]["hold"] = hold;
+            c["steps"][0]["metadata"]["hold_sha"] = sha;
+            c
+        };
+        for (now, says) in [
+            (
+                rewrite(json!("David reads it first"), json!(H1)),
+                "\"David reads it first\"",
+            ),
+            (rewrite(json!("area policy"), json!(H2)), "at 22222222"),
+            (rewrite(Value::Null, json!(H1)), "carries no hold now"),
+        ] {
+            let why = super::judge(&reader, &now, &run, &as_read, "d", "t")
+                .await
+                .expect_err("another hold is not lifted");
+            assert!(why.contains(says), "{says}: {why}");
+            assert!(why.contains("\"area policy\" at 11111111"), "{why}");
+            assert!(why.contains("Nothing was written"), "{why}");
+        }
+        // The same hold, as every reader shows it, is the same hold.
+        let spaced = rewrite(json!("  area policy "), json!(H1));
+        super::judge(&reader, &spaced, &run, &as_read, "d", "t")
+            .await
+            .expect("same text, same head");
+    }
+
+    /// The hold is REQUIRED on the wire: a body that names only the
+    /// review is not a release body (422 at the door), so no asker can
+    /// lift whatever hold happens to be there.
+    #[test]
+    fn a_release_body_without_the_hold_it_judged_is_not_one() {
+        let bare: Result<ReleaseAsk, _> = serde_json::from_value(json!({"review": REVIEWER}));
+        assert!(
+            bare.expect_err("refused").to_string().contains("hold"),
+            "names the missing field"
+        );
+        let full: ReleaseAsk = serde_json::from_value(
+            json!({"review": REVIEWER, "hold": {"reason": "x", "sha": null}}),
+        )
+        .expect("a body");
+        assert_eq!(full.hold.reason.as_deref(), Some("x"));
     }
 
     fn ask(head: Option<&str>) -> ReleaseAsk {
@@ -1911,8 +2246,7 @@ mod tests {
     /// writes `releaser` on the review step; the release rule asks the
     /// door like anyone else and the JUDGE refuses it, so the refusal is
     /// the door's and no handler carries a second copy of the check. A
-    /// person releases the marked car exactly as before: David, and any
-    /// other person or agent, because the mark binds automation only.
+    /// named actor still releases without an alias-registry dependency.
     #[tokio::test]
     async fn a_car_marked_for_a_persons_own_release_is_refused_to_a_rule() {
         let mut car = held_car();
@@ -1928,10 +2262,13 @@ mod tests {
         judge(&Advisory, &car, &run, &ask(None), legacy, "t")
             .await
             .expect_err("rule:<name> is the same rule");
-        for person in ["emp-david", "agent-codex", ""] {
-            judge(&Advisory, &car, &run, &ask(None), person, "t")
+        judge(&Advisory, &car, &run, &ask(None), "emp-david", "t")
+            .await
+            .expect("the exact named actor needs no registry");
+        for other in ["agent-codex", "emp-another", ""] {
+            judge(&Advisory, &car, &run, &ask(None), other, "t")
                 .await
-                .unwrap_or_else(|why| panic!("{person:?} releases it as today: {why}"));
+                .expect_err("every other actor is refused");
         }
     }
 
@@ -1940,8 +2277,8 @@ mod tests {
     /// other shape — a list, an object, a bool, null, a blank string —
     /// reserved nothing and the rule was GRANTED. `boss hold` writes a
     /// string; any other shape is a hand-written merge whose intent the
-    /// judge cannot read, so every automation is refused, and a person
-    /// still releases it as today. Absent is the only unmarked car.
+    /// judge cannot read, so every actor is refused. Absent is the only
+    /// unmarked car.
     #[tokio::test]
     async fn a_releaser_mark_in_any_other_shape_refuses_every_automation() {
         let run = reviewer(review_at(H1, RELEASE, ""));
@@ -1957,16 +2294,130 @@ mod tests {
         ] {
             let mut car = held_car();
             car["steps"][0]["metadata"][crate::car::RELEASER] = mark.clone();
-            for caller in [RULE_ACTOR, "rule:x", "automation:train-conductor"] {
+            for caller in [
+                RULE_ACTOR,
+                "rule:x",
+                "automation:train-conductor",
+                "emp-david",
+                "agent-codex",
+                "",
+            ] {
                 let why = judge(&Advisory, &car, &run, &ask(None), caller, "t")
                     .await
                     .expect_err("a mark naming no one refuses an automation");
                 assert!(why.contains(crate::car::RELEASER), "{mark}: {why}");
             }
-            judge(&Advisory, &car, &run, &ask(None), "emp-david", "t")
-                .await
-                .unwrap_or_else(|why| panic!("{mark}: a person releases it as today: {why}"));
         }
+    }
+
+    struct ReleaseActors(Option<Vec<Value>>);
+
+    #[tokio::test]
+    async fn a_release_freezes_the_reservation_it_judged_in_the_write_precondition() {
+        let mut car = held_car();
+        car["steps"][0]["metadata"][crate::car::RELEASER] = json!("emp-david");
+        let run = reviewer(review_at(H1, RELEASE, ""));
+        let granted = judge(&Advisory, &car, &run, &ask(None), "emp-david", "t")
+            .await
+            .expect("the named actor");
+        assert_eq!(
+            granted.expect[crate::car::RELEASER],
+            "emp-david",
+            "a reservation changed between judge and merge must refuse"
+        );
+        car["steps"][0]["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove(crate::car::RELEASER);
+        let unreserved = judge(&Advisory, &car, &run, &ask(None), "agent-codex", "t")
+            .await
+            .expect("no reservation needs no registry");
+        assert_eq!(
+            unreserved.expect.get(crate::car::RELEASER),
+            Some(&Value::Null),
+            "a newly placed reservation must also refuse the old write"
+        );
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutorRecordReader for ReleaseActors {
+        async fn release_actor_rows(&self) -> Result<Vec<Value>> {
+            self.0
+                .clone()
+                .ok_or_else(|| anyhow!("registry unavailable"))
+        }
+        async fn protocol_version(&self, kind: &str, version: i64) -> Result<Option<Value>> {
+            Advisory.protocol_version(kind, version).await
+        }
+        async fn executor_original(
+            &self,
+            job: uuid::Uuid,
+            step: uuid::Uuid,
+            key: &str,
+        ) -> Result<Option<crate::first_record::FirstRecord>> {
+            Advisory.executor_original(job, step, key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn release_alias_authority_comes_only_from_one_native_registry_snapshot() {
+        let mut car = held_car();
+        car["steps"][0]["metadata"][crate::car::RELEASER] = json!("agent-owner");
+        let run = reviewer(review_at(H1, RELEASE, ""));
+        let owner =
+            json!({"id":"agent-owner","aliases":["owner@login.example","another-owner-alias"]});
+        let reader = ReleaseActors(Some(vec![owner.clone()]));
+        for by in ["agent-owner", "owner@login.example", "another-owner-alias"] {
+            judge(&reader, &car, &run, &ask(None), by, "t")
+                .await
+                .expect("named or registered alias");
+        }
+        for by in [
+            "owner",
+            "agent-owner@login.example",
+            "agent-codex",
+            RULE_ACTOR,
+            "",
+        ] {
+            judge(&reader, &car, &run, &ask(None), by, "t")
+                .await
+                .expect_err("no inferred aliases");
+        }
+        for reader in [
+            ReleaseActors(None),
+            ReleaseActors(Some(vec![])),
+            ReleaseActors(Some(vec![
+                owner.clone(),
+                json!({"id":"agent-other","aliases":["owner@login.example"]}),
+            ])),
+        ] {
+            judge(&reader, &car, &run, &ask(None), "owner@login.example", "t")
+                .await
+                .expect_err("unavailable, missing or ambiguous alias refuses");
+            judge(&reader, &car, &run, &ask(None), "agent-owner", "t")
+                .await
+                .expect("exact identity is independent of aliases");
+        }
+        car["steps"][0]["metadata"][crate::car::RELEASER] = json!("owner@login.example");
+        judge(&reader, &car, &run, &ask(None), "agent-owner", "t")
+            .await
+            .expect_err("an alias reservation does not delegate back to its agent row");
+        car["steps"][0]["metadata"][crate::car::RELEASER] = json!("agent-owner");
+        let (run, record) = attested_source(&car, &run, H1);
+        let reader = SourceFixture {
+            reader: &reader,
+            record,
+        };
+        assert!(
+            decision_for(&reader, &car, Ok(&run), "another-owner-alias", "t")
+                .await
+                .releasable
+        );
+        assert!(
+            !decision_for(&reader, &car, Ok(&run), "agent-codex", "t")
+                .await
+                .releasable
+        );
     }
 
     /// The refusals the release rule must leave untouched are the

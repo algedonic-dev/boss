@@ -96,6 +96,7 @@ fn local_auth(guest_access: GuestAccess) -> Arc<LocalAuthState> {
         http: reqwest::Client::new(),
         machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
             .unwrap(),
+        classes_timeout: boss_core::http_client::CLIENT_TIMEOUT,
         audit: boss_gateway::audit::AuthAudit::disabled(),
         guest_access,
         oidc: None,

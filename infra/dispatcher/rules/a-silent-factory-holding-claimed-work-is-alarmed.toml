@@ -1,0 +1,90 @@
+# An actor that holds claimed work and whose open work-session has had
+# no write of its own for 45 minutes is an alarm that names it (backlog
+# 628dc540, David's request 2026-10-28).
+#
+# THE CASE. Measured 2026-10-28: agent-codex, the factory, stopped on a
+# temporary model-capacity limit at about 06:42Z and nothing restarted
+# it until David did at about 19:20Z — about 12.5 h down — and again
+# from about 20:57Z to 22:38Z. Nothing noticed: its interactive TUI
+# waits at an error prompt and never exits, the run died rule judges
+# only runs and only at 4 h, and the idle-actor alarm beside this one
+# reads the OPPOSITE case, an actor with no run and ready urgent work.
+#
+# THE ARGS ARE THE DECLARATION, as registry data:
+#   - silent_minutes, 45: the decision's bound ("detected and failed
+#     over within an hour"). Measured from the newest write SIGNED BY
+#     the actor on its own open session, read off that packet's audit
+#     slice; a note the conductor writes onto the factory's session is
+#     not the factory speaking.
+#   - ignore_key_prefixes, `factory_restart_,factory_turn`: the keys
+#     infra/dev/factory-loop.sh writes — its restart note when it
+#     relaunches the CLI after a failed or limited turn, and the
+#     `factory_turn` that rides with the `last_active_at` it stamps at
+#     every turn start and end (so work-session-ends-when-silent never
+#     closes a live factory's session). A write that changes ANY key
+#     under these prefixes is the supervisor's. The supervisor is alive
+#     while the model is not, and its writes (a turn at least every 30
+#     min while it backs off) would otherwise hold a 45-minute alarm off
+#     forever. The handler's test holds both prefixes equal to the
+#     script's keys (CLAUDE.md 9a).
+#   - restart_key_prefixes, `factory_restart_`: the loop's RESTART note.
+#     One newer than the actor's last own write overrides a bound
+#     worker (below): the supervisor is saying the CLI itself is down.
+#     Each must also be an ignored prefix, or the note would be the
+#     actor speaking; the handler refuses one that is not.
+#
+# THE ACTOR IS WATCHED, NOT ONE SESSION (review 97bb7698, decided
+# 2026-10-29 on 628dc540): with no OPEN session the actor's newest
+# session of any status is read, and a holder with no session at all is
+# an alarm at once. The actor is MOVING when IT completed a step of one
+# of its runs inside the bound (a completion by automation — the
+# run-died rule, a train landing, a marker — is not the actor) or a gate
+# one of its runs launched moved its branch inside the bound. A run's
+# bound, unretired dev-build worker DEFERS the alarm to twice
+# silent_minutes (90 minutes) from the actor's own last write, never
+# longer, because nothing observes a worker after its receipt: on
+# 2026-10-28 run 320b62e1's worker stayed bound from 06:31Z until the
+# run died at 11:00Z while the factory, stopped at a model limit since
+# 06:42Z, built nothing (review 1c7ab966, decided
+# 2026-10-29 on 628dc540). A healthy long build is covered by the
+# deferral; the alarm tells the conductor to check worker liveness and
+# branch movement before releasing, and to release only a run whose
+# worker is gone.
+#
+# DEDUP: by the alarm staying OPEN. It closes ITSELF when the actor
+# writes to its session again after the silence it recorded; closing
+# re-arms the watch, so the next silence files again. A full event
+# window's oldest event is unknown and never closes it.
+#
+# EVERY FIVE MINUTES: the bound is minutes, so the alarm lands between
+# 45 and 50 minutes into a silence. The steady read is the agents
+# registry, the open runs, the open alarms and each actor's queue; a
+# session's events are read only for an actor that holds work or has an
+# open alarm.
+#
+# NOT CHANGED HERE: the agent-run 4 h died bound
+# (agent-run-dies-when-building-is-silent). It is held equal to twice the
+# building step's duration by platform_bundle_agent_run.rs, and a silent
+# factory's runs are a different judgement from a slow build; the
+# failover — releasing a silent factory's claims — is the conductor's
+# act on a read of this alarm.
+[[rule]]
+name = "a-silent-factory-holding-claimed-work-is-alarmed"
+why = """
+A TIMER over an ABSENCE, the standing exemption: the condition is writes
+that did NOT land, and no event says "forty-five minutes passed and the
+factory holding claimed builds wrote nothing". A Workflow can say who a
+step is for; it cannot notice that its holder has stopped at a model
+limit. Measured 2026-10-28 (backlog 628dc540): agent-codex was down
+about 12.5 h and then about 1.7 h with claimed work and nothing fired.
+It routes nothing and refuses nothing: one firing files ONE urgent alarm
+per silent actor, naming the actor, the silence, its last note and what
+it holds, owned by the platform owner and assigned to nobody — never to
+the actor that stopped. The open alarm holds the next tick, and the
+actor's next write on the session withdraws it.
+"""
+version = 1
+schedule = { cadence = "every-5-minutes", anchor_date = "2026-10-29" }
+[[rule.do]]
+handler = "jobs.silent_session_watch"
+args = { silent_minutes = "45", ignore_key_prefixes = "\"factory_restart_,factory_turn\"", restart_key_prefixes = "\"factory_restart_\"" }

@@ -4,8 +4,8 @@
 // David, 2026-09-26, answering 6a123f1f ("agents on the People
 // roster?"): "No, Agents can go under a page in the IT department." So
 // an agent is never a People row and never headcount, and this is where
-// the roster of agents is read. It is the DIRECTORY; the Crew Board (the
-// Department Map's shop-floor station) is live activity, and stays so.
+// the roster of agents is read. It is the DIRECTORY; live activity is
+// the Department Map's shop-floor station.
 //
 // READ-ONLY. Writes to the registry stay where they are: `boss tenant
 // publish` through `POST /api/agents/batch`, which the gateway does not
@@ -25,7 +25,6 @@
 // — the rule `data/remote.ts` exists for.
 
 import { fetchRemote, type Remote } from '../../data/remote';
-import { parseRunRecords, type RunRecord } from '../crew/crew';
 
 const str = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null);
 const num = (v: unknown): number | null =>
@@ -52,8 +51,14 @@ export type Agent = Readonly<{
   department: string | null;
   /// The model a run uses when it does not say, as the rate card spells it.
   defaultModel: string | null;
+  /// The model CLASS the row records — the `<class>` of an active
+  /// `robots:<class>` pool, what a `model:<class>` step admits it by
+  /// (backlog 06d8988b) — or null: records none, never read off the model.
+  modelClass: string | null;
   hourlyBudgetUsdMicros: number | null;
-  maxConcurrentRuns: number | null;
+  // No concurrency cap: the row's `max_concurrent_runs` bounds nothing
+  // since backlog 3e927996 — a robot is bounded by its `robots:<model>`
+  // pool alone — so the page does not show it as a limit.
 }>;
 
 export function parseAgents(raw: unknown): ReadonlyArray<Agent> {
@@ -67,20 +72,83 @@ export function parseAgents(raw: unknown): ReadonlyArray<Agent> {
       role: str(r.role),
       department: str(r.department),
       defaultModel: str(r.default_model),
+      modelClass: str(r.model_class),
       hourlyBudgetUsdMicros: num(r.hourly_budget_usd_micros),
-      maxConcurrentRuns: num(r.max_concurrent_runs),
     }))
     .filter((a) => a.id !== '');
+}
+
+// ---------------------------------------------------------------------
+// The finish record — `GET /api/agent-runs` (backlog 5082a08b). Moved
+// here from the retired Crew Board's read model (backlog 462fb22a), whose
+// only live readers were this page's.
+// ---------------------------------------------------------------------
+
+/// One row of `agent_runs`: a run that reached a terminal, with what it
+/// cost. `boss dispatch --report` writes it, keyed by the agent-run
+/// packet's id, and ONLY at a terminal — the row is insert-once
+/// (8f1de7bf) — so an OPEN run has no cost to show yet, and this is a
+/// list of finished runs rather than a column on the open ones.
+///
+/// Two limits of the record ride on the rows rather than being papered
+/// over: rows before the effort instrumentation carry no `effort`
+/// (fd5ce137's era boundary), and rows before 65c9c05a carry no branch.
+/// Each renders as not recorded, never as a guess.
+export type RunRecord = Readonly<{
+  runId: string;
+  actor: string | null;
+  model: string | null;
+  outcome: string | null;
+  finishedAt: string | null;
+  /// Wall-clock minutes, start to finish; `null` without both stamps.
+  minutes: number | null;
+  tokens: number | null;
+  /// Priced cost in micro-dollars; `null` is UNPRICED, never free.
+  usdMicros: number | null;
+  branch: string | null;
+  packet: string | null;
+  effort: string | null;
+}>;
+
+export function parseRunRecords(raw: unknown): ReadonlyArray<RunRecord> {
+  return rows(raw)
+    .map((r) => {
+      const detail = (r.detail && typeof r.detail === 'object' ? r.detail : {}) as Record<
+        string,
+        unknown
+      >;
+      const started = Date.parse(str(r.started_at) ?? '');
+      const finished = Date.parse(str(r.finished_at) ?? '');
+      return {
+        runId: str(r.run_id) ?? '',
+        actor: str(r.actor_id),
+        model: str(r.model),
+        outcome: str(r.outcome),
+        finishedAt: str(r.finished_at),
+        minutes:
+          Number.isFinite(started) && Number.isFinite(finished)
+            ? Math.round((finished - started) / 60_000)
+            : null,
+        tokens: num(r.total_tokens),
+        usdMicros: num(r.usd_micros),
+        branch: str(r.branch),
+        packet: str(r.job_id),
+        effort: str(detail.effort),
+      };
+    })
+    .filter((r) => r.runId !== '');
+}
+
+/// A run's cost as the page prints it. Unpriced is said in words: a
+/// `$0.00` for a run nobody priced would read as a free one.
+export function costText(r: RunRecord): string {
+  return r.usdMicros === null ? 'not priced' : `$${(r.usdMicros / 1_000_000).toFixed(2)}`;
 }
 
 export const NOT_DECLARED = 'not declared';
 
 export function budgetText(micros: number | null): string {
   return micros === null ? NOT_DECLARED : `$${(micros / 1_000_000).toFixed(2)} an hour`;
-}
-
-export function capText(n: number | null): string {
-  return n === null ? NOT_DECLARED : String(n);
 }
 
 /// The efforts an agent's runs in the window ran at, most-run first:

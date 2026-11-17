@@ -15,7 +15,8 @@
 //! WHAT IS VERIFIED, AND WHAT IS NOT. The caller presents, in [`HEADER`],
 //! a Kubernetes ServiceAccount token projected for ONE audience that is
 //! not the cluster's own. The door checks, in this order: RS256 and
-//! nothing else; a signing key the trusted key set names; the signature;
+//! nothing else; no `crit` header and a `typ`, if any, of JWT (backlog
+//! 3ecb415b); a signing key the trusted key set names; the signature;
 //! then the issuer, the audience (that one and no other), the namespace
 //! and ServiceAccount (the `sub` AND the `kubernetes.io` claim, which must
 //! agree), the expiry, and a lifetime of at most [`MAX_LIFETIME_SECS`].
@@ -121,6 +122,8 @@ pub enum Refusal {
     MultiplePresented,
     Malformed,
     Algorithm,
+    Critical,
+    Type,
     KeysUnavailable,
     UnknownKey,
     WeakKey,
@@ -148,6 +151,10 @@ impl std::fmt::Display for Refusal {
             Refusal::MultiplePresented => "more than one broker-stage token was presented",
             Refusal::Malformed => "the broker-stage token is not a well-formed signed token",
             Refusal::Algorithm => "the broker-stage token is not signed with RS256",
+            Refusal::Critical => {
+                "the broker-stage token names a critical header extension, and this door understands none"
+            }
+            Refusal::Type => "the broker-stage token's header declares a type other than JWT",
             Refusal::KeysUnavailable => "the trusted signing keys are unavailable",
             Refusal::UnknownKey => "the broker-stage token names a signing key that is not trusted",
             Refusal::WeakKey => "the trusted signing key is shorter than 2048 bits",
@@ -415,6 +422,23 @@ pub fn verify(
     let header_json = json(header)?;
     if header_json.get("alg").and_then(Value::as_str) != Some("RS256") {
         return Err(Refusal::Algorithm);
+    }
+    // RFC 7515 §4.1.11: `crit` names extensions a recipient must
+    // understand or refuse, and this door understands none; a
+    // ServiceAccount token carries no `crit` (review of 25fff647, F8).
+    if header_json.get("crit").is_some() {
+        return Err(Refusal::Critical);
+    }
+    // `typ` is optional and a ServiceAccount token omits it; present, it
+    // says JWT (RFC 7519 §5.1; `application/` may be dropped and case
+    // does not count, RFC 7515 §4.1.9). Any other type is another token.
+    if let Some(typ) = header_json.get("typ") {
+        let jwt = typ.as_str().is_some_and(|t| {
+            t.eq_ignore_ascii_case("JWT") || t.eq_ignore_ascii_case("application/jwt")
+        });
+        if !jwt {
+            return Err(Refusal::Type);
+        }
     }
     let kid = header_json
         .get("kid")

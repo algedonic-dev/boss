@@ -27,9 +27,10 @@
 // holds for `standing`: null draws no marks at all, where a real zero
 // draws an empty track.
 //
-// Everything here is pure arithmetic over the layout in world.ts, so a
-// platform that lies fails world-interior.test.ts before it is a
-// picture. WorldMap.svelte owns the strokes.
+// Pure functions, so a platform that lies fails world-interior.test.ts
+// before it is a picture. Where the platforms went inside a territory's
+// outline (`platformLayout`) retired with the world map (R3 of the
+// transit-map retirement, backlog 23a4b4d7); the queue boards draw them.
 
 import {
   AGE_THRESHOLDS,
@@ -39,10 +40,7 @@ import {
   type InboundRow,
 } from '../receiving/receiving';
 import type { Place } from './regions';
-import type { Actor } from './shop-floor';
 import type { Siding } from '../marshalling/marshalling';
-import { contentsBox, overflowNoteAt, type NoteAt } from './region-contents';
-import type { Territory } from './world';
 
 /** Which standing packets are flagged, and from which end of the
  *  queue: the oldest stand at the HEAD (receiving's age bands), the
@@ -82,21 +80,14 @@ export type Deck =
       kind: 'ready';
       region: string;
       platforms: ReadonlyArray<Platform>;
-      /** THE SHOP FLOOR'S ACTORS (design 62de32ae, decision 8): a lamp
-       *  per session and per run, under the identity they share
-       *  (shop-floor.ts). The shop floor hands these up in place of
-       *  platforms, and the region map draws them instead. */
-      actors?: ReadonlyArray<Actor>;
     }>;
 
 /** The regions whose interior is platforms rather than wagons in
  *  transit. The other six are region-contents.ts's INTERIOR_REGIONS.
  *  The shop floor joined them on backlog 94c6ffd0 as a platform per
- *  crew; since decision 8 of design 62de32ae its deck carries ACTORS
- *  instead (shop-floor.ts) — a lamp per session and per run, labelled,
- *  because anonymous marks on a crew's track could not say which run
- *  was building what. It stays in this list because its board mounts
- *  under the map the same way the queue boards do. */
+ *  crew. Its actor deck (design 62de32ae, decision 8) went with the
+ *  Crew Board (backlog 462fb22a); it stays in this list because its
+ *  board mounts under the map the same way the queue boards do. */
 export const PLATFORM_REGIONS: ReadonlyArray<string> = ['receiving', 'marshalling', 'shop-floor'];
 
 export function hasPlatforms(region: string): boolean {
@@ -114,7 +105,6 @@ export function marshallingPlatforms(
   windowHours: number,
 ): ReadonlyArray<Platform> {
   return sidings.map((s): Platform => {
-    const over = s.wipLimit !== null && s.depth > s.wipLimit ? s.depth - s.wipLimit : 0;
     const oldest = s.oldestAgeDays === null ? null : `oldest ${s.oldestAgeDays} d`;
     const rate = s.flow.kind === 'counted' ? s.flow.served : null;
     const left =
@@ -125,9 +115,9 @@ export function marshallingPlatforms(
       key: s.station,
       name: s.station,
       standing: s.depth,
-      bound: s.wipLimit,
+      bound: null,
       rate,
-      flag: { from: 'tail', n: over },
+      flag: { from: 'tail', n: 0 },
       note: [oldest, left].filter((p) => p !== null).join(' · '),
     };
   });
@@ -203,104 +193,4 @@ export function receivingPlatforms(
   return [...platforms].sort(
     (a, b) => b.flag.n - a.flag.n || (b.standing ?? 0) - (a.standing ?? 0) || a.name.localeCompare(b.name),
   );
-}
-
-// ---------------------------------------------------------------------
-// Where the platforms go inside the outline.
-// ---------------------------------------------------------------------
-
-/** One standing packet, placed. */
-export type PlacedMark = Readonly<{ x: number; y: number; w: number; h: number; flagged: boolean }>;
-
-export type PlacedPlatform = Readonly<{
-  platform: Platform;
-  /** The platform's own block, inside the territory's rect. */
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  /** The track the marks stand on. */
-  trackY: number;
-  marks: ReadonlyArray<PlacedMark>;
-  /** Packets the track had no room for — counted, never dropped. */
-  overflow: number;
-  /** How many packets each mark stands for. 1 when the whole queue
-   *  fits; more when it does not, and the renderer says so — a track
-   *  of 18 marks under a count of 30 is a scale, not a miscount. */
-  perMark: number;
-  /** Where the bound falls along the track, or null when the queue is
-   *  no longer than its bound: a marker at the very end would say
-   *  nothing, and one past it would be a guess about where. */
-  boundX: number | null;
-}>;
-
-/** A platform: a name line, then the track its packets stand on. */
-const PLATFORM_H = 24;
-const LABEL_H = 11;
-const MARK_W = 4;
-const MARK_H = 8;
-const MARK_GAP = 2;
-/** Room kept at the right of every track for the rate figure, so a
- *  full queue's marks never run under the number beside them. */
-const RATE_W = 26;
-
-/** Stack the platforms under the territory's zoomed header. What does
- *  not fit is COUNTED at both levels — platforms past the rect's room,
- *  and marks past the track's — because a region that drew a tidy
- *  subset would read as a quiet one. */
-export function platformLayout(
-  t: Territory,
-  platforms: ReadonlyArray<Platform>,
-): Readonly<{ placed: ReadonlyArray<PlacedPlatform>; hidden: number; note: NoteAt }> {
-  // The room the region's contents may use — head off the top, edge
-  // and MACHINERY STRIP off the bottom. One definition, once shared
-  // with the wagon plates' `interiorLayout` (backlog 3a916816; deleted,
-  // fe77a1d2 car 3): this divided the same canvas
-  // without the strip's term, so a platform row and a machine glyph
-  // could be placed in the same pixels.
-  const box = contentsBox(t, PLATFORM_H);
-  const w = box.w;
-  const rows = Math.max(1, Math.floor(box.h / PLATFORM_H));
-  const per = Math.max(1, Math.floor((w - RATE_W + MARK_GAP) / (MARK_W + MARK_GAP)));
-  const placed = platforms.slice(0, rows).map((platform, i): PlacedPlatform => {
-    const y = box.y + i * PLATFORM_H;
-    const trackY = y + LABEL_H;
-    const standing = platform.standing ?? 0;
-    const drawn = Math.min(standing, per);
-    // A queue longer than the track is drawn as the WHOLE queue at a
-    // scale: each mark stands for `perMark` packets, so the bound and
-    // the packets past it stay where they belong in the queue. Marks
-    // that simply stopped at the track's end would put a 24-deep bound
-    // off the picture exactly when it matters — a 30-deep station over
-    // its limit would draw no bound at all.
-    const perMark = drawn === 0 ? 1 : standing / drawn;
-    const trackLen = drawn === 0 ? 0 : drawn * (MARK_W + MARK_GAP) - MARK_GAP;
-    const marks = Array.from({ length: drawn }, (_, k): PlacedMark => ({
-      x: box.x + k * (MARK_W + MARK_GAP),
-      y: trackY,
-      w: MARK_W,
-      h: MARK_H,
-      flagged:
-        platform.flag.from === 'head'
-          ? k * perMark < platform.flag.n
-          : (k + 1) * perMark > standing - platform.flag.n,
-    }));
-    const bound = platform.bound;
-    return {
-      platform,
-      x: box.x,
-      y,
-      w,
-      h: PLATFORM_H,
-      trackY,
-      marks,
-      overflow: standing - drawn,
-      perMark,
-      boundX:
-        bound !== null && bound > 0 && bound < standing
-          ? box.x + (bound / standing) * trackLen
-          : null,
-    };
-  });
-  return { placed, hidden: Math.max(0, platforms.length - placed.length), note: overflowNoteAt(box) };
 }

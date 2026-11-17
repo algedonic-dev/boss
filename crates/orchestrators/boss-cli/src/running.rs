@@ -22,7 +22,7 @@
 //! "deployed" in conversation:
 //!
 //!   MERGED    the forge's main carries it            (`boss merged`)
-//!   DEPLOYED  a release directory exists and `current` points at it
+//!   DEPLOYED  the latest cluster converge records its applied generation
 //!   RUNNING   the process serving requests was built from it
 //!
 //! They are routinely different, and the gap between the last two is
@@ -30,7 +30,9 @@
 //! production. This verb reports all three side by side so the gap is
 //! visible rather than assumed.
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
+use serde_json::Value;
+use std::time::Duration;
 
 /// What the three layers say. `None` everywhere means "could not read",
 /// never "absent" — the same fail-closed rule the gate's concurrency
@@ -39,11 +41,11 @@ use anyhow::Result;
 pub struct Generations {
     /// The forge's main, via ls-remote. The merge authority.
     pub main: Option<String>,
-    /// What `/usr/local/boss/current` resolves to on the deploy host.
+    /// The latest cluster converge's rolled or unchanged image generation.
     pub deployed: Option<String>,
     /// The commit the live jobs API reports serving, from
     /// `capabilities.commit`. This is the only one that describes a
-    /// PROCESS rather than a filesystem.
+    /// PROCESS rather than a recorded deployment.
     pub running: Option<String>,
 }
 
@@ -52,8 +54,8 @@ pub struct Generations {
 pub enum Alignment {
     /// All three agree — the ordinary steady state.
     Aligned,
-    /// Deployed matches main but the process predates it. The pods have
-    /// not rolled; anything built into the binary (StepType registry,
+    /// The deployment record and serving build differ. The pods may not
+    /// have rolled; anything built into the binary (StepType registry,
     /// embedded seeds) is still the OLD value even though the file is
     /// on disk.
     NotRolled,
@@ -97,7 +99,7 @@ fn same_commit(a: &str, b: &str) -> bool {
 pub fn align(g: &Generations) -> Alignment {
     let (Some(main), Some(dep)) = (&g.main, &g.deployed) else {
         return Alignment::Unknown(
-            "could not read main or the deployed release — an unread layer is \
+            "could not read main or the latest cluster converge record — an unread layer is \
              not an aligned one"
                 .into(),
         );
@@ -119,38 +121,119 @@ pub fn align(g: &Generations) -> Alignment {
     Alignment::Aligned
 }
 
-fn sh(args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(args[0])
-        .args(&args[1..])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!s.is_empty()).then_some(s)
+fn commit(value: &Value) -> Result<String> {
+    let text = value.as_str().context("missing commit")?;
+    ensure!(
+        (7..=64).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid commit {text:?}"
+    );
+    Ok(text.to_owned())
 }
 
-/// Read `capabilities.commit` out of the live jobs API health endpoint.
-/// Hand-parsed rather than pulling a JSON dependency into a read that
-/// must not fail for its own reasons.
-fn running_commit(jobs_url: &str) -> Option<String> {
-    let body = sh(&[
-        "curl",
-        "-s",
-        "-m",
-        "20",
-        &format!("{jobs_url}/api/jobs/health"),
-    ])?;
-    let idx = body.find("\"commit\"")?;
-    let rest = &body[idx + 8..];
-    let start = rest.find('"')? + 1;
-    let end = rest[start..].find('"')? + start;
-    let v = rest[start..end].to_string();
-    (!v.is_empty()).then_some(v)
+struct Deployment {
+    head: String,
+    packet: String,
+    at: String,
 }
 
-pub fn run(clone: Option<String>, remote: Option<String>, jobs_url: Option<String>) -> Result<()> {
+// Ask for the latest record, never a successful older one: an open or failed
+// attempt without deployment evidence must not inherit a previous green.
+fn deployed_from_record(body: &Value) -> Result<Deployment> {
+    ensure!(
+        body["full"] == true && body["limit"] == 1 && body["offset"] == 0,
+        "latest converge read did not return a full first-row envelope"
+    );
+    let rows = body["data"].as_array().context("converge rows missing")?;
+    ensure!(
+        rows.len() == 1 && body["total"].as_u64().is_some_and(|n| n >= 1),
+        "latest converge record is absent or ambiguous"
+    );
+    let job = &rows[0];
+    ensure!(
+        job["kind"] == "maintenance-cluster-converge",
+        "latest record is not a cluster converge"
+    );
+    ensure!(
+        matches!(job["status"].as_str(), Some("open" | "closed")),
+        "invalid converge packet status"
+    );
+    let packet = job["id"].as_str().context("converge packet id missing")?;
+    uuid::Uuid::parse_str(packet).context("invalid converge packet id")?;
+    let opened = job["opened_at"]
+        .as_str()
+        .context("converge opening time missing")?;
+    let opened_at =
+        chrono::DateTime::parse_from_rfc3339(opened).context("invalid converge opening time")?;
+    let steps = job["steps"].as_array().context("converge steps missing")?;
+    let mut runs = steps.iter().filter(|s| s["spec_slug"] == "run");
+    let run = runs.next().context("converge run step missing")?;
+    ensure!(runs.next().is_none(), "ambiguous converge run step");
+    let metadata = &run["metadata"];
+    let (head, at) = if metadata.get("rolled").is_some() {
+        ensure!(
+            matches!(run["status"].as_str(), Some("active" | "completed")),
+            "converge roll is not recorded on an active or completed run"
+        );
+        let head = commit(&metadata["rolled"])?;
+        let at = metadata["rolled_at"]
+            .as_str()
+            .context("converge roll time missing")?;
+        ensure!(
+            chrono::DateTime::parse_from_rfc3339(at).context("invalid converge roll time")?
+                >= opened_at,
+            "converge roll predates its packet"
+        );
+        (head, at)
+    } else {
+        ensure!(
+            job["status"] == "closed" && run["status"] == "completed" && metadata["result"] == "ok",
+            "latest converge has not recorded a roll or a successful unchanged check"
+        );
+        (commit(&metadata["unchanged"])?, opened)
+    };
+    Ok(Deployment {
+        head,
+        packet: packet.to_owned(),
+        at: at.to_owned(),
+    })
+}
+
+async fn merged_commit(clone: &str, remote: &str) -> Result<String> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::process::Command::new("git")
+            .args(["-C", clone, "ls-remote", remote, "refs/heads/main"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("git ls-remote timed out after 20s")??;
+    ensure!(
+        output.status.success(),
+        "git ls-remote failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let head =
+        crate::receipt::exact_ref_head(&String::from_utf8_lossy(&output.stdout), "refs/heads/main")
+            .context("git ls-remote did not name exactly refs/heads/main")?;
+    commit(&Value::String(head))
+}
+
+async fn read_json(
+    http: &crate::machine_http::MachineClient,
+    base: &str,
+    path: &str,
+) -> Result<Value> {
+    crate::sor_client::api_at(http, base, reqwest::Method::GET, path, None)
+        .await?
+        .context("read returned no JSON body")
+}
+
+pub async fn run(
+    clone: Option<String>,
+    remote: Option<String>,
+    jobs_url: Option<String>,
+) -> Result<()> {
     let clone = clone.unwrap_or_else(|| ".".to_string());
     let remote = remote.unwrap_or_else(|| "origin".to_string());
     // No default (backlog 6cf47547): the literal fallback here was the
@@ -161,30 +244,53 @@ pub fn run(clone: Option<String>, remote: Option<String>, jobs_url: Option<Strin
     let jobs_url = crate::sor_client::resolve_jobs_base(jobs_url.as_deref())?;
     let jobs_url = jobs_url.trim_end_matches('/');
 
+    let http = crate::sor_client::machine_client_with(
+        reqwest::Client::builder().timeout(Duration::from_secs(20)),
+    )?;
+    let (main, deployment, running) = tokio::join!(
+        merged_commit(&clone, &remote),
+        read_json(
+            &http,
+            jobs_url,
+            "/api/jobs?kind=maintenance-cluster-converge&full=true&limit=1"
+        ),
+        read_json(&http, jobs_url, "/api/jobs/health"),
+    );
+    let deployment = deployment.and_then(|body| deployed_from_record(&body));
+    let running = running.and_then(|body| commit(&body["capabilities"]["commit"]));
     let g = Generations {
-        main: sh(&["git", "-C", &clone, "ls-remote", &remote, "refs/heads/main"])
-            .and_then(|s| s.split_whitespace().next().map(str::to_string)),
-        deployed: sh(&["readlink", "/usr/local/boss/current"])
-            .map(|s| s.rsplit('/').next().unwrap_or(&s).to_string()),
-        running: running_commit(jobs_url),
+        main: main.as_ref().ok().cloned(),
+        deployed: deployment.as_ref().ok().map(|d| d.head.clone()),
+        running: running.as_ref().ok().cloned(),
     };
 
     println!("boss running:");
     println!("  merged   main({remote})  {}", short(&g.main));
-    println!("  deployed current         {}", short(&g.deployed));
+    println!("  deployed cluster record  {}", short(&g.deployed));
     println!("  running  jobs api        {}", short(&g.running));
+    if let Ok(record) = &deployment {
+        println!("  deployment record {} at {}", record.packet, record.at);
+    }
+    if let Err(error) = main {
+        println!("  merged unread: clone {clone:?}, remote {remote:?}: {error:#}");
+    }
+    if let Err(error) = deployment {
+        println!("  cluster converge unread: {error:#}");
+    }
+    if let Err(error) = running {
+        println!("  running unread at {jobs_url}/api/jobs/health: {error:#}");
+    }
     match align(&g) {
-        Alignment::Aligned => println!("  ALIGNED — all three agree"),
+        Alignment::Aligned => {
+            println!("  ALIGNED — main, recorded cluster generation and serving build agree")
+        }
         Alignment::NotRolled => println!(
-            "  NOT ROLLED — the release is on disk but the process predates it. \n\
-             \x20   Anything compiled INTO the binary (the StepType registry, embedded \n\
-             \x20   seeds) is still the old value. Proving against the tree here records \n\
-             \x20   something true about the files and false about production."
+            "  NOT ROLLED — the recorded cluster generation and serving build differ. \n\
+             \x20   Read the deployment record and live health before proving this change."
         ),
-        Alignment::NotDeployed => println!(
-            "  NOT DEPLOYED — main has moved past the deploy host. The merge \n\
-             \x20   landed; nothing is serving it yet."
-        ),
+        Alignment::NotDeployed => {
+            println!("  NOT DEPLOYED — the recorded cluster generation differs from main.")
+        }
         Alignment::Unknown(why) => println!("  UNKNOWN — {why}"),
     }
     Ok(())
@@ -322,12 +428,12 @@ pub enum Cmd {
     },
 }
 
-pub fn dispatch(cmd: Cmd) -> Result<()> {
+pub async fn dispatch(cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Running {
             clone,
             remote,
             jobs_url,
-        } => run(clone, remote, jobs_url),
+        } => run(clone, remote, jobs_url).await,
     }
 }

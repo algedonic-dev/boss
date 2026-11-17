@@ -17,6 +17,7 @@ use boss_core::actor::ActorId;
 use boss_core::agent::AgentCaps;
 use boss_core::event::Event;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use chrono::{DateTime, Utc};
 
@@ -36,6 +37,12 @@ pub struct InMemoryAgentRuns {
     events: RwLock<Vec<Event>>,
     /// run id -> its work profile; the `agent_run_profiles` table.
     profiles: RwLock<HashMap<String, RunProfile>>,
+    /// packet id -> `jobs.kind`, the one column of the jobs table the
+    /// per-protocol reading reads (backlog 05bf580b).
+    job_kinds: HashMap<Uuid, String>,
+    /// When set, the jobs read fails as a dark table would — so a test
+    /// can ask what a failed read answers.
+    jobs_unreadable: bool,
 }
 
 impl InMemoryAgentRuns {
@@ -46,7 +53,22 @@ impl InMemoryAgentRuns {
             runs: RwLock::new(HashMap::new()),
             events: RwLock::new(Vec::new()),
             profiles: RwLock::new(HashMap::new()),
+            job_kinds: HashMap::new(),
+            jobs_unreadable: false,
         }
+    }
+
+    /// Hold packet `job_id` as a packet of workflow `kind` — a `jobs`
+    /// row, as far as this log reads one.
+    pub fn with_job_kind(mut self, job_id: Uuid, kind: &str) -> Self {
+        self.job_kinds.insert(job_id, kind.to_string());
+        self
+    }
+
+    /// Make the jobs read fail, as a storage error.
+    pub fn with_unreadable_jobs(mut self) -> Self {
+        self.jobs_unreadable = true;
+        self
     }
 
     /// Register `agent_id` with the model its runs take when a report
@@ -57,9 +79,8 @@ impl InMemoryAgentRuns {
         self.with_budgeted_agent(agent_id, default_model, AgentCaps::default())
     }
 
-    /// Register `agent_id` with its default model and the caps its row
-    /// declares (`agents.hourly_budget_usd_micros`,
-    /// `agents.max_concurrent_runs`).
+    /// Register `agent_id` with its default model and the cap its row
+    /// declares (`agents.hourly_budget_usd_micros`).
     pub fn with_budgeted_agent(
         mut self,
         agent_id: &str,
@@ -181,6 +202,18 @@ impl AgentRunLog for InMemoryAgentRuns {
             ..filter.clone()
         };
         Ok(self.list_runs(&every).await?.len() as u64)
+    }
+
+    async fn job_kinds(&self, job_ids: &[Uuid]) -> Result<HashMap<Uuid, String>, AgentRunError> {
+        if self.jobs_unreadable {
+            return Err(AgentRunError::Storage(
+                "the jobs table could not be read (in-memory fault)".into(),
+            ));
+        }
+        Ok(job_ids
+            .iter()
+            .filter_map(|id| self.job_kinds.get(id).map(|k| (*id, k.clone())))
+            .collect())
     }
 
     async fn rate_card(&self) -> Result<Vec<RateCardRow>, AgentRunError> {

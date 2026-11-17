@@ -1,0 +1,7 @@
+# backlog-item's build step names its executor by model class (design
+# ccfe87ff pass item 1, backlog 446ab559). A TIMING hold (backlog a4b57aca
+# kept these when it retired the default holds): the row must wait for what
+# it names to read back live.
+drift_publish = "held"
+lifts = 'backlog 446ab559 (design ccfe87ff pass item 1): once GET /api/agents reads back agent-claude and agent-claude-b recording model_class opus, the deliberate publish of this row, then a car that deletes this file.'
+why = '''The build step declares executor model:opus|sol (model:opus from 2026-11-05 until David widened it on 2026-11-08, backlog b89af803), so the claim door admits and the dispatcher nominates only a robot whose agents row records one of those classes. On 2026-11-05 GET /api/agents answered all three robots with model_class null, and against that roster every build admitted under this version is nominated to nobody and refused at every claim. The classes are tenant data (seeds/agents.toml through the agents batch door) and must read back live before this row is published; an unattended drift publish after a converge would not wait for them.'''

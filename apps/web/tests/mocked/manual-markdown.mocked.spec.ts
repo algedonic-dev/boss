@@ -9,7 +9,7 @@ async function readBody(page: Page, body: string): Promise<void> {
     title: 'Welcome', body, audience: { all: true }, current_version: 1,
     published: true, created_at: '2026-09-16T12:00:00Z', updated_at: '2026-09-16T12:00:00Z',
   };
-  await page.route(/\/api\/content\/manual$/, (r) => r.fulfill({ json: [section] }));
+  await page.route(/\/api\/content\/manual-index$/, (r) => r.fulfill({ json: [section] }));
   await page.route(/\/api\/content\/manual\/welcome$/, (r) => r.fulfill({ json: section }));
   await page.route(/\/api\/people\/emp-001$/, (r) => r.fulfill({ json: { id: 'emp-001', name: 'Rhea <HR>' } }));
   await mountPage(page, '/ux/manual/welcome', { titleMatch: /Company manual/ });

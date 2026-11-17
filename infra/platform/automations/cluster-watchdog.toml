@@ -13,3 +13,5 @@
 id = "automation:cluster-watchdog"
 role = "platform-admin"
 description = 'The cluster watchdog and every forge script that files an alert without naming itself: it finds the platform owner and files an urgent alert item (infra/forge/alert-lib.sh).'
+# Host station: estate (backlog 6ecb5480, station-tree.md section 6).
+station = "134464a5-0b56-4386-86cb-d354c7448fdf"

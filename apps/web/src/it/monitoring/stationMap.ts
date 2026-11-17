@@ -12,10 +12,7 @@ import {
 } from '@boss/web-kit/ui/packet-card';
 import {
   isSim,
-  upstreamButton,
   type JobLite,
-  type StationUpstream,
-  type UpstreamButton,
 } from '../yard/yard';
 
 // The registry row as `GET /api/stations` serializes it (StationSpec
@@ -27,7 +24,6 @@ export type StationRow = Readonly<{
   title: string;
   kind: string;
   discipline?: readonly string[];
-  wip_limit?: number | null;
   rollup_parent?: string | null;
 }>;
 
@@ -39,7 +35,6 @@ export type StationNode = Readonly<{
   kind: string;
   hue: string;
   discipline: string;
-  wipLimit: number | null;
   depth: number | null;
   /// Days since the oldest waiting packet was opened, or null when the
   /// station holds nothing. THE SORT KEY, per flow-board Q2: depth
@@ -47,7 +42,6 @@ export type StationNode = Readonly<{
   /// read exactly 48 on 2026-08-17 and none was a bottleneck, they
   /// were a bug — while nine days waiting is neglect at any volume.
   oldestAgeDays: number | null;
-  overLimit: boolean;
   /// Packets this station's predicate CANNOT see — absent from the
   /// depth beside it rather than deprioritised, because a projected
   /// key never reached their step (backlog abda9ab4). `depth +
@@ -70,16 +64,8 @@ export type MapState =
 export type StationQueueView = Readonly<{
   station: string;
   discipline: string;
-  wipLimit: number | null;
-  overLimit: boolean;
   total: number;
   cards: readonly PacketCardData[];
-  /// The walk upstream, when the registry row declares one. Same
-  /// affordance the yard's dock renders, from the same envelope field
-  /// and the same mapper — a node that reads shallower than expected
-  /// is diagnosed one click upstream, and the map is where an operator
-  /// notices the depth.
-  upstream: UpstreamButton | null;
 }>;
 
 /// The ratified default discipline, phrased the way the doc phrases
@@ -96,19 +82,17 @@ export function toStationNode(row: StationRow): StationNode {
     kind: row.kind,
     hue: protocolHue(row.kind),
     discipline: disciplineLabel(row.discipline),
-    wipLimit: row.wip_limit ?? null,
     depth: null,
     oldestAgeDays: null,
-    overLimit: false,
     unreachable: null,
   };
 }
 
 export function withDepth(
   node: StationNode,
-  queue: Readonly<{ total: number; over_limit: boolean }>,
+  queue: Readonly<{ total: number }>,
 ): StationNode {
-  return { ...node, depth: queue.total, overLimit: queue.over_limit };
+  return { ...node, depth: queue.total };
 }
 
 /// Pure classification of the `GET /api/stations` answer. 404 and 503
@@ -147,9 +131,6 @@ export function queueViewFromBody(body: unknown): StationQueueView | null {
   const e = body as {
     station?: unknown;
     discipline?: readonly string[];
-    wip_limit?: number | null;
-    over_limit?: unknown;
-    upstream?: StationUpstream | null;
     total?: unknown;
     data?: unknown;
   };
@@ -158,11 +139,8 @@ export function queueViewFromBody(body: unknown): StationQueueView | null {
   return {
     station: e.station,
     discipline: disciplineLabel(e.discipline),
-    wipLimit: e.wip_limit ?? null,
-    overLimit: e.over_limit === true,
     total: typeof e.total === 'number' ? e.total : jobs.length,
     cards: jobs.map(toQueueCard),
-    upstream: upstreamButton(e.upstream),
   };
 }
 
@@ -184,7 +162,6 @@ export async function fetchStations(): Promise<MapState> {
 export type StationLoad = Readonly<{
   station: string;
   depth: number;
-  over_limit: boolean;
   oldest_age_days: number | null;
   /// See `StationNode.unreachable`. Optional because a server that
   /// predates it sends nothing, and an absent field must read as "not
@@ -213,7 +190,6 @@ export function withLoad(
       ? {
           ...n,
           depth: r.depth,
-          overLimit: r.over_limit,
           oldestAgeDays: r.oldest_age_days,
           unreachable: typeof r.unreachable === 'number' ? r.unreachable : null,
         }

@@ -1,8 +1,7 @@
 # boss-web
 
-Svelte 5 + Runes frontend for BOSS. Shipped 2026-04-23 via the
-four-phase Svelte migration; replaces the earlier React app.
-Bundled by Bun + `bun-plugin-svelte`.
+Svelte 5 + Runes frontend for BOSS, bundled by Bun +
+`bun-plugin-svelte`.
 
 ## Dev loop
 

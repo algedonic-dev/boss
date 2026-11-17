@@ -140,6 +140,7 @@ impl Fixture {
         for lib in [
             "git-answer.sh",
             "trunk-ref.sh",
+            "public-mirror.sh",
             "pattern-scan.sh",
             "scanned.sh",
             "allowlist.sh",
@@ -263,6 +264,11 @@ exec {} "$@"
             // The fixture has only `main`, and naming it explicitly keeps
             // the test independent of any remote the fixture might grow.
             .env("BOSS_TRUNK_REF", "main")
+            // The public mirror runs this suite with BOSS_TRUNK=none
+            // declared (backlog 2d28df78); beside the ref named above it
+            // is refused as a contradiction, and these cases are about a
+            // checkout that has a trunk.
+            .env_remove("BOSS_TRUNK")
             .env("LINT_GIT_SHIM_BREAK", break_git);
         if !break_git.is_empty() {
             let path = std::env::var("PATH").unwrap_or_default();

@@ -86,7 +86,9 @@ case "$*" in
 esac
 printf '%s\n' "$*" >> "$STUB_ARGV"
 S="$STUB_STATE"
+stdin_enabled=no
 while [ $# -gt 0 ]; do
+    [ "$1" = -i ] && stdin_enabled=yes
     case "$1" in --kubeconfig=/kc) shift; break ;; esac
     shift
 done
@@ -94,6 +96,27 @@ done
 if [ -n "${STUB_FORBIDDEN:-}" ]; then
     echo "Error from server (Forbidden): $2 is forbidden: User \"system:serviceaccount:boss-dev:boss-dev\" cannot get resource \"$2\" in API group \"longhorn.io\"" >&2
     exit 1
+fi
+# Raw deletion must carry the exact UID the plan retained. A replacement
+# created after the final GET is deliberately not the object authorized.
+if [ "$1 $2" = 'delete --raw' ]; then
+    r=${3##*/}; body=""
+    while [ $# -gt 0 ]; do [ "$1" = -f ] && body="$2"; shift; done
+    [ "$body" = - ] && [ "$stdin_enabled" = yes ] || {
+        echo 'container delete requires docker -i and -f -; host files are not mounted' >&2
+        exit 1
+    }
+    cat > "$S/delete-options.json"
+    body="$S/delete-options.json"
+    if [ -n "${STUB_RECREATE_ON_DELETE:-}" ]; then
+        jq --arg r "$r" 'map(if .metadata.name==$r then .metadata.uid="replacement-uid" else . end)' "$S/replicas.json" > "$S/r.new"
+        mv "$S/r.new" "$S/replicas.json"
+    fi
+    uid=$(jq -r '.preconditions.uid' "$body")
+    actual=$(jq -r --arg r "$r" '.[]|select(.metadata.name==$r)|.metadata.uid' "$S/replicas.json")
+    [ "$uid" = "$actual" ] || { echo 'UID precondition failed' >&2; exit 1; }
+    unset STUB_RECREATE_ON_DELETE
+    set -- delete replicas.longhorn.io "$r"
 fi
 reps() { # <jq program> — rewrite the replica list
     jq "$1" "$S/replicas.json" > "$S/replicas.new" && mv "$S/replicas.new" "$S/replicas.json"
@@ -136,6 +159,10 @@ finalize() { # every replica already shown terminating goes
 }
 case "$1 $2" in
 "get volumes.longhorn.io")
+    if [ -n "${STUB_UNREAD_AFTER_DELETE:-}" ] && [ -f "$S/delete-options.json" ]; then
+        echo 'fixture Forbidden: final volume channel unread after delete refusal' >&2
+        exit 1
+    fi
     f="$S/vol-$3.json"
     [ -f "$f" ] || { echo "Error from server (NotFound): volumes.longhorn.io \"$3\" not found" >&2; exit 1; }
     cat "$f"; exit 0 ;;
@@ -148,7 +175,33 @@ case "$1 $2" in
     finalize; exit 0 ;;
 "get nodes.longhorn.io")
     printf '{"apiVersion":"v1","kind":"List","items":%s}\n' "$(cat "$S/lhnodes.json")"; exit 0 ;;
+"get engines.longhorn.io")
+    jq -n --slurpfile v "$S/vol-pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56.json" --slurpfile r "$S/replicas.json" '
+      $v[0] as $v | [$r[0][] | select(.spec.volumeName == $v.metadata.name)] as $r
+      | {kind:"List",items:[{kind:"Engine",metadata:{name:"engine",namespace:"longhorn-system",uid:"engine-uid"},
+          spec:{volumeName:$v.metadata.name,nodeID:$v.spec.nodeID,engineImage:$v.spec.image,
+                replicaAddressMap:($r|map({key:.metadata.name,value:"tcp://fixture"})|from_entries)},
+          status:{currentState:(if $v.status.state == "attached" then "running" else "stopped" end),
+                  replicaModeMap:($r|map({key:.metadata.name,value:"RW"})|from_entries)}}]}'
+    exit 0 ;;
+"get volumeattachments.longhorn.io") cat "$S/attachment.json"; exit 0 ;;
+"get engineimages.longhorn.io")
+    jq -n '{kind:"List",items:[{kind:"EngineImage",metadata:{name:"image",namespace:"longhorn-system",uid:"image-uid"},spec:{image:"longhornio/longhorn-engine:v1.11.3"},status:{state:"deployed",nodeDeploymentMap:{"cp-1":true,"cp-2":true,"cp-3":true}}}]}'
+    exit 0 ;;
+"get pvc")
+    printf '{"kind":"PersistentVolumeClaim","metadata":{"name":"boss-backups","namespace":"boss","uid":"claim-uid"},"spec":{"volumeName":"%s"},"status":{"phase":"Bound"}}\n' 'pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56'
+    exit 0 ;;
+"get pods"|"get jobs"|"get volumeattachments.storage.k8s.io")
+    echo '{"kind":"List","items":[]}' ; exit 0 ;;
+"get cronjobs")
+    cat "$S/cronjobs.json"; exit 0 ;;
+"patch volumeattachments.longhorn.io")
+    p=""; while [ $# -gt 0 ]; do [ "$1" = -p ] && p="$2"; shift; done
+    exec python3 "$S/attachment-patch.py" "$p" "$PPID" ;;
 "patch volumes.longhorn.io")
+    if [ -n "${STUB_HOLD_BEFORE_COUNT_PATCH:-}" ]; then
+        python3 "$S/attachment-patch.py" --hold-count || exit 1
+    fi
     v="$3"; f="$S/vol-$v.json"; p=""
     while [ $# -gt 0 ]; do [ "$1" = -p ] && p="$2"; shift; done
     [ -z "${STUB_PATCH_FAIL:-}" ] || { echo "Error from server: admission webhook \"validator.longhorn.io\" denied the request" >&2; exit 1; }
@@ -178,6 +231,9 @@ case "$1 $2" in
     robust "$v"
     echo "volume.longhorn.io/$v patched"; exit 0 ;;
 "delete replicas.longhorn.io")
+    if [ -n "${STUB_RECREATE_ON_DELETE:-}" ]; then
+        reps "map(if .metadata.name == \"$3\" then .metadata.uid=\"replacement-uid\" else . end)"
+    fi
     r="$3"
     [ -z "${STUB_DELETE_FAIL:-}" ] || { echo "Error from server: deletion refused" >&2; exit 1; }
     row=$(jq -c --arg r "$r" '.[] | select(.metadata.name == $r)' "$S/replicas.json")
@@ -362,6 +418,10 @@ impl Longhorn {
         write_exec(&dir.join("bin/sudo"), STUB);
         write_exec(&dir.join("bin/date"), CLOCK_DATE);
         write_exec(&dir.join("bin/sleep"), CLOCK_SLEEP);
+        write_file(
+            &dir.join("state/attachment-patch.py"),
+            include_str!("fixtures/lower_attachment_transport.py"),
+        );
         let l = Longhorn { dir };
         l.state("clock", "1759341600\n");
         l.volume(volume(4));
@@ -469,7 +529,7 @@ impl Longhorn {
         self.state("lhnodes.json", &n.to_string());
     }
 
-    fn run(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+    fn command(&self, args: &[&str], env: &[(&str, &str)]) -> Command {
         let path = format!(
             "{}:{}",
             self.dir.join("bin").display(),
@@ -493,7 +553,11 @@ impl Longhorn {
         for (k, v) in env {
             c.env(k, v);
         }
-        c.output().expect("the script runs")
+        c
+    }
+
+    fn run(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        self.command(args, env).output().expect("the script runs")
     }
 
     /// Every door call, with the door's prefix cut off.
@@ -554,6 +618,543 @@ fn text(o: &Output) -> String {
         String::from_utf8_lossy(&o.stdout),
         String::from_utf8_lossy(&o.stderr)
     )
+}
+
+// The new lower door must name the copy it spends, rather than letting
+// Longhorn choose one. The legacy retirement door keeps its floor of3.
+#[test]
+fn lower_three_to_two_names_the_replica_and_reads_the_effect() {
+    let l = Longhorn::new("lower_three_to_two");
+    lower_estate(&l);
+    let rep = format!("{VOL}-r-7c1934ba");
+    let p = l.run(&["--lower", "--plan", VOL, &rep], &[]);
+    assert!(p.status.success(), "lower plan: {}", text(&p));
+    let out = text(&p);
+    assert!(out.contains("plan: lower-volume-replicas"), "{out}");
+    assert!(out.contains("3 -> 2"), "{out}");
+    assert!(out.contains("floor is 2"), "{out}");
+    let hash = String::from_utf8_lossy(&p.stderr)
+        .lines()
+        .find_map(|s| s.strip_prefix("plan-sha256: "))
+        .unwrap()
+        .to_owned();
+    let w = l.run(&["--lower", VOL, &rep, &hash], &[]);
+    assert!(w.status.success(), "lower write: {}", text(&w));
+    assert_eq!(l.volume_now()["spec"]["numberOfReplicas"], 2);
+    let writes = l.writes();
+    assert_eq!(writes.len(), 2, "{writes:?}");
+    assert!(writes[0].starts_with("patch volumes.longhorn.io"));
+    assert!(writes[1].starts_with("delete --raw /apis/longhorn.io/v1beta2/"));
+    assert_eq!(
+        l.read_state("delete-options.json")["preconditions"]["uid"],
+        "replica-uid-0"
+    );
+    assert_eq!(
+        l.read_state("delete-options.json")["gracePeriodSeconds"],
+        30
+    );
+    assert!(text(&w).contains("read back: spec.numberOfReplicas=2"));
+    let registry = verb("lower-volume-replicas");
+    assert_eq!(registry["requires_approval"], true);
+    assert_eq!(registry["plan_verb"], "plan-a-volume-replica-lowering");
+    assert_eq!(registry["approvers"], json!(["emp-david"]));
+    assert_eq!(registry["argv"][1], "--lower");
+    assert!(
+        text(&w)
+            .lines()
+            .any(|line| jq_test(registry["effect"].as_str().unwrap(), line))
+    );
+}
+
+#[test]
+fn lower_never_goes_below_two_or_guesses_a_changed_signed_set() {
+    let l = Longhorn::new("lower_floor_two");
+    lower_estate(&l);
+    let mut v = l.volume_now();
+    v["spec"]["numberOfReplicas"] = json!(2);
+    l.volume(v);
+    let mut reps = l.read_state("replicas.json");
+    reps.as_array_mut().unwrap().pop();
+    l.replicas(reps);
+    let rep = format!("{VOL}-r-7c1934ba");
+    let p = l.run(&["--lower", "--plan", VOL, &rep], &[]);
+    assert_eq!(p.status.code(), Some(78), "{}", text(&p));
+    assert!(text(&p).contains("floor"), "{}", text(&p));
+    assert!(l.writes().is_empty());
+}
+
+fn lower_estate(l: &Longhorn) {
+    let mut v = volume(3);
+    v["metadata"]["uid"] = json!("volume-uid");
+    v["metadata"]["resourceVersion"] = json!("1");
+    v["spec"]["image"] = json!("longhornio/longhorn-engine:v1.11.3");
+    l.volume(v);
+    let mut reps = json!([
+        Longhorn::cp("cp-1"),
+        Longhorn::cp("cp-2"),
+        Longhorn::cp("cp-3")
+    ]);
+    for (n, r) in reps.as_array_mut().unwrap().iter_mut().enumerate() {
+        r["metadata"]["uid"] = json!(format!("replica-uid-{n}"));
+    }
+    l.replicas(reps);
+    let mut nodes = estate(None);
+    for n in nodes.as_array_mut().unwrap() {
+        n["metadata"]["uid"] = json!(format!("node-{}", n["metadata"]["name"].as_str().unwrap()));
+    }
+    l.nodes(nodes);
+}
+
+#[test]
+fn lower_helper_boundary_contracts_are_executed_in_the_gate() {
+    let out = Command::new("python3")
+        .arg(repo_root().join("infra/forge/tests/lower-volume-replicas-test.py"))
+        .output()
+        .expect("the lower helper's owning tests run");
+    assert!(out.status.success(), "{}", text(&out));
+}
+
+#[test]
+fn lower_a_recreated_named_replica_is_not_deleted_in_the_last_read_race() {
+    let l = Longhorn::new("lower_recreated_delete");
+    lower_estate(&l);
+    let rep = format!("{VOL}-r-7c1934ba");
+    let p = l.run(&["--lower", "--plan", VOL, &rep], &[]);
+    assert!(p.status.success(), "{}", text(&p));
+    let hash = String::from_utf8_lossy(&p.stderr)
+        .lines()
+        .find_map(|s| s.strip_prefix("plan-sha256: "))
+        .unwrap()
+        .to_owned();
+    let w = l.run(
+        &["--lower", VOL, &rep, &hash],
+        &[("STUB_RECREATE_ON_DELETE", "1")],
+    );
+    assert!(
+        !w.status.success(),
+        "a replacement UID must survive: {}",
+        text(&w)
+    );
+    assert!(
+        l.read_state("replicas.json")
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["metadata"]["uid"] == "replacement-uid")
+    );
+    let snapshot = stopped_snapshot(&w);
+    assert_eq!(snapshot["state"], "observed");
+    assert_eq!(snapshot["volume_uid"], "volume-uid");
+    assert_eq!(snapshot["declared_count"], 2);
+    let replicas = snapshot["replicas"].as_array().unwrap();
+    assert_eq!(
+        replicas.len(),
+        3,
+        "partial count/delete outcome is not settled"
+    );
+    assert!(replicas.iter().any(|r| r["uid"] == "replacement-uid"));
+    assert!(
+        replicas
+            .iter()
+            .all(|r| r["name"].is_string() && r["node"].is_string() && r["disk"].is_string())
+    );
+    assert!(!text(&w).contains("; no effect"));
+}
+
+fn stopped_snapshot(output: &Output) -> Value {
+    let text = text(output);
+    let rows: Vec<_> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("lower-volume-replicas final-observation: "))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "stopped write must retain exactly one final observation: {text}"
+    );
+    serde_json::from_str(rows[0]).unwrap()
+}
+
+#[test]
+fn lower_unread_final_inventory_is_unknown_not_an_empty_or_expected_effect() {
+    let l = Longhorn::new("lower_unread_final");
+    lower_estate(&l);
+    let rep = format!("{VOL}-r-7c1934ba");
+    let plan = l.run(&["--lower", "--plan", VOL, &rep], &[]);
+    assert!(plan.status.success(), "{}", text(&plan));
+    let hash = String::from_utf8_lossy(&plan.stderr)
+        .lines()
+        .find_map(|s| s.strip_prefix("plan-sha256: "))
+        .unwrap()
+        .to_owned();
+    let write = l.run(
+        &["--lower", VOL, &rep, &hash],
+        &[
+            ("STUB_RECREATE_ON_DELETE", "1"),
+            ("STUB_UNREAD_AFTER_DELETE", "1"),
+        ],
+    );
+    assert!(!write.status.success());
+    let snapshot = stopped_snapshot(&write);
+    assert_eq!(snapshot["state"], "UNKNOWN");
+    assert!(snapshot["declared_count"].is_null());
+    assert!(snapshot["replicas"].is_null());
+    assert!(snapshot["error"].is_string());
+    assert!(text(&write).contains("effect UNKNOWN"));
+}
+
+#[test]
+fn lower_detached_uses_owned_frontend_disabled_ticket_and_returns_detached() {
+    let l = Longhorn::new("lower_detached_ticket");
+    lower_detached_estate(&l);
+    let rep = format!("{VOL}-r-7c1934ba");
+    let p = l.run(&["--lower", "--plan", VOL, &rep], &[]);
+    assert!(p.status.success(), "{}", text(&p));
+    let hash = String::from_utf8_lossy(&p.stderr)
+        .lines()
+        .find_map(|s| s.strip_prefix("plan-sha256: "))
+        .unwrap()
+        .to_owned();
+    let w = l.run(&["--lower", VOL, &rep, &hash], &[]);
+    assert!(w.status.success(), "{}", text(&w));
+    assert_eq!(l.volume_now()["status"]["state"], "detached");
+    assert_eq!(l.volume_now()["spec"]["numberOfReplicas"], 2);
+    assert!(
+        l.read_state("attachment.json")["spec"]["attachmentTickets"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    let calls = l.writes().join("\n");
+    assert!(calls.contains("disableFrontend"), "{calls}");
+    assert!(text(&w).contains("maintenance ticket removed and detached/stopped read back"));
+}
+
+fn lower_detached_estate(l: &Longhorn) {
+    lower_estate(l);
+    let mut v = l.volume_now();
+    v["spec"]["nodeID"] = json!("");
+    v["status"]["currentNodeID"] = json!("");
+    v["status"]["state"] = json!("detached");
+    v["status"]["robustness"] = json!("unknown");
+    v["status"]["kubernetesStatus"]["pvcName"] = json!("boss-backups");
+    l.volume(v);
+    let mut reps = l.read_state("replicas.json");
+    for r in reps.as_array_mut().unwrap() {
+        r["status"]["currentState"] = json!("stopped");
+    }
+    l.replicas(reps);
+    l.state("attachment.json", &json!({"kind":"VolumeAttachment","metadata":{"name":VOL,"namespace":"longhorn-system","uid":"va-uid","resourceVersion":"1"},"spec":{"volume":VOL,"attachmentTickets":{}},"status":{}}).to_string());
+    l.state("cronjobs.json", &json!({"kind":"List","items":[{"kind":"CronJob","metadata":{"name":"backup","namespace":"boss","uid":"cron-uid"},"spec":{"schedule":"10 9 * * *","timeZone":"Etc/UTC","jobTemplate":{"spec":{"template":{"spec":{"volumes":[{"persistentVolumeClaim":{"claimName":"boss-backups"}}]}}}}}}]}).to_string());
+}
+
+#[test]
+fn lower_attachment_must_reference_the_signed_volume() {
+    for reference in [json!("another-volume"), Value::Null] {
+        let l = Longhorn::new("lower_attachment_reference");
+        lower_detached_estate(&l);
+        let mut attachment = l.read_state("attachment.json");
+        attachment["spec"]["volume"] = reference;
+        l.state("attachment.json", &attachment.to_string());
+        let rep = format!("{VOL}-r-7c1934ba");
+        let p = l.run(&["--lower", "--plan", VOL, &rep], &[]);
+        assert!(
+            !p.status.success(),
+            "wrong volume reference admitted: {}",
+            text(&p)
+        );
+        assert!(l.writes().is_empty(), "a rejected reference must not write");
+    }
+}
+
+#[test]
+fn lower_unknown_attach_effect_reconciles_only_its_own_ticket() {
+    let l = Longhorn::new("lower_lost_attach_ack");
+    lower_detached_estate(&l);
+    let rep = format!("{VOL}-r-7c1934ba");
+    let p = l.run(&["--lower", "--plan", VOL, &rep], &[]);
+    assert!(p.status.success(), "{}", text(&p));
+    let hash = String::from_utf8_lossy(&p.stderr)
+        .lines()
+        .find_map(|s| s.strip_prefix("plan-sha256: "))
+        .unwrap()
+        .to_owned();
+    let w = l.run(
+        &["--lower", VOL, &rep, &hash],
+        &[("STUB_ATTACH_LOST_ACK", "1")],
+    );
+    assert_eq!(w.status.code(), Some(1), "{}", text(&w));
+    assert!(
+        l.read_state("attachment.json")["spec"]["attachmentTickets"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(l.volume_now()["spec"]["numberOfReplicas"], 3);
+    assert_eq!(l.volume_now()["status"]["state"], "detached");
+    assert!(
+        !l.writes()
+            .iter()
+            .any(|x| x.starts_with("delete ") || x.starts_with("patch volumes.longhorn.io"))
+    );
+}
+
+#[test]
+fn lower_sigkill_after_actual_ticket_admission_still_cleans_own_ticket() {
+    let l = Longhorn::new("lower_killed_after_attach");
+    lower_detached_estate(&l);
+    let rep = format!("{VOL}-r-7c1934ba");
+    let p = l.run(&["--lower", "--plan", VOL, &rep], &[]);
+    assert!(p.status.success(), "{}", text(&p));
+    let hash = String::from_utf8_lossy(&p.stderr)
+        .lines()
+        .find_map(|s| s.strip_prefix("plan-sha256: "))
+        .unwrap()
+        .to_owned();
+    let w = l.run(
+        &["--lower", VOL, &rep, &hash],
+        &[("STUB_KILL_AFTER_ATTACH", "1")],
+    );
+    assert!(!w.status.success(), "{}", text(&w));
+    assert!(
+        l.dir.join("state/killed-worker").exists(),
+        "actual admitted worker was killed"
+    );
+    assert!(
+        l.read_state("attachment.json")["spec"]["attachmentTickets"]
+            .as_object()
+            .unwrap()
+            .is_empty(),
+        "SIGKILL left the own maintenance ticket: {}",
+        text(&w)
+    );
+    assert_eq!(l.volume_now()["status"]["state"], "detached");
+    assert!(
+        !text(&w).contains(" declared "),
+        "killed work cannot claim an effect"
+    );
+}
+
+struct ExternalAttach(std::process::Child);
+
+impl Drop for ExternalAttach {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn attachment_barrier(l: &Longhorn, name: &str) {
+    let path = l.dir.join("state").join(name);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !path.exists() && std::time::Instant::now() < end {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(path.exists(), "missing actual fixture handshake {name}");
+}
+
+#[test]
+fn lower_actual_patch_and_plan_stdout_survive_a_file_backed_worker_sigkill() {
+    let l = Longhorn::new("lower_real_buffered_output");
+    lower_detached_estate(&l);
+    let rep = format!("{VOL}-r-7c1934ba");
+    let plan = l.run(&["--lower", "--plan", VOL, &rep], &[]);
+    assert!(plan.status.success(), "{}", text(&plan));
+    let hash = String::from_utf8_lossy(&plan.stderr)
+        .lines()
+        .find_map(|s| s.strip_prefix("plan-sha256: "))
+        .unwrap()
+        .to_owned();
+    let path = l.dir.join("actual-runner-output.log");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut command = l.command(
+        &["--lower", VOL, &rep, &hash],
+        &[("STUB_HOLD_BEFORE_COUNT_PATCH", "1")],
+    );
+    let mut launcher = ExternalAttach(
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(file.try_clone().unwrap())
+            .stderr(file)
+            .spawn()
+            .unwrap(),
+    );
+    attachment_barrier(&l, "count-patch-ready");
+    let pid = std::fs::read_to_string(l.dir.join("state/attached-worker")).unwrap();
+    assert!(
+        Command::new("kill")
+            .args(["-KILL", pid.trim()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(!launcher.0.wait().unwrap().success());
+    let retained = std::fs::read_to_string(path).unwrap();
+    let attach = retained
+        .find("volumeattachment patched\n")
+        .unwrap_or_else(|| panic!("actual attach response lost on worker SIGKILL: {retained}"));
+    let plans: Vec<_> = retained
+        .match_indices("plan: retire-volume-replica\n")
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(
+        plans.len(),
+        2,
+        "captured plan stdout and actual engine-write plan must both survive: {retained}"
+    );
+    assert!(
+        attach < plans[0] && plans[0] < plans[1],
+        "producer stdout was reordered: {retained}"
+    );
+    assert!(
+        retained.contains("plan-sha256:"),
+        "engine plan stderr must remain: {retained}"
+    );
+    assert!(!l.writes().iter().any(|line| line.starts_with("delete ")));
+}
+
+#[test]
+fn lower_cleanup_fences_an_attach_executed_outside_its_process_tree() {
+    for (mode, fence_flag) in [
+        ("killed", None),
+        ("lost-ack", None),
+        ("timeout", None),
+        ("lost-ack", Some("STUB_FENCE_RACE")),
+        ("lost-ack", Some("STUB_FENCE_LOST_ACK")),
+    ] {
+        let l = Longhorn::new("lower_external_attach");
+        lower_detached_estate(&l);
+        let rep = format!("{VOL}-r-7c1934ba");
+        let plan = l.run(&["--lower", "--plan", VOL, &rep], &[]);
+        assert!(plan.status.success(), "{}", text(&plan));
+        let hash = String::from_utf8_lossy(&plan.stderr)
+            .lines()
+            .find_map(|s| s.strip_prefix("plan-sha256: "))
+            .unwrap()
+            .to_owned();
+        let log = std::fs::File::create(l.dir.join("external-daemon.log")).unwrap();
+        // Started before the registered launcher: not its child, process group
+        // or adopted descendant. The daemon, not the client, applies the body.
+        let mut daemon = ExternalAttach(
+            Command::new("python3")
+                .arg(l.dir.join("state/attachment-patch.py"))
+                .arg("--daemon")
+                .env("STUB_STATE", l.dir.join("state"))
+                .stdin(std::process::Stdio::null())
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .spawn()
+                .unwrap(),
+        );
+        attachment_barrier(&l, "external-ready");
+        let write = std::thread::scope(|scope| {
+            let work = scope.spawn(|| {
+                let mut flags = vec![("STUB_EXTERNAL_ATTACH", mode)];
+                if let Some(flag) = fence_flag {
+                    flags.push((flag, "1"));
+                }
+                l.run(&["--lower", VOL, &rep, &hash], &flags)
+            });
+            attachment_barrier(&l, "external-received");
+            attachment_barrier(&l, "queued-worker");
+            if mode == "killed" {
+                let pid = std::fs::read_to_string(l.dir.join("state/queued-worker")).unwrap();
+                assert!(
+                    Command::new("kill")
+                        .args(["-KILL", pid.trim()])
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            work.join().unwrap()
+        });
+        assert!(!write.status.success(), "{mode}: {}", text(&write));
+        // Release only AFTER the real production cleanup/launcher returned.
+        // No sleep stands in for ordering, and no fake cleanup is substituted.
+        l.state("release-queued", "after real cleanup returned");
+        attachment_barrier(&l, "external-done");
+        assert!(daemon.0.wait().unwrap().success());
+        let attachment = l.read_state("attachment.json");
+        assert!(
+            attachment["spec"]["attachmentTickets"]
+                .as_object()
+                .unwrap()
+                .is_empty(),
+            "{mode}: late outside-owner attach stranded a ticket after actual cleanup: {}\n{}",
+            attachment,
+            text(&write)
+        );
+        assert_eq!(
+            std::fs::read_to_string(l.dir.join("state/external-done")).unwrap(),
+            if fence_flag == Some("STUB_FENCE_RACE") {
+                "applied"
+            } else {
+                "conflict"
+            },
+            "the actual old UID/RV request must refuse after the fence"
+        );
+        let patches =
+            std::fs::read_to_string(l.dir.join("state/attachment-patches.jsonl")).unwrap();
+        let patches: Vec<Value> = patches
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        if fence_flag == Some("STUB_FENCE_RACE") {
+            assert!(
+                patches
+                    .iter()
+                    .any(|entry| entry["origin"] == "client" && entry["status"] == "conflict")
+            );
+            assert!(
+                patches.iter().any(|entry| entry["patch"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|operation| operation["op"] == "remove")),
+                "actual own-ticket removal missing: {patches:?}"
+            );
+        }
+        if fence_flag == Some("STUB_FENCE_LOST_ACK") {
+            assert!(text(&write).contains("fence ACK UNKNOWN"));
+            assert!(l.dir.join("state/fence-ack-lost").exists());
+        }
+        assert!(text(&write).contains("effect UNKNOWN"));
+    }
+}
+
+#[test]
+fn lower_cleanup_never_removes_a_changed_ticket_or_replaced_attachment() {
+    for flag in ["STUB_CHANGED_OWN_TICKET", "STUB_REPLACED_ATTACHMENT"] {
+        let l = Longhorn::new("lower_cleanup_identity");
+        lower_detached_estate(&l);
+        let rep = format!("{VOL}-r-7c1934ba");
+        let p = l.run(&["--lower", "--plan", VOL, &rep], &[]);
+        assert!(p.status.success(), "{}", text(&p));
+        let hash = String::from_utf8_lossy(&p.stderr)
+            .lines()
+            .find_map(|s| s.strip_prefix("plan-sha256: "))
+            .unwrap()
+            .to_owned();
+        let w = l.run(&["--lower", VOL, &rep, &hash], &[(flag, "1")]);
+        assert!(!w.status.success(), "{}", text(&w));
+        assert!(text(&w).contains("cleanup debt"), "{}", text(&w));
+        assert!(
+            !l.read_state("attachment.json")["spec"]["attachmentTickets"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(l.volume_now()["spec"]["numberOfReplicas"], 3);
+        assert_eq!(
+            l.writes()
+                .iter()
+                .filter(|s| s.starts_with("patch volumeattachments.longhorn.io"))
+                .count(),
+            1
+        );
+        assert!(!text(&w).contains(" declared "));
+    }
 }
 
 fn verb(name: &str) -> Value {

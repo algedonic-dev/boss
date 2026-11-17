@@ -27,8 +27,10 @@ only in `~/talos-homelab/v2` on a laptop, applied by hand with
 - **w-1, since 2026-09-30** — a second document, a `UserVolumeConfig`
   named `gate`: w-1's second NVMe as one xfs volume Talos mounts at
   `/var/mnt/gate`, chosen by the selector `!system_disk &&
-  disk.transport == "nvme" && disk.size > 500u * GB` and never by a
-  serial or device name. ALL the gate's disk I/O moves there — seed and
+  disk.transport == "nvme" && disk.size > 500u * GB && disk.model !=
+  "KINGSTON SNV3S1000G"` and never by a serial or device name (the
+  model term, since 2026-11-07, keeps the Kingston out so a volume
+  provisioned anew lands on a Micron; design 121f44a1). ALL the gate's disk I/O moves there — seed and
   workspaces on one filesystem, because a reflink cannot cross two
   (backlog `52ea56ac`, design `8457c07b`). Declared before it was
   applied: the check reads it `ABSENT` until David applies it. There is
@@ -45,14 +47,59 @@ only in `~/talos-homelab/v2` on a laptop, applied by hand with
 - **cp-1, cp-2, cp-3** — `machine.kubelet.extraConfig` image-GC
   thresholds, one of the levers behind the 2026-09-11 outage of the
   system of record (design `16115a17`).
-- **w-2, since 2026-10-09** — the same image-GC pair, 50/40, and nothing
-  else (backlog `666e0570`). Declared to be APPLIED, not as found: w-2
+- **w-2, since 2026-10-09** — the same image-GC pair, 50/40
+  (backlog `666e0570`). Declared to be APPLIED, not as found: w-2
   had no declaration, and its disk filled with old boss-ci images to
   Longhorn's 25% floor while the kubelet's default 85% line had never
   fired. The forge mirror is live there and left undeclared on purpose
   (it reads `UNDECLARED`): a patch carrying a live entry is refused
   unless it is idempotent, and whether Talos appends mirror endpoints is
   unmeasured. The file's own header has the measurement.
+- **w-1, since 2026-10-19** — the same image-GC pair, 50/40, for the
+  same reason at nine times the size (backlog `67e98635`): 231.2 GiB
+  available of 928.9 against Longhorn's 25% floor of 232.2, imagefs
+  535.2 GiB, so every dev-build worker volume provisioned and never got
+  a replica. Declared to be applied; its other entries are live, so it
+  reaches the node as a NARROWED patch (below).
+- **w-1 and w-2, since 2026-10-29** — the
+  `machine.nodeAnnotations` key `node.longhorn.io/default-node-tags`,
+  whose string value is the JSON list `["dev-build"]` (backlog
+  `e14a472d`, option C). Longhorn copies this default only when the
+  node's tag list is empty; the annotation readback is therefore not a
+  substitute for reading Longhorn's `spec.tags`. No control plane
+  declares this tag, and neither does the data node w-3 (below).
+- **w-3, since 2026-11-11** — the data node joined that day (backlog
+  `9323f4bf`), declared with the image-GC pair and the forge mirror.
+  They are the entries to apply. Its live config had not been read when
+  they were written. It declares **no** dev-build tag: design
+  `3c475a19` gives its Microns to PostgreSQL and durable Longhorn and
+  makes it never a build node, and a tagged node's disks take a
+  disposable dev-build replica whatever node its pod runs on (backlog
+  `1011f72f`). `dev_build_volume_class.rs` holds a worker whose estate
+  row declares `boss.dev/purpose=database` to that.
+- **w-1, since 2026-11-12** — a third document, the `UserVolumeConfig`
+  `scratch`: the KINGSTON SNV3S1000G the gate selector keeps out,
+  selected by `!system_disk && disk.transport == "nvme" && disk.model ==
+  "KINGSTON SNV3S1000G"`, one xfs volume at `/var/mnt/scratch` that
+  becomes Longhorn disk `u-scratch` for dev-build worker volumes only
+  (backlog `46328c3a`, design `3c475a19` car 2). Declared before it was
+  applied; the order it goes live in is the last section below.
+- **w-3, since 2026-11-11** — two `UserVolumeConfig` documents, one per
+  Micron 7400 PRO 960 GB (design `3c475a19` section 2, backlog
+  `4d1caddb`): `postgres` (Longhorn disk `u-postgres`, the system of
+  record's data) on the drive window `ba305b66` records blank, and
+  `data` (`u-data`, durable replicas) on the one that was w-1's gate
+  volume and still carries its `u-gate` partition, so `data` provisions
+  only after that partition is wiped (the sequence is under the
+  Longhorn disk door below); each xfs at `/var/mnt/<name>`. Chosen by
+  `!system_disk && disk.serial == "<serial>"`, the one place in this
+  directory a serial
+  selects a disk: the two drives are the same model and size, so a
+  selector of what the disk is matches both and Talos picks between
+  them in unsorted arrival order. A replaced drive matches nothing and
+  the volume reads `waiting` until the file names its serial — never a
+  new disk taking the system of record's volume. The file's comment has
+  why serial and not wwid.
 - **every node but w-2** — `machine.registries.mirrors` for
   `10.20.0.15:3000`, the forge's registry every image in the cluster is
   pulled through.
@@ -73,6 +120,22 @@ PKI, tokens, the cluster secret, and anything else `talosctl gen
 secrets` produces **never live here**. A patch is a fragment; the
 secrets stay under `/etc/boss-ops` on the cluster-operator host
 (design `1bc4b4ed`) and in the operator's own config until then.
+
+## The image a blank node network-boots: `netboot.toml`
+
+`netboot.toml` declares ONE Talos schematic and version, with the
+sha256 of its netboot kernel and initramfs and the Image Factory's metal
+kernel args (backlog `ee31ab73`, 2026-10-19). The forge serves it ONLY to
+the NICs listed in its `netboot_macs` — every other PXE client gets no
+answer, and an empty list answers nobody, so an installed node that tries
+the network first still boots its disk (review `bcff47dd` N1, backlog
+`8cf6faf7`) — proxy-DHCP (no leases, no DNS), TFTP for iPXE,
+HTTP for the script and the pair — through `infra/forge/netboot.sh`,
+which the forge converge runs, and serves nothing that does not hash to
+this file. The node lands in maintenance mode and joins nothing; the
+config is applied by hand as before. Changing the version is an edit to
+this file, measured as its header says. The schematic is spelled there
+and nowhere else in the tree (`netboot_sh.rs` holds it to that).
 
 ## Reading a node against its declaration
 
@@ -107,7 +170,7 @@ Exit 2 is a usage refusal (no such node, unreadable input, wrong
 hostname); 78 is no python3. The classes read for `UNDECLARED` are
 `machine.files` under `/var/local`, every `extraMounts` entry, every
 `imageGC*` key of `extraConfig`, every registry mirror, and every
-`UserVolumeConfig` — so the
+`nodeAnnotations` key, plus every `UserVolumeConfig` — so the
 first run on a control plane will most likely list a mount the grep of
 2026-09-15 showed but did not name. That is the check working: declare
 it here, or leave it listed.
@@ -141,9 +204,10 @@ talosctl -n <address> patch machineconfig --mode=no-reboot --dry-run --patch @<f
 talosctl -n <address> patch machineconfig --mode=no-reboot --patch @<fragment>.yaml
 ```
 
-The kubelet restarts; running pods survive; **no reboot** (`files`,
-`extraMounts`, `extraConfig`, `registries` and a `UserVolumeConfig` all
-apply live). `--mode=no-reboot` makes that a constraint rather than an
+The listed classes apply live: `files`, `extraMounts`, `extraConfig`,
+`registries`, `nodeAnnotations` and `UserVolumeConfig`. A kubelet
+configuration change restarts the kubelet; running pods survive;
+**no reboot**. `--mode=no-reboot` makes that a constraint rather than an
 expectation: the default `auto` REBOOTS the node if Talos judges the
 change needs it, and a surprise reboot of w-1 takes the dev pod, the
 gates in flight and its Longhorn replicas with it (review `a79746c6`);
@@ -164,7 +228,8 @@ Two things the merge will not do for you:
 So a node that already carries part of its declaration is patched with
 a fragment of ONLY what it lacks, never the whole file again — the whole
 of `w-1.yaml` re-applied would add a third copy of the seed file entry.
-The check afterwards is what proves the fragment equalled the
+`node-converge` builds that fragment itself (`check-declared.sh --absent`,
+below). The check afterwards is what proves the fragment equalled the
 declaration. For w-1's gate disk the fragment is the `UserVolumeConfig`
 document ALONE. A `UserVolumeConfig` (Talos v1.10 and later) is
 provisioned by the node's volume controller when the config lands —
@@ -205,19 +270,49 @@ it does and refuses, in order:
   declares today are admitted (the image-GC pair, `EXTRA_CONFIG_KEYS` in
   the check), because `extraConfig` passes any kubelet
   setting straight through, anonymous auth and authorization mode
-  among them;
+  among them. Under `nodeAnnotations`, only
+  `node.longhorn.io/default-node-tags` is admitted; the check reads
+  other keys but does not authorize applying them. In particular,
+  Longhorn's default-disks annotation can create disks and is not
+  admitted by this door;
 - `talosctl patch machineconfig --mode=no-reboot --dry-run`, whose
   summary must read "Applied configuration without a reboot" and whose
   diff must change something — so an applied plan is never run twice;
 - the same dry run with the patch applied TWICE: when it differs, the
-  patch appends (the doubling above), and it is refused if ANY entry it
-  declares, in any class, is already live;
+  patch appends (the doubling above). If ANY entry it declares, in any
+  class, is already live, the whole declaration is neither dry-run nor
+  applied: the plan NARROWS it FIRST to the entries that read ABSENT
+  live (`check-declared.sh --absent <node>`, which re-emits them from the
+  DECLARED values in canonical form; backlog `9cf1673d`, built for
+  `67e98635`), prints that patch beside the declaration, judges it as a
+  declaration of its own (read classes, its own two dry runs) and
+  applies exactly it. First, because the copy Talos's merge would append
+  can be a change it refuses outright in no-reboot mode: the first live
+  plan dry-ran w-1's whole declaration, Talos answered "this config
+  change can't be applied in immediate mode" over a second seed files
+  entry, and the narrowed patch was never built (backlog `a3b1084f`). It
+  refuses instead, before any dry run, when a declared entry DRIFTs
+  live — adding entries cannot correct a drift, and narrowing past one
+  would read back as converged with the drift still there — or when no
+  entry is absent, since the patch could then only add a second copy.
+  When only a `UserVolumeConfig` is absent — every machine entry live,
+  as after `retire-a-user-volume` — the narrowed patch is that volume
+  document ALONE, read back with `check-declared.sh --narrowed` (a
+  narrowed patch may hold no machine fragment; a declaration here still
+  holds exactly one), and the plan names the documents it carries
+  (backlog `a93010a1`: ops-request `797b0d0d` refused exactly this
+  patch, and the volume was applied by hand).
+  Only a node with every entry ABSENT has its whole declaration dry-run;
 - Talos's diff is rendered with each context line reduced to its key,
   a changed line shaped like a credential refuses the plan unprinted,
   and the check's findings appear as a verdict and a key each, never a
   live value;
 - the apply (`--mode=no-reboot`), then the live config read through
-  `check-declared.sh` until every declared entry is `MATCH`, and the
+  `check-declared.sh` until every declared entry is `MATCH` — for a
+  narrowed patch, every entry IT carries `MATCH` and every declared
+  entry it did not carry reading exactly as it did before the apply, so
+  a DOUBLED entry left as found is no failure and a patch that disturbed
+  an entry it never named is no effect — and the
   Node read until it is `Ready=True` with its kubelet lease renewed
   after the apply, and read again at the end of the bound (every
   successful run takes the whole 120 s) — the verb's effect line, or
@@ -250,21 +345,315 @@ it does and refuses, in order:
 
 Reboot, upgrade, reset and etcd membership never become verbs.
 
-**When the append rule refuses, the live entries are not the problem.**
+**When the append rule bites, the live entries are not the problem.**
 Applying a whole declaration file is not idempotent for a list Talos's
 merge cannot key, so a declaration whose entries are already live cannot
-be re-applied — w-1 today (its seed file entry DOUBLED, its mount and
-mirror live), and every control plane if Talos appends mirror
-endpoints. **Never remove a working live entry to unblock the verb:**
-the seed mount, the forge mirror and the image-GC thresholds are what
-the node runs on, and de-duplicating a DOUBLED entry by hand only
-leaves a MATCH, which is refused the same way. The remedy is a
-declaration narrowed, for that run, to the entries that read ABSENT on
-the node, or the partial patch that applies only those (a follow-up
-item).
+be re-applied — w-1 (its seed file entry DOUBLED as last read, its
+mount, mirror and gate volume live), and every control plane if Talos
+appends mirror endpoints. **Never remove a working live entry to unblock
+the verb:** the seed mount, the forge mirror and the image-GC thresholds
+are what the node runs on. The verb narrows instead: since 2026-10-19
+(backlog `9cf1673d`'s first half, built for `67e98635`, when w-1's
+image-GC pair could not reach the node and its Longhorn disk sat under
+the scheduling floor) a plan for such a node applies the entries that
+read ABSENT and nothing else. A DOUBLED entry is left as found; a verb
+that removes one copy, signed by passkey, is the half of `9cf1673d`
+still open.
 
 A plan that exits 1 saying Talos's dry run "did not read as a summary
 and a config diff" is about the output format, not the node: the
 parser reads talosctl's `Dry run summary:` / `Config diff:` shape,
 optionally opened with the node's address or name, and fails closed on
 anything else. The first live render is its measurement.
+
+## A user volume becomes Longhorn capacity: `add-longhorn-disk`
+
+A `UserVolumeConfig` applied by `node-converge` is a mounted
+filesystem at `/var/mnt/<name>` and nothing more: Longhorn knows a disk
+only when its node's `nodes.longhorn.io` object lists it under
+`spec.disks`. Until backlog `493a02b6` (2026-10-19) no door wrote that
+list, so a node maintenance window that fitted a disk ended at a
+mounted volume nothing used. The second door is the ops pair
+`plan-a-longhorn-disk <node> <volume>` and `add-longhorn-disk <node>
+<volume> <plan_sha256>` (`infra/forge/longhorn-disk.sh`), in the same
+plan-and-passkey shape. It reads the mount from the declaration here,
+never from the packet, and refuses:
+
+- a volume `patches/<node>.yaml` does not name as a `UserVolumeConfig`,
+  or a declaration `check-declared.sh --only-read-classes` refuses (the
+  `!system_disk` allowlist above);
+- a volume Talos does not read `ready` at `/var/mnt/<name>`, or one on
+  the disk `EPHEMERAL` lives on;
+- a path any PersistentVolume or pod on the node already mounts — which
+  is how w-1's gate volume (`/var/mnt/gate`, the local PV `gate-w-1` and
+  the trim pod's hostPath) is refused;
+- a path that is, is under, or holds an existing Longhorn disk.
+
+The write is one compare-and-set patch adding the disk `u-<name>`,
+untagged and schedulable, and its read-back is Longhorn's own: the disk
+`Ready` and `Schedulable` with a `diskUUID` of its own, every other disk
+unchanged. The order for a worker's second disk is: declare its
+`UserVolumeConfig` in `patches/<node>.yaml` and land it, fit the disk,
+`node-converge <node>`, then `plan-a-longhorn-disk <node> <volume>` and
+`add-longhorn-disk` under the passkey, then `node-disk-usage <node>`
+lists the new disk. The first declarations it is for are w-3's
+`postgres` and `data` (2026-11-11), and `data`'s drive is not empty:
+it was w-1's gate volume and still carries the `u-gate` partition,
+which fills it (window `ba305b66`), and Talos makes a user volume only
+in free space. So the sequence is: `talos-get w-3 disks` names the disk
+with serial `220133DDBEDB`; `plan-a-partition-wipe w-3 <its partition>`
+renders a plan naming that serial and the label `u-gate`;
+`wipe-a-partition w-3 <partition> <plan_sha256>` under David's passkey
+drops it; then `plan-a-node-converge w-3` / `node-converge`, after
+which `talos-get w-3 volumestatus` reads `u-postgres` and `u-data`
+`ready`; then `add-longhorn-disk w-3 postgres` and `add-longhorn-disk
+w-3 data`. A converge run before the wipe leaves `data` `waiting` and
+`add-longhorn-disk w-3 data` refuses it; `postgres`, on the blank
+drive, is unaffected. w-1's `scratch` (2026-11-12) is the next, with
+its own sequence in the last section below. A node whose ONLY disk is
+replaced needs none of this door — but it may need the next pair down:
+Longhorn can keep the OLD disk's record for the reinstalled system disk
+(join-a-node `829f75a8`, 2026-10-19: a one-bay worker reinstalled on its
+larger disk, and on 2026-10-21 w-2's default disk still read
+`DiskFilesystemChanged` under the old `diskUUID`, placing nothing).
+
+The inverse is the pair `plan-a-longhorn-disk-removal <node> <volume>`
+and `remove-longhorn-disk <node> <volume> <plan_sha256>`
+(`infra/forge/remove-longhorn-disk.sh`, backlog `b791c5b4`): it takes
+`u-<name>` at `/var/mnt/<name>` back out of `spec.disks` — the disk the
+add door places and no other, so a default disk cannot be named — and
+it is the way out for a disk Longhorn never read `Ready` after the add.
+It refuses while the disk holds anything: a replica on its `diskUUID`
+or on its node and path, a scheduled replica or backing image in
+Longhorn's `diskStatus`, a nonzero `storageScheduled`, or a backing
+image file, orphaned replica data naming its UUID or its node and
+disk name/path, or a backing-image manager naming its UUID or node and
+mount path. The manager read also protects a disk with no recorded UUID.
+A standing manager counts even when its image maps are empty; this
+verb does not infer file absence from a manager's changing status.
+An orphan or manager list that cannot be read or interpreted is
+not an empty disk. Deleting orphan objects still count until gone;
+the removal verb deletes neither those objects nor their files.
+It does not evict; move a replica off first with
+`move-volume-replica` or `retire-volume-replica`. The write makes the
+disk unschedulable, reads what is on it again, and only then removes
+it, each a compare-and-set; if a replica landed in between, the disk
+is left unschedulable and nothing is removed. Its read-back is the disk
+gone from `spec.disks` and from Longhorn's `diskStatus`, every other
+disk unchanged. The Talos volume stays mounted; un-declaring it is a
+separate change to `patches/<node>.yaml` and a `node-converge`.
+
+The approved run records measured whole-second durations for disabling
+scheduling, the configured settle wait, the holdings recheck, removing
+the record, and waiting for Longhorn to release `diskStatus`. The last
+measurement includes its poll count and configured bounds, including
+on a timeout. These observations are outside the deterministic signed
+plan. The 15-second settle and 180-second read-back defaults remain
+uncalibrated bounds until the first approved live run records them;
+a fixture run does not establish Longhorn's production timing.
+
+The third pair repairs a node's DEFAULT disk whose record drifted from
+the disk under it: `plan-a-longhorn-disk-reregistration <node>` and
+`reregister-longhorn-disk <node> <plan_sha256>`
+(`infra/forge/reregister-longhorn-disk.sh`, backlog `36d2c484`). The
+packet names only the node; the disk is the one at `/var/lib/longhorn`
+named `default-disk-<hex>`. It refuses unless Longhorn reads that disk
+`Ready=False` with reason `DiskFilesystemChanged` and the disk's own
+`longhorn-disk.cfg`, read from the node through `talosctl read`, names a
+`diskUUID` other than the record's — and, as the removal does, while
+anything names the record on either UUID. The write makes the record
+unschedulable and reads its holdings again, removes it, waits for
+Longhorn to drop the stale status, and adds the same record back
+schedulable, each a compare-and-set; Longhorn then records the UUID the
+file names. Its read-back is the disk `Ready` and `Schedulable` under
+that UUID with a `storageMaximum` above zero, every other disk
+unchanged.
+
+The fourth pair sets a disk's TAGS, which the add writes empty:
+`plan-a-longhorn-disk-tags <node> <disk> <tags>` and
+`set-longhorn-disk-tags <node> <disk> <tags> <plan_sha256>`
+(`infra/forge/longhorn-disk-tags.sh`, backlog `aa650aaf`). Design
+`3c475a19` needs it: w-3's `u-postgres` tagged `durable,postgres`, its
+`u-data` `durable`, and every default disk `durable`, before PostgreSQL
+selects with `diskSelector: [postgres]`. The disk is one the node
+already has — `u-<name>` at `/var/mnt/<name>`, or the node's one
+`default-disk-<hex>` at `/var/lib/longhorn` — and the tags are one of the
+script's fixed spellings (`durable`, `durable,postgres`, `scratch`, or
+`none` for the untagged disk the add writes). It refuses a disk Longhorn
+does not read `Ready` and `Schedulable`, tags the disk already carries,
+and a retag that would strand a placed replica whose volume's
+`diskSelector` the new tags no longer hold (Longhorn moves nothing when
+tags change) — or, for a volume with no `diskSelector`, any tags at all
+while Longhorn's `allow-empty-disk-selector-volume` reads `false`. That
+setting is read with the plan and carried in its signed bytes, never
+assumed from Longhorn's default. The write is one compare-and-set patch of that disk's
+`tags`; its read-back is the tags as planned, every other field and disk
+unchanged, and the disk still `Ready` and `Schedulable` under the same
+`diskUUID`. For the design: `add-longhorn-disk w-3 postgres` and
+`add-longhorn-disk w-3 data`, then `set-longhorn-disk-tags w-3
+u-postgres durable,postgres` and `set-longhorn-disk-tags w-3 u-data
+durable`, each read back with `read-longhorn-node-tags w-3`.
+
+## A user volume moves disks: `retire-a-user-volume` first
+
+Talos does not move a provisioned user volume when its declared
+`diskSelector` changes, and `node-converge` only adds — it refuses a
+`DRIFT`. So moving a volume to another disk without a reboot (backlog
+`412d504c`, door 1 of the move David ordered on 2026-11-07 for w-1's
+gate volume: Kingston SNV3S1000G to a Micron 7400 PRO) starts by
+deleting the live document: the pair `plan-a-user-volume-retirement
+<node> <volume>` and `retire-a-user-volume <node> <volume>
+<plan_sha256>` (`infra/forge/retire-user-volume.sh`), plan and passkey
+as above. The write applies one patch in `--mode=no-reboot`:
+
+```yaml
+apiVersion: v1alpha1
+kind: UserVolumeConfig
+name: <volume>
+$patch: delete
+```
+
+Talos unmounts `/var/mnt/<volume>` and keeps the partition. The bound
+is that the TREE has stated the move: the declaration here must still
+name the volume (and pass `--only-read-classes`, since `node-converge`
+provisions it again from it next), and the live document must `DRIFT`
+from it in its `diskSelector` — a `MATCH` is refused, because retiring
+it would only provision it again on the same disk. The plan records
+both selectors. It also refuses a volume Talos does not read `ready`,
+a partition not labelled `u-<volume>`, and any running pod on the node
+that mounts the path, anything under it, or a path that holds it —
+judged by each container's effective host path (the hostPath, or the
+PersistentVolume its claim is bound to, plus its `subPath`, compared
+canonical with `.` components cleaned), so a parent hostPath `/var/mnt`
+with `subPath: gate` or `./gate` counts (a gate run in flight: hold the
+gates first). It also refuses when the node's `nodes.longhorn.io`
+registers a disk that is the path, sits under it, or holds it, because
+Longhorn writes only its registered disks — and, with that read, one
+mount is exempt: Longhorn's instance-manager (in `longhorn-system`,
+labelled `longhorn.io/component=instance-manager`, named
+`instance-manager-*`) mounting host `/` whole, which it does on every
+node (backlog `76c8b647`; the first live plan refused on it). The plan
+prints each exempt mount.
+Its read-back is the live config reading `UserVolumeConfig[<volume>]`
+`ABSENT`, Talos holding no `u-<volume>`, and the partition still
+labelled `u-<volume>`. The rest of the move is its own doors: free the
+old partition, `node-converge` the declaration (the volume now
+`ABSENT` live, provisioned by the new selector), and prove the new
+volume.
+
+## w-1's Kingston becomes the scratch disk: the sequence
+
+Design `3c475a19` section 4 car 2, backlog `46328c3a` (urgent, David
+2026-11-12: "let's get that hardware online with priority"). On
+2026-11-12 at 15:29Z two builder runs were refused by the worker door
+for want of room on w-1's 980 PRO default disk (229 GiB placeable under
+Longhorn's 25% floor), which every dev-build worker volume shares with
+every durable replica on the node, while w-1's KINGSTON SNV3S1000G sat
+fitted and idle once the gate volume had moved to the Micron 9300 PRO.
+
+**What the tree declares** (this car): the `scratch` `UserVolumeConfig`
+in `patches/w-1.yaml`, which takes the Kingston by model, the same
+string the `gate` selector refuses; the StorageClass
+`longhorn-dev-scratch` in `../manifests/boss-dev.yaml` (the build-node
+tag AND `diskSelector: scratch`); the StorageClass `longhorn-durable` in
+`../manifests/longhorn-durable.yaml` (three replicas, `diskSelector:
+durable`); and `read-longhorn-setting allow-empty-disk-selector-volume`.
+None of these changes a running thing: a declared volume is `ABSENT`
+until `node-converge` applies it, and no claim names either class yet.
+
+**The order is changed from design D2, and why.** D2 tags every default
+disk `durable` and gives the durable volumes `diskSelector: durable`
+BEFORE the scratch disk exists. That cannot run today: the disk-tag door
+of backlog `aa650aaf` (`plan-a-longhorn-disk-tags` /
+`set-longhorn-disk-tags`, car `1f52c57b`, not on main when this was
+written) is bounded to the registry's talos-WORKERS, so it refuses the
+control planes' default disks; and it refuses a retag that would strand
+a replica whose volume's selector the new tags stop holding, so no
+durable volume can take `[durable]` while one of its replicas sits on an
+untaggable control-plane disk — every durable volume has one (design
+section 1.2). The durable half of D2 therefore waits for design car 5,
+which empties the control planes; the scratch half goes now. Nothing is
+lost by it: with Longhorn's `allow-empty-disk-selector-volume` at its
+default `true`, a `durable` tag on a default disk turns no volume away
+and protects nothing until volumes carry the selector.
+
+**How the scratch disk is protected meanwhile, and what that costs.** A
+durable volume has no disk selector, so Longhorn may place one of its
+replicas on `u-scratch` when it builds a new one on w-1 (a rebuild, or
+a new volume). That is a placement defect, not a durability one: a
+durable volume keeps three replicas on three distinct nodes, so a
+replica on `u-scratch` is w-1's one replica of it, and losing the
+Kingston costs that volume one rebuild, exactly as losing w-1 would.
+The single-replica volumes on w-1 (the dev pod's `/work`, the
+dev-build workers) are disposable by class. So the protection is
+detection plus the existing door: `read-volume-replica-history` names
+any durable replica on `u-scratch`, and `move-volume-replica` takes it
+off. Closing it by placement uses `plan-a-longhorn-selector-policy false`
+and `set-longhorn-selector-policy false <plan_sha256>` with David's
+passkey, then `read-longhorn-setting allow-empty-disk-selector-volume`.
+The plan signs all disk specs and refuses any tagged default disk. With every
+default disk left UNTAGGED, as this order leaves them, that keeps every
+volume without a selector off every tagged disk, `u-scratch` included,
+and changes nothing else. It must be set back to `true`, or every
+durable volume must already carry its selector, before car 5's sequence
+tags any default disk `durable`.
+
+**What David runs, in order** — each mutating step is a plan and its
+passkey, and each read says whether the next step may run:
+
+0. `read-longhorn-setting allow-empty-disk-selector-volume` records
+   whether a volume with no selector may use a tagged disk (`true` is
+   Longhorn's default: the detection above is the protection; `false`:
+   `u-scratch` is already closed to them). Once this door has landed,
+   plan and approve `set-longhorn-selector-policy false` to close tagged
+   disks to volumes without a disk selector; read the setting back before
+   proceeding. It moves no existing replicas. To undo, plan and approve
+   `true`; restore it before tagging any default disk durable.
+   `read-longhorn-node-tags`
+   for every node records the tags before anything is written. No
+   default disk is tagged in this sequence.
+1. Wait for `aa650aaf` to land and converge: step 5 needs its verb.
+   Steps 2-4 do not, and may run before it.
+2. Read the Kingston's partitions: `talos-get w-1 disks` names its device
+   (model `KINGSTON SNV3S1000G`), and `plan-a-partition-wipe w-1
+   <its partition, e.g. nvme2n1p1>` says whether Talos still reads the
+   `u-gate` partition it held from 2026-09-30 to 2026-11-07. If it does,
+   `wipe-a-partition` with that plan (passkey). If the plan refuses
+   because no partition labelled `u-*` is there, there is nothing to
+   wipe. The wipe comes BEFORE the converge: Talos finds a volume by its
+   partition label first, and a disk still filled by `u-gate` has no
+   room to provision `scratch`.
+3. `plan-a-node-converge w-1 <the commit this car merged as>` /
+   `node-converge` (passkey). The plan's narrowed patch is the `scratch`
+   document alone (every other entry is live); `talos-get w-1
+   volumestatus u-scratch` then reads `ready`, xfs, mounted at
+   `/var/mnt/scratch`, on the Kingston.
+4. `plan-a-longhorn-disk w-1 scratch` / `add-longhorn-disk` (passkey):
+   Longhorn disk `u-scratch` at `/var/mnt/scratch`, read back `Ready` and
+   `Schedulable`. It is written UNTAGGED, so run step 5 straight after.
+5. Tag it: `plan-a-longhorn-disk-tags` / `set-longhorn-disk-tags` on w-1's
+   `u-scratch` with `scratch` (passkey; `aa650aaf`'s verb, which admits
+   exactly that tag on a worker's disk; its argument spelling is the one
+   it lands with). `read-longhorn-node-tags w-1` reads `u-scratch
+   [scratch]` and the default disk untagged; `read-volume-replica-history`
+   shows no durable replica on `u-scratch` (if one landed, the
+   `move-volume-replica` pair takes it off).
+6. The car after this one moves `WORKER_VOLUME_CLASS` in
+   `infra/dev/dev-build.py` to `longhorn-dev-scratch` and makes the
+   worker door's budget count only disks tagged `scratch`. It waits for
+   step 5 on purpose: landed earlier, every builder would be refused,
+   because the class could place nowhere.
+
+**Measured by**: `node-disk-usage w-1` lists `u-scratch`; after step 6
+the next worker volume's replica is on `u-scratch`
+(`read-volume-replica-history`), and the worker door's budget line names
+`w-1/u-scratch` with about 700 GiB placeable; no durable replica is on
+`u-scratch` a week later.
+
+**What waits for design car 5**: tagging the worker default disks (and
+w-3's data disks) `durable`, giving the existing durable volumes
+`diskSelector: durable` on the Longhorn volume itself (no door does
+that yet either), and pointing new durable claims at `longhorn-durable`
+— in that order, after the control planes hold no replica, because the
+disk-tag door refuses the control planes and refuses to strand a
+replica.

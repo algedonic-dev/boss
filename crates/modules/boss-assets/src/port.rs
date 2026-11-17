@@ -3,6 +3,7 @@
 //! this trait.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 use crate::types::{AssetCurrentState, AssetEvent, AssetEventKind, AssetId, AssetsSummary};
 use boss_core::actor::ActorId;
@@ -105,7 +106,7 @@ pub fn refuse_negative_page(limit: i64, offset: i64) -> Result<(), AssetsError> 
     Ok(())
 }
 
-/// Result of a `batch_append` call.
+/// Result of a `batch_record` call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BatchAppendStats {
     pub inserted: u64,
@@ -126,23 +127,48 @@ pub trait AssetsRepository: Send + Sync {
     /// event id already exists, so a redelivery is a duplicate whatever
     /// it names; `UnknownModel` if the event names a catalog model the
     /// store does not hold (`model_named`).
+    ///
+    /// Stages NO fact: this is the bus ingress's re-application of an
+    /// `asset.*` fact [`Self::record`] already staged, and staging it
+    /// again would mint a second fact for one event. A new event comes
+    /// in through `record`.
     async fn append(&self, event: AssetEvent) -> Result<(), AssetsError>;
 
-    /// Append a batch of events. Implementations are free to choose a
+    /// Append one event as `append` does, refusing the same way, and
+    /// stage its fact — `bridge::asset_event_to_core(event,
+    /// recorded_at)` — on the transactional outbox in the SAME
+    /// transaction, so the asset and the fact commit together or not
+    /// at all. Until 2026-11-10 the HTTP door appended and then
+    /// published the fact straight to the bus, so on a dark bus it was
+    /// logged and DROPPED (backlog 2e45840a, design ad9519bc part d);
+    /// staged here, the relay delivers it when the bus returns.
+    async fn record(
+        &self,
+        event: AssetEvent,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<(), AssetsError>;
+
+    /// Record a batch of events. Implementations are free to choose a
     /// faster bulk path; the contract is "same observable result as
-    /// calling `append` once per event in the input order, except that
+    /// calling `record` once per event in the input order, except that
     /// duplicates do not error out — they're counted and skipped" — a
     /// second copy of an id WITHIN the batch included: the first copy is
-    /// stored and applied, the second counted. It is all or nothing: a
-    /// refusal (`UnknownModel`, `Invalid`) stores none of the batch.
+    /// stored and applied, the second counted. A fact is staged for each
+    /// event STORED, so a redelivery stages none. It is all or nothing:
+    /// a refusal (`UnknownModel`, `Invalid`) stores and stages none of
+    /// the batch.
     ///
-    /// Default implementation loops `append` for adapters that don't
+    /// Default implementation loops `record` for adapters that don't
     /// have a real bulk path; it is NOT all or nothing, so both adapters
     /// here override it.
-    async fn batch_append(&self, events: Vec<AssetEvent>) -> Result<BatchAppendStats, AssetsError> {
+    async fn batch_record(
+        &self,
+        events: Vec<AssetEvent>,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<BatchAppendStats, AssetsError> {
         let mut stats = BatchAppendStats::default();
         for event in events {
-            match self.append(event).await {
+            match self.record(event, recorded_at).await {
                 Ok(()) => stats.inserted += 1,
                 Err(AssetsError::DuplicateEvent(_)) => stats.duplicates += 1,
                 Err(e) => return Err(e),

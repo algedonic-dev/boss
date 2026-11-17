@@ -166,3 +166,62 @@ this body as its own v1 while a live lineage keeps the version it
 reached. `owning_team` is written in the files that have one only to
 record the live value; the loader stamps the bundle's default and
 ignores the key.
+
+## Every protocol names its owner station
+
+Each row's `metadata.owner` is the stable `id` of the standing station
+that owns the protocol (docs/design/station-tree.md §2 and §4; T6 of
+design 4b27a65a, backlog baac0b65): the company's root, `engineering`,
+`operations` or `finance` today, as design c0ae096f §1 decided on
+2026-11-10 (twelve rows moved from the first assignment in car 2's
+first sweep; held `publish-a-protocol` moves at the platform owner's
+own publish). Three of the twelve, `break-glass-enrolment`,
+`enroll-a-managed-agent` and `workflow-design`, are passkey-protected
+on the server, so each carries a file under
+`infra/platform/workflow-holds/` and goes live at the owner's signed
+publish; the other nine an agent publishes (review 6254feec). It names
+an id, never a name or an
+address, so re-parenting or renaming a station moves no protocol, and
+moving a protocol is changing this one value (§8 rule 3).
+`station_tree::validate_protocol_owners` judges it, and
+`crates/core/boss-jobs/tests/station_tree.rs` pins every row. The steps
+a protocol places are checked against its owner's subtree (next
+section; docs/invariants/a-protocol-names-only-its-owners-subtree.toml).
+`metadata.department` stays beside it until the department join reads
+the owner: `boss_jobs::department::kinds_declaring`, behind
+`GET /api/jobs?department=<code>`, which the department pages
+(`apps/web/src/departments/department.ts`) read — and `it` is still a
+live department there until its retirement (design df0ecd8b).
+
+## A step stands at a station, or hands off
+
+A step names WHERE it runs as `metadata_defaults.at`, the stable `id`
+of a station inside its protocol's owner's subtree, or names a
+hand-off as `metadata_defaults.fulfilled_by`, the kind of the protocol
+that fulfils it under that kind's own owner; never both
+(docs/design/station-tree.md §1 and §4; T6, backlog baac0b65).
+`station_tree::validate_protocol_subtree` judges every row and the
+station-tree pins hold the bundle to it, so moving a protocol to
+another owner names every step that would fall outside its new subtree
+(§8 rule 3). `at` is placement only: who may claim the step is still
+its `audience` and `executor`.
+
+Engineering's protocols place every work step (sweep 2 of design
+c0ae096f, backlog baac0b65): a robot's work at `build`, a car's
+`review` step (held for its review, or riding its train) at
+engineering's `review` stage, a boarding train at `loading-dock`, a
+train's PR and merge on the `forge` and its CI at `forge-ci`, a landed
+car's two debts at `probe-shed` and `landed-review`, a design's
+questions at `design-review` and its fold at `design`. A step that
+waits on another packet hands off to it: a car's `gate` and a run's
+`verdict` are `fulfilled_by = "gate-run"`. An `at` never names a
+station whose own predicate refuses the packets standing at that step:
+a queue is its predicate OR its tree address, so the car's `review`
+placed at `loading-dock` would add held and train-borne cars to the
+dock queue the dock's predicate keeps them out of; a boardable car
+still stands at the dock through that predicate. The pin does not
+require a marker (a trigger, an outcome) to name a station. The steps with
+no honest station are named, each with its reason, in
+`ENGINEERING_UNPLACED` in `crates/core/boss-jobs/tests/station_tree.rs`,
+and `every_engineering_work_step_names_where_it_runs_or_why_not` refuses
+a new engineering step that is neither.

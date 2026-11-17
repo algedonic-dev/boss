@@ -1,0 +1,7 @@
+# ship-a-change's proven step names its executor as equipment, the
+# probe shed (design ccfe87ff pass item 2, backlog 364b27a3). A TIMING
+# hold (backlog a4b57aca kept these when it retired the default holds):
+# the row must wait for what it names to read back live.
+drift_publish = "held"
+lifts = 'backlog 364b27a3 (design ccfe87ff pass item 2): once GET /api/stations reads back gates, converge and probe-shed as equipment with their automata and bays, the deliberate publish of this row, then a car that deletes this file.'
+why = '''The proven step declares executor equipment:probe-shed, so a claim on it clears only for the probe shed's automaton, automation:ops-runner, with a free bay. On 2026-11-05 GET /api/stations held no probe-shed row: it reaches the registry through the platform seed on the converge after this car lands. The publish endpoint judges only an executor's shape, so a row published first would name a station the claim door reads as absent and admits no one at; an unattended drift publish after a converge would not wait for the station to read back.'''

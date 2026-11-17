@@ -63,9 +63,10 @@ describe('subjectPath', () => {
     const cases: ReadonlyArray<[string, string, Route['kind']]> = [
       ['asset', '/ux/assets/x', 'asset'],
       ['account', '/ux/accounts/x', 'account'],
-      ['purchase_order', '/ux/purchase-orders/x', 'po'],
+      // Finance's pages live at Finance's address (backlog c7ef4728).
+      ['purchase_order', '/finance/purchase-orders/x', 'po'],
       ['employee', '/ux/people/x', 'employee'],
-      ['vendor', '/ux/vendors/x', 'vendor'],
+      ['vendor', '/finance/vendors/x', 'vendor'],
       ['custom', '/ux/jobs?subject_id=x', 'jobs'],
     ];
     for (const [k, want, route] of cases) {

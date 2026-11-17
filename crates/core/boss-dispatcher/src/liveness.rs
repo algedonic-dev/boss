@@ -1,30 +1,49 @@
-//! Live readiness of the dispatcher's two durable JetStream consumers — the
+//! Live readiness of the dispatcher's durable JetStream consumers — the
 //! signal a `/api/dispatcher/health` 200 cannot give you.
 //!
-//! `boss-dispatcher` spawns both consumer loops detached: if either's message
+//! `boss-dispatcher` spawns its consumer loops detached: if one's message
 //! stream ends — a NATS blip, or JetStream not ready at cold start under a
 //! launcher with NO per-service restart (the docker `services-launcher.sh`
 //! uses `wait -n`, unlike systemd which restarts a dead unit) — the loop just
-//! logs and ends while the PROCESS stays up and health-green. With the
-//! assignment consumer dead, ready Steps are never assigned, the workforce has
-//! nothing to pull, and every Job stalls `open`: the exact "thousands of jobs
-//! in flight, nothing reaching a terminal state" failure.
+//! logs and ends while the PROCESS stays up and health-green. With the rules
+//! consumer dead, no finished step's side effect runs and every Job that
+//! waits on one stalls `open`: the exact "thousands of jobs in flight,
+//! nothing reaching a terminal state" failure. (The assignment consumer that
+//! once stood beside it was retired by backlog e1eaf72b.)
 //!
 //! This handle makes that visible at `/api/dispatcher/readyz` so an operator —
-//! and the brewery sim's pre-Go readiness gate — can confirm both consumers are
+//! and the brewery sim's pre-Go readiness gate — can confirm the consumers are
 //! actually bound and draining before trusting the stack with work.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
-/// Shared, lock-free liveness for the dispatcher's consumers. One instance is
+/// Completed phase durations, summed across concurrent events. Totals
+/// are work time, not wall time or a promise about currently stuck work.
+#[derive(Default, serde::Serialize)]
+struct RulesPhaseCosts {
+    events: u64,
+    match_nanos: u64,
+    dispatch_calls: u64,
+    dispatch_nanos: u64,
+    record_calls: u64,
+    record_rows_attempted: u64,
+    record_nanos: u64,
+}
+
+struct LaneState {
+    cutover: Option<crate::rules::delivery::Cutover>,
+    running: bool,
+    lag: Option<Result<crate::rules::lag::ConsumerLag, String>>,
+}
+
+/// Shared liveness and operational readings for the consumers. One instance is
 /// created in `main`, cloned into each consumer loop (which marks it), and
 /// cloned into the HTTP surface (which reads it for `/readyz`).
 #[derive(Default)]
 pub struct DispatcherLiveness {
-    /// `dispatcher.rs::run_loop`'s `dispatcher-steps` consumer is bound + draining.
-    assigning: AtomicBool,
-    /// Step events the assignment loop has handled since bind (monotonic).
-    assignment_events: AtomicU64,
+    delivery_lanes: std::sync::RwLock<std::collections::BTreeMap<String, LaneState>>,
+    rules_lag: std::sync::RwLock<Option<Result<crate::rules::lag::ConsumerLag, String>>>,
+    rules_costs: std::sync::Mutex<RulesPhaseCosts>,
     /// The rules runner's `dispatcher-rules` consumer is bound + draining.
     rules_running: AtomicBool,
     /// Side-effect events the rules runner has handled since bind (monotonic).
@@ -63,26 +82,140 @@ pub struct DispatcherLiveness {
 }
 
 impl DispatcherLiveness {
+    pub fn configure_delivery_lanes(&self, cutovers: &[crate::rules::delivery::Cutover]) {
+        if let Ok(mut lanes) = self.delivery_lanes.write() {
+            *lanes = cutovers
+                .iter()
+                .map(|c| {
+                    (
+                        c.lane.clone(),
+                        LaneState {
+                            cutover: Some(c.clone()),
+                            running: false,
+                            lag: None,
+                        },
+                    )
+                })
+                .collect();
+        }
+    }
+
+    /// Refused lanes remain visibly not-ready while independent consumers run.
+    pub fn configure_delivery_lane_refusals(
+        &self,
+        refused: &std::collections::BTreeMap<String, String>,
+    ) {
+        if let Ok(mut lanes) = self.delivery_lanes.write() {
+            for (name, reason) in refused {
+                lanes.insert(
+                    name.clone(),
+                    LaneState {
+                        cutover: None,
+                        running: false,
+                        lag: Some(Err(reason.clone())),
+                    },
+                );
+            }
+        }
+    }
+
+    pub fn mark_delivery_lane(&self, lane: &str, running: bool) {
+        if let Ok(mut lanes) = self.delivery_lanes.write()
+            && let Some(state) = lanes.get_mut(lane)
+        {
+            state.running = running;
+        }
+    }
+
+    pub fn record_delivery_lane_lag(
+        &self,
+        lane: &str,
+        lag: Result<crate::rules::lag::ConsumerLag, String>,
+    ) {
+        if let Ok(mut lanes) = self.delivery_lanes.write()
+            && let Some(state) = lanes.get_mut(lane)
+        {
+            state.lag = Some(lag);
+        }
+    }
+
+    fn delivery_lanes_observation(&self) -> serde_json::Value {
+        match self.delivery_lanes.read() {
+            Ok(lanes) => {
+                serde_json::json!({"capability_version":1,"supported_transports":["jetstream"],"lanes":lanes.iter().map(|(name,state)| {
+                let lag = match &state.lag {
+                    Some(Ok(value)) => value.snapshot(Self::now_unix()),
+                    Some(Err(error)) => serde_json::json!({"status":"unavailable","error":error}),
+                    None => serde_json::json!({"status":"unobserved"}),
+                };
+                (name.clone(),serde_json::json!({"cutover":state.cutover,"running":state.running,"lag":lag}))
+            }).collect::<std::collections::BTreeMap<_,_>>()})
+            }
+            Err(_) => {
+                serde_json::json!({"capability_version":1,"status":"unavailable","reason":"delivery-lane observation lock unread"})
+            }
+        }
+    }
+    pub fn record_match_cost(&self, elapsed: std::time::Duration) {
+        if let Ok(mut costs) = self.rules_costs.lock() {
+            costs.events = costs.events.saturating_add(1);
+            costs.match_nanos = costs
+                .match_nanos
+                .saturating_add(elapsed.as_nanos().try_into().unwrap_or(u64::MAX));
+        }
+    }
+
+    pub fn record_dispatch_cost(&self, elapsed: std::time::Duration) {
+        if let Ok(mut costs) = self.rules_costs.lock() {
+            costs.dispatch_calls = costs.dispatch_calls.saturating_add(1);
+            costs.dispatch_nanos = costs
+                .dispatch_nanos
+                .saturating_add(elapsed.as_nanos().try_into().unwrap_or(u64::MAX));
+        }
+    }
+
+    pub fn record_firing_cost(&self, elapsed: std::time::Duration, rows: usize) {
+        if let Ok(mut costs) = self.rules_costs.lock() {
+            costs.record_calls = costs.record_calls.saturating_add(1);
+            costs.record_rows_attempted = costs.record_rows_attempted.saturating_add(rows as u64);
+            costs.record_nanos = costs
+                .record_nanos
+                .saturating_add(elapsed.as_nanos().try_into().unwrap_or(u64::MAX));
+        }
+    }
+    pub fn record_rules_lag(&self, sample: Result<crate::rules::lag::ConsumerLag, String>) {
+        if let Ok(mut current) = self.rules_lag.write() {
+            *current = Some(sample);
+        }
+    }
+
+    fn rules_lag_snapshot(&self) -> serde_json::Value {
+        match self.rules_lag.read().ok().as_deref() {
+            Some(Some(Ok(sample))) => sample.snapshot(Self::now_unix()),
+            Some(Some(Err(error))) => serde_json::json!({"status": "unavailable", "error": error}),
+            _ => serde_json::json!({"status": "unobserved"}),
+        }
+    }
+
+    /// Health's richer operational reading. Readyz keeps its original
+    /// numbers-and-flags-only public contract.
+    pub fn observation(&self) -> serde_json::Value {
+        let mut value = self.snapshot();
+        value["rules_consumer_lag"] = self.rules_lag_snapshot();
+        value["rules_delivery_lanes"] = self.delivery_lanes_observation();
+        value["rules_phase_costs"] = self
+            .rules_costs
+            .lock()
+            .ok()
+            .map(|costs| serde_json::json!(*costs))
+            .unwrap_or(serde_json::Value::Null);
+        value
+    }
     fn now_unix() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0)
-    }
-
-    /// Called by `run_loop` once its durable consumer is bound.
-    pub fn mark_assigning(&self) {
-        self.assigning.store(true, Ordering::Relaxed);
-    }
-    /// Called by `run_loop` when its message stream ends (consumer dead).
-    pub fn mark_assign_stopped(&self) {
-        self.assigning.store(false, Ordering::Relaxed);
-    }
-    /// Called by `run_loop` per handled step event.
-    pub fn record_assignment(&self) {
-        self.assignment_events.fetch_add(1, Ordering::Relaxed);
-        self.last_event_unix
-            .store(Self::now_unix(), Ordering::Relaxed);
     }
 
     /// Called by the rules runner once its durable consumer is bound.
@@ -128,21 +261,25 @@ impl DispatcherLiveness {
             .store(Self::now_unix(), Ordering::Relaxed);
     }
 
-    /// JSON body for `/api/dispatcher/readyz`. `ready` is true only when BOTH
-    /// durable consumers are bound — the precondition for a Job to flow
-    /// step-ready → assigned → worked → side-effects → closed.
+    /// JSON body for `/api/dispatcher/readyz`. `ready` is true only when the
+    /// rules consumer and every delivery lane are bound — the precondition
+    /// for a finished step's side effects to run. (It also required the
+    /// assignment consumer until that was retired, backlog e1eaf72b: a
+    /// ready step now stands at its station until an executor pulls it.)
     pub fn snapshot(&self) -> serde_json::Value {
-        let assigning = self.assigning.load(Ordering::Relaxed);
         let rules_running = self.rules_running.load(Ordering::Relaxed);
-        // `ready` stays gated on the two JetStream consumers only — the
+        let lanes_running = self
+            .delivery_lanes
+            .read()
+            .map(|lanes| lanes.values().all(|v| v.running))
+            .unwrap_or(false);
+        // `ready` stays gated on the JetStream consumers only — the
         // schedule runner is optional (it never starts when the registry
         // has no schedule rules), so gating readiness on it would falsely
         // mark a schedule-free deployment not-ready. Its liveness is
         // reported as informational fields instead.
         serde_json::json!({
-            "ready": assigning && rules_running,
-            "assigning": assigning,
-            "assignment_events": self.assignment_events.load(Ordering::Relaxed),
+            "ready": rules_running && lanes_running,
             "rules_running": rules_running,
             "rules_events": self.rules_events.load(Ordering::Relaxed),
             "schedule_running": self.schedule_running.load(Ordering::Relaxed),
@@ -159,6 +296,16 @@ impl DispatcherLiveness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bound_consumer_is_not_evidence_of_a_measured_backlog() {
+        let live = DispatcherLiveness::default();
+        live.mark_rules_running();
+        let snapshot = live.observation();
+        assert_eq!(snapshot["rules_consumer_lag"]["status"], "unobserved");
+        assert!(snapshot["rules_consumer_lag"]["pending"].is_null());
+        assert!(snapshot["rules_consumer_lag"]["oldest_unacked_age_seconds"].is_null());
+    }
 
     /// The finding the estate chain raises on (8834804a) is "an
     /// unrecorded dead-letter happened RECENTLY", judged against the

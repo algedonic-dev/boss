@@ -1,4 +1,4 @@
-// The /ux/finance view, read off and written back to the URL (backlog
+// The /finance view, read off and written back to the URL (backlog
 // 2ab44d55, page audit 3f964c57 gap 7).
 //
 // The active tab lived in component state only, so back from an

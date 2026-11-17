@@ -55,6 +55,10 @@ async fn minimal_wires_the_required_ports_and_leaves_every_optional_one_absent()
     assert!(state.delivery.is_none());
     assert!(state.agent_budget.is_none());
     assert!(state.schema_ledger.is_none());
+    assert_eq!(
+        state.schema_read_timeout,
+        boss_jobs::schema_level::READ_TIMEOUT
+    );
     assert!(state.yard_moves.is_none());
 
     let app = router(state);

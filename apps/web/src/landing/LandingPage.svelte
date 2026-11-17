@@ -87,7 +87,7 @@
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    font-family: -apple-system, system-ui, sans-serif;
+    font-family: var(--font-body);
     font-size: 0.95rem;
   }
   .cta-link {

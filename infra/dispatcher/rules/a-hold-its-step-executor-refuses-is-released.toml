@@ -1,0 +1,40 @@
+# A nomination or claim on a step whose PINNED executor declaration
+# refuses its holder is released to the step's role audience, with an
+# `executor_refused` note naming the holder, its kind and class, and the
+# demanded executor (backlog 231cb747, conductor order 20261105_1714Z).
+#
+# THE CASE. On 2026-11-05 agent-codex held 37 of the ready/active builds
+# among the 300 newest backlog items, and Codex does not build from
+# here. Design ccfe87ff's first pass has backlog-item's build declare
+# `executor = "model:opus"`, and the claim door then refuses a robot whose
+# agents row records another class — but only at the NEXT claim. A
+# nomination is a step PUT the claim door never judges, and a claim made
+# before a packet was moved onto a declaring version stands as it was.
+#
+# THIS FILE IS THE EVENT HALF: `step.assigned.<kind>` fires on a
+# nomination and on a claim alike, so a hold the declaration refuses is
+# released the moment it is made. Its twin,
+# `a-standing-hold-its-step-executor-refuses-is-released-hourly`, sweeps
+# the open board for the residue no event announces. One handler serves
+# both; its doc says what it judges and, as plainly, what it leaves alone
+# (capacity and registry facts, a person on a role step, a packet pinned
+# to a version that declares nothing).
+[[rule]]
+name = "a-hold-its-step-executor-refuses-is-released"
+why = """
+A CROSS-PROTOCOL REACTOR, the standing exemption: the condition is any
+step, on any protocol, whose pinned `executor` refuses the actor now
+holding it, and a Workflow `on` consequence is one protocol's — no row
+can say "on every protocol, a holder my declaration refuses goes back
+to the queue". The claim door already refuses such a claim; what it
+cannot refuse is a nomination (a PUT it never judges) or a hold carried
+onto a declaring version by a convert. Measured 2026-11-05 (backlog
+231cb747): 37 builds held by an executor the next version refuses. It
+adds no routing beyond the release, which returns the step to `ready`
+and unassigned under its own authority role — the state a claim takes
+it from — and it refuses nothing and dispatches nothing.
+"""
+version = 1
+on_event = "step.assigned.*"
+[[rule.do]]
+handler = "jobs.release_executor_refused"

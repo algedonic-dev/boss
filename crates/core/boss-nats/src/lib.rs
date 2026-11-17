@@ -9,5 +9,9 @@
 
 pub mod bus;
 pub mod durable;
+// A loopback NATS wire stub for the confirmed-publish tests (backlog
+// 2e45840a); boss-events' relay test includes the same file by path.
+#[cfg(test)]
+mod nats_stub;
 
 pub use bus::NatsEventBus;

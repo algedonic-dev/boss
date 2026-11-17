@@ -46,11 +46,10 @@ pub struct DeliveryPolicyRow {
     /// rollout act after compatible writers and legacy drain are proved.
     #[serde(default = "legacy_gate_queue_owner")]
     pub gate_queue_owner: String,
-    /// How many gates `boss gate` admits at once before it refuses.
-    /// Read by the gate CLI (the number it enforces) AND by the yard
-    /// status surface (the number it draws as slots) — one source, so
-    /// the capacity a page shows is the capacity the pipeline obeys.
-    pub gate_max_concurrent: i32,
+    // NO GATE CAPACITY HERE. `gate_max_concurrent` was this row's until
+    // policy v11; since item 0a78f8f8 (factory taxonomy M2) the capacity
+    // is the `bays` of the `gates` equipment station
+    // (`crate::stations::GATES_STATION`), its one home (CLAUDE.md §9a).
     /// Optional lighter-delivery eligibility and evidence contract. Old policy
     /// versions have no such contract and retain image delivery. Consumers
     /// refuse malformed channel data to that same heavier route.
@@ -73,9 +72,9 @@ pub fn resident_gate_queue(raw: &str) -> Result<bool, String> {
 }
 
 impl DeliveryPolicyRow {
-    /// Every budget, named as its column is — the nine values the table
+    /// Every budget, named as its column is — the eight values the table
     /// CHECKs above 0.
-    pub fn budgets(&self) -> [(&'static str, i32); 9] {
+    pub fn budgets(&self) -> [(&'static str, i32); 8] {
         [
             ("max_red_trains", self.max_red_trains),
             ("stall_hours", self.stall_hours),
@@ -85,7 +84,6 @@ impl DeliveryPolicyRow {
             ("skip_reason_file_budget", self.skip_reason_file_budget),
             ("blip_cause_budget", self.blip_cause_budget),
             ("ci_host_floor_gb", self.ci_host_floor_gb),
-            ("gate_max_concurrent", self.gate_max_concurrent),
         ]
     }
 }

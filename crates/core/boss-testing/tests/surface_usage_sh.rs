@@ -23,9 +23,99 @@ const JOB_ID: &str = "0123456789abcdef";
 /// argument; here it means the roll-up or the catalog was not read.
 const CANNOT_ANSWER: i32 = 3;
 
+fn traced_curl_script() -> &'static str {
+    // No argv, URL, headers or environment dump: even a query can carry a secret.
+    r#"#!/bin/bash
+printf 'curl_start utc=%s pid=%s port=%s\n' "$EPOCHREALTIME" "$$" "$FIXTURE_CURL_PORT" >> "$FIXTURE_CURL_TRACE"
+"$FIXTURE_REAL_CURL" "$@"
+status=$?
+printf 'curl_exit utc=%s pid=%s port=%s status=%s\n' "$EPOCHREALTIME" "$$" "$FIXTURE_CURL_PORT" "$status" >> "$FIXTURE_CURL_TRACE"
+exit "$status"
+"#
+}
+
+fn admission_trace(began: std::time::Instant, port: u16, stage: &str, status: Option<u16>) {
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "fixture": "lost-ack-native-admission", "port": port, "pid": std::process::id(),
+            "thread": format!("{:?}", std::thread::current().id()), "stage": stage,
+            "elapsed_ns": began.elapsed().as_nanos(), "utc": format!("{:?}", std::time::SystemTime::now()),
+            "status": status,
+        })
+    );
+}
+
+#[test]
+fn curl_diagnostics_preserve_raw_bytes_exit_and_hide_arguments() {
+    let directory = boss_testing::scratch_dir("lost-ack-curl-trace-control");
+    let real = directory.join("real-curl");
+    boss_testing::write_exec(
+        &real,
+        r#"#!/bin/bash
+[[ $# == 3 && "$1" == 'http://user:password@fixture/private?token=do-not-record' && "$2" == '-H' && "$3" == 'Authorization: secret' ]] || exit 91
+read -r input
+[[ "$input" == 'unchanged stdin' && "$FIXTURE_PASSTHROUGH" == 'unchanged environment' ]] || exit 92
+printf '\000\377out'
+printf '\000\376err' >&2
+exit 23
+"#,
+    );
+    let wrapper = directory.join("curl");
+    boss_testing::write_exec(&wrapper, traced_curl_script());
+    let trace = directory.join("curl.trace");
+    let mut child = Command::new(&wrapper)
+        .args([
+            "http://user:password@fixture/private?token=do-not-record",
+            "-H",
+            "Authorization: secret",
+        ])
+        .env("FIXTURE_REAL_CURL", real)
+        .env("FIXTURE_CURL_TRACE", &trace)
+        .env("FIXTURE_CURL_PORT", "12345")
+        .env("FIXTURE_PASSTHROUGH", "unchanged environment")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    boss_testing::feed_stdin(&mut child, b"unchanged stdin\n");
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(23));
+    assert_eq!(output.stdout, b"\x00\xffout");
+    assert_eq!(output.stderr, b"\x00\xfeerr");
+    let events = std::fs::read_to_string(trace).unwrap_or_default();
+    assert!(
+        events.contains("curl_start"),
+        "missing curl start: {events}"
+    );
+    assert!(events.contains("curl_exit"), "missing curl exit: {events}");
+    assert!(
+        events.contains("status=23"),
+        "missing actual exit: {events}"
+    );
+    for forbidden in ["password", "token", "Authorization", "secret", "private"] {
+        assert!(!events.contains(forbidden), "argument leaked: {events}");
+    }
+}
+
+/// What a loaded gate bay may add to a call the stub ANSWERS. It rides
+/// on the open-packet read of every `packet-*` mode, the call the wrap
+/// bounds with BOSS_WRAP_MAX_TIME; longer than the 1 s that bound once
+/// was (backlog 39f5bf22).
+const ANSWER_STALL: Duration = Duration::from_millis(1500);
+
+/// What one answered stub call may take on a loaded gate bay, and so the
+/// BOSS_WRAP_MAX_TIME the packet lifecycle runs under. No stub mode
+/// leaves a call unanswered (a lost ack closes the socket), so the bound
+/// only keeps a wedged run finite and costs no test its wait.
+const FIXTURE_BUDGET: Duration = Duration::from_secs(10);
+const _: () = assert!(ANSWER_STALL.as_millis() < FIXTURE_BUDGET.as_millis());
+
 const STUB: &str = r#"
-import http.server, json, sys, socket
+import http.server, json, os, sys, socket, time
 log, started, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+answer_stall = float(os.environ["ANSWER_STALL_SECS"])
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.bind(("127.0.0.1", 0))
 port = sock.getsockname()[1]
@@ -35,7 +125,13 @@ ROLLUP = {"since": "2026-09-16T05:30:00Z", "until": "2026-09-17T05:30:00Z", "row
   {"actor_id": "emp-david", "route": "/ux/jobs/:jobId", "opens": 3, "last_at": "2026-09-17T00:30:00Z"},
   {"actor_id": "emp-032", "route": "/ux/me", "opens": 2, "last_at": "2026-09-16T09:00:00Z"}
 ]}
+if mode.startswith("packet-") and mode != "packet-rerun-existing":
+    OPEN = {"data": [], "total": 0}
+if mode == "packet-rerun-existing":
+    OPEN["data"][0]["metadata"]["unit_invocation_id"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 class H(http.server.BaseHTTPRequestHandler):
+    packet_reads = 0
+    packet_posts = 0
     def log_message(self, *a): pass
     def _reply(self, code, body=b"{}"):
         self.send_response(code); self.send_header("content-type", "application/json")
@@ -50,16 +146,73 @@ class H(http.server.BaseHTTPRequestHandler):
                 self._reply(400, b'{"error":"since and until are required"}')
             else:
                 self._reply(200, json.dumps(ROLLUP).encode())
+        elif self.path.startswith("/api/jobs/"):
+            if mode == "packet-empty-after-ack":
+                self._reply(200, b"")
+            elif mode == "packet-unread-after-ack":
+                self._reply(503)
+            else:
+                found = next((j for j in OPEN["data"] if j["id"] == self.path.rsplit("/", 1)[-1]), None)
+                if found and mode == "packet-mismatch-after-ack":
+                    found = dict(found, title="a different admission body")
+                if found and mode == "packet-foreign-id-after-ack":
+                    found = dict(found, id="ffffffff-ffff-4fff-afff-ffffffffffff")
+                if found and mode == "packet-foreign-subject-after-ack":
+                    found = dict(found, subject={"subject_kind":"custom", "id":"infra/foreign"})
+                if found and mode == "packet-foreign-kind-after-ack":
+                    found = dict(found, kind="maintenance-foreign")
+                if found and mode == "packet-foreign-metadata-after-ack":
+                    found = dict(found, metadata=dict(found["metadata"], chore="foreign"))
+                if found and mode == "packet-missing-owner-after-ack":
+                    found = {k:v for k,v in found.items() if k != "owner_id"}
+                if found and mode == "packet-missing-status-after-ack":
+                    found = {k:v for k,v in found.items() if k != "status"}
+                self._reply(200 if found else 404, json.dumps(found or {}).encode())
         elif self.path.startswith("/api/jobs"):
-            self._reply(200, json.dumps(OPEN).encode())
+            type(self).packet_reads += 1
+            if mode.startswith("packet-"):
+                time.sleep(answer_stall)
+            if mode == "packet-permanent" or (mode == "packet-recover" and type(self).packet_reads == 1) or (mode == "packet-unread-after-ack" and type(self).packet_posts):
+                self._reply(503)
+            else:
+                self._reply(200, json.dumps(OPEN).encode())
         else:
             self._reply(404, b'{"error":"no such route"}')
     def do_POST(self):
         n = int(self.headers.get("content-length", "0"))
-        self.rfile.read(n)
+        body = self.rfile.read(n)
         with open(log, "ab") as f:
             f.write(b"POST " + self.path.encode() + b"\n")
-        if self.path == "/api/surface-opens/sweep":
+        if self.path == "/api/jobs":
+            type(self).packet_posts += 1
+            sent = json.loads(body)
+            with open(log, "ab") as f:
+                f.write(b"ADMIT " + json.dumps(sent, separators=(",", ":")).encode() + b"\n")
+            if mode == "packet-post-permanent" or (mode == "packet-post-recover" and type(self).packet_posts == 1):
+                self._reply(503)
+                return
+            key = sent.get("id", "0123456789abcdef")
+            old = next((j for j in OPEN["data"] if j["id"] == key), None)
+            if old:
+                same = all(old.get(k) == v for k, v in sent.items())
+                self._reply(200 if same else 409, json.dumps({"id": key, "already_admitted": same}).encode())
+                return
+            stored = dict(sent, id=key)
+            # Admission resolves a non-roster owner, and the protocol may
+            # move status before a lost ACK is read back. Echoing the
+            # request here would conceal the real admission contract.
+            if mode in ("packet-normalized-owner-after-ack", "packet-normalized-both-after-ack"):
+                stored["owner_id"] = "emp-resolved-admin"
+            if mode in ("packet-normalized-status-after-ack", "packet-normalized-both-after-ack"):
+                stored["status"] = "closed"
+            OPEN["data"].append(stored)
+            OPEN["total"] = len(OPEN["data"])
+            if mode in ("packet-lost-ack", "packet-unread-after-ack", "packet-mismatch-after-ack", "packet-empty-after-ack", "packet-normalized-owner-after-ack", "packet-normalized-status-after-ack", "packet-normalized-both-after-ack", "packet-foreign-id-after-ack", "packet-foreign-subject-after-ack", "packet-foreign-kind-after-ack", "packet-foreign-metadata-after-ack", "packet-missing-owner-after-ack", "packet-missing-status-after-ack"):
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.connection.close()
+                return
+            self._reply(201, json.dumps({"id": key}).encode())
+        elif self.path == "/api/surface-opens/sweep":
             if mode == "sweep-down":
                 self._reply(500, b'{"error":"storage: boom"}')
             else:
@@ -75,6 +228,9 @@ class H(http.server.BaseHTTPRequestHandler):
             line = b"NOT JSON: " + repr(e).encode()
         with open(log, "ab") as f:
             f.write(b"PATCH " + self.path.encode() + b"\n" + line + b"\n")
+        for packet in OPEN["data"]:
+            if self.path == "/api/jobs/" + packet["id"] + "/metadata":
+                packet.setdefault("metadata", {}).update(json.loads(body))
         self._reply(204, b"")
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H, bind_and_activate=False)
 srv.socket.close(); srv.socket = sock; srv.server_address = sock.getsockname(); srv.server_activate()
@@ -152,6 +308,7 @@ fn start_stub(case: &str, mode: &str) -> Stub {
         .arg(&log)
         .arg(&started)
         .arg(mode)
+        .env("ANSWER_STALL_SECS", ANSWER_STALL.as_secs_f64().to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
@@ -468,4 +625,613 @@ fn a_failed_sweep_still_files_the_reading_and_exits_nonzero() {
         out.contains("NOT swept"),
         "the headline says so too:\n{out}"
     );
+}
+
+// Drive both actual unit programs. A wrapper's deliberate exit0 on a
+// visibility miss is not success when the collector then loses its record.
+fn packet_lifecycle(stub: &Stub, opt_in: bool) -> (std::process::Output, String) {
+    packet_lifecycle_with_ledger(stub, opt_in, false)
+}
+
+fn packet_lifecycle_with_ledger(
+    stub: &Stub,
+    opt_in: bool,
+    ledger: bool,
+) -> (std::process::Output, String) {
+    let launch = stub.log.with_extension("lifecycle.sh");
+    boss_testing::write_file(
+        &launch,
+        &format!(
+            "#!/usr/bin/env bash\nbash '{}' maintenance-surface-usage 'Surface usage'\nbash '{}' file --repo '{}'\n",
+            repo_root().join("infra/boss-maintenance-wrap.sh").display(),
+            script().display(),
+            repo_root().display()
+        ),
+    );
+    let home = stub.log.with_extension("home");
+    boss_testing::create_dir(&home);
+    let mut command = Command::new("bash");
+    command
+        .arg(&launch)
+        .env("BOSS_JOBS_URL", format!("http://127.0.0.1:{}", stub.port))
+        .env("BOSS_WRAP_MAX_TIME", FIXTURE_BUDGET.as_secs().to_string())
+        .env("BOSS_API_RETRY_DEADLINE", "0")
+        .env("HOME", &home)
+        .env("KUBERNETES_SERVICE_HOST", "fixture")
+        .env_remove("BOSS_NODE_ID")
+        .env_remove("HOST_ID")
+        .env_remove("INVOCATION_ID");
+    if ledger {
+        command
+            .env_remove("KUBERNETES_SERVICE_HOST")
+            .env("HOST_ID", "fixture");
+        let ledger_dir = home.join(".boss-maintenance-unrecorded");
+        boss_testing::create_dir(&ledger_dir);
+        boss_testing::write_file(
+            &ledger_dir.join("maintenance-surface-usage@fixture.jsonl"),
+            "{\"id\":\"older-unrecorded\",\"at\":\"2026-10-24T00:00:00Z\",\"why\":\"original visibility failure\"}\n",
+        );
+    }
+    if opt_in {
+        command
+            .env("BOSS_WRAP_OPEN_RETRY", "3")
+            .env("INVOCATION_ID", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .env("BOSS_WRAP_OPEN_RETRY_WAIT", "0");
+    } else {
+        command
+            .env_remove("BOSS_WRAP_OPEN_RETRY")
+            .env_remove("BOSS_WRAP_OPEN_RETRY_WAIT");
+    }
+    let out = without_proxy(&mut command).output().unwrap();
+    let calls = std::fs::read_to_string(&stub.log).unwrap();
+    (out, calls)
+}
+
+#[test]
+fn a_packet_open_read_failure_does_not_lose_the_actual_surface_reading() {
+    let stub = start_stub("packet-recover", "packet-recover");
+    let (out, calls) = packet_lifecycle(&stub, true);
+    assert!(
+        out.status.success(),
+        "actual collector failed after wrapper: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        calls.lines().filter(|l| *l == "POST /api/jobs").count(),
+        1,
+        "{calls}"
+    );
+    assert!(
+        calls.contains("PATCH /api/jobs/"),
+        "reading was never filed: {calls}"
+    );
+    assert!(
+        calls.contains("\"opens\":12"),
+        "whole measured row missing: {calls}"
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|l| l.starts_with("GET /api/surface-opens/rollup"))
+            .count(),
+        1,
+        "collector recomputed during packet retry: {calls}"
+    );
+}
+
+#[test]
+fn a_permanent_packet_open_failure_is_bounded_and_keeps_the_whole_reading() {
+    let stub = start_stub("packet-permanent", "packet-permanent");
+    let started = std::time::Instant::now();
+    let (out, calls) = packet_lifecycle(&stub, true);
+    assert!(!out.status.success());
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "fixture retry never ended"
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|l| l.starts_with("GET /api/jobs?"))
+            .count(),
+        4,
+        "three bounded wrapper reads plus collector read: {calls}"
+    );
+    assert!(!calls.contains("POST /api/jobs"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("NOT filed") && err.contains("\"complete\": true"),
+        "full refusal/row missing: {err}"
+    );
+}
+
+#[test]
+fn a_lost_packet_create_ack_reads_back_the_same_id_without_a_duplicate() {
+    let stub = start_stub("packet-lost-ack", "packet-lost-ack");
+    let (out, calls) = packet_lifecycle(&stub, true);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sent: Vec<serde_json::Value> = calls
+        .lines()
+        .filter_map(|l| l.strip_prefix("ADMIT "))
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        sent.len(),
+        1,
+        "unknown ACK must not mint another packet: {calls}"
+    );
+    let id = sent[0]["id"]
+        .as_str()
+        .expect("opt-in creates under one stable caller UUID");
+    assert!(
+        calls.contains(&format!("GET /api/jobs/{id}\n")),
+        "unknown ACK never read its exact identity: {calls}"
+    );
+    assert!(
+        calls.contains(&format!("PATCH /api/jobs/{id}/metadata\n")),
+        "collector did not file original reading: {calls}"
+    );
+}
+
+#[test]
+fn a_lost_ack_confirms_the_server_resolved_owner_and_protocol_status() {
+    for mode in [
+        "packet-lost-ack",
+        "packet-normalized-owner-after-ack",
+        "packet-normalized-status-after-ack",
+        "packet-normalized-both-after-ack",
+    ] {
+        let stub = start_stub(mode, mode);
+        let (out, calls) = packet_lifecycle(&stub, true);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{mode}: {stdout}\n{stderr}\n{calls}");
+        assert!(
+            stdout.contains("spawned today's"),
+            "{mode}: an admitted packet was falsely refused: {stdout}\n{stderr}\n{calls}"
+        );
+        assert!(
+            !stderr.contains("packet create acknowledgement is unread or differs"),
+            "{mode}: {stderr}"
+        );
+        let admissions: Vec<serde_json::Value> = calls
+            .lines()
+            .filter_map(|line| line.strip_prefix("ADMIT "))
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(admissions.len(), 1, "no duplicate POST: {mode}: {calls}");
+        let id = admissions[0]["id"].as_str().unwrap();
+        assert!(calls.contains(&format!("GET /api/jobs/{id}\n")), "{calls}");
+    }
+}
+
+#[test]
+fn a_lost_ack_never_confirms_a_foreign_identity_subject_or_metadata() {
+    for mode in [
+        "packet-foreign-id-after-ack",
+        "packet-foreign-subject-after-ack",
+        "packet-foreign-kind-after-ack",
+        "packet-foreign-metadata-after-ack",
+        "packet-missing-owner-after-ack",
+        "packet-missing-status-after-ack",
+    ] {
+        let stub = start_stub(mode, mode);
+        let (out, calls) = packet_lifecycle(&stub, true);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| *line == "POST /api/jobs")
+                .count(),
+            1,
+            "{mode}: {calls}"
+        );
+        assert!(
+            stderr.contains(
+                "packet create acknowledgement is unread or differs; no duplicate was sent"
+            ),
+            "{mode}: {stderr}"
+        );
+        assert!(!stdout.contains("spawned today's"), "{mode}: {stdout}");
+    }
+}
+
+/// Use the real admission handler and the shipped Workflow, not an echo
+/// server: the POST commits with a resolved owner, its ACK is lost, and
+/// the wrapper must judge the native GET representation without a resend.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_ack_confirms_actual_native_admission_with_a_resolved_timer_owner() {
+    use axum::response::IntoResponse;
+    use axum::serve::ListenerExt;
+    use boss_core::{port::EventBus, publisher::DomainPublisher};
+    use boss_jobs::{
+        InMemoryJobs, InMemoryWorkflows, JobsRepository, WorkflowRegistry,
+        http::{JobsApiState, router},
+        owner_resolution::RosterLookup,
+    };
+    use boss_policy_client::{Action, FakePolicyClient, Resource, Scope};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU16, AtomicUsize, Ordering},
+    };
+
+    struct Roster;
+    #[async_trait::async_trait]
+    impl RosterLookup for Roster {
+        async fn active_holders(&self, role: &str) -> Result<Vec<String>, String> {
+            Ok(if role == "platform-admin" {
+                vec!["emp-resolved-admin".into()]
+            } else {
+                vec![]
+            })
+        }
+        async fn is_active_employee(&self, id: &str) -> Result<bool, String> {
+            // A tenant CAN have an active bootstrap employee. The
+            // opt-in request must still use its explicit machine owner.
+            Ok(matches!(id, "emp-bootstrap-admin" | "emp-resolved-admin"))
+        }
+    }
+
+    let registry = Arc::new(InMemoryWorkflows::for_fixture());
+    let specifications = boss_jobs::seed_loader::load_workflows(
+        repo_root().join("infra/platform/workflows/maintenance-surface-usage.toml"),
+    )
+    .unwrap();
+    for spec in specifications {
+        registry.seed(spec).unwrap();
+    }
+    let jobs = Arc::new(InMemoryJobs::new());
+    let bus = boss_testing::RecordingEventBus::new();
+    let events: Arc<dyn EventBus> = bus.clone();
+    let policy = Arc::new(
+        FakePolicyClient::builder()
+            .allow(
+                "platform-admin",
+                Action::Create,
+                Resource::job(),
+                Scope::All,
+            )
+            .allow("platform-admin", Action::Read, Resource::job(), Scope::All)
+            .build(),
+    );
+    let state = JobsApiState {
+        kind_registry: Some(registry as Arc<dyn WorkflowRegistry>),
+        roster: Some(Arc::new(Roster)),
+        ..JobsApiState::minimal(
+            jobs.clone(),
+            bus,
+            DomainPublisher::new(events, "jobs"),
+            policy,
+            Arc::new(boss_clock_client::WallClockClient),
+        )
+    };
+    let began = std::time::Instant::now();
+    let trace_port = Arc::new(AtomicU16::new(0));
+    let posts = Arc::new(AtomicUsize::new(0));
+    let requests = posts.clone();
+    let native = router(state);
+    let middleware_port = trace_port.clone();
+    let app = native.clone().layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let posts = posts.clone();
+            let trace_port = middleware_port.clone();
+            async move {
+                let port = trace_port.load(Ordering::Relaxed);
+                admission_trace(began, port, "middleware_entry", None);
+                let method = match request.method().as_str() { "GET" => "GET", "POST" => "POST", _ => "other" };
+                let route = match request.uri().path() {
+                    "/api/jobs" => "/api/jobs",
+                    path if path.starts_with("/api/jobs/") => "/api/jobs/:id",
+                    _ => "other",
+                };
+                eprintln!("{}", serde_json::json!({"fixture": "lost-ack-native-admission", "port": port, "method": method, "route": route}));
+                let admission = request.method() == axum::http::Method::POST
+                    && request.uri().path() == "/api/jobs";
+                let response = next.run(request).await;
+                admission_trace(began, port, "native_response_decision", Some(response.status().as_u16()));
+                if admission {
+                    posts.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+                    admission_trace(began, port, "injected_lost_ack", Some(503));
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "ACK lost after admission",
+                    )
+                        .into_response()
+                } else {
+                    response
+                }
+            }
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    // Label observations without moving bind/spawn or adding a readiness barrier.
+    trace_port.store(port, Ordering::Relaxed);
+    admission_trace(began, port, "listener_bound", None);
+    eprintln!(
+        "lost-ack fixture port={port} runtime_workers={}",
+        tokio::runtime::Handle::current().metrics().num_workers()
+    );
+    let listener = listener.tap_io(move |_| admission_trace(began, port, "accept", None));
+    let server = tokio::spawn(async move {
+        admission_trace(began, port, "server_task_entry", None);
+        axum::serve(listener, app).await.unwrap()
+    });
+    let output = tokio::task::spawn_blocking(move || {
+        let directory = boss_testing::scratch_dir("lost-ack-native-admission-trace");
+        let real = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|path| path.join("curl")).find(|path| path.is_file()).unwrap();
+        boss_testing::write_exec(&directory.join("curl"), traced_curl_script());
+        let trace = directory.join("curl.trace");
+        let mut paths = vec![directory.clone()];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        let result = without_proxy(&mut Command::new("bash"))
+            .arg(repo_root().join("infra/boss-maintenance-wrap.sh"))
+            .args(["maintenance-surface-usage", "Surface usage"])
+            .env("BOSS_JOBS_URL", base)
+            .env("BOSS_WRAP_OPEN_RETRY", "3")
+            .env("BOSS_WRAP_OPEN_RETRY_WAIT", "0")
+            .env("BOSS_API_RETRY_DEADLINE", "0")
+            .env("KUBERNETES_SERVICE_HOST", "fixture")
+            .env("INVOCATION_ID", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("FIXTURE_REAL_CURL", real)
+            .env("FIXTURE_CURL_TRACE", &trace)
+            .env("FIXTURE_CURL_PORT", port.to_string())
+            .env_remove("BOSS_NODE_ID")
+            .env_remove("HOST_ID")
+            .output()
+            .unwrap();
+        // Preserve native bytes before ANY jobs/owner/status assertion can panic.
+        std::fs::write(directory.join("child.stdout"), &result.stdout).unwrap();
+        std::fs::write(directory.join("child.stderr"), &result.stderr).unwrap();
+        admission_trace(began, port, "wrapper_exit", result.status.code().and_then(|n| n.try_into().ok()));
+        eprintln!("lost-ack fixture port={port} raw_directory={directory:?} status={} stdout={:?} stderr={:?} curl_trace={:?}", result.status, result.stdout, result.stderr, std::fs::read_to_string(trace));
+        result
+    })
+    .await
+    .unwrap();
+    server.abort();
+    let _ = server.await;
+    admission_trace(began, port, "server_joined", None);
+    let (packets, total) = jobs
+        .list_jobs(&boss_jobs::port::JobFilter::default(), 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].owner_id, "emp-resolved-admin");
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "no second POST");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("spawned today's"), "{stdout}\n{stderr}");
+    assert!(!stderr.contains("UNRECORDED RUN"), "{stderr}");
+    println!(
+        "NATIVE_ADMISSION posts=1 packets=1 resolved_owner={} confirmed=true",
+        packets[0].owner_id
+    );
+
+    // The canonical exception is conditional: a requested active person
+    // stays caller-owned, so a different active owner is a collision.
+    use tower::ServiceExt;
+    let mut body = serde_json::json!({
+        "id": "18181818-1818-4818-a818-181818181818",
+        "kind": "maintenance-surface-usage",
+        "subject": {"subject_kind": "custom", "id": "infra/maintenance-surface-usage"},
+        "title": "Active human owner control",
+        "owner_id": "emp-bootstrap-admin",
+        "priority": "standard", "status": "open",
+        "metadata": {"chore": "maintenance-surface-usage"}, "tags": ["maintenance"]
+    });
+    for expected in [201, 200, 409, 422] {
+        if expected == 409 {
+            body["owner_id"] = "emp-resolved-admin".into();
+        }
+        if expected == 422 {
+            body.as_object_mut().unwrap().remove("owner_id");
+        }
+        let response = native.clone().oneshot(
+            axum::http::Request::builder()
+                .method("POST").uri("/api/jobs")
+                .header("content-type", "application/json")
+                .header("x-boss-user", r#"{"id":"automation:maintenance-timer","role":"platform-admin","access_tier":"operator"}"#)
+                .body(axum::body::Body::from(body.to_string())).unwrap()
+        ).await.unwrap();
+        assert_eq!(response.status().as_u16(), expected);
+    }
+}
+
+#[test]
+fn an_unread_create_ack_is_not_reposted_or_called_recorded() {
+    let stub = start_stub("packet-unread-after-ack", "packet-unread-after-ack");
+    let (out, calls) = packet_lifecycle(&stub, true);
+    assert!(!out.status.success());
+    assert_eq!(
+        calls.lines().filter(|l| *l == "POST /api/jobs").count(),
+        1,
+        "uncertain readback must not mint another UUID: {calls}"
+    );
+    assert!(!calls.contains("PATCH /api/jobs/"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("NOT filed"));
+}
+
+#[test]
+fn other_maintenance_callers_keep_the_existing_single_attempt_behavior() {
+    let stub = start_stub("packet-default", "packet-recover");
+    let (out, calls) = packet_lifecycle(&stub, false);
+    assert!(!out.status.success());
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|l| l.starts_with("GET /api/jobs?"))
+            .count(),
+        2,
+        "default wrapper changed: {calls}"
+    );
+    assert!(!calls.contains("POST /api/jobs"));
+}
+
+#[test]
+fn a_default_packet_keeps_its_legacy_owner_and_server_allocated_identity() {
+    let stub = start_stub("packet-default-open", "packet-default-open");
+    let (out, calls) = packet_lifecycle(&stub, false);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let admissions: Vec<serde_json::Value> = calls
+        .lines()
+        .filter_map(|line| line.strip_prefix("ADMIT "))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(admissions.len(), 1);
+    assert_eq!(admissions[0]["owner_id"], "emp-bootstrap-admin");
+    assert!(admissions[0].get("id").is_none());
+}
+
+#[test]
+fn an_opt_in_unknown_ack_preserves_the_original_carried_rows_as_possibly_recorded() {
+    let stub = start_stub("ledger-unknown-ack", "packet-unread-after-ack");
+    let (out, calls) = packet_lifecycle_with_ledger(&stub, true, true);
+    assert!(!out.status.success());
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| *line == "POST /api/jobs")
+            .count(),
+        1
+    );
+    let ledger = stub
+        .log
+        .with_extension("home")
+        .join(".boss-maintenance-unrecorded/maintenance-surface-usage@fixture.jsonl");
+    let rows = std::fs::read_to_string(ledger).unwrap();
+    let original: serde_json::Value = rows
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|r| r["id"] == "older-unrecorded")
+        .unwrap();
+    assert_eq!(original["why"], "original visibility failure");
+    assert!(
+        original["possibly_recorded_at"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "a committed-but-unread create cannot return the carried row as never sent: {original}"
+    );
+}
+
+#[test]
+fn a_transient_create_failure_retries_the_exact_same_caller_packet_after_absence_readback() {
+    let stub = start_stub("post-recovery", "packet-post-recover");
+    let (out, calls) = packet_lifecycle(&stub, true);
+    assert!(
+        out.status.success(),
+        "{}\n{calls}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let admitted: Vec<serde_json::Value> = calls
+        .lines()
+        .filter_map(|line| line.strip_prefix("ADMIT "))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(admitted.len(), 2);
+    assert_eq!(admitted[0], admitted[1], "never change ID or body on retry");
+    let id = admitted[0]["id"].as_str().unwrap();
+    assert!(calls.contains(&format!("GET /api/jobs/{id}\n")));
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|l| l.starts_with("GET /api/surface-opens/rollup?"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_permanent_create_failure_stops_at_the_declared_bound_and_retains_the_reading() {
+    let stub = start_stub("post-permanent", "packet-post-permanent");
+    let (out, calls) = packet_lifecycle(&stub, true);
+    assert!(!out.status.success());
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| *line == "POST /api/jobs")
+            .count(),
+        3,
+        "bounded identical admission attempts: {calls}"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("recorded nothing"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("\"complete\": true"));
+}
+
+#[test]
+fn a_mismatched_create_readback_is_not_reposted_or_called_a_confirmed_admission() {
+    let stub = start_stub("mismatch-ack", "packet-mismatch-after-ack");
+    let (out, calls) = packet_lifecycle(&stub, true);
+    // Visibility refusal must not stop the actual collector's work. The
+    // wrapper cannot call the mismatched admission confirmed, even when
+    // the collector can subsequently file a real reading on the open row.
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| *line == "POST /api/jobs")
+            .count(),
+        1
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("packet create acknowledgement is unread or differs; no duplicate was sent")
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("spawned today's"));
+}
+
+#[test]
+fn an_empty_successful_create_readback_is_not_a_confirmed_admission() {
+    let stub = start_stub("empty-ack", "packet-empty-after-ack");
+    let (out, calls) = packet_lifecycle(&stub, true);
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| *line == "POST /api/jobs")
+            .count(),
+        1
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("packet create acknowledgement is unread or differs; no duplicate was sent")
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("spawned today's"));
+}
+
+#[test]
+fn an_existing_packet_keeps_its_creation_identity_when_a_fresh_reading_is_filed() {
+    let stub = start_stub("existing-reading", "packet-rerun-existing");
+    let (out, calls) = packet_lifecycle(&stub, true);
+    assert!(
+        out.status.success(),
+        "{}\n{calls}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!calls.contains("POST /api/jobs\n"));
+    let patches = stub.patches();
+    assert_eq!(patches.len(), 1);
+    assert_eq!(
+        patches[0].1["reading_invocation_id"],
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
+    assert!(
+        patches[0].1.get("unit_invocation_id").is_none(),
+        "creation identity is not overwritten"
+    );
+    assert_eq!(patches[0].1["coverage"]["complete"], true);
+    assert_eq!(patches[0].1["measured"]["opens"], 12);
 }

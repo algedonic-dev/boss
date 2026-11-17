@@ -145,7 +145,10 @@ impl Tree {
                 self.dir.join("receipt.json").to_str().expect("utf8"),
             )
             .env("GIT_CEILING_DIRECTORIES", "")
-            .env_remove("BOSS_ESTATE");
+            .env_remove("BOSS_ESTATE")
+            // Nor BOSS_TRUNK=none (backlog 2d28df78): these cases are about
+            // the gate's own annotations, not a declaration's.
+            .env_remove("BOSS_TRUNK");
         match actions {
             Some(v) => cmd.env("GITHUB_ACTIONS", v),
             None => cmd.env_remove("GITHUB_ACTIONS"),

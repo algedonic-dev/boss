@@ -1,0 +1,75 @@
+# ---------------------------------------------------------------------------
+# build — where a change is built: the backlog items waiting at their
+# `build` step, and the robots that build them.
+#
+# WHY (backlog b5c815e4, design 52613d21 row 1, approved by David
+# 2026-11-09). Measured 2026-11-09 19:22Z on GET /api/claims: every
+# robots:opus and robots:sol builder claim stood at
+# `a.platform-admin.opus-5-5`, a per-executor address with no parent, so
+# no station of the tree held the robot slots and nothing could read how
+# many builders the factory seats or whether they starve. David, the same
+# day: "Which station are builders using right now to build? Because that
+# is really where the resource allocation of the building slots needs to
+# be made." This row is that station. Design 506e0a1c seats executors at
+# it (car 9fb46266 seats agent-codex and agent-claude-b here), and the
+# dispatcher rule of backlog 9dbac3e7 reads its queue against the gates'
+# bays.
+#
+# A GENERIC station of the tree, standing, under /algedonic/engineering
+# (station-tree.md section 1: "Engineering makes the change ... and the
+# workspaces where robots build"). What its parent allocates to it:
+#
+#   - every robot pool, whole: robots:opus and robots:sol, read off their
+#     rows (infra/platform/pools/robots:*.toml). Engineering's robots
+#     build (station-tree.md section 3), and today every robot claim is a
+#     builder's. The slot counts are the pool rows' tunables; the tree's
+#     allocation rule (validate_station_tree) refuses this row if a pool
+#     is published below what it holds here.
+#   - NOT YET its share of host:w-1. A builder's vCPU is placed today in
+#     the FLOATING share of agent-run's owner, engineering: its 28 less
+#     what the stations standing in it reserve (flow_resources.rs
+#     `floating_shares`, read at the claim door since backlog 5608c1a2).
+#     The dev pod's 16 is exactly that float, so reserving it here would
+#     leave engineering floating 0 and refuse every builder's claim —
+#     a_run_floats_in_its_owners_share_of_the_build_node (tests/
+#     workflow_resources.rs) went red on the first draft that did. The
+#     share moves here in the car that makes the claim at this station
+#     (ask part 2 of b5c815e4), when the claim door reads build's share.
+#
+# SEATS ARE THE ROBOT SLOTS IT HOLDS (6 + 4), held equal by
+# the_build_station_stands_under_engineering_and_seats_the_robot_slots_it_holds.
+#
+# Version 3 (backlog 5b103bfa; bumped from the LIVE newest, v2):
+# robots:sol 2 -> 4 and capacity 8 -> 10, holding robots:sol v2 (capacity
+# 4, published 2026-11-16 03:31Z) whole, as engineering v6 does. The
+# shared dev-build worker-volume budget (6) still bounds the total of
+# concurrent runs. Nothing else changed.
+#
+# Its queue is the default admission queue, priority then age, over the
+# open backlog items whose `build` step is ready or being worked.
+#
+# It is placed by its `parent` (backlog 53abeb8d). The retired department
+# label is removed with its floor reader (backlog aa82eb11).
+# To change this station, bump `version`.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "build"
+version = 3
+status = "active"
+title = "Build — changes waiting for a builder or being built"
+kind = "group"
+discipline = ["priority", "age"]
+id = "0409a62b-1022-4b1a-8507-a1522171d71b"
+parent = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5"
+mode = "standing"
+capacity = 10
+allocation = { "robots:opus" = 6, "robots:sol" = 4 }
+
+[station.predicate]
+kind = "backlog-item"
+status = "open"
+
+[station.predicate.step]
+slug = "build"
+status_in = ["ready", "active"]

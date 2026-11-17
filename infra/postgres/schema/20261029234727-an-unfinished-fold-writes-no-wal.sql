@@ -1,0 +1,24 @@
+-- 20261029234727-an-unfinished-fold-writes-no-wal.sql — an unfinished
+-- membership fold's storage is unlogged.
+--
+-- Origin: backlog b6e1d969 (David approved 2026-10-29, #1 of the drive
+-- analysis on d9b39685). PostgreSQL's data and WAL share one Longhorn
+-- volume on the control-plane system disks that also carry etcd, and a
+-- WAL fsync there measured about 90 ms mean with stalls of seconds. Every
+-- refresh flight that pauses its fold saves a build of about 100 MB into
+-- these chunks, and each saved byte was written twice: to WAL, and again
+-- to the heap. Measured on PostgreSQL 16 by the store test
+-- an_unfinished_fold_save_writes_its_bytes_to_no_wal: a 2,511,466-byte
+-- build wrote 1,095,346 bytes of WAL; unlogged, it writes none.
+--
+-- The rows are disposable progress, never a served generation and never a
+-- fact: a pure function of audit_log at the build's own fixed cut
+-- (20261029015000-membership-fold-builds.sql). A crash truncates an
+-- unlogged table, so the next flight finds no saved fold and folds cold,
+-- which is exactly what it does today when no fold was saved. A standby
+-- does not receive the rows, for the same reason it does not need them.
+--
+-- The chunks reference the headers, and a logged table may not reference
+-- an unlogged one, so the chunks change first.
+ALTER TABLE membership_fold_build_chunks SET UNLOGGED;
+ALTER TABLE membership_fold_builds SET UNLOGGED;

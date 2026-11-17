@@ -15,6 +15,11 @@
 # check-declared.sh reports it ABSENT. (A /var/mnt/gate kubelet mount
 # was declared beside it first and withdrawn by review a79746c6 — see
 # the extraMounts comment below.)
+#
+# The THIRD document (UserVolumeConfig `scratch`, the Kingston as the
+# Longhorn scratch disk) was declared 2026-11-12 (backlog 46328c3a,
+# design 3c475a19 car 2), likewise before it was live: it reads ABSENT
+# until node-converge applies it, narrowed to that one document.
 machine:
   # The gate seed's directory: a local PersistentVolume
   # (infra/cluster/manifests/gate-seed-local.yaml) refuses a path that
@@ -61,6 +66,26 @@ machine:
       # pod decides whether that suffices. If it does not, the entry
       # comes back in a car of its own, beside the gate's refusal to run
       # on EPHEMERAL (infra/gate-runner/run.sh).
+    # THE IMAGE-GC PAIR (backlog 67e98635), declared to be APPLIED, not as
+    # found. Read 2026-10-19 14:56Z by node-disk-usage (ops-request
+    # c4331d4a): nodefs 928.9 GiB, 231.2 available; imagefs used 535.2
+    # GiB, nearly all of it boss-ci images no container uses (the Node
+    # lists only its 50 newest; one per train). Longhorn's default disk
+    # is /var/lib/longhorn on this same filesystem, and Longhorn stops
+    # placing replicas on it below 25% available (232.2 GiB) — while the
+    # kubelet, with no pair declared, collects images only at its default
+    # 85% used. Between 75% and 85% nothing reclaims and no volume can be
+    # placed: every dev-build worker's volume provisioned and never got a
+    # replica. At 50% used the kubelet removes images no container uses,
+    # least recently used first, down to 40%; it never removes one a
+    # running container uses, and the cost is a re-pull from the forge on
+    # the LAN. The pair is w-2's (666e0570) and cp-1/cp-3's: it holds w-2
+    # at 44.6% used (ops-request 9984007c, the same morning). It reaches
+    # w-1 through node-converge's NARROWED patch (9cf1673d): the list
+    # entries above are live, so only the entries ABSENT live are applied.
+    extraConfig:
+      imageGCHighThresholdPercent: 50
+      imageGCLowThresholdPercent: 40
   # Every image the cluster runs is pulled through the forge's registry
   # (infra/forge; plain http on the LAN).
   registries:
@@ -68,6 +93,17 @@ machine:
       10.20.0.15:3000:
         endpoints:
           - http://10.20.0.15:3000
+  # THE LONGHORN TAG (backlog e14a472d): this node's disks may hold a
+  # dev-build worker's replica. The volume class longhorn-dev-build
+  # (infra/cluster/manifests/boss-dev.yaml) selects Longhorn nodes tagged
+  # dev-build, because the class before it placed a replica on any disk
+  # with room, a control plane's system disk among them. Longhorn copies
+  # this annotation into the node's tags only while its tag list is empty
+  # (all five nodes read tags=[] on 2026-10-29); a node tagged since by
+  # another hand keeps its tags, which nodes.longhorn.io spec.tags shows.
+  # No control plane declares it.
+  nodeAnnotations:
+    node.longhorn.io/default-node-tags: '["dev-build"]'
 ---
 # THE GATE VOLUME — w-1's second NVMe, ALL of it, one xfs filesystem
 # that Talos mounts at /var/mnt/gate (a user volume is mounted at
@@ -89,7 +125,27 @@ machine:
 # the running root from nvme0n1p2 to nvme1n1p2
 # (infra/cluster/manifests/gate-seed-local.yaml). Not the system disk,
 # NVMe, larger than 500 GB — the install disk is excluded by the first
-# term and a USB stick or small SSD by the other two. If no disk
+# term and a USB stick or small SSD by the other two. The fourth term
+# keeps OUT the KINGSTON SNV3S1000G that carried this volume from
+# 2026-09-30 to the move decided on 2026-11-07 (design 121f44a1: a
+# budget DRAM-less drive writing at 60 MB/s under three gates, 854 ms
+# per write, 3.4 TB/day). It stays fitted as the Longhorn scratch disk
+# (the `scratch` document below, selected by the same model string),
+# and without the term it would match too: it is NVMe, not the system
+# disk and 1.0 TB, and when two disks match, Talos provisions on the
+# first candidate in arrival order, which is unsorted (B's reading of
+# v1.13.8 volumes/locate.go on backlog 88b35891). Excluded by MODEL,
+# not size, because the drives on either side of it bracket it: the
+# interim Micron 7400 PRO (960 GB) is smaller and the Micron 9300 PRO
+# (3.84 TB) planned to replace it is larger, so no size range admits
+# both and refuses the Kingston. The selector matches either Micron
+# with no edit; the later swap changes nothing here.
+#
+# A SELECTOR CHOOSES ONLY WHERE A NEW VOLUME IS MADE. Talos finds an
+# existing volume by its partition label (u-gate) on any disk before it
+# reads this selector, so editing the selector moves nothing. The
+# volume leaves the Kingston only when its u-gate partition is gone
+# (wiped, or the disk unplugged at the next boot). If no disk
 # matches (an M.2 SATA drive reports transport `sata`), Talos provisions
 # nothing and the volume reads as waiting in `talosctl get
 # volumestatus`. That is NOT loud by itself: once the volume has ever
@@ -108,7 +164,44 @@ kind: UserVolumeConfig
 name: gate
 provisioning:
   diskSelector:
-    match: '!system_disk && disk.transport == "nvme" && disk.size > 500u * GB'
+    match: '!system_disk && disk.transport == "nvme" && disk.size > 500u * GB && disk.model != "KINGSTON SNV3S1000G"'
+  minSize: 500GB
+  grow: true
+filesystem:
+  type: xfs
+---
+# THE SCRATCH VOLUME — w-1's KINGSTON SNV3S1000G, idle since the gate
+# volume moved to the Micron 9300 PRO, ALL of it, one xfs filesystem
+# Talos mounts at /var/mnt/scratch (design 3c475a19 section 4 car 2,
+# backlog 46328c3a). Measured 2026-11-12 15:29Z: two builder runs were
+# refused by the worker door because every dev-build worker volume and
+# every durable replica on this node share the 980 PRO's default disk
+# (229 GiB placeable under Longhorn's 25% floor), while this 1 TB drive
+# sat fitted and unused. add-longhorn-disk makes it Longhorn disk
+# u-scratch, the disk-tag door tags it `scratch`, and the class
+# longhorn-dev-scratch (infra/cluster/manifests/boss-dev.yaml) places a
+# worker volume only on a disk with that tag. Nothing durable belongs
+# here (design D3): a worker volume lost with this drive is a build run
+# again, and it is a budget DRAM-less drive whose endurance the gates
+# have mostly spent.
+#
+# Chosen by MODEL, the same string the gate selector above refuses, so
+# the two selectors split w-1's non-system NVMe disks between them: the
+# Kingston only for scratch, every other disk only for the gate. Never a
+# serial or a kernel name (the forge's devices renumbered on 2026-09-21).
+# Talos finds an existing volume by its partition label first: if the
+# Kingston still carries the u-gate partition it held from 2026-09-30 to
+# 2026-11-07, that partition is wiped through plan-a-partition-wipe /
+# wipe-a-partition BEFORE the node-converge that provisions this volume,
+# or the disk has no room for it (infra/cluster/talos/README.md, the
+# scratch disk's sequence). No kubelet extraMount for /var/mnt/scratch,
+# for the gate volume's reason (review a79746c6).
+apiVersion: v1alpha1
+kind: UserVolumeConfig
+name: scratch
+provisioning:
+  diskSelector:
+    match: '!system_disk && disk.transport == "nvme" && disk.model == "KINGSTON SNV3S1000G"'
   minSize: 500GB
   grow: true
 filesystem:

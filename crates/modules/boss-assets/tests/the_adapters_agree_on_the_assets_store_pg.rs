@@ -8,10 +8,11 @@
 //! WHY IT EXISTS. The port was stated for Postgres alone
 //! (`projection_persistence.rs`) and for the double alone (its unit
 //! tests); this file is the one statement of every method of the port,
-//! each case holding each adapter to the same stated answer. The store
-//! keeps no outbox: its write IS the fact, a row of `asset_events`, so
-//! every write is judged by the log it leaves (`events_for`) and by the
-//! projection every reader is answered from.
+//! each case holding each adapter to the same stated answer. Every
+//! write is judged by the log it leaves (`events_for`) and by the
+//! projection every reader is answered from; the fact `record` stages
+//! beside it is held by a dark-bus test of its own
+//! (`a_dark_bus_still_records_an_asset_event_pg.rs`).
 //!
 //! WHAT ITS FIRST RUN FOUND (2026-10-01), each fixed in the adapter the
 //! port's own words make wrong:
@@ -403,11 +404,14 @@ async fn a_batch_counts_duplicates_within_itself_and_applies_each_stored_copy_on
     let ship = ev("e-2", "suite-ab", 2, installed("account", "acct-1"));
     let stats = w
         .repo()
-        .batch_append(vec![
-            ev("e-1", "suite-ab", 1, received(Some("suite-model-b"))),
-            ship.clone(),
-            ev("e-2", "suite-ab", 3, installed("account", "acct-2")),
-        ])
+        .batch_record(
+            vec![
+                ev("e-1", "suite-ab", 1, received(Some("suite-model-b"))),
+                ship.clone(),
+                ev("e-2", "suite-ab", 3, installed("account", "acct-2")),
+            ],
+            chrono::Utc::now(),
+        )
         .await
         .expect("batch");
     assert_eq!(
@@ -631,22 +635,25 @@ async fn an_unknown_model_is_refused_and_nothing_is_stored<W: World>(w: &W, adap
     }
     let err = w
         .repo()
-        .batch_append(vec![
-            ev("e-3", "suite-B", 1, received(Some("suite-model-a"))),
-            ev(
-                "e-4",
-                "suite-a-z",
-                1,
-                AssetEventKind::Sold {
-                    account_id: "acct-1".into(),
-                    price_cents: 100,
-                    currency: "USD".into(),
-                    order_id: None,
-                    condition: AssetCondition::new("new"),
-                },
-            ),
-            ev("e-5", "suite-ab", 2, received(Some("suite-no-such-model"))),
-        ])
+        .batch_record(
+            vec![
+                ev("e-3", "suite-B", 1, received(Some("suite-model-a"))),
+                ev(
+                    "e-4",
+                    "suite-a-z",
+                    1,
+                    AssetEventKind::Sold {
+                        account_id: "acct-1".into(),
+                        price_cents: 100,
+                        currency: "USD".into(),
+                        order_id: None,
+                        condition: AssetCondition::new("new"),
+                    },
+                ),
+                ev("e-5", "suite-ab", 2, received(Some("suite-no-such-model"))),
+            ],
+            chrono::Utc::now(),
+        )
         .await
         .expect_err("an unknown model in a batch");
     assert!(
@@ -693,10 +700,10 @@ async fn a_nul_byte_is_refused_naming_its_field_and_misses_on_read<W: World>(w: 
         );
         let err = w
             .repo()
-            .batch_append(vec![
-                ev("e-ok", "suite-B", 1, received(Some("suite-model-a"))),
-                e,
-            ])
+            .batch_record(
+                vec![ev("e-ok", "suite-B", 1, received(Some("suite-model-a"))), e],
+                chrono::Utc::now(),
+            )
             .await
             .expect_err("a NUL in a batch");
         assert!(
@@ -831,10 +838,10 @@ async fn an_actor_whose_text_form_reads_back_as_another_is_refused<W: World>(w: 
         );
         let err = w
             .repo()
-            .batch_append(vec![
-                ev("e-ok", "suite-B", 1, received(Some("suite-model-a"))),
-                e,
-            ])
+            .batch_record(
+                vec![ev("e-ok", "suite-B", 1, received(Some("suite-model-a"))), e],
+                chrono::Utc::now(),
+            )
             .await
             .expect_err("a drifting actor in a batch");
         assert!(

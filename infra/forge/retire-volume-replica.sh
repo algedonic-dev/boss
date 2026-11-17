@@ -131,14 +131,53 @@ set -uo pipefail
 
 ME=retire-volume-replica
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# jq-1.6 can accept silence: every guard must first establish a document.
+# shellcheck source=infra/lib/jq.sh
+. "$HERE/../lib/jq.sh"
+# The lower door shares this engine; its extra runtime witness is a fixed
+# source helper, never an environment-selected command (723c0828).
+LOWER_CONTEXT=""
+if [ "${1-}" = --lower ]; then
+    shift
+    if [ "${1-}" = --plan ]; then
+        exec bash "$HERE/lower-volume-replicas.sh" "$@"
+    fi
+    # The registered shell owns the effect line. A helper exit alone is
+    # not evidence: its typed result exists only after final cleanup/readback.
+    LOWER_RESULT_DIR="$(mktemp -d)" || exit 1
+    trap 'rm -rf -- "$LOWER_RESULT_DIR"' EXIT
+    bash "$HERE/lower-volume-replicas.sh" --effect-result "$LOWER_RESULT_DIR/result.json" "$@"
+    lower_status=$?
+    [ "$lower_status" -eq 0 ] || exit "$lower_status"
+    if ! jq_doc_file "$LOWER_RESULT_DIR/result.json" || ! jq -e --arg volume "${1-}" --arg replica "${2-}" '
+        type == "object" and .schema == 1 and .volume == $volume and .replica == $replica
+        and (.target | type == "number" and floor == . and . >= 2)
+        and (.maintenance | type == "boolean")
+        ' "$LOWER_RESULT_DIR/result.json" >/dev/null; then
+        echo 'lower-volume-replicas: FAILED — verified final result missing or malformed; effect UNKNOWN' >&2
+        exit 1
+    fi
+    lower_target="$(jq -r .target "$LOWER_RESULT_DIR/result.json")" || exit 1
+    if [ "$(jq -r .maintenance "$LOWER_RESULT_DIR/result.json")" = true ]; then
+        lower_readback='maintenance ticket removed and detached/stopped read back'
+    else
+        lower_readback='fresh attached RW set read back'
+    fi
+    printf 'lower-volume-replicas: pvc-%s declared %s; exactly pvc-%s retired; %s\n' \
+        "${1#pvc-}" "$lower_target" "${2#pvc-}" "$lower_readback"
+    exit 0
+elif [ "${1-}" = --lower-checked ]; then
+    LOWER_CONTEXT="${2-}"
+    [ -n "$LOWER_CONTEXT" ] || exit 78
+    shift 2
+fi
+lower_guard() {
+    [ -z "$LOWER_CONTEXT" ] || python3 "$HERE/lower-volume-replicas.py" --guard "$LOWER_CONTEXT" "$1"
+}
 # shellcheck source=infra/lib/sor.sh
 . "$HERE/../lib/sor.sh"
 # shellcheck source=infra/estate/ops-credentials.sh
 . "$HERE/../estate/ops-credentials.sh"
-# jq_doc_file: on jq-1.6 `jq -e` passes an input carrying no document
-# (backlog d96e38ab), so every guard below asks that first.
-# shellcheck source=infra/lib/jq.sh
-. "$HERE/../lib/jq.sh"
 # LONGHORN_LEDGER_JQ: the webhook's disk arithmetic, one copy.
 # shellcheck source=infra/lib/longhorn-ledger.sh
 . "$HERE/../lib/longhorn-ledger.sh"
@@ -517,6 +556,9 @@ cas() {
     else
         patch="[{\"op\":\"test\",\"path\":\"/spec/numberOfReplicas\",\"value\":$1},{\"op\":\"replace\",\"path\":\"/spec/numberOfReplicas\",\"value\":$2}]"
     fi
+    if [ -n "$LOWER_CONTEXT" ]; then
+        patch="$(jq -c --argjson patch "$patch" '[{op:"test",path:"/metadata/uid",value:.volume_uid}] + $patch' "$LOWER_CONTEXT")" || return 1
+    fi
     # shellcheck disable=SC2086 # K is one line the door prints to be word-split
     $K patch volumes.longhorn.io "$VOL" -n "$LH" --type=json --request-timeout=20s \
         -p "$patch" \
@@ -586,6 +628,7 @@ none() { n "$1 | join(\", \") | if . == \"\" then \"none\" else . end"; }
 
 echo "$ME: plan $APPROVED still holds — retiring replica $REP of $VOL: numberOfReplicas $DECLARED -> $DOWN"
 # --- step 1: lower -------------------------------------------------------------
+lower_guard before-lower || fail "the lower door's fresh runtime witness refused before lowering; nothing was written"
 if ! cas "$N" "$DOWN"; then
     sed 's/^/    /' "$WORK/patch.err" >&2
     fail "kubectl patch volumes.longhorn.io $VOL ($DECLARED -> $DOWN) did not succeed (its words above) — nothing else was done and $REP stands; read the volume again with plan-a-volume-replica-retirement before anything else"
@@ -631,11 +674,19 @@ while :; do
     sleep "$POLL_S"
 done
 if [ -z "$trimmed" ]; then
+    lower_guard before-delete || fail "the lower door's fresh runtime witness refused; the lowered count stands and the named replica is NOT deleted"
     # Straight off the read above: every replica but the named one
     # healthy, the named one still there.
     # shellcheck disable=SC2086
-    if ! $K delete replicas.longhorn.io "$REP" -n "$LH" --wait=false --request-timeout=20s \
-            > "$WORK/delete.out" 2> "$WORK/delete.err"; then
+    delete_named() {
+        if [ -n "$LOWER_CONTEXT" ]; then
+            python3 "$HERE/lower-volume-replicas.py" --delete "$LOWER_CONTEXT"
+        else
+            # shellcheck disable=SC2086
+            $K delete replicas.longhorn.io "$REP" -n "$LH" --wait=false --request-timeout=20s
+        fi
+    }
+    if ! delete_named > "$WORK/delete.out" 2> "$WORK/delete.err"; then
         sed 's/^/    /' "$WORK/delete.err" >&2
         fail "kubectl delete replicas.longhorn.io $REP did not succeed (its words above) — spec.numberOfReplicas is $DOWN with $N replicas, $REP among them; read the volume again with plan-a-volume-replica-retirement"
     fi

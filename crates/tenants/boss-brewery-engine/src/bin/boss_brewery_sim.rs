@@ -108,8 +108,8 @@ async fn readiness_pass(client: &reqwest::Client, api_base: &str) -> Vec<(String
     }
 
     // 2. The dispatcher's durable consumers are actually BOUND — the signal a
-    //    /health 200 can't give. Without this the workforce never gets
-    //    assigned Steps and Jobs never reach a terminal state.
+    //    /health 200 can't give. Without this no finished step's side
+    //    effect runs and Jobs never reach a terminal state.
     {
         let url = format!(
             "{}/api/dispatcher/readyz",
@@ -122,12 +122,8 @@ async fn readiness_pass(client: &reqwest::Client, api_base: &str) -> Vec<(String
                     (
                         b("ready"),
                         format!(
-                            "assigning={} rules_running={} assignment_events={} rules_events={}",
-                            b("assigning"),
+                            "rules_running={} rules_events={}",
                             b("rules_running"),
-                            v.get("assignment_events")
-                                .and_then(|x| x.as_u64())
-                                .unwrap_or(0),
                             v.get("rules_events").and_then(|x| x.as_u64()).unwrap_or(0),
                         ),
                     )

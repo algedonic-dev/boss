@@ -161,6 +161,15 @@ def diffs(level, tree, live, path=""):
         a, b = tree.get(key), live.get(key)
         here = f"{path}.{key}" if path else key
         inner, by = NESTED.get((level, key), (None, None))
+        if level == "step" and key == "resources":
+            # This field family has exact STRING wire values. In particular an
+            # old numeric API representation is drift, never a float-coerced
+            # equivalent of the new string declaration.
+            a = None if absent(a) else a
+            b = None if absent(b) else b
+            if a != b:
+                yield (here, a, b)
+            continue
         if inner and by:
             a, b = a or [], b or []
             an, bn = names(a, by), names(b, by)
@@ -230,6 +239,26 @@ def main(argv):
     tree = dict(rows[0])
     if "step" in tree:
         tree["steps"] = tree.pop("step")
+    # Only authoring integers cross this boundary. The registry/API wire is
+    # already exact decimal text: never coerce a numeric live row to equality,
+    # and never put resource amounts through value()'s legacy float adapter.
+    try:
+        for step in tree.get("steps", []):
+            resources = step.get("resources")
+            if not isinstance(resources, dict):
+                continue
+            for key in ("vcpu", "ram_gb", "disk_gb"):
+                amount = resources.get(key)
+                if type(amount) is int:
+                    resources[key] = str(amount)
+                elif type(amount) is float:
+                    raise ValueError(
+                        f"steps[{step.get('title')}].resources.{key}: float literal refused; "
+                        'write a quoted exact decimal such as "0.5"'
+                    )
+    except (TypeError, ValueError) as error:
+        print(f"UNREADABLE {toml_path}: {error}")
+        return 3
     found = list(diffs("workflow", tree, live))
     if not found:
         print("EQUAL")

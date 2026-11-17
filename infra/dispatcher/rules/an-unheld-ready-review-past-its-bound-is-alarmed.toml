@@ -1,0 +1,65 @@
+# A ready review NOBODY holds, waiting past the bound its protocol
+# declares, is an alarm that names it (backlog f0e604dc, part 3 of
+# eb86a174).
+#
+# THE CASE. Measured 2026-11-15 ~20:08Z over the 137 open ship-a-change
+# cars (triage run ee18d394, all rows read): 27 READY review steps had no
+# holder — 14 `review`, 13 `landed-review` — and both steps declare
+# `duration_hours = 2.0` (infra/platform/workflows/ship-a-change.toml).
+# Re-read at 20:15Z from the queue-age lens, every stamp exact: the held
+# cars' `review`s had waited 2.6 to 588 hours, the `landed-review`s 7.2
+# to 79 hours. Nothing fired on any of them.
+#
+# WHY NO NEIGHBOUR COVERED IT, AND STILL SHOULD NOT.
+#   - `agent-held-real-work-is-watched-hourly` reads steps an AGENT
+#     holds; a step nobody holds names no agent.
+#   - `an-idle-actor-holding-urgent-nominations-is-alarmed` keys on an
+#     actor, and an unheld step has none.
+#   - The parked return of stale nominations to their station (car
+#     ff8d4bef, `a-stranded-review-nomination-returns-to-its-station`)
+#     makes this case MORE common: what it returns is ready, nobody's,
+#     and otherwise unread.
+#
+# THE ARGS ARE THE DECLARATION, as registry data:
+#   - kind / profile: the open ship-a-change board, and only steps whose
+#     agent block declares the `reviewer` profile — the predicate the
+#     station pull's own-review exclusion reads, so membership names no
+#     slug.
+#   - marked.review = hold: a car's `review` step is ready on EVERY
+#     parked car, and an unheld one waits on its train, not on a reader
+#     (measured: the one unheld review at 20:15Z was a green car at the
+#     dock). It waits on a reviewer only while the car is held, read by
+#     `boss_jobs::stranded::marked`, so a released `hold = false` reads
+#     released.
+#   - NO bound here. The bound is the step's own `duration_hours` in the
+#     workflow version the car is PINNED to, which the protocol's comment
+#     beside it requires; a second copy on this row would be a fact that
+#     lives twice. The handler's shipped-rule test refuses an `hours` arg.
+#
+# ONE ALARM PER STATION (the step's `at`): a queue of late reviews is
+# one packet naming every step oldest first, never one per step. DEDUP
+# by the alarm staying OPEN; closing it re-arms the watch.
+#
+# HOURLY: the bound is two hours, so an alarm is at most an hour late;
+# the reads are the open car board, the queue-age lens, each pinned
+# workflow version a candidate needs, and the open alarms.
+[[rule]]
+name = "an-unheld-ready-review-past-its-bound-is-alarmed"
+why = """
+A TIMER over an ABSENCE, the standing exemption: the condition is a
+claim that did NOT happen, and no event says "two hours passed and no
+reviewer took this review". A Workflow can declare a step's expected
+duration and who may take it; it cannot notice that nobody did.
+Measured 2026-11-15 (backlog f0e604dc): 27 ready review steps held by
+nobody across 137 open cars, held reviews up to 588 h against a declared
+2 h, and nothing fired. It routes nothing and refuses nothing: one
+firing files ONE urgent alarm per station whose unheld reviews passed
+their pinned bound, naming each car and step oldest first, owned by the
+platform owner and assigned to nobody. The open alarm holds the next
+tick; closing it re-arms.
+"""
+version = 1
+schedule = { cadence = "hourly", anchor_date = "2026-11-15" }
+[[rule.do]]
+handler = "jobs.unheld_review_watch"
+args = { kind = "\"ship-a-change\"", profile = "\"reviewer\"", "marked.review" = "\"hold\"" }

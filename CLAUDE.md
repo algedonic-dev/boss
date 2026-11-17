@@ -44,14 +44,20 @@ Treat the example tenant as a plugin built on top of the core, and the
 core itself as a generic state-machine modeling toolkit that
 happens to be tuned for human + agent executors.
 
-The four foundational primitives are **Subjects** (identity-bearing
-things the work is about — an asset, an account, an employee), **Jobs**
-(bounded units of coordinated work), **Steps** (typed transitions inside
-a Job), and **Events** (the immutable record of state changes — the
-system of record). The Class registry (reference data on Subjects),
-StepPlugins (UX extensions on Steps), and Policy (the privilege model)
-are supporting concepts that hang off the four. We start small, stay
-incremental, and optimize for adaptability over everything else.
+The problem BOSS models is coordination: how to use the constrained
+assets represented by **resource pools**, plus a work force of
+**executors** (human, robot, automaton), to perform complex **jobs**
+broken into simple **steps**. A **station** is just a place to
+temporarily reserve the right resources and executors to do a step
+according to **protocol**; **machines** are the software provisioned
+into a station; the **audit record** proves what happened. Those are
+the eight primitives of
+[docs/design/factory-taxonomy-v2.md](docs/design/factory-taxonomy-v2.md),
+and README.md opens with them for outsiders. The v1 four — Subjects,
+Jobs, Steps, Events — still name most of the code (§Primitives below),
+with the Class registry, StepPlugins and Policy hanging off them. We
+start small, stay incremental, and optimize for adaptability over
+everything else.
 
 ### Founding ideas — what every load-bearing decision is measured against
 
@@ -284,6 +290,8 @@ crates.
 
 Four interlocking primitives model everything. Stay close to them — new work types and new UX ship as data in registries, not as new core code paths.
 
+**The direction is the station tree** (David, 2026-11-06, design 4b27a65a). It has eight primitives: resource pool, job packet, job step, station, executor (human, robot or automaton), machine, protocol and audit record. Every station is a node of one tree under the company, defined by what its parent allocates to it. [docs/design/factory-taxonomy-v2.md](docs/design/factory-taxonomy-v2.md) holds the primitives and rules, and supersedes the v1 taxonomy paragraph below. [docs/design/station-tree.md](docs/design/station-tree.md) is Algedonic's tree. Until the retirement cars land, the code holds both vocabularies: build new things in v2's words, and keep writing the old word wherever an older build still reads it.
+
 ### Subjects
 The identity-bearing things work is *about*. BOSS treats Subject as a trait: each kind (Asset, Account, Employee, PurchaseOrder, Campaign, Vendor, Custom) implements it with its own KB view. Adding a new Subject kind means a new crate (or a new module in the example tenant) that implements the trait — not a switch in core code.
 
@@ -316,6 +324,8 @@ These three hang off the four primitives. They are load-bearing infrastructure, 
 - **Class registry** — typed reference data each Subject kind owns. One `classes` table keyed `(subject_kind, code)` carries every taxonomy in the system: roles (Classes of `employee` Subjects), AccountTypes (Classes of `account` Subjects), asset models, account tiers, a department's function. Departments themselves are not Classes: they are Subjects with identity in the `departments` registry (`GET /api/departments`), which an employee's `department` validates against (backlog c87e3d6d). See [docs/design/class-registry.md](docs/design/class-registry.md).
 - **StepPlugins** — UX extensions on Steps. A plugin is a small JS bundle served by the gateway at `/plugins/<path>` that renders a custom surface for a step kind. Plugins ship as data (a row in `step_plugins`) + a static JS asset; authoring at `/system/step-plugins`. **New step surfaces do not require a core code change in `apps/web`.** Decision record: [docs/architecture-decisions.md](docs/architecture-decisions.md) §Step UX & frontend.
 - **Policy** — every write passes through `boss-policy` (via the `PolicyClient` port). Rules are row-level: a rule grants an `(action, resource)` within a `scope`; user-specific overrides take precedence; `policy_rule_audit` tracks every decision.
+
+**The factory taxonomy** sorts what runs the three layers, so the code and the floor use one vocabulary. Executors are of exactly three kinds — a **person** (judgment; stateful; capacity by roster), a **robot** (judgment; stochastic; stateless between claims; capacity in slots) and an **automaton** (deterministic; operates equipment; has health; capacity in bays); the dispatcher, the conductor and the sweeper are automata whose step is a reaction to the record, and `machine` keeps only its other meanings here (state machine, machine token, machine door). Places are **generic stations** (any count, a check injected) or **equipment stations** (gates, deploy, the probe shed, the dock: bound to machinery, operated by an automaton, shared by many protocols, capacity in bays). Resources are **pools** (slots, vCPU, RAM, people; released on step end), **stock** (disk, credentials; recovered by a protocol) and **bays** (per equipment station, the non-fungible constraint on top of the pools). The table, the mapping from today's words and the cars that enforce it: [docs/design/factory-taxonomy.md](docs/design/factory-taxonomy.md).
 
 ### How to add a new thing
 The shape of an "add a new thing" change follows the primitives:
@@ -881,7 +891,13 @@ a door that stops being true is a defect worth a car.
   line names the three slowest lints) PLUS workspace clippy when the tree
   implies a crate, including dependent test targets, PLUS every declared
   tree-wide pin — the database-free source scans every scoped gate runs,
-  which were 19 of 61 failed W41 car gates (2f0c722a). Warm leaf edits reuse
+  which were 19 of 61 failed W41 car gates (2f0c722a). **The pins make it
+  minutes, not seconds**: on a warm worktree target on the dev pod
+  (2026-10-18, backlog 1c03eeb0) `--lint` took 561 s for a boss-testing
+  change — 47 s of fmt and lints, 123 s of workspace clippy, 387 s for the
+  64 pins run one crate at a time (19347752 runs them in parallel) — so a
+  change that implies no crate still pays about seven and a half minutes.
+  Warm leaf edits reuse
   cached dependents; a core-type edit pays for the workspace check that
   catches literals in other crates (4669e9d7, design caa2acc9). Neither is
   a gate, and both say so: the build and the suites
@@ -889,9 +905,15 @@ a door that stops being true is a defect worth a car.
   of cluster time to learn that `cargo fmt` had been run on one crate and
   not another, and `--quick` alone cost two more gates to clippy errors
   `--lint` would have caught — the second of them on 2026-09-21, by a
-  session that had read this line (`410e21e2`). Reach for `--quick` only
-  where nothing compiles: a docs, infra or `apps/` change maps to no
-  crate, and `--lint` says so and skips clippy anyway.
+  session that had read this line (`410e21e2`). Reach for `--quick` alone
+  for a docs-only change: it implies no crate, so `--lint` would add the
+  pins and nothing else, and a pin reads prose rarely (one is
+  the_vsm_mapping_outlives_its_code, on docs/architecture-decisions.md;
+  a docs car's own gate still runs every pin). A change under `infra/` or
+  `apps/` that implies no crate is the opposite case and runs `--lint`:
+  the pins are the checks that read those trees — 55 of the 60 tests/
+  pins name `infra`, and the web-fetch and mirror-URL pins read
+  apps/web/src.
 
 - **Briefing a builder — `boss brief <packet>`.** The packet verbatim
   from the system of record, plus the invariants *derived* from the files

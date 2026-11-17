@@ -13,7 +13,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-serde_json = "1"
+# The workspace's serde_json features (a84cb148), so a value fuzzed here
+# parses exactly as the services parse it.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [dependencies.boss-expr]
 path = ".."

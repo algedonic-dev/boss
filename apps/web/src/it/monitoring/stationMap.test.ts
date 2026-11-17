@@ -16,9 +16,8 @@ function row(over: Partial<StationRow> = {}): StationRow {
     name: 'loading-dock',
     version: 1,
     title: 'Loading dock',
-    kind: 'batch',
+    kind: 'equipment',
     discipline: ['priority', 'age'],
-    wip_limit: null,
     ...over,
   };
 }
@@ -40,14 +39,12 @@ describe('toStationNode', () => {
     const n = toStationNode(row());
     expect(n.name).toBe('loading-dock');
     expect(n.title).toBe('Loading dock');
-    expect(n.kind).toBe('batch');
+    expect(n.kind).toBe('equipment');
     expect(n.discipline).toBe('priority, then age');
     expect(n.depth).toBeNull();
-    expect(n.overLimit).toBe(false);
-    expect(n.wipLimit).toBeNull();
   });
   test('the kind chip is colored by protocolHue of the kind string — a new kind needs zero code', () => {
-    expect(toStationNode(row({ kind: 'batch' })).hue).toBe(protocolHue('batch'));
+    expect(toStationNode(row({ kind: 'equipment' })).hue).toBe(protocolHue('equipment'));
     expect(toStationNode(row({ kind: 'some-future-kind' })).hue).toBe(
       protocolHue('some-future-kind'),
     );
@@ -56,21 +53,18 @@ describe('toStationNode', () => {
     const n = toStationNode(row({ title: '' }));
     expect(n.title).toBe('loading-dock');
   });
-  test('wip_limit rides through', () => {
-    expect(toStationNode(row({ wip_limit: 8 })).wipLimit).toBe(8);
-  });
 });
 
 describe('withDepth', () => {
   test('folds a polled queue envelope into the node', () => {
-    const n = withDepth(toStationNode(row()), { total: 12, over_limit: false });
+    const n = withDepth(toStationNode(row()), { total: 12,  });
     expect(n.depth).toBe(12);
-    expect(n.overLimit).toBe(false);
   });
-  test('over_limit is advisory state on the node, straight from the envelope', () => {
-    const n = withDepth(toStationNode(row({ wip_limit: 3 })), { total: 5, over_limit: true });
+  test('retired advisory fields do not become station state', () => {
+    const n = withDepth(toStationNode(row({  })), { total: 5,  });
     expect(n.depth).toBe(5);
-    expect(n.overLimit).toBe(true);
+    expect(n).not.toHaveProperty('overLimit');
+    expect(n).not.toHaveProperty('wipLimit');
   });
 });
 
@@ -136,10 +130,8 @@ describe('toQueueCard — the yard grammar for a station queue packet', () => {
 describe('queueViewFromBody', () => {
   const envelope = {
     station: 'loading-dock',
-    kind: 'batch',
+    kind: 'equipment',
     discipline: ['priority', 'age'],
-    wip_limit: 3,
-    over_limit: true,
     total: 2,
     data: [
       { id: 'a', kind: 'ship-a-change', title: 'A', status: 'open', opened_on: '2026-08-12' },
@@ -151,8 +143,6 @@ describe('queueViewFromBody', () => {
     expect(v).not.toBeNull();
     expect(v!.station).toBe('loading-dock');
     expect(v!.discipline).toBe('priority, then age');
-    expect(v!.wipLimit).toBe(3);
-    expect(v!.overLimit).toBe(true);
     expect(v!.total).toBe(2);
     expect(v!.cards.map(c => c.id)).toEqual(['a', 'b']);
   });
@@ -160,24 +150,6 @@ describe('queueViewFromBody', () => {
     expect(queueViewFromBody([])).toBeNull();
     expect(queueViewFromBody(null)).toBeNull();
     expect(queueViewFromBody({ nope: true })).toBeNull();
-  });
-
-  // The walk upstream reaches every station lens, not just the yard's
-  // dock: the map's queue panel is where an operator lands when a node
-  // reads shallower than expected.
-  test('a declared upstream rides the envelope into the queue view', () => {
-    const v = queueViewFromBody({
-      ...envelope,
-      upstream: { label: 'FEEDBACK', href: '/it/design/feedback' },
-    });
-    expect(v!.upstream).toEqual({
-      label: '↑ UPSTREAM: FEEDBACK',
-      href: '/it/design/feedback',
-      title: 'Walk upstream to FEEDBACK — the queue that feeds this station',
-    });
-  });
-  test('a station with no declared upstream gets no button', () => {
-    expect(queueViewFromBody(envelope)!.upstream).toBeNull();
   });
 });
 
@@ -193,7 +165,6 @@ describe('withLoad carries the unreachable count', () => {
         {
           station: 'a.platform-admin.opus-5-1m',
           depth: 124,
-          over_limit: false,
           oldest_age_days: 3,
           unreachable: 57,
         },
@@ -206,7 +177,7 @@ describe('withLoad carries the unreachable count', () => {
   test('a server that does not measure it reads null, never zero', () => {
     const nodes = withLoad(
       [toStationNode(row())],
-      [{ station: 'loading-dock', depth: 2, over_limit: false, oldest_age_days: null }],
+      [{ station: 'loading-dock', depth: 2, oldest_age_days: null }],
     );
     expect(nodes[0]!.unreachable).toBeNull();
   });
@@ -218,7 +189,6 @@ describe('withLoad carries the unreachable count', () => {
         {
           station: 'loading-dock',
           depth: 2,
-          over_limit: false,
           oldest_age_days: null,
           unreachable: 0,
         },

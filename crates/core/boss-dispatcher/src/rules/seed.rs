@@ -149,6 +149,7 @@ pub fn differing_fields(file: &RawRule, row: &RawRule) -> Vec<&'static str> {
         ("when", file.when != row.when),
         ("do", file.do_steps != row.do_steps),
         ("delay", file.delay != row.delay),
+        ("delivery_lane", file.delivery_lane != row.delivery_lane),
     ]
     .into_iter()
     .filter_map(|(field, differs)| differs.then_some(field))
@@ -424,8 +425,8 @@ async fn insert_active(pool: &PgPool, rule: &RawRule, version: i32) -> Result<bo
     let done = sqlx::query(
         "INSERT INTO dispatcher_rules \
             (name, version, status, on_event, when_expr, do_steps, delay, \
-             schedule_cadence, schedule_anchor, schedule_calendar) \
-         VALUES ($1, $2, 'active', $3, $4, $5, $6, $7, $8, $9) \
+             schedule_cadence, schedule_anchor, schedule_calendar, delivery_lane) \
+         VALUES ($1, $2, 'active', $3, $4, $5, $6, $7, $8, $9, $10) \
          ON CONFLICT (name, version) DO NOTHING",
     )
     .bind(&rule.name)
@@ -437,6 +438,7 @@ async fn insert_active(pool: &PgPool, rule: &RawRule, version: i32) -> Result<bo
     .bind(cadence)
     .bind(anchor)
     .bind(calendar)
+    .bind(&rule.delivery_lane)
     .execute(&mut *tx)
     .await
     .map_err(store)?;

@@ -26,6 +26,10 @@
 //!   second loss on that sha: the machine files ONE pipeline-failure item
 //!   naming both gate-runs and stops ([`Answer::FileFailure`]);
 //! - a relaunch the machine could not start is the same hand-back;
+//! - a hand-back is ONE item per lost run whatever answers are lost on
+//!   the way: it is filed under [`handback_item_id`], its request is on
+//!   the record ([`FILING`]) before the POST, and a later pass replays
+//!   that request and recovers that item (backlog cedc8e69);
 //! - a later hand re-gate of a sha the machine already relaunched is the
 //!   agent's, and its loss is declined rather than relaunched again.
 //!
@@ -61,6 +65,14 @@ pub const LAUNCH_FAILED: &str = "launch_failed";
 /// refused, or the conductor dying mid-launch — reads as the machine's
 /// unfinished try and is handed back, never as "a newer gate exists".
 pub const ATTEMPTING: &str = "attempting";
+/// Written on the lost run BEFORE the hand-back's POST, carrying the
+/// whole request (`request`, whose `id` is [`handback_item_id`]): the
+/// filing is one logical command, and a pass that cannot read its answer
+/// — the admission committed and the response died, or the
+/// [`FAILURE_FILED`] stamp after it was refused — leaves this behind, so
+/// the next pass replays THAT request and recovers THAT item rather than
+/// filing another (backlog cedc8e69). Unfinished: owed past the window.
+pub const FILING: &str = "filing";
 /// Launches refused before anything was filed (the gate bound, train
 /// priority unreadable): `{count, first_at, last: [{at, cause}]}`. Not a
 /// try — retried every pass — but when the window closes on them the
@@ -68,6 +80,14 @@ pub const ATTEMPTING: &str = "attempting";
 pub const REFUSALS: &str = "lost_relaunch_refusals";
 /// How many refusal causes the record keeps (the latest).
 pub const REFUSALS_KEPT: usize = 5;
+/// `true` exactly while the [`STAMP`] says the machine's own act is
+/// unfinished ([`ATTEMPTING`], [`LAUNCH_FAILED`]), and deleted by every
+/// other write. The conductor's census reads `metadata_has=` this key
+/// instead of every stamp ever written: finished stamps are re-read on
+/// every pass and grow forever (~11 a week, ~27KB each, measured
+/// 2026-10-17), and the metadata filter cannot reach `STAMP.action`
+/// (a containment document is flat; backlog de67e500).
+pub const UNFINISHED: &str = "lost_relaunch_unfinished";
 
 /// The ONE metadata write after a refused launch: the refusal appended to
 /// [`REFUSALS`] (bounded), and the [`ATTEMPTING`] stamp cleared, so the
@@ -95,6 +115,7 @@ pub fn refusal_patch(lost: &Value, now: DateTime<Utc>, cause: &str) -> Value {
     json!({
         REFUSALS: {"count": count, "first_at": first_at, "last": last},
         STAMP: Value::Null,
+        UNFINISHED: Value::Null,
     })
 }
 
@@ -172,18 +193,46 @@ pub fn car_standing(cars: &[Value], branch: &str) -> CarStanding {
     }
 }
 
+/// Whether the lost run's change is already on main, as the conductor
+/// read it from git. A sha that is an ancestor of main is the plain
+/// case; a TWIN is the case the sha check missed (backlog 6a39558a,
+/// 2026-10-18): item 0c77e4db's builder opened three branches for one
+/// change, the third landed (#1247), and the conductor relaunched the
+/// two lost gates of the other two — each with its park intent — so two
+/// cars were parked for commits main already held and one boarded a red
+/// train (b0e4ba33). Their shas were never ancestors of main; merging
+/// either head into main wrote main's own tree (13190d8a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Landed {
+    /// Neither: the change is not on main.
+    No,
+    /// The lost sha is an ancestor of main.
+    Ancestor,
+    /// Merging the lost sha into main writes main's own `tree`: its net
+    /// change landed under another branch.
+    InMainTree { tree: String },
+    /// The content check could not be read; the cause. Never a verdict.
+    Unknown(String),
+}
+
 /// The facts about one lost gate-run, as the conductor read them.
 #[derive(Debug, Clone)]
 pub struct Facts<'a> {
     /// The lost gate-run, as `GET /api/jobs/{id}` (or a `full=true`
     /// list row) returns it: id, status, `opened_at`, metadata, steps.
     pub lost: &'a Value,
-    /// The branch's head on the forge now; `None` when the branch is gone.
-    pub branch_head: Option<&'a str>,
+    /// The branch's head on the forge now: `Ok(None)` when the branch is
+    /// gone, `Err(cause)` when the forge could not be read. UNKNOWN is
+    /// never "gone" (cd4c55ef), and never silent either (backlog
+    /// f39eedf2): an unread head is answered [`Answer::Hold`], so each
+    /// failed read is recorded on the run and a forge dark for the whole
+    /// window is handed back naming its error rather than aging out.
+    pub branch_head: Result<Option<&'a str>, &'a str>,
     /// Every OTHER gate-run for the branch, any status, same shape.
     pub others: &'a [Value],
-    /// Is the lost run's sha already an ancestor of main?
-    pub landed: bool,
+    /// Is the lost run's change already on main — by its sha, or by its
+    /// content under a twin branch — or could that not be read?
+    pub landed: Landed,
     pub car: CarStanding,
     pub now: DateTime<Utc>,
 }
@@ -210,6 +259,12 @@ pub enum Answer {
     },
     /// The machine looked and will not relaunch; the reason is stamped.
     Decline(String),
+    /// The machine cannot read a fact its answer turns on — whether the
+    /// change is already on main, or where the branch's head is: launch
+    /// and decline nothing this pass, record the cause as a refusal (so a
+    /// hold that never clears is handed back when the window closes), and
+    /// ask again next pass.
+    Hold(String),
 }
 
 /// The run's metadata as its resident submission reads it — the same
@@ -270,9 +325,17 @@ pub fn is_candidate(run: &Value, now: DateTime<Utc>) -> bool {
         && match stamp_action(run) {
             // The machine's own unfinished act is answered whatever the
             // window says — it never ages out silently.
-            Some(a) => a == LAUNCH_FAILED || a == ATTEMPTING,
+            Some(a) => is_unfinished(a),
             None => in_window(run, now) || refusals_said(run).is_some(),
         }
+}
+
+/// The stamp actions that are the machine's own unfinished act, owed an
+/// answer whatever the window says. One predicate for both readers: the
+/// candidate test above and the [`UNFINISHED`] marker [`stamp`] writes,
+/// which is how the conductor's census finds them.
+fn is_unfinished(action: &str) -> bool {
+    action == LAUNCH_FAILED || action == ATTEMPTING || action == FILING
 }
 
 fn in_window(run: &Value, now: DateTime<Utc>) -> bool {
@@ -297,6 +360,32 @@ pub fn answer(facts: &Facts<'_>) -> Option<Answer> {
     let branch = text(md, "branch")?.to_string();
     let sha = text(md, "sha")?.to_string();
     let short = &sha[..sha.len().min(8)];
+    // The hand-back is already under way: its request is on the record,
+    // and the answer is THAT request, whatever has moved since — a fresh
+    // reading would name other runs or another cause, or decline over an
+    // item that may already exist (backlog cedc8e69).
+    if stamp_action(run) == Some(FILING) {
+        let st = run.pointer(&format!("/metadata/{STAMP}"));
+        let evidence = st.and_then(|s| s.pointer("/request/metadata/evidence"));
+        let field = |k: &str| evidence.and_then(|e| e.get(k)).and_then(Value::as_str);
+        let gate_run = |n: usize| {
+            evidence
+                .and_then(|e| e.pointer(&format!("/gate_runs/{n}")))
+                .and_then(Value::as_str)
+                .unwrap_or("(not recorded)")
+                .to_string()
+        };
+        return Some(Answer::FileFailure {
+            first: gate_run(0),
+            second: gate_run(1),
+            why: field("why")
+                .or_else(|| st.and_then(|s| s.get("reason")).and_then(Value::as_str))
+                .unwrap_or("(no cause recorded)")
+                .to_string(),
+            branch: field("branch").unwrap_or(&branch).to_string(),
+            sha: field("sha").unwrap_or(&sha).to_string(),
+        });
+    }
     // The machine tried and could not start the relaunch: hand it back
     // whatever has moved since, because a launch failure is the
     // machine's failure and an agent must see it.
@@ -407,22 +496,39 @@ pub fn answer(facts: &Facts<'_>) -> Option<Answer> {
         )));
     }
     match facts.branch_head {
-        None => {
+        // Every answer below turns on the head (a moved branch declines
+        // even a second loss), so an unread one decides none of them.
+        Err(cause) => {
+            return Some(Answer::Hold(format!(
+                "the forge's head for {branch} could not be read ({cause}); whether it moved \
+                 or is gone is unknown, so nothing is relaunched or declined until it reads"
+            )));
+        }
+        Ok(None) => {
             return Some(Answer::Decline(format!(
                 "{branch} no longer exists on the forge"
             )));
         }
-        Some(head) if head != sha => {
+        Ok(Some(head)) if head != sha => {
             return Some(Answer::Decline(format!(
                 "{branch} moved from {short} to {} since the lost gate",
                 &head[..head.len().min(8)]
             )));
         }
-        Some(_) => {}
+        Ok(Some(_)) => {}
     }
-    if facts.landed {
+    if facts.landed == Landed::Ancestor {
         return Some(Answer::Decline(format!(
             "{short} already landed on main — nothing left to gate"
+        )));
+    }
+    // A landed twin is declined like a landed sha, and for the same
+    // reason: nothing is left to gate, so nothing may be parked (backlog
+    // 6a39558a — faa27ef3 and 363c2d7d were parked this way).
+    if let Landed::InMainTree { tree } = &facts.landed {
+        return Some(Answer::Decline(format!(
+            "{short}'s change is already on main — a landed twin: merging it into main \
+             writes main's own tree {tree}; nothing left to gate or park"
         )));
     }
     match &facts.car {
@@ -467,6 +573,16 @@ pub fn answer(facts: &Facts<'_>) -> Option<Answer> {
             id(spent)
         )));
     }
+    // UNKNOWN never parks: a relaunch carries the park intent, so it
+    // waits until the content check reads. Held only here, at the one
+    // answer that launches — every hand-back and decline above stands
+    // without it.
+    if let Landed::Unknown(cause) = &facts.landed {
+        return Some(Answer::Hold(format!(
+            "whether {branch}@{short}'s change is already on main could not be read ({cause}); \
+             a relaunch would carry its park intent, so none is launched until it reads"
+        )));
+    }
     Some(Answer::Relaunch {
         marks: relaunch_marks(md, &lost_id),
         branch,
@@ -490,7 +606,8 @@ pub fn relaunch_marks(lost_source: &Value, lost_id: &str) -> Value {
     Value::Object(m)
 }
 
-/// The [`STAMP`] value the conductor writes on the lost run.
+/// The [`STAMP`] value the conductor writes on the lost run, with its
+/// [`UNFINISHED`] marker set or deleted to match.
 pub fn stamp(
     action: &str,
     now: DateTime<Utc>,
@@ -509,13 +626,90 @@ pub fn stamp(
             m.insert(k.into(), json!(v));
         }
     }
-    json!({ STAMP: Value::Object(m) })
+    // The marker rides in the same PATCH as the stamp, so the two can
+    // never be read apart; null deletes a prior attempt's marker.
+    let unfinished = if is_unfinished(action) {
+        json!(true)
+    } else {
+        Value::Null
+    };
+    json!({ STAMP: Value::Object(m), UNFINISHED: unfinished })
+}
+
+/// The id of THE hand-back item for one lost gate-run, derived from that
+/// run alone (backlog cedc8e69). The POST used to carry no id, so the
+/// server minted one per send, and a send whose answer was lost — or
+/// whose [`FAILURE_FILED`] stamp was refused — left the run eligible and
+/// the next pass filed a second item. The jobs API admits an id once
+/// (558396ff: the same body again is answered `already_admitted`, a
+/// different one 409), so every pass, every restart and every concurrent
+/// conductor names ONE packet. The lost run and not the answer's fields:
+/// the hand-back is one per lost run, and a reading that moved must still
+/// collide with the first.
+pub fn handback_item_id(lost_id: &str) -> String {
+    /// A fixed namespace, so every conductor derives the same id.
+    const HANDBACK: uuid::Uuid = uuid::Uuid::from_u128(0xcedc_8e69_250f_4f4e_b8ea_ef46_ca58_fcbe);
+    uuid::Uuid::new_v5(
+        &HANDBACK,
+        format!("lost-gate-handback:{lost_id}").as_bytes(),
+    )
+    .to_string()
+}
+
+/// The hand-back request already on the record — the [`FILING`] stamp's
+/// `request`, exactly as it was first written — or `None` when no filing
+/// is under way. A pass that finds one replays it verbatim.
+pub fn filing_request(run: &Value) -> Option<&Value> {
+    if stamp_action(run) != Some(FILING) {
+        return None;
+    }
+    run.pointer(&format!("/metadata/{STAMP}/request"))
+        .filter(|r| r.get("id").and_then(Value::as_str).is_some())
+}
+
+fn request_why(request: &Value) -> Option<&str> {
+    request
+        .pointer("/metadata/evidence/why")
+        .and_then(Value::as_str)
+}
+
+/// The write BEFORE the hand-back's POST: [`FILING`], naming the item it
+/// will be and carrying the whole request (the request receipt).
+pub fn filing_stamp(now: DateTime<Utc>, request: &Value) -> Value {
+    let item = request.get("id").and_then(Value::as_str);
+    let mut s = stamp(FILING, now, None, item, request_why(request));
+    s[STAMP]["request"] = request.clone();
+    s
+}
+
+/// The write AFTER the item was admitted or recovered: [`FAILURE_FILED`]
+/// naming it, with the request as sent and `result` — what the jobs API
+/// answered, or what was read back — beside it, whole.
+pub fn filed_stamp(now: DateTime<Utc>, request: &Value, item: &str, result: &Value) -> Value {
+    let mut s = stamp(FAILURE_FILED, now, None, Some(item), request_why(request));
+    s[STAMP]["request"] = request.clone();
+    s[STAMP]["result"] = result.clone();
+    s
+}
+
+/// PURE: is `item`, as `GET /api/jobs/{id}` returned it, THE hand-back
+/// for `lost_id` — the derived id, a backlog-item, naming that lost run
+/// among its gate-runs? The recovery read after an answer that could not
+/// be read accepts nothing less: anything else is UNKNOWN, never filed.
+pub fn is_original_handback(item: &Value, lost_id: &str) -> bool {
+    item.get("id").and_then(Value::as_str) == Some(handback_item_id(lost_id).as_str())
+        && item.get("kind").and_then(Value::as_str) == Some("backlog-item")
+        && item
+            .pointer("/metadata/evidence/gate_runs")
+            .and_then(Value::as_array)
+            .is_some_and(|runs| runs.iter().any(|r| r.as_str() == Some(lost_id)))
 }
 
 /// The ONE pipeline-failure item a hand-back files: both gate-runs, the
 /// branch and sha, and what the machine saw — so the agent starts from
-/// the reading, not from "lost".
+/// the reading, not from "lost". Under [`handback_item_id`] of `lost_id`.
 pub fn failure_item_body(
+    lost_id: &str,
     branch: &str,
     sha: &str,
     first: &str,
@@ -525,6 +719,7 @@ pub fn failure_item_body(
 ) -> Value {
     let short = &sha[..sha.len().min(8)];
     json!({
+        "id": handback_item_id(lost_id),
         "kind": "backlog-item",
         "title": format!(
             "A lost car gate could not be relaunched by the machine: {branch}@{short}"
@@ -621,9 +816,9 @@ mod tests {
     fn facts<'a>(lost: &'a Value, others: &'a [Value]) -> Facts<'a> {
         Facts {
             lost,
-            branch_head: Some(SHA),
+            branch_head: Ok(Some(SHA)),
             others,
-            landed: false,
+            landed: Landed::No,
             car: CarStanding::NoCar,
             now: now(),
         }
@@ -764,7 +959,7 @@ mod tests {
     fn a_moved_branch_is_declined() {
         let run = lost_run();
         let f = Facts {
-            branch_head: Some("fedcba9876543210fedcba9876543210fedcba98"),
+            branch_head: Ok(Some("fedcba9876543210fedcba9876543210fedcba98")),
             ..facts(&run, &[])
         };
         assert!(declined(answer(&f)).contains("moved"));
@@ -774,10 +969,55 @@ mod tests {
     fn a_deleted_branch_is_declined() {
         let run = lost_run();
         let f = Facts {
-            branch_head: None,
+            branch_head: Ok(None),
             ..facts(&run, &[])
         };
         assert!(declined(answer(&f)).contains("no longer exists"));
+    }
+
+    /// Backlog f39eedf2: a head the forge would not answer is UNKNOWN —
+    /// not "gone", not "moved", and not a relaunch either. It holds, the
+    /// conductor records the hold as a refusal, and when the window
+    /// closes on those refusals the loss is handed back naming the forge
+    /// error rather than aging out with nothing on its record.
+    #[test]
+    fn an_unread_branch_head_holds_and_is_handed_back_when_the_window_closes() {
+        let mut run = lost_run();
+        let dark = "HTTP 502 Bad Gateway reading branch fix/a-thing";
+        let f = Facts {
+            branch_head: Err(dark),
+            ..facts(&run, &[])
+        };
+        let why = match answer(&f) {
+            Some(Answer::Hold(why)) => why,
+            other => panic!("expected a hold, got {other:?}"),
+        };
+        assert!(why.contains(dark), "{why}");
+        // A second loss on an unread head holds too: a moved branch would
+        // decline it, so it is not filed until the head reads.
+        let second = with_md(lost_run(), RELAUNCH_OF, json!("first-run"));
+        assert!(matches!(
+            answer(&Facts {
+                branch_head: Err(dark),
+                ..facts(&second, &[])
+            }),
+            Some(Answer::Hold(_))
+        ));
+        // The conductor records each hold as a refusal; past the window,
+        // with the forge still dark, the hand-back names the forge error.
+        run["metadata"][REFUSALS] = refusal_patch(&run, now(), &why)[REFUSALS].clone();
+        run["steps"][0]["completed_at"] = json!(at(WINDOW_HOURS * 60 + 1));
+        assert!(is_candidate(&run, now()));
+        match answer(&Facts {
+            branch_head: Err(dark),
+            ..facts(&run, &[])
+        }) {
+            Some(Answer::FileFailure { first, why, .. }) => {
+                assert_eq!(first, LOST);
+                assert!(why.contains(dark), "{why}");
+            }
+            other => panic!("expected a hand-back, got {other:?}"),
+        }
     }
 
     #[test]
@@ -802,10 +1042,58 @@ mod tests {
     fn a_landed_sha_is_declined() {
         let run = lost_run();
         let f = Facts {
-            landed: true,
+            landed: Landed::Ancestor,
             ..facts(&run, &[])
         };
         assert!(declined(answer(&f)).contains("landed"));
+    }
+
+    /// Backlog 6a39558a: the lost sha is no ancestor of main, but its
+    /// change landed under a twin branch — merging it into main writes
+    /// main's own tree. Relaunching it carries the park intent and files
+    /// a car for nothing (faa27ef3, 363c2d7d); it is declined instead,
+    /// naming the tree, and nothing is launched.
+    #[test]
+    fn a_change_already_on_main_under_a_twin_branch_is_not_relaunched() {
+        let run = lost_run();
+        let f = Facts {
+            landed: Landed::InMainTree {
+                tree: "13190d8a".into(),
+            },
+            ..facts(&run, &[])
+        };
+        let why = declined(answer(&f));
+        assert!(why.contains("landed twin"), "{why}");
+        assert!(why.contains("13190d8a"), "{why}");
+    }
+
+    /// The content check could not be read: UNKNOWN never parks. Nothing
+    /// is launched, and the cause rides the hold.
+    #[test]
+    fn an_unreadable_landing_holds_and_launches_nothing() {
+        let run = lost_run();
+        let f = Facts {
+            landed: Landed::Unknown("git merge-tree errored".into()),
+            ..facts(&run, &[])
+        };
+        match answer(&f) {
+            Some(Answer::Hold(why)) => assert!(why.contains("git merge-tree errored"), "{why}"),
+            other => panic!("expected a hold, got {other:?}"),
+        }
+    }
+
+    /// The control: a change genuinely not on main still relaunches with
+    /// its whole park intent.
+    #[test]
+    fn an_unlanded_change_still_relaunches_with_its_park_intent() {
+        let run = lost_run();
+        let Some(Answer::Relaunch { marks, .. }) = answer(&facts(&run, &[])) else {
+            panic!("expected a relaunch");
+        };
+        assert_eq!(
+            marks["park_backlog_item"],
+            run["metadata"]["park_backlog_item"]
+        );
     }
 
     #[test]
@@ -903,7 +1191,7 @@ mod tests {
     fn a_second_loss_on_a_moved_branch_is_declined_not_filed() {
         let run = with_md(lost_run(), RELAUNCH_OF, json!("first-run"));
         let f = Facts {
-            branch_head: Some("fedcba9876543210fedcba9876543210fedcba98"),
+            branch_head: Ok(Some("fedcba9876543210fedcba9876543210fedcba98")),
             ..facts(&run, &[])
         };
         assert!(declined(answer(&f)).contains("moved"));
@@ -911,7 +1199,16 @@ mod tests {
 
     #[test]
     fn the_failure_item_is_a_pipeline_failure_naming_both_runs() {
-        let body = failure_item_body("fix/a-thing", SHA, "first-run", LOST, "lost twice", "emp-x");
+        let body = failure_item_body(
+            LOST,
+            "fix/a-thing",
+            SHA,
+            "first-run",
+            LOST,
+            "lost twice",
+            "emp-x",
+        );
+        assert_eq!(body["id"], json!(handback_item_id(LOST)));
         assert_eq!(body["kind"], "backlog-item");
         assert_eq!(body["owner_id"], "emp-x");
         assert_eq!(body["metadata"]["input_channel"], "pipeline-failure");
@@ -924,6 +1221,97 @@ mod tests {
             body["metadata"]["evidence"]["gate_runs"],
             json!(["first-run", LOST])
         );
+    }
+
+    // -- one hand-back, one item (backlog cedc8e69) ---------------------
+
+    /// The id is the lost run's alone: every pass, restart and conductor
+    /// derives the same one, and two lost runs never share one.
+    #[test]
+    fn the_handback_item_id_is_derived_from_the_lost_run_alone() {
+        let id = handback_item_id(LOST);
+        assert_eq!(id, handback_item_id(LOST));
+        assert_ne!(id, handback_item_id("22222222-0000-0000-0000-000000000000"));
+        assert!(uuid::Uuid::parse_str(&id).is_ok(), "{id}");
+        // A different reading of the same loss still names the same item.
+        let a = failure_item_body(LOST, "fix/a-thing", SHA, "x", LOST, "one cause", "emp-x");
+        let b = failure_item_body(LOST, "fix/a-thing", SHA, LOST, "y", "another", "emp-y");
+        assert_eq!(a["id"], b["id"]);
+    }
+
+    /// A filing under way is owed past the window, and answered with ITS
+    /// request — the original gate-runs and cause — even when every fact
+    /// has moved: a fresh reading here would decline over an item that
+    /// may already exist, or file a second one.
+    #[test]
+    fn a_filing_under_way_replays_its_original_request_whatever_moved() {
+        let request = failure_item_body(
+            LOST,
+            "fix/a-thing",
+            SHA,
+            "first-run",
+            LOST,
+            "the original cause",
+            "emp-x",
+        );
+        let mut run = with_md(lost_run(), RELAUNCH_OF, json!("first-run"));
+        let s = filing_stamp(now(), &request);
+        assert_eq!(s[UNFINISHED], json!(true), "{s}");
+        assert_eq!(s[STAMP]["item"], request["id"]);
+        run["metadata"][STAMP] = s[STAMP].clone();
+        run["metadata"][UNFINISHED] = json!(true);
+        run["steps"][0]["completed_at"] = json!(at(WINDOW_HOURS * 60 + 30));
+        assert!(is_candidate(&run, now()));
+        assert_eq!(filing_request(&run), Some(&request));
+        let others = [other("hand-regate", 1, json!({}))];
+        let f = Facts {
+            branch_head: Ok(Some("fedcba9876543210fedcba9876543210fedcba98")),
+            landed: Landed::Ancestor,
+            car: CarStanding::Withdrawn,
+            ..facts(&run, &others)
+        };
+        assert_eq!(
+            answer(&f),
+            Some(Answer::FileFailure {
+                branch: "fix/a-thing".into(),
+                sha: SHA.into(),
+                first: "first-run".into(),
+                second: LOST.into(),
+                why: "the original cause".into(),
+            })
+        );
+        // No filing under way: no request to replay.
+        assert_eq!(filing_request(&lost_run()), None);
+    }
+
+    /// The outcome carries both receipts whole and clears the marker.
+    #[test]
+    fn the_filed_stamp_keeps_the_request_and_the_result() {
+        let request = failure_item_body(LOST, "fix/a-thing", SHA, "f", LOST, "cause", "emp-x");
+        let id = handback_item_id(LOST);
+        let result = json!({"id": id, "already_admitted": true});
+        let s = filed_stamp(now(), &request, &id, &result);
+        assert_eq!(s[STAMP]["action"], FAILURE_FILED);
+        assert_eq!(s[STAMP]["item"], json!(id));
+        assert_eq!(s[STAMP]["reason"], "cause");
+        assert_eq!(s[STAMP]["request"], request);
+        assert_eq!(s[STAMP]["result"], result);
+        assert_eq!(s.as_object().unwrap().get(UNFINISHED), Some(&Value::Null));
+    }
+
+    /// The recovery read accepts the original and nothing else.
+    #[test]
+    fn only_the_original_handback_is_recovered() {
+        let mut item = failure_item_body(LOST, "fix/a-thing", SHA, "f", LOST, "cause", "emp-x");
+        assert!(is_original_handback(&item, LOST));
+        assert!(!is_original_handback(&item, "f"), "another run's id");
+        item["kind"] = json!("ops-request");
+        assert!(!is_original_handback(&item, LOST));
+        let mut other_runs = failure_item_body(LOST, "fix/a-thing", SHA, "f", "g", "c", "e");
+        assert!(!is_original_handback(&other_runs, LOST), "names neither");
+        other_runs["metadata"]["evidence"]["gate_runs"] = json!(["f", LOST]);
+        other_runs["id"] = json!("someone-else");
+        assert!(!is_original_handback(&other_runs, LOST), "another id");
     }
 
     // -- the stamp and the car ------------------------------------------
@@ -1083,6 +1471,53 @@ mod tests {
         let mut run = lost_run();
         run["steps"][0]["completed_at"] = json!(at(WINDOW_HOURS * 60 + 1));
         assert_eq!(answer(&facts(&run, &[])), None);
+    }
+
+    /// THE NARROW CENSUS (backlog de67e500). Beyond the window the
+    /// conductor reads stamped runs only to find the machine's own
+    /// unfinished acts, and it finds them by [`UNFINISHED`] rather than
+    /// by every stamp ever written (re-read each pass, growing forever).
+    /// So every stamp carries the marker exactly when [`is_candidate`]
+    /// still owes it an answer past the window, and says null otherwise,
+    /// which a metadata PATCH reads as "delete": the outcome that
+    /// answers an attempt takes the marker with it.
+    #[test]
+    fn a_stamp_carries_the_unfinished_marker_exactly_when_it_is_still_owed() {
+        let mut past = lost_run();
+        past["steps"][0]["completed_at"] = json!(at(WINDOW_HOURS * 60 + 1));
+        assert!(
+            !is_candidate(&past, now()),
+            "the fixture is past its window"
+        );
+        for action in [
+            RELAUNCHED,
+            DECLINED,
+            FAILURE_FILED,
+            LAUNCH_FAILED,
+            ATTEMPTING,
+            FILING,
+        ] {
+            let s = stamp(action, now(), None, None, None);
+            let owed = is_candidate(&with_md(past.clone(), STAMP, s[STAMP].clone()), now());
+            let marker = s.as_object().unwrap().get(UNFINISHED);
+            if owed {
+                assert_eq!(marker, Some(&json!(true)), "{action}: {s}");
+            } else {
+                assert_eq!(marker, Some(&Value::Null), "{action}: {s}");
+            }
+        }
+        // Every owed action is owed (the loop above is not vacuous).
+        assert!([LAUNCH_FAILED, ATTEMPTING, FILING].iter().all(|a| stamp(
+            a,
+            now(),
+            None,
+            None,
+            None
+        )[UNFINISHED]
+            == json!(true)));
+        // A refused launch clears the attempt AND its marker.
+        let p = refusal_patch(&lost_run(), now(), "2 gate(s) running of 2");
+        assert_eq!(p.as_object().unwrap().get(UNFINISHED), Some(&Value::Null));
     }
 
     /// The refusal record is bounded: a count, the first time, and the

@@ -100,7 +100,7 @@ read_node_roles() { # <node-id>
                     http://* | https://*) machine_token_header NODE_ROLES_MT_HDR "$nodes_url" || NODE_ROLES_MT_HDR="" ;;
                 esac
             fi
-            if roles_out="$(curl -sS --max-time 10 \
+            if roles_out="$(curl -q -sS --max-time 10 \
                 ${NODE_ROLES_MT_HDR:+-H "$NODE_ROLES_MT_HDR"} \
                 -H "x-boss-user: $(sor_reader_header "automation:$prefix")" \
                 -w '\n%{http_code}' "$nodes_url" 2>/dev/null)"; then

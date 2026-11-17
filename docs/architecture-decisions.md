@@ -111,10 +111,10 @@ directly:
 | `boss-cybernetics` responsibility | superseded by |
 |---|---|
 | budget caps before dispatch | `boss-jobs/src/agent_budget.rs` — the claim door reserves the step's budget against the actor's hour, before the CAS |
-| one-at-a-time dispatch | `boss dispatch` — one `agent-run` packet per step, bounded by `agents.max_concurrent_runs` at the claim |
+| one-at-a-time dispatch | `boss dispatch` — one `agent-run` packet per step, its `building` claim bounded by a slot of its `robots:<model>` pool (the per-actor `agents.max_concurrent_runs` cap retired, backlog 3e927996) |
 | lifecycle telemetry | `agent_runs` plus the run packet's terminals |
 | chaining on completion | the `agent-run` workflow's terminals and the dispatcher rules firing off them |
-| the per-agent durable inbox | a **station** (923b6571), pulled through the same claim door by `boss dispatch --next --station` |
+| the per-agent durable inbox | a **station** (923b6571) — since design 6e42c6de the executor's own tree station and its subtree, filtered by the role, model and assignment it may claim — pulled through the same claim door by `boss dispatch --next` |
 
 The inbox was **the real gap, not a translation**, and the ordering
 this decision set was held: the crate did not leave the tree until the
@@ -125,7 +125,10 @@ capability is lost by accident. The inbox's caller is the operator's
 session: David decided on 2026-09-23 that running `boss dispatch
 --next` by hand counts as the runner having run (the session is the
 CPU, 57c108c2), so no headless runner stands in for the old loop. Its
-config (`infra/cybernetics/`) and its systemd unit left with it.
+config (`infra/cybernetics/`) and its systemd unit left with it. The
+direction has since moved: design `506e0a1c` (2026-11-09) seats each
+executor at stations and moves Codex and Claude B onto a supervised pull
+loop once `boss station pull` exists (§The network substrate).
 
 **`boss-observability` is retired as SUPERSEDED-BY, not deleted as
 dead** (2026-09-23, backlog 467175e7, design 8382bbb2 — the second car,
@@ -170,8 +173,9 @@ queue the actor has policy to work** (David: "Any queue that the actor
 has policy to work should be available to be worked overnight too");
 (4) **with the bound read from the agents registry and enforced server
 side**, never a second copy in the rule row (§9a). The claim door
-already judges `agents.max_concurrent_runs` (backlog `57c108c2`); the
-cadence itself is not built, which is why the paragraph above records
+judges a run's `building` against its `robots:<model>` pool (the
+per-actor `agents.max_concurrent_runs` cap of backlog `57c108c2`
+retired under 3e927996); the cadence itself is not built, which is why the paragraph above records
 the session as the CPU.
 
 *Algedonic* signals keep their Beer meaning throughout: rules firing
@@ -433,6 +437,32 @@ re-evaluation is incremental. The predicate DSL is a tiny custom
 language shared verbatim with the dispatcher's `when` clauses and
 handler args.
 
+**A closed record on another packet is checked by the actor that
+relies on it, not by `ready_when`** (design-doc *Make closed native
+evidence a Workflow readiness condition*, `69c0ace7`, David
+2026-10-04, its one question accepted as proposed). The design asked
+for a registry-declared external-evidence condition: a jobs-adapter
+verifier that reads a referenced native run at the transition,
+server-stamps an event-backed receipt that alone opens readiness, and
+demotes the step when a bound fact moves. Not built, and no protocol
+now needs it. `build_context` still hands `ready_when` only the
+subject, the job's metadata and the packet's own steps, and the one
+use the design named, the tenant merge's independent review (design
+`9de0cd1c`), was built on ONE packet instead (backlog `84e7c3e4`,
+2026-10-09): ops-request carries a `review` step wherever the verb's
+file declares `requires_review` (today `merge-tenant-main` alone),
+`approve` is ready over that step's `release`, and the ops runner,
+not the predicate, holds the cross-packet facts. It renders the plan
+onto `approve` only for a landed `tenant-reviewer` run that is not
+the source run and a plan that still hashes to the reviewed bytes,
+and checks both again before the claim. The plan keys on both steps
+declare `writer = "runner:ops"`, resolvable since 2026-10-10 under
+row E of design `b08725c2`, the separate credential decision Q1
+asked for. The branch that began this design's core change
+(`fix/closed-native-evidence-gates-tenant-approval`) was never pushed.
+A protocol that later needs a closed cross-packet record before READY
+takes this decision's shape; until one is measured, no item is filed.
+
 **Sub-Jobs are a typed contract** (`delegate-subjob` — the one
 spelling): the parent step's completion *is* the child Job's
 close, parents must handle every possible child outcome, and the
@@ -531,6 +561,33 @@ conditional publication lifecycle, establish provider attestation, make
 Secret and Job writes one distributed transaction, grant installation
 permissions, or prove a public publication succeeded. Those obligations
 remain with their owning packets.
+
+**A workflow-publish step cannot yet be completed conditionally.**
+Design-doc *Commit conditional workflow publication without publishing
+past a lost claim*
+([bbaa0cac](https://boss.algedonic.dev/ux/jobs/bbaa0cac-f573-43bd-9775-a62db426be8d),
+2026-10-03, no questions) holds the half of the conditional-completion
+contract that `POST …/complete-if` does not meet. Each StepType declares
+`conditional_completion`: `row-and-outbox`, the default, or
+`inline-effect`, a kind whose completion acts outside the step row and
+its outbox. `workflow-publish` is the one inline-effect kind, and the
+conditional door refuses it, and any kind the registry does not know,
+409 `unsupported_capability` before any evidence, status, event or
+registry write. The reason is ordering: the status PUT still runs
+`dispatch_workflow_publish`, whose registry transaction commits on its
+own, before the step's version check (`update_step_if_unchanged_at`), so
+a claim lost between them leaves a published version beside an unmoved
+step, and publishing after completion would instead record a completion
+whose effect failed. What holds today: a re-send of the same spec from
+the same authoring packet is answered with the row it already wrote, not
+another version (backlogs `558396ff`, `4bdb8150`, `50ded63d`), and
+`publish_authored_if_absent` makes absent-only publication one atomic
+adapter operation. Not built: one committing boundary for the claim
+judgement, the publication and the completion (a shared transaction, or
+an intent/effect protocol whose consumer records the publication before
+the completion), with races, exact replay, retained failure causes and
+rebuild proven on both adapters. That build is owed on backlog item
+`0071b36f`, which stays open until it lands.
 
 **A Job carries the instant it was admitted, not only the day**
 (design `f2cdff23`, David 2026-09-20, all three questions accepted as
@@ -660,6 +717,22 @@ packet must never reach `answered` when nothing left the building. Not
 yet built; the send needs an SMTP submission transport behind
 `MailTransport`, beside the log and HTTP-API ones.
 
+**The support row writes down what bffc0aba and 3a89774d decided, and the
+drafting agent reads a bounded set.** Design `770c352c` drafts the
+`receive-a-message` Workflow row (seven steps: received by the
+support-inbox sensor, triage by the founder as real, spam or duplicate,
+draft by the agent, approve as a presence-backed sign-off on the exact
+words, sent by the transport exactly as approved, answered or spam),
+adding no decision those two designs had not made. Its one question, a
+data boundary, was accepted on 2026-11-02: to support a reply the drafting
+agent may read **the packet and its thread, the correspondent's own
+account and packets when the sender address matches a known account, the
+manual and the published catalog**, and NEVER another correspondent's
+packets, other accounts, credentials or unpublished prices; the draft's
+`sources` object names every read, so the approver can see the boundary
+was kept. The row lands after the mail adapter (492a61ae) and the Bridge
+host car (67e08c6a).
+
 **Workflows bootstrap through Jobs.** The system-owned
 `workflow-design` kind authors new Workflows inside a Job (draft
 edits live in the authoring Job; the terminal `workflow-publish`
@@ -684,6 +757,58 @@ design **approve** step requires a `workflow-approver` capability —
 authoring a work-type is operational leadership's call, not the deploy
 operator's alone (core policy grants it to `platform-admin`; tenants
 grant it to their leaders; `design-doc-review` stays `platform-admin`).
+
+**What an actor holds and is owed is answered by one server reader.**
+Design `7526f859` (2026-11-01, no questions; extends 347d14ee) replaces six
+independent computations (the idle-actor watch, the urgent-item watch, the
+urgent-first door, `boss orient` MY WORK, the top board with
+`outranks::claim_run`, and `boss step release`), which had collected
+eleven filed defects between them. `boss_jobs::holdings::for_actor` returns
+every step the actor holds or is owed, typed: how it is held (claimed with
+an open, gate-waiting or absent run; nominated; via a role or a station),
+what carries it (a car in flight, held, landed awaiting proof, partial, or
+none) and what it awaits (gate, a person, a packet, capacity, nothing).
+Outcome steps and human-act steps are never lines. **Waiting is a fact**:
+`waiting_on {kind, id, since}` is a reserved step key written by the door
+that made the step wait, so a watch never re-alarms a line that awaits a
+person or a packet; it alarms when the awaited thing resolved and the line
+did not move. Every watch, orient, the board and outranks read the reader;
+`boss step release` refuses a line whose claim has an open run, naming it,
+and completes only on a read-back with no holder. A pin names every file
+that computes a holding without the reader. Under the station tree, the
+capacity case of `awaits` is the named constraint that station-spec
+resolution records (4b27a65a, T6).
+
+**Every machine-owned metadata key has one registered writer, and every
+door enforces it.** Design `7fc4fb2e` (2026-10-31, no questions) makes the
+reserved keys a registry in boss-jobs, each key with its ONE writer and
+shape (`release`, `hold`, `corrections`, `repins`, `priority_changes`,
+`opened_by`, `outcome`, `authoring_job_id`, `selected_by` as a bounded
+ring, a step's `title`, the gate attempt, and the `waiting_on` key of
+7526f859, among others). Job POST and PUT, step PUT, the merge door, the
+first-record door, the conditional door and the workflow POST all run the
+same check: a reserved key from a caller that is not its writer is refused
+409 naming the writer; a job PUT never carries a reserved key forward and a
+create cannot carry one in. The merge door and the job PUT take the
+version the caller read (`If-Match`), and a write against a moved version
+is refused with the current one. A declared field's type is judged when it
+is written, not only at completion. A person's `hold` and the gate's
+`gate_hold` are two keys, and the release rule lifts only `gate_hold`.
+Every car is a mutating-door change and parks held for a distinct review.
+
+**A step may name a list of people as its audience.** Design `a00427ab`
+(backlog 4c550a4a): the ops runner can assign a rendered approval only when
+its verb names exactly one approver, and all 31 shipped approval verbs
+named `emp-david` alone. The proposal was to lint one approver per verb
+until a second person joins; David decided otherwise on 2026-11-05: a
+**fourth audience variant** beside individual, role and station, a list of
+employee ids. The step shows in every named person's queue, is held by
+none of them, and any one valid passkey signature satisfies it. Quorum is
+not new: a verb wanting two of three declares its approvers plus the
+existing `sign_offs_required`, and the step completes on the Nth
+signature. Named ids, not a role, because a role is registry data a policy
+writer can widen while a named list is a tree change (his reasoning of
+2026-09-22). The approve step's passkey signature stays the only approval.
 
 ## The network substrate — packets, stations, routes
 
@@ -768,16 +893,24 @@ traffic until there is bandwidth or capability to handle it —
 **queuing separated from dispatching**: a station holds and orders,
 the router moves. The registry lives in `boss-jobs` beside the
 workflow registry, same append-only versioned posture, one active
-row per name. Four kinds share one row shape: **actor** (every
-executor has one), **group** (departments and teams), **constraint**
-(membership by capability predicate, not an enumerated roster), and
-**batch** (the bundling points — loading dock, review queue, board
-windows — where packets accumulate for periodic, higher-bandwidth
-handling). **Membership is derived and motion is evented**: the row
+row per name. Four kinds share one row shape, in two families. The
+GENERIC station, sorted by who serves it: **actor** (every executor
+has one), **group** (departments and teams), and **constraint**
+(membership by capability predicate, not an enumerated roster). And
+**equipment** (factory taxonomy M2, item 0a78f8f8, 2026-11-03): a
+station that is shared process equipment, naming the automaton that
+operates it and its **bays** — required there and refused on every
+other kind. The dock is equipment (the conductor, one bay) and so are
+the gates (the gate runner), whose bays ARE the gate capacity — the
+delivery policy's `gate_max_concurrent` was dropped for them. The
+kind equipment replaced, **batch**, was deleted: a batch station is an
+equipment station whose automaton's program is a cadence (Q1, decided
+2026-11-02). **Membership is derived and motion is evented**: the row
 carries a predicate evaluated over open packets at read time, so no
 mutable current-station field exists to drift from `steps`, and the
-router emits arrival/departure markers so the map and flow metrics
-read motion without one. Per-actor stations need no per-actor rows —
+map and flow metrics read motion off each step's own ready and
+completion stamps without one (§Station membership is read, not
+replayed). Per-actor stations need no per-actor rows —
 the predicate carries a literal `"@me"` that the evaluator binds to
 the requesting actor once, before any packet is compared, and both
 failure modes fail closed (an unbindable placeholder answers with an
@@ -796,6 +929,241 @@ filed the packet is empty at exactly the moment it matters if
 departed packets vanish at closure. Stations ship read-only and
 barely seeded — two platform `batch` rows, no authoring API — so
 "every executor has one" is the design, not today's data.
+
+Decision history: the v1 taxonomy is design `4348b857`, decided by
+David on 2026-11-02 (Q1: the dock became equipment with the conductor as
+its automaton, and `batch` was retired; Q2: a person's capacity is a pool
+whose capacity is a roster read, `people:<role>` rows re-derived when the
+roster changes and never hand-set), superseded by the station tree,
+design `4b27a65a`, 2026-11-06 (`docs/design/factory-taxonomy-v2.md`),
+which keeps v1's census, diagnosis, executor kinds and two failure facts
+and retires the equipment/generic split, bays as a kind and
+automation-as-group. Q2 survives into v2 unchanged as the `people:<role>`
+pool.
+
+**The doors read data, so the taxonomy is used by writing rows.** By
+2026-11-05 the v1 taxonomy's mechanisms were on main (executor kinds, the
+claim door judging a holder against a step's declared executor, robots
+nominated by model class, the two failure facts, the vocabulary lint), and
+almost none of the data they read existed: no robot carried a model class,
+no step declared an executor, only the gates and the dock were declared
+with capacity, pools named no station and stations declared no edges.
+Design `ccfe87ff`, its three questions decided as proposed on 2026-11-05,
+orders one data pass: model classes on the robots and `executor =
+model:<class>` on **build and the two reviews** (the adversarial review and
+the landed-review); `executor = equipment:<station>` on the gate-run's
+`record-verdict` and the car's probe step; everything else stays
+undeclared until a constraint is real. The converge is **three** stations
+(deploy, probe shed, converge), each with its own capacity, because
+different automata operate them and they hold different resources. A pool
+names the station it serves, a station declares its edges, and departments
+declare their stations, and these **are** the console's remaining
+bindings: the console binds by reading them, with no further console car.
+
+**A robot's model class is derived from its claimant's default model,
+not declared beside it.** Design-doc *Five further collapses of
+duplicated factory facts and packet handoffs* (`942dc0ac`, Q3, David
+2026-11-08) found the model-to-class fact in two places: an agent row
+declares `model_class` beside `default_model`, and each `robots:<class>`
+pool lists its models, so claiming, nomination and billing could read
+different paths to one class. Decided, for today's fixed-model robots:
+the pool's models list is the one mapping, the agent's class is derived
+from it by one pure resolver, and the separately authored class column
+goes once every reader has moved. The robot pool draw resolves the
+ACTUAL claimant's default model, never the step's requested model; the
+resolved class is frozen on each resource claim; claimant-first billing
+stays; an unknown or multiply mapped model refuses rather than falling
+back. A future multi-model executor needs an observed model selection,
+not a second editable class (item `d0315c8d`, not yet built).
+
+In v2's words (4b27a65a): "equipment station" is a standing station with
+machines, its "bays" are the station's capacity, and "a pool names its
+station" is the station holding an allocation from its parent.
+
+**An executor is seated at stations and pulls its next step; the
+coordinator allocates and never assigns** (design `506e0a1c`, David
+2026-11-09, its three questions decided as proposed). David asked
+whether Claude B and Codex should work within a station, so the station
+decides which of its steps each takes, rather than a coordinator session
+choosing their work — which is v2's rule that an executor claims a step
+at a station and a robot is pool capacity. Measured on main that day:
+the pull exists, `POST /api/stations/{name}/claim-next`, an atomic claim
+of the eligible head of a station's queue with a conserved selection
+receipt, and the dispatcher re-offers a station's oldest waiting step
+when a pool releases (`jobs-reoffer-waiting-on-release`); but nothing
+called it, no executor was seated anywhere, the station queues had last
+been generated on 2026-10-30, and a held car's review was handed out by
+a coordinator rather than queued. Decided: (1) **a seat is data on the
+executor's agents-registry row** — no new table, no per-step executor
+key — and a station's who-pool is the set of executors seated there; an
+executor may hold **several seats, in order**, and pulls from the first
+with admissible work, so a reviewer serves landed-review first and build
+second rather than idling when no review waits; (2) **reviewer distinct
+from builder is a station rule**: a held car's review is a step queued at
+landed-review or design-review, and the claim refuses a pull by the actor
+who built the car, so the distinctness no longer rests on a coordinator
+picking a reviewer; (3) **Codex and Claude B leave their interactive
+sessions for a supervised pull loop** once the pull works — both sat idle
+at a prompt from 21:04Z that evening — and switching them ends their
+current sessions, which is David's go to give. One verb, `boss station
+pull <station>`, wraps claim-next as the first act of every executor
+turn and returns the step with its dispatch brief. The coordinator's
+remaining job is allocation — how many seats, at which stations — plus
+releases and holds; a dark station with no seated executor is normal.
+Not built when decided: the projection repair the stale queues need
+(item `b3572a26`, the prerequisite), the seat key, the verb, the
+builder-distinct refusal in the claim, review steps at the review
+stations, and the loop. This is the pull half of M above (who acts next),
+answered by the station's discipline at the claim rather than by the
+dispatcher's reflex on `step.ready`.
+
+**The queue coordinator's cycle is a rules document; choosing each
+executor's work has since moved to the station** (design-doc `8cc2c71f`,
+"Queue coordinator cycle: advance, refill, isolate holds, and prove wake
+capability", opened by agent-codex 2026-10-02 with no open questions;
+folded 2026-11-12). An actor explicitly assigned to coordinate the
+queues runs one cycle: observe through `boss orient`, advance completed
+work before refilling, refill by urgency then age, keep gate submissions
+coherent, keep each hold on its own packet with an owner and a next
+observable check, and leave a cycle receipt. Its five-minute recheck is
+an operating target, not a wake source: prose implements no timer, and
+a wake capability is claimed only from machine evidence. Built: the
+text, as `infra/platform/documents/coordinator-rules.md`, which
+CLAUDE.md's session-startup section names for that assignment (car
+`6893e4ba`, train #900), since amended for option A's review holds
+(`bd331d38`, train #1015) and the owed landed reviews (`c851ed24`,
+train #1042). Not built: the design's own verification, which is two
+evidenced cycles, the measured delays and a recorded wake capability.
+That stays owed on item `6cd6c935`, which the car left open as a
+partial (its build step still ready on 2026-11-12). Superseded in part:
+the cycle's assigning half, where the coordinator picks each executor's
+next packet and its distinct reviewer, gives way to `506e0a1c` above
+(the coordinator allocates seats, the executor pulls through `boss
+dispatch --next`, design `6e42c6de`), and that decision's answer to the
+wake question is the supervised pull loop, not yet built. Until those
+land, the rules document still speaks in the older words.
+
+**A step is a station address, a completion contract and a readiness
+predicate; the station answers who and where, the packet what,
+and why stays David's** (design `771f83ca`, David 2026-11-08, its
+three questions answered as proposed on the reviewed text; Q2's
+representation since left open, below). David asked whether a step can be essentially an
+address plus formal completion checks, then framed doing work as
+five question words: a station is the virtual space that brings WHO
+(its admitted executors) and WHERE (the resource pools and machines
+it reserves durably, or draws and releases) together; its priority
+admission queue orders WHEN; the packet and its encoded step are WHAT;
+and WHY is David's intent, carried on the packet with its design
+and decision links for people to read, never evaluated or compiled
+into a predicate. Stations and protocols are both data. So a step
+keeps its stable identity (today's `title` slug, which predicates
+reference: an id, not display text) and its `ready_when` (dependency,
+not capacity), names where its work can be done, and declares what
+proves it done. Measured on origin/main `d88cf723`: 89 active workflow
+rows and 542 steps live, 79 and 478 in source, where 269 top-level
+placement and execution keys across 231 source steps (`audience`,
+`authority_role`, `agent`, `executor`, `resources`, `claimable`)
+mix routing, execution and authority, and the 37 source `agent`
+blocks hold only eight distinct configurations.
+
+**Execution policy is the station's, and the station cannot negotiate
+the contract** (Q1). A station service owns its admissible executor
+kinds and model classes, the agent profile, model preference, budget
+and effort, its machines, its claim discipline and its resource bill;
+allocation stays on the station tree and its pools. A step carries
+no executor, profile or bill that overrides or widens the station's:
+a protocol that needs different execution addresses a different
+station service. What the completion contract requires (business
+authority, a person-only decision, a named signer, independence
+from the builder, fresh evidence, an assurance floor) stays on the
+contract and is checked at claim and at completion; a station that
+can host robots cannot relax it, and a queue address is never a
+permission grant. The census holds 48 `human_only` defaults and 11
+`assurance_required` steps, and both meanings survive any move. Read
+against the station tree's T6 (4b27a65a), the step's station spec narrows to an
+address: executor, machine and bill defaults belong to the station
+service it names, and only the contract's non-negotiable conditions
+ride the step. Model-specific work is station structure: work David
+means to require Opus addresses a station whose admissible robots are
+`robots:opus`, with no model key on the step. A requested model is
+not an observed claimant, so the 41 live agent-block preferences do
+not become enforced Opus-only constraints, and the five hard executor
+declarations do not become preferences.
+
+**A published address must be able to fulfil its contract.** The
+authoring test is that the addressed station's WHO and WHERE can do
+the step's WHAT. Publishing resolves a static address against the
+active station tree and refuses, naming the protocol, step, station
+and version and each unsatisfied requirement, unless the station
+advertises a service with an admissible executor, the required machine
+interface, a compatible Step UX (a builtin renderer whose schema covers
+the fields suffices) and verifiers for the evidence and assurance
+asked. For a dynamic address whose candidate set is enumerable,
+every permitted candidate is validated, not one convenient station;
+an unenumerable set records its declared bound and leaves the check
+to resolution. Resolution and admission re-read the actual station
+against the pinned contract and live allocation, and refuse an unknown,
+ambiguous, retired or incompatible destination by name rather than
+routing elsewhere. A busy station is capable and waiting; free capacity
+does not make an unsupported contract executable. Admission records
+the capability witness (station and service versions, contract kind and
+version, executor identity and class, machine and UX bindings); a live
+station edit never widens a pinned contract; and moving claimed work
+is an explicit recorded transition that keeps its claim, resources and
+signed evidence. StepType keeps contract identity, fields, evidence,
+sign-off and assurance semantics, while its completion dispatch mode,
+executor defaults and duration model are to split out into station
+execution policy: this is not the StepType registry's retirement. Step
+UX resolves from the contract kind and its pinned plugin version;
+Station UX starts from the existing station lens plus a registered
+renderer, and a station row never supplies arbitrary fetch URLs or
+grants endpoint permissions (uploaded station code needs its own
+sandbox design first).
+
+**A station may advertise a child's capability only as delegated,
+with a witness** (Q3, under the station tree's R8). The parent names
+the child service or protocol that fulfils the contract; resolution
+records the chosen child and its completion evidence; the child claims
+its own allocation; delegation is acyclic and bounded; an unavailable
+child refuses; and the station page shows delegated capability apart
+from direct. There is no flat union of the descendants' capabilities,
+and a parent never claims to operate a child's machines.
+
+**A dark station is a normal state.** A station with zero durable
+allocation and no admitted work is a declared space that keeps its
+identity, purpose and capability declaration and an entitlement to draw
+from permitted floating pools. It is not a missing row, an outage or an
+unreadable observation, and it needs no resident worker. Capability is
+not possession: admission draws atomically under the ancestor and pool
+bounds and records the acquisition before work starts, and that is what
+wakes the station; viewing it, queueing work for it or advertising its
+capability does not. When the last temporary draw is released and no
+durable allocation remains, it darkens again. The view draws darkness
+as normal, and parent summaries do not count it as an outage; it shows
+declared draw sources apart from resources held, keeps queued work and
+its named wait visible while dark, and draws stale, unknown and failed
+reads distinctly from intentional dark. Unknown capacity is never zero.
+
+Decision history and what is open: the review answered Q2 as its
+proposal then read, typed predecessor or packet references constrained
+to a station subtree, resolved once at readiness and readdressed
+only by an audited move while unclaimed. David's five-question
+framing arrived as that review completed, and the amended design
+(2026-11-09) leaves the addressing representation (static identities,
+packet or predecessor references, declared selection rules) and its
+binding moment open as a data-design choice, claiming no retrospective
+approval. Design `305cf4ce` (2026-11-12, §Claims stand at the station
+the tree resolves) selects the scheme: one static `at = <station id>`
+on the step, `under` dropped. The publish, resolution and witness
+requirements above bind it. Not built
+when decided: StepSpec has no address or completion wrapper, nothing
+validates a station's capability against a contract, and filing
+authorized no protocol publish or build. The design estimates 400
+to 700 gross lines of selector, projection and backfill retirement
+once readers move, against new validation cost, and promises no net
+deletion before the old readers retire. The census, both inventories
+and exhibit E1 (backlog-item v20 and ship-a-change v15 rewritten
+losslessly) stay on the packet.
 
 **P, Q and M name the three domains of getting work to an actor, and
 Q's constraint stations are projected from P's protocols** (folded
@@ -827,6 +1195,37 @@ unmatched route, and (5): both rows are still authored files under
 `infra/platform/stations/`. Whether Q becomes an owning domain was
 narrowed by the dispatcher/station boundary (§Dispatcher) and stays
 open there.
+
+**A role or a model is an executor filter, not a station** (design-doc
+`6e42c6de`, "A role or model is an executor filter, not a station",
+David 2026-11-10; it supersedes decision (1) above). Who may execute a
+step — a role, a model, a person — is checked at the claim. Stations
+are only the declared nodes of the one tree (4b27a65a), and no station
+name is generated: `q.<role>.<kind>` and `a.<role>.<model>` were a view
+of everything a role or a model could do, standing outside the tree
+with no parent, capacity or allocation, and on 2026-11-10 they held the
+yard's two largest piles (1,164 packets at `q.platform-admin.task`, 724
+at `a.platform-admin.opus-5-5`) while no work flowed through either.
+Decided: (1) `boss dispatch --next` pulls from the executor's own tree
+station and its subtree, filtered by what it may claim; (2) MY WORK is
+a filter on step audience and assignee, not a station read; (3) the
+yard and the map draw only tree stations, and a role or model view is
+a filter on the claims and queue reads; (4) generation stops. Built:
+(1) and (2) (backlog `d49e5ddb`, train #1680) — `--next --station`
+refuses a `q.`/`a.` name and names the tree form, the authored
+`q.platform-admin.task` row included, whose work an unseated executor
+now pulls from the root rather than executive (design 2910ec3d's
+hand-off). Not built: the readers that still name a
+generated station — the claims console, `station_reach`, gate queue
+observation and the regions fixtures (backlog `ed2a3e34`) — and the
+retirement of `station_projection`'s generation with a pin that every
+station a reader sees is a declared row (backlog `2eb78346`); live
+`GET /api/stations` still answered 14 `q.`/`a.` names among 38 on
+2026-11-12. `--next` sends no `?station=` on its claim: car 1 was built
+while the claim door judged a station by predicate alone, and the door
+has used the queue's own membership since train #1676 (backlog
+`1e7f5372`); the comments still saying otherwise, and `--next --model`
+being ignored by the filter, are backlog `844f2cea`.
 
 **An address is a requirement, not a destination** (folded from
 `requirements-based-addressing.md`, all six questions decided in the
@@ -921,12 +1320,34 @@ registry is dark — and is now held equal to the bundle with no
 database (`the_bundle_equals_the_compiled_fallback`), closing a
 triangle the migration-side pin had left open on one edge.
 
-**Priority becomes Class-registry data.** The `CHECK` constraint,
-the closed Rust enum and the TS union retire together in favour of
-Classes of `job`-kind Subjects — §Registries-over-code one level
-down — and only then can a station's discipline reference priority
-meaningfully. Escalation stays a hop between stations, never a
-discipline.
+**Priority is a number on the packet, and the words are bands in a
+registry.** David decided on 2026-10-31 (backlog 9ca42fe5) that priority is
+a number each station queue orders by, that labels are bands over it held
+in a registry, and that there are three bands for now, Critical ("the job
+is required for factory operations to come back online normally"), High
+("prioritized ahead of Standard, not blocking") and Standard. Design
+`67f17da0` settles the rest with no open questions. The number is an
+integer **0..=1000, higher drains first**; a station whose discipline names
+`priority` sorts by it descending, then by age. The bands are
+`infra/platform/priority-bands/<name>.toml`, one file per band, published
+like stations, each with `name`, `label`, `floor`, `default`, `meaning`,
+the flags `outranks_standard`, `triggers_escalation` and
+`first_dispatch_guard`, and `migrates_from`: Critical floor 700 (default
+800, all three flags; emergency → 900, urgent → 800), High floor 400
+(default 500, no flags), Standard floor 0 (default 200; standard → 200,
+scheduled → 100). One reader, `boss_core::priority`, answers every rank and
+word question, and a lint refuses a comparison outside it. `PUT
+/api/jobs/{id}/priority` takes a number or a band name and refuses the
+legacy words (no alias period before 1.0.0); every job read returns the
+number and a `priority_band` computed on the server. The migration goes
+through the record's own doors: a schema column backfilled through
+`migrates_from`, the rebuilder replaying old words through the same map,
+the 2026-10-31 sweep's items moved to High by the verb with a reason, and
+no `priority_changes` history rewritten. More bands later are registry
+rows. Decision history: this replaces the earlier decision that priority
+would become Class-registry data (Classes of `job`-kind Subjects retiring
+the `CHECK` constraint, the closed enum and the TS union); escalation
+stays a hop between stations, never a discipline.
 
 **A protocol gets a page.** Each workflow kind grows the network
 vocabulary — name, version, purpose, demands, and usage read from
@@ -1069,6 +1490,16 @@ any time; widening to everyone and the verdict are David's** while he
 is the only human user, to revisit when a second joins. Not decided:
 percentage rollouts (with one human there is nobody to randomise) and a
 flight carrying a value (a value is a registry row).
+**IT map graduation, 2026-10-23.** David promoted both `it-map-transit`
+(flight `54c04706`) and `it-map-live` (flight `71c4d42e`): the desktop
+Department Map always renders the transit monitor with recorded packet
+motion, the phone keeps its strip, and the viewer keeps their crossing
+time choice. The WorldMap and rate-replay rendering paths are retired.
+Superseded since: R3 of backlog `23a4b4d7` deleted the transit monitor
+itself (trains #1638 and #1639, 2026-11-09), so `/it` no longer draws a
+map; see the System Network Map paragraph at the end of Step UX &
+frontend.
+
 Built, 2026-09-24: car 1 (#637) is `boss_jobs::flights` behind `GET
 /api/flights/mine`, the gateway's inline, web-kit's
 `flights.svelte.ts`, `infra/platform/workflows/flight-a-change.toml`
@@ -1186,6 +1617,28 @@ and bands each row by the receiving yard's own age thresholds (past 3
 days aging, past 14 stale) — one definition of old, not a second copy.
 The derived list waits on that measurement.
 
+**`/it/design` is the design-doc review queue and nothing wider; when
+it is empty it says so of itself and points at My Day** (backlog
+`8c0e11d8`, David 2026-10-11, "Drop the stale declaration"; the plan is
+design `f3cd65ad`, which asked no new question). Measured by page-audit
+`79db48ae` on 2026-09-23: the page read "Nothing is waiting on a
+decision" while six page-audit sign-offs waited on emp-david, and five
+workflow rows declared `surfaces = ["system-design"]`, a hint no reader
+of the page consumes. Of the two options on the item — render every
+decision those rows route to Design, or drop the hint — he chose the
+drop, which keeps the watch list above as the one place an actor's
+decisions gather. Decided: (1) Design keeps its station, its review
+progress and its decided, folding and settled panels; pending builds
+and generic human approvals do not become Design rows; (2) the stale
+hint leaves `department-retro`, `doc-flatten`, `page-audit` and
+`protocol-retro` (`incident` had already moved to `system-incidents`)
+as new append-only versions, and in-flight packets stay on the version
+they were admitted under; (3) the empty state claims only that no
+design doc waits, and links to My Day's *Yours to decide* for the rest,
+because an empty station is not an actor with no work. Not built: on
+2026-11-13 the four rows still carry the hint and the page's empty line
+is unqualified.
+
 **Stuck is a packet past its own place's bound whose next move is ours,
 counted per third and never summed** (design `cf820810`, David
 2026-09-23, all seven questions accepted as proposed; answers backlog
@@ -1234,68 +1687,345 @@ behind X)" — busy, or troubled when the edge can never clear. Built
 (`boss_jobs::regions::stuck`, `ThirdStuck`), and the HUD frame below and
 `boss orient` read it through the `thirds` rows.
 
-### Station membership flow requires conserved original state
+### The company station hosts the company's decisions
 
-Design `aa0f88c1-4845-4b96-ab5a-8a8e8bd3b5ce`, settled with no open
-questions on 2026-10-15, answers part of urgent
-`a4de1e72-0010-4247-8c38-35d791d6e1e4`. Packet membership is a separate,
-versioned flow basis from the existing distinct ready/done **step-events**
-counts. Count every false-to-true arrival and true-to-false departure,
-including re-entry; two eligible steps on one packet are not two packets.
-Expiry, cancellation, reassignment and registry publication can change
-membership without proving work served. Preserve their departure causes.
+**The executive station is the root's own function, so it retires into
+the root** (design-doc "The executive station is the company station",
+`2910ec3d`, David 2026-11-10: "the Executive station is actually the
+same as the Algedonic station in theory"; no open questions). The human
+decision steps — approval, scope sign-off, decided designs, the
+operator's task queue and watchlist, passkey promotion, break-glass
+enrolment, publish requests and operator confirmations — are hosted at
+the root, `algedonic`. The department tier directly under it is the
+units that do the work: Engineering and Operations, and Finance since
+design `c0ae096f`. The reasons: a station is defined by what its parent
+allocates to it, and executive was allocated nothing (0 reserved, one
+floating draw per human step) and had no executor the root does not
+hold; receiving and marshalling then both read as waiting at the
+company, which is what they meant; and in the design's reading of Beer,
+policy and identity close the whole system rather than sit beside its
+operations as a sibling department. That last is a reason for the
+shape, not a mapping: §The Viable System Model, mapped, still leaves S5
+unmapped. A second human, such as a hosting customer's operator or an
+employee, is a `people:*` pool at the root or a station under the
+department they serve, never a peer of the company, and a desk is split
+out on the day it has an allocation of its own. Only the station moves:
+`executive` as a role or a Class is untouched.
 
-Evaluate the full registry population through `StationPredicate::matches`,
-`bind_self` and `in_window`, rather than station-name branches. The native
-2026-10-15 measurement contained **19 of 19 stations**; five predicates
-need more than the existing cube: agent model/authority step metadata;
-completed design review and its seven-day terminal window; the caller's
-submitted-by/dismissed watchlist and its fourteen-day window; original
-proof-probe absence alongside platform-admin task membership; and original
-failing CI judgement, later repair and terminal train state. Loading-dock's
-metadata predicate also remains in scope. Derived station history comes
-from immutable workflow publications with authored-row precedence, not a
-projection's read-time creation stamp or today's protocol set.
+Not built as of 2026-11-12 (origin/main `e8bb76713`; the live registry
+agrees). `executive.toml` v2 is live, `design-decided`, `my-watchlist`
+and `q.platform-admin.task` still name it as their parent, the
+`surface-usage` automation is hosted there, `GET /api/departments` still
+answers an `executive` row, and the web's station tree draws an
+executive card. `design-review` and `landed-review` have already left it
+for engineering's `design` and `review` stations (design `c0ae096f`).
+Until the cars land, `docs/design/station-tree.md` describes the tree as
+it runs, not as decided. The cars are backlog items, one each: the
+registry (`878fd1e7`: re-parent or retire the three rows, delete the
+executive row, take it out of the departments registry, and pin that no
+station names a parent with no row), the web (`cd3fa679`: the tree
+layout and the Exec page render the root), and the station-tree.md fold
+(`c353bbc5`, written after both have landed).
 
-Replay full original Job/Step snapshots in audit order, with the original
-station version, an initial state before the requested window and complete
-bounded history. Reuse the landed packet/station historical read ports;
-their current carriers still omit `audit_log.created_at`. Conserve that
-original insertion instant through both adapters. A live Event's
-`timestamp` is wall time under the current Event contract, but it is a
-different original from the audit insertion instant used for rate windows.
-Neither today's packet metadata nor a timestamp guessed at read time can
-supply missing history.
+### Station membership is read, not replayed
 
-An original domain transaction needs a conserved group and completeness
-witness, so its sibling snapshots do not manufacture intermediate queue
-crossings. Equal timestamps, adjacent audit rows and the outbox relay's
-transaction do not establish that boundary. A relay that has delivered only
-part of an original group leaves that interval unavailable. Terminal expiry
-also needs original, versioned business-clock configuration and epoch
-coverage: wall-to-business intervals must survive configure, pause, resume,
-restart and the direct Jobs reset writers. Ephemeral ticks and the current
-mutable clock row prove no past mapping; wall mode needs its original mode
-and coverage witness too. This decision specifies the evidence contract,
-not an invented clock-history implementation.
+**A station answers who, where and when from its current state, and its
+history from stamps the step record already holds** (design-doc "Station
+membership is read, not replayed", `7b8ed079`, 2026-11-10; no open
+questions). A packet is at a station only while one of its steps is: its
+membership is the station queue read, `GET /api/stations/{id}/queue`, and
+nothing else computes it. Flow is counted over each step's two stamps,
+`became_ready_at` and `completed_at` (`boss_jobs::station_window`; the
+`step-window-v1` basis of `GET /api/stations/flow` and the yard's
+marshalling read): an arrival is a step that became ready at the station
+in the window, a departure a step that completed there, and a skipped
+step is neither; waiting is the current queue, and age is now minus the
+oldest standing step's ready flip. Nothing replays the audit log to draw a
+picture; the log stays the system of record, and `?basis=step-events`
+keeps the ready/done event cube only as a separate unit, never as a
+fallback. What is given up is the span of a packet that passed through a
+station with no step addressed to it. If a reader ever needs a step's
+station-at-the-time, the step records it at completion, as one column; no
+station the map judges needs it today. Built: car 1 (backlog `95a9eca2`)
+moved the readers, car 2 (`3db0db44`, train #1681, 2026-11-11) deleted the
+~31k-line replay, its observation doors and its tables, and on 2026-11-12
+the live yard read every station judged with `flow_as_of` equal to
+`map_as_of` and all 38 flow rows on `step-window-v1`.
 
-The reader reports basis, station version, caller binding, authorized scope,
-window, covered interval and audit cutoffs. Personal flow stays explicitly
-bound to the actual caller. Narrow or denied scope must not become a global
-aggregate or expose unauthorized historical packets. Missing snapshots,
-original wall instants, group completeness, clock mapping, registry history
-or safe scope remain **UNKNOWN**, with the deciding original reason; a
-truncated slice is not empty success. Preserve unaffected known intervals
-without disguising the unknown part as zero.
+Decision history: the windowed packet-membership replay — its
+conserved-original evidence contract (design `aa0f88c1`), witnessed-cut
+bound (`c195e83e`), constant-outcome proof (`16fadf07`), witnessed commit
+order (`ea650502`), lagging-relay prefix (`a0a5758b`), scope-bound
+checkpoints (`8e7d8364`) and indexed-row generation (`6b00612f`), parked by
+design `a3c5e58a` on 2026-11-08 — was retired with its code, its
+observation doors and its tables by design `7b8ed079` (2026-11-10), under
+which a station's membership is its queue read and its flow is a windowed
+count over the step record's own timestamps.
 
-This is a source plan, not delivery of the new reader. Acceptance still
-requires causal controls for all five predicates and the full population:
-metadata-only changes, repeated entry, atomic sibling changes and partial
-relay, pause/resume/reset expiry, publication/retirement, caller binding,
-narrow/denied scope and incomplete originals. The same originals must
-replay deterministically. Preflight, gates, independent review and deployed
-full-window evidence remain owed. No history is rewritten, move cleared,
-alarm demoted or new private read authority granted by this fold.
+### Every protocol names the station that owns it
+
+**A protocol belongs to the station whose work it is, and its row names
+that station** (design-doc "Every protocol names its owner station;
+Engineering and Operations gain stage stations; Finance returns as a
+department", `c0ae096f`, David 2026-11-10; no open questions). It is T6
+of the station tree (`4b27a65a`) with its ownership decided from the
+company frame. A workflow row's `metadata.owner` is the id of a
+standing station, so moving a protocol is changing that one value, and
+each step names where it runs (`at` in its `metadata_defaults`;
+`under` dropped by design `305cf4ce`) or a `fulfilled_by` hand-off.
+**Engineering** owns
+changing the system (ship-a-change, gate-run, pr-train, agent-run,
+design-doc and the other delivery and design protocols); **Operations**
+owns running it (every `maintenance-*` row but the ledger two, nodes,
+disks, credentials, recovery sheets, incident); **Finance** owns money
+in and out (the two ledger rows); the root, `algedonic`, owns intake and
+decisions (backlog-item, user-feedback, approval, publish-request,
+passkey-promotion, department-retro, correct-the-record, work-session,
+learning). The design's table decided each row; the rows and the pin
+`every_platform_protocol_names_a_standing_owner_station`
+(`crates/core/boss-jobs/tests/station_tree.rs`) are the record.
+
+**Engineering and Operations hold stations for their stages, and Finance
+is a department again.** Engineering, where most of the volume runs,
+holds `design` (design docs, workflow design, protocol experiments;
+`design-review` sits under it) and `review` (landed and held car
+reviews; `landed-review` sits under it) beside build, gates,
+loading-dock, probe-shed and forge. Operations holds `maintenance` for
+the `maintenance-*` family; a child per family is added only when its
+allocation differs. `finance` is a tier-one station under the root,
+because the company now holds real money: it owns the company's money
+as data (the Stripe balance, ledger account 1010; every purchase,
+recorded by a human step; and the budget a review reads, available
+equals balance minus committed spend). It never spends: purchases happen
+outside BOSS, by David, and are recorded back. It hosts the Finance
+pages, and its first open finding is backlog `5c1c435d` (account 1010's
+-100 cent credit balance through 2026-10-31).
+
+Where it stands on 2026-11-12 (origin/main `de93d1291`). **Landed:** the
+stations — `finance`, `design`, `review`, `maintenance` and the
+re-parenting of `design-review` and `landed-review` — car `aa478558`
+(backlog `599fec3e`, train #1672, 2026-11-10), and `GET
+/api/departments` answers a `finance` row; every one of the 79 platform
+rows names an owner station (car `c5894471`, 2026-11-08, from T6's first
+assignment); and T6 car B (`a44830d5`, train #1698) lets a step name its
+station. **Pending:** (a) the twelve rows whose owner this table changed
+— break-glass-enrolment, correct-the-record, enroll-a-managed-agent,
+incident, maintenance-codebase-metrics, maintenance-protocol-drift, the
+two ledger rows, protocol-experiment, protocol-retro, work-session and
+workflow-design — ride car `db099d49`, held with a CHANGES verdict
+(three passkey-protected rows lack hold files), and `publish-a-protocol`,
+a held kind, moves at the platform owner's own publish; (b) only one
+platform step names a station (gate-run's receipt step, at `gates`), and
+sweep 2 places every step of engineering's protocols (backlog
+`baac0b65`); (c) packets pinned to versions that predate the owners
+stand at no tree station (595 of 727 measured on 2026-11-10) until the
+cohort convert moves them (car `d59e29b5`, backlog `56b81861`); (d)
+`metadata.department` stays beside the owner on 77 rows while
+`GET /api/jobs?department=` reads it, until IT retires (`df0ecd8b`);
+(e) the Finance page reading the balance and the budget from the ledger,
+with the deposit step, is backlog `9d284874`, sharing the capacity
+review's purchase step (`eea00a8b`) and balance read (`b77c52c1`).
+
+### Claims stand at the station the tree resolves
+
+**Every claim records the tree station it stands at, and the claim door
+resolves it** (design-doc "Claims stand at stations: closing the station
+tree open edges", `305cf4ce`, David 2026-11-12: "Work is supposed to sit
+at the admission queue of a station now, not at a name or robot or
+executor"). It closes the open edges of T6 (`4b27a65a`) and of the owners
+above. Current truth:
+
+- **A step names its station with one static `at = <station id>`, and
+  `under` is dropped** (D2; Q1 approved). The protocol knows where its
+  steps run; a tree station's predicate shrinks to tags, and a pin is to
+  hold that none names a workflow kind.
+- **The claim door resolves the station** (D1, D7): the step's `at`,
+  else the deepest tree station whose queue holds the packet, and never
+  an `a.*` or `q.*` name. A claim made for someone else judges the
+  nominee against that station rather than refusing it. `boss dispatch
+  --next` claims through `claim-next`. Resolution is a pure function of
+  the tree at a sequence; the dispatcher only re-offers on release.
+- **The record names a station by id** (D3): claim facts carry
+  `_station_id`, and the name is a display copy until readers move.
+- **One unit of build work holds one claim** (D4): the item's `build`
+  step is `fulfilled_by` its agent-run, whose `building` step stands at
+  `build` and draws from build's allocation, not the protocol owner's.
+- **A station's `capability` (executor kinds, roles, model classes)
+  decides whom it admits**, checked at the claim; a seat is pull order,
+  not permission (D5). Publish refuses an address whose station cannot
+  satisfy the step's contract, and at runtime a step no executor may
+  take waits with `waiting_on {kind: executor}`.
+- **One share function serves every pool** (D6), evaluated at the
+  claim's station and walking up to the root. An allocation entry is
+  `reserved` or `floating`, and a floating draw rises to the nearest
+  ancestor. Station `capacity` is enforced as seats and `bays` retires
+  into it; `model-slot:*` gives way to `robots:*` plus `budget:robots`;
+  a run bills vCPU only when it binds a worker. Robot pools are
+  allocated at the company root, and whether a robot floats company-wide
+  or is seated in Engineering, which then sub-allocates, is a data
+  choice: the share function expresses both, so it can be settled
+  empirically (Q2). The root allocates `people:platform-admin`; a
+  station that needs human work, such as an approval, declares a human
+  resource slot drawn from it, and the operator's executor view orders
+  his human steps across stations (Q3).
+- **The generated stations retire in order** (D8): cohort convert, steps
+  declare `at`, the door resolves from the tree, readers move,
+  generation stops. The end state is pinned: every claim fact's station
+  id is a declared active tree row.
+
+Built as of 2026-11-12: none of it. `GET /api/claims` at 18:01Z held 97
+claims (not truncated): none at a tree station, 76 at
+`a.platform-admin.opus-5-5`, 11 at `q.platform-admin.task`, 10 with no
+station, and 2 carrying an allocation. On origin/main `3f27bf5b4` no
+claim fact writes `_station_id`, boss-cli calls no `claim-next`, and no
+station row declares `capability`. In flight: car `541c8c8d` (parked)
+records a tree station, by name, only for a step queued at none; sweep 2
+(car `89c105cd`) places engineering's steps with `at`; the cohort
+convert is car `d59e29b5`. The cars are backlog items, one each: the
+door's resolution (`5662d4b6`, on top of `541c8c8d`); `claim-next` and
+`_station_id` (`df5c2ee6`); one build claim and its vCPU bill
+(`b5c815e4` part 2, with `db88f6a9`); capability (`21b0b946`); the share
+function (`5da9495d`); the living docs and the invariant register,
+riding with the first or second (`2864e177`); then `ed2a3e34` and
+`2eb78346`. The measure is the share of claims at a declared tree
+station.
+
+Decision history: the website recorded the proposals for Q2 (robots
+float on Engineering's share) and Q3 (human steps draw nothing) as
+accepted, by mistake; David's answers, given in chat at about 17:50Z,
+stand as corrections on the review step and are what D6 reads above.
+
+**A station pull validates against its owners inside the claim's own
+transaction, and refuses an owner it cannot fence** (design-doc
+"Selection validation keeps its owner through the claim commit",
+`4e61511c`, opened by agent-codex and answered by David 2026-10-04, both
+questions as proposed). Design `f31d94ac` made the selection and its
+claim one transaction. That left the actor, policy, calendar and
+run-count facts the claim checks, which a second HTTP read, a copied hash
+or a matching DSN cannot hold still until COMMIT. Decided: (1) only an
+owner adapter that joins the selector's native transaction, and proves it
+fences the same store, validates a fresh selection. A remote or
+unsupported owner is refused and the specific-step claim door is
+unchanged. A distributed prepare/commit must declare its actor,
+revocation and crash semantics before it is built. (2) Each owner
+declares its linearization instant, its clock and expiry inputs and its
+runtime-mode boundary. A decision lease would be a separate authority
+decision.
+
+Built as source by car `1ef711ce` (train #1135, 2026-10-13), in
+`crates/core/boss-jobs/src/native_selection_store.rs`:
+
+- The receipt copies the agent, alias, automation, rule and override rows
+  the claim consumed.
+- The claim's transaction share-locks `agents`, `actor_aliases`,
+  `automation_actors`, `policy_rules` and `policy_user_overrides`, and
+  re-judges the grant and its expiry under those locks.
+- A calendar hold is judged in the same transaction.
+- The hour's budget stays advisory: it reads `unknown`, never zero.
+- The ingress fixes the machine mode and a five-second pre-commit budget.
+- The same-store proof is the constructor's own identity, not a DSN.
+- `PgJobs` without that store refuses a fresh selection.
+
+No roster read sits on the claim path, so no roster fence was owed.
+
+**The caller's identity and the machine mode are fixed at ingress and
+last until COMMIT dispatch, inside that one five-second budget**
+(design-doc "Define native selector identity and mode lifetime at commit
+dispatch", `ce447ce3`, opened by agent-codex and answered by David
+2026-10-05, both questions as proposed). Neither is a writer fence. A
+credential or session retired, or a mode moved, after ingress governs
+later requests and cancels no admitted one. Expiry before dispatch rolls
+back and never sends COMMIT; a COMMIT already dispatched is reconciled
+from its original receipt, never cancelled or retried under a new
+request id. Actor aliases, policy rules, scope and expiry are still
+locked and judged fresh at commit, and the mode's LAN ConfigMap rollback
+stays independent of the jobs API. Built by the same car, `1ef711ce`:
+`AuthenticatedSelectionIngress` carries the resolved actor and observed
+mode, `SELECTION_PRE_COMMIT_BUDGET` is the five seconds, and
+`a_mode_move_changes_new_ingress_without_rewriting_the_admitted_operation`
+and `commit_completion_is_not_canceled_by_the_pre_dispatch_sql_budget`
+pin it. This settles the caller and mode halves of the writer-fence
+condition design `9c554429` places on the wiring, `1f04d9c6`; the
+policy half stands.
+
+Not live: the production jobs API builds `PgJobs::with_urls`, which holds
+no native store. On the running build (`b92a4399d`, 2026-11-13), a
+claim-next that finds a head therefore answers 409 "native selection store
+is not configured"; this was read from source, not exercised. The pulls
+this section and `506e0a1c` build on (`df5c2ee6`, `dbb9c722`) need two
+things first: the lock-order fix `f4479975`, then the wiring, item
+`1f04d9c6`.
+
+**The same store is one constructor's handle, and the serving
+composition stays refused until its policy-mode owner fences writers**
+(design-doc "Bind native station selection to its actual store and
+runtime authority owners", `9c554429`, opened by agent-codex and answered
+by David 2026-10-05, both questions as proposed). It named the two
+owners `4e61511c` left open. (1) One private `NativeSelectionStore`,
+built by a constructor, is shared by the selector and every owner
+adapter in one transaction. Its identity cannot be deserialized or
+derived from a DSN, so a second handle over the same pool, or matching
+rows, is refused. A cross-process owner observation would first need a
+declared generic record with its own authority, never a decision id
+taken from `policy_rule_audit`. (2) The serving composition, with its
+mounted role mode and remote policy, roster and calendar clients, stays
+refused for a fresh selection until its policy, caller and mode owner
+fences writers. Authority is not read off SQL rows, a cached mode, a
+file hash or an open descriptor; a move to a native mode authority is
+its own reviewed activation. Built: (1), by car `1ef711ce` (the
+constructor-identity bullet above), pinned by
+`actual_shared_constructor_joins_one_transaction_but_same_pool_new_handle_refuses`;
+no cross-process record exists. (2) holds today only because nothing
+serves the store. It is therefore a condition on the wiring, `1f04d9c6`,
+and not a car of its own: before that item serves the store it must say
+whether the policy rows read under share locks and the machine mode the
+ingress fixes are that fence, or whether the activation needs one.
+
+### IT retires as a department
+
+**IT is not a department; its work belongs to the stations that do it
+now** (design-doc "IT retires as a department: its work now lives in
+Engineering, Operations and the company", `df0ecd8b`, David 2026-11-10:
+"we have broken up its old responsibilities into Engineering and
+Operations"; no open questions). `it` is not a tier-one station and gets
+no row. Engineering builds, gates and ships changes; Operations runs the
+estate, deploys and incidents; the root, `algedonic`, hosts the
+company's own intake and decisions. Each IT surface moves to a host
+station (design `deba3000`) by this table, any line of which David may
+amend:
+
+| old IT surface | host station |
+|---|---|
+| backlog, receiving, feedback, tree | the root, `algedonic` |
+| design | the root for decided designs, engineering for design work |
+| yard, marshalling, step-plugins, registry, experiments, agents, crew | engineering |
+| estate, sensors, monitoring, credentials, incidents | operations |
+| metrics, subjects | the root, until a station's executors claim them |
+
+Pages move a few per car, usually when a car touches the page anyway.
+Each move deletes the `/it` route it replaces, with no redirect shim
+before 1.0.0, and the IT sidebar group goes when it is empty. The order
+of retirement follows the readers. A row's `department = "it"` leaves
+it when the row moves to its owner station, and a sweep finishes the
+rest once `GET /api/jobs?department=` reads owner ancestry. The
+departments registry's `it` row goes only after that, because a station
+row's `department` is validated against that registry
+(`validate_department` in `stations.rs`). `docs/design/station-tree.md`
+changes last, once the rest is built. Until then, the 2026-09-25 roster
+under design `8c3e9599`, which made `it` the department with engineering
+and operations as its two halves, is history.
+
+Not built as of 2026-11-12 (origin/main `50f9be981`; the live registry
+agrees): 13 station rows and 75 workflow rows under `infra/platform/`
+still carry `department = "it"`; `GET /api/departments` still answers
+an `it` row, declared through `department/declare.rs`; `nav-catalog.ts`
+still spells 22 `/it` entries over 19 page folders under
+`apps/web/src/it/`. The cars are backlog items, one each: the rows and
+the department reader (`8b144a6e`), after the T6 owner sweep
+(`baac0b65`); the registry's `it` row (`aaf4ca88`); the page moves
+(`92bfcb04`), which use the host field (`03fb75c8`) and the derived URL
+(`0bc2eb68`) of design `deba3000`; and the station-tree.md fold
+(`0378b763`).
 
 ### Station alarms state the action the factory needs
 
@@ -1435,11 +2165,54 @@ original declaration as true or infer missing dispatch context. The
 workflow version retained by `e95433aa` is dispatch provenance, not a
 reader version. No legacy row is automatically superseded in the ledger.
 
+**A historical placement reading is judged only against witnesses the
+record kept** (design `ef8f9488`, David 2026-10-16, both questions
+accepted as proposed; answers `c8d22e63`). Q1: the v2 handoff model
+(`registered-agent-handoff-v2`) and its cause cutoff stay as they are,
+and new evidence is never fed into it as invented historical state. A
+separately named observed-placement model may judge a crossing by the
+map's own read only when the original successful before and after read
+witnesses and their snapshot bounds were conserved. A later
+repeatable-read observation cannot stand in for an old witness, and
+where either witness is missing the reading stays UNKNOWN. So original
+13538, admitted after its cause, stays UNKNOWN: that ordering proves
+neither a phantom move nor an invalid dispatch. Had cause-cutoff-only
+semantics been chosen instead, such pre-admission cases would stay
+uncorrectable; v2 is never widened to reach them. Q2: reading a
+recorded admission observation needs less authority than creating one.
+The GET on `/api/yard/moves/{seq}/diagnoses/{diagnosis}/admission-observations/{request}`
+asks for a named actor and the whole-map ReadJob scope the moves record
+already uses (`move_admission.rs::get`, pinned by
+`exact_recorded_admission_is_readable_without_correction_authority`);
+the POST that creates one keeps the correction authority. No role, grant
+or credential was added. Q2 is built; Q1's model is not. No
+observed-placement or `historical-placement-snapshot-v1` evaluator
+exists, and `move_diagnosis.rs` still supports only the v2 handoff
+family. The design's next step was a witness inventory of the 41 legacy
+rows outside v2. It was never run: `c8d22e63` closed through the
+version stamp instead (David, 2026-10-17, above). Those rows predate
+the stamp and no longer count toward the band, so no evaluator is owed
+for them. Q1 binds any future historical model; none is pending.
+
 The ledger's typed validation, immutable projection and admission
 observation landed under `c8d22e63`. Its further native-proof
 acquisition (branch `feat/acknowledge-exact-historical-evidence-loss`)
 was set aside by David on 2026-10-17 in favour of the version stamp
 above, which is how `c8d22e63` closes.
+
+That branch was building design `84ae79ae` (David, 2026-10-16), which
+accepted an append-only "acknowledged historical evidence loss"
+disposition for exactly the 42 legacy UNKNOWN crossings whose original
+before/after reads the mover never retained: bound to that one manifest
+by a human authorization, never meaning corrected or genuine, and
+shown as a historical warning only after native proof of the repaired
+mover, a capturing producer and a clean window. It was never built: no
+acknowledgement disposition exists on main. The stamp made it
+unnecessary. Those 42 rows predate the stamp, so their `mover_version`
+is unknown and they no longer count toward the band, while they stay
+in the raw record unchanged. The decision admitted no reuse for later
+incidents, so any future evidence-loss disposition needs a decision of
+its own.
 
 This fold records accepted meaning, not an implemented alarm classifier
 or runtime clearance. Urgent `df8fe965` stays open for implementation
@@ -1497,6 +2270,225 @@ passes it nothing — a region's rails still render under its map — and
 on a phone the frame stacks its rows above the strip map, which groups
 under the server's thirds but does not yet use the HUD rows as its
 headers.
+
+**An alarm is its own packet kind, owned end to end by the observer that
+raised it.** Design `97cb3a87` (2026-11-01, engineering decisions, no
+questions) gives alarms a platform kind `alarm`: `raised` (observer,
+condition, subject, evidence, severity), a `watching` step the observer
+re-completes on each observation (`last_seen`, `count`, `state` alarming,
+warning or silenced), and terminals `resolved` (by the observer, when the
+condition clears), `stale` (by the silence sweep, when the observer stops
+reporting) and `escalated` (files the repair and nominates the person the
+condition names). There is **one open alarm per (observer, condition,
+subject)**: a re-observation updates `watching`, so one dark episode is one
+packet with a count. The observer that raised an alarm resolves it. Filing
+returns the id or fails loudly on the observer's own packet. Silence is a
+relation (`silenced_by = <packet>`, for a maintenance window or a declared
+quiet): the alarm still exists and counts, and nothing decides not to
+file. Severity on the boards reads `state`, so a factory whose open alarms
+are all `warning` is not red. Once the kind lands, the backlog-item door
+refuses `input_channel = telemetry/monitoring`: an alarm is not intake.
+
+**Registry drift is a fact observed by one comparator and carried by an
+alarm.** Design `aeb6e66a` (2026-11-01, no questions):
+`boss_jobs::registry::compare(tree_row, live_row)` is the one comparator,
+answering `Same`, `Differs {fields}` or `Unreadable {why}` (a crash is
+unreadable with a distinct exit code, never a diff), called by the publish
+verb, the lint, the drift sweep, the experiment door and `publish-drift
+--check`. Whoever sees drift writes `registry.drift.observed`, carried by
+an `alarm` packet (97cb3a87) with one open per (kind, direction); the
+comparator that next finds `Same` resolves it, and a publish that lands the
+named fields writes `retired_by` on it in the same act. Every publish
+records `published_from = tree_sha`, and a publish over a live version the
+tree's history never contained refuses, naming the live edit, unless
+`--take` is given and recorded, so which side is ahead is a read. A held
+kind's hold text is rendered from the open drift fact, never written by
+hand.
+
+**Live registry content is authoritative after bootstrap; git holds its
+recovery export.** Design-doc *Five further collapses of duplicated
+factory facts and packet handoffs* (`942dc0ac`, Q2, David 2026-11-08)
+found workflow and pool rows acting as current truth in two places, the
+append-only live registry and the mutable `infra/platform/workflows/`
+and `pools/` files, reconciled by a comparator walking git history and
+a planned write-back of live edits into the tree. Decided: after
+bootstrap the registry's append-only row, version and publication event
+are the authority, and packets keep the version they were admitted
+under. Git holds the initial tenant data and a generated, versioned
+recovery export naming its source version and hash, never a competing
+live edit; a desired tree edit becomes a signed row proposal through the
+registry road, not an implicit republish on converge. This replaces the
+bidirectional write-back strategy (the pool write-back item `add6ac6e`
+was declined for it), and it is conditional: an offline restore from
+the export must be tested and a deliberate import road must exist
+before the drift loop and its history arbitration retire. Validation,
+signed snapshots, approval holds, append-only versions and read-back
+stay. Until then the comparator above is the live mechanism (item
+`c26aacaa`, in build when this was folded on 2026-11-12).
+
+### Claims and reservations are the factory's state
+
+**The factory at any instant is its table of open claims.** Design
+`a236103a` (David, 2026-10-31; all six questions accepted as proposed)
+reframes the operations console: an actor holding a step of a packet,
+under a pinned protocol version, at a station, since a time, with what it
+reserved. Every console reading (queue depth, utilisation, burn, who is
+where, what is stuck) is an aggregation of that table joined to the
+record, so the console is derived, not instrumented. A robot exists only
+while it holds a step, so "which robot is busy" has no answer; the scarce
+things are human attention, money per verified unit, time and, only when a
+pool runs dry, compute. Resources are reserved and released as part of
+step claim and completion; stations carry no tolerances of their own (the
+protocol does, and the machinery is injected).
+
+The data half: a step declares a **bill of resources** (absent means zero);
+**pools are a registry** (`infra/platform/pools/`), each naming a capacity
+and, for a stock, its reclaimer; the claim door **reserves the step's
+vector in the claim transaction** or refuses with the first failing
+dimension recorded as the step's `waiting_on`; every exit **releases**, and
+a reservation carries a **lease** (`claimed_at + duration_hours × 2`);
+`GET /api/claims` answers open claims, reservations and the server-computed
+**binding** constraint, and the client adds nothing up. The six decisions:
+
+- **Model slots are both an actor property and a pool.** The actor row
+  (`agents.max_concurrent_runs`) bounds an identity, the pool row bounds
+  the class, and a claim passes both. Provider rate limits are observed,
+  never declared, and drawn as headroom. *Superseded by the station tree
+  (design `a3c5e58a`, 2026-11-08):* the per-actor cap is retired (item
+  3e927996, 2026-11-15) now that `robots:<model>` pools carry concurrency,
+  so one mechanism bounds a robot. The column survives as a stored
+  declaration nothing judges, until the tenant seed stops writing it.
+- **A stock orphan is a row the reclaimer reads**, not a step on the
+  packet that orphaned it: the orphan outlives the packet. The packet
+  records that it orphaned; the pool records who discharges.
+- **A human station reserves a person** through the same
+  `jobs.step.reserved` event, against a people pool whose capacity comes
+  from the roster, never from presence.
+- Decision history: `as_of` over a materialised claims history, and the
+  review screen that replays an incident from it (P6, console car 7),
+  was retired from current truth by design `a3c5e58a` on 2026-11-08; the
+  console keeps the current claims read (`/api/claims`), the alarm
+  packet is the incident record, and car 7 is not built.
+- **The IT world stays IT's landing.** The factory view is `CompanyMap`
+  with roll-ups at its own route and IT one card on it: absorb an API,
+  federate a page. *Superseded by the station tree (design `a3c5e58a`,
+  2026-11-08):* there is no separate IT landing beside a `CompanyMap`
+  factory view; the landing is the algedonic station page (design
+  `c4854fd4` car 2).
+- **The transit map retires behind its flight** only once the floor draws
+  every station and route it draws today, keeping live motion's real-moves
+  layer. The station tree's T7 sharpens the condition: not until the new
+  floor shows jobs moving.
+
+Superseded by the station tree (design 4b27a65a, 2026-11-06; decided
+for this design by `a3c5e58a`, 2026-11-08): pools were "factory-level
+only" here, and are now allocations drawn from a parent station; in v2
+a station is defined by its allocation and every pool is held by a
+station drawn from its parent, and
+the step's `resources` block becomes a station spec whose resolution
+replaces `waiting_on` with the named constraint.
+
+**A claim, its reservations and its refusal are one transaction.** Design
+`acd41b4c` (item b6cf3513), its one question accepted as proposed on
+2026-11-01, is the trust boundary for the console's reserve/release door
+(a236103a D3/D4). The resource transition joins the jobs repository's own
+write transaction, not a second service: under locks taken in one
+documented order (actor admission owner, pool rows, step generation) the
+claim rechecks pool versions, roster facts, the run cap, live
+reservations and outstanding stock obligations, then either CASes the step
+and writes the whole vector, lease and `jobs.step.reserved` facts in the
+same commit, or commits a bounded `waiting_on` refusal naming the first
+failing dimension in stable registry order and acquires nothing. Unknown
+capacity is never free: positive demand against it refuses as
+capacity-unknown. Quantities are exact decimals. A retry returns the
+original acquisition. Every real exit releases through the same
+transition, compared on claim id, generation and holder, so a stale
+completion never releases a newer claimant's resources.
+
+The boundary's rules: **leases are generation-fenced with no implicit
+renewal** and grant no process-kill authority, and a logical release is
+not evidence that a pod stopped consuming CPU or RAM; **stock stays
+charged until the named reclaimer discharges it** with verified machine
+evidence (a server-side `ResourceReturnVerifier`, never a caller's
+`returned=true`); **people capacity comes from a versioned, qualified
+roster witness**, never presence or the absence of an agent row; money
+stays advisory and the actor cap keeps counting OPEN agent-run packets
+(*superseded by the station tree*, design `a3c5e58a`, 2026-11-08: the cap
+is retired now that `robots:<model>` pools carry concurrency, item 3e927996);
+absent amounts stay zero and in-flight packets keep their pinned
+protocols. Billed protocol versions are enabled only after their
+capacities and evidence adapters are qualified. `jobs.step.reserved` and
+`released` are replay inputs, so a rebuild recreates the same rows and
+totals. The invariant is live reservations plus undischarged stock
+≤ each qualified capacity, never an assertion over an UNKNOWN denominator.
+The decision approved this boundary for engineering review and
+implementation, not credentials, cleanup authority or production
+activation.
+
+**Three decided designs that pulled against the 2026-11-07/08 steers are
+retired, parked or superseded** (design `a3c5e58a`, David 2026-11-08,
+all three questions decided as proposed). (1) **The console's history
+scrub is retired**: `as_of` over a materialised claims history and the
+review screen that replays an incident (a236103a Q4, P6 car 7) leave
+current truth, because they are history replay; the console keeps the
+current claims read and the alarm packet is the incident record.
+(2) **Membership replay**: parked here, then retired outright by design
+`7b8ed079` (§Station membership is read, not replayed). (3) **Factory-level-only
+pools, the separate IT landing with `CompanyMap` as the factory view,
+and the per-actor run cap** (a236103a D2 and Q5, acd41b4c, d996ce3d) are
+superseded by the station tree: pools are allocations drawn from a
+parent station, the landing is the algedonic station page (design
+c4854fd4 car 2, item 72d58e00), and the per-actor cap is retired now
+that `robots:<model>` pools carry concurrency (T5, item 3e927996), so one
+mechanism bounds a robot.
+
+### Every remnant leaves with its owner
+
+**A remnant is an allocation, not stock.** Design `777016f1` (David,
+2026-11-09; its one question settled as proposed) applies the station
+rule of 2026-11-08 (a station finishes its work and sends the job on,
+releasing its allocations) to what agent-run v14 did not yet release.
+The station that makes a remnant owns it and releases it when the job
+departs, and the release is recorded on the job, so a release that
+fails is a red record someone reads rather than a restart count. The
+owners: the **worktree** is the build step's; the **worker volume** and
+the run's **launch refs and scratch targets** are the run's; the
+**forge branch** is the car's, released when it lands or is retired.
+Stock is only what no step owns: disk as capacity, credentials, shared
+build caches. A reclaimer survives only as a safety net for orphans
+whose owner packet is gone: an automaton reacting to the record (packet
+closed, remnant present), not a timer, and each orphan it takes is
+filed as a leak against the station that made it. The dev pod's reclaim
+script (`infra/cluster/dev-scratch-reclaim.sh`) retires into rows, one
+car per job it does (a dispatcher rule or a cadence verb each), and is
+deleted when it holds nothing. Priority: standard consolidation work
+beside the station-flow cars, worktree release first, urgent only where
+a remnant is filling a disk.
+
+**Car 1: the worktree** (backlog `f8d2bffc`). Measured 2026-11-09: 727
+worktrees, 622 locked (317 by the launchers' `git worktree add --lock`,
+whose reason is git's own `added with --lock`; 32 by the agent harness,
+naming a parent session that outlives the run by days), and /work at 80%.
+`boss dispatch --report` releases the tree its run's record names
+(`gate_run.worktree` on `verdict` or `building`, else the
+`worker_session.local_root` its worker was bound from) once the run has
+departed (`gated`, `delivered`, `refused` or `died`), and writes
+`worktree_release` on the run: the bytes, or why it was kept, or the
+refusal. It releases at the run's close and not at the hand-off, which
+the design's table also names: at the hand-off the builder still stands
+in the tree (`boss gate --wait` runs there and the report follows), and
+a run awaiting its verdict has not departed. The release never discards
+work. It keeps, with the reason on the run, a tree that is the main
+checkout, names no branch or gated sha, has moved to another branch,
+holds any uncommitted or untracked path (enumerated explicitly despite
+user configuration; ignored build output does not count), has a head that
+is on no forge branch and is neither the gated sha nor carried by it
+(`git cherry` only after excluding unmatched merges, whose resolutions
+patch ids omit), or carries a lock other than git's `added with --lock`.
+Harness locks always keep the tree: they belong to a session across runs,
+and one departed run cannot release that session's working directory.
+A green nobody
+reported after stays until the orphan reclaimer (car 3) reads it.
 
 ## Step types are property bundles; the alphabet is the mechanisms
 
@@ -1742,7 +2734,7 @@ dispatcher's registry watch for those emissions and invoke
 handlers.** Rules are rows in the append-only versioned **`dispatcher_rules`
 registry** (`on_event`, `when`, `do`, over the shared expression
 DSL) — the step_plugins-style draft → active → retired lifecycle,
-authored in-app at `/system/dispatcher/rules`. **`infra/dispatcher/rules/`
+authored in-app at `/it/registry/rules`. **`infra/dispatcher/rules/`
 — one `<rule-name>.toml` per rule — is the registry's DEFINITION, and
 the table is derived from it:** the dispatcher publishes every authored
 rule the table lacks at boot and retires every enforced rule no file
@@ -1779,7 +2771,7 @@ still refuses a migration that inserts or updates a rule; it passes a
 DELETE, which cannot open a second home.
 The reactive wiring is visualized as a cascade — trigger event →
 rule → handler → emitted event → re-triggered rule, feedback cycles
-highlighted, filterable by trigger event — at `/system/dispatcher`. The
+highlighted, filterable by trigger event — at `/it/registry/dispatcher`. The
 dispatcher is reactive, not a catalog of everything the system can
 produce. Each rule is an
 **actor**: every side effect it fires is attributed
@@ -1827,11 +2819,16 @@ queue policy, so the dispatcher may *execute* a matchmaking rule and
 must not *be* one; executing rules, redelivery and dead-lettering stay
 substrate. The rule does not adopt Q as an owning domain (question
 `1dfed5d6` stays open) and schedules no migration. Measured against the
-tree on 2026-09-27, both violations it names stand: the assign strategy
-is `pick_employee_with_role_fallback` in
-`crates/core/boss-dispatcher/src/dispatcher.rs` — role order, first role
-with a holder, spread by step id, all discipline and none of it data,
-whose path out is an `assign` field on the station row — and My Day's
+tree on 2026-09-27, both violations it names stood: the assign strategy
+was `pick_employee_with_role_fallback` in the dispatcher's
+`dispatcher.rs` (deleted 2026-11-12) — role order, first role
+with a holder, spread by step id, all discipline and none of it data.
+Its path out was not an `assign` field on the station row: on 2026-11-11
+(backlog e1eaf72b) David ruled that "work is supposed to sit at the
+admission queue of a station now, not at a name or robot or executor",
+and the matchmaker was deleted — a ready step stands at its station
+unassigned and an executor pulls it (`boss dispatch --next`), filtered by
+role and model class at the claim. My Day's
 queue partition is `splitQueues` in `apps/web/src/me/assignments.ts`,
 half repaired, since the verdict test now reads the StepType registry's
 `decision_shaped` flag first and keeps `VERDICT_KINDS` only as the
@@ -1968,7 +2965,10 @@ cannot witness is not yet data. The build plan is
 (`3613f0af`, Departments `86f32b7d`) needs follow-up work seven days after
 an unanswered inquiry; its tenant companion `aecd8740` remains open.
 Current rule parsing stores `delay` but matching drops it before effects.
-Accepting the syntax is not scheduling. No in-memory sleep, immediate or
+Accepting the syntax is not scheduling, so until this contract is built
+the shared rule validator (`authoring::validate`: draft, dry run, publish,
+boot seed, `boss tenant check`) refuses every rule declaring a `delay`,
+well-formed or not — the first car fails closed. No in-memory sleep, immediate or
 manual reminder, source-age reset, or Sales-specific core branch satisfies
 this contract.
 
@@ -2124,6 +3124,67 @@ row-less telemetry), idempotency guards double as event gates
 post-commit publishing workspace-wide. Two full-year from-empty
 regens (484K and 1.84M outbox events, zero undelivered) are the
 acceptance record.
+
+**The relay waits for a locked predecessor; it never skips one**
+(design-doc "Preserve pending outbox order before guarded gate
+replay", 2026-10-16, landed the same day in train #1206). The relay's
+claim in `drain_outbox_once` takes pending rows `ORDER BY id … FOR
+UPDATE` without `SKIP LOCKED`. With it, a relay that met an earlier
+row held by another transaction audited the later row first: a real
+relay test recorded one Job's two committed `jobs.job.updated` facts
+in reverse, which replay then reads as the wrong final state. Skipping
+bought no concurrency, because the audit insert already serializes
+on the hash chain's lock; it only bought a wrong order. The wait is
+bounded and visible: the claim runs under `lock_timeout = '2s'`, so a
+held predecessor returns a retryable error and leaves every fact
+pending, never skipped. This orders the audit of committed pending
+rows and nothing more: it does not order independent uncommitted
+transactions, repair audit rows already reversed, or make publication
+exactly-once (the publish phase stays at-least-once). The outbox
+prune keeps `SKIP LOCKED`, since a deletion has no order to keep.
+`boss-events/tests/stream_order_pg.rs` pins it: a held predecessor
+blocks the later fact, a cancelled relay leaves both facts for a fresh
+one, two concurrent relays write one audit row per fact in order, and
+a prolonged hold returns the visible error. The design filed no open
+questions and its review step was never run, so this records what
+landed, not a ruling.
+
+**A dark message bus degrades a service; it never exits one**
+(design-doc of that title, 2026-11-10, after the 2026-11-09 outage in
+which an unreachable NATS crash-looped the boss pod while Postgres
+stayed up; its five cars landed by 2026-11-11). The outbox means the
+write path no longer needs the bus, so nothing treats the bus as a boot
+precondition. `boss_nats::NatsEventBus::connect` is the one constructor,
+the dispatcher included: it retries the first connect and reconnects
+without bound, and only a malformed URL still exits, as a config error.
+JetStream's stream is ensured again on every connect, and each durable
+consumer opens and reopens in a capped-backoff loop (`keep_bound`). **A
+write on a dark bus commits and the outbox holds its publish — never a
+503**: the fact commits in the state's own transaction, so provenance
+and conservation hold, and refusing would turn a night's outage into
+work re-driven by hand in the morning. Reads come from Postgres either
+way. The relay keeps its audit-then-publish order, so `audit_log` lags
+the outbox while the bus is dark; split the relay's cursor only if a
+reader of `audit_log` is measured to need it current through an outage.
+`delivered_at` waits for the stream's PubAck, because the design's
+premise was wrong: async-nats queues a publish on a dark bus and answers
+Ok, so a stamp on Ok marked delivered events that never left. No write
+path's event is dropped by a dark bus any longer; the agents door's
+unresolved-login count and the asset event, its last two direct
+publishes, stage on the outbox. A degraded service looks degraded:
+every `/health` carries `capabilities.bus` (`connected` or
+`disconnected`) as a field, never as the status, which stays `ok` and
+200, because a readiness probe that failed on the bus would dark the
+record exactly as the crash did; the relay's minute heartbeat logs
+outbox depth and oldest-undelivered age, and WARNs when a minute
+delivered nothing while rows are owed. A vanished delivery-lane
+consumer is not recreated, because the cutover fence pins it by
+creation time and a recreated one would silently skip what was
+published while it was gone; it stays visibly not running until an
+operator rebinds. Still open: the alarm on undelivered age belongs to a
+reader outside the jobs API (backlog 9574cd04), and the bus's own
+availability is the single-replica NATS item, c6fc7326; this decision
+makes an outage cost lag instead of the record, not rarer.
 
 The log itself is tamper-evident in three layers: append-only
 enforcement (BEFORE-triggers reject UPDATE/DELETE), a **hash
@@ -2295,6 +3356,22 @@ cannot erase it; `step.corrections` on the job GET and its live stream;
 (`boss_jobs::corrections::TERMINAL_STEP_HINT`) at both sites and in the
 dispatcher's test double. Not yet built: the shared web marker.
 
+**A registry write stages its fact in its own transaction, and one routine
+replays every registry.** Design `e5d814d3` (extends 3036296f mechanism A,
+"a write leaves a fact") retires fifteen gap items with one mechanism:
+`boss_events::stage_fact(tx, kind, row)` writes the outbox row in the same
+transaction as the registry write, with the FULL row as payload, named
+`<registry>.<row>.declared | updated | retired`. Because every fact carries
+the full row, `boss-rebuild` replays every registry with one routine,
+registered as (table, key columns, fact prefix): upsert by (table, key,
+version) on declared and updated, mark retired on retired, in log order;
+per-registry rebuilders that only replay full rows are deleted. Registries
+without a write door (subject kinds, credential text, classes) gain a PATCH
+door that calls the helper. `migrations-declare-schema-only` refuses INSERT
+on registry tables after the cutover as it refuses UPDATE and DELETE, and
+the emitted-kinds lint reads `AuthAudit::emit` call sites. When the last
+gap closes, `writes-without-a-fact.txt` is deleted.
+
 ## Finance & ledger
 
 The ledger is a dedicated crate consuming `financial_facts` via a
@@ -2324,6 +3401,30 @@ recorded full rows, including signed costs, without invoking ordinary
 command validation or rewriting those facts. A credit-specific signed
 cost needs an explicit money-policy decision. The physical Warehouse's
 activation is a separate decision.
+
+**An order or bill belongs to the vendor its reference names by ID.**
+(Design "Vendor dashboards need a stated rule for unresolved financial
+references", `ccfa6069`, David 2026-10-11, answered as proposed;
+backlog `ddf9d70a`.) Attribution reads the stable vendor Subject ID,
+never the display name: vendor creation admits duplicate names, empty
+names and a name equal to another vendor's ID, so a join by name
+double-counts, lets an empty reference claim an empty-named vendor and
+misses an order that names its vendor by ID — each reproduced on
+synthetic fixtures, none observed in a live balance. A null or empty
+reference is unassigned. A nonempty reference that matches no vendor ID
+is unresolved and shown as unresolved, never assigned by name; any
+mapping from a legacy name to an ID is explicit and evidenced, and
+recorded data is preserved — no automatic migration, no financial
+write. The write side already holds the rule: the purchase-order door
+accepts a registered vendor ID, null or empty and refuses a display
+name 404 with no event, and the PostgreSQL adapter validates a
+nonempty reference against the vendor Subject ID (its documented
+import escape does not). **Left open**, because the answer accepted the
+proposal's own deferral: whether a unique-name fallback is ever
+permitted, and how unresolved records count toward the dashboard's
+totals and outstanding amounts — both to be answered before the UI
+repair. Not built: `apps/web/src/vendors/VendorsList.svelte` still
+matches orders and bills to `vendor.name`.
 
 **The chart of accounts is tenant data; the starter chart is the
 brewery's.** (Backlog `41af5195`; design `18cf4272`, David 2026-09-17;
@@ -2376,6 +3477,42 @@ that sell goods, and hosting revenue (`8db1d6a6`) posts to the ledger
 the way sponsorships do. Not built: `receive-a-bill` exists in neither
 this tree nor the tenant's, and the page still reads commerce and
 inventory.
+
+**Closing and reopening a period goes through a reviewed packet, and
+the two closes are two protocols** (design `98781bb9`, David
+2026-10-13, both questions accepted as proposed; answers `e536e91a`).
+Decided: (1) **the monthly close stays the founder-reviewed `/lock`**
+that the native `close-a-period` loop already runs (evidence, founder
+approval, lock, ledger event), approved in `3613f0af` and not
+re-approved here. **The fiscal-year Close is a different act**:
+`POST /api/ledger/periods/{id}/close` refuses any period that is not a
+year and posts closing entries into retained earnings, with WIP
+treatment, so it becomes its own named, reviewed protocol before any
+surface offers it. A monthly period is never sent to `/close`, and a
+journal effect is never labelled a monthly freeze. (2) **A locked month
+reopens only on a packet** that records a nonempty reason and a genuine
+founder approval bound to that period's current lock and checksum. An
+approval that comes late or is repeated cannot apply to another period,
+a newer lock or a substituted request, and an approval that is
+declined, missing or dark does not unlock. **A fiscal year whose closing
+entries are posted stays refused** until a reviewed correction or
+reversal protocol says how those entries are conserved; clearing the
+year and guessing the accounting effect is not an option. The UI opens
+and advances these packets and shows their state. It never writes
+because a button was enabled, and a caller-provided packet id is not
+proof of approval at the write boundary. The policy grants on
+`ledger-period` (backlog `25a4f7f9`) say who may write; they are not
+that approval. Two questions remain open, because both decisions
+accepted their "confirm whether" clause as written: whether the
+original Close requirement includes the fiscal-year protocol now or
+stays an explicit outstanding obligation, and whether reopening a year
+is needed now and under which reversal policy. Item `e536e91a` stays
+open until both are answered and built. Not built, measured on main
+2026-11-13: `TrialBalanceTab.svelte` still calls `lockPeriod` and
+`unlockPeriod` directly, with Unlock behind a `window.confirm`; the
+unlock event records the actor, the time and the period but no reason;
+and this tree holds neither a reopening protocol nor a fiscal-year
+close protocol.
 
 **The tax regime is tenant data; the migration's kinds and rates are
 the brewery's.** (Backlog `7f163e58`; design `e187198f`, 2026-09-18.)
@@ -2523,6 +3660,32 @@ must not be described as completed isolation of all company data until
 those reads have their own refusal evidence. The playground's deliberate
 audit read does not excuse a Basic-mode leak.
 
+### A denied job read refuses; a partial station view names its gaps
+
+Decided on design-doc "Denied job reads report refusal, and anonymous
+station views disclose their boundary" (`6ec8f538`, review by emp-david
+2026-10-11). (Q1) A caller whose effective job-read scope is none —
+`Predicate::None`, or a grant that translates to `JobScope::None` such as
+another department's — is refused 403 by `GET /api/jobs`, naming the
+caller and the action and nothing about the packets hidden, as the
+station reads already do through `readable_predicate`. No endpoint
+answers that caller an empty 200; an allowed scope that matches nothing
+still does, and `/api/jobs/live` keeps its own declared public window. A
+future exception is a named, reviewed endpoint contract. Readers render
+the refusal as a refusal, never as calm: the Incidents page must not
+paint "No active incidents" for it. (Q2) An allowed caller with no
+identity a per-actor station can bind to still reads the network's load,
+and each such station is marked unavailable for that reason, never
+dropped and never given a zero depth, so a partial view cannot read as a
+complete, idle network. No grant widens.
+
+Not built, measured on main at `f998bdbaa`: `list_jobs` still answers a
+none scope with an empty 200 (its comment calls that a clean empty state
+instead of 403 noise), and `stations_load` still drops every station
+`bind_self` cannot bind. Q1 is item `18933cc6`, Q2 item `68889216`. Wording
+a station 403 as a refusal rather than an outage on the marshalling
+board is item `7abb184f`.
+
 ### Policy decisions and authority
 
 Every write passes `boss-policy` via the `PolicyClient` port.
@@ -2668,10 +3831,122 @@ tally restart clears a loss the log does not yet state, and a process
 joins the next one's watch only across a clean `<gate>.recording_ended`
 stated at SIGTERM — one that died holding facts breaks the watch.
 
+**A window requires the services this deployment launched, read from
+the launcher's own record** (design-doc *Gate evidence covers the
+authoritative deployment profile*, `3cc6152a`, David 2026-10-05, Q1
+accepted as proposed; answers backlog `b0787727`). The required set
+had been every gated row of `boss_ports`, so the six services the
+Algedonic, LLC instance deliberately does not run (assets, catalog,
+inventory, shipping, simulator, sim-control) were six permanent gaps
+and the machine-gate window could never read clean. The port registry
+stays the inventory of what the software can run; what this instance
+must run is what `infra/oss-quickstart/services-launcher.sh` selected
+from the tenant manifest's modules and `BOSS_SIM_ENABLED`, written as
+a `start`/`skip` line per binary to `BOSS_LAUNCH_RECORD` — one
+definition, so the launcher and the requirement cannot disagree. The
+record can only EXCUSE, and every excuse is checked: a skipped service
+whose port accepts a connection, answers its tally read or has a gate
+fact in the window is not clean, and a record that is missing,
+unreadable, truncated or names no decision for a service excuses
+nothing (`roster_errors`; every service then required). No caller
+narrows it: `/api/events/gate-window` takes only `gate` and `hours`,
+and a required service that is down stays required and dirty. Its
+provenance is on the log: every machine-gate and actor-role
+`recording_began` carries `roster` — the sha256 generation of its
+launch record's decisions (reasons and order excluded) and its image's
+commit, or why it has none — and a window whose hours span two
+generations, or whose required service's running process stated
+another or none, is not clean and names both (`judged_generations`),
+so a new selection never inherits an old clean window and the
+mechanism's first boot did not backdate itself. Operating rule: any
+change to the launcher's array or the tenant's modules is a new
+generation and restarts every counting enforce clock. The policy check
+consults no launch record. Built, all three closed: backlog `93e0814a`
+(the required set from the record, car `b43f2a32`, train #971),
+`14fe115c` (the generation, car `35baf5b0`, #1004) and `b13bd730` (the
+actor-role window bound to the same roster, car `5e77881a`, #1018).
+The self-issued rotation's revoke, the refusals and asked alarms
+(through `gate_window_read`) and the flip's judge
+(`infra/ops/gate-window-is-clean.sh`, which requires exactly one
+stated generation) read that one answer. Read live 2026-11-13T04:40Z:
+21 services required, the six excused with their recorded reasons and
+none listening, one generation, `not_clean` empty, and the 72 hours
+not yet covered (clean since 2026-11-10T15:01Z). The design authorized
+no enforcement flip, rotation or grant, and those stay on their rows.
+
+**A profile adoption and a machine-token mutation are to reserve
+through one owner outside the jobs API; none of it is built**
+(design-doc *Fence BOSS deployment adoption through an independent
+owner*, `51c69035`, opened by agent-codex, David 2026-10-06, Q1
+accepted as proposed). It extends the decision above and changes none
+of it. Decided: an independently supervised deployment-transition
+coordinator on the forge, with its own persistence port on the
+existing database, never calling the jobs API before it acts. Converge,
+both rollbacks (the deploy lib's and the watchdog's) and the launcher,
+before it starts the selected services, reserve an adoption through it,
+and the self-issued rotation reserves its mutation through it. The two
+never coexist, and an unknown external effect stays unresolved until
+bound evidence resolves it. A reservation carries the complete selector
+artifact (image, manifest, launcher definition, simulation inputs) and
+the original it replaces, so a rollback restores the whole artifact,
+never an image alone. While the owner is down, only a same-profile
+restart proven against a complete last-converged receipt proceeds; a
+profile-changing rollout or rollback holds. Its callers present a
+broker-issued credential of their own family, never the estate token it
+fences. The design authorized no grant, credential, issuer or
+activation. Not built, measured on origin/main `375a3f75` 2026-11-13:
+no coordinator, port or `deployment.adoption.*` event exists;
+`cluster-deploy-runner.sh` runs `converge_tenant` before
+`apply_instance` with no reservation; both rollbacks name an image
+only; the self-issued rotation reads the joined gate window and
+reserves nothing. The broker has no issuer for the coordinator's
+credential or database role, which the design names a prerequisite.
+The Pg deployment-selection publication the design was read against
+never landed; on main the roster generation above detects a changed
+profile after the fact, which is detection, not a fence. The build is
+item `ac2084b6`; item `3ff7b8eb` (design `2afd8e21`) names it a
+prerequisite.
+
+**That window sees only the listeners the registry names; a complete
+listener observation by the instance itself is decided and not built**
+(design-doc *Authenticate complete BOSS instance listener inventory*,
+`2afd8e21`, David 2026-10-06, Q1 accepted as proposed). The tally
+reader's targets are `boss_ports::all()` (`LocalTallies::at_declared_ports`),
+so it can refuse a missing known service but cannot discover another
+socket: on 2026-10-06 a real private listener started in Off mode with
+no recording facts, and the coverage read still answered
+`covers_requested_window=true` with no input error (builder run
+`ee53b974`). Decided: a replaceable `RuntimeListenerInventory` port
+whose native adapter runs in the instance workload and observes its own
+network namespace, under a verified instance principal mapped to its
+Pod and namespace (never the shared estate token plus an asserted
+actor). It records complete IPv4 and IPv6 TCP LISTEN capture, its
+bytes, interval and parse; missing, truncated or ambiguous evidence, an
+owner the delivered artifact's versioned listener data cannot bind, and
+a changed deployment generation each refuse coverage. A familiar port
+or a self-reported name is not ownership. An unknown socket is a
+discrepancy and gets no machine token, actor header or authenticated
+probe. The trust accepted is the co-resident workload's honesty; an
+independently isolated observer would need its own decision. Built:
+only the source half, the tree-wide pin
+`every_service_mounts_the_machine_gate.rs`, which inventories serving
+calls and unaccounted TCP binds by syntax, with the tenant's loopback
+callback declared in `crates/tenants/boss-brewery-engine/listener-inventory.toml`
+(car `83cf7eab`, 2026-10-14), and which states it is not runtime
+evidence. Not built: the port, its adapter, the instance principal and
+the ownership data. The build waits on two accepted designs, both
+folded here and neither built: the adoption owner (`51c69035`, above)
+and lossless observation retention (`d4bb88fe`, below). This decision
+grants no issuer, credential, deployment or activation; the build is backlog `3ff7b8eb`.
+
 **The actor-role report is the third gate on that reader, and its
 window is judged per process** (backlog `e0bdba74`, 2026-10-08; amends
 point 4 of design `abf9eeae`, which called the tally "telemetry, not
-audit-log events"). Row H earns `enforce` on 72 hours with zero
+audit-log events"; design-doc *Where the actor-role report window
+lives: on the event log, or in a telemetry store beside it*,
+`da2234b8`, David 2026-10-08, both questions accepted as proposed,
+chose the log over a telemetry table with a second reader, and train
+#1000 built it). Row H earns `enforce` on 72 hours with zero
 would-deny for every registered actor and zero unregistered writers,
 and that tally was process memory in a pod seven trains restarted in
 twelve hours: `durable_window` was a constant `false`. It now states
@@ -2692,7 +3967,15 @@ re-judges every live row: `would-deny`, `would-change-scope`,
 made is no pass. The window is read at
 `/api/events/gate-window?gate=actor-role`, over every service the
 launcher started, and each service's own report answers its own
-window, `durable_window` true only when the log was read. Two things
+window, `durable_window` true only when the log was read. The gateway
+states no such facts: its one database pool is the audit sink of the
+internet-facing process, so it mounts `role_service::unrecorded_tally`,
+and the design's second answer left its wiring to a follow-up car,
+the estate window reading not clean until then. Read live
+2026-11-13T09:07Z, the window names it ("no `actor_role.recording_began`
+from `gateway` on the log: it has never recorded here"), and the events
+reader's read of the gateway's report answers 403. No item or car
+owned that follow-up; it is item `fc884927`. Two things
 it holds that a merged reading does not: every live process must
 answer and match the newest start the log holds FOR THAT SERVICE, so
 one service's clean restart never stands in for another's long-lived
@@ -2703,6 +3986,130 @@ reset the clock, nor does the mode word moving between words that
 record; `off`, a process that states no clean end, a gap longer than a
 restart, a lost fact and any would-refuse do. It refuses nothing: the
 car that makes `enforce` refuse declares `actor_role.refused` then.
+
+**Under row H, a gateway-forwarded User is kept only on a signed
+delegation from a named shared workload; none of it is built**
+(design-doc *Verify shared-workload identity delegation before role
+enforcement*, `ec695ecd`, opened by agent-codex, David 2026-10-06, Q1
+accepted as proposed; it answers a gap in `ddf0773e`, the item that
+owns row H). Design `abf9eeae` lets a gateway-forwarded request keep
+the gateway's resolution, and nothing can tell such a request apart:
+the gateway strips client `x-boss-*` headers and forwards the
+session's full User in `x-boss-user` beside the estate machine token,
+which every estate caller holds, so neither the header, the token nor
+a loopback address proves who forwarded it. Decided: a
+**shared-workload issuer**, named as such. Its signature proves that
+the declared BOSS workload asserted the User, not that the gateway
+process did, and every process that can read the signing key, plus
+the administrators of that workload, is in its trust base. The key
+family is asymmetric and broker-issued (a new issuer handler,
+`resourceNames`-scoped placement, never placed by hand), with public
+verification material mounted in each consumer. The envelope binds
+the complete User, the session identity, issuer, audience service,
+deployment, key generation and a lifetime of at most 60 s with at most
+2 s of future skew. It travels only to literal-loopback upstreams in
+the same Pod, with proxies and redirects disabled; any other hop
+refuses until authenticated confidential transport is separately
+approved. Method, path, query and body are not signed, there is no
+nonce store, and a replay within the lifetime is allowed: each request
+still passes its own policy, ownership, presence and idempotence
+doors, and a delegation carries no approval. The verifier runs before
+role resolution. An invalid assertion never establishes provenance,
+and an absent one takes the ordinary machine path. The stronger
+alternative, isolating the gateway's signing workload first (its own
+ServiceAccount, session key and broker roots), was not chosen. The
+decision approves a trust mapping only, and no grant, Secret,
+deployment or H flip. Not built, measured on origin/main `2dbd868b`
+2026-11-13: no `WorkloadIdentitySigner`, verifier or
+`VerifiedWorkloadDelegation` exists; `role_headers.rs` still forwards
+`x-boss-user` and the estate token; the broker has no issuer for the
+key family; and row H cannot refuse (`role_reader.rs` maps the
+`enforce` word to `report`, and `boss.yaml` sets `report`). The build
+is item `8460533e`, and row H's enforce car on `ddf0773e`
+waits on it.
+
+**An automation reads at a tier only when its own row records one, and
+reading a draft is a grant of its own** (design-doc *Qualify the
+movement observer with explicit read-only authority*, `600c07d7`,
+opened by agent-codex, David 2026-10-17, its one question accepted as
+proposed; answers backlog `f21804d8`). The movement observer
+(`automation:yard-mover`) must read the complete graph: job Read,
+estate Read, workflow Read, the drafts, and the machinery reads, which
+ask an Operator-or-Auditor tier (`trust::can_read`). The automation
+registry recorded a role and no tier, and the one tier rule there was
+infers Operator from an agent's role. Decided: a role is not a tier.
+An automation row may record one tier, Auditor, the existing read-only
+machinery tier, which admits the machinery reads and refuses their
+writes and overrides no policy leg. It is resolved afresh for the exact
+configured id: never a family member's through `signs_for`, a header's
+claim, a borrowed reader or an inference from the role, and a missing,
+dark, changed or revoked row refuses. Reading an unpublished draft,
+which needed Create, Update or Publish on `workflow`, gains a read-only
+leg, Read on `workflow-draft`, granted to no visitor, ordinary reader,
+agent or auditor by default. It confers no authoring, and every owning
+draft read asks the same four legs. The capture is never narrowed to
+dodge a check: an observer without the draft grant stays unqualified.
+Existing callers and author access are unchanged. The design approved
+the mechanism only. Enrolling the actor, publishing its tier or grants,
+credentials, producer activation and the native proof (full capture,
+catalog, the 720 proof and the 42 historical UNKNOWNs) are separate
+recorded operations.
+
+Built (train #1242, 2026-10-18): the nullable `automation_actors.access_tier`
+column, whose CHECK admits only `auditor`
+(`20261018020000-an-automation-row-records-its-read-tier.sql`), and
+`RecordedTier`, `recorded_reader` and `recorded_reader_again` with
+their port forms in `boss-jobs/src/agents/automations.rs`, re-resolution
+refusing a changed role or tier or a missing row. The platform seed
+inserts a tier only with a fresh row, on its `automation.declared` fact,
+and never stamps over or revokes a held one. The `READ_WORKFLOW_DRAFT`
+control is the fourth leg of `http/kinds.rs::may_read_drafts`, read by
+the kind and station draft reads. Its only default holder is
+`platform-admin`, pinned by `only_platform_admin_reads_workflow_drafts_by_default`.
+Not built, measured on origin/main `ebed6540` 2026-11-13: no bundle row
+for `automation:yard-mover`, and no row records a tier. No door records
+or revokes a tier on a held row, so no event yet states a tier change.
+No production caller resolves through `recorded_reader`: the in-process
+mover (`http/moves.rs::run_mover`) still builds its caller in code at
+the User tier. A native producer adopting the resolvers before
+discovery, capture, acceptance, replay and reconciliation has not landed.
+
+**A judged gate observation is kept only as prose; retaining it whole,
+as immutable chunk facts behind a verified manifest, is decided and
+not built** (design-doc *Retain complete gate observations as bounded
+immutable evidence*, `d4bb88fe`, opened by agent-codex, David
+2026-10-06, Q1 accepted as proposed). A reader of the windows above
+takes the joined window whole or not at all, up to
+`gate_window_read::MAX_RESPONSE_BYTES` (64 MiB), and then writes a
+sentence about it: `policy.check.refusals.alarm`,
+`machine.gate.asked.alarm` and the self-issued rotation's revoke each
+record their verdict in prose. The window's facts stay in `audit_log`;
+its live tally reads, roster and probes do not, so a recovery cannot be
+re-read later as the evidence it was judged on. Copying the observation
+onto the alarm was tried on a branch that never landed (`8b536e67` to
+`e188d625`, 2026-10-06): an 1800-fact window the reader accepts made
+the recovery write answer 413, and one event is bounded below any
+request by `MAX_STAGED_EVENT_BYTES` (983040, `boss-events/src/outbox.rs`),
+which stays. Decided: the complete canonical observation is appended
+as ordered chunk facts, each a whole event under that bound, then one
+manifest fact binding the encoding, total bytes and SHA-256, every
+chunk's id, length and hash, the original publication and the
+observation's purpose and interval; the alarm or recovery carries only
+a reference to the manifest. Chunks without a verified manifest are no
+evidence and no recovery is claimed before it closes; an identical
+retry writes nothing and a conflicting one refuses; reconstruction
+reproduces the exact bytes or refuses a missing, reordered, duplicate,
+foreign or truncated chunk. The design found today's content
+attachments are not that contract (finalize trusts the supplied hash, a
+detached object is collected after 30 days, a signed PUT can
+overwrite), so the train diagnostics' chunked content transport
+(`boss-cli/src/train/diagnostic_adapter/artifacts.rs`) is not the reuse.
+It granted no writer, reader, event kind or endpoint; those are
+established with the build. Not built, measured on origin/main
+`2dbd868b` 2026-11-13: no chunk or manifest event kind, and no
+reference on any alarm. The build is item `702c8851`; the runtime
+listener inventory (item `3ff7b8eb`, design `2afd8e21`) needs it for
+its capture retention.
 
 **One actor, one identity: an agent's login resolves to a registered
 id the way a human's does** (design `6fda05ae`, David 2026-09-12; all
@@ -2731,6 +4138,67 @@ recorded before a run starts) sequence after the run is a recorded
 fact. Car 1 (registry + alias + resolution, window open) building
 2026-09-15.
 
+**Which model reviewed a car is the launcher's record, never the run's
+word, and a FORMAL review is not yet bound to it** (design-doc *Bind
+formal reviewer provenance to the executor launch*, `5155f530`, Q1
+decided as proposed by David 2026-10-04, answering urgent `ad82090a`:
+two reviewer runs declared `opus-5[1m]`, ran `gpt-6-sol` and wrote
+RELEASE on cars a train then boarded; sequenced by design-doc *Refuse a
+release when the reviewer model differs?*, `fb9ba887`, David
+2026-10-09). The Workflow's preferred model, the configured launch and
+the observed inference are three different facts, and a rate card
+pricing a model observes nothing. Decided: a manual, externally spawned
+reviewer may make a FORMAL release only on a trusted host/tool launch
+receipt bound to its run, exact claim, configured model and execution
+handle — never a parent's self-attestation, an environment variable or
+caller metadata; until the launcher writes that receipt a mismatch is
+recorded and not refused (`fb9ba887` D1), and once it does, only the
+launcher's record counts (D2). Built: the step agent block's
+`executor_provenance` word (`advisory` | `verified`), the immutable
+`executor.source_claim` and `executor.binding` first records and one
+predicate, `executor_attestation::executor_eligibility`, read by `boss
+review`, `boss release` and train boarding alike (train #955,
+2026-10-05); agent blocks naming the model that runs (car `acfd53d0`,
+train #1036); and the launcher's pre-claim `launch.model` record —
+written by `boss dispatch --launch`, and by `--from-hook` from the Agent
+call — which a release now states as "declared, launched, observed"
+(`car_release::reviewer_model`, train #1045, item `e6b05dd6`). Not
+built, measured on origin/main 2026-11-13: the only production verifier
+is `UnavailableLaunchReceiptVerifier`, which refuses every receipt;
+nothing outside tests writes the source claim or the binding; no
+authored workflow declares `verified`; so every FORMAL review is
+advisory and the model is said at release, never judged. And a run
+claimed before its Agent call, as `boss dispatch --next` claims it,
+gets no `launch.model` at all and reads launched unknown. The refusal
+D1 deferred to D2 is backlog `ff17de8f`.
+
+**The source claim is captured in the claim's own commit, declared by
+the protocol and never rewritten** (design-doc *Capture declared claim
+evidence atomically under the admitted protocol*, `c0e07e34`, opened by
+agent-codex and answered by David 2026-10-05, both questions as
+proposed, answering `ad82090a`). It decides who writes the
+`executor.source_claim` that the launch receipt above binds. A record
+written after the claim could be missing for a claim that stands, and
+one written before could exist for a claim that was refused. Decided:
+(1) a versioned step row may declare `claim_records`, and only the
+workflow publish authority declares them. Each record's values come
+from a closed vocabulary of observations the server makes itself: the
+admitted job, the step, the protocol kind and version, the resolved
+claimant and the claim stamp. Source and configuration come from the
+original admission envelope or an authenticated observation port, never
+from mutable metadata. If a declared observation is missing, the claim
+is refused before anything changes. The claim, its records and their
+events commit together, or none of them do. Core claim code never names
+the executor key; the executor adapter maps the generic record onto
+it. (2) `conserve_original`: an equal retry returns the first receipt
+and records no second event. A changed holder or binding is refused,
+and a new execution is a new run. Not built, measured on origin/main
+2026-11-13: `claim_step_displacing_at` takes no record, and no step row
+declares `claim_records`. The build is item `a84ebe76`, the
+source-claim half of `ff17de8f`. It extends the specific-step claim
+door, which is live. The native selection commit that `4e61511c` binds
+is not served until `1f04d9c6`.
+
 **A run reported as a bare total is priced at a declared blend, and
 says so** (design `91a9bfe7`, David 2026-09-20: "The blended rate for
 the cost of runs sounds fine"; all three questions accepted as
@@ -2751,6 +4219,42 @@ unreported run answer `None`; a measured split always wins; (3) **the
 record an assurance nobody has, so the series starts where the pricing
 does.
 
+**A run's spend is read per protocol and step, a helper is charged
+once, and a 1-hour cache write gets its own price** (design-doc *Read
+per-protocol spend with verified helper attribution and cache
+lifetimes*, `091e8034`, both questions decided as proposed by David
+2026-10-11; answers backlog `05bf580b`). It extends the metering of
+the next paragraph, "A run is priced from what it consumed", and
+reopens neither of its rules: an unknown price stays unknown, and a
+budget stays a reading. Decided: (1) `agent_rate_card` gains a nullable
+per-model 1-hour write rate, its provenance the provider's dated
+official rate; new usage records split cache writes into 5-minute and
+1-hour counts that must sum to the total; an unclassified lifetime or a
+missing rate leaves the price unknown; a recorded price and its floor
+are never rewritten, and publishing code changes no live rate. (2) A
+helper a run spawns keeps its own usage record and native model, tied
+to its parent by a verified execution receipt; direct and inclusive
+readings are shown apart, an inclusive sum charges each usage record
+once, and a missing edge, an ambiguous overlap or an incomplete set of
+children makes the inclusive figure unknown and names why. The plan is
+three cars, all on item `05bf580b`: a per-protocol read grouped by the
+job's kind and the run's `detail.step`, with an explicit unattributed
+bucket; the helper edges; then the rate. Measured on origin/main and
+live 2026-11-13, none was built: `/api/agent-runs/cost` grouped by model
+and branch only, and an unmatched `workflow_kind` answered the same 812
+runs (444 unpriced) since 2026-11-06 as no filter. The read half of the
+first car has landed since: the cost read answers `protocols` — the set
+by `jobs.kind` and `detail.step`, with `no_job`, `unknown_job` and
+`no_step` buckets — and `workflow_kind` scopes it, so an unmatched kind
+answers zero; rendering it on the workflow page is still to build. Of
+the other two, as measured: the card's 13 rows carry one write rate each,
+and `cache_write_1h` is counted but priced at the 5-minute rate; the
+meter reads exactly one transcript per run, so a helper's turns reach no
+parent. The receipt a helper edge needs is not written either: every
+launch record sets `parent_runtime_id` to null, and the launch-receipt
+verifier in the formal-review paragraph above still refuses every
+receipt.
+
 **A run is priced from what it consumed, and a budget is a reading,
 not a limit** (backlog `e6b2066f`, David 2026-09-23: "the goal is the
 PLUMBING to understand costs … we do NOT want budgets to limit
@@ -2768,6 +4272,31 @@ write rate, so a 1-hour write is a floor), basis `metered`; (3) the
 than about five times low; (4) an over-cap claim is admitted and
 `agents.claim.over_budget` rides the log beside it, and an over-cap run
 is recorded with its `budget` reading `deny` — neither refuses.
+
+**A native runtime roster enters the record as an explicit, dated
+snapshot, and an open run is not evidence that an executor is running**
+(design-doc *Observed runtime roster on the BOSS Shop Floor*, `aad7c419`,
+2026-10-02, recorded as engineering decisions with no open questions;
+answers backlog `daa8f63f`). A capture is a `runtime-roster-capture`
+packet filed by `boss roster record` from an operator-copied native
+call/output pair: source, evidenced namespace, collection interval,
+receipt time, the raw response and normalized rows ride a completed
+`capture` step, so they are immutable. A malformed or incomplete read is
+a `failed` capture, never an empty healthy roster; an equal capture-id
+replay is idempotent and a conflicting one refuses. A native path is an
+alias reused across tasks: it is never joined to a BOSS run or read from
+completion prose, current work stays unknown until an assignment epoch
+and an attributable start acknowledgment tie a native instance to one
+claimed step, and no heartbeat, observed model or billing is made up
+from coordinator interaction (the run meters above stay the only spend
+record). Measured 2026-11-12: the protocol and the verb are built,
+pinned by `boss-cli/tests/runtime_roster_capture.rs`; two captures exist,
+the last on 2026-10-03. The presentation was built and then retired with
+the Crew Board (item `740b3fb6`, train #1636, 2026-11-08), and no station
+view draws a capture today. Not built, and held open on `daa8f63f`:
+showing captures beside a station's Working rows, the current-task
+mapping, and a continuous adapter — which needs a supported runtime
+bridge and its own reviewed design before it adds a trust boundary.
 
 **A destructive change is approved by the founder's passkey over a
 rendered plan and executed by the machine** (design `17835005`, David
@@ -2852,6 +4381,52 @@ open: the approve step's runner-written keys
 (`plan`, `verb`, `host`, `args`, `rendered_plan_sha256`) are writable by
 anyone who can write the step — the runner's re-render and the ceremony
 binding refuse a swap, but do not prevent one.
+
+**A tenant merge's passkey is asked only over an independent review of
+the same plan** (design `9de0cd1c`, David 2026-10-04, its one question
+accepted as proposed; answers backlog `84e7c3e4`). This narrows the
+passkey route above for one verb. The approval proved who decided and
+which bytes they signed, and nothing about whether anyone but the
+branch's author had read them: the BOSS car reviewer resolves a
+ship-a-change car on the BOSS forge, and a tenant builder ships none,
+so the review was an operator's convention the next shift could not
+read. Decided: a closed independent RELEASE of the exact rendered plan
+is a machine-checked precondition of the approval becoming ready, and
+is checked again before the claim; an absent, open, unreadable,
+`changes`, self-authored or moved review refuses before any mutation,
+and anything the plan names moving needs a fresh review and a fresh
+approval. Single use, the ancestry check, the main lease and the
+effect readback stand as they were, and the review grants no write,
+publish, export or standing authority; tenant publication stays with
+its own item (`69c8aee1`). Built (train #1026, car `e1f4fc2a`,
+2026-10-09): `infra/ops/verbs/merge-tenant-main.json` declares
+`requires_review`; ops-request carries a `review` step funded for the
+`tenant-reviewer` profile (`infra/platform/documents/tenant-reviewer-rules.md`),
+`approve` is ready only over its `release`, and `changes` closes the
+request on `not-released`. The runner's `verify_review`
+(`infra/ops/ops-runner.sh`) renders the approval's plan only for a
+LANDED tenant-reviewer run dispatched for that step, which is not the
+source run it names, whose source run's `tenant_receipt` sha the plan
+lands, and whose `reviewed_plan_sha256` is the hash of the plan
+rendered onto the step. The approval's plan is a fresh render that
+must hash to the reviewed bytes, and the review run rides beside it as
+`review_run` inside the shape the passkey signs, never inside the plan
+it vouches for, so the digest is not circular; `review_holds_for`
+checks both again before the claim. Pinned by
+`boss-jobs/tests/a_tenant_merge_waits_for_an_independent_review.rs`
+(readiness) and boss-testing's `ops_runner_approval_sh.rs` (the
+runner). Live on 2026-11-13: ops-request v17 is active, and all eight
+`merge-tenant-main` requests filed since 2026-10-09 carry
+`requires_review` (request `9ea628e8`, 2026-11-06, was released by
+review run `d7c8e75e`, signed `agent-codex`, over source run
+`b3499c2a`, signed `claude-b`). The cross-packet check lives in the
+runner rather than in `ready_when` because design `69c0ace7`'s
+predicate-level verifier was never built; that design's fold records
+this build as the reason. Two gaps stand, with no new item:
+independence is per RUN, not per agent, because every agent signs as
+a shared actor id, so two runs of one agent can author and review the
+same merge; and nothing verifies which model reviewed, which backlog
+`ff17de8f` owns.
 
 **A key a human signs has one declared writer, and the server knows
 who that writer is** (design `f623e425`, David 2026-09-25, Q1 answered
@@ -3179,8 +4754,52 @@ found two pairs the hand table missed (Read on `event` and `subject`,
 asked by global search), and a pair some door admits only at scope
 `all` — the estate, a policy rule, the registry ladder, the commerce and
 asset writes — is declared so and held only at `all` (car 1's release
-review, LOW); the flag tells coverage and never widens a door. Not yet
-built: the three guards.
+review, LOW); the flag tells coverage and never widens a door. The
+three guards have since landed: G3 in train #950 (2026-10-05), G1 in
+#965 and G2 in #972 (both 2026-10-06).
+
+**Seeding a fresh instance's policy is an installation act, not a write
+the guard lets through blind** (design `b757cf08`, David 2026-10-17, its
+one question accepted as proposed; answers backlog `44d78329`). Measured
+at f2c551dc and still so at ebed6540e: when the guard's standing is
+blind — the roster answers no active employee, or no bound passkey — a
+rule with no row under its id passes unjudged, so a new wider rule on a
+role no real person holds can raise a pair's widest-scope bar past the
+narrower person who held it (review N2) and orphan a control the blind
+path never sees. The exception has one legitimate caller,
+`bootstrap::publish_policy_rules`, which posts a tenant's rules before
+the roster and the founder's passkey exist; core defaults are a separate
+path (`bootstrap_reconcile`, through the port at startup) and no
+substitute for tenant seeds. Decided: (1) **an ordinary policy-rule write
+under blind standing refuses, a new id included**, with the existing
+503 naming the source and no mutation; no empty roster, fresh id, tenant
+name, request body, force flag, `x-boss-user` claim or machine token
+alone establishes a first installation; (2) **the pre-roster tenant
+import moves to one bounded, local, service-owned operation** — not a
+public HTTP door — that takes the exact seed artifact the already
+authorised provisioning path selected for this instance, bound to an
+initialisation identity that provisioning created (never inferred from
+missing rows or an empty roster), validates the whole artifact first, and
+commits the batch with an immutable receipt that consumes the identity in
+one transaction: an identical retry returns the original receipt, a
+changed digest is refused, and rollback, restart, an emptied table or a
+lost key never reopens it; (3) **existing and restored stores default
+closed**, an upgrade with no initialisation record included, and replay
+never overwrites live policy or operator-tuned rows; (4) **no new
+credential, principal, grant, role or remote bootstrap API**: if the
+existing provisioning path cannot prove custody of the artifact and the
+identity, the build stays blocked and names that missing dependency
+rather than inventing authority; (5) complete-standing coverage, the
+exact break-glass restoration, the service-read repair and the policy
+service's availability under a dark People or Jobs API stay as they are,
+and there is no blanket ban on wider rules — a wider rule is valid while
+a real holder remains. The guard change and the import ship together (or
+behind an inert preparatory car), held for a trust-boundary review,
+because a guard alone strands first boot. Out of scope: cross-service
+write races (`581d0146`) and the below-door writers — boot reconcile,
+migrations, restores (`844aef24`). Not yet built: on main the blind arm
+of `Standing::rule_write` (`crates/core/boss-policy/src/guard.rs`) still
+answers a rule with no existing row `Ok`, and no import operation exists.
 
 **The DR hold is lifted; refusing cars release one per train, in a
 fixed order, each naming a way back that does not pass through what it
@@ -3244,6 +4863,83 @@ handled by that named rollback, never by improvising. The must-fix lists
 from each car's own review travel with the car and are not re-decided
 here.
 
+**The order in (5) was shortened: D and G2 went ahead of C, and C's
+window became one daily cycle** (design-doc "Shorten the enforce
+queue: D and G2 go next, C keeps its own lane, and its window is one
+daily cycle", `09618594`, David 2026-10-06, all three questions
+accepted as proposed). D and G2 did not wait for C, which boarded when
+its own window was clean; the signer half of E went ahead of its
+runner half. What ran, read off each car's record: D in car `d50717c0`
+(train #969) and G2 in car `fdd13a69` (train #972), both on
+2026-10-06, so G1, D and G2 landed within about nine hours, not 24
+apart. David waived the 24-hour spacing of (4) for each pair, and each
+car records the waiver: `david_waiver_2026-10-06_24h` for G1 to D,
+`wait_waived` for D to G2. Nothing else was waived: each car still had
+an adversarial RELEASE at its head and a Pacific-hours train, and D
+also had its 72-hour window read at departure and David's rollback
+dry run. The design proposed 30 clean hours for C, and David set 26
+instead on 2026-10-07 (`row_c_bar_20261007` on `2710c8fc`, kept
+2026-10-17). Under that bar every sender that runs daily or more often
+must be seen once, and each slower sender is checked by name, because
+no window shorter than a week sees a weekly caller. The 26 hours
+replaced 72 for row C only. C enforced in car `10f1b77a` (train #1413,
+2026-10-26), released by David on a machine-read clean 26-hour window.
+Its release door now refuses a machine-gate enforce flip unless a
+passing `gate-window-is-clean.sh machine-gate 26` receipt is bound to
+the head (`boss_jobs::release_window`). David published the signer
+half of E as ops-request v10 on 2026-10-07 (car `a4a6009c`). The
+runner half followed later (see the runner-delivery section below).
+It too went ahead of C (design-doc "Release order amendment: E moves
+ahead of C", `ae1e2aff`, David 2026-10-10), in train #1067 on
+2026-10-11, fifteen days before C. That day David also amended E's
+precondition for boss-gcp, which had no approval verb with work to
+do: the runner's own signed record replaced an executed approved
+ops-request there (ops-request `17cd3612`, `reclaim-gcp-root`, closed
+`nothing-to-do` and written by `automation:ops-runner`). The forge's
+precondition was unchanged.
+Items `47aed706`, `b8e75382`, `6c9183de` and `2710c8fc` closed
+2026-10-07, 10-09, 10-12 and 10-26. Nothing of `09618594` is unbuilt.
+
+**Kubernetes admission history is not a release input: the B-to-G1
+window was read from B's own record** (design-doc "A native
+admission-history reader reports its coverage before its verdict",
+`25bdb2cc`, its one question approved by David 2026-10-03; it answered
+backlog `90218205`, closed stale 2026-10-07). The 24 hours with no
+unintended refusal in (4) are read from the refusing car's own record,
+as written above, and not from the API server's admission log. David
+decided on 2026-10-06 that B's own record stood (its daily break-glass
+deposit runs since 2026-10-02, each exit 0, recorded on G1's car
+`0df4f091`); G1 then landed, and no remaining step of `b08725c2` reads
+admission history. Built, as read-only ops verbs under the existing
+operator credentials that answer `unavailable`, never clean, when a fact
+is missing: `discover-admission-source` (this design's approved
+sanitized audit-source discovery, allowlisted output only),
+`probe-admission-source-access` (design `f927de0c`) and
+`probe-admission-reader-identity` (`ad504a45`). The access probe's live
+answer, twice on 2026-10-05 (ops-requests `979f54b4` and `0bc6a951`):
+history unavailable on all three control-plane nodes, reason
+`retained_member_size_bound`, a retained audit file over the fixed
+1 MiB bound. Design-doc "Stream retained admission files within a fixed
+operator work budget" (`ad504a45`, its one question approved in session
+on 2026-10-05, the quote kept on the packet) then made the probe's file
+read a stream: each retained member is read whole, at most 32 MiB
+encoded and 64 MiB decoded, 256 MiB encoded per pass, in exactly two
+complete passes that must agree, under the unchanged 256 MiB memory and
+850 s run, and anything over a bound answers `unavailable`, never
+clipped and never retried (car `46384d3d`, train #957; the `STREAM_*`
+constants in `infra/forge/admission-source.py`). Its prerequisite, the
+installed reader's identity, is car `47a035e5` (train #966) and has
+never been run live. The one access probe since the stream landed,
+ops-request `afc02a99` on 2026-10-10, answered `retained_member_size_bound`
+on all three nodes again: under the streamed bound, a member over
+32 MiB, which the design expected, since its ceilings sit below the
+configured 100 MiB rotation. No bound grows without a new decision.
+Not built, and owed by nothing: the complete history
+reader of the design's phases 2 and 3, which counts a declared interval
+and judges coverage before outcome, and its native positive-and-denial
+proof. Its contract stays on the packet; a later release that does need
+admission evidence starts from the 2026-10-10 probe answer.
+
 **Which in-cluster senders hold the machine token** (design-doc
 `c8502e17`, David 2026-10-07; backlog `37742794`; under the standing
 rule of `c395e62c` that a workload running branch or third-party code
@@ -3267,6 +4963,37 @@ nothing to the system of record at all: the `reclaim` job that asked the
 forge to sweep its disk after each run is deleted rather than left as a
 request whose designed answer is a refusal; the hourly host sweep is the
 reclaim, and its own packet carries what it did.
+
+**How the machine token reaches the two off-cluster hosts** (design-doc
+"How two credentials reach the places that must present them",
+`20058482`, questions forge-token and gcp-token, David 2026-10-06;
+backlog `88379df3`, under `2710c8fc`). Design `6805c764` car 4's road,
+`boss credential pull machine-token` under a name-scoped Role, is not
+taken: boss-gcp holds no credential that may read a Secret, and a Role
+for it would be a credential fetched to fetch a credential. Each host
+instead holds all three slots of Secret `boss/boss-machine-token` in a
+ROOT-ONLY `/etc/boss/machine-token` (root:root 0700, slots 0600), and
+no new cluster grant was made. (1) **The forge** deposits it on every
+converge tick through the admin kubeconfig it already holds
+(`infra/forge/machine-token-deposit.sh`), and the units that ran as
+david (the host observer, the disk-floor sweep, the deploy runner) run
+as root. A group was measured out: a unit sharing david's uid writes its
+header file where a process of that uid reads it. A recorded probe runs
+as `boss-probe` and can read neither. (2) **boss-gcp** is pushed to from
+the cluster by the `boss-machine-token-push` CronJob, every ten minutes,
+on a deposit key of its own forced to the receiver's `machine-token`
+purpose, so the break-glass kubeconfig keeps its cannot-read-secrets
+proof. The key, cadence and enrollment are design `bdc60b65`'s
+`gcp-push`, whose own fold is still open. Each host's converge then
+verifies by effect, through the reader every caller uses, and records
+`machine_token_effect`. Built: cars `ca0f16af` (forge, 2026-10-06) and
+`fe480972` (boss-gcp, train #980, 2026-10-07). Live, read 2026-11-13:
+the forge's converge of 07:03Z and boss-gcp's of 06:51Z each record
+`matched current`, and the five newest of 5,229 push packets closed
+completed. Not built: an alarm when boss-gcp's effect reads anything
+but `matched current` (backlog `619e1850`, open, owed before row C of
+`b08725c2`). The design's third answer, who fetches the broker stage's
+signing keys, is folded under the broker stage decision below.
 
 **Who holds the forge registry push credential** (design-doc
 `c8502e17`, question image-build, David 2026-10-07; backlog `683d7fe9`,
@@ -3304,6 +5031,90 @@ disk, served as that repository's owner, with no credential; and the
 operator's rootless daemon — 43 GB of images and 33 GB of build cache on
 2026-10-07 — is used by nothing unattended and is his to free.
 
+**Root on the forge executes only a tree it fetched itself, and a probe
+runs only as `boss-probe`** (design-doc "The forge host: probes get
+their own account, and root stops executing from a checkout its owner
+can write", `c98c79aa`, three questions, David 2026-10-06; backlog
+`703358ce` and `a604a35b`). (1) **fallback: stop, never fall back.** A
+recorded probe runs as `boss-probe` (own group only, nologin, no sudoers
+rule, not in `docker`, so neither daemon's socket opens for it) in the
+root-owned read-only view
+`/var/lib/boss/probe-view`, never as david
+(`infra/forge/probe-account.sh`). Each runner tick writes its marker
+only when the account verifies then; without it the unattended door
+(`probe_account_refusal` in `prove.rs`) runs nothing, the car records
+did-not-run, never NOT PROVEN, and is retried hourly, and the converge
+is red with `probe_account: STOPPED: <why>`. The read verb
+`probe-account-controls` prints one PASS or FAIL per control on the
+host. (2) **root-tree: yes, in three stages, all built.** Root executes
+`/var/lib/boss/tree/current` (`infra/forge/root-tree.sh`): root's own
+repository, filled from Forgejo's on local disk with the serving side
+run as its owner and every object checked, moved only by a whole
+generation that fast-forwards `current` (a rewind is refused, exit 3,
+until a person runs `refresh --accept-rewind <sha>`). Stage 1 is the
+converge, through a launcher outside the tree that starts the newest
+generation whose own converge completed (`good`); stage 2 is the ops
+runner and every verb, which reach the checkout only as
+`BOSS_OPS_CHECKOUT`, where git runs as its owner; stage 3 is the other
+units, the cluster deploy runner and disk sweep last (backlog
+`683d7fe9`). boss-gcp followed under `db018094` (below), and
+`a604a35b` closed delivered on 2026-10-14 against the installed units on
+both hosts. (3) **sudo-docker: superseded.** The forge sudo decision on
+`a604a35b` (position B, David 2026-10-07) moved the three units that
+used david's `sudo docker` to root on root's tree, so nothing unattended
+uses it, and kept David's own interactive sudo as it is; a password on
+it was offered and not taken. No per-unit sudoers wrapper is owed. Live,
+read 2026-11-13: the forge converge of 08:14Z records `probe_account`
+verified with no sudo, and root's tree and the probe view both at forge
+main `2dbd868b`. Not built: the tree's own text still says otherwise in
+four places, among them rows of `no_unattended_unit_runs_from_a_home.rs`
+that call boss-gcp's stage owed (backlog `c440ab8d`).
+
+**Row C, second round: who holds the machine token, and what runs branch
+code instead** (design-doc "Row C, second round: who holds the machine
+token on each host, and what the gate runner and the dev pod do
+instead", `bdc60b65`, David 2026-10-06, all five questions as proposed).
+Each answer is built and live, read 2026-11-13. (1) **probe-user**:
+a recorded car probe on the forge runs as `boss-probe` (no sudo, no
+docker, nothing of david's), made and verified by effect on every
+converge (`infra/forge/probe-account.sh`), and a host where it does not
+verify runs no probe (design `c98c79aa`). Cars `1386dd64` and
+`55a99efa`, item `703358ce` closed 2026-10-09. The read verb
+`probe-account-controls` reports what `sudo -l` says for the checkout's
+owner. The proposed group for the three david units was not taken: they
+run as root (see design `20058482`). (2) **gcp-push**: a dedicated
+`machine-token-deposit-key`, prepared by the broker through its own
+kind `prepare-the-machine-token-deposit-key`, not a second rule on
+`prepare-a-deposit-key`, because a step's writer believes one actor.
+The broker Role gained that one name. The sibling CronJob
+`boss-machine-token-push` runs every ten minutes. Car `fe480972`
+(train #980). Its one preparation packet closed with its human
+enrollment and verify-by-effect steps completed, and the newest of 5,234
+push packets closed at 08:00Z. (3) **observer**: the estate observer
+mounts the token, runs the forge mirror's image by digest, and takes
+`secret-header.sh` from the boss image through a `reader` init
+container. Car `3b8d02f6`, item `066a7613`, held by
+`infra/lint/a-manifest-sender-presents-the-machine-token.sh`.
+(4) **gate-verdict**: a gate Job with `GATE_VERDICT_CARRIER=pod-log`
+writes nothing to the jobs API. It prints its receipt and a trailer
+(Job, verdict, bytes, sha256) to its own stdout, and the trailer again
+to its termination message. The conductor records the verdict from the
+frame that message names (`train/carried_verdict.rs`). It is not the
+results volume, because every gate mounts `/gate-runs` read-write. The
+edit-level read is handed in as `BOSS_EDIT_LEVEL_ANSWER`. Cars
+`c57ad98d` and `033c5c2f`, item `934ccad1` closed 2026-10-09. The
+conductor then took the record at gate end through a pod watch (car
+`7d64488c`, item `301d6c3b`). Live: the newest gate-runs' receipt
+steps are completed by `automation:train-conductor`. (5) **dev-pod**:
+on a refused selector, `wt-cargo`, `wt-web`, `boss --built` and
+`as-gate-uid.sh` refuse with exit 75 while `boss-api` answers. The
+activation is not declared in `boss-dev.yaml` as proposed. Design
+`a68fc42a` D6 put the store and its selector on the `/work` PVC, which
+a roll keeps. Isolation is on (`b3071bf4` closed 2026-10-22). Builder
+pre-flight runs through `dev-build exec-auto`. Nothing of `bdc60b65` is
+left unowned. The boss-gcp effect alarm is `619e1850`, activation's gaps
+are `a68fc42a`'s own fold, and the READ/USE matrix is `86d93e12`.
+
 **Where root on boss-gcp fetches its own tree from** (design-doc
 `db018094`, question q1, David 2026-10-10; backlog `ca356c79`). Root on
 boss-gcp executes only from a root-owned tree (design `c98c79aa`), and
@@ -3330,6 +5141,91 @@ transport to boss-gcp, the tree that reads the file, and the four units'
 move are later cars, in that order. The registry row says that its
 consumer is pending; publishing the row and starting its first rotation
 wait for the transport car, so no credential is minted without a reader.
+
+**Who may act on a step is a predicate over authoritative actor facts, and
+eligibility never grants authority or implies presence.** Design
+`347d14ee` (answers b4330f74; David decided that human is an actor
+attribute alongside certifications and experience) records the shape. A
+step declares `actor_requirements = { schema, predicate }` (for example
+`actor.human == true`) in its metadata defaults, evaluated by boss-expr's
+bounded evaluator over a small typed fact set validated at publication;
+one module answers every caller (claim, assignment, completion, dispatch,
+protected metadata writes and the needs-you view) with eligible,
+ineligible or unknown and a named reason, and unknown never grants. Human
+is true only for a verified active employee identity that resolves to no
+agent or automation; an agent cannot become human through a writable
+attribute, and qualifications are typed authoritative assertions with
+provenance and validity, not caller strings. The admission to act is the
+conjunction of the existing authentication, policy, assignment, station
+capability and readiness checks plus the requirement: it can narrow a
+grant, never create one. Presence stays the existing `assurance_required =
+"presence"`, raised only where a passkey-bound approval is the protocol,
+never merely because a human is required. Needs-you is a canonical server
+projection over the same reader. Migration is additive: one compatibility
+reader normalizes legacy `human_only`, new versions publish through the
+workflow door, nothing is repinned without the conversion door, and
+`human_only` is removed only when no source, live version, pinned packet or
+consumer still needs it.
+
+**A declared credential remedy is routed to a named human; routing never
+delegates the authority.** Design `6e884db1` (answers backlog `08caa5e3`;
+Q1 accepted as proposed, David 2026-10-17). The case: when boss-gcp does
+not hold the break-glass deposit key, the daily deposit prints
+`RED break-glass-deposit/authorize-key` with the line to place, and the
+dispatcher hands it to `maintenance.chore.file_reds`, which files an
+ordinary backlog-item whose triage is role-routed and agent-capable.
+Owning a job does not assign a human step, so the one act the platform
+owner owes never reached the owner's own queue. Decided: for that declared route
+only, the authenticated dispatcher may create ONE linked human-only
+remediation packet beside the ordinary diagnosis, carrying only a
+validated, structured public proposal and assigned to the current
+eligible platform owner. That is permission to route a proposal and
+nothing more: it grants no right to enroll, approve or execute, to change
+the receiver or its purpose, to read any further credential, or to clear
+an alarm on a human's report. Genuine passkey identity, existing policy,
+exact-content signing and independent machine verification all stay
+mandatory; an assignee, a human-shaped header or a platform-owner lookup
+never proves the caller is that human. The contract that follows:
+(1) the mapping is registry data (source chore kind, finding route,
+target workflow version, proposal schema, human step, holder selector,
+verification relation) executed by one generic adapter, starting with
+this single mapping, with no core switch on a route, a credential or a
+person; (2) nothing is parsed out of RED prose: the producer exposes a
+versioned typed proposal binding the exact public key, forced-command
+line, receiver account, pinned host-key fingerprint and source, validated
+whole against the existing receiver contract (its command, `restrict`, no
+second key, nothing trailing), and a producer that cannot supply one
+within its existing authority leaves the diagnosis at proposal
+unavailable, never an agent's reconstruction or a wider reader; no
+private key, token or Secret payload rides on the packet; (3) the holder
+resolves through the `PlatformOwner` port and is checked as an active,
+eligible employee, and a missing or unverifiable holder is a visible
+unresolved-routing diagnosis with no actionable packet, never a fallback
+to the caller, an automation id or a hardcoded `emp-david`; (4) the
+assignment goes through the supported admission door recording the real
+machine actor, never a machine writing the person's answer, and if the
+nomination-only operation of `e8f9e47f` is needed it is a dependency,
+not a bypass; (5) the human signs the exact bytes displayed, under the
+existing presence rules, and a changed proposal is a new unsigned
+proposal and a new decision with the old one retained; (6) dedup is on
+source, route, receiver, purpose and exact proposal identity through a
+persisted idempotent create-and-link, so a nightly repeat names one open
+packet and a changed key stays separately visible; (7) the diagnosis
+stays open until a later real maintenance run's receiver receipt, bound
+to the proposed key and the human act, shows the effect and its negative
+checks: a refusal, a supersession, a chat confirmation or an unrelated
+successful deposit clears nothing, and an unreachable human is waiting,
+not an idle agent task. Delivery is one credentials-marked car held for
+adversarial review under an exact-head full gate; publication and native
+acceptance follow their own protocols. No question was left open.
+**Not built** when this was folded (2026-11-13): the rule
+`file-backlog-items-on-break-glass-deposit-red` still hands the route to
+`file_reds`, `break-glass-deposit.sh` still prints the line only as
+prose, no remediation workflow exists under `infra/platform/workflows/`,
+and `e8f9e47f` is open. On 2026-11-01 the consolidation pass closed
+`08caa5e3` as a duplicate of the alarm design `97cb3a87`, whose car 2
+carries deposit reds escalating to the platform owner; that kind is not
+built either.
 
 ## Calendar
 
@@ -3467,6 +5363,27 @@ need their original records, current measurements need dates and native
 evidence, and detecting a fault is distinct from fixing it. A protocol's
 existence proves neither completed backups nor guaranteed uptime.
 
+**The blog is flat files the converge observes page by page, under the
+founder's name.** Design `f89a241f`, both questions accepted on 2026-11-04.
+A post is one flat file, `site/blog-<slug>.html`, with an optional
+`site/blog-<slug>-evidence.json`; not a subdirectory (the converge would
+not stage it) and not content rows rendered by the gateway, which buys
+nothing until posts need search, drafts or images. `site/blog.html` lists
+the posts newest first, a contended shared file accepted while posts are
+serialized through the founder's approve step. The converge observes
+**every** page it stages (`steps.run.site.pages: {path: sha256}`, read the
+way a visitor's request reaches the gateway), and a
+`publish-a-blog-post` packet's live step closes on its page's hash through
+the same dispatcher rule the landing page uses, never by hand. A post's
+numbers are copied, dated and sanitized into its evidence file, and a
+second actor's scrub step refuses internal addresses, hostnames,
+credential names and any number its source does not hold. The blog is
+linked from the masthead as **Engineering notes**, `engineering.html` keeps
+its URL as the first entry, and www still leads with small-business
+benefits. Every post carries **David's byline as founder** (the approve
+step is his signature on the words) and states that agents drafted it
+under the `publish-a-blog-post` protocol.
+
 ### Content records and attachments
 
 Bulletins and the company manual are separate tables in
@@ -3564,6 +5481,40 @@ than name-lookup-first — the join on system-issued identity is the
 point, not a later feature.
 
 ## Step UX & frontend
+
+### Department tabs fold to the available width
+
+Above the phone width, department tabs sit on the shared chrome bar
+when they fit; only the remainder folds into More. Measure the available
+width after the wordmark and right-hand controls, and each tab's rendered
+width. Reserve room for More whenever anything folds, and omit More
+when every department fits. A fixed department-count breakpoint would
+encode one tenant's registry in CSS.
+
+Home and the viewer's own department never fold and keep their places.
+Other departments follow in registry order and fold from the end, so
+the visible set is a prefix as width changes. Navigating at a fixed
+width does not reshuffle that set. A folded active department still
+names the More control, preserving orientation without pinning the
+department being visited.
+
+Simulator belongs inside IT, not among department tabs.
+This is David's Q2 resolution, which replaces the proposal to pin
+Simulator beside Home. The phone keeps its pinned tabs, More and
+scrolling band; tab type and padding do not shrink to fit more tabs.
+The sidebar, IT family strip and department-access policy are separate.
+
+This is the settled contract from
+[248e66c4](https://boss.algedonic.dev/ux/jobs/248e66c4-50b3-4e81-bee7-aa9d9b49f8a6),
+answering feedback
+[9fa458cf](https://boss.algedonic.dev/ux/jobs/9fa458cf-253a-4594-9c6a-751802fd5abd).
+The fold records the decision; implementation and browser verification
+remain owed. Verification uses the tenant's declared departments at
+wide, intermediate and phone widths: all fit without More when room
+permits, inline and folded tabs conserve the full list without
+duplicates, narrower inline sets are prefixes, and navigation preserves
+the set at a fixed width. The Simulator check must follow the resolution,
+not the superseded proposal.
 
 ### Unmatched routes preserve the failed address
 
@@ -3778,6 +5729,44 @@ playground and the simulator carry. It differs in kind from the
 stand-down above: a department with no protocol at all has nothing to
 dogfood. Nothing to build; the batch fix landed on its own (#586).
 
+**The Accounts directory is generic: an account's work is its packets,
+and each optional panel waits on its own integration** (design-doc "Accounts shows department work and guards optional
+module panels", `f8faef35`, 2026-10-04, answering backlog `4ddeb106`;
+its panel half refined by design-doc "Accounts integration activation
+and deployment evidence prerequisites", `8f28b94f`, 2026-10-12).
+Measured: `apps/web/src/accounts` reads assets, open AR, invoices and
+shipments for every tenant, hides a column whose loaded values are all
+zero, searches "Account, doctor, city…" and picks a timeline icon by
+the literal kinds `field-service` and `sale`. The f8faef35 review was
+never signed; the decision on record is David's answer on the item's
+review, not accepted as proposed: "Accounts should configured /
+re-coded for our OSS business purposes, but we will also need a generic
+module for the OSS and the brewery needs it too." Read with the
+proposal: (1) the primary view is the account plus its packet work —
+an Open work count that excludes closed and cancelled, a link to the
+scoped packet list, a history with Workflow labels and one generic
+icon, and no Workflow kind named in code; (2) a packet about something
+else joins an account only through a Subject reference its admitted
+Workflow version declares (kind, step, field), read from completed-step
+evidence, never from names or arbitrary metadata, and no published row
+or historical envelope is rewritten — the closed sponsorship `49cd9cc9`
+records its sponsor only in `reconcile.sponsor_account_id`; (3) assets,
+commerce and shipping each read only when that integration is Enabled,
+a module bit is presentation (`finance=true` is not commerce), Unknown
+says unknown, and an enabled read that fails is a named warning, never
+a zero panel; (4) every paginated read compares rows to `total`. The
+prose says "department"; in station-tree words that is the page's host
+station (design `deba3000`), and the nav catalog still names the v1
+owner `sales`, which is no station row. Built: (3)'s source contract,
+car `a3038f63` (`boss-core/src/integration.rs`: the declaration, the
+observation and the fail-closed Enabled/Disabled/Unknown derivation);
+the open-AR server aggregate, car `3486058f`; the current gap pinned
+in a mocked spec, car `befbb559`. Not built: the deployment observer,
+the entitled gateway reader, the Accounts consumers and the fleet-join
+removal, on item `93d83074` (policy trust boundary); (1) and (2), on
+item `5901d9fc`. Activation, row publication and the historical
+sponsorship link stay a human's.
+
 **The IT department's pages consolidated behind a few rows, families as
 tabs, and `/system` is gone** (folded from `it-consolidation.md`, all
 four questions decided by David in packet `1f6d55e0`, 2026-08-31):
@@ -3802,6 +5791,42 @@ yards, then back to **seven** when the Department Map took the yards
 as stations on one map (design `e765b3fc`, 2026-09-25). Registry and
 doc text still naming a `/system` path resolves to the catch-all until
 touched, deliberately not swept.
+
+**Every page belongs to the station that hosts it, and its URL is that
+station's address plus the page's slug** (design-doc "Every page
+belongs to the station that hosts it", `deba3000`, David 2026-11-10;
+no open questions). David: "every station owns its position in the
+tree ... that also makes maintenance of the pages the job of the
+station that is hosting the pages." A page has one host station, named
+by id beside its registration in `nav-catalog.ts`; company-level pages
+are hosted at the root, `algedonic`. A page holds the dashboards,
+context and reading its station's executors need for the steps they
+claim, and a page no station's executors use is a deletion candidate,
+judged by the `maintenance-surface-usage` reading rather than by
+guesswork. Changing a page is a step at its host station, through that
+station's queue. The URL is derived from the host's parent chain, so a
+re-parented station moves its pages' URLs with it (/finance and
+/finance/vendors, /engineering/gates, /operations/estate). Record views
+that belong to no one station, such as a packet or a subject, stay at
+the root under a short record path such as `/jobs/:id`. Both the `/ux`
+and `/it` prefixes retire as their pages move. Moves are slow and made
+car by car, usually when a car touches the page anyway, with no
+redirect shims before 1.0.0. An unhosted-page count records the
+migration's progress, and when it reaches zero the field becomes
+required. This generalises the department rule in the next paragraph,
+because a department is just the tier of stations under the root. It
+supersedes two parts of that rule: the leaf-code URL, under which a
+re-org changed no URL, and the `it` department code. The open
+`/ux`-dissolves cars (3, 5, 6, 7 and 8 of `8c3e9599`) are to be re-read
+against it, not built to their old targets. Built so far: Finance's
+pages sit at /finance (backlog `c7ef4728`), and a station's upstream is
+its parent's page rather than a hand-typed route (`a1c0a0ff`). Not
+built, as of 2026-11-12 (origin/main `de93d1291`): the catalog has no
+host field and still spells 18 `/ux` and 22 `/it` entries by hand. The
+cars are backlog items: the host field, the unhosted report and the
+root's pages (`03fb75c8`); a station's page listing what it hosts
+(`e63139c6`); page-area items landing at the host station (`4eea33e2`);
+and the URL derived from the host's address (`0bc2eb68`).
 
 **Every page belongs to a department or to Home, at `/<code>/<slug>`;
 `/ux` is deleted outright and its old links stop resolving** (design
@@ -4062,8 +6087,9 @@ receiving → marshalling → shop floor → gates → dock → track → arriva
 arrivals — with the rails redefined to match (a gate-run opened, parked
 on green, boarded, judged red); the old line put the dock before the
 gates and a car walked backwards through two regions; (4) **the
-regions are a partition**: a packet stands in receiving until its first
-step after the trigger completes and in marshalling only after, the
+regions are a partition**: the original implementation keeps a packet in
+receiving until a non-trigger step completes (superseded by the explicit
+intake decision below, not yet implemented), and in marshalling only after; the
 eight named regions claim first and those two take the remainder, one
 server test (`no_job_id_is_counted_in_two_regions`) pins it, and
 receiving reads past its 500-row page instead of flooring — the world's
@@ -4110,6 +6136,36 @@ filer's `input_channel`, or `unclassified`), where the region measures
 the share over what stands and the jobs list hands each row its lane on
 `lane=true`, so the receiving board draws the server's reading and
 keeps no vocabulary of its own.
+
+**Receiving is an explicit phase of the pinned protocol.** (Engineering
+decision `e37f5f51`, 2026-11-16; backlog `49391a67`.) An optional typed
+`intake = { step = <slug> }` declaration names one existing non-trigger,
+non-terminal step. No declaration means no receiving phase. Category,
+kind names and completion of unrelated work do not imply intake. Only
+the declared step's completion accepts the packet; ready, active and
+skipped do not. Its recorded completion time is the crossing time; a
+missing stamp stays unknown. This keeps a working page audit or an open
+work-session from appearing to wait for triage throughout its life.
+
+Read the declaration from each packet's pinned protocol version. An
+unread or malformed specification leaves placement unavailable, never
+an empty receiving queue. Keep specific station/equipment placement and
+train carriage precedence, and derive receiving, marshalling, board
+membership, counts, border crossings and moves from one placement
+reading. A packet without intake remains visible at its declared work
+station and in its actor's queue.
+
+**Not built.** Inventory active and in-flight pinned specifications,
+publish declarations for real intake decisions and use recorded packet
+conversion only where its evidence checks permit. Historical versions
+remain immutable; omission on an old version also means no receiving
+phase. Record rollout reclassification under the placement model
+generation, separately from operational movement: never invent a
+triage completion or crossing time at deployment. The implementation
+must prove pinned-version handling, unknown reads, exact-step acceptance,
+disjoint membership and deployed positive controls. Station pagination
+already uses `list_every` and is outside this repair. The design packet
+holds the acceptance matrix and rollout constraints.
 
 **The map moves only where the record says work is moving, so
 stillness is the stall signal** (design `31bade8f`, "The IT map moves",
@@ -4259,6 +6315,138 @@ week, and nothing else until that sensor has produced a decision, with
 the step requiring the reader to write down what the number would have
 to say to change anything BEFORE taking the reading — not yet built.
 
+**A train is on the map at all times, drawn once, where the server says it
+stands.** Design `1c28b67f` (feedback f31a46e5, David 2026-09-29), five
+questions decided as proposed on 2026-10-22. The server is the one
+definition of where an open train stands (`train_region`: boarding at the
+dock, awaiting CI or merge at the gates, deploying or converging on the
+track), so a region carries `trains: [{id, cars, phase}]` and the client
+draws what it is handed rather than deriving it again. A standing train is
+the same bar with a pip per car that a crossing train is, up to three per
+station and then `+n`, laid out by a pure function pinned not to cover the
+station's ring or words. A train with a dot in flight is not also drawn
+standing, because a train in two places is a picture of something that did
+not happen. A click selects the station (one tap, one target) and the
+title names the train, its cars and its phase. Only trains stand; cars,
+gate-runs and other packets keep their counts. This is current activity,
+so it carries onto the station-tree floor (T7) when the transit map
+retires.
+
+**Every absolute time on the station tree reads local and UTC side by
+side.** Design-doc "The station tree shows UTC beside local time"
+(`b03ef2d4`, answering feedback 0b1fd59f, David 2026-11-08: "We need to
+show UTC in addition to local time since the factory runs on UTC"),
+decided with no open question. A time the station-tree floor or a station
+page draws (`apps/web/src/it/tree/`) reads `17:42 PT · 01:42Z`, the UTC
+half in secondary ink on the same line, because UTC is the stack's clock:
+the record, the alarms and the handoffs are written in it. One formatter
+does it, `formatLocalAndUtc` in the SPA's one date module
+(`libs/web-kit/src/ui/date.ts`), drawn by `LocalUtc.svelte`, and no page
+formats its own; relative ages ("12m ago") keep their form. Built by car
+3a01f5e2 (train #1699, 2026-11-12) for the Working column's since and the
+StationLine and StationMotion moves lists. Not built: the right rail's
+Moves list (`StationRail.svelte`, train #1704) still prints `hh:mm:ssZ`
+sliced from the ISO string, UTC alone, in its own code (backlog aa1b9ea6).
+
+**The top board shows what David reads.** Design `b31eb68e` (feedback
+d0d46f02, David 2026-09-30), five questions decided as proposed on
+2026-10-22: the MACHINES row leaves the top board (a failed machine already
+troubles its own region and stands on the alarms board; the row added only
+an unjudged count), so the ALARMS column holds Outranks alone; Next up drops
+the gate line and every dispatcher scheduled-rule row, deleting their reads
+if nothing else uses them; Next up holds **three** events across timed and
+untimed rows, soonest first, while a source that could not be read still
+adds its own row, because an unread source left off would read as nothing
+coming; and the cut lives in the server's one definition (`next_up.rs`),
+so the board and `boss orient` print the same three. The map scrolling
+with the page was recorded as already shipped (train #1144).
+
+**A station acts on its packets only through doors that already exist.**
+Design `ad3989ff` (feedback 2b713c5d, David 2026-10-09), five questions
+decided as proposed on 2026-10-22: every packet a station panel lists links
+to its packet page, where its steps' own doors are, and a row carries a
+button only where the website already has a door (the dock's release and
+the track's cancel), because a control is a link to the step's surface and
+the approval door is a trust boundary a map must not route around. Garage
+stranded and held greens anchor to their gate-run packet with the short
+sha, and a row with no packet id says "no packet named" rather than
+linking to nothing. A website door to free a dead run's step (`boss step
+release`) is a trust-boundary verb of its own, filed separately. The exits'
+removal and the dock's release view were recorded as shipped, not rebuilt;
+the overview keeps its orientation panel.
+
+**A station page answers in its header, and its body is the line the
+packets move along.** Design-doc "The engineering page answers in five
+seconds, and shows jobs moving through stations and their machines"
+(`08d1530e`, reviewed by David 2026-11-12, its three questions decided as
+proposed). Measured before it on `/it/tree/engineering`: the plate read
+CLEAR at all times, the same stations were drawn three times (parts grid,
+motion band, In/Working/Out), and the motion band opened on a protocol
+with no packets. Decided: the header shows Working, Stuck and Needs you as
+linked counts and the binding constraint. The body is the owned protocol
+with the most open packets, drawn as a line of station boxes, and the
+other protocols are count chips and thin strips. Each box shows its
+admission queue, its seats or bays as cells holding a named packet and its
+dwell, and every internal path, bundled above four in parallel. The boxes
+sit on the line, not in a second view (Q1). A packet the record does not
+place waits in a tray by step and pinned version, and is never placed by
+guessing. A packet moves on screen only when a recorded move names it,
+and nothing replays. The right rail holds the waits ladder, Stuck, Needs
+you and the pools as one strip, with the caveat said once. A car's mark
+comes from its claim's `executor_kind`. Engineering has its own line
+colour, the IT blue it used to borrow (Q2). Amber means past the step's
+budget and red means stuck: an idle machine with a queue (Q3). Built as of
+2026-11-12 (origin/main `0c15d43bc`): the station line, with admission
+columns, seats, gate bays read from `gate_bay` and `gate_reservation`,
+internal paths, executor marks and the tray (`StationLine.svelte`, train
+#1701, backlog `9d0b0944`); and the answer band, the right rail, In and
+Out deleted, `--map-line-engineering`, and `/engineering` routed to the
+station page (train #1704, backlog `950ad972`). The queue read's slim
+`fields=` option was dropped, because the page no longer reads the queue.
+Not built: the parts grid and the Working column still render beside the
+line (`70857db1`); the thin strips (`e560f66e`); amber, which no read on
+the page judges yet (`d512d3d6`); and the tray's link to the cohort
+convert (`86cc4689`), after `boss job convert --cohort` lands (car
+`d59e29b5`). Hops wait on three server cars, in order: taking a gate bay
+becomes a claim, and steps carry `ready_at` and `admitted_at` (`0ef800c6`);
+moves are keyed by tree station, step and seat, not by the retired regions
+in `moves.rs` (`de0fddb5`); then the glide itself (`513670f8`). The build
+station's robot seats fill only when claims stand at their step's tree
+station (car `541c8c8d`, parked). David set the order the rest of the data
+arrives in, one car at a time: steps placed at their stations, the cohort
+convert, station admission queues (`424329a5`), claims at tree stations,
+the three hop cars, then `1893ad4d` and `41ec2e4f`.
+
+**The company-to-department map was built, then retired with the transit
+map; its accuracy contracts live on in the station page.** Design-doc
+"System Network Map: orient first, inspect deliberately"
+(`d4dada70`, David 2026-10-02, both questions decided as proposed;
+answers feedback `e847f969`) set a presentation order: a company map
+with departments as regions, IT the one connected region and every
+other department a stub reading "Not connected", then a simplified IT
+transit overview, then a station or route overview, then the queue or
+the packet. Each level was a presentation scope over existing
+registries, never a new entity. Built the same day (train #895, car
+`1d8ecfff`): `/map` as `CompanyMap.svelte`, and `/it?view=overview`.
+Retired since, and not to be rebuilt: the transit map and its overview
+went with R3 of backlog `23a4b4d7` (trains #1638 and #1639, 2026-11-09;
+David, 2026-11-08: the visuals show real, current activity only);
+`CompanyMap` and `/map` went with backlog `858e62aa` (train #1647,
+2026-11-09); and IT as a region went with design `df0ecd8b` (§IT
+retires as a department). The order survives in station-tree words:
+`/it/tree` is the company index, `/it` draws Needs you, the alarms
+board and the root station's page, a station page answers in its header
+(`08d1530e`, above), and a station's packets link to their packet pages
+(`ad3989ff`). What carries over is the design's accuracy contracts, and
+the station page keeps them: a failed read is said, drawn as a red rail
+and never as an empty list; a packet moves on screen only when a
+recorded move names it; and a packet the record does not place is never
+placed by guessing. The defect the design set aside, merged cars read
+as stranded greens once they aged past a 400-row car read, was repaired
+on its own (`d59c4a37`: the yard reads every scoped car), and runtime
+roster ingress stays its own item (`daa8f63f`). Nothing of this design
+remains to build.
+
 ## OSS posture & tier boundaries
 
 Two install paths: single-VM bare metal (`infra/oss-quickstart/`)
@@ -4320,7 +6508,8 @@ starter chart (33 accounts) and a `companies` row each — and on
 2026-09-17 the company's own instance answered "Brewery Taproom" from
 `/api/locations`. Those rows are now the example tenants' seeds
 (`examples/brewery/seeds/classes.json`, `locations.toml`, the new
-`chart_of_accounts.toml`; `examples/used-device-shop/seeds/classes.toml`),
+`chart_of_accounts.toml`; and the device shop's classes seed until that
+tenant was deleted on 2026-09-24),
 published through the same contract every tenant uses. The migrations
 are not edited — an applied file is history and `migrate.sh` refuses
 a changed checksum — so the rows still land in every database the
@@ -4396,6 +6585,32 @@ the stamp and the export verb follow. The rule is stated for tenants in
 `docs/tenant-contract.md` ("The instance is the truth; `--take`
 overwrites by decision").
 
+**A merged tenant main is not a published one; publication is its own
+recorded act.** Design-doc *A tenant delivery proves publication after
+the merge* (`26f6bd62`, David 2026-10-03, its one question accepted as
+proposed) was filed when a Marketing protocol merged onto the tenant's
+main and stayed absent from the live registry: once the stamp above is
+set, a services start publishes nothing, so a merge proves source only.
+Decided: a bounded, passkey-approved publisher renders every declared
+row as absent, equal or kept, inserts only the absent ones, refuses a
+dark or drifted read, and reads each effect back; the item closes on
+that live read-back, never on the merge or a restart. Built: the verb
+pair `plan-a-tenant-publish` / `publish-tenant` (backlog `1610115d`, car
+`0c562093`, 2026-10-21), and an insert-only workflow publication port
+(car `cd077f2b`, 2026-10-03). Superseded: Q1's one approval binding the
+main push and its manifest together. *A workflow publish that needs a
+person is a packet on that person* (`b1f319bc`, David 2026-11-05) gives
+each tenant merge that lands a workflow or rule row its own
+`publish-a-protocol` packet and approval; that filing trigger is not
+built (item `accbe126`), and a publication executing as an Operations
+child is item `dcbeef5a`. Not built: the merge plan still says the
+tenant seed publishes "at every services-container start"
+(`infra/forge/merge-tenant-main.sh` and the `merge-tenant-main` verb's
+`about`), which item `69c8aee1` owns. The Marketing row
+(`measure-the-page`) went live on 2026-10-11 through the tenant seed,
+not a recorded publish, and item `9f69a057` still waits on its
+prove-delivery read-back.
+
 **A module is on only when its tenant lists it `true`, and an instance
 says how many at boot** (design `1054c099`, David 2026-09-22). Measured:
 the company's own gateway answered `"modules":{}`, and under the contract
@@ -4420,6 +6635,22 @@ line (`modules on: <n> of <m> declared`, naming both sides), and the live
 manifest reads exec, finance and support on and every other declared
 module off.
 
+**An off module's page shows a notice at its URL, unless its catalog
+entry says absent** (design "Vendors removal: preserve or gate the
+coupled Finance detail routes", `45fad3bb`, David 2026-10-11, answered
+as proposed). A direct visit to a page whose module is off renders the
+module-off notice. A catalog entry declaring `whenDisabled: 'absent'`
+renders not-found instead, and only once the manifest has been read; an
+unread manifest decides nothing (`withManifest` in
+`apps/web/src/shell/sections.ts`). Vendors is the one entry that
+declares it, gated on `warehouse`, so the company's instance neither
+links nor serves /finance/vendors while the brewery keeps it (backlog
+`6d6f88bd`, landed 2026-10-11 in train #1096). The question was the
+money-adjacent scope: purchase-order and vendor-invoice detail shared
+the Vendors entry, so the gate would have removed them too. They do
+not follow the register. Each is its own unlisted Finance entry with no
+module, so both stay reachable and add no sidebar row.
+
 ## Deployment, the forge, and the cluster
 
 ### A gate judges its tree; registry drift is estate work
@@ -4441,6 +6672,25 @@ after the lineage guard required by `9235802a` exists, under a named actor
 with the declared publication scope. A live-ahead row, unmatched lineage
 or retirement remains filed work. That conditional approval is not proof
 that automatic publication or the separate cadence observer has shipped.
+Its direction changed on 2026-11-08 (design-doc *Five further collapses
+of duplicated factory facts and packet handoffs*, `942dc0ac`, Q2): after
+bootstrap the live row is the authority and a tree edit is a proposal,
+so an automatic tree-ahead publish is no longer the target; see "Live
+registry content is authoritative after bootstrap" under the network
+substrate.
+
+**A test never writes a Duration.** Design `e975816d` (2026-10-31, no
+questions): `boss_testing::deadline(kind)` returns the bound for a named
+kind of wait (`startup`, `io`, `reap`, `sql`, `witness`) as a base times a
+load factor read once (load average over CPU quota, or
+`BOSS_TEST_LOAD_FACTOR` set by the gate from its measured stall), and
+`wait_until` fails naming the kind, base, factor and elapsed time.
+`no-wallclock.sh` refuses `Duration::from_*`, `sleep` and numeric timeouts
+in test code outside the helper. The gate runs suites under a per-test
+timeout from the same factor, so a hung test fails by name inside the
+bound instead of holding the gate. Fixtures start ready and say what they
+replayed; a refusal under load is a failure, never a pass; a reaped child
+is awaited on its exit; a witness waits on its writer's own signal.
 
 ### Type checks cover dependent fixtures
 
@@ -4464,10 +6714,12 @@ These are the engineering decisions recorded in
 [caa2acc9](https://boss.algedonic.dev/ux/jobs/caa2acc9-4d2f-4224-9d2a-d96d281c3f30),
 not a claim that every in-source literal has been migrated.
 
-**Deployment is modeled on how networks patch** (living reference:
-`docs/design/deployment-as-network.md`, which the deploy scripts and
-unit files cite by question number), which means distinguishing what
-kind of thing is changing. **Traffic** —
+**Deployment is modeled on how networks patch** (decided 2026-08-12;
+the reasoning is in `docs/design/deployment-as-network.md`, whose
+mechanisms — generations, a commit-confirmed flip, scratch as wave 1 —
+were built for the one bare-metal box and deleted with it on
+2026-09-18, so of that document only the split below is current),
+which means distinguishing what kind of thing is changing. **Traffic** —
 requests in flight, Jobs mid-step, the log — is never rolled back; a
 delivered response is history. **Derived state** — binaries,
 projections, the served SPA — is *reconverged*, not restored:
@@ -4480,46 +6732,54 @@ migrations are exactly the N-1 compatibility that lets a reverted
 binary run on today's schema, and the SPA's content-hashed dist is
 make-before-break natively.
 
-**Generations make installs make-before-break.** A release lands in
-`releases/<sha>/` carrying `bin/`, `web-dist/`, `step-plugins/` and
-the source-fingerprint stamp, with `current` and `previous`
-symlinks that unit `ExecStart` lines go through; deploy is install
-beside, flip, restart, and revert is re-point and restart — seconds,
-not a rebuild. Three generations are kept, with an explicit prune
-step that prints sizes, because this box has had its disk-full day.
-The web dist joins the generation, so `rsync --delete` retires
-cleanly and the SPA's content-hashed naming finally has a revert
-path.
+**The converge reconverges the cluster on main, and a rollback names
+its target.** The bare-metal deploy — release generations under
+`releases/<sha>/` behind `current` and `previous` symlinks, a flip
+confirmed at +2 and +8 minutes and auto-reverted at +10 by its own
+`boss-deploy-confirm` unit, and scratch as the first wave — was
+deleted by train #443 on 2026-09-18 (H7 under §Consolidation toward
+1.0.0). What deploys now is `infra/forge/cluster-deploy-runner.sh` on
+the forge host. For a new main head it builds the all-in-one image
+(`infra/oss-quickstart/Dockerfile`, which carries the SPA), pushes it
+to the forge registry, and proves it boots (`image_boots` in
+`cluster-deploy-lib.sh`) before anything is applied, so a head that
+fails there is quarantined with no dark window at all. It then applies
+the tree's manifests and rolls `deploy/boss` with one patch, so every
+revision in the history is a coherent template. A roll that does not
+go Ready is rolled back to the **last converged build, by name**
+(`roll_deployment`), never to "the previous revision", which on
+2026-09-05 was the placeholder the apply had just created and could
+not boot; the failed head stays quarantined until it is cleared, and
+what the converge does after repeated init failures of one build is
+design `b2e778ec`, below. The train hears the roll on the converge's own
+packet (`report_rolled`, dispatcher rule
+`complete-train-converged-on-runner-rolled`). The roll is not
+make-before-break: `deploy/boss` runs `strategy: Recreate` because two
+RWO claims cannot attach to two pods (`infra/cluster/manifests/boss.yaml`),
+so a roll has a dark window that the readiness probe shortens and does
+not remove.
 
-**The flip is commit-confirmed — a dead-man switch.** After a flip
-the deploy is UNCONFIRMED, and the confirm is every deployed unit's
-health probe returning 200 (reusing the deploy roster itself, so the
-confirm cannot drift from the deploy list), plus dispatcher readiness,
-plus one write round-trip through the HTTP API. It is read at **+2
-and +8 minutes** — the delayed second reading is what catches the
-dispatcher silent-death class — and an unconfirmed deploy
-auto-reverts at +10. The evaluator is its **own systemd unit armed
-at flip**, never an in-process wait inside the deployer: a 45-minute
-build timeout once killed the deployer mid-run, and a dead-man
-switch that dies with the process it guards reverts nothing.
-Auto-revert covers binaries, web dist and step plugins; **schema,
-registries, the log and the data stay** — roll-forward only. Two
-riders follow from that: emitted config bodies snapshot into the
-generation and restore with it, and events written during the
-unconfirmed window stay in the log forever, so projections and
-rebuilders must tolerate unknown event kinds — closure doing
-revert-safety work. The conductor completes the train Job's
-deploy step only on the confirm marker, and an auto-revert reopens
-it.
+**The dead-man is a watchdog that owes nothing to what it watches.**
+The commit-confirmed flip's lesson outlived it: an evaluator that dies
+with the process it guards reverts nothing. `infra/forge/cluster-watchdog.sh`
+runs every five minutes from its own timer on the forge, opens no
+packet through the API it watches, and reads `/api/jobs/health` from
+outside the cluster; once the API has been dark for three consecutive
+checks it rolls `deploy/boss` to the converge's stamped last-converged
+build by name, and when it cannot read the cluster it says it is blind
+and files one alert rather than closing ok. `rollback-to <sha>` is the
+operator's verb for the same act, and it reads the image back before
+it claims the roll. **Schema, registries, the log and the data are
+never rolled back** — roll-forward only — so events written by a build
+that is later rolled away stay in the log, and projections and
+rebuilders must tolerate event kinds the running build does not know:
+closure doing revert-safety work.
 
-**Scratch is wave 1, named honestly.** Per-environment `current`
-symlinks are what make a wave seam possible at all; scratch's
-confirm covers only the paired services it runs, so it reduces
-prod's exposure and never replaces prod's own confirm and dead-man.
-Real per-node waves and true drain-patch-undrain arrive with the
-cluster; on one box, restart order plus health gates approximate
-them, and the approximation is named so nobody mistakes it for the
-thing.
+**There is no canary wave.** Scratch was wave 1 on the one box and went
+with it. The converge rolls prod first and applies the other instances
+(the Ales playground) the same way only after prod is stamped, so they
+follow prod rather than shield it. Per-node waves and a true
+drain-patch-undrain are not built.
 
 **Git and CI come inside, on Forgejo.** Internalizing is what turns
 the merge wall into policy — the ship-a-change `review` step gains a
@@ -4566,10 +6826,13 @@ is now a **maintenance Workflow kind**: success completes the run
 step, failure completes nothing and leaves the Job open and loud,
 and recovery closes the standing Job, so a failed backup is an
 algedonic signal instead of a quiet journal line. The spawner is
-deliberately the **systemd timer's wrapper on wall-clock time**, not
-the dispatcher's schedule runner — an amendment to the original
-proposal, ratified: sim-day rules fire every couple of wall-minutes
-at warp, and maintenance is wall-clock work. The cadence loop
+deliberately the **maintenance wrap on wall-clock time**
+(`infra/boss-maintenance-wrap.sh`), not the dispatcher's schedule
+runner — an amendment to the original proposal, ratified: sim-day
+rules fire every couple of wall-minutes at warp, and maintenance is
+wall-clock work. The wrap was a systemd timer's when this was decided;
+the chores that moved into the cluster run the same wrap from a
+CronJob (`infra/boss-chore.sh`). The cadence loop
 retired the *train's* timers, not systemd itself; the remaining
 timers are a rollout list, not a claim.
 
@@ -4653,6 +6916,31 @@ request drift; free-space floors remain independent. Neither this
 declaration nor its verdict changes storage, bootstrap templates,
 authority or the signed explicit-size approval boundary. This child
 does not complete the parent's remaining automatic remedy work.
+
+**A claim that cannot grow is proposed exactly one decisive replica
+move, or refused** (design-doc `ada8f698`, "A tight claim proposes one
+evidenced replica move"; its review answer chose neither option, and
+David chose option A in chat on 2026-10-07; part of backlog `53c8cb72`).
+When `plan-the-largest-instance-volume-expansion` finds no whole-GiB
+growth that fits, `expand-instance-volume.sh --plan-largest` asks
+`move-volume-replica.sh --plan-decisive` whether exactly one replica
+move would free the volume. A replica is eligible only when the
+existing move plan admits it and every remaining replica disk admits
+the projected growth on the same ledger and live arithmetic. The one
+eligible replica is proposed as `plan-a-volume-replica-move` with that
+plan and its hash. Zero or several eligible replicas, a bound that is
+only the ceiling, no short disk, or more replicas than the retirement
+floor each refuse and name every candidate. Nothing ranks, and listing
+order never chooses. The dispatcher files only that read-only plan
+request, from the `no_growth_plan_verb` declared on the discovery's
+`discovery_remedies` entry. A person files `move-volume-replica` and
+David's passkey signs its plan. Option B, ranked partial-progress moves
+across several short disks, was not chosen, so a claim with two short
+disks stays a person's plan. Built: train #978 (2026-10-07) carried the
+read, the selector and the dispatcher fallback, pinned by
+`a_tight_claim_proposes_one_decisive_replica_move.rs`, and `53c8cb72`
+closed that day. The verb contract is in `infra/ops/verbs/README.md`,
+"When no growth fits".
 
 **Retiring a unit will mean masking it, because disabling is not
 retiring** (design `7b230ddf`, David 2026-09-23, accepted as proposed;
@@ -4758,6 +7046,33 @@ red. The short-lived-certificate CA is not a field: Cloudflare generates
 one per application, and reading its public key into the Secret the
 manifest names is a root ceremony, done once.
 
+**SSH stays the base connection; Mosh is optional, and only on a route
+that already exists** (design `7ddd18ea`, David 2026-10-13, both
+questions as proposed). The question was whether Mosh would stop the
+dev door dropping. It cannot on the door as built: the Cloudflare
+`ssh://` route streams SSH over WebSockets and publishes no UDP
+service, so installing Mosh does nothing for the public name. tmux
+already keeps the work alive across a drop; what Mosh adds is that the
+terminal reconnects to it without a new login, and nothing else. So (1)
+**a Mosh trial runs only on a UDP route David's client already has**,
+and no VPN, relay or public UDP exposure is added for it. Without such
+a route the work is repairing and measuring SSH on today's path, and a
+private route is a separate design. (2) **Mosh is an optional command
+first.** It becomes the preferred interactive connection only on a
+proven route, after a day of twenty planned client-side interruptions
+all recover to the same live tmux workload, and only on David's
+acceptance. A disconnected session may live eight hours. SSH stays for
+file transfer, automation and fallback either way. Neither transport
+survives a pod replacement, so the comparison records pod restarts
+beside every drop. Where it stands: **no Mosh is built and no trial
+has run**. The decision authorised no deployment, and the bounded UDP
+range the design sketched (four ports) is a proposal for that trial,
+not a declaration. The SSH half has moved: the pod's sshd now sends
+keepalives every 30 s (`ClientAliveInterval`, backlog `98c6514e`,
+2026-11-02) and timestamps the line that says why each session ended.
+The client-side keepalive is still owed on the reliability item
+`d4c8e9bf`.
+
 **The train is tested where the seed is** (design `128b5496`, David
 2026-09-12, all three questions accepted as proposed; cars landed
 2026-09-13). Measured off the forge's task list on 2026-09-12: CI's jobs
@@ -4794,7 +7109,26 @@ The diagnosis names a full gate-run UUID; the supported merge door clears
 the strikes and appends who looked, when, the verified gate and verbatim
 diagnosis, keeping earlier releases. This is an operator action with
 independent held review, not automated clearing or runtime activation
-(David approved design `921c62af`, 2026-10-11; backlog `602fd374`). While CI still ran
+(David approved design `921c62af`, 2026-10-11; backlog `602fd374`).
+A train that has lost its pointer to its gate is recovered from the
+record, never by choosing a verdict (backlog `971c9006`). The conductor
+reads a complete census of every gate-run filed for the train, closed ones
+included, and binds the one original attempt at the train's exact head
+without filing another. If it finds two or more genuine originals, it holds
+the train, uncounted, with no new gate and no fallback to CI alone, because
+it never picks the newest or the greenest (`launch_train_gate` and
+`train_gate_census` in `boss-cli/src/train/conductor.rs`). Choosing among
+several genuine attempts is a human trust decision, taken one train at a
+time. Design `e312597f` (David, 2026-10-17, accepted as proposed) granted it
+once, for train `be43bf8c` (PR 1213), as a guarded metadata repair. The
+repair writes only the gate reference and an actor-attributed recovery
+marker, and only after the exact head, the native Job, the launch intent,
+the census and the provenance have been verified again. It leaves CI and
+gate judgement, every hold and each duplicate's own outcome as they were.
+That grant is not standing permission for selective adoption, automated
+recovery or a new actor. Binding an earlier green never hides a later red
+at the same head: the later red is reconciled under the merge policy, or
+the train waits. While CI still ran
 the Rust checks, a gate the conductor could not *file* fell back to CI
 alone after three passes, stamped `train_gate_fallback`; car 3 sets
 `BOSS_TRAIN_GATE_REQUIRED=1` in the same change that drops CI's `fast`
@@ -4804,11 +7138,165 @@ the image's baked stamp disagrees with the tree, and a floating tag was
 once served stale from the runner's cache (`6aa603ef`) — so
 `build-image` keeps pushing `boss-ci:<sha>` (about a minute, layers
 cached) and the disk cost it carries is the bigger forge disk's to
-absorb. The double run went first (`fix/a-train-is-tested-once`,
+absorb. *Superseded 2026-10-18 (backlog `399ee6c3`):* 780 trains in
+09-17..10-15 each pushed and pulled a 3.48 GB image while the forge's
+disk floor stayed a named reason trains are rate-limited, and the tag
+is now `boss-ci:<stamp>` — the recipe hash the
+locomotive already checks, which no runner can hold stale — built only
+when the registry does not already serve it under `:rust1.96` too. The double run went first (`fix/a-train-is-tested-once`,
 2026-09-12: `pull_request` alone); the two hours of unconverged trains
 on 2026-09-13 taught that a tag in the mirror *list* is a declaration
 and the registry holding it is the fact, which the converge now closes
 before it builds.
+
+**A tree is proven once: a one-car train whose inputs equal its car's
+gate carries the car's green.** Design `cdf626ac` ("Prove each tree once,
+then stop recompiling it", David 2026-10-15, all three questions accepted
+as proposed) measured that gate-shaped time on one disk, not agent time,
+set the factory's pace, and that a one-car train usually re-ran its car's
+gate on the same tree: in 2026-10-01..15, 48 of 216 comparable one-car
+trains were tree-identical to the car's green, 48 of 48 green, 12.4% of
+train-gate minutes. (1) **Telemetry and the gate disk come first, then
+reuse.** The receipt now says where the runner spent its time
+(`timeline`: runner start, each setup phase, `setup_s`; backlog
+`d777b20a`) and samples io, cpu and memory pressure
+(`infra/gate-runner/runtime-evidence.py`); the red's cause is recorded
+as two facts beside the verdict, `equipment_fault` and `product_defect`
+(`boss-jobs/src/failure_facts.rs`, item `c02fc3b3`), with `flake_of` on
+a green re-gate at the same head; nothing yet tallies them across gates
+(`1a75675a`). The gate disk went to the IT session as ops work (Q3), and
+is the drive story of `121f44a1` and `3c475a19` below. (2)
+**Reuse binds, never copies** (`boss-cli/src/train_gate_reuse.rs`,
+backlogs `bbc13a4e` and `2647cf38`): the train's `train_gate_run` points
+at the car's own gate-run when there is one car, its full or `--auto`
+green (never a scoped one), an assembled head that is exactly one merge
+of main at departure with that main the car's base, an equal tree, the
+run.sh that tree carries, every container image equal by digest to the
+one the car's pod resolved, and an equal launch request. An input the
+record cannot supply refuses like an unequal one, and anything else files
+the ordinary train gate. The conductor sets `BOSS_TRAIN_GATE_REUSE=exact`,
+but `gate-runner.yaml` names its images by tag, so no train binds until
+backlog `35a0de38` pins them. (3) **The queue-owned gate is the end
+state, and it is not designed yet** (Q2): one full gate per car against
+main plus the cars ahead, then the tested sha fast-forwarded, retiring
+the separate train gate. Until it has its own design packet the train
+gate stays, and a cold, unselected full run is to audit before test
+selection is allowed on car gates. David chose `--auto` as the car-gate
+default on 2026-11-02, full only for a trust-marked or judge-flagged car
+(backlog `885873eb`), without that cold audit having run; the unscoped
+full gate on main after each converge (backlog `77596188`) is the audit
+that exists. `006f480f` below decides to widen reuse from whole trees to
+single checks.
+
+**A train gate runs every check its cars' greens did not already prove for
+an input-identical tree.** Design `006f480f` (item 217e129c), both
+questions accepted on 2026-11-02. A check runs unless some boarded car's
+green proved it for an input-identical tree in an identical environment,
+input-identical being computed from the check's derived input closure
+against both the other cars' diffs and main's movement since the car's
+base; every undeclared closure runs, and any global file moving runs
+everything. The release guarantee becomes "every check in the scope either
+ran on the assembled tree or is named as covered, with the receipt that
+proved it": a covered check records `result: "pass"` with `covered_by`,
+not a new result word. The conductor computes the plan and carries it into
+the gate; the gate pod reads nothing from the system of record. Skipping is
+licensed only after zero escapes over 30 consecutive trains or seven days
+in shadow mode, and the full gate on main after each converge stays the
+backstop. The always-run floor (the fixture, every lint, the tree-wide
+pins, svelte-check) stays, because those have undeclared or live input
+closures no receipt can prove for another tree; the pins' cost is attacked
+separately.
+
+**Trains depart on a declared rhythm, and a landed change's dependents are
+proven on main after it converges** (design `c6d314a9`, "Deploying faster
+without faster gates", David 2026-10-16, both questions decided). Measured
+over October's trains: an unheld car spent a median 44.7 minutes from ready
+to converged, 36% of it in the train gate and 11% in the 30-minute boarding
+cooldown; replayed over the real arrivals, batching windows only added
+latency and one car per train was ruinous (median 231 minutes). (1)
+**Depart on a clear track** ("If the tracks are open, a new train can
+depart after gating"): board rule v11 dropped the cooldown to zero, live
+from 2026-10-17, after migration `20261016193000` let the cadence registry
+accept a zero delay (backlog `613295dc`). The before/after reading the
+question proposed was never written onto the packet. *Superseded
+2026-11-02* (backlog `a74d06d3`): with depth 1 and no cooldown nearly every
+train carried one car whose train gate re-tested its car's tree, so David
+moved to hourly departures that skip an empty dock, and v12, depth 1 with
+a 60-minute cooldown, is the active rule
+(`infra/platform/cadence/train-board-on-dock-depth.toml`). (2) **Option
+(a): an unscoped full gate on current main after each converge.** `--auto`
+tests only the crates whose files changed; clippy compiles their
+dependents but never runs their tests, and in 118 of 252 October trains
+neither the car's gate nor the train's tested them, so a dependent broken
+that way surfaced later as a red on an unrelated car. The conductor now
+runs one full gate of main per main sha, coalesced, never while a merged
+train is unconverged, last in line and only when a bay would still stand
+free after it; a red files one urgent item naming the failing checks and
+the trains merged since main's last green full gate
+(`boss-jobs/src/full_gate_on_main.rs`, backlog `77596188`). It detects and
+attributes; it never holds, strikes or cancels a train. Option (b),
+testing every dependent inside the train gate, was not taken: the
+dependent set is a median 38 of 51 crates, a nearly full gate on most
+trains' critical path. The design's other finding, the byte-identical
+train-gate skip, is `cdf626ac`'s reuse above; a dependency-graph "change
+index" to skip disjoint train gates was judged not worth building at 6–8%
+of train-gate minutes, and `006f480f` above later took up that question
+check by check.
+
+**The release image is built once, on the train, and the converge rolls
+it by digest — decided, not built** (folded from `build-and-deploy-cost.md`,
+its four questions decided 2026-08-14; restated for a container image by
+design `a80f0608`, David 2026-11-13, both questions decided as proposed;
+backlog `0d860145`). The 2026-08-13 measurement: the workspace CI had just
+compiled was compiled again for the deploy, from scratch whenever a core
+crate changed (30+ minutes on train 12, against 164 s for a leaf crate),
+while across 14 trains the median wait was CI at 35 minutes board→merge and
+the deploy at 3 minutes merge→deploy. The 2026-08-14 decision: (Q1) **one
+build per commit, consumed by every environment** — option (a), CI builds
+the release binaries and the deploy fetches them into the generation
+store's `releases/<sha>/bin/`; (Q2) **the artifact is keyed by the commit
+it was built from, a mismatch is refused, and what landed is recorded**,
+the locomotive's equality posture; (Q3) CI's own cost does not move with
+it, and is data to gather rather than a blocker; (Q4) worth doing now,
+because "we want to be more active in general". **Q1(a) was never built,
+and its mechanism is gone**: train #443 deleted the bare-metal deploy
+(`deploy-services.sh`, `deploy-web.sh`, `deploy-confirm.sh`) on 2026-09-18,
+and with it the only writer of `releases/<sha>/bin/` for services, so the
+generation store of the 2026-08-12 deploy design (`deployment-as-network.md`
+Q1) is retired; `infra/generation.sh` survives only
+for its `gen_atomic_link`, sourced by `infra/estate/install-cli-from-image.sh:201`,
+whose note says the store variables "are not used here". **What runs today
+compiles after the merge**: `infra/forge/cluster-deploy-runner.sh:449`
+runs `docker build -f infra/oss-quickstart/Dockerfile` at the merged head
+on the forge host, whose `rust-build` stage runs `cargo build --release`
+(`Dockerfile:175-184`); the image is pushed at `:488` and proves it boots
+(`image_boots`) only at `:498`, when main already carries the tree. Nothing
+before the merge builds it: neither `infra/gate.sh` nor
+`infra/gate-runner/run.sh` runs `--release`, and forge CI, triggered on
+`pull_request` alone (`.forgejo/workflows/ci.yml:38-40`), builds only the
+`boss-ci` runner image. So one tree compiles three or four times — the
+builder's worktree, the car gate, the train gate, the converge — and the
+image that deploys is the first release build anyone made of it. `a80f0608`
+restates the intent in image terms: (1) **forge CI builds the product image
+once per train, before the merge** — build, `image_boots`, push by digest,
+and record `{image_digest, image_tree}` on the train — with push rights on
+the product image repo only (Q1), because the train is already the
+assembled tree's test and forge CI runs beside the gate, not in a gate
+bay; (2) **the converge pulls and rolls that digest when the merge commit's
+tree equals the recorded tree, compiling nothing** — tree equality, not
+commit equality, because the squash makes a new commit object that carries
+the PR head's tree (`ci.yml:34`); (3) **on a tree mismatch it builds from
+source as today and records `build_reason`** on its run summary, since a
+refusal would leave a correct merge unconverged, and the fallback is
+deleted if its count stays at zero for a month; (4) **`BOSS_BUILD_COMMIT`
+stays the commit the image was built at**, and the train's `converged`
+step accepts a running commit whose tree equals the merge commit's; (5)
+**scope stops at the product image**: no release build moves into the gate
+and the gate's tests stay debug-profile, so "the deployed binary is the
+tested binary" holds up to the profile switch and no further. Built so far:
+this fold. The CI image build and the converge-by-digest are two further
+cars, after the gate-image digest pin of backlog `35a0de38` (Q2); until
+they land, every converge still runs the `docker build` at `:449`.
 
 **A car lands where its change goes live** (design `c6bd173e`, David
 2026-09-15, all three questions accepted as proposed; from his feedback
@@ -4873,10 +7361,11 @@ build on a hosted instance. Our own reader, `cluster-watchdog.sh`,
 reads the jobs port on the LAN; an off-LAN monitor authenticates like
 any other reader, and a public read would be a new `PUBLIC_BY_DESIGN`
 row with its own why. **Not built yet:** `boss running` judging a
-MIGRATED layer by `schema.pending == 0` waits on its DEPLOYED layer
-reading the cluster instead of the retired bare-metal release symlink
-(backlog `004bdb2b`), because a fourth row on a verb whose other layers
-answer UNREADABLE would be one more row nobody can read.
+MIGRATED layer by `schema.pending == 0` remains separate work.
+Its DEPLOYED layer now reads the latest cluster converge's recorded
+roll or successful unchanged-image check (backlog `004bdb2b`), naming
+and dating that packet beside the live health build. An unread latest
+record stays unknown; it never falls back to an older successful run.
 
 **A builder is a pod, not a process in the operator's shell** (design
 `90a14acc`, David 2026-09-15, all three questions accepted as
@@ -5052,11 +7541,12 @@ values** (design `125d405d`, answering backlog `fd6d6c08`, David
 instructions or generate a new print job. The print job can simply be
 a PDF download to print"; all three questions accepted as proposed). Measured on
 origin/main `b4c80a0d`: no printable re-entry sheet existed, and the
-two prose runbooks playing its part each contradicted the tree —
-`docs/runbooks/access-recovery.md` names Kanidm as the human door's
-recovery while the gateway boots `LocalAuth`, and
-`docs/runbooks/dev-pod-access.md` lands in tmux session `main` while
-`boss-dev.yaml` starts `dev` — the retyped copy §9a exists to refuse.
+two prose runbooks playing its part each contradicted the tree — the
+access-recovery runbook named Kanidm as the human door's recovery
+while the gateway boots `LocalAuth`, and the dev-pod-access runbook
+landed in tmux session `main` while `boss-dev.yaml` starts `dev` — the
+retyped copy §9a exists to refuse (both runbooks were deleted on
+2026-09-29 by the car that added `infra/recovery/re-entry.toml`).
 Several facts a human needs under stress lived in no file at all; the
 admin kubeconfig has two spellings (`fb444bbb`); and the break-glass
 door has one road in, Cloudflare Access plus the in-cluster tunnel,
@@ -5215,6 +7705,809 @@ dependency to add before hardening starts. Not chosen: the jobs API
 proxying read-only paths for the probe tier, which duplicates the
 gateway's routing inside a domain service.
 
+**A probe is a declared object that is executed, not shell text that is
+graded.** Design `0fe4c35e` (2026-10-31, filed with no questions because
+"proven requires a machine-run probe" already states the intent) retires
+the regex text judge in `boss-jobs/src/probe.rs`, which thirteen open
+items each caught misjudging in one direction or the other. A car's probe
+becomes `[probe]` data in its park file: `since` (a reference resolved
+from the record, such as the car's recording start), `read` (one of four
+kinds: a named gate check, a tree grep, a record read, a host read),
+`expect` (a typed comparison: after, before, equals, count_gt, matches)
+and `waits_on`, required when the read is a close the probe waits for.
+`boss prove` resolves `since`, performs the read and evaluates `expect` on
+typed values, so "does this probe compare the recording start" is answered
+by running it. The park door and the prove door share one validator, so
+the two cannot judge different sentences; a refusal names the key and its
+value in full; a shell read declares the tools it runs as data, compared
+with the forge's tool roster rather than its prose. The text judge, its
+clauses, lints and spelling pin are deleted in the third of three cars.
+
+**Whether a car landed is written once, by the train, at the merge.**
+Design `98f35ac2` (2026-10-31, no questions: every input is already on
+the record) ends eleven readers re-deriving "did this change land" from
+git after the fact, each wrong in its own way. When the conductor merges a
+train it records on the train and on each boarded car, in one evented
+write, `landed = { train, squash_sha, car_head, patch_ids, tree_sha_after,
+at }`; a car boarded as a twin of a landed change gets `retired = { as:
+"twin", carried_by, landed, at }`, and the item that named the car receives
+the fact through the car→item edge. `boss merged`, `boss car retire`,
+`gate::landing`, the lost-gate relaunch, auto-park and the bury pass read
+that record first. Git is consulted only for a branch no train recorded,
+through one fallback (merging the branch into main yields main's own
+tree), and that fallback answers UNKNOWN, never MERGED, on a
+whitespace-only patch-id match or a failed `git cherry`. The vocabulary
+gains the twin: a reviewer verdict `retire` with `carried_by`, retirement
+across items, an arrival rule that closes an item on `landed` or on
+`retired` as twin, and an auto-park that refuses a green whose change the
+record says landed.
+
+**One change, one packet: the car is the change from its first build
+minute to its proof.** Design `689d1f7f` (David 2026-11-08, from his
+question "are job packets and cars still distinct things?"; all three
+questions accepted as proposed). Measured that evening, one change was
+four packets — the ask (backlog-item), the builder (agent-run), the test
+(gate-run) and the car (ship-a-change) — and 299 of the newest 300 cars
+had been filed by the auto-park rule at gate GREEN, so the engineering
+station's ship-a-change line showed nothing in build or in the gates
+while four builders and four gates ran. The slips that day came from
+the stitching between the four, not from the work: a re-gate on a
+renamed branch parked a twin car, and `rerail --finish` existed only to
+copy a receipt from one packet to another. Decided: **the ship-a-change
+packet is the change**, admitted when the build starts and the one
+packet every reader of "this change" reads — the station page, the
+yard, orient, the train, the proof. (1) **The ask survives beside it**:
+a backlog-item's intake, triage and disposition are a different thing
+from a change and often yield several cars or none, so its `build` step
+is fulfilled by its car(s) (factory-taxonomy-v2 R8, a step fulfilled by
+packets one altitude down) and only the linking code goes. (2) **The
+agent-run and the gate-run stay packets**, as children one altitude
+down — the gate is an equipment station with bays and its own protocol,
+and a run carries the claim, the worker and the spend — each carrying
+one parent edge to the car step it fulfils instead of cross-links.
+(3) **Five cars, one at a time through the trains**, because each
+touches dispatch, the conductor or the auto-park handler the factory
+runs on. Built: car 1 (train #1645, 2026-11-09, item `68a8726e`) — `boss
+dispatch --started` admits the run's car at `build`, adopting the
+branch's open car on a repair instead of filing a twin; a park-intent
+`boss gate` completes `build` and stamps its gate-run on the car's
+`gate` step; a verdict that is not green hands that step back to READY
+with the verdict beside it; and (train #1648, item `366c9fb1`) a car
+whose run ends `refused` or `died`, or whose item closes unbuilt, before
+any gate ran ends through ship-a-change's `abandoned` terminal, fenced
+against a gate launch on one gate-step key so exactly one of the two
+lands. Car 2 (train #1690, 2026-11-11, item `a3a367e4`) — the gate-run
+records the R8 edge, `fulfils = {job, step}` (`boss_jobs::fulfils`),
+written only once the car reads back holding the launch's stamp, and
+its verdict follows that edge: green completes the step, anything else
+hands it back, every write judged on the stamp, and auto-park neither
+files, refreshes nor adopts for an edged gate-run. The edge is not
+`parent_step_id` on purpose: the subjob rule completes a parent on ANY
+close, and a gate-run closes on a red too, so that spelling would have
+boarded red code. Not yet built: car 3 retires auto-park's park and
+refresh path, `rerail --finish` and the receipt copy keys
+(`regate_receipt`, `regate_note`), so a re-gate is the gate step
+fulfilled again by a new child at a new head; car 4 has the item's
+`build` step fulfilled by its car and retires `--park-backlog-item` /
+`--park-partial-item` for "which item this car fulfils", recorded once
+at admission; car 5 retires the stranded-green sweep (a green with no
+car cannot exist) and the yard's car/gate join. Until car 3 lands, a
+gate-run with no edge — launched before car 2, or one whose edge write
+was lost — still reaches its car by the auto-park scan, and the
+re-gate repair CLAUDE.md §Doors describes (park flags, or `boss rerail
+<car> --finish`) is still the live door.
+
+**A publication executes once, as an Operations child fulfilling the
+publication step.** Design-doc *Five further collapses of duplicated
+factory facts and packet handoffs*
+([942dc0ac](https://boss.algedonic.dev/ux/jobs/942dc0ac-f4ec-48fb-aa0b-078544cd8803),
+David 2026-11-08, all four questions accepted as proposed) found one
+publication split across two packets: a `publish-a-protocol` (or
+`publish-to-github`) packet owns the approval and a nominal step, a
+sibling `ops-request` executes it, and ten dispatcher rules plus prose
+regexes copy its result back through the `for_protocol_publish` and
+`for_publish` edges. Decided (Q1): R8 extends beyond software change to
+publication. The publication packet keeps its person's approval; its
+step is fulfilled by one Operations packet one altitude down, bound at
+the child's admission; the child keeps host admission, the signed
+approval, the named signer and the immutable execution result, and the
+parent's completion is judged from that structured result. The bespoke
+filing and result-copy rules retire as each consumer moves; verb output
+stays as evidence, and a correct refusal (a failing check) still
+refuses. Not yet built (item `dcbeef5a`). The same design's other
+decisions sit at their topics: registry authority (after the drift
+comparator, under the network substrate), robot model class (after the
+data pass that put classes on the robots) and the gates reservation
+(after gate admission, below). Its one collapse that needed no
+question has landed: the ops verb files compile once, in `boss-jobs`,
+and `boss-dispatcher-handlers` reads `boss_jobs::ops_verbs::verb_files()`
+instead of its own generator and duplicate pin (item `418fd736`, train
+#1637, 2026-11-09).
+
+**Gate admission is a claim on a pool, not a hand-built line.** Design
+`d996ce3d` (self-critique pass H1, David 2026-11-01: "we need simple
+units"), its one question accepted on 2026-11-02, found gate admission
+deciding each of its questions twice: train precedence by two mechanisms,
+a place in the line held by four liveness rules with three TTLs (the
+waiter heartbeat, the packet's presence, the train's bound-wait key, the
+dock's kept claim), occupancy counted from both claims and a native Job
+census, the bound in three definitions, and an oldest-first line that was
+the one queue in the system not reading priority. Decided: the gate bays
+are the **first billed protocol version on the claim door**, ahead of the
+agent workspace slot, because bay capacity is the one capacity the factory
+already measures daily. A gate-run's bay step claims one unit at the
+`gates` station through the ordinary claim door; train gates, dock
+re-gates and car gates are the same claim with a class. The station's
+discipline `["class", "priority", "age"]` (class rank train, dock re-gate,
+car gate) is the only order, the claim is the only record of occupancy
+(the Job launched after it carries the claim id, and the census only
+reports a Job without a claim), and the claim's lease is the only
+liveness. The actor cap counts building runs only, so a run waiting for a
+bay no longer holds a run slot. *Superseded by the station tree (design
+`a3c5e58a`, 2026-11-08):* the per-actor cap is retired now that
+`robots:<model>` pools carry concurrency (item 3e927996), so a robot is
+bounded by one mechanism, its pool.
+
+In the station tree's words (4b27a65a, reconciled 2026-11-06) the bound
+is the `gates` station's capacity, 2 until the new drive is measured;
+`gate_max_concurrent` is already gone from the delivery policy, and
+`bay` is a retired word for new files.
+
+**A train's place at the gates is one reservation, and a native Job is
+an observation of it.** Design-doc *Five further collapses of duplicated
+factory facts and packet handoffs* (`942dc0ac`, Q4, David 2026-11-08)
+measured one place held in several systems: the train's
+`train_gate_bound_wait` metadata, a separate count of it in the gate
+line, and a native admission Job plus a runner Job joined by packet
+identity, so a lost CREATE acknowledgement could count one train twice
+(item `279a388e`) and a census-unavailable hold kept its place with no
+time bound (item `05bc8fe5`). Decided: the target is one recorded
+reservation at the `gates` station, on the gate-run's step and claim,
+covering queued, admitted, running and released, with native Jobs bound
+to it by immutable identity, so a lost acknowledgement is answered by
+reading back the same identity rather than a second place. That target
+waits on proof of crash recovery across the API/native boundary. Until
+then the place readers are unified over the existing atomic native
+reservation, classification is fixed, and admission is not relaxed: no
+database count replaces the atomic CREATE, every real execution stays
+in the census, and an unreadable census still refuses. The reservation
+belongs to the gate-run, not to the train it fulfils under R8 (item
+`b8d65e3c`, not yet built).
+
+**A scoped gate admission owner is selected by a new value of the
+existing `gate_queue_owner`, and the value proves nothing by itself.**
+Design-doc *Fence the cutover from existing gate senders to scoped
+admission* (`32b69969`, opened by agent-codex, its one question
+accepted as proposed by David 2026-10-17) found that the gate-capacity
+plan (designs `1e787fc2`, `640acd5c`, `f31d94ac`) named no signal that
+would move gate sends to a scoped, fenced native admission owner, and
+that a policy read alone cannot stop an older sender that has already
+passed its check. Decided: no policy field is added and the single
+total, train-first, is kept; the contract of the existing
+`gate_queue_owner` gains one more value, distinct from `legacy` and
+`resident`. Its proposed spelling is `scoped-native`, and the answer
+keeps that spelling a proposal, not an approved phase. A client that
+checks the policy refuses a value it does not know rather than falling
+back to `legacy` or `resident`. In the new mode a client refuses a
+direct train, car or legacy native CREATE and submits to the declared
+station; the scoped owner, after selection and immediately before its
+one conditional fixed-name runner CREATE, re-reads the same pinned
+policy and the current native membership and bay binding. No failed
+read, unknown attempt or absent object permits fallback, resend,
+adoption or bay release. The value takes effect only after the
+compatible API and schema, every managed launch entry point and the
+exact executor artifact are installed and evidenced, and every earlier
+sender is proved stopped and unable to restart, with its old and
+uncertain children still counted against the total. It grants no
+principal, role, native permission, enrollment, credential, publication
+or activation; those stay separately authorized. If the field is not
+extended, the record must name another authoritative signal and how
+each old writer is fenced, and required metadata an old writer does
+not know is not a fence. Not built on origin/main (2026-11-13):
+`resident_gate_queue` in `crates/core/boss-jobs/src/delivery/types.rs`
+and the CHECK in
+`infra/postgres/schema/20261016050000-gate-queue-ownership-policy.sql`
+accept only `legacy` and `resident`, and the policy bundle
+(`infra/platform/delivery-policy/train-conductor.toml`, v12) declares
+`resident`. Since this answer the total left the delivery policy
+(v12) and is the `gates` station's capacity, 3.
+
+**A gate whose first claim was rejected before its send permit may close
+withdrawn, and only on proof.** Design-doc *Guarded withdrawal after a
+proven pre-send claim rejection* (`5d2bc66d`, Q1 accepted as proposed by
+David on 2026-10-17, for urgent item `870dbfe4`) supplements the native
+attempt design `9dfd7b85`, whose rule stands: a caller that finds an
+attempt still SENDING reconciles natively or stays UNKNOWN. The measured
+case fails earlier: the server commits a first SENDING claim, the
+original receipt names a different actor than the attempt (cf060e7d:
+`codex@algedonic.dev` against canonical `agent-codex`), and the launcher
+refuses before it constructs SendPermit. `boss gate --withdraw` rightly
+refuses that state today, as a protected native attempt that a later
+absence cannot prove harmless (`withdraw_refusal` in
+`boss-cli/src/gate.rs`). Decided: one more proof class, first
+claim actor mismatch with no predecessor attempt and nothing broader,
+that permits a terminal **withdrawn** verdict and nothing else. It
+requires the genuine original conditional receipt and its event pair,
+every other confirmation predicate matching, independently retained
+provenance binding the original invocation to a compatible launcher
+whose source fails that confirmation before the only SendPermit
+constructor, the existing writer and authority checks, and a complete
+fresh native census that finds no execution. The operation records a
+typed rejected-claim proof on the existing `gate_orphan_claim` contract
+through the same conditional arbitration as the sender, reconciles
+natively again, then writes the existing withdrawn verdict and reads back
+the close. It preserves the original SENDING attempt, request and
+receipts byte for byte, and creates no SendPermit, `no_child`, retry,
+deletion or native action; later work is a new packet. A missing
+artifact, conflicting evidence or any possibly effective execution stays
+UNKNOWN, including cf060e7d if its launcher provenance cannot be
+recovered, and 27112421, whose Job and Pod genuinely exist, is a refusal
+control. Approving the mechanism settles no gate. Not yet built.
+
+**A scoped executor passes the machine door on its own verified
+credential, never on the estate token.** Design-doc *Admit the scoped
+executor purpose at the machine door without an estate token*
+(`ed279f2a`, opened by agent-codex, its one question accepted as
+proposed by David 2026-10-17) is a trust-boundary amendment to the
+gate-capacity plan (item `0f4224bc`) and to the scoped-admission cutover
+of design-doc `32b69969`, and replaces neither that cutover's signal nor
+its proof that old writers are stopped. It found that the jobs API
+mounts the machine gate around every other door, so in a non-degraded
+`enforce` only the estate token or the probe-reader credential passes,
+and the reader is GET and HEAD only: a scoped executor had no write
+transport, and nothing approved said what it should present. The
+estate token would grant a broader identity than its purpose, and
+exempting its URLs would admit unqualified callers. Decided: the jobs
+service may hand its existing machine-door admission one explicitly
+configured, server-owned purpose resolver, and only the configured
+native executor's fully verified purpose credential passes through it,
+in `enforce` too. Before resolving any identity the server verifies a
+distinct issuer and audience, the signature and lifetime, the current
+Pod, Job and ServiceAccount UIDs, a registered open run, the exact
+installed executor artifact and its protected enrollment on the
+published pinned workflow. An admitted credential reaches only the
+operation its sealed context authorizes: each write still needs its
+exact control, selection or bay scope and current policy, and an
+identity read never supplies a write or a send. It is not an estate
+token, a probe reader, an asserted actor or header, a policy Allow or a
+broker-stage authority, and the raw credential is taken off the request
+before any handler and never recorded. Missing or partial configuration
+leaves admission exactly as it is; an invalid, expired, mixed,
+duplicate, foreign or changed identity refuses, and acceptance and
+refusal stay visible in machine-door reporting without token values.
+The answer approves a server admission contract only. No principal,
+catalog entry, credential placement, native permission, enrollment,
+publication, cutover or activation is granted; those stay separately
+authorized under `32b69969` and the parent. Not built on origin/main
+(2026-11-13): `crates/core/boss-jobs/src/bin/boss_jobs_api.rs` mounts
+`boss_core::machine_gate::mount_with_request_latency` with no resolver,
+and the gate's `Presented` in `crates/core/boss-core/src/machine_gate.rs`
+has no variant for a purpose credential.
+
+**A delivered proof records the protocol scope it covers.** Design
+`52b65a31` (agent-codex, 2026-11-16; answers `b141b8e4`, no open
+questions) records the engineering contract for the readiness probes
+part. A car records versioned scope bound to its frozen gate head:
+repository, base and head, protocol kind and registry version or content
+identity, owning station at that version, derivation and diff or
+publication evidence. Derive workflow additions, deletions and renames
+from their declarations; tenant changes carry their repository and
+publication evidence. An item's department is a routing hint, not proof
+of scope. Code-only changes need explicit evidenced scope through the
+existing review. Missing, ambiguous or conflicting scope stays unknown;
+an evidenced empty scope is a different fact. The server validates the
+association, a changed head refreshes it through re-gating, and a
+historical backfill is explicit and audited, never inferred silently
+from today's owner.
+
+Readiness joins that scope to deployed artifact evidence and actual
+machine-run proof results on the server, preserving original rule
+versions, verdicts and separate corrections or rule sweeps. A green
+build gate alone proves no delivery. Return the observation cut,
+population completeness, obligation counts and evidence IDs. Count each
+car/protocol obligation once; keep retirement obligations with the
+former owner and do not erase unpaid obligations on later publication.
+The population is all retained delivered cars through the recorded cut;
+unassigned unknown scope remains visible rather than disappearing from
+the join. The probes part is true only with a complete population and
+attribution, at least one applicable obligation and qualifying passes
+for every obligation. Known owed or failed obligations make it false
+when judgment is complete; unknown attribution, unread evidence,
+incomplete sources or no applicable obligations make it null with a
+reason. Known failures remain visible alongside a null result. This
+does not replace the proof classes below or turn source-only evidence
+into a runtime pass. Readiness and retros use the same server result.
+
+**Not built:** first record scope through the car protocol, then add the
+pure join and API evidence, then replace the readiness sentinel and
+render it. Registry publication is append-only; conversions and legacy
+backfills are recorded. Tests cover changed heads, tenant identity,
+ownership changes, duplicate scope, retirement, failed or pending proof,
+corrections, incomplete reads and zero obligations. Delivery requires a
+machine-run API probe demonstrating both a valid association and that
+unknown or failed evidence cannot pass. This fold supplies the contract,
+not its implementation or live proof.
+
+**A proof is a claim on an event, with a lease, and a car whose change
+nothing in production can print closes on its landed-review.** Design
+`ada8715e` (self-critique pass H3), its one question accepted on
+2026-11-02, measured the proof loop as the factory's largest consumer of
+ops-requests: 1,864 run-car-probe requests in nine days, 1,703 of them from
+the hourly recheck, six cars accounting for 1,111 rechecks of probes
+waiting on an event that had not fired; 62 landed cars held open at
+`proven`, 44 of them carrying no probe at all and so unable to close by
+rule. Decided: one record on the car, written at park, `proof = { class,
+probe, expect, waits_on, attempts, lease_until }`. The **class** is
+declared at park and pinned by a lint: `behaviour` (a probe that prints its
+expectation on the deployed build, declaring the host it runs on, which
+the park refuses if that host cannot run it), `absence` (a deletion),
+`guard` (a refusal of something real), or `review` (a test, pin, doc or
+verb-doc change, proven by the landed-review's byte-identity reading). A
+rerun fires when the event in `waits_on` fires, never by a clock; the
+hourly recheck goes. When `lease_until` (park time plus the car's
+`duration_hours × k`) passes without a green, the car reaches a terminal
+`unproven` with the last diagnosis and its item reopens. `attempts` is the
+one record every path writes, the arrival run, an event rerun, a person,
+the independent prover and the owed-proof payment alike. `boss prove`
+stays the one judge.
+
+**An attended browser observation is evidence, and it qualifies a claim
+only through an independent typed judgment, never as a `boss prove`
+receipt.** Design `ec6fc29a`, its one question accepted on 2026-10-15,
+met a claim only a signed-in browser can observe: the deployed question
+renderer, whose gateway reads need the person's HttpOnly session. A
+browser can run checks, but the server cannot know from a submitted JSON
+object that the JavaScript really ran, and the step API checks a proof
+field's shape, not who executed it. Decided: a separate versioned
+`browser-renderer-observation` protocol and StepPlugin, with no change to
+the renderer, gateway authentication or roles. The person's browser
+fetches the served asset over its own session, refuses a redirect, a
+wrong path, an oversize body or a digest that differs from the pinned
+contract, and runs the exact bytes against a fixed synthetic suite in an
+opaque sandboxed frame that has no network and never writes to a live
+packet. The person submits the whole record: renderer, suite and every
+assertion, as attachments. The actor comes from the server's write
+stamp, and no pass flag the client sends counts. A different executor
+then runs `boss browser qualify`, which re-reads the originals, refuses
+self-review and incomplete or mismatched evidence, and records an
+`attended-browser-independent-review` qualification. `boss browser
+accept` writes that qualification onto a car only after the car has been
+explicitly converted to a `ship-a-change` version with the distinct
+`attended-qualified` terminal. The car's `proven` step and its evidence
+stay as they were. Had the question been rejected, the observation would
+have stayed evidence only until a trusted browser executor existed;
+exporting the human's session to an agent was never proposed. Built and
+published (the observation row at v2, `ship-a-change` v16 carrying the
+terminal; runbook
+[docs/runbooks/browser-renderer-observation.md](runbooks/browser-renderer-observation.md)),
+but no observation had been filed as of 2026-11-13, so no renderer has
+yet been qualified this way.
+
+**The dev pod's work volume grows in place, through a door of its own,
+and never at the cost of the live session.** Design `9687bcaf`, its one
+question accepted as proposed by David on 2026-10-15 (urgent parent
+`31d76e37`). `/work` held about 5.1 GiB against a 12 GiB preflight floor
+and an 18 GiB reclaim target; a reclaim pass had removed nothing, because
+what filled it was locked, dirty or sole-copy work, and deduplication
+could have freed under 1 GiB. Decided: grow the claim rather than delete,
+move or archive sole originals. `boss-dev/boss-dev-work` gets a
+fixed-purpose pair, the read-only `plan-dev-work-volume-expansion` and
+the mutating `expand-dev-work-volume`, and the instances-only
+`expand-instance-volume` keeps refusing `boss-dev`. The pair takes no
+namespace, claim or command from the caller, only a whole-GiB size, and
+it only grows, at most 2x per operation. The plan pins the claim's UID,
+its bound volume, the old request and the live pod and mount, and checks
+every replica disk against both Longhorn's physical space and its
+scheduling ledger. A missing or partial read is "cannot answer", not a
+plan. David approves that exact plan with his passkey through the
+ops-request path, and approving the design never stands in for it. The
+write is one PATCH to the claim's storage field, conditioned on its UID
+and old request. No restart, replica move, recreation, new grant or
+credential is allowed; if growth needs any of them, the door stops and
+a separate maintenance proposal follows. Proof is the same mounted
+filesystem showing more than 18 GiB free, with the pod and session
+processes unchanged. A pending resize or a timeout stays unproven and is
+never retried or answered by a shrink. The ceiling was 64Gi; correction
+`[0]` on the review (2026-10-28) moved it to 65..128Gi, which design
+`cab8f1cd` below settled. Built: both verb rows and
+`infra/forge/dev-work-volume.sh` (2026-10-15 to 2026-10-28), and the
+claim in `boss-dev.yaml` is declared a `floor`, so a converge never asks
+for a shrink of a claim that has grown past its manifest. The parent
+closed on 2026-10-18; whole-hash conservation of the records on the
+volume is still unproven, and the verb's receipt says so.
+
+**The dev-work ceiling follows what the estate can place, and the
+worktrees that fill it are bounded.** Design `cab8f1cd`, three questions
+decided as proposed on 2026-10-22, found `/work` under its 18 GB floor at
+the 64Gi ceiling of the expansion door (9687bcaf), with 555 live worktrees,
+220 of them harness locks left by builder runs. Decided, both in order:
+the ceiling rises to **128Gi** (the 64Gi bound encoded an estate that
+could not place larger replicas; the plan verb admits 65..128Gi on main);
+locked worktrees are bounded at **40 per actor**, the oldest closed-run lock
+released first; and a detached head no ref holds is reclaimed after **7
+days**, its commits first saved under `refs/reclaimed/` so removing a
+checkout never loses work. Measured by `/work` free space staying above
+18 GB on each reclaim receipt for seven days.
+
+**A volume claim is retired by a passkey-approved verb, never by hand.**
+Design `b4b1c99d`, filed with no open questions; David decided it on
+2026-10-18 on the design-review of backlog `f36eb7ce`: "manually running
+any ops command is a gap in BOSS coverage." Until then
+`delete-orphan-object` kept PersistentVolumeClaims out of its kind floor
+as a named human step with the admin kubeconfig, because a claim is
+bytes. That floor is unchanged; the claim gets a door of its own, shaped
+like the dev-work expansion above. The read-only
+`plan-a-volume-claim-retirement` renders one named claim (uid, size,
+class, its volume and reclaim policy, the Longhorn volume) and refuses by
+name a protected claim (`pgdata-postgres-0`, `boss-dev-work`, in any
+namespace), a claim `undeclared-objects.sh --check` does not call
+undeclared (an unowned namespace, a declared or controller-owned claim),
+a claim being deleted, and a claim that any Pod, Job, CronJob or
+workload controller in its namespace mounts or would stamp again. David
+signs those plan bytes with his passkey (design `17835005`). The mutating
+`retire-volume-claim` re-renders, acts only when the plan still hashes to
+the signed value, attaches the PVC, PV and Longhorn YAML to the
+ops-request and reads it back before deleting, deletes once with
+`preconditions.uid`, and prints its effect only when the claim reads back
+gone and the volume reads back gone (Delete) or kept (Retain). One claim
+per request, and a second run of an applied plan refuses. Built on
+2026-10-18 (both rows in `infra/ops/verbs/`,
+`infra/forge/retire-volume-claim.sh`), and the registry refuses an
+approval verb that names no `plan_verb` (`boss-jobs/src/ops_verbs.rs`).
+`retire-access-object` is its sibling for ServiceAccounts and grants.
+Not yet used: on 2026-11-13 no ops-request had named either verb, so the
+first use the design named, the eight leaked `dev-build-*` worker claims
+of item `2346fe79`, did not go through it.
+
+**Agent evidence on `/work` is archived losslessly or kept, never
+expired.** Design `195276f0` was filed with no open questions, and David
+approved it on 2026-10-17 on the design-review step of backlog
+`25022367`. On 2026-10-16 `/work` reached 96% with 1.7 GiB free. The
+hourly reclaim correctly kept 486 dirty, locked or unreferenced
+worktrees, and it had no lifecycle at all for the scratch, session and
+transcript files agents leave behind. Decided: the lifecycle is the
+existing reclaim sidecar's hourly pass reading a versioned data policy,
+not a new service. There is no destructive expiry, and no transcript is
+ever truncated. The one action is lossless compression of completed
+evidence. The plain copy is released only after the decoded archive
+matches the original's full digest and an fsynced, append-only manifest
+records it. A reader that opens a literal path gets it back through a
+verified restore. An unknown policy, owner, liveness, reader or reserve
+retains, under a named reason. Completion is read from the record (a
+closed, reported run that no open packet names), never from age, a
+filename or a quiet process table, and a missing heartbeat is not a dead
+writer. Session and transcript stores stay unsupported until their real
+readers are measured. Activation is a separate act: exact-head review, an
+adversarial review (the item is a `mutating-verb` trust boundary), and
+native acceptance of one bounded pass.
+
+Built, on origin/main 2026-11-13: the policy
+`infra/cluster/artifact-lifecycle.toml` (version 2, four families,
+owned by platform-admin) and `infra/cluster/dev-artifact-inventory.py`.
+The hourly pass in `dev-scratch-reclaim.sh` runs it as a dry run that
+accounts every file by family, unit and retaining reason, beside the
+mount's reserve and shortfall. Also built: the agent-run completion join,
+the archive actuator (each file revalidated under one exclusive
+lifecycle lock, and an interrupted pass recovered by the next), and the `--restore PATH` door. Its
+loader refuses an action on a reader other than `plain-path`, an action
+without a join or a per-pass byte budget, and any action but `archive`.
+Not active: no family carries `action = "archive"`, so the mechanism has
+archived nothing, and its FILESTORE seam is unselected. Not built: the
+exact deduplication the design permits, and the disk incident naming
+what the inventory retains, because no alarm reads its report yet.
+Backlog `25022367` stays open for the activation.
+
+**The estate registry is the hardware inventory, and hardware operations
+are protocols, not runbooks.** Design `60a8c155` (David, 2026-10-24: "I
+don't think we have an accurate understanding of all the physical
+hardware"), three questions decided as proposed the same day. The live
+registry held seven machines with only their first disk, no CPU, memory,
+GPU, NIC, firmware or location, and no alarm comparing declared with
+measured. Decided: read-only inventory probes per machine through existing
+read doors merge into the registry rows with a declared-vs-measured diff,
+and the declared-vs-measured alarm files drift itself; what probes cannot
+discover (workstation, NAS, UPS, switches and router, spares, cloud
+accounts beyond boss-gcp) is David's to list, with where it is. Hardware
+protocols are built as Workflow rows in this order: capacity response
+(each capacity alarm names its door, and a missing door is the build),
+snapshot hygiene, disk replace/add, node join/retire, firmware/OS upgrade,
+failure response. The approval boundary: reads and bounded reclaims run
+unattended; anything that resizes, moves, removes, reboots or upgrades
+needs David's passkey on the website; physical acts (cabling, a disk swap)
+stay his, with a checklist the protocol prints. In the station tree
+(4b27a65a) the estate is the root station's pools.
+
+**The offsite backup is one versioned bucket, and the old receiver is
+gone.** Design `1511f7d4` (David, 2026-10-27, both questions yes): the
+boss-gcp SSH dump receiver, unused since the GCS bucket `boss-gcs-backup`
+became the only offsite copy on 2026-10-01, is retired (its receiving
+path, `authorized_keys` line and Secret) through a passkey-gated ops verb
+that reads back their absence; and the bucket gets object versioning with
+a lifecycle rule deleting noncurrent versions after **30 days**, through a
+passkey-gated verb that reads back the state, so a buggy prune or a
+compromised writer key makes noncurrent versions instead of destroying
+every offsite copy at once.
+
+**At most one LIVE worker per run, with a bounded, recorded chain of
+re-admissions.** Design `4e79c324` (backlog d26832f7), its one question
+accepted on 2026-10-29, relaxes the isolation invariant of reviews
+b831d89e and 7dd185c6 from "one worker per run's lifetime", under which a
+single Kubernetes read timeout ended a run for good (five runs lost on
+2026-10-29). A run binds a new worker only after its old Job's retirement
+is acknowledged by UID (a 404 counts as confirmed), only when no live
+binding for its tree remains, only for the same tree, only for a
+re-admittable cause recorded as `cause_class` (`api-transient`,
+`storage-placement`, `capacity`, `source-moved`; integrity refusals and an
+absent source stay final), and at most **twice**. Each re-admission is an
+append-only record (`run-worker-<run>.readmit-<n>.json`, written link-once
+so two racing controllers collide rather than double-allocate) in the
+controller store and on the agent-run as `worker_readmissions`, and stop,
+ensure and ownership follow the chain to the newest session.
+
+**PostgreSQL moves to its own node on power-loss-protected disks; the
+cloud is the off-site copy, never the primary.** Design `f29798c0`
+(answers ba0b7308), three questions decided by David on 2026-10-31. The
+disk: David bought a Dell Precision 5820 with two Micron 7400 PRO 960 GB U.3
+drives and PCIe adapters, to be the database node (the placement and
+timing are in design 3c475a19 and the hardware plan on 121f44a1). The
+durability tier is **D-a only**: WAL archived to the existing GCS bucket
+through pgBackRest (RPO about 60 s, restore 15–60 min), accepting slower
+recovery to save cost; the cloud standby (D-b) and an in-LAN streaming
+standby (D-c) are not taken. The primary does **not** move to the cloud:
+the measured 51–57 ms LAN-to-GCP round trip would add 0.2 s to a read and
+up to a second to a write, and a WAN outage would darken the system of
+record and its alarms.
+
+**A node's install disk is declared by what it is, never by kernel name.**
+Design `ae40927c` (backlog 25d682bd), its one question accepted on
+2026-10-31: w-1's two NVMe disks are exactly the same size, so only the
+model tells them apart, and a reinstall applying a config that names
+`/dev/nvme0n1` after enumeration flips would install onto the other disk
+and wipe the gate volume. node-converge may now write one more Talos key,
+`machine.install.diskSelector`, as a read-and-write class of
+`check-declared.sh` limited to the literal selector fields `model`, `type`,
+`size` and `busPath` (never `disk`, `wipe`, `image` or `extraKernelArgs`),
+so `w-1.yaml` declares its system disk by model and every apply remains a
+passkey-signed plan. The selector is the exact model, not a glob, serial
+or bus path, and an install that matches nothing refuses rather than
+picking a disk. The design's other decisions, made from the frame: no
+door reads machineconfig, redacted or otherwise; `talos-get` gains the
+read-only resource `systemdisk`; and the upgrade verb (1695feb6) refuses
+unless the systemdisk's model equals the declared one, so an upgrade
+proves the disk it will touch before it touches it. The rule applies to
+every node that gains a second disk.
+
+**A gate's PostgreSQL data directory is memory, never the system disk.**
+Design-doc `3a8a44c1` ("Using both of w-1's drives properly: the gate's
+Postgres leaves the system disk, and three choices that are yours", David's
+answers 2026-10-07) measured that a gate's test check barely wrote the gate
+volume and wrote w-1's system disk instead, because each gate's PGDATA was
+an emptyDir on EPHEMERAL beside the builders. Built on 2026-10-08 (backlog
+9cd74fd5): the `pgdata` volume in `infra/gate-runner/gate-runner.yaml` is
+`medium: Memory` with a size limit, which loses nothing because the
+sidecar runs with fsync, synchronous_commit and full_page_writes off, and
+the test `the_gate_postgres_data_lives_in_memory` pins it. The read-only
+disk report its step 1 asked for exists as the `node-disk-usage` verb
+(backlog ebcddea5). The rest of the doc was overtaken. Per-drive latency
+is the on-demand `talos-read-diskstats` verb and is never an estate field
+(f29798c0). The scratch-reclaim item b6d23b1b closed stale on 2026-10-19.
+The Q new-drive "not yet" gave way to 121f44a1 and 3c475a19 below: the
+gate volume has been on the Micron 9300 PRO since 2026-11-11 (window
+ba305b66). The Q four-bays rule gave way to 121f44a1 D2, and the count is
+`bays` in `infra/platform/stations/gates.toml`. The Q who-yields rule was
+never built: the `gates` station's reservation of 12 vCPU of `host:w-1`
+does that job.
+
+**A gate ends on its verdict; the seed refresh runs after it, beside
+the record and never in it.** Design `b4bf8bba` ("Separate judged gate
+completion from supervised seed refresh", both questions approved as
+proposed by David on 2026-10-16; backlog 3e2c8ddc, with 82ffaff3 folded
+in) measured a green that waited 638 s for its own seed copy (gate-run
+86dd2d48), because the conductor records a verdict only from a `gate`
+container that has ended. Built and live: `infra/gate-runner/gate-runner.yaml`
+labels the Job `boss.dev/gate-layout: judged-init` and runs `gate` as a
+one-shot init container after the postgres sidecar, then a regular
+`seed-refresh` container that the kubelet starts only after the gate
+ended 0. That container runs main's `infra/gate-runner/seed-refresh.sh`
+from the ConfigMap, holds no credential, and takes one line of a fixed
+shape from the gate (`refresh <40 hex>` or `skip <word>`). It refreshes
+under the exclusive non-blocking seed lock: a busy lock skips, nothing
+queues, and the copy is staged and then renamed. Each phase is bounded
+at 900 s plus a 30 s grace, the helper always exits 0, and the
+conductor writes its record as `seed_maintenance` on the closed
+gate-run (`recorded`, `not-run` or `unknown`, never guessed), never
+into the receipt and never as a strike
+(`boss-cli/src/train/carried_verdict.rs`). The recorder reads `gate`'s end
+from the status list its pod spec declares it in, exactly once, and the
+old layout stays readable. Two parts of Q2 are not as decided. The
+bounds are env values in the manifest, not rows in the delivery-policy
+registry. And the bays are unchanged: a Job holds its bay until it
+finishes, helper included (`running_gates` in `boss-cli/src/gate.rs`). So
+the verdict arrives earlier, but the next gate starts no sooner.
+Admitting one while a refresh runs still waits on the node-headroom
+proof Q2 asked for. Rollback deletes that label, `GATE_LAYOUT` and the
+helper, and moves `gate` back under `containers:`.
+
+**Emptying a gate's workspace will have one supervised owner of its
+own; no gate waits for it.** Design `bb75d192` ("Give gate workspace
+cleanup a separate supervised owner"). David approved its one question
+as proposed on 2026-10-17. It measured a red gate whose receipt was
+written 17 minutes before its container ended, because that container
+was still deleting its workspace in uninterruptible XFS I/O. The gate's
+workspace is a persistent per-Pod directory on a Retain volume, not an
+emptyDir. The decision is one serialized owner limited to that
+volume's runs directory. The container that holds the verdict keeps its
+full evidence and receipt, leaves its workspace pending, and exits with
+its real verdict. It starts no detached child. The owner deletes a
+directory only with proof from the trusted recorder: the gate ended
+natively, and its full evidence was durably retained. A file in the
+branch-writable workspace cannot supply either proof. Before each batch
+the owner checks the directory's identity and the original `.alive`
+inode and takes that lock. It keeps anything live, young, replaced,
+symlinked, ambiguous or missing proof, and an interrupted batch stays a
+named, resumable, incomplete operation. No deadline can bound a syscall
+already blocked in kernel I/O. The registry owns the batch, age and
+headroom policy. Cleanup backlog, bytes and inodes, judging slots and
+node headroom are counted separately, and judging concurrency is
+unchanged. Any scoped credential comes from the broker. The approval
+itself ran no cleanup and granted nothing. Activation still needs a
+trust review of the exact head and native proof of conservation,
+headroom and lifecycle. **Not built** as of 2026-11-13, and no open item
+carries it, because item 82ffaff3 closed on 2026-10-17. Three deleters
+remain in `infra/gate-runner/run.sh`. A red still empties its own
+workspace in its EXIT trap (`empty_workspace`), whose
+`find -mindepth 1 -delete` also removes the `.alive` it holds locked. A
+green on the judged-init layout has `seed-refresh.sh maintain` empty it
+under `timeout`, which cannot bound a stuck disk. Every gate's start
+runs `sweep_dead_workspaces` on dead runs idle for an hour. The design
+collapses that sweep into the new owner and keeps synchronous cleanup as
+the named rollback.
+
+**The gate's limit was one drive, and the fix is a drive fit for the
+writes.** Design `121f44a1` (backlog 739d417d) measured on 2026-11-01 that
+the three gates sharing w-1 were bound by the gate volume alone: a
+DRAM-less Kingston NV3 100% busy at 60 MB/s with 854 ms mean writes,
+taking about 3.4 TB a day against a 320 TBW rating, while CPU, memory, the
+install disk and Longhorn were idle. David decided (Q new-drive, 2026-11-01)
+not to pull drives from w-1 but to add a Micron 7400 PRO 960 GB in a PCIe
+slot as the gate volume, with a Dell Precision 5820 coming to run the
+database on its own node. As carried out: on 2026-11-07 the gate volume
+moved to a Micron 7400 PRO on w-1 through the volume doors with no reboot,
+and the Kingston was left blank. The gates stay at two seats until the new
+drive is measured.
+
+**Each drive carries what its endurance and durability fit, selected by
+what it is.** Design `3c475a19` turns David's approved hardware shape
+(recorded on 121f44a1, 2026-11-01) into a placement, filed with no
+questions. On w-1: the Micron 9300 PRO 3.84 TB becomes the gate volume,
+selected by size (> 2 TB); the Kingston NV3 becomes Longhorn `scratch`, for
+single-copy dev-build worker volumes only, because it is rebuildable, not
+because it is spare; the Samsung 980 PRO stays the system disk and a
+`durable, postgres` Longhorn disk. The Dell joins as worker `w-3`
+(`boss.dev/purpose=database`, never a build node or a control plane), its
+first 7400 PRO the system of record's data volume and its second a durable
+Longhorn disk. PostgreSQL runs on **two** replicas on the two best disks
+(w-3 and w-1's 980 PRO), pinned by `diskSelector: [postgres]` and node
+affinity, after a restore of the newest dump into a scratch database has
+been compared with the live record. Durable volumes are placed by tag
+**before** any scratch disk exists, Longhorn leaves the control planes by
+eviction and scheduling is then closed there, and two new passkey doors
+exist for it (a user-volume wipe and a Longhorn disk-tag write). The
+registry, the Talos patch and the Longhorn classes say so before anything
+is fitted. The order is five cars: gate volume, Kingston to scratch, the
+Dell joins, PostgreSQL to the Dell, Longhorn off the control planes. The
+interim of 2026-11-07 (the gate on a 7400 PRO, pending the 9300 PRO) is a
+step on the way, not a change of placement.
+
+**A node-local volume moves between two fitted disks on one protocol,
+`move-a-node-volume`.** Design-doc `558ca6d7` ("Move a node-local volume
+between two fitted disks as one protocol: move-a-node-volume", answers
+backlog e581f615), its one question decided by David on 2026-11-11. Every
+door such a move needs already exists: `boss gates hold` / `release`,
+`retire-a-user-volume`, `wipe-a-partition`, `node-converge` (volume-only
+patches since a93010a1) and `prove-gate-volume`. What was missing was the
+order of the doors and the evidence each one owes. The 2026-11-07 move off
+the Kingston was recorded as free-text keys on 88b35891, and only the
+operator's session knew which door came next. The move is a Workflow row,
+not code. It is also not a step of `node-maintenance-window`: that
+protocol powers a node off for hands-on work, and this one powers nothing
+off. Where a window fits a disk beside the old one, the window ends at
+`declare-capacity` and a `move-a-node-volume` packet does the move. Its
+steps are declare, hold, retire, wipe, converge, prove, resume and
+verify-work. Each step completes with its ops-request id and the request's
+effect line, copied rather than retyped. When a step completes, a
+dispatcher rule files the next request, so David signs from the website.
+**declare** refuses a target selector unless exactly one fitted,
+non-system disk matches it: which disk Talos picks for a two-way match has
+not been measured. When two fitted disks share a model, the selector names
+the target's serial. There is no data-copy step, because the gate volume
+rebuilds cold; a volume whose data cannot be rebuilt is out of scope for
+this row. A failure after the wipe leaves the station held and the packet
+open at the step that failed. Node, volume, station and proof verb are
+packet metadata, but declare refuses a volume whose workload has no proof
+verb, so today the row moves only the gate volume. **Three passkeys per
+move (Q1):** retire, wipe and converge each keep a signature on their own
+plan. The wipe plan and the converge dry-run read node state that exists
+only after the step before them has run, so one upfront signature would
+sign intent rather than bytes (design `17835005`). Not built as of
+2026-11-12 (origin/main `50f9be981`): the row and its dispatcher rules are
+one car, carried by e581f615's `build` step. The first move between
+fitted disks after that car lands runs on the row, and its converge is the
+first live run of node-converge's repaired volume-only patch.
+
+**Hardware is proposed by a weekly capacity review, and only when the
+hardware we have is used well.** Design-doc `27c94d85` ("Capacity review: a
+weekly protocol that proposes hardware only when the hardware we have is
+used well"), filed with no open questions on 2026-11-10, after that day's
+hardware was judged by hand in chat while the cheapest win of the day cost
+nothing (worker volumes sized from 100Gi to 40Gi from a measured 17.9 GB
+peak, b3ad4219, fitting 6 builders where 2 had fitted). David's four
+decisions (2026-11-10): (1) **weekly** — a clock rule files one
+`capacity-review` packet a week, because needs can accelerate suddenly;
+(2) **David approves every purchase** — BOSS holds no spending mechanism,
+and the available seed balance (1,000 USD put into the company Stripe
+account that day) is a search constraint no proposal may exceed, read from
+the ledger and never typed, so further seeding or sponsorship revenue
+raises it without an edit; (3) **the purchase is a human step on David**,
+with a step plugin where he views the approved item and records vendor,
+order reference, price paid, expected arrival and serials; (4) **cloud is
+evaluated, never provisioned** — the scan may price it as a comparison
+only. The protocol runs measure (the needs report from the record, naming
+ONE binding constraint with numbers), use-first (when software or
+configuration on hardware we already have can fix it, the review files
+backlog items and ends with no proposal), scan (candidates as structured data, judged against role
+requirements held as registry rows), propose (ranked, or none, with the
+expected change in the constraint and the total cost against the balance),
+decide (David), purchase (David), place and bring up (the estate registry
+first, then the existing doors, never by hand) and prove (re-measure the
+constraint measure named). The price paid posts to the ledger as an
+expense, so how much is left is a figure the next review reads. Not built,
+as of 2026-11-12: its five cars — the Workflow row and its clock rule
+(backlog f75cebe0), the role-requirements registry (024584bc), the
+needs-report read (82ea2ecc), the purchase step plugin (eea00a8b), and the
+ledger posting with the balance read (b77c52c1). Backlog 3c08f3a1, the
+one-off acquisition protocol, closed as its duplicate.
+
+**A failed roll holds the converge by itself; hold-converge stays David's.**
+Design `b2e778ec` (item 78625ebd; fix car 1741c487 landed in #1509) is the
+post-mortem of the two system-of-record outages of 2026-11-01, when a
+`CREATE INDEX CONCURRENTLY` on the boot path was cancelled by its lock
+timeout and the watchdog rolled back. Its one question was accepted on
+2026-11-02: `hold-converge` keeps David's authorization (the same as
+`rollback-to`); instead **the converge runner holds itself** after a failed
+roll, because its precondition is already machine-readable (a converge
+packet with `failed_stage=roll` on the head about to be re-rolled): after
+N init failures of one build it rolls back to the named last-converged
+build and refuses to roll that head again until the item it files is
+closed. No new authority is needed, and release stays an operator act or
+clears when a later head converges. The protocol gains, as cars: the
+phase pin flipped so every `CONCURRENTLY` file is post-start by
+construction and boot-wait is the two historical files only; a gate pin
+that applies the real schema's boot phase while a long snapshot is open
+and fails if boot overruns its budget; long transactions as a registry
+row whose measured durations are the pin's budget; actor alarms that hold
+or name a recorded dark window as their cause; and a boot that stops at
+the first named failure of a no-transaction file and puts the cause on
+the converge packet.
+
+**The interactive foothold is separate from the build environment.**
+Design `0491591b` (backlog 47601829), after the dev pod sat Pending for
+about 80 minutes during the w-1 drive window of 2026-11-06/07 and David had
+no shell inside the LAN while everything else was up. A tiny, always-present
+`boss-dev-standby` Deployment (well under 1 CPU and 1Gi requested,
+required off the control planes and off the dev pod's node, no `/work`
+volume, a shallow clone from the forge, never building) carries sshd, the
+`boss` shim, `boss-api`, kubectl and git, and its login banner prints the
+dev pod's phase, node and last scheduler event before the prompt. It is a
+door of its own (`dev-standby-ssh` in the estate doors, probed by the door
+observer, offered on the login menu). David's two decisions on 2026-11-07:
+the standby carries **the dev session's ServiceAccount and machine token
+but NOT the forge write token** (it reads and files, it never pushes), and
+it gets a **public hostname**, `standby.algedonic.dev`, behind the same
+Cloudflare Access policy as the dev door, because the case it exists for is
+being outside with the LAN door dark. A lint pins its anti-affinity and its
+small request.
+
 ## Consolidation toward 1.0.0
 
 **The debt is measured, the order to pay it is decided, and every
@@ -5329,6 +8622,10 @@ backlog packets the design spawned):
   `20260918063829` deletes the seeded rows wherever nothing references
   them. Measured: the instance rows a fresh install boots with (seven
   nodes, eight service instances, their roles, eight credentials) → none.
+  Explicit positive estate `disk_gb` is the narrow exception to
+  `e187198f`'s insert-if-absent default: it refreshes a kept node from
+  the tree; omitted capacity and other existing fields stay kept, and
+  missing roles remain append-only (item `c426bc8a`).
 - **H9 — the lint declares its own consist skip** (train #447,
   2026-09-18, item `6fa15484`). Which lints the consist check leaves
   out lived five times, and nothing held `gate.sh`'s copy equal to the
@@ -5399,6 +8696,41 @@ CLI on the forge with the shell twins retired verb by verb, are decided
 above and not yet filed as items; the stranger-lens items likewise. The
 MEDIUM and LOW findings ride as filler, by what a first outside user
 would see.
+
+**The factory was drawn whole once, and the drawing ranks ten collapses.**
+Design `e30c9b6b` (2026-10-31, origin/main `dc2d4c1db`) mapped the tree and
+the live record with five independent read-only mappers and no
+architecture documents. Measured: 113,603 packets, 71% maintenance or
+observation ticks; 306 registry rows against 581k lines of production
+code; tests at 152% of production; five separate things that tick; facts
+with two writers (a train's `converged`, a gate's verdict); four records
+around one agent step; and protocol leaked into code at both ends of the
+pipeline (the conductor's 9.1k-line train machine, approval in
+`ops-runner.sh`, thresholds in handlers). The findings F1–F10 and their
+measurements stay on the packet. Decided by David on 2026-10-31:
+
+- **The order.** F1 (heartbeats out of the record) and F2 (the step is the
+  run: retire agent-run, agent-execution and the `agent_runs` row) first
+  and in parallel; then F3, a verb action and a threshold trigger in the
+  rule grammar, because F4 (one scheduler), F6 (the verb surface) and F7
+  collapse onto it; F5 and F6 as continuous small cars; F8 as
+  infrastructure cars; F7 last, behind a flight.
+- **Unit ticks live outside the audit log.** A unit run is an event with a
+  projection (telemetry lives outside the log, 2026-09-16), and a packet is
+  filed only when a run fails. One `chore-run` kind with `metadata.chore`
+  is acceptable only until that projection exists.
+- **No fourth layer.** The review proposed naming "the movers" (rules,
+  loops, runners) beside substrate, protocols and actors. David declined:
+  movers, or coordinators, are actors that route or handle rather than
+  work the job, which does not justify a layer. The station tree (design
+  4b27a65a) since gives them their word: they are automata, the machines
+  of the stations that contain them.
+- **The conductor stays a service, and trains run by protocol.** Not the
+  proposal's "conductor becomes protocol": a CI/CD service still exists,
+  but it does not push a train step by step. Trains run through their
+  protocol, and the conductor watches on a loop for problems that need a
+  protocol triggered. The proposal's acceptance test still applies: each
+  two-writer fact (`converged`, the gate verdict) ends with one writer.
 
 ## Design docs and the decision record
 
@@ -5725,6 +9057,54 @@ Both host deliveries, DR rehearsal, authenticated executor evidence,
 the remaining R4 proxy-forgery boundary, and declared writer activation
 remain separate held obligations on their original packets.
 
+## A runner's delivery acknowledgment is signed by its own host credential
+
+Settled by design-doc "A runner delivery acknowledgment names its
+authenticated host principal" (`104a93d5`), its one question
+(`delivery-attester`) approved by David on 2026-10-05; it answered the
+delivery half of backlog `1e50e66b` and the oldest, `6c9183de`. The host
+that holds a broker-issued runner credential attests its own
+installation with that credential: no new issuer, grant or
+shared-machine actor assertion. Its trust limit is the one design
+`f623e425` already accepted for execution: a compromised host, or a
+stolen host credential, can lie about its own host, so the
+acknowledgment is the host's report, not a proof of a file write.
+Independent installation attestation would need a named external
+attester and issuer first, and none exists.
+
+**Built** (car `0451f958`, train #957, 2026-10-06).
+`POST /api/credentials/{id}/delivery` (`boss_jobs::credentials::http`,
+`credentials/runner_delivery.rs`) admits only a request whose presented
+runner credential resolves, from the mounted Secret's own generation and
+from whichever slot holds it (the staged `next` during a first
+installation), to its host and minted-for packet. The caller must be
+`automation:ops-runner` at operator tier, and the body may carry only
+`job_id`, `attempt` and `secret_uid`, which must match that generation
+and the owner's original installed receipt. The recorded actor is the
+one the resolver proves, never a typed label: the `x-boss-user` ids the
+host scripts still send (`automation:runner-credential-deposit`,
+`automation:runner-credential-recv`) reach the record only on a request
+the door did not resolve. The rotation-phase door refuses a request that
+presents a runner credential or carries the delivery purpose, so
+delivery cannot record or replay a stage phase, and a retry reads the
+original receipt back at `GET /api/credentials/{id}/delivery/{attempt}`.
+Both hosts acknowledge through one helper, `infra/lib/runner-delivery-ack.sh`:
+the forge from `runner-credential-deposit.sh`, boss-gcp from
+`runner-credential-recv.sh` (car `2532e4ae`).
+
+**Live.** The forge's first runner rotation (`c896cb12`, 2026-10-09) and
+boss-gcp's (`f194ab3e`, 2026-10-10) each completed `delivered` as
+`automation:ops-runner`, with a `delivered_receipt` bound to its host,
+rotation packet and attempt. Those two deliveries met row E's
+precondition in design `b08725c2`: `runner:ops` entered
+`RESOLVABLE_PRINCIPALS` (`boss_jobs::field_writer`, 2026-10-10) and the
+ops-request approve keys declare it as their writer. The "Not yet built"
+list under the declared-writer decision above is therefore out of date
+on boss-gcp delivery, `RESOLVABLE_PRINCIPALS` and the ops-request
+declaration. Who may issue and install is the stage half, decided by
+design `6e28ed42` below. Nothing of `104a93d5` is left unbuilt, and both
+parent items are closed.
+
 ## A runner credential's broker stage is believed from a verified workload token
 
 Settled by design packet `6e28ed42-38af-4dae-87cb-3b208de27d41`, answered
@@ -5822,6 +9202,121 @@ loopback inside the pod; a reader of that hop is a process in the pod,
 which already holds the same ServiceAccount — the shared-workload limit
 this decision accepted. Still to decide: whether an UNCONFIGURED door
 should refuse runner rows by default rather than record the typed label.
+
+## A run survives silence only on progress the server can attribute
+
+Settled by design-doc "Bind native-run survival to authenticated
+substantive progress evidence" (`afddd915`), its one question
+(`progress-authority`) approved by David on 2026-10-06; it answered
+backlog `d4c0cd2d`. An executor's own checkpoint may postpone its run's
+`died` only when the jobs API can bind the caller to the run's assignee
+through a protected credential, and the checkpoint is an immutable,
+server-stamped record of new work (a committed source hash, a check with
+its exit status and log hash, a bound artifact). It proves an authorised
+submission, never continuous execution. The four-hour bound does not
+change. A metadata write, a summary, the `--started` worker receipt, a
+session heartbeat, a live host or a typed `x-boss-user` renews nothing,
+and until such a credential exists the checkpoint door refuses rather
+than trust an asserted actor.
+
+**Built** — the refusing half. `agent-run-dies-when-building-is-silent`
+reads completed-step stamps and a linked gate alone: the gate's launch
+counts (car `cd552f58`, 2026-10-18), only when the gate was born linked
+(`aaf5cafa`, 2026-10-20), and a queued place counts too (`18ad59b9`,
+2026-10-21). Its comment no longer says a metadata write keeps a run
+alive. The silent-session watch and the overdue-receipt rule
+(`a-declared-worker-receipt-is-observed-every-five-minutes`) file
+alarms; neither postpones a death.
+
+**Not built** — the checkpoint door. The only principals the server
+resolves today are `runner:ops` and `signer`
+(`boss_jobs::field_writer::RESOLVABLE_PRINCIPALS`); an agent signs with
+`BOSS_ACTOR` behind the shared estate token, so the precondition is
+unmet. Backlog `56cfa6b5` holds the car until an executor credential
+exists.
+
+## A bounded START prints the current contract and lists the history
+
+Settled by design-doc "Bound agent START without losing original
+evidence or required authority" (`e72dc7c9`), its one question (Q1)
+approved as proposed by David on 2026-10-15; it answered backlog
+`40f0436c`. The measurement: a dispatched START printed every job
+metadata value and every completed step's, and asked the worker to read
+all of it before its own `--started` receipt. On packet 266f06e8 that
+was 1,003,270 bytes, 836,756 of them one old gate-window observation,
+with the pinned protocol at byte 959,711 and the run's own identity at
+1,000,374. Conservation was already solved, because an oversized brief
+rides as a verified attachment. Attention was not, and neither another
+attachment nor a shorter summary bounds it.
+
+**The decision.** A Workflow row may opt into a versioned contract,
+`execution-inputs/v1`, declared under its `metadata.execution_inputs`
+and pinned with the packet's version, so publishing a row changes no
+admitted run. Under it every recorded value is in one of three classes:
+REQUIRED current input, printed verbatim in the START; a MANDATORY
+original, a verified reference the worker still reads in full before
+`--started`; or an AVAILABLE historical original, retrievable in full
+and not claimed read. Available does not mean read, satisfied, current,
+superseded or green.
+
+- **Unclassified is REQUIRED.** Age, size, completion, a familiar key
+  name, a prefix such as `coordinator_`, prose and model judgment never
+  demote a value. A missing, malformed or conflicting declaration never
+  makes content optional, and where sources disagree the strongest class
+  wins.
+- **Two things may demote, and nothing else.** One is the row's own
+  selectors, by exact pointer, which are registry data that publish
+  authority already guards. The other is an operator's classification
+  of ONE FROZEN VALUE, binding the packet id, the JSON pointer and the
+  value's sha256 with a purpose and a reason. It goes through an audited
+  door that asks `publish` on `workflow`, so no new role is granted. A
+  changed value, a new correction or a copy onto another packet returns
+  the value to REQUIRED, and the old packet is never rewritten.
+- **Some facts cannot be demoted at all:** target and scope, the pinned
+  protocol and the step's specification, authority and assignee, the
+  executor's rules and derived invariants, the own-run declaration,
+  holds and prerequisites, decisions and their resolutions, corrections
+  including withdrawals, the findings the assignment must resolve, and
+  any evidence a current step, predicate or proof requires.
+- **The bound refuses rather than clips.** The START is at most 128 KiB
+  of UTF-8, rules, own-run and manifest included, and names at most 256
+  originals; past that it names one verified inventory, which is itself
+  mandatory. Required material that does not fit is an admission refusal
+  that names each oversized source and its size. Nothing is summarised.
+  Authority and the own-run identity come before the historical list.
+- **Originals are conserved as bytes.** The raw packet snapshot is
+  stored as the API answered it, before parsing, and so is the complete
+  legacy brief, each through the verified attachment door. The manifest
+  must round-trip through admission before the prompt is offered. The
+  bounded receipt states that this exact START and every mandatory
+  original were read, and binds the contract, the START digest and the
+  manifest digest. A coordinator's receipt cannot stand in for the
+  worker's. Retrieval verifies bytes and never certifies reading.
+- **Legacy stays whole.** Legacy rows, legacy runs and any adapter that
+  cannot enforce the contract keep the complete START and the obligation
+  to read all of it. There is no automatic repin, no receipt rewrite and
+  no silent fallback to truncation.
+
+**Built.** Car `df6adff8` merged on 2026-10-26 (train #1414). The pure
+evaluator is `boss_jobs::execution_inputs`, which holds the bounds and
+`protected`, the list of facts no classification can demote. The
+operator's door is `POST /api/jobs/{id}/input-classifications`, behind
+`boss classify`, and it appends to the packet's reserved
+`input_classifications` list. `boss dispatch` renders the bounded START
+through the one brief renderer (`start_inputs.rs`) and admits it only
+after its record round-trips. `boss dispatch <run> --original
+<n|snapshot|legacy>` prints an original once it has been verified
+against the manifest. The native acceptance, which replays the actual
+retained packet, is an ignored test that FAILS without its private
+input (`the_actual_native_packet_replays_bounded_and_conserved`).
+
+**Not enabled.** No Workflow row opts in. On 2026-11-13 none of the 89
+active rows in the live registry carried `execution_inputs`, and no row
+under `infra/platform/workflows/` declares it. Every START today is
+therefore the legacy complete one; this fold's own START was 82,526
+bytes. The design put the backlog workflow's opt-in after tests and a
+distinct review, and no packet yet records either that opt-in or an
+authorized native acceptance run.
 
 ## Open findings — where two live decisions disagree
 
@@ -5964,6 +9459,47 @@ bounded references, and the same reader reconstructs intermediate originals and 
 assessment on replay. Inline and single-file historical records keep their
 meaning. No upload or event limit is increased and no original is shortened.
 
+## A launched agent runs as its own Job — decided, built dormant, parked
+
+Design-doc "A launched agent runs outside the launching verb: its own
+pod, and a bound the verb does not hold" (`21062f95`, answered by David
+2026-10-10T23:31Z) settles where an agent started by `boss dispatch
+--launch` executes. Q1: in a Kubernetes Job of its own in `boss-dev`, on
+the dev worker's posture (uid 65534 / gid 1500, no privilege, read-only
+root), not under a second Unix account on the dev pod. Q2: it holds no
+credential of the dev pod — no ServiceAccount, machine or forge token —
+only its harness login, read-only (the login cache is amended by
+`6f3ef63c` below), and its own workspace; the launching verb writes the
+run's receipts from what the process prints. Q3: the cluster holds the
+bound: `activeDeadlineSeconds` is the verb's bound plus its grace, so a
+suspended or killed verb no longer extends a launch, and deleting the
+Job ends every process in the pod, whatever process group it joined.
+
+**Built, dormant.** The Job contract and its property validator
+(`launch_job.rs`), the controller lifecycle (`launch_controller.rs`),
+the native transport (`launch_cluster.rs`, rows under
+`infra/platform/agent-controllers/`) and the `launch = "cluster"` branch
+in `dispatch_launch.rs`. Nothing selects it: the one controller row,
+`agent-controllers/codex-exec.toml`, says `enabled = false`, and no
+harness row declares `cluster` (`codex-exec` is `process`, both Claude
+rows are `host-tool`).
+
+**Not built, and parked.** The managed issuer that gives each Job its
+login (backlog `68e53553`), a published witnessed image, enrollment,
+activation and the RBAC grant. David parked the program on 2026-10-17
+(design-doc "Agents launched as cluster Jobs: continue, narrow, or
+park", `b922bd17`): parked, not closed, to return to option A, Codex in
+cluster Jobs. Backlog `3869107c` and `68e53553` stay open and carry the
+remaining cars.
+
+**So today** (origin/main `5f3cd40d0`, 2026-11-13): a launched agent
+runs in the dev pod as the session's Unix account. A `process` launch is
+bounded by the verb's own timer and its process-group stop; a
+`host-tool` agent — every Claude builder and reviewer — is the session's
+own subagent, and none of the newest 200 of 6362 agent-run packets
+carries a `launch` receipt. The uncredentialed worker below isolates the
+code a builder runs, not the agent process itself.
+
 ## Managed Codex cache boundary
 
 David completed design-doc `6f3ef63c-469e-47e9-a48c-0eb7cbcb3214`
@@ -6003,6 +9539,28 @@ exist. Dedicated authenticated private human enrollment UX, genuine consent,
 issuer installation, private collection/recovery and native runtime acceptance
 remain owed by3869107c. Neither this decision fold nor a source GREEN is
 evidence of those effects or authority to activate isolation.
+
+### The issuer input is an issuer-owned login — decided, unbuilt, parked
+
+Design-doc "Declare the issuer-owned login binding for isolated launched
+harnesses" (`85c991d1`, answered by David 2026-10-12T00:22Z) settles
+which login the read-only issuer input above may be. A launch stays
+fail-closed until a credential registry row names the issuer, principal
+and scope, the read-only storage and its consumer, and the renewal
+owner, with an installed-generation receipt; the recommended binding is
+issuer-managed and dedicated to launched harnesses. Whatever the estate
+can derive is issued, delivered, renewed and revoked by a broker handler
+with effect evidence; only an authorization it cannot derive is David's
+act. It is no licence to copy a session's login, create a sample Secret
+or make the mount writable. David chose the account on 2026-10-13: the
+coordination session's own.
+
+**So today** (origin/main `f998bdbaa`, 2026-11-13): no such row exists —
+`boss credential list` shows 19 credentials and no harness login — so
+the cluster path refuses an absent login witness (`launch_cluster.rs`)
+as well as being disabled. The managed issuer that would install it is
+backlog `68e53553`, parked with the program (section "A launched agent
+runs as its own Job" above).
 
 ### Private collector placement
 
@@ -6119,17 +9677,595 @@ listener, projection, Service and network route, plus a real registered
 generation-closure producer. A later mutable read or caller assertion
 cannot supply an original installation or prove closed issuance.
 
-The projected-token compatibility debt remains open. A kubelet-managed
-600-second projection does not give the broker every original TokenRequest
-request/response or enumerate all rotated tokens. The producer must
-reconcile that path with real issuer-bound evidence and durable closure,
-including cancellation, restart and lost acknowledgement. Preserve the
-consumer's original-token expiry and complete issuance-witness obligations;
-do not fabricate replies, weaken expiry, grant collector API access or add
-an issuer. Any extra TokenRequest/TokenReview authority needs its own
-explicit decision.
+This decision left a projected-token compatibility debt open, and the
+next subsection settles it. A kubelet-managed 600-second projection does
+not give the broker every original TokenRequest request/response, and it
+cannot enumerate every rotated token. The producer had to reconcile that
+path with durable closure, including cancellation, restart and lost
+acknowledgement. Do not fabricate replies, weaken expiry, grant collector
+API access or add an issuer. Any extra TokenRequest/TokenReview authority
+needs its own explicit decision.
 
 This amendment proves no installed grant, producer, TLS endpoint,
 credential/provider effect, enrollment or native READ/USE acceptance.
 Urgent `3869107c-1ff5-462e-ae24-9b11dfc37d97` remains open, and the
 existing isolation hold remains in force.
+
+### Retirement proves accepted authority, not issuance — bb59ee3d
+
+David accepted design-doc "Reconcile projected collector tokens with
+protected generation retirement"
+(`bb59ee3d-e0bc-4aa1-947b-637d3c06a5ba`) on 2026-10-16 at 14:34:24 UTC,
+resolving `projected-token-retirement-proof` as proposed. It amends one
+evidence form that `916ea815` kept. Retirement no longer has to list
+every original kubelet TokenRequest request and response. That list
+cannot be produced: the collector Job requests a projected token
+(`managed_cache/collector.rs:82`), and the kubelet, not the broker,
+requests and rotates it.
+
+The approved kubelet projection and the sole issuer stay. Retirement
+instead proves that the private collection endpoint can no longer
+accept any token of the old generation. It needs all of these:
+
+- **One protected generation record.** The broker owns it and serves it
+  to the existing `RegisteredCensus` consumer. The record holds the
+  launch intents, the original create and Pod responses, and the
+  admission seal. An intent is persisted before it is sent. A lost
+  create or delete acknowledgement stays unresolved until it is matched
+  to the exact original identity. The controller registers a collector
+  before launching it and cannot mint its own clearance. A sealed
+  generation refuses new launches across restart and cancellation.
+  Labels, an empty list or a caller's completeness flag cannot seal it.
+- **Admission and the seal share one durable boundary.** A private
+  request binds its authenticated collector, lease and nonce to the
+  generation before the broker reads its body. A request already
+  admitted finishes or is durably cancelled before closure. The seal
+  denies every later admission, whatever the token's rotation, and a
+  restart cannot reopen it. A valid offline JWT alone cannot pass this
+  gate. No new metadata IPC, journaled Exec or shared-PVC transport is
+  implied.
+- **The original launch set is conserved.** Original Job, Pod,
+  installation and current-trust inputs are kept privately, and the
+  absence of each named Job and Pod is observed twice with exact
+  NotFound. A changed UID or container, an unknown or missing original,
+  an unresolved operation or a replacement refuses. A namespace query
+  cannot rebuild the set.
+- **The verifier's real policy is bound into the evidence.** The
+  endpoint verifies offline, not through TokenReview
+  (`managed_cache/ipc.rs` `authenticate` calls
+  `boss_jobs::credentials::broker_stage::verify`). That verifier refuses
+  a signed lifetime over `MAX_LIFETIME_SECS` (600), gives expiry no
+  grace, and allows at most `NOT_BEFORE_LEEWAY_SECS` (30) on `iat` and
+  `nbf` (`broker_stage.rs:85`, `:88`). The proof binds the identity of
+  the verifier actually serving, and those limits keep one definition.
+  It never reads them from the projection's requested duration. A
+  long-lived token from the real issuer is refused before its body is
+  read.
+- **The bound is seal time plus 630 seconds.** T is the broker's own
+  clock reading when the seal durably commits. Every token accepted
+  before T expires by T+630 s. Retirement waits that long and rereads
+  the closure unchanged. Clock reversal, missing clock provenance, a
+  missing policy identity, a missing quiescence receipt or a changed
+  closure refuses. The result is recorded as an accepted-authority
+  expiry bound, never as the last issued token's expiry.
+- **Presented originals stay private.** They are kept only in the
+  broker-private, descriptor-confined store, never in packets,
+  attachments, logs, Exec journals or argv. No current projected-token
+  read stands in for an original kubelet response.
+
+This proves that no old token can still be accepted at that endpoint.
+It does not prove that every token Kubernetes issued has expired. It
+authorises no TokenRequest, TokenReview, audit stream, collector API
+grant or new issuer, and the controller gains no PVC-deletion or Secret
+authority. The proposal's alternatives were not taken: keeping the
+literal all-issued ledger would leave qualification unavailable, and
+broker-minted TokenRequests would need their own authority design.
+
+**So today** (origin/main `11e2e77c7`, 2026-11-13): nothing of the
+amendment is built. No `GenerationAuthority` port or generation seal
+exists. `RegisteredCensus` (`observer/evidence.rs:59`) has only the two
+test implementations in `observer/tests.rs`. `observer/retirement.rs`
+still requires the schema-1 closure, with original TokenRequest
+requests and `expirationTimestamp` replies (`retirement.rs:67`, `:117`,
+`:136`), so retirement refuses today. The producer and its consumers
+are owed red-first under urgent `3869107c`, alongside the installer
+obligations listed above. Grant convergence, installation, enrollment
+and native acceptance stay under the existing holds.
+
+### The broker originates compute creation — source authority 27787f53
+
+David accepted design-doc "Choose the genuine managed compute original
+producer" (`27787f53-ada2-4d99-9ddf-093577a3f1f8`) on 2026-10-17 at
+00:03:57 UTC, resolving `compute-original-producer` with the recommended
+answer. It amends `001fe8d0`, which placed compute creation with the
+controller and gave the broker GET only. The reason: a per-run Record
+needs genuine originals, and the controller is an interactive dev-session
+workload whose executable can come from a writable worktree. A mutable
+job field, a caller-carried CREATE reply, possession of a workload token
+or a later GET is not an original.
+
+So source may move ONLY the creation of the managed compute workspace PVC
+and compute Job into the broker's fixed lease-acquisition driver. Before
+any CREATE the broker verifies the controller workload, the registered
+run, the installed issuer generation and the publisher-qualified image,
+derives the fixed manifest itself, and fsyncs one append-only LaunchGroup
+for the lease. A second group or a changed command for the same lease is
+refused. Each CREATE is reserved durably before dispatch, and its complete
+request and reply are retained before anything interprets them. A lost or
+partial reply stays UNKNOWN: there is no retried POST, and no later GET
+is adopted as the original. The Job controller creates the Pod, so Bind
+takes only a Pod-name locator, which the broker reads back by exact name
+before it publishes Record. The controller keeps submission, Pod
+observation, UID-conditioned retirement and collector creation, and the
+Collect handoff of `001fe8d0` is unchanged.
+
+The added source authority binds the SHARED `boss/boss`:
+
+| Namespace | Resources | Verbs |
+| --- | --- | --- |
+| `boss-dev` | batch Jobs | create |
+| `boss-dev` | core PVCs | create |
+
+That account runs the whole `boss` Pod (dispatcher, jobs, gateway and the
+rest), so these rights are not broker-only. Kubernetes cannot name-scope
+CREATE, so any holder can create a Job in `boss-dev` that names another
+ServiceAccount or mounts a Secret there, or allocate PVC storage. David
+accepted that trade. The declined alternative was a separately qualified
+controller producer with its own immutable journal. No Pod create, Job or
+PVC mutation, list/watch, exec/log, Secret read, TokenRequest or worker
+grant is added.
+
+**So today** (origin/main `f00acc632`, 2026-11-13): none of it is built.
+The controller still creates both objects through its own transport
+(`Effect::CreateWorkspace` and `Effect::CreateJob` in
+`launch_controller.rs`). No source names a LaunchGroup. In `boss-dev` the
+manifests grant `boss/boss` only `get` and `patch` on named Secrets
+(`boss-credential-broker.yaml`), and neither Job nor PVC create. Even
+the `001fe8d0` observer Role is not declared. The cluster path stays
+disabled (`agent-controllers/codex-exec.toml`, `enabled = false`). The
+decision authorizes no grant, installation, enrollment or activation.
+Urgent `3869107c` stays open and carries the work, and the issuer stays
+on `68e53553`.
+
+### The installer deposits the original and hands off by append — de48ff01
+
+David accepted design-doc "Preserve managed collector installation
+originals through bootstrap and broker replacement"
+(`de48ff01-9bdb-4e4b-8c55-5967785b7c2b`) on 2026-10-16 at 17:33:35 UTC,
+resolving `installer-original-custody` as proposed. It settles a gap
+the sections above left. Under `001fe8d0` the normal converge creates the
+fixed TLS Secret empty and the broker cannot create Secrets; under
+`916ea815` the broker must hold the original empty-Secret creation and
+its own original Pod and container, and may not take them from a later
+read. Nothing delivered that creation receipt to the broker. And an
+ordinary rollout replaces the broker Pod while the Secret is already
+populated, so neither rebinding nor a fresh bootstrap was lawful.
+
+- **Bootstrap is a fixed receipt deposit.** The converge keeps creating
+  the Secret. The forge captures the exact empty CREATE reply privately,
+  then delivers only that metadata through one fixed-purpose installer
+  operation on the existing broker's ordinary service, separate from
+  collection. The caller is authenticated as the actual forge installer,
+  not as a typed actor with the shared estate token. The existing forge
+  host credential (`boss_jobs::runner_credential`, held root-only by the
+  forge converge) gains this one further fixed purpose, named here; no
+  new issuer is added. The transport's target, confidentiality and host
+  identity are qualified before any runtime use.
+- **The broker checks for itself.** It observes its own Pod and the
+  unchanged empty Secret, validates the original UID and
+  resourceVersion, the workload, container and projection, and the
+  descriptor store's ownership, and retains every original before it
+  mints or publishes anything. A fixed request UUID with an immutable
+  intent and readback makes a lost acknowledgement replay the same
+  binding. The operation accepts no caller path, selector, URL, key,
+  cache or token value and no other install action; only fixed
+  statuses, identities, hashes and counts leave it.
+- **Replacement appends; it never re-originates.** The root installation
+  and its CREATE receipt are kept forever. A separately authorized
+  installer may append a linked successor-incarnation proof. It needs
+  the old owner quiescent, the old incarnation's termination or absence
+  independently evidenced, the same Secret UID, slot and trust custody,
+  and the successor's workload, container and projection validated
+  independently. A Pod replacement and a container restart each need
+  their own native termination evidence; an HTTP timeout or an actor's
+  assertion is not evidence. Anything missing or unknown holds the
+  handoff.
+- **Old generations keep what they ran under.** The old generation
+  closure, its actual artifact and policy and its original clocks are
+  preserved, and the successor cannot rewrite them. New generations bind
+  the successor's actual artifact and policy. Unknown clock continuity
+  or accepted-authority bound, an unresolved old reader, create or
+  delete acknowledgement, a replaced Secret or a source or trust
+  mismatch refuses. The listener and renewal are configured only after
+  the handoff commits.
+
+The alternatives were not taken. Keeping today's refusal is safe but
+leaves `3869107c` unable to finish. Storing the original in the Secret
+or an annotation, or rebuilding it from a GET, breaks the accepted
+custody contract; an admin Exec or shared-PVC ferry, or a second
+issuer, is a different trust boundary; broad Secret create or list is
+unneeded. This is a source contract only. It adds no Kubernetes grant,
+TokenRequest or TokenReview, credential read or mint, provider
+operation, enrollment or activation, and any further authority the
+implementation finds returns as its own decision.
+
+**So today** (origin/main `11e2e77c7`, 2026-11-13): none of it is built.
+`FileBoundStore::bind` (`managed_collector_tls/installation.rs:380`)
+still expects an `Original` from a protected installer, and only its
+tests call it. It refuses a broker container whose `restartCount` is
+not 0 (`:168`) and a Secret whose UID or resourceVersion differs from
+the original or that is no longer empty (`:397`), and it has no
+successor path, so a broker rollout still strands the installation. No
+manifest declares `boss-managed-cache-server-tls`, nothing outside the
+module wires `managed_collector_tls`, and neither `runner_credential.rs`
+nor `forge-converge.sh` names an installer purpose. The work stays on
+urgent `3869107c` under the existing runtime and activation holds.
+
+## Dev builds run in an uncredentialed worker
+
+Design-doc "Dev builds cannot read or use trusted session credentials"
+(`c395e62c-5658-4588-a3cb-6ccd9e78d360`, 2026-10-05, no open
+questions) is the dev half of David's isolation decision on backlog
+`2710c8fc`. The credential-bearing doors (`boss`, `boss-api`, the
+machine and forge tokens, the dev-session ServiceAccount) stay in the
+trusted dev session. All repository and dependency code runs in a
+separate worker Pod that holds no credential: bun lifecycle scripts,
+`build.rs`, proc macros, candidate binaries, tests and lints. The
+trusted controller owns the Kubernetes connection and the exact worker
+Pod UID, and sends argv over the existing authenticated exec. No path
+runs from the worker to a door. There is no stamping proxy or socket,
+no bearer session token, and no new issuer or principal. What the worker
+returns is data, never a command or an actor. A failed launch or
+transfer is a stop, never a fallback to the trusted container. The
+in-cluster senders rule above cites the same design: a workload running
+branch or third-party code never holds the machine token.
+
+Built, under backlog `b3071bf4` (closed delivered 2026-10-22; isolation
+ON since 2026-10-21):
+
+- The worker, `worker_job` in `infra/dev/dev-build.py`. It mounts no
+  ServiceAccount token and shares no host namespace. It runs as uid
+  65534 / gid 1500 with every capability dropped and a read-only root,
+  and `forge-read` is mounted only in the bootstrap init container.
+- The controller doors, `dev-build start`, `exec-auto`, `put` and `get`.
+  They are published as a dev-control generation that
+  `/work/tools/dev-control/enabled` selects (`infra/dev/activate-control.py`).
+  `boss`, `boss-api`, `wt-cargo` and `wt-web` answer from that copy.
+  On a refused selector, `wt-cargo`, `wt-web`, `boss --built` and
+  `as-gate-uid.sh` refuse with exit 75, while `boss-api` still answers.
+- The source fixtures for the acceptance controls are
+  `infra/dev/isolation-fixture.py` and `infra/dev/fixtures/` (a build.rs
+  attack, a proc macro, read/use, and a stamping-proxy negative). The
+  native fake receiver is `infra/forge/isolation-fixture-contract.md`
+  (design `a21c491c`).
+
+Not built: the deployed, fake-only READ/USE acceptance matrix, which is
+the design's controls 1-5 run against a live worker. `b3071bf4` closed
+on three reads (the doors refuse, the budget refuses, and a builder
+built through a worker), not on that matrix. Its own
+`acceptance_matrix_runtime_route_20261005` records every deployed row
+as owed. Backlog `86d93e12` owns it. Left out on purpose and still out:
+authenticated per-agent identity. A session's `BOSS_ACTOR` is still an
+assertion the trusted session makes. Later refinements live elsewhere:
+activation and its gaps in design `a68fc42a` (its own fold), the
+re-admission chain in `4e79c324` above, and the committed-head binding
+in `ac162341` below.
+
+## The matrix's live target runs on the forge executor
+
+Design-doc "Bound the native fake-only isolation fixture and its
+lifecycle" (`a21c491c-6a72-4698-804d-65cc38e68f9c`, answering
+`b3071bf4`) asked who may create the live network target that the
+READ/USE matrix's worker negatives need. David accepted R1 on
+2026-10-15. The target is one fixed synthetic receiver Job and one
+internal ClusterIP Service in `boss-dev`. The existing forge ops
+executor creates them, using the rights it already holds. The
+dev-session account gets no Service authority, and nothing gets a new
+grant, credential, broker, egress route or network policy. If the
+forge executor cannot show the rights it needs, the operation refuses
+and names what is missing. The approval grants no rights by itself.
+
+The receiver mounts no token and no credential. Its effects are
+counters in its own emptyDir, and it calls no real service. A request
+carrying only an asserted user, role or machine header is refused. A
+request carrying the receiver's own synthetic authority is accepted.
+That authority never leaves the receiver, so the candidate worker
+cannot use it. The request's id fixes every name, and the operation
+binds to the native UIDs it created. Teardown reads all the evidence
+back first, then deletes by UID precondition and observes that the
+objects are gone. A lost acknowledgement or a changed UID leaves the
+fixture UNKNOWN. Nothing re-creates it by name, and a TTL does not
+count as teardown. The design activates nothing.
+
+Built on 2026-10-15 as three ops verbs: `prepare-isolation-fixture`,
+`observe-isolation-fixture` and `retire-isolation-fixture`
+(`infra/ops/verbs/`, driven by `infra/forge/isolation-fixture.sh`).
+The live inventory reads the fixture's own journal to declare its
+objects. The contract is `infra/forge/isolation-fixture-contract.md`.
+That is source. Running the verbs natively is part of the matrix that
+`86d93e12` owns, and a source green is not a native receipt.
+
+## A dev worker follows its worktree's committed head
+
+David answered Q1 YES on design-doc
+`ac162341-3767-489b-876f-49246faa8a14` on 2026-10-20 at 17:04:24 UTC,
+answering backlog `ceea10b8-fcef-443d-9cd0-59d3af0a61a2`, a flip
+gate for dev isolation `b3071bf4`. A dev-isolation worker is admitted on
+one exact commit, fetched by its init container, and until this decision
+every `exec-auto` refused once the bound worktree's `HEAD` moved off that
+sha. Builder rule 4's own order (commit, then pre-flight) therefore
+tripped it on every first commit, and the activation receipt's
+`rehearsal-check-after-commit` could not go green, so isolation could
+not be activated through its own door. The decided reading: the binding
+follows the worktree's committed head through the put door. The
+worker exists to run candidate code away from credentials, so its
+content was never the trusted part; the put door already carries
+builder-chosen bytes into it with no binding change. A re-sync writes
+the same bytes through the same door, with no new credential, no new
+network path from the worker and a receipt per file. What changes is
+the meaning of the binding record: it attests the local commit whose
+committed content the worker was synced to, with the fetched sha kept
+beside it. The rules:
+
+- `admitted_head` is the sha the init container fetched and never
+  changes for the session's life. `synced_head` is the local commit the
+  worker was last synced to; it starts equal to `admitted_head`, and
+  `check_binding` compares the bound worktree's `HEAD` to `synced_head`.
+- On a moved `HEAD`, `exec-auto` reads locally and metadata-only, as
+  `source_head` does, `git diff --name-status --no-renames
+  <synced_head>..HEAD`, and requires `synced_head` to be an ancestor of
+  `HEAD`.
+- It refuses before writing anything, naming stop and re-admit as the
+  way on, when the head does not descend from `synced_head` (a rebase or
+  a reset onto another line), or any changed path is a symlink, a
+  submodule, a mode-only change, a path the put door's own rules forbid,
+  or a file over the put door's 16 MiB bound.
+- Added and modified files go through the existing put code path;
+  deleted files go through a new `remove` worker operation with the same
+  path rules and the same directory-fd walk as put. That operation is
+  the only new worker-side code; the worker gains no credential, route
+  or authority.
+- Each path gets a re-sync receipt (the sha256 put already prints, or
+  `removed`), and `synced_head` advances only after every path has one.
+  The re-sync never commits in the worker, whose own `HEAD` stays the
+  admitted sha.
+
+Decided from the frame beside Q1, because each widens nothing. The
+worker's clone carries the forge's main as `forge/main`: the init fetch
+adds `+refs/heads/main:refs/remotes/forge/main`, same container, token
+and forge, so `infra/lint/lib/trunk-ref.sh` (which tries `forge/main`
+first) and the trunk-relative pins run in the worker as in the gate,
+with no hand-set `BOSS_TRUNK_REF`. The brief's worker-execution
+invariant states the lifecycle, derived from the controller rather than
+retyped: admit only a head the forge has; a commit re-syncs on the next
+`exec-auto`; a rebase or a non-file change needs stop and re-admit.
+Builder rule 4's wording follows it. Refusing an unpushed head before a
+pod is created stays with `457ac1e2`, which owns that refusal. This
+answers the per-commit cost design `a68fc42a` named as its gap (e) and
+left undecided; that design's own fold of D1-D3 is not made here.
+
+The cars, in order: `forge/main` in the bootstrap, with a dev-build test
+that the rendered init command carries the refspec; the `remove`
+operation and the re-sync in `exec-auto`, test first, which flips the
+`rehearsal-check-after-commit` pin in `preflight-control_test.py` from
+"stale is named" to "the second build after a commit passes", with a
+test for each refusal above and for receipt-before-advance; then the
+brief's invariant lines and builder rule 4, pinned by the brief tests.
+This fold builds none of them and activates nothing. Backlog `ceea10b8`
+and `b3071bf4` stay open, and the existing isolation hold remains in
+force until isolation is activated through its own receipt.
+
+## Dev isolation activation follows main from the /work PVC
+
+Design-doc "Dev isolation activation: state, gaps and plan (b3071bf4)"
+(`a68fc42a-f057-4dbd-b619-d2d163ce1097`) is how the uncredentialed
+worker above was switched on. David answered D1-D6 on 2026-10-10, each
+on its recommended reading. Measured against origin/main on 2026-11-13:
+
+- D1, built. A failed re-activation leaves the selector refused, not
+  absent. `wt-cargo`, `wt-web`, `boss --built` and `as-gate-uid.sh`
+  then exit 75 while `boss-api` still answers. The reclaim sidecar's
+  hourly pass files `dev-control-selector-missing`, `dev-control-refused`
+  or `dev-control-behind` (`infra/cluster/dev-scratch-reclaim.sh`).
+- D2, built. Builder pre-flight, probe rehearsals and direct
+  interpreters run through `dev-build exec-auto` (builder rules and the
+  brief's worker-execution invariant). The first builder to build a car
+  through a worker is on `b3071bf4`'s record, 2026-10-22.
+- D3, built. `infra/dev/control-images.json` names the worker and
+  postgres images by repository and tag, `forge_url` comes from
+  `infra/estate/estate.toml`, and `infra/estate/install-cli-from-image.sh`
+  resolves both digests into each generation's immutable `config.json`.
+- D4, built. CiliumNetworkPolicy `boss-dev-build-egress`, applied by the
+  cluster converge, selects `boss.dev/purpose: isolated-build` pods. It
+  denies every pod but kube-dns, the host, the nodes, the API server
+  and the private ranges, and allows DNS, the forge's port and public
+  port 443. The `dev-build-fence-status` verb reads it back.
+- D6, built. The store and selector are `/work/tools/dev-control` on the
+  `/work` PVC, which a roll keeps, and the hourly install re-activates
+  each verified generation (`--reactivate`). On 2026-11-13 the selector
+  and `image-cli/current` named the same generation, `2dbd868b`.
+- D5, half built. Workers start cold (`WT_SEED=/workspace/no-seed` in
+  `infra/dev/dev-build.py`). The main-only seed is backlog `db949aee`,
+  and the cold build's measured cost is `e3ec2d95`.
+
+Gap (e), a cold worker per commit, was answered by `ac162341` above. The
+USE row the fence exists for is still unproven: the deployed READ/USE
+matrix is `86d93e12`.
+
+## After the shop floor, the machine carries the work (393bdef6, 2026-10-16)
+
+Design-doc "After the shop floor, the machine moves the work: release on
+verdict, launch on ready, and a map that shows who moved it" (`393bdef6`,
+David accepted all three questions as proposed on 2026-10-16) measured a
+week of downstream work. Two acts still waited on a session or on David:
+launching a reviewer (353 launches, about 145 h of delay) and releasing
+a held car on its reviewer's RELEASE (156 releases, about 106 h). The
+rule it set: **who judges does not change; the machine does the carrying
+around the judgement.** A reviewer still reviews and an agent still
+repairs.
+
+- **Q1, release on verdict. Built.** The rule
+  `release-a-held-car-on-its-reviewer-verdict` (backlog `0cfc57e6`)
+  fires when an agent-run records a review verdict naming a car, and
+  asks the one release door with that review, signed as the rule. The
+  door's judge decides, for every hold class, and refuses a CHANGES
+  verdict or a verdict for a head the hold no longer names. The rule
+  itself leaves a car to a person when the verdict comes from a run the
+  car's review step was not dispatched to, or was recorded before the
+  hold now on the car. Each refusal is written once onto the car's
+  review step as `auto_release`, and the yard shows it beside the hold.
+  A sibling rule (`60993cda`) asks again when a review hold is placed
+  after its verdict. If the event is lost, the car stays held.
+  David's per-car override is `boss hold --releaser`. `6fa9c790`
+  (below) has since made that mark reserve the release for the named
+  actor alone, not only against automation. Which cars are held at all
+  is option A's question (`bd331d38`, 2026-10-09), measured and kept
+  on 2026-11-15 (`e2f42de3`, "Both review holds stay" below).
+- **Q2, launch on ready. Decided, not built.** The machine would launch
+  a run only for a step whose agent block opts in (`launch = auto`),
+  starting with held-car review and landed-review. Budgets stay on the
+  block and the agents row, and sessions keep rescue and every red. It
+  rides behind the launched agent as its own Job (`21062f95`). That
+  program is built dormant, and David parked it on 2026-10-17, not
+  closed, to return to option A, Codex in cluster Jobs (`b922bd17`,
+  section "A launched agent runs as its own Job" above). The agent
+  block has no `launch` key (`AgentSpec` refuses unknown keys). A later
+  decision answers the same delay another way: an executor seated at a
+  station pulls its next step, and a held car's review queues at a
+  review station (`506e0a1c` above, 2026-11-09). Nobody has decided
+  Q2's trigger again since then.
+- **Q3, where the garage line falls.** The machine relaunches a lost
+  gate once, on the same sha, with its park intent; it retires a landed
+  twin; and it cancels a train whose two verdict halves are red. Agents
+  rework a red gate, write or correct a proof probe, and write a hold.
+  What the machine tries once and fails goes back to an agent with what
+  it saw. Built:
+  - the conductor's lost-gate relaunch (`boss_jobs::lost_gate`, backlog
+    `565131e1`). A second loss on the same sha files one
+    pipeline-failure item naming both runs, and stops.
+  - landed twins. A consist that adds nothing to main retires each car
+    as a landed twin (`81408a81`), and auto-park refuses a green whose
+    change the record says landed (`98f35ac2`).
+  - red trains. The judged-red cancel predates this design
+    (`a2d4d842`, 2026-09-24). It acts once both halves have spoken, one
+    is red and the red names its check. A red named by the forge alone
+    with one culprit car followed on 2026-10-18 (`b4a95f47`).
+  - publish `measure`. Its lesser item is also built: the dispatcher
+    completes it from the drift reading
+    (`publish-measure-lands-the-drift-reading`, backlog `f4bafd6b`).
+
+**The map's reading. Half built.** Each region downstream of the shop
+floor carries a `machine-moved X% · N hand-moved/day` KPI: gates, dock,
+track, shed, arrivals, garage and publish
+(`boss_jobs::regions::automation`, backlog `9ca41c08`). It counts the
+`completed_by` of the step completions that leave the region, by actor
+class, and keeps unattributed completions apart. It has a direction and
+no target ratio. A step's declared `executor_class` (machine, agent or
+human) is a Workflow field. When a row omits it, the class is read off
+the agent block, `human_only` and the step kind. No workflow row in the
+tree declares it.
+Nothing yet compares it with `completed_by`, so the two flags the design
+asked for are not built: a step declared machine but moved by hand, and
+a step declared for hands that never needed one. Hand acts that are not
+step completions, such as a release, a launch or a relaunch, are still
+not counted. `moves::Cause` carries no actor. The reading is still keyed
+by the IT map's region names, not by the station tree's (`4b27a65a`).
+
+## Reserved car releases (6fa9c790 Q1, 2026-10-26)
+
+A car's review-step `releaser` mark reserves release for that exact actor
+and unique aliases of the registry row whose ID is that reservation.
+An agent listing a person's ID as its alias gains no authority over that
+person's reservation; naming an alias does not delegate back to its row.
+Deleting or changing an existing reservation on a held review is judged
+against the current reservation before the write, through both the CLI
+and server metadata door. Placing a new reservation remains open.
+Every other person,
+agent or automation is refused at the shared release judge, with no
+metadata or event written. The guarded write compares the raw reservation
+under the review row's lock, so a reservation placed or changed after
+judgment refuses the old write. A malformed reservation fails closed. Exact
+named identity needs no alias lookup; missing, unavailable or ambiguous
+registry evidence cannot grant an alias release. An absent reservation
+keeps the ordinary review-based release contract.
+
+The yard judges release for its signed-in viewer and uses the same door
+as the CLI. A person's own shell or the yard's Release button attributes
+the act to that person; a command typed into an agent's shell signs as
+the agent and gains no authority from who typed it. The intended release
+of car `10f1b77a` stands. This supersedes the automation-only reservation
+rule in `393bdef6` Q1; it adds no passkey requirement or other permission.
+
+## Both review holds stay; the cost is the wait after a verdict (e2f42de3, 2026-11-15)
+
+Two holds decide which green cars wait at the dock for an adversarial
+review before they board. The **trust-boundary hold** reads the item's
+mark, an area from `infra/platform/trust-areas.toml`. The **path hold**
+(backlog `fdbb447e`) is the gate's judge reading the diff: a car that
+touches an ops verb, what a verb runs, the runner, a harness file, the
+hold's own code, or a file that claims a review, its renderer or a file
+it prints prose from. In practice it sweeps in common files such as
+boss-cli's `main.rs`, `brief.rs`, `dispatch.rs` and
+`infra/platform/documents/builder-rules.md`. On 2026-11-15 about 40
+green cars stood held, trains left one car each (about 31 a day) and the
+backlog stood near 1,190 items. The conductor's hypothesis was that the
+path hold is too wide, and that anything outside the trust areas could
+move to the post-merge `landed-review`.
+
+**The measurement says no.** Design-doc "Narrowing the dock path-based
+review hold: the measurement says keep it" (`e2f42de3`, David answered
+Q1 as proposed on 2026-11-15) read the 1,000 most recent `agent-run`
+packets closed within 7 days (of 1,326), with the reads taken before
+21:39Z on 2026-11-15. 174 were reviewer runs on a car's `review` step.
+The verdict came from each run's own report (CHANGES or RELEASE in its
+first 700 characters). The hold class came from each run's own brief,
+which carries the hold text verbatim at review time. A first pass read
+the hold off the car instead, and was biased: a released car loses its
+hold note, so released cars dropped out of the held classes and CHANGES
+rates read 89–100%.
+
+| Hold class at review time | Verdicts | CHANGES | Rate | P1 among CHANGES |
+|---|---|---|---|---|
+| Path hold only | 101 | 43 | 43% | 9 |
+| Trust boundary | 39 | 18 | 46% | 4 |
+| Neither named in the brief | 8 | 0 | 0% | 0 |
+
+Landed reviews of cars that boarded unheld, same window: 98 read
+verdicts, 27 with findings (28%): 1 P1, 4 P2 and 22 unrated, mostly
+nonblocking coverage findings. A further 24 landed-review runs were
+refused for independence or never read a verdict. So the path hold
+finds defects at the trust hold's rate, with more P1s in absolute
+count. It is not a false-positive hold. Moving it after the merge would
+put about 9 P1s a week on main, where the landed-review loop finds less
+and fixes later. Path-hold CHANGES that would have landed include
+`3cf75d5b` (a run left at briefed with building pending was aged by no
+rule), `53ca42f4` (the shared-checkout guard passed a bare relative
+write) and `f82e386f` (a car-folds-into-carrier race).
+
+**Decision: keep both holds as they are, and cut the wait after a
+verdict instead.** The measured cost was not the review but what
+followed it. A CHANGES verdict had no route back to its builder (car
+`1d5379b5` sat 85 minutes; thirteen cars carried CHANGES from
+2026-11-14 for more than a day), ready reviews held by nobody raised no
+alarm, and reviews pooled on one or two named robots. Three cars answer
+that:
+
+- `ff8d4bef`, landed in train #1777: a review nominated to its own
+  builder, or unclaimed for 2 h, returns to its station.
+- `c2b21676` (car `53afc07d`): a CHANGES verdict returns the item's
+  build to its station as a repair. In flight at the fold.
+- `f0e604dc` (car `63699224`): an hourly per-station alarm for unheld
+  ready reviews past their declared bound. In flight at the fold.
+
+Still open: cars built for part of an item (`partial_item`) have no
+repair route (`390f9e55`), and `6178a9b0`'s remaining split items, a
+red gate whose builder's session is gone (`bbea9094`) and the instant
+`step.assigned` twin (`c9cbf382`).
+
+**Revisit on a number, not a feeling.** One week after `c2b21676` and
+`f0e604dc` converge, measure again by the same method, which the record
+reproduces. Add dock wait (green to boarded) by hold class and the
+CHANGES-to-repair interval beside the CHANGES rates. If the path hold's
+CHANGES rate has fallen below the landed-review rate (28% here), reopen
+the question. Whether to trade defect-catching for throughput anyway
+stays David's call.

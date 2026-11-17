@@ -18,7 +18,9 @@
 //!   a shell re-encodes is a byte the record's sha256 no longer vouches
 //!   for.
 //! - CONFIRMATION OVER STATUS CODES (the rule `boss job patch` states).
-//!   A 201 is the store's claim; the verb then GETs the attachment by
+//!   A 201 is the store's claim (and so is a 200, its answer that the
+//!   target already holds these exact bytes — backlog e5490f2e); the
+//!   verb then GETs the attachment by
 //!   its id and hashes what comes back. It reports success only when
 //!   the file it read from disk, the row's `sha256` and the bytes read
 //!   back are one digest. A store that is switched OFF answers every
@@ -208,6 +210,10 @@ pub(crate) struct Attached {
     pub(crate) size_bytes: u64,
     pub(crate) filename: String,
     pub(crate) uploaded_by: String,
+    /// The store answered the attachment the target already held for
+    /// these bytes (200) rather than a new one (201) — backlog e5490f2e.
+    /// Either way the bytes were read back and verified.
+    pub(crate) reused: bool,
 }
 
 /// Attach `path` to `target` on the store at `content_base`, and read it
@@ -267,8 +273,31 @@ pub(crate) async fn attach_at(
             body.trim()
         );
     }
-    if status != reqwest::StatusCode::CREATED {
-        bail!("POST {url} -> {status}, not 201 Created: {}", body.trim());
+    // 201 is a new attachment; 200 is the store answering the live
+    // attachment this target already holds for these exact bytes, which
+    // it hashed itself (backlog e5490f2e). Both are claims, and both
+    // meet the same checks below: the target, the digest, and the
+    // read-back. Any other status — a 409 included — is refused.
+    let reused = match status {
+        reqwest::StatusCode::CREATED => false,
+        reqwest::StatusCode::OK => true,
+        _ => bail!(
+            "POST {url} -> {status}, not 201 Created or 200 OK: {}",
+            body.trim()
+        ),
+    };
+    let row_target = (
+        row.pointer("/target/kind").and_then(Value::as_str),
+        row.pointer("/target/id").and_then(Value::as_str),
+    );
+    if row_target != (Some(target.kind), Some(target.id.as_str())) {
+        bail!(
+            "POST {url} -> {status} answered a row attached to {} {}, not {} — refusing a \
+             reference to an attachment on a target this verb did not name",
+            row_target.0.unwrap_or("<no kind>"),
+            row_target.1.unwrap_or("<no id>"),
+            target.label
+        );
     }
     let text = |k: &str| {
         row.get(k)
@@ -285,6 +314,7 @@ pub(crate) async fn attach_at(
             .with_context(|| format!("the store's row has no `size_bytes`: {body}"))?,
         filename: text("filename")?,
         uploaded_by: text("uploaded_by")?,
+        reused,
     };
     if attached.sha256 != on_disk || attached.size_bytes != size {
         bail!(
@@ -396,8 +426,13 @@ async fn run(packet: &str, file: &Path, step: Option<&str>) -> Result<()> {
     let target = target_for(&job, step)?;
     let content = crate::tenant_publish::service_on_door(&jobs_base, "content")?;
     let a = attach_at(&http, &content, &target, file, signature).await?;
+    let verb = if a.reused {
+        "was already attached"
+    } else {
+        "attached"
+    };
     println!(
-        "boss attach: {} ({} bytes, sha256 {}) attached to {} as file {}, uploaded by {}\n\
+        "boss attach: {} ({} bytes, sha256 {}) {verb} to {} as file {}, uploaded by {}\n\
          confirmed: read back from {content}/api/files/{} byte-identical",
         a.filename,
         grouped(a.size_bytes),
@@ -638,6 +673,116 @@ pub(crate) mod tests {
         .unwrap_err();
         let e = format!("{e:#}");
         assert!(e.contains("does not read back"), "{e}");
+    }
+
+    /// Backlog e5490f2e: the same bytes attached to the same target a
+    /// second time — a retried dispatch, or one whose first answer was
+    /// lost — is the attachment the target already holds, confirmed by
+    /// the same read-back, and still credited to whoever attached it
+    /// first. It used to be refused as `POST -> 409 <digest>`.
+    #[tokio::test]
+    async fn identical_bytes_attached_twice_to_one_target_are_the_one_verified_attachment() {
+        let bytes = b"one brief, sent twice\r\n\0".to_vec();
+        let path = file_of("brief.txt", &bytes);
+        let base = store().await;
+        let http = crate::sor_client::machine_client().unwrap();
+        let first = attach_at(&http, &base, &job_target(), &path, as_agent())
+            .await
+            .expect("first attach");
+        assert!(!first.reused);
+        let again = attach_at(
+            &http,
+            &base,
+            &job_target(),
+            &path,
+            identity::Signature::As("agent-retry".into()),
+        )
+        .await
+        .expect("the identical second attach is a verified reuse, not a 409");
+        assert!(again.reused);
+        assert_eq!(again.file_id, first.file_id);
+        assert_eq!(again.sha256, sha(&bytes));
+        assert_eq!(
+            again.uploaded_by, "agent-test",
+            "the first attacher keeps the credit"
+        );
+    }
+
+    /// A store's 200 is its claim of a reuse; the read-back is the fact.
+    /// A row whose bytes do not come back is refused exactly as a 201's.
+    #[tokio::test]
+    async fn a_reuse_answer_whose_bytes_do_not_read_back_is_a_failure() {
+        let bytes = b"the real bytes".to_vec();
+        let digest = sha(&bytes);
+        let row = json!({
+            "id": "0b8f6c1e-0000-4000-8000-000000000002",
+            "target": {"kind": "job", "id": job_target().id},
+            "bucket": "b", "object_key": format!("sha256/{digest}"),
+            "sha256": digest, "size_bytes": bytes.len(), "mime": "text/plain",
+            "filename": "a.txt", "uploaded_by": "agent-test",
+            "uploaded_at": "2026-09-23T00:00:00Z", "deleted_at": null
+        });
+        let liar = axum::Router::new()
+            .route(
+                "/api/files",
+                axum::routing::post(move |_: WholeRequest| {
+                    let row = row.clone();
+                    async move { (axum::http::StatusCode::OK, axum::Json(row)) }
+                }),
+            )
+            .route(
+                "/api/files/{id}",
+                axum::routing::get(|| async { "other bytes" }),
+            );
+        let path = file_of("a.txt", &bytes);
+        let e = attach_at(
+            &crate::sor_client::machine_client().unwrap(),
+            &serve(liar).await,
+            &job_target(),
+            &path,
+            as_agent(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("does not read back"), "{e:#}");
+    }
+
+    /// A row on a target the verb did not name is not this attachment,
+    /// whatever its bytes: refused before it is read back or reported.
+    #[tokio::test]
+    async fn a_row_for_another_target_is_refused() {
+        let bytes = b"the real bytes".to_vec();
+        let digest = sha(&bytes);
+        let row = json!({
+            "id": "0b8f6c1e-0000-4000-8000-000000000003",
+            "target": {"kind": "job", "id": "someone-elses-packet"},
+            "bucket": "b", "object_key": format!("sha256/{digest}"),
+            "sha256": digest, "size_bytes": bytes.len(), "mime": "text/plain",
+            "filename": "a.txt", "uploaded_by": "agent-other",
+            "uploaded_at": "2026-09-23T00:00:00Z", "deleted_at": null
+        });
+        let elsewhere = axum::Router::new().route(
+            "/api/files",
+            axum::routing::post(move |_: WholeRequest| {
+                let row = row.clone();
+                async move { (axum::http::StatusCode::OK, axum::Json(row)) }
+            }),
+        );
+        let path = file_of("a.txt", &bytes);
+        let e = attach_at(
+            &crate::sor_client::machine_client().unwrap(),
+            &serve(elsewhere).await,
+            &job_target(),
+            &path,
+            as_agent(),
+        )
+        .await
+        .unwrap_err();
+        let e = format!("{e:#}");
+        assert!(
+            e.contains("attached to job someone-elses-packet, not packet 7610dd2f"),
+            "{e}"
+        );
     }
 
     fn packet() -> Value {

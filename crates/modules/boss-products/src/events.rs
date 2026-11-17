@@ -9,6 +9,9 @@
 /// re-emission of the same SKU UPSERTs the catalog row.
 pub const PRODUCT_UPSERTED: &str = "products.product.upserted";
 
+/// One complete immutable catalog version; a duplicate leaves no new fact.
+pub const SKU_VERSION_APPENDED: &str = "products.sku.version.appended";
+
 /// Full ProductInventory row state on (sku, location) upsert.
 /// Production side-effects + sale consume side-effects emit this.
 pub const PRODUCT_INVENTORY_UPSERTED: &str = "products.inventory.upserted";

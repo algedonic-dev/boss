@@ -169,11 +169,21 @@
 #                         packet, not a unit timeout
 #   BOSS_RUN_SUMMARY_FILE where cli_sha / cli_result / cli_action /
 #                         cli_image land (infra/run-summary.sh)
+#   BOSS_CLI_FORWARD_ONLY a git checkout to judge ancestry from: set, a
+#                         <sha> that is an ancestor of the generation
+#                         `current` names is refused under the store's
+#                         lock (exit 3) — see NEVER BACKWARDS below.
+#                         Unset (boss-gcp, the forge), an older sha
+#                         installs: there it is a rollback target
 #
 # EXIT
 #   0  the CLI at <sha> is confirmed on the host path
 #   1  refused / not confirmed — cli_result on the packet says which
 #   2  usage
+#   3  superseded — BOSS_CLI_FORWARD_ONLY is set and `current` already
+#      names a later commit than <sha>; nothing changed
+#   4  unordered — BOSS_CLI_FORWARD_ONLY is set and git could not say
+#      whether <sha> is behind `current`; refused, nothing changed
 #   75 not yet — the registry has no image for <sha>'s tag (the deploy
 #      runner has not built it); nothing changed, the next tick retries
 set -uo pipefail
@@ -250,14 +260,16 @@ run_summary_field cli_image "$IMAGE"
 # One exit path for every verdict that is not "ok": the packet carries
 # the verdict, the journal carries the paragraph, and `current` is
 # whatever it was. A `not yet:` verdict exits 75 — the wait, not the
-# fault — and every other exits 1.
+# fault — a `superseded:` one 3 (a later generation is already in
+# place; see NEVER BACKWARDS), an `unordered:` one 4 (forward-only could
+# not read the order), and every other exits 1.
 refuse() { # <cli_result> <message...>
     local result="$1"; shift
     printf '%s: %s — %s\n    %s\n' "$NAME" "$(printf '%s' "${result%%:*}" | tr '[:lower:]' '[:upper:]')" "${result#*: }" "$*" >&2
     run_summary_field cli_result "$result"
     run_summary_note "$NAME: $result — $*"
     [ -n "${stage:-}" ] && rm -rf "$stage"
-    case "$result" in "not yet:"*) exit 75 ;; esac
+    case "$result" in "not yet:"*) exit 75 ;; "superseded:"*) exit 3 ;; "unordered:"*) exit 4 ;; esac
     exit 1
 }
 
@@ -309,6 +321,47 @@ exec 9<"$LOCK" || refuse "failed: cannot open $LOCK" "the store's install lock c
 if ! flock -w "$LOCK_WAIT" 9; then
     refuse "not yet: another install into $STORE held its lock for ${LOCK_WAIT}s" \
         "a concurrent run of this installer is still pulling into $STORE (BOSS_CLI_LOCK_WAIT=${LOCK_WAIT}s); nothing was touched. Retry: the waiter that gets the lock finds its generation, if the holder installed one, and fetches nothing."
+fi
+
+# --- never backwards, judged under the lock ---------------------------------
+# NEVER BACKWARDS (review fea0a737 of car a51bb843, backlog f72c9a8f).
+# The dev pod's sidecar installs the newest built train before main when
+# main's image is late, and it judged "is the store behind this train"
+# BEFORE this lock: a shim install of main that finished between that
+# judgement and the sidecar's turn here was then overwritten by the
+# older train — reproduced with the sidecar's own helpers. A judgement
+# made outside the lock every writer of this store takes cannot hold, so
+# the caller names the checkout to judge from and the judgement is made
+# HERE, holding it: a <sha> that is an ancestor of the generation
+# `current` names now is `superseded` (exit 3) and nothing is touched —
+# not the wrapper, not `current`, not the selector below. Opt-in,
+# because on boss-gcp and the forge an older sha is a rollback target
+# (CLAUDE.md §Diagnosis: "roll back" is a target), and they never set
+# it. git answering 1 (not an ancestor, unrelated history included) is
+# not backwards and installs.
+#
+# AN ORDER GIT CANNOT READ IS NOT A PASS (review 5f191039). This used
+# to log any other answer — an unknown commit, a checkout git refuses
+# to read, a git that is not there (128, 127, …) — and install anyway,
+# which the reviewer reproduced moving `current` back to an older sha
+# with exit 128 injected into this one read. A caller that asked for
+# forward-only asked for proof, and no evidence is not a pass: the
+# install is `unordered` (exit 4), refused before anything is touched,
+# with git's own words printed whole, and the sidecar files it as a
+# problem like any other refusal.
+if [ -n "${BOSS_CLI_FORWARD_ONLY:-}" ]; then
+    held="$(readlink "$STORE/current" 2>/dev/null || true)"
+    if [ -n "$held" ] && [ "$held" != "$SHA" ]; then
+        order=0
+        order_said="$(git -C "$BOSS_CLI_FORWARD_ONLY" merge-base --is-ancestor "$SHA" "$held" 2>&1)" || order=$?
+        case "$order" in
+            0) refuse "superseded: $STORE/current already names $held, a later commit than $SHA" \
+                   "BOSS_CLI_FORWARD_ONLY=$BOSS_CLI_FORWARD_ONLY: another install put $held in place first, and $SHA is its ancestor, so installing it would move the store backwards; current stays at $held and nothing was touched." ;;
+            1) ;;
+            *) refuse "unordered: git could not order $SHA against current $held (exit $order)" \
+                   "BOSS_CLI_FORWARD_ONLY=$BOSS_CLI_FORWARD_ONLY: forward-only needs git to say whether $SHA is behind $held, and git -C $BOSS_CLI_FORWARD_ONLY merge-base --is-ancestor $SHA $held exited $order, saying in full: ${order_said:-nothing}. Unproved is not forward, so current stays at $held and nothing was touched." ;;
+        esac
+    fi
 fi
 
 # --- the wrapper, current with the tree -------------------------------------
@@ -377,7 +430,9 @@ http_get() { # <url> <out-file> <headers-file> <accept|""> -> prints the http co
     local -a args=(-sS -o "$out" -D "$hdrs" -w '%{http_code}' --max-time "$left" -L)
     [ -n "$accept" ] && args+=(-H "Accept: $accept")
     [ -n "$TOKEN_HDR" ] && args+=(-H "$TOKEN_HDR")
-    curl "${args[@]}" "$url"
+    # -q FIRST (review 3874e4a8): the registry pull token rides in args
+    # above, and a curlrc read before argv could send it elsewhere.
+    curl -q "${args[@]}" "$url"
 }
 
 # Refuse with the request named and its body printed whole.

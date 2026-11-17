@@ -82,7 +82,7 @@ export type ReleaseResult =
 /// changes hands "by release", and offered no release):
 ///
 /// 1. the merge door: the run edge cleared and the `released` stamp
-///    `{why, by, at, from_run}` recorded, in one write
+///    `{why, by, at, from_run, from}` recorded, in one write
 ///    ([`releaseMetadata`]);
 /// 2. the PUT: [`RELEASE`] — `ready`, nobody's;
 /// 3. the read-back, because a 2xx is a claim and the step as it now
@@ -93,7 +93,11 @@ export type ReleaseResult =
 /// 675f1858, #2). The next holder takes the step through the claim.
 export async function releaseStep(
   jobId: string,
-  step: Readonly<{ id: string; metadata: Readonly<Record<string, unknown>> }>,
+  step: Readonly<{
+    id: string;
+    assignee_id?: string | null;
+    metadata: Readonly<Record<string, unknown>>;
+  }>,
   why: string,
   by: string | null,
   opts?: WriteOpts,
@@ -107,7 +111,7 @@ export async function releaseStep(
   const merged = await mergeStepMetadata(
     jobId,
     step.id,
-    releaseMetadata(step.metadata, why, by, new Date().toISOString()),
+    releaseMetadata(step.metadata, why, by, new Date().toISOString(), step.assignee_id ?? null),
     opts,
   );
   if (merged.kind === 'failed') return merged;

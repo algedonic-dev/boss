@@ -97,11 +97,14 @@
 #
 # THE PLAN (stdout; sha256 on stderr as `plan-sha256:`, since a hash
 # cannot be inside what it hashes) names the volume, its size, the three
-# trim settings, the replica to move and its disk's ledger, the count's
-# path (N -> N+1 -> N), every target disk with its ledger sum, what the
+# trim settings, the replica to move, the count's
+# path (N -> N+1 -> N), every target disk and its headroom verdict, what the
 # remaining replicas' disks admit after the move, every step and every
 # Longhorn disk's verdict. No clock, no live free space and no actualSize
-# in the bytes. The count and the replicas before are IN the bytes, so a
+# in the bytes. Ledger arithmetic and the attached engine's current node
+# also ride unsigned diagnostics, as do the reasons a disk is not a
+# target: changing a reason must not void an unchanged verdict (856f070e).
+# The count and the replicas before are IN the bytes, so a
 # second run of an applied plan re-renders to a refusal: at most once.
 #
 # THE WRITE, in this order, each step only when the one before read back:
@@ -375,7 +378,8 @@ facts() {
         | [$rdisks[] | select(.d == null or .d.room == null) | "disk \(.uuid) on \(.node)"] as $unknown
         | [$rdisks[] | select(.d != null and .d.room != null)
             | . + {per: ((.d.room / .count) | floor)}
-            | . + {line: "disk \(.uuid) (\(.d.name) on \(.d.node)): \(.count) replica(s) of this volume; ProvisionedLimit (\(.d.max) - \(.d.reserved)) x \($opct)% = \(.d.limit); storageScheduled \(.d.scheduled); room \(.d.room) bytes, \(.per) per replica — \(if .per >= $size then "admits growth to twice the volume (\(2 * $size) bytes)" else "SHORT: admits growth of \(.per) bytes, not the volume'"'"'s \($size)" end)"}]
+            | . + {line: "disk \(.uuid) (\(.d.name) on \(.d.node)): \(.count) replica(s) of this volume; ProvisionedLimit (\(.d.max) - \(.d.reserved)) x \($opct)% = \(.d.limit); storageScheduled \(.d.scheduled); room \(.d.room) bytes, \(.per) per replica — \(if .per >= $size then "admits growth to twice the volume (\(2 * $size) bytes)" else "SHORT: admits growth of \(.per) bytes, not the volume'"'"'s \($size)" end)",
+                   decision: "disk \(.uuid) (\(.d.name) on \(.d.node)): \(.count) replica(s) of this volume; \(if .per >= $size then "admits growth to twice the volume (\(2 * $size) bytes)" else "SHORT: does not admit growth to twice the volume (\(2 * $size) bytes)" end)"}]
             | sort_by(.uuid) as $known
         # The disks after the move: every replica disk but the moving
         # replica'"'"'s, one fewer on that disk.
@@ -408,7 +412,7 @@ facts() {
                   (if ([$dsel[] | select(($d.tags | index(.)) == null)] | length) > 0
                    then "disk tags \($d.tags) do not hold the volume'"'"'s diskSelector \($dsel)" else empty end),
                   (if $d.room == null then "its ledger is unreported"
-                   elif $d.room < $size then "room \($d.room) bytes is short of the replica'"'"'s \($size)" else empty end)]) as $why
+                   elif $d.room < $size then "ledger headroom is short of one replica" else empty end)]) as $why
             | {uuid: $d.uuid, node: $d.node, name: $d.name, room: $d.room,
                target: ($why == []),
                ok: ($why == [] and $d.room >= 2 * $size),
@@ -421,7 +425,10 @@ facts() {
                line: (if $why == []
                       then "disk \($d.uuid) (\($d.name) on \($d.node)): TARGET — ProvisionedLimit (\($d.max) - \($d.reserved)) x \($opct)% = \($d.limit); storageScheduled \($d.scheduled); headroom \($d.room) bytes \(if $d.room >= 2 * $size then ">=" else "<" end) 2 x \($size) = \(2 * $size)\(if $d.room >= 2 * $size then "" else " — Longhorn may place the replica here, and the volume'"'"'s next growth would fail the webhook on this disk" end)"
                       else "disk \($d.uuid // $d.name) (\($d.name) on \($d.node)): not a target — \($why | join("; "))" end),
-               live: "disk \($d.uuid // $d.name) (\($d.name) on \($d.node)): storageAvailable \(if $d.available == null then "unreported" else "\($d.available) bytes" end) against the floor \(($d | lh_floor($mpct)) // "unknown"); the volume'"'"'s actualSize \($actual // "unreported")"}]
+               decision: (if $why == []
+                          then "disk \($d.uuid) (\($d.name) on \($d.node)): TARGET — \(if $d.room >= 2 * $size then "admits" else "SHORT of" end) ledger headroom for twice the volume (\(2 * $size) bytes)"
+                          else "disk \($d.uuid // $d.name) (\($d.name) on \($d.node)): not a target" end),
+               live: "disk \($d.uuid // $d.name) (\($d.name) on \($d.node)): ProvisionedLimit (\($d.max) - \($d.reserved)) x \($opct)% = \($d.limit); storageScheduled \($d.scheduled); room \($d.room) bytes; storageAvailable \(if $d.available == null then "unreported" else "\($d.available) bytes" end) against the floor \(($d | lh_floor($mpct)) // "unknown"); the volume'"'"'s actualSize \($actual // "unreported")"}]
             | sort_by(.node, .name) as $verdicts
         | {size: $size, opct: $opct, mpct: $mpct,
            current: ($V.spec.numberOfReplicas // null),
@@ -447,7 +454,9 @@ facts() {
            rep: (if $R == null then null
                  else {node: ($R.spec.nodeID // "no node"), disk: ($R.spec.diskID // "none"), healthy: ($R | lh_healthy)} end),
            unknown: $unknown,
-           disk_lines: [$known[] | .line],
+           disk_lines: [$known[] | .decision],
+           disk_live: [$known[] | .line],
+           short_after_decisions: [$remain[] | select(.per < $size) | .decision],
            short_after: $short_after,
            blocked: $blocked,
            after_fit: (if $remain == [] then null else ([$remain[] | .per] | min) + $size end),
@@ -455,8 +464,8 @@ facts() {
            short_targets: [$verdicts[] | select(.target and (.ok | not)) | .line],
            live_short: [$verdicts[] | select(.target and .live_why != []) | "disk \(.uuid) (\(.name) on \(.node)): \(.live_why | join("; "))"],
            after_live: $after_live,
-           verdicts: [$verdicts[] | .line],
-           live: [$verdicts[] | .live]}) end' 2> "$WORK/facts.err"
+           verdicts: [$verdicts[] | .decision],
+           live: [$verdicts[] | .line, .live]}) end' 2> "$WORK/facts.err"
 }
 
 # render — read Longhorn now, apply the bounds, and write the plan to
@@ -551,13 +560,15 @@ bounds_targets() {
 }
 
 write_plan() {
+    echo "$ME: live, not signed: attached engine on $(q .on); remaining disks admit up to $(q .after_fit) bytes" >&2
+    jq -r --arg me "$ME" '.disk_live[] | "\($me): live, not signed: \(.)"' "$F" >&2
     jq -r --arg me "$ME" '.after_live[] | "\($me): live, not signed — a remaining replica disk that would refuse the volume'"'"'s growth to twice today, so the read-back will name it: \(.)"' "$F" >&2
     {
         echo "plan: move-volume-replica"
         echo "volume: $VOL"
         echo "claim: $(q .claim)"
         echo "size: $SIZE bytes ($(q '.size | if . % 1073741824 == 0 then "\(. / 1073741824) GiB" else "~\(. / 1073741824 | floor) GiB" end'))"
-        echo "state: $(q .state)$( [ -n "$(q .on)" ] && echo " on $(q .on)")"
+        echo "state: $(q .state)"
         echo "robustness: healthy"
         echo "data engine: $(q .engine)"
         echo "anti-affinity: one replica per node ($(q .anti))"
@@ -568,9 +579,9 @@ write_plan() {
         echo "targets: the new replica lands on a node holding none, on one of these $(q '.targets | length') disk(s), each with ledger headroom for at least twice the volume ($((2 * SIZE)) bytes): $TARGETS"
         echo "live: each target passes Longhorn v1.11.3's placement test, IsSchedulableToDisk(size, actualSize), and the volume's next growth there by CheckReplicasSizeExpansion's per-disk test — judged at this render and again at the write's; the figures ride stderr, not these bytes"
         if [ "$(q '.short_after | length')" -eq 0 ]; then
-            echo "after: every replica's disk admits growth to twice the volume in its ledger; the remaining disks admit up to $(q .after_fit) bytes"
+            echo "after: every replica's disk admits growth to twice the volume in its ledger"
         else
-            echo "after: the remaining replicas' disks admit up to $(q .after_fit) bytes, and these are SHORT of twice the volume, so the read-back will say the volume is not yet free to grow: $(q '.short_after | join("; ")')"
+            echo "after: remaining replica disks are SHORT of twice the volume, so the read-back will say the volume is not yet free to grow: $(q '.short_after_decisions | join("; ")')"
         fi
         echo "step 1: kubectl patch volumes.longhorn.io $VOL -n $LH --type=json — test that spec.numberOfReplicas is still $N, replace it with $((N + 1))"
         echo "step 2: wait up to ${REBUILD_S}s for a replica not listed below to read healthy on a target disk; otherwise the count STAYS $((N + 1)), $REP is NOT deleted, and the run says so"

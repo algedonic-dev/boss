@@ -513,7 +513,8 @@ pub(crate) fn people_error_response(e: PeopleError) -> Response {
         // less than this (review c3b96c09 F2, 2026-10-06: the guard
         // logged nothing, so a 503 could not be read where it landed).
         // The reason is the guard's own fixed text — which source, which
-        // status — never a URL, a token or an upstream body.
+        // status, which transport cause (2a30b1c3) — never a URL, a token
+        // or an upstream body.
         PeopleError::Unavailable(msg) => {
             tracing::warn!(reason = %msg, "coverage guard could not judge a People write; answering 503");
             (StatusCode::SERVICE_UNAVAILABLE, msg).into_response()

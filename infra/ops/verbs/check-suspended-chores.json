@@ -1,0 +1,11 @@
+{
+  "about": "READ-ONLY: which cluster chores (CronJobs labelled boss-chore=true, in any namespace) stand suspended, and since when (infra/forge/check-suspended-chores.sh; backlog 87e08026, car 2 of d28c0051). Takes no arguments. WHY: the converge's client-side apply does not own spec.suspend, so it keeps a live suspend=true across every apply, and check-manifests-applied only asks that each CronJob exists, so a chore suspended by hand (boss/boss-search-reindex, 2026-11-11 05:02Z) and never resumed stood suspended in silence. Through the forge's ops_kubectl door, one kubectl get: the labelled CronJobs as a list with their managedFields (kubectl hides them by default). Each suspended chore is printed with its lastScheduleTime and how long it has been suspended — the API server's own managedFields time for the entry that owns spec.suspend, never a clock kept here. Its last line is the verdict `READ — suspended <n>, oldest_hours <h>, chores <ns/name,...|none>`. Filed every day by the dispatcher rule check-suspended-chores-daily and judged by watch-check-suspended-chores-daily, which files one urgent alarm for a pass whose oldest suspension has stood 24 hours — the threshold is the watch's `when`, not a number here. A read that could not look, an answer naming no labelled CronJob at all (every chore carries the label, so that is a wrong target, not 'none'), or a suspended chore whose suspension time cannot be read is CANNOT ANSWER (exit 1) with no verdict, which the watch alarms on too. Timeout 180: one read bounded at 20 s and, the first time, the door image's pull bounded at 120 s.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/check-suspended-chores.sh"
+  ],
+  "params": [],
+  "timeout": 180
+}

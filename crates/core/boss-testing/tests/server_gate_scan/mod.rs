@@ -377,7 +377,10 @@ impl Function<'_> {
                 };
                 matches!(
                     resolved.as_str(),
-                    "machine_gate::mount" | "boss_core::machine_gate::mount"
+                    "machine_gate::mount"
+                        | "boss_core::machine_gate::mount"
+                        | "machine_gate::mount_with_request_latency"
+                        | "boss_core::machine_gate::mount_with_request_latency"
                 )
             }
             syn::Expr::Path(_) => variable(expr).is_some_and(|v| {

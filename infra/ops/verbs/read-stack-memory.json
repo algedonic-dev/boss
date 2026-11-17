@@ -1,0 +1,8 @@
+{
+  "about": "READ-ONLY fixed per-instance stack memory point observations: boss and boss-playground, with target nodes cp-3 and w-1. Resolve each Deployment boss through its ReplicaSet and exact running Pod/container UID before and after the read. Existing forge ops_kubectl credential reads fixed kubelet summaries; no new nodes/proxy grant, arbitrary path, exec, environment or packet parameters. Conserve full bounded native streams and source identities in an attachment. Missing, stale, replaced, oversized, unschedulable or refused data is unavailable, never zero. Both 12Gi limits remain UNMEASURED: working set is not a lifetime peak, safe memory limit, aggregate capacity or cause proof. No placement, resource or node configuration changes by this reader. Backlog 6fd7ea29.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/read-stack-memory.sh"],
+  "params": [],
+  "capture": "separate-streams",
+  "timeout": 310
+}

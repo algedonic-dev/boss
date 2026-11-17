@@ -1,6 +1,6 @@
 # Design: design docs as data — the discussion moves into BOSS
 
-**Status**: approved — in-review — open questions tracked at `/system/design` (2026-08-16).
+**Status**: approved — all eight questions resolved 2026-08-16 (§Decisions below).
 **Source**: feedback `19614937`, reframed by David 2026-08-08: design
 prose rides the PR train because git is its system of record and BOSS
 is a read-through cache of the checkout — but the train exists for
@@ -40,9 +40,10 @@ code toll.
   `boss-docs-api` indexes `{repo_root}/docs/design/*.md` (18 docs)
   into `design_docs` + `design_questions` rows; reindex runs at
   startup or via `POST /api/design/reindex`; malformed docs are
-  rejected into `/api/design/rejections`. What is reviewable at
-  `/system/design` equals whatever branch `/opt/boss` has checked
-  out.
+  rejected into `/api/design/rejections`. What is reviewable on the
+  design review page (then `/system/design`; the page lives at
+  `/it/design` since `/system` retired on 2026-08-31) equals whatever
+  branch `/opt/boss` has checked out.
 - **The decision flow is already data.** Review Jobs
   (`design-doc-review` + the `review-design` step plugin), pending
   resolutions (`design_pending_decisions`), and flush jobs
@@ -84,8 +85,8 @@ The audit-log Q2/Q6 arc, run through the current pipeline end to end:
    deployment.** It pushes `origin`, which 403s from the playground;
    the code documents the workaround env var. The sanctioned writer
    of decisions fails without operator folklore.
-4. **Reviewable = checked out.** Making the updated doc readable at
-   `/system/design` before merge required checking its branch out
+4. **Reviewable = checked out.** Making the updated doc readable on
+   the design review page before merge required checking its branch out
    globally — blocking the train conductor's clean-on-main deploy
    check — then relying on the persisted index *not* being refreshed
    after switching back. A correctness property held by not running
@@ -122,8 +123,9 @@ supersedes v(n); an open review pins to the version it opened under.
   rather than text a worker splices into markdown. The
   anchor-matching rewrite, the flush worker's git dance, and failure
   modes 1–3 above are deleted, not fixed.
-- **Authoring.** `/system/design` gains authoring the way
-  `/system/workflows` has it, and the same API serves agents — an
+- **Authoring.** The design review page (`/it/design`) gains authoring
+  the way the workflow registry (`/it/registry`) has it, and the same
+  API serves agents — an
   agent posts analysis from its session and the reader sees it
   seconds later, policy-gated and provenance-stamped like any other
   write. Failure modes 4–5 cease to exist.

@@ -87,9 +87,19 @@ pub(crate) struct Stub {
     pub base: String,
     writes: Arc<Mutex<Vec<String>>>,
     sent: Arc<Mutex<Vec<(String, Value)>>>,
+    reads: Arc<Mutex<Vec<String>>>,
 }
 
 impl Stub {
+    pub(crate) fn read_count(&self, path: &str) -> usize {
+        self.reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|seen| seen.as_str() == path)
+            .count()
+    }
+
     pub(crate) fn writes(&self) -> Vec<String> {
         self.writes.lock().unwrap().clone()
     }
@@ -109,8 +119,20 @@ impl Stub {
 /// first matching route wins; an unmatched GET is a 404. Every other
 /// method is recorded as a write and answered with a created id.
 pub(crate) async fn serve(answers: Vec<(&'static str, Value)>) -> Stub {
+    serve_sequence(answers, vec![]).await
+}
+
+/// Finite response changes let tests observe an actual failed read and its retry.
+/// The final answer repeats; every GET is counted independently of writes.
+pub(crate) async fn serve_sequence(
+    answers: Vec<(&'static str, Value)>,
+    sequences: Vec<(&'static str, Vec<Value>)>,
+) -> Stub {
     let writes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sent: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+    let reads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let read_log = reads.clone();
+    let sequences = Arc::new(Mutex::new(sequences));
     let log = writes.clone();
     let bodies = sent.clone();
     let answers = Arc::new(answers);
@@ -118,6 +140,8 @@ pub(crate) async fn serve(answers: Vec<(&'static str, Value)>) -> Stub {
         let answers = answers.clone();
         let log = log.clone();
         let bodies = bodies.clone();
+        let reads = read_log.clone();
+        let sequences = sequences.clone();
         async move {
             if method != Method::GET {
                 // A write to a step the fixtures hold as finished is
@@ -163,6 +187,22 @@ pub(crate) async fn serve(answers: Vec<(&'static str, Value)>) -> Stub {
                     .push((format!("{method} {}", uri.path()), parsed));
                 return axum::Json(json!({ "id": "stub-created" })).into_response();
             }
+            let path = uri.path_and_query().unwrap().as_str().to_string();
+            reads.lock().unwrap().push(path.clone());
+            if let Some((_, replies)) = sequences
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|(route, _)| *route == path)
+            {
+                assert!(!replies.is_empty(), "a response sequence cannot be empty");
+                let body = if replies.len() > 1 {
+                    replies.remove(0)
+                } else {
+                    replies[0].clone()
+                };
+                return axum::Json(body).into_response();
+            }
             answer(&answers, &uri)
         }
     });
@@ -173,6 +213,7 @@ pub(crate) async fn serve(answers: Vec<(&'static str, Value)>) -> Stub {
         base: format!("http://{addr}"),
         writes,
         sent,
+        reads,
     }
 }
 

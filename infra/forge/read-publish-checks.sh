@@ -220,7 +220,7 @@ publish_pr_states "read-publish-checks"
 #    The read carries the machine token as the writes do (backlog
 #    44b2087e: it went out with x-boss-user alone, six times in half an
 #    hour on 2026-10-07, each a caller the jobs gate would refuse).
-if ! curl -fsS -H "x-boss-user: $BOSS_USER" \
+if ! curl -q -fsS -H "x-boss-user: $BOSS_USER" \
         ${MT_HDR:+-H "$MT_HDR"} \
         "$BASE/api/jobs?kind=publish-to-github&status=open&limit=20&full=true" > "$workdir/jobs" 2> "$workdir/err"; then
     fail "jobs API unreachable at $BASE — $(cat "$workdir/err")"
@@ -266,7 +266,7 @@ job_id=$(printf '%s' "$target" | jq -r '.id')
 #     A hand run has no request, and writes nothing here.
 if [[ "${OPS_REQUEST_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
     jq -n -c --arg p "$job_id" '{for_publish: $p}' > "$workdir/for-publish"
-    if curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+    if curl -q -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
             ${MT_HDR:+-H "$MT_HDR"} \
             --data-binary @"$workdir/for-publish" "$BASE/api/jobs/$OPS_REQUEST_ID/metadata" > /dev/null 2>"$workdir/err"; then
         say "request ${OPS_REQUEST_ID:0:8} names publish $job_id (for_publish)"
@@ -294,7 +294,7 @@ gh_get() {
     # One GET against the public API; the body to stdout, curl's words
     # to $workdir/err. No token: the mirror is public, and this verb
     # holds none.
-    curl -fsS -H "accept: application/vnd.github+json" "$GITHUB_API/repos/$MIRROR_SLUG/$1" 2>"$workdir/err"
+    curl -q -fsS -H "accept: application/vnd.github+json" "$GITHUB_API/repos/$MIRROR_SLUG/$1" 2>"$workdir/err"
 }
 checks="$workdir/checks.json"
 # A GitHub that cannot be read is a FAILURE, not a not-yet: nothing was
@@ -338,7 +338,7 @@ if [ -n "$note" ]; then
                                       annotations: .output.annotations_count, url: .html_url,
                                       app: .app.slug}],
             still_running: [.check_runs[]? | select(.status != "completed") | .name]}}' "$checks" > "$workdir/partial"
-    curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+    curl -q -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
         ${MT_HDR:+-H "$MT_HDR"} \
         --data-binary @"$workdir/partial" "$BASE/api/jobs/$job_id/metadata" > /dev/null 2>"$workdir/err" \
         || fail "writing the partial reading onto ${job_id:0:8} (PATCH /api/jobs/$job_id/metadata) — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
@@ -492,7 +492,7 @@ if [ -n "$running" ]; then
     if [ "$past" -eq 0 ]; then
         # The partial reading goes on the packet — the scan's counts are
         # final, and what is still running is named — and nothing else.
-        curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+        curl -q -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
             ${MT_HDR:+-H "$MT_HDR"} \
             --data-binary @"$workdir/reading" "$BASE/api/jobs/$job_id/metadata" > /dev/null 2>"$workdir/err" \
             || fail "writing the partial reading onto ${job_id:0:8} (PATCH /api/jobs/$job_id/metadata) — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
@@ -515,7 +515,7 @@ failing=$(jq -r '[.code_scanning.failing[]
       + (if .annotations_unread then " (its annotations could not be read)" else "" end)]
     | join("; ")' "$workdir/reading")
 
-curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+curl -q -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
     ${MT_HDR:+-H "$MT_HDR"} \
     --data-binary @"$workdir/reading" "$BASE/api/jobs/$job_id/metadata" > /dev/null 2>"$workdir/err" \
     || fail "writing the reading onto ${job_id:0:8} (PATCH /api/jobs/$job_id/metadata) — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
@@ -533,11 +533,11 @@ jq -n -c --arg c "$conclusion" --arg a "$alerts" --arg r "$rules" --arg h "$head
      failing: $f, still_running: $s}' \
     > "$workdir/payload"
 printf '%s\n' '{"status":"completed"}' > "$workdir/done"
-curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+curl -q -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
     ${MT_HDR:+-H "$MT_HDR"} \
     --data-binary @"$workdir/payload" "$BASE/api/jobs/$job_id/steps/$step_id/metadata" > /dev/null 2>"$workdir/err" \
     || fail "the reading is on ${job_id:0:8} but writing it onto read-checks failed — $(head -c 300 "$workdir/err" | tr '\n' ' '); complete the step by hand with conclusion=$conclusion alerts=$alerts rules=$rules"
-curl -fsS -X PUT -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+curl -q -fsS -X PUT -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
     ${MT_HDR:+-H "$MT_HDR"} \
     --data-binary @"$workdir/done" "$BASE/api/jobs/$job_id/steps/$step_id" > /dev/null 2>"$workdir/err" \
     || fail "the reading is on ${job_id:0:8} and on read-checks, but completing read-checks failed — $(head -c 300 "$workdir/err" | tr '\n' ' '); complete the step by hand"

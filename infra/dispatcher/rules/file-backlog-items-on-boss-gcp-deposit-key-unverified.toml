@@ -1,0 +1,86 @@
+# A deposit-key audit on boss-gcp that cannot judge the file, tick after
+# tick, is alarmed off the converge's own record (backlog ada4d019;
+# review ee6589a9 N1 of car 3cd92f7a).
+#
+# boss-gcp-converge.service runs infra/gcp/audit-deposit-keys.sh over
+# the deposit account's authorized_keys every half hour and records
+# `deposit_key_verdict` on its `run` step: clean, unconfined or
+# unverified. `unconfined` is a finding and is
+# file-backlog-items-on-boss-gcp-deposit-key-unconfined's. `unverified`
+# is the audit failing to reach a verdict at all — a file it could not
+# read, a NUL byte, the converge's 60 s bound — and that rule files
+# nothing for it, rightly: no evidence is not a finding. Until this rule
+# nothing else read the word either, so an audit that could NEVER judge
+# the file read unverified every half hour, forever, and nobody was told:
+# "a check nobody reads is a check that is not running" (CLAUDE.md,
+# Diagnosis). One known way in, measured by car 3cd92f7a's builder: the
+# audit's option split is quadratic, so a receiver line with a ~200 KB
+# option field outruns the bound and reads UNVERIFIED, never clean.
+#
+# THE RULE SELECTS THE TICK; THE HANDLER COUNTS. `when` picks the run
+# step of a tick that recorded a verdict, the shape the unconfined rule
+# fires on. On an unverified tick the
+# streak judge then reads the newest converge packets back from the jobs
+# API — the state is the packets, nothing is held in a process — and
+# files ONE backlog-item only when the newest `n` completed runs ALL
+# read unverified. Any run that reads otherwise (clean, unconfined, or
+# no verdict) resets the count.
+#
+# N = 3 AGAINST THE 30-MINUTE TICK. One unverified tick is a home that
+# stalled once or a converge killed mid-audit; three in a row is 60-90
+# minutes with no verdict on a root door's key file, which is a
+# condition — the persistence the estate alarm uses for a level
+# (estate_alarm::PERSIST_N), at the same order of minutes. It is not a
+# pager: an unverified file has shown no finding, so the item is
+# standard priority, like the unconfined one.
+#
+# ONE ITEM WHILE IT IS OPEN, deduped by the route below (the key the
+# chore judge dedups on). A closed item files again on the next streak:
+# a recurrence after a fix is a new fact.
+#
+# THE RUN THAT READS OTHERWISE ENDS IT (v2, backlog 3ff17da3; review
+# 9c86843a of car 3d96add5). v1 selected unverified ticks only, so the
+# tick that broke a streak never reached the judge and nothing closed
+# its item: the audit could read clean for weeks under an open item,
+# and when it went blind again the new streak was folded into it as
+# "already open; nothing filed" — the reader saw no new fact. So the
+# rule now hands the judge every tick whose audit RECORDED a verdict.
+# A clean or unconfined tick is the audit judging the file again: the
+# judge closes the open item it filed (the triage step `stale`, citing
+# that run and its audit line), and only if nobody has acted on it
+# since — an item a person annotated or routed is told it recovered and
+# stays theirs. A tick with no verdict at all is not evidence the audit
+# recovered and is still not selected. The unconfined rule reads the
+# unconfined tick as well; the two write to different routes and
+# different notes, so neither judges the other's item.
+[[rule]]
+name = "file-backlog-items-on-boss-gcp-deposit-key-unverified"
+why = """
+A THRESHOLD, the second of the dispatcher's three sanctioned roles
+(David, 2026-08-14: clock, threshold, matchmaking). What files is a
+LEVEL integrated over time — the same verdict on N consecutive runs of
+a maintenance packet — which no Workflow consequence can express: the
+converge's protocol records its own run, and cannot see its previous
+runs or open another kind's packet. Measured by review ee6589a9 N1 of
+car 3cd92f7a and re-measured by triage on origin/main cfae8594e: the
+only rule reading deposit_key_verdict fired on unconfined alone, so an
+unverified audit was read by nothing. No authority widened: the
+handler's only writes are one standard backlog-item owned by the
+platform owner and one `verdict_streak` note on the converge's own
+packet, the shape the chore judge already writes. Nothing on the host
+is touched, and nothing about how the audit judges a key changes.
+v2 (backlog 3ff17da3) adds one write: on a tick that reads clean or
+unconfined, the handler completes the `triage` step of the item IT
+filed as `stale` — only while that step is still unrouted and the item
+carries no key but the ones it was filed with — or merges a recovery
+note onto it otherwise. It touches no item it did not file.
+"""
+# v2 (backlog 3ff17da3): every judged tick, so the streak's end closes
+# its item. Without the bump the seed keeps the v1 row and this edit
+# never goes live (732c3cf9).
+version = 2
+on_event = "step.done.task"
+when = 'workflow_kind = "maintenance-boss-gcp-converge" AND spec_slug = "run" AND (metadata.deposit_key_verdict = "unverified" OR metadata.deposit_key_verdict = "clean" OR metadata.deposit_key_verdict = "unconfined")'
+[[rule.do]]
+handler = "maintenance.verdict.streak"
+args = { step = "\"run\"", field = "\"deposit_key_verdict\"", value = "\"unverified\"", n = "3", evidence = "\"deposit_key_audit\"", route = "\"boss-gcp-converge/deposit-key-unverified\"", title = "\"boss-gcp's deposit-key audit cannot judge the file\"", design = "\"bdc60b65\"", area = "\"credentials\"" }

@@ -35,10 +35,10 @@ documentation directory.
   [`architecture-decisions.md`](architecture-decisions.md) each
   release.
 - **[runbooks/](runbooks/)** — operator + developer runbooks.
-- **[architecture/](architecture/)** — Mermaid sources + rendered
-  SVG / PNG for the four architecture diagrams. The app's IT
-  Knowledge Base page (`/system/kb`) imports these SVGs to render them
-  in-app.
+- **[architecture/](architecture/)** — the Mermaid sources of the
+  four architecture diagrams, and nothing rendered: the app's IT
+  Knowledge Base page (`/it/kb`) draws each one in the browser from
+  its `.mmd` file.
 - **[formal/](formal/)** — TLA+ specs (`StepStatus.tla` for the
   Step lifecycle, `LedgerPeriodLock.tla` for journal posting +
   period locks) that the TLC model checker exhaustively verifies on

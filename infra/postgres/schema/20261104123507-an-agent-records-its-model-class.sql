@@ -1,0 +1,25 @@
+-- 20261104123507-an-agent-records-its-model-class.sql — factory
+-- taxonomy T2d (backlog 06d8988b; conductor decision 20261104T0939 on
+-- 4839d6a1).
+--
+-- A step whose executor is `model:<class>` admits a robot running that
+-- model CLASS — the `<class>` of an active `model-slot:<class>` pool.
+-- The row recorded only `default_model`, a model ID (`opus-5-5[1m]`),
+-- and nothing may parse an id to guess a class, so every robot read
+-- "no class" at the claim. This column is where a robot's class is
+-- declared.
+--
+-- NULLABLE, AND NO BACKFILL. A row registered before it records no
+-- class, which no `model:` step admits; deriving one from
+-- `default_model` here would be exactly the guess the decision forbids.
+-- A class lands through the agents batch door (`POST
+-- /api/agents/batch`), which refuses one no active pool declares and
+-- records `agent.declared` / `agent.updated`.
+--
+-- NO FOREIGN KEY. Pools are versioned (`resource_pools` keys on name
+-- AND version) and a class is admitted only while its pool is ACTIVE,
+-- which a key cannot say; the door checks it at write and the claim
+-- door checks it again at the claim, so a pool retired after the
+-- declaration admits no one. The CHECK refuses only the empty class.
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS model_class TEXT
+    CONSTRAINT agents_model_class_nonempty CHECK (model_class IS NULL OR btrim(model_class) <> '');

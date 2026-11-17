@@ -22,6 +22,7 @@ use crate::types::{JeRecorded, Product, ProductInventory};
 
 #[derive(Default)]
 struct State {
+    sku_versions: BTreeMap<(String, i64), crate::sku::SkuVersion>,
     products: BTreeMap<String, Product>,
     inventory: BTreeMap<(String, String), ProductInventory>,
     /// The `financial_facts` natural keys `(kind, source_table,
@@ -83,6 +84,46 @@ fn settle(row: &mut ProductInventory, stamp: &EventStamp) {
 
 #[async_trait]
 impl ProductsRepository for InMemoryProducts {
+    async fn append_sku_version(
+        &self,
+        row: &crate::sku::SkuVersion,
+        stamp: &EventStamp,
+    ) -> Result<bool, ProductsError> {
+        crate::sku::validate(row)?;
+        let mut state = self.state()?;
+        let key = (row.sku.clone(), row.version);
+        if let Some(old) = state.sku_versions.get(&key) {
+            return if old == row {
+                Ok(false)
+            } else {
+                Err(crate::sku::conflict(row))
+            };
+        }
+        let latest = state
+            .sku_versions
+            .keys()
+            .filter(|(sku, _)| sku == &row.sku)
+            .map(|(_, version)| *version)
+            .max()
+            .unwrap_or(0);
+        if latest.checked_add(1) != Some(row.version) {
+            return Err(crate::sku::conflict(row));
+        }
+        let payload = crate::sku::fact(row);
+        state.sku_versions.insert(key, row.clone());
+        record(
+            &mut state,
+            stamp,
+            crate::events::SKU_VERSION_APPENDED,
+            payload,
+        );
+        Ok(true)
+    }
+
+    async fn sku_versions(&self) -> Result<Vec<crate::sku::SkuVersion>, ProductsError> {
+        Ok(self.state()?.sku_versions.values().cloned().collect())
+    }
+
     async fn list_products(&self, active_only: bool) -> Result<Vec<Product>, ProductsError> {
         // BTreeMap<String, _> iterates in byte order of SKU.
         Ok(self

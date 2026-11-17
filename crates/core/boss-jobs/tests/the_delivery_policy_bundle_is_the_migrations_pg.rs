@@ -318,7 +318,7 @@ async fn a_bundle_row_that_differs_from_the_live_row_is_refused_by_field() {
         .find(|s| s.name() == POLICY)
         .expect("the bundle declares the conductor's policy");
     let declared = edited.version();
-    edited.row.gate_max_concurrent += 1;
+    edited.row.stall_hours += 1;
 
     let err = seed_delivery_policies(&registry, &specs, &actor(), chrono::Utc::now(), false)
         .await
@@ -330,7 +330,7 @@ async fn a_bundle_row_that_differs_from_the_live_row_is_refused_by_field() {
             assert_eq!(refusals[0].version, declared);
             assert_eq!(
                 refusals[0].fields,
-                vec!["gate_max_concurrent".to_string()],
+                vec!["stall_hours".to_string()],
                 "the refusal names every differing column"
             );
         }
@@ -340,7 +340,7 @@ async fn a_bundle_row_that_differs_from_the_live_row_is_refused_by_field() {
     assert!(
         text.contains(POLICY)
             && text.contains("version")
-            && text.contains("gate_max_concurrent")
+            && text.contains("stall_hours")
             && text.contains("infra/platform/delivery-policy/"),
         "the refusal must name the policy, the edit path, the field and the bundle: {text}"
     );
@@ -374,7 +374,7 @@ async fn a_version_bump_publishes_and_retires_the_live_row() {
         .expect("the policy is active");
     // A value the live row does not hold, so the served row can only
     // carry it if the bump published.
-    let raised = live.row.gate_max_concurrent + 1;
+    let raised = live.row.stall_hours + 1;
 
     let mut specs = bundle();
     let bumped = specs
@@ -382,7 +382,7 @@ async fn a_version_bump_publishes_and_retires_the_live_row() {
         .find(|s| s.name() == POLICY)
         .expect("the bundle declares the conductor's policy");
     bumped.row.version = live.version() + 1;
-    bumped.row.gate_max_concurrent = raised;
+    bumped.row.stall_hours = raised;
 
     let report = seed_delivery_policies(&registry, &specs, &actor(), chrono::Utc::now(), false)
         .await
@@ -399,7 +399,7 @@ async fn a_version_bump_publishes_and_retires_the_live_row() {
         .find(|r| r.status == WorkflowStatus::Active)
         .expect("the policy is active");
     assert_eq!(now_active.version(), live.version() + 1);
-    assert_eq!(now_active.row.gate_max_concurrent, raised);
+    assert_eq!(now_active.row.stall_hours, raised);
     let old = lineage
         .iter()
         .find(|r| r.version() == live.version())
@@ -409,7 +409,7 @@ async fn a_version_bump_publishes_and_retires_the_live_row() {
     // What the conductor reads is what the bundle now says — and the
     // version a train departed under is still readable, retired.
     let served: Vec<(i32, i32)> = sqlx::query_as(
-        "SELECT version, gate_max_concurrent FROM delivery_policy \
+        "SELECT version, stall_hours FROM delivery_policy \
          WHERE status = 'active' AND name = $1",
     )
     .bind(POLICY)

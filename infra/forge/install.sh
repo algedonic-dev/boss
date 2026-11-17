@@ -107,8 +107,20 @@ UNITS=(
 # prints (infra/gcp/install-units.sh `rows` / `roster`), so what the
 # forge installs and what it watches are ONE list (CLAUDE.md §9a).
 # Every row is in role: this host installs its whole list, whatever its
-# roles; the ops runner, which IS role-gated, the observer asks
-# install-ops-runner.sh --in-role about itself.
+# roles.
+#
+# `beyond-rows` names every unit this file installs that is NOT one of
+# those pairs, one per line, by asking the file that installs it: the
+# ops runner (role-gated, and with its waker, since this host starts it
+# through no tree helper — install-ops-runner.sh --units) and the two
+# network-boot daemons (netboot.sh units, wherever the network-boot step
+# below runs). Until it, the observer asked the runner's --in-role alone,
+# so the waker that landed on 2026-10-20 rode the forge's reading as
+# `undeclared_units`, running and judged by nothing, and the network-boot
+# daemons were seen by nothing but the next converge (backlog 2eae38d4).
+netboot_applies() {
+    [ "${INSTALL_ETC:-/etc/systemd/system}" = "/etc/systemd/system" ] || [ -n "${INSTALL_NETBOOT_ROOT:-}" ]
+}
 case "${1:-}" in
     rows)
         for u in "${UNITS[@]}"; do echo "$u:forge"; done
@@ -118,9 +130,16 @@ case "${1:-}" in
         for u in "${UNITS[@]}"; do echo "in-role $u"; done
         exit 0
         ;;
+    beyond-rows)
+        bash "${HERE}/../ops/install-ops-runner.sh" --units || exit 78
+        if netboot_applies; then
+            bash "${HERE}/netboot.sh" units || exit 78
+        fi
+        exit 0
+        ;;
     "") ;;
     *)
-        echo "usage: $0 [rows|roster]" >&2
+        echo "usage: $0 [rows|roster|beyond-rows]" >&2
         exit 2
         ;;
 esac
@@ -185,6 +204,9 @@ if [ -n "${BOSS_CONVERGE_HOLD:-}" ]; then
 fi
 if [ -n "${INSTALL_KIT_LIBEXEC:-}" ]; then
     host_seam INSTALL_KIT_SUDOERS_DIR
+fi
+if [ -n "${INSTALL_NETBOOT_ROOT:-}" ]; then
+    host_seam INSTALL_NETBOOT_ROOT /var/lib/boss/netboot
 fi
 case ",${BOSS_NODE_ROLES:-}," in
     *,cluster-operator,*)
@@ -727,6 +749,20 @@ done
 # why every failure in it is non-fatal.
 JOURNAL_DOOR_URL="$BOSS_FORGE_JOURNAL_URL" bash "${HERE}/../journal-door-ensure.sh"
 
+# NETWORK BOOT (backlog ee31ab73, David 2026-10-19): proxy-DHCP + TFTP +
+# HTTP so a blank node PXE-boots the declared Talos image into
+# maintenance mode, with no USB. infra/forge/netboot.sh `ensure` is the
+# one definition — it mirrors the pair infra/cluster/talos/netboot.toml
+# declares, serves it only verified, and installs its two daemons
+# (not in UNITS above: those are timer pairs). Carried, not fatal, like
+# the probe account's: a pair that cannot be verified stops network boot
+# and reds this run at its end, but never leaves a unit uninstalled. A
+# scratch run (the lints) touches no netboot root unless it names one.
+netboot_rc=0
+if netboot_applies; then
+    INSTALL_ETC="$ETC" INSTALL_SYSTEMCTL="$SYSTEMCTL" bash "${HERE}/netboot.sh" ensure || netboot_rc=$?
+fi
+
 # A HELD RUN SAYS HELD, HERE TOO (review 5f3736a2, F7). This line used to
 # read "9 unit pair(s) installed and enabled" on a run that had replaced
 # no unit file — the success line, and the `summary` a reader of the
@@ -786,4 +822,11 @@ if [ "$probe_account_rc" -ne 0 ]; then
     echo "install.sh: the probe account did NOT verify (exit $probe_account_rc) — probe-account.sh said why above." >&2
     echo "    Every unit converged; no probe runs on this host until it does (\`probe_account\` on the packet)." >&2
     exit "$probe_account_rc"
+fi
+# Network boot's, after it: netboot.sh named what failed above and on the
+# packet (`netboot`).
+if [ "$netboot_rc" -ne 0 ]; then
+    echo "install.sh: network boot is NOT serving (exit $netboot_rc) — netboot.sh said why above." >&2
+    echo "    Every unit converged; a blank node on the LAN gets no PXE answer until it does (\`netboot\` on the packet)." >&2
+    exit "$netboot_rc"
 fi

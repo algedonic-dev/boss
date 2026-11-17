@@ -172,9 +172,12 @@ merge: the department view calls it. Recording that here matters
 because the question is phrased as though a decision is pending,
 and the only pending part is drawing the labels.
 
-Flow should stay. `apps/web/src/it/flow/FlowPage.svelte` is a live
-page at `/system/flow`, and it answers a different question from
-this one — "how much is my team getting through", which is a scalar
+(Overtaken on 2026-08-31: the IT consolidation, packet `1f6d55e0`,
+retired the Flow page and folded its unique series into Atlas at
+`/it/operate/atlas`. The proposal as written follows.)
+
+Flow should stay. Flow was then a live page, and it answers a
+different question from this one — "how much is my team getting through", which is a scalar
 per team, versus "where is work moving between kinds", which is a
 topology. Folding a throughput list into a network diagram makes
 the diagram answer a question it is a bad shape for, and removes

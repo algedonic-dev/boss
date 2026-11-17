@@ -5,3 +5,5 @@
 id = "automation:codebase-metrics"
 role = "platform-admin"
 description = 'Records the codebase size and shape, daily (infra/codebase-metrics.sh).'
+# Host station: engineering (backlog 6ecb5480, station-tree.md section 6).
+station = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5"

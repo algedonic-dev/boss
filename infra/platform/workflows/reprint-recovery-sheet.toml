@@ -48,7 +48,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "Print the recovery sheet again, because the tree now says something the signed paper copy does not (design 125d405d). Filed and kept current by the daily recovery-sheet check: the PDF rendered from origin/main is attached to the `print` step with the fact-level diff on the packet. The platform owner prints it, destroys the copy it replaces and approves `print` with a passkey over the machine-filled statement; the version on that step is then the printed version. `declined` records a print that did not happen."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { owner = "9660c60f-eb47-4405-ae08-fcbb30c71e5f", department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "render"
@@ -65,7 +65,7 @@ assurance_required = "presence"
 sign_offs_required = ["platform-admin"]
 title_template = "Print the recovery sheet and sign for the copy it replaces"
 authority_role = "platform-admin"
-metadata_defaults = { fact_hash = "{metadata.fact_hash}", version = "{metadata.version}", pdf_sha256 = "{metadata.pdf_sha256}", origin_sha = "{metadata.origin_sha}", rendered_at = "{metadata.rendered_at}", replaces_version = "{metadata.replaces_version}", statement = "{metadata.statement}", procedure = "YOUR PASSKEY SIGNS THIS STEP'S CONTENT, and you type nothing: every key was filled by the daily check. Download the PDF attached to this step - its file name carries the version, and `pdf_file_ref` and `pdf_sha256` name the one to print. Print it, put it where the paper copy is kept, and destroy the copy it replaces. Then Approve: the `statement` is what you are signing. Reject if the copy was not printed or the old one could not be found; the next daily check files the print job again. The packet's `diff` says what changed since the version on paper." }
+metadata_defaults = { human_only = true, human_presentation = { ask = "Print this recovery sheet and replace the old copy", why_person = "A person must handle and retain the physical paper copy.", action = "Print the named PDF and sign for its replacement", after = "The daily check records the signed paper version; rejection leaves replacement owed.", evidence = "current-step" }, fact_hash = "{metadata.fact_hash}", version = "{metadata.version}", pdf_sha256 = "{metadata.pdf_sha256}", origin_sha = "{metadata.origin_sha}", rendered_at = "{metadata.rendered_at}", replaces_version = "{metadata.replaces_version}", statement = "{metadata.statement}", procedure = "YOUR PASSKEY SIGNS THIS STEP'S CONTENT, and you type nothing: every key was filled by the daily check. Download the PDF attached to this step - its file name carries the version, and `pdf_file_ref` and `pdf_sha256` name the one to print. Print it, put it where the paper copy is kept, and destroy the copy it replaces. Then Approve: the `statement` is what you are signing. Reject if the copy was not printed or the old one could not be found; the next daily check files the print job again. The packet's `diff` says what changed since the version on paper." }
 
 [[workflow.step.fields]]
 name = "fact_hash"
@@ -107,6 +107,14 @@ filled_by = "filer"
 name = "statement"
 field_type = "string"
 required = true
+filled_by = "filer"
+
+# The attachment is created after admission, then mirrored by the print
+# verb for the person to inspect. It is context, never their decision.
+[[workflow.step.fields]]
+name = "pdf_file_ref"
+field_type = "string"
+required = false
 filled_by = "filer"
 
 [[workflow.step.fields]]

@@ -229,7 +229,7 @@ primitives" sentence stale. Five places say it:
 **The tooling gap this creates.** Q2's consequence is explicitly a
 tooling obligation, not a structural one: *"we will definitely need
 tools for managing the policy aspects of protocol specifically."*
-Today there is a workflow-authoring surface (`/system/workflows`) and
+Today there is a workflow-authoring surface (`/it/registry`) and
 a policy subsystem with its own rules and `policy_rule_audit`, and
 **nothing that lets an author see, review, or audit the governance
 aspect of one protocol in one place** — who may act, on what, in
@@ -434,22 +434,16 @@ regardless of what happens to the frame.
 
 ### Dangling references
 
-5. **`protocol-cadence.md:13`** (the doc retired on 2026-09-27, its
-   decision folded into `docs/architecture-decisions.md`) cited
-   `[clock-as-service (docs/design/clock-as-service.md)]`. **That file
-   does not exist** anywhere in the tree. It is also malformed as a
-   markdown link, so no link check would catch it.
-
-6. **`docs/architecture-diagram.md:200`** cites
-   *"designed under `external-financial-actors.md`"*. **No such file.**
-
-7. **`infra/blueprints/ssh-ca/`** is cited twice as somewhere an
-   operator should look —
-   `docs/runbooks/dev-environment-bootstrap.md:279` (*"see
-   `infra/blueprints/ssh-ca/README.md`"*) and
-   `docs/runbooks/operator.md:315` (*"restore the blueprint at
-   `infra/blueprints/ssh-ca/`"*). **`infra/blueprints/` does not
-   exist.** These are break-glass procedures pointing at nothing.
+5–7. **Resolved.** These three named citations of files that were
+   never written: a clock-as-service design doc cited by
+   `protocol-cadence.md` (itself retired on 2026-09-27, its decision
+   folded into `docs/architecture-decisions.md`), an
+   external-financial-actors doc cited by
+   `docs/architecture-diagram.md`, and an SSH CA blueprint directory
+   cited by two break-glass procedures in
+   `docs/runbooks/dev-environment-bootstrap.md` and
+   `docs/runbooks/operator.md`. Measured on 2026-11-16 (backlog
+   `d83cbd3f`), none of the three citations remains in those files.
 
 8. **`docs/runbooks/operator.md:402`** instructs *"Write down what
    happened in `docs/runbooks/incidents/`"*. Directory does not exist.

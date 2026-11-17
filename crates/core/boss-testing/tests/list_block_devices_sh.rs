@@ -40,6 +40,7 @@ struct Dev {
     kname: &'static str,
     dtype: &'static str,
     size: &'static str,
+    size_bytes: &'static str,
     model: &'static str,
     serial: &'static str,
     /// Its own mountpoint, if any.
@@ -74,6 +75,7 @@ impl Host {
                     kname: "nvme0n1",
                     dtype: "disk",
                     size: "931.5G",
+                    size_bytes: "1000204886016",
                     model: "FIXTURE NVMe 1TB",
                     serial: "BLANK0001",
                     mount: "",
@@ -84,6 +86,7 @@ impl Host {
                     kname: "nvme1n1",
                     dtype: "disk",
                     size: "476.9G",
+                    size_bytes: "512110190592",
                     model: "FIXTURE NVMe 512GB",
                     serial: "ROOT0001",
                     mount: "",
@@ -94,6 +97,7 @@ impl Host {
                     kname: "nvme1n1p1",
                     dtype: "part",
                     size: "1G",
+                    size_bytes: "1073741824",
                     model: "",
                     serial: "",
                     mount: "/boot/efi",
@@ -104,6 +108,7 @@ impl Host {
                     kname: "nvme1n1p2",
                     dtype: "part",
                     size: "475.9G",
+                    size_bytes: "511036448768",
                     model: "",
                     serial: "",
                     mount: "/",
@@ -150,6 +155,10 @@ impl Host {
             let dev = format!("/dev/{}", d.kname);
             arms.push((format!("lsblk -dno TYPE {dev}"), format!("{}\n", d.dtype)));
             arms.push((format!("lsblk -dno SIZE {dev}"), format!("{}\n", d.size)));
+            arms.push((
+                format!("lsblk -bdno SIZE {dev}"),
+                format!("{}\n", d.size_bytes),
+            ));
             arms.push((format!("lsblk -dno MODEL {dev}"), format!("{}\n", d.model)));
             arms.push((
                 format!("lsblk -dno SERIAL {dev}"),
@@ -317,6 +326,53 @@ fn the_blank_drive_is_the_one_candidate_named_by_its_by_id_links() {
         !cands.contains("ROOT0001") && !cands.contains("nvme1n1"),
         "the root disk is never a candidate:\n{cands}"
     );
+}
+
+#[test]
+fn exact_bytes_are_additive_for_every_device_including_the_used_root_disk() {
+    let host = Host::forge("exact-bytes");
+    let (rc, out, err) = host.run();
+    assert_eq!(rc, 0, "{out}\n{err}");
+    for dev in &host.devs {
+        let row = block(&out, dev.kname);
+        assert!(
+            row.contains(&format!("size_bytes:  {}", dev.size_bytes)),
+            "{} lost exact bytes:\n{row}",
+            dev.kname
+        );
+        assert!(
+            row.contains(dev.size),
+            "the existing human size stays:\n{row}"
+        );
+    }
+    assert!(block(&out, "nvme0n1").contains("candidate:   YES"));
+    assert!(block(&out, "nvme1n1").contains("backs /:     yes"));
+}
+
+#[test]
+fn an_unreadable_or_malformed_exact_size_is_not_a_measured_size() {
+    for value in ["", "931.5G", "-1", "0", "12 34"] {
+        let mut host = Host::forge("bad-exact-bytes");
+        host.dev_mut("nvme0n1").size_bytes = value;
+        let (rc, out, err) = host.run();
+        assert_ne!(
+            rc, 0,
+            "bad exact size {value:?} must be loud:\n{out}\n{err}"
+        );
+        let row = block(&out, "nvme0n1");
+        assert!(row.contains("size_bytes:  UNREADABLE"), "{row}");
+        assert!(!row.contains("candidate:   YES"), "{row}");
+        assert!(
+            row.contains("931.5G"),
+            "keep the old available fields:\n{row}"
+        );
+    }
+    let mut host = Host::forge("failed-exact-bytes");
+    host.fail.push("lsblk -bdno SIZE /dev/nvme0n1".into());
+    let (rc, out, err) = host.run();
+    assert_ne!(rc, 0, "{out}\n{err}");
+    assert!(block(&out, "nvme0n1").contains("size_bytes:  UNREADABLE"));
+    assert!(err.contains("size_bytes"), "{err}");
 }
 
 /// `--candidates` prints the candidate lines alone — what

@@ -37,6 +37,16 @@
 //! and the immutable boarding list names the car (approved design
 //! 921c62af, backlog602fd374). Unknown, pending, aborted or successful
 //! evidence never clears a strike. This does not clear strikes automatically.
+//!
+//! A REUSED CAR GATE IS ITS TRAIN'S GATE (backlog cb2268d3). A one-car
+//! train that binds `train_gate_run` to its car's own green
+//! (`train_gate_reuse`, decision `reused`) files no train gate, and the
+//! bind stamps the train only — so the gate-run its verdict rests on has
+//! no `train` mark and was refused as "gates no train", leaving that train
+//! no strike-release path. Such a gate-run counts when the diagnosis also
+//! names the train by full id and that train's own record binds it; it is
+//! then judged by exactly the checks above. A train named only to place
+//! a reused gate-run is not listed among the refused ids.
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -94,19 +104,44 @@ pub(crate) fn train_of(gate_run: &Value) -> Option<&str> {
         .filter(|t| !t.is_empty())
 }
 
+/// The train that carries a car's own gate-run BY REUSE (backlog
+/// cb2268d3): a one-car train that bound `train_gate_run` to its car's
+/// green files no train gate, and the bind stamps only the train, so the
+/// gate-run its verdict rests on has no `train` mark. It is that train's
+/// gate exactly when the train's own record binds it
+/// (`train_gate_reuse::reused_gate_run`). `Some(train id)` then.
+pub(crate) fn reused_by<'a>(gate_run: &Value, train: &'a Value) -> Option<&'a str> {
+    let id = gate_run.get("id").and_then(Value::as_str)?;
+    if train.get("kind").and_then(Value::as_str) != Some("pr-train")
+        || crate::train_gate_reuse::reused_gate_run(train) != Some(id)
+    {
+        return None;
+    }
+    train.get("id").and_then(Value::as_str)
+}
+
 /// Does this gate-run count as a strike the car earned? `Ok` when it is
 /// a failed train whose gate and boarding evidence names `car_id`; otherwise the reason
 /// it does not, in words the refusal prints beside the id. `train` is
 /// the train [`train_of`] names, read by the caller (`None` when it
-/// could not be read).
-pub(crate) fn judge(gate_run: &Value, train: Option<&Value>, car_id: &str) -> Result<(), String> {
+/// could not be read) — or, for a gate-run with no train mark, a train
+/// the diagnosis names that carries it by reuse ([`reused_by`]).
+pub(crate) fn judge<'a>(
+    gate_run: &'a Value,
+    train: Option<&'a Value>,
+    car_id: &str,
+) -> Result<(), String> {
     let kind = gate_run.get("kind").and_then(Value::as_str).unwrap_or("?");
     if kind != "gate-run" {
         return Err(format!("is a {kind}, not a gate-run"));
     }
-    let Some(tid) = train_of(gate_run) else {
+    let Some(tid) = train_of(gate_run).or_else(|| train.and_then(|t| reused_by(gate_run, t)))
+    else {
         return Err(
-            "gates no train (a car's own gate is not a strike — only a train's red is)".into(),
+            "gates no train (a car's own gate is not a strike — only a train's red is; a car's \
+             gate-run a one-car train carried by reuse counts when the diagnosis also names \
+             that train by its FULL id)"
+                .into(),
         );
     };
     let Some(train) = train else {
@@ -121,6 +156,11 @@ pub(crate) fn judge(gate_run: &Value, train: Option<&Value>, car_id: &str) -> Re
     }
     match crate::train_gate::standing(gate_run) {
         crate::train_gate::Standing::Failed => {}
+        // Struck before backlog 06c452f2 made this shape a refusal.
+        crate::train_gate::Standing::Refused(_) if crate::train_gate::unreadable_red(gate_run) => {}
+        // A gate-run recorded `unjudged` (c02fc3b3) strikes nobody now; a
+        // strike laid on one before that is the strike most owed a release.
+        crate::train_gate::Standing::Unjudged(_) => {}
         crate::train_gate::Standing::Green => {
             checked_combined_failure(gate_run, train).map_err(|why| {
                 format!("is not red — GREEN gate lacks checked combined failure: {why}")
@@ -264,8 +304,19 @@ pub(crate) fn release_patch(car: &Value, entry: Value) -> Value {
     patch
 }
 
-/// The verb. Every refusal happens before the one write.
-pub(crate) async fn release_struck(wire: &Wire, given: &str, diagnosis: &str) -> Result<()> {
+/// The verb. Every refusal happens before the strike's write. Then, read
+/// back with no strike left, the review step's red-train hold for a
+/// train this look cleared is lifted too (`steps::lift_struck_hold`,
+/// backlog 79129752): the strike and that hold are two marks of one
+/// judged red, and clearing only the first left car 775feba5 held at the
+/// dock with nothing standing against it. `releaser` is the shell the
+/// look is given from, asked exactly as a bare release asks it.
+pub(crate) async fn release_struck(
+    wire: &Wire,
+    given: &str,
+    diagnosis: &str,
+    releaser: &crate::review_verdict::Releaser,
+) -> Result<()> {
     let car = wire.car(given).await?;
     let car_id = crate::envelope::job_id(&car)
         .context("the car has no id")?
@@ -291,29 +342,65 @@ pub(crate) async fn release_struck(wire: &Wire, given: &str, diagnosis: &str) ->
             "boss release: the diagnosis names no gate-run — it must name, by FULL id, at least \
              one failed train's gate-run {label} rode (RED gate or checked GREEN gate with \
              completed failing Forge CI; a train's gate-run id is its \
-             `train_gate_run` metadata). Nothing was written."
+             `train_gate_run` metadata, and when that is the car's own gate-run, carried by \
+             reuse, name the train beside it). Nothing was written."
         );
     }
-    let mut verified = Vec::new();
-    let mut refused = Vec::new();
+    // Every named record first: a gate-run a one-car train carried by
+    // reuse has no `train` mark, and the train that binds it is found
+    // among the trains the diagnosis also names (backlog cb2268d3).
+    let mut read = Vec::new();
     for id in &ids {
-        let verdict = match wire.packet(id).await {
-            Err(e) => Err(format!("could not be read ({e})")),
-            Ok(run) => {
-                let train = match train_of(&run) {
-                    Some(t) if run.get("kind").and_then(Value::as_str) == Some("gate-run") => {
+        read.push(wire.packet(id).await.map_err(|e| format!("{e}")));
+    }
+    let named_trains: Vec<&Value> = read
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .filter(|p| p.get("kind").and_then(Value::as_str) == Some("pr-train"))
+        .collect();
+    let mut verified = Vec::new();
+    // The trains those gate-runs gate: the red-train holds this look may lift.
+    let mut cleared_trains: Vec<String> = Vec::new();
+    let mut refused = Vec::new();
+    for (id, packet) in ids.iter().zip(&read) {
+        let (verdict, tid) = match packet {
+            Err(e) => (Err(format!("could not be read ({e})")), None),
+            Ok(run) => match train_of(run) {
+                Some(t) => {
+                    let train = if run.get("kind").and_then(Value::as_str) == Some("gate-run") {
                         wire.packet(t).await.ok()
-                    }
-                    _ => None,
-                };
-                judge(&run, train.as_ref(), &car_id)
-            }
+                    } else {
+                        None
+                    };
+                    (judge(run, train.as_ref(), &car_id), Some(t.to_string()))
+                }
+                None => {
+                    let carrier = named_trains
+                        .iter()
+                        .copied()
+                        .find(|t| reused_by(run, t).is_some());
+                    (
+                        judge(run, carrier, &car_id),
+                        carrier.and_then(|t| reused_by(run, t)).map(str::to_string),
+                    )
+                }
+            },
         };
         match verdict {
-            Ok(()) => verified.push(id.clone()),
-            Err(why) => refused.push(format!("  {id} {why}")),
+            Ok(()) => {
+                verified.push(id.clone());
+                cleared_trains.extend(tid);
+            }
+            Err(why) => refused.push((id, why)),
         }
     }
+    // A train named only so its reused gate-run could be placed is not
+    // a refused id.
+    let refused: Vec<String> = refused
+        .into_iter()
+        .filter(|(id, _)| !cleared_trains.contains(id))
+        .map(|(id, why)| format!("  {id} {why}"))
+        .collect();
     if verified.is_empty() {
         bail!(
             "boss release: the diagnosis names no red train gate-run or checked GREEN gate of a \
@@ -341,9 +428,10 @@ pub(crate) async fn release_struck(wire: &Wire, given: &str, diagnosis: &str) ->
     if !all_took {
         bail!("the API answered the write but the car does not hold what was sent\n{report}");
     }
+    let hold = crate::steps::lift_struck_hold(wire, &after, &cleared_trains, releaser).await?;
     println!(
         "boss release: {label} — {reds} red-train strike(s) cleared on a diagnosis naming {}\n  \
-         the look is recorded under `{KEY_RELEASES}`; it boards at the next tick",
+         the look is recorded under `{KEY_RELEASES}`; {hold}",
         verified
             .iter()
             .map(|g| format!("gate-run {}", crate::train::id8(g)))
@@ -409,6 +497,19 @@ mod tests {
         assert!(green.unwrap_err().contains("not red"));
         let lost = judge(&gate_run("lost", Some(TRAIN)), Some(&train(&[CAR])), CAR);
         assert!(lost.unwrap_err().contains("not red"));
+        // A strike laid on a `failed` step over an UNREADABLE receipt —
+        // gate-run df02648a's, verbatim — is one the conductor laid
+        // before backlog 06c452f2 made that shape a refusal. It is the
+        // strike most owed a release, so it still counts.
+        let mut unreadable = gate_run("failed", Some(TRAIN));
+        unreadable["steps"][0]["metadata"]["receipt"] = json!(crate::train_gate::DF02648A_RECEIPT);
+        assert_eq!(judge(&unreadable, Some(&train(&[CAR])), CAR), Ok(()));
+        // A plain refusal never struck anyone, and still does not count.
+        let mut refused = gate_run("failed", Some(TRAIN));
+        refused["steps"][0]["metadata"]["receipt"] =
+            json!(r#"{"verdict":"refused","refused_because":"disk floor"}"#);
+        let refused = judge(&refused, Some(&train(&[CAR])), CAR);
+        assert!(refused.unwrap_err().contains("not red"));
         let own_gate = judge(&gate_run("failed", None), None, CAR);
         assert!(own_gate.unwrap_err().contains("gates no train"));
         let elsewhere = judge(

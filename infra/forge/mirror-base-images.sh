@@ -53,9 +53,22 @@ export DOCKER_CONFIG="${BOSS_MIRROR_DOCKER_CONFIG:-$REGISTRY_PUSH_DIR}"
 # nightly backup ships with. A resolver stall or a rate limit on any of
 # them is an outage diagnosed from the outside, which is what the
 # mirror exists to prevent.
+#
+# BUN IS COPIED FROM ONE DIGEST, NOT A TAG (backlog e30098d3). The gate's
+# bun install cache lives on the shared seed volume, and its safety
+# rests on bun's own rename discipline, read in bun-v1.3.14's source; a
+# floating `1.3-slim` would let a full run of this script hand every
+# later gate image a different bun with no line of the tree changing.
+# The digest is the multi-arch index `oven/bun:1.3.14-slim` and
+# `1.3-slim` both named on Docker Hub when this was written (2026-10-19,
+# both last pushed 2026-05-13); the boss-ci Dockerfile checks the
+# revision it copies, so a forge tag moved by anything else still
+# refuses the build. The forge tag keeps its name on purpose: a renamed
+# tag must be mirrored BEFORE the train that pulls it, and build-image
+# pulls from the forge before any converge runs this.
 IMAGES="
 gcr.io/kaniko-project/executor:v1.23.2-debug|kaniko-executor:v1.23.2-debug
-docker.io/oven/bun:1.3-slim|bun:1.3-slim
+docker.io/oven/bun@sha256:d56a2534ffd262e92c12fd3249d3924d296d97086da773f821d7d0477435ea04|bun:1.3-slim
 docker.io/library/rust:1.96.1-slim-bookworm|rust:1.96.1-slim-bookworm
 docker.io/library/postgres:16|postgres:16
 docker.io/library/postgres:16-alpine|postgres:16-alpine

@@ -1,0 +1,92 @@
+# ---------------------------------------------------------------------------
+# release-milestone — a dated release milestone, held on a person's
+# calendar (backlog fe199985, design e1dba350, folded into
+# docs/architecture-decisions.md §Calendar).
+#
+# WHY. David, page audit 0e4fef17 (/ux/calendar/me), 2026-09-24: "We are
+# going to need to start scheduling things. Why don't we put some release
+# milestone dates on the calendar as a practical test." The page renders
+# reservations and the step hook makes them (calendar_hook.rs: a step
+# entering `active` with `scheduled_at`, `duration_minutes` and an
+# assignee reserves `employee:<assignee>`), but until this row no live
+# protocol had a scheduling step, so the calendar held nothing.
+#
+# A PLAN, NOT THE RELEASE. `cut-a-release` is the act — it opens when the
+# founder decides main is worth a name and its changelog is ready at
+# once. A milestone weeks ahead is a separate packet; linking the two
+# later is one metadata key, not a merger.
+#
+# ONE PACKET PER MILESTONE. The hook makes one reservation per step, and
+# milestone names are not known in advance, so the row bakes in none.
+#
+# HOW IT RUNS. File one with `version` and `milestone`. Whoever schedules
+# it merges `scheduled_at` and `duration_minutes` onto the `schedule`
+# step (the step metadata door, or the Scheduling surface), then claims
+# it — for themselves, or `?claimed_for=<employee>` with step-assign
+# authority — and the claim reserves that window on the holder's
+# calendar, where /ux/calendar/me shows it. The step names no
+# `individual`: in the platform bundle that audience is claim-for
+# authority and names an automation (design 611fbffd, S3), so whose
+# calendar carries the date is the claim's to say. Completing the step
+# closes the packet `met` and keeps the reservation as the record of the
+# date. A date that moves is withdrawn (the packet closes, the hold is
+# released, d1619c7b) and a new packet is filed, so both dates stay in
+# the record (design e1dba350 Q3); rescheduling waits until moves are
+# frequent.
+#
+# `metadata.department` stays beside the owner because a live reader
+# still reads it: boss_jobs::department::kinds_declaring, pinned by
+# every_platform_protocol_names_its_department.rs. Pinned by
+# crates/core/boss-jobs/tests/platform_bundle_release_milestone.rs.
+# ---------------------------------------------------------------------------
+
+[[workflow]]
+kind = "release-milestone"
+label = "Release milestone"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "A dated release milestone held on a person's calendar: one packet per milestone (a version and what is due, such as feature freeze or the release itself). Whoever schedules it writes the date and duration on the schedule step and claims it, which reserves that window on the holder's calendar. Completing the step closes the packet met. A date that moves is withdrawn and refiled, so both dates stay in the record. A plan, not the release: cutting one is cut-a-release."
+metadata = { owner = "00b04483-90c6-46b9-b911-8e19d2a0b410", department = "it", owner_role = "platform-admin" }
+metadata_schema = { type = "object", required = ["version", "milestone"], properties = { version = { type = "string" }, milestone = { type = "string" } } }
+
+[[workflow.step]]
+title = "set"
+kind = "trigger"
+ready_when = "true"
+title_template = "Milestone set"
+metadata_defaults = { trigger_kind = "operator", trigger_name = "milestone-set" }
+
+[[workflow.step]]
+title = "schedule"
+kind = "scheduling"
+ready_when = "steps.set.done"
+title_template = "Schedule {metadata.version}: {metadata.milestone}"
+authority_role = "platform-admin"
+audience = { role = "platform-admin" }
+# The kind requires location and scheduled_at at done, and the hook
+# reserves only with duration_minutes, so all three are declared
+# required: the step's form is built from what it declares
+# (a_step_declares_what_its_kind_requires.rs; gate-run cd8a67ce went red
+# without scheduled_at). location keeps its `online` default below.
+# The kind's descriptions (seeds/step_types.toml) live here as comments,
+# because a row's field carries no description key: StepField drops it,
+# and gate-run 362607d2 went red on workflow_row_compare_py for the three
+# keys the file stated and the rendered row did not.
+#   location          Location
+#   scheduled_at      Scheduled date/time
+#   duration_minutes  Duration in minutes
+fields = [
+  { name = "location", field_type = "string", required = true },
+  { name = "scheduled_at", field_type = "date-time", required = true },
+  { name = "duration_minutes", field_type = "integer", required = true },
+]
+metadata_defaults = { location = "online", procedure = "Merge scheduled_at (RFC 3339, UTC) and duration_minutes onto this step through the step metadata door, then claim it for the person whose calendar carries the date; the claim reserves that window. Complete it on the day. A date that moves is not edited here: close this packet withdrawn and file a new one." }
+
+[[workflow.step]]
+title = "met"
+kind = "outcome"
+ready_when = "steps.schedule.done"
+title_template = "Milestone met"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "met" }

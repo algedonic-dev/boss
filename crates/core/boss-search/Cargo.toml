@@ -17,6 +17,10 @@ name = "boss-search-reindex"
 path = "src/bin/boss_search_reindex.rs"
 required-features = ["postgres"]
 
+[[test]]
+name = "rebuild_events_plan_pg"
+required-features = ["postgres"]
+
 [features]
 default = ["postgres"]
 postgres = ["dep:sqlx", "dep:boss-events"]
@@ -43,6 +47,9 @@ sqlx = { version = "0.8", default-features = false, features = ["macros", "runti
 
 [dev-dependencies]
 boss-testing = { path = "../boss-testing", features = ["postgres"] }
+# The events half reads event_facts (backlog 832386eb); tests build it
+# with its own rebuilder rather than writing projection rows by hand.
+boss-views = { path = "../boss-views", features = ["postgres"] }
 tower = { workspace = true }
 http-body-util = "0.1"
 sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }

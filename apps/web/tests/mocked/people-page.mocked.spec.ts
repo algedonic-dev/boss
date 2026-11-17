@@ -400,7 +400,7 @@ test.describe('/ux/people — links and back', () => {
     // The list route is the People tab's catalog entry; the link's
     // target is the router's employee route, whose pattern
     // /ux/people/:empId surface-opens.test.ts pins. The catalog lists
-    // no detail entry for it (the same shape as /ux/vendors, e9c8e28d).
+    // no detail entry for it (the same shape as /finance/vendors, e9c8e28d).
     expect(ROUTE_CATALOG.people.path).toBe(PATH);
     expect(ROUTE_CATALOG.people.label).toBe('Employees');
     expect(ROUTE_CATALOG.people.owner).toBe('people');

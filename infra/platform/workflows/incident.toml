@@ -68,7 +68,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "An outage or degradation, worked as a packet: raise what was seen, stabilize the live system first, then learn from it in the order that forces the questions that get missed — the timeline before the theory, 'did we just ship this?' before the root cause, what should have found it, what can be REMOVED before anything is added, each action filed as its own packet — and a person reviews the findings. The platform's one incident protocol since 2026-09-24: incident-post-mortem and post-mortem were folded in and retired (backlog 59d15039)."
-metadata = { department = "it", surfaces = ["system-incidents"] }
+metadata = { owner = "9660c60f-eb47-4405-ae08-fcbb30c71e5f", department = "it", surfaces = ["system-incidents"] }
 
 [[workflow.step]]
 title = "raised"
@@ -177,7 +177,7 @@ kind = "incident-review"
 ready_when = "steps.actions.done"
 title_template = "Human review of the findings"
 authority_role = "platform-admin"
-metadata_defaults = { human_only = true }
+metadata_defaults = { human_presentation = { ask = "Review what happened and the actions taken", why_person = "The people who investigated an incident cannot substitute for your independent judgment.", action = "Read the findings and record your review", after = "Your completed review closes the incident; its follow-up requests keep their own obligations.", evidence = "current-step" }, human_only = true }
 
 [[workflow.step]]
 title = "closed"

@@ -491,12 +491,20 @@ pub const CONTRACT: &[Entry] = &[
                   names each change from → to (design e187198f); the jobs API's login door \
                   resolves each alias to the id (design 6fda05ae; backlog f56155f0)",
         shape: "`[[agent]]` rows: id (`agent-<slug>`), display_name, default_model (a rate-card \
-                model, e.g. `opus-5[1m]`), aliases? (the logins that sign as it), role? (a \
+                model, e.g. `opus-5[1m]`), model_class? (the <class> of an active \
+                `robots:<class>` pool, checked at the batch door — what a `model:<class>` \
+                step admits a robot by; never derived from default_model, backlog 06d8988b), \
+                aliases? (the logins that sign as it), role? (a \
                 Class code under (employee, role)) and department? (a departments-registry \
                 code, backlog c87e3d6d), checked at the batch door like an employee's — a role \
                 audience resolves to every holder, agents included; backlog ab192a9f), \
-                hourly_budget_usd_micros?, max_concurrent_runs? — the `agents` table's columns \
-                and nothing else; validated by `boss_jobs::agents::load_agents_toml`",
+                hourly_budget_usd_micros?, max_concurrent_runs? (stored; bounds nothing \
+                since backlog 3e927996, a robot is bounded by its robots:<class> pool), \
+                stations? (the stations the \
+                executor is seated at, in the order it serves them — each an active station, \
+                checked at the batch door; omitted keeps the held seats, `[]` unseats; design \
+                506e0a1c) — the `agents` table's columns and nothing else; validated by \
+                `boss_jobs::agents::load_agents_toml`",
         parse: parse_agents,
         scaffold: Some(scaffold_agents),
     },

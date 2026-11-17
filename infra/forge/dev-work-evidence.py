@@ -152,7 +152,7 @@ def from_packet(packet, request):
     need(type(metadata) is dict and metadata.get('host')=='forge' and metadata.get('verb')=='plan-dev-work-volume-expansion'
          and type(metadata.get('args')) is list and len(metadata['args'])==1
          and type(metadata['args'][0]) is str
-         and re.fullmatch(r'(4[1-9]|5[0-9]|6[0-4])Gi',metadata['args'][0]),
+         and re.fullmatch(r'(4[1-9]|[5-9][0-9]|1[01][0-9]|12[0-8])Gi',metadata['args'][0]),
          'ops-request is not the fixed forge volume planner')
     steps=packet.get('steps')
     need(type(steps) is list,'ops execution record missing')

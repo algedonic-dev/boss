@@ -494,9 +494,12 @@ metadata_defaults = { line_items = [
 # Pull + stage the kegs from the cooler — the physical pick a warehouse hand
 # performs (human labor), gated on the stock-check deciding "fulfill". This is
 # the fulfillment step the old flow was missing (it jumped straight from
-# acknowledge to ship). Finished goods are relieved here against the kegs
-# actually pulled — see the FG-drawdown-on-pick rule in rules.toml. Wholesale
-# ships from the stock morning-brew builds; there is no per-order brew.
+# acknowledge to ship). The kegs leave the shelf here, but this step moves no
+# stock on the record: finished goods are drawn down when the invoice issues,
+# by the products-consume-on-invoice-created rule in rules.toml (car 0e0549dc's
+# review found this comment citing an FG-drawdown-on-pick rule that never
+# existed). Wholesale ships from the stock morning-brew builds; there is no
+# per-order brew.
 [[workflow.step]]
 title = "pull-and-stage"
 kind = "handoff"

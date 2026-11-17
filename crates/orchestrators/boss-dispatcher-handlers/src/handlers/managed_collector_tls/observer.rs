@@ -10,15 +10,16 @@ pub use native::HttpCurrentTrust;
 /// The fixed endpoint never accepts a caller URL, proxy or ambient trust.
 pub struct ServedLeaf;
 impl ServedLeaf {
+    // Test-only, and it keeps the observer's own error: a test that saw
+    // only `Refused` could assert nothing but a boolean, so a failed
+    // observation reached a gate receipt with no cause (backlog d17da356).
     #[cfg(test)]
     async fn observe_test(
         &self,
         trust: &str,
         address: std::net::SocketAddr,
-    ) -> Result<Vec<u8>, Refused> {
-        Self::connect(trust.to_owned(), address)
-            .await
-            .map_err(|_| Refused)
+    ) -> Result<Vec<u8>, String> {
+        Self::connect(trust.to_owned(), address).await
     }
     pub async fn observe(&self, trust: &str) -> Result<Vec<u8>, Refused> {
         self.original(trust).await.map_err(|_| Refused)

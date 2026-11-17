@@ -40,12 +40,31 @@ use std::process::Command;
 
 /// `systemctl show <unit> --property=...`: every unit loaded and at
 /// rest; forge-converge.service failed the way the 72 runs did, unless
-/// `STUB_CONVERGE=ok`.
+/// `STUB_CONVERGE=ok`. The three long-running units the forge installs
+/// beside its timer pairs — the ops-runner waker and the two network-boot
+/// daemons — run (Type=simple), unless `STUB_WAKE=dead`, which leaves the
+/// waker failed the way a refusal (exit 78) leaves it. `systemctl
+/// list-units` answers what the forge's own reading of 2026-10-20 found
+/// running under the boss- prefix: the runner's timer and its waker.
 const SYSTEMCTL: &str = r#"#!/bin/sh
+if [ "$1" = "list-units" ]; then
+    echo "boss-ops-runner.timer loaded active waiting BOSS ops: answer ops-request packets"
+    [ "${STUB_WAKE:-running}" = "running" ] &&
+        echo "boss-ops-runner-wake.service loaded active running BOSS ops: wake the ops-request runner"
+    exit 0
+fi
 unit="$2"
 case "$unit" in
     *.timer)
         printf 'LoadState=loaded\nActiveState=active\nSubState=waiting\nResult=success\n' ;;
+    boss-ops-runner-wake.service)
+        if [ "${STUB_WAKE:-running}" = "dead" ]; then
+            printf 'LoadState=loaded\nActiveState=failed\nSubState=failed\nResult=exit-code\nExecMainStatus=78\nType=simple\n'
+        else
+            printf 'LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nExecMainStatus=0\nType=simple\n'
+        fi ;;
+    forge-netboot-dhcp.service|forge-netboot-http.service)
+        printf 'LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nExecMainStatus=0\nType=simple\n' ;;
     forge-converge.service)
         if [ "${STUB_CONVERGE:-failed}" = "ok" ]; then
             printf 'LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nExecMainStatus=0\nType=oneshot\n'
@@ -196,6 +215,9 @@ fn a_failed_forge_converge_reaches_the_estate_door_as_an_unhealthy_unit() {
         "cluster-watchdog.timer",
         "estate-observe-units.timer",
         "boss-ops-runner.service",
+        "boss-ops-runner-wake.service",
+        "forge-netboot-dhcp.service",
+        "forge-netboot-http.service",
     ] {
         assert_eq!(unit(node, name)["healthy"], true, "{name}: {obs}");
     }
@@ -257,4 +279,74 @@ fn a_healthy_forge_posts_a_clean_reading_and_exits_zero() {
         true,
         "{obs}"
     );
+    // The waker the 2026-10-20 reading carried as undeclared is watched,
+    // so nothing running under the boss- prefix is left outside the roster.
+    assert_eq!(
+        obs["nodes"][0]["undeclared_units"],
+        serde_json::json!([]),
+        "{obs}"
+    );
+}
+
+/// THE WAKER IS WATCHED WHERE IT RUNS (backlog 2eae38d4). On 2026-10-20
+/// the forge's own reading carried `boss-ops-runner-wake.service` under
+/// `undeclared_units` — running, and outside what the observer judged —
+/// so a dead waker would have shown only as ops-request `queued_s`
+/// drifting from ~10 s back toward ~33 s while the timer kept every
+/// request moving. Dead, it is a red unit on the estate record, the row
+/// estate compare turns into `unit_unhealthy:forge/boss-ops-runner-wake.service`,
+/// and the observer fails locally too.
+#[test]
+fn a_dead_waker_on_the_forge_is_a_red_unit_on_the_estate_record() {
+    let forge = Forge::new("dead-waker");
+    let run = forge.observe(
+        Some("cluster-operator,ops-runner"),
+        &[("STUB_CONVERGE", "ok"), ("STUB_WAKE", "dead")],
+    );
+    assert_eq!(
+        run.rc, 1,
+        "a dead waker must fail the observer locally:\n{}",
+        run.text
+    );
+    let obs = forge.posted();
+    let node = &obs["nodes"][0];
+    assert_eq!(node["healthy"], false, "{obs}");
+    let wake = unit(node, "boss-ops-runner-wake.service");
+    assert_eq!(wake["healthy"], false, "{wake}");
+    assert_eq!(wake["exec_main_status"], 78, "{wake}");
+    let red = node["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|u| u["healthy"] != true)
+        .count();
+    assert_eq!(red, 1, "only the waker is red: {obs}");
+}
+
+/// Without the ops-runner role the forge installs no runner, so there is
+/// no waker to watch — watching one would read not-found forever, the
+/// 2026-09-15 false alarms again. The network-boot daemons stay: the
+/// forge installs them whatever its roles.
+#[test]
+fn a_forge_outside_the_ops_runner_role_watches_no_waker() {
+    let forge = Forge::new("no-runner");
+    let run = forge.observe(Some("cluster-operator"), &[("STUB_CONVERGE", "ok")]);
+    assert_eq!(run.rc, 0, "{}", run.text);
+    let obs = forge.posted();
+    let watched: Vec<&str> = obs["nodes"][0]["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|u| u["unit"].as_str())
+        .collect();
+    for gone in [
+        "boss-ops-runner.timer",
+        "boss-ops-runner.service",
+        "boss-ops-runner-wake.service",
+    ] {
+        assert!(!watched.contains(&gone), "{gone}: {obs}");
+    }
+    for kept in ["forge-netboot-dhcp.service", "forge-netboot-http.service"] {
+        assert!(watched.contains(&kept), "{kept}: {obs}");
+    }
 }

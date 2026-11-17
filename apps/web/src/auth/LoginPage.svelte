@@ -10,7 +10,8 @@
   // share this component's state via the inline mode toggle.
 
   import { onMount } from 'svelte';
-  import { safeSitePath } from '@boss/web-kit/links';
+  import { safeLinkHref } from '@boss/web-kit/links';
+  import { oidcLoginHref, safeNext } from './loginNext';
 
   let email = $state<string>('');
   let password = $state<string>('');
@@ -19,6 +20,13 @@
   let busy = $state<boolean>(false);
   let error = $state<string | null>(null);
   let guestOffered = $state<boolean>(false);
+  // Who the guest button signs a visitor in as is the DEPLOYMENT's
+  // answer, read off GET /api/auth/guest with `enabled`, never a
+  // constant here: this page spelled one instance's address, so every
+  // adopter's visitors were told they would be that instance's guest
+  // (approved design c6f08b60 D2, item 26f5080a). null when the
+  // gateway names none, and then the note names no address.
+  let guestEmail = $state<string | null>(null);
   // Same ask-before-offering contract as guest: the IdP button only
   // renders where the gateway says OIDC is configured (idm-kanidm) -
   // a deployment without the front door never shows a door.
@@ -30,7 +38,11 @@
   let showLocalAuth = $state<boolean>(false);
 
   // If the SPA already has a session (someone hit /login while
-  // logged in), redirect to home rather than bury them in a form.
+  // logged in), go on to `next` — home when there is none — rather
+  // than bury them in a form. This is also how a passkey sign-in
+  // returns to its page: the gateway's IdP callback lands on
+  // /login?next=<page>, so `safeNext` judges that page here, the one
+  // place `next` is judged (backlog 7d70cad6).
   //
   // A guest is the exception: they are signed in, but arriving here
   // is how they ask to stop being a guest, so bouncing them home
@@ -42,7 +54,7 @@
       const r = await fetch('/api/auth/me');
       if (r.ok) {
         const me = await r.json();
-        if (me.employee_id) window.location.href = '/';
+        if (me.employee_id) window.location.href = safeNext(window.location.search);
       }
     } catch {
       // ignore — auth provider may not be local-auth, in which
@@ -53,7 +65,11 @@
     // be shown a button that answers 404.
     try {
       const r = await fetch('/api/auth/guest');
-      if (r.ok) guestOffered = (await r.json()).enabled === true;
+      if (r.ok) {
+        const offer = await r.json();
+        guestOffered = offer.enabled === true;
+        guestEmail = typeof offer.email === 'string' && offer.email.trim() !== '' ? offer.email : null;
+      }
     } catch {
       // no availability endpoint — no button.
     }
@@ -74,8 +90,7 @@
         error = (await r.text()) || `HTTP ${r.status}`;
         return;
       }
-      const params = new URLSearchParams(window.location.search);
-      window.location.href = safeNext(params);
+      window.location.href = safeNext(window.location.search);
     } catch (e) {
       error = String(e);
     } finally {
@@ -98,8 +113,7 @@
       }
       // Gateway set the boss_session cookie. Drop the next-page
       // intent into the URL if a 401-redirect put one there.
-      const params = new URLSearchParams(window.location.search);
-      window.location.href = safeNext(params);
+      window.location.href = safeNext(window.location.search);
     } catch (e) {
       error = String(e);
     } finally {
@@ -108,17 +122,11 @@
   }
 
 
-  // The `next` param is attacker-reachable (anything can link to
-  // /login?next=...), so it admits in-app paths only — the same rule
-  // router.ts applies to `from`, where the comment names the attack:
-  // a value on another origin turns sign-in into an open redirect.
-  // `//evil.example` is scheme-relative and just as hostile as
-  // `https://`, hence the second test. So are `/\evil.example` and a
-  // `next` carrying a tab or newline, which a browser strips to `//`;
-  // safeSitePath refuses all of them (4f1f7698).
-  function safeNext(params: URLSearchParams): string {
-    return safeSitePath(params.get('next')) ?? '/';
-  }
+  // `next` is attacker-reachable, so it admits in-app paths only; the
+  // rule and its reasons live in ./loginNext.ts, the one place it is
+  // read (backlog 7d70cad6 moved it there so the passkey door below
+  // carries the same judged value).
+  const oidcHref = oidcLoginHref(window.location.search);
 
   async function consumeReset(): Promise<void> {
     busy = true;
@@ -404,8 +412,11 @@
       <div class="guest-block">
         {#if showLocalAuth}<div class="guest-divider"><span>or</span></div>{/if}
         <!-- A NAVIGATION, not a fetch: the auth-code flow is a round
-             trip through the IdP and back to the callback. -->
-        <a class="guest-btn oidc-btn" href="/api/auth/oidc/login">
+             trip through the IdP and back to the callback. The href is
+             judged by safeLinkHref like every bound link
+             (linkSinks.test.ts); oidcLoginHref always answers a path
+             on this site, so it passes unchanged. -->
+        <a class="guest-btn oidc-btn" href={safeLinkHref(oidcHref)}>
           Sign in with Algedonic ID
         </a>
         <p class="guest-note">
@@ -421,8 +432,9 @@
           Browse as a guest
         </button>
         <p class="guest-note">
-          Signs you in as <code>guest@algedonic.dev</code> — read-only. You can open
-          any record and follow the audit log; nothing you do changes anything.
+          {#if guestEmail}Signs you in as <code>{guestEmail}</code> — read-only.{:else}Signs
+          you in as a guest — read-only.{/if} You can open any record and follow
+          the audit log; nothing you do changes anything.
         </p>
       </div>
     {/if}

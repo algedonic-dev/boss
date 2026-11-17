@@ -27,6 +27,11 @@ name = "boss-jobs-rebuild"
 path = "src/bin/boss_jobs_rebuild.rs"
 required-features = ["postgres"]
 
+[[bin]]
+name = "boss-registry-export"
+path = "src/bin/boss_registry_export.rs"
+required-features = ["postgres"]
+
 [features]
 default = []
 postgres = ["dep:sqlx", "boss-policy-client/postgres", "boss-calendar/postgres", "boss-events/postgres"]
@@ -34,17 +39,73 @@ postgres = ["dep:sqlx", "boss-policy-client/postgres", "boss-calendar/postgres",
 # `update_step_at`): tests plant rows and interleaved writers with it,
 # and no service may write through it, so it exists only here, turned on
 # by this crate's own dev-dependency below (backlog 428332da).
-test-support = []
+#
+# It also turns on boss-events' `test-support`, where the fold fixtures'
+# measured stall and budget are spelled once (backlog 03a5dbdc).
+test-support = ["boss-events/test-support"]
+
+# The declared-writer controls share the actual router between memory
+# and isolated Postgres race fixtures; both are required for this port.
+[[test]]
+name = "a_passkey_guards_only_passkey_protocols"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_ops_runner_is_the_only_writer_of_the_plan_a_human_signs"
+required-features = ["postgres"]
 
 [[test]]
 name = "cadence_history"
 required-features = ["postgres"]
 
 [[test]]
+name = "resource_pools"
+required-features = ["postgres"]
+
+[[test]]
+name = "claims_console_history"
+required-features = ["postgres"]
+
+# Its claims console reads through the native audit source into the
+# Postgres history as well as the in-memory one (backlog 971a6190).
+[[test]]
+name = "a_per_step_claim_records_the_station_its_step_is_queued_at"
+required-features = ["postgres"]
+
+[[test]]
+name = "claims_console_http"
+
+[[test]]
+name = "flow_resource_claims"
+required-features = ["postgres"]
+
+[[test]]
+name = "an_exhausted_pool_makes_a_claim_wait_in_its_queue"
+required-features = ["postgres"]
+
+[[test]]
 name = "conditional_binding_authority"
 required-features = ["postgres"]
 
+[[test]]
+name = "a_packets_priority_moves_through_its_own_door_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_packet_keeps_a_reserve_under_its_event_bound_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_step_batch_reads_each_packet_once_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "request_latency_pg"
+required-features = ["postgres"]
+
 [dependencies]
+rust_decimal = { version = "1", features = ["serde"] }
+num-bigint = "0.4"
 boss-clock-client = { path = "../boss-clock-client" }
 boss-ports = { path = "../boss-ports" }
 # `blocking`: the workflow bootstrap walk sends through
@@ -61,7 +122,7 @@ boss-subject-kinds-client = { path = "../boss-subject-kinds-client" }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 axum = { workspace = true }
@@ -79,6 +140,11 @@ base64 = "0.22"
 anyhow = { workspace = true }
 clap = { workspace = true }
 toml = { workspace = true }
+# The ops allowlist's arg patterns (ops_verbs.rs, backlog 7aef2405) — the
+# same crate boss-cli read them with before they moved here.
+regex = "1"
+# Read the reviewed ConfigMap semantically, including quoted/aliased YAML.
+yaml_serde = "0.10"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures = { workspace = true }
@@ -134,6 +200,10 @@ name = "cadence_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "registry_export_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "credentials_pg"
 required-features = ["postgres"]
 
@@ -166,7 +236,19 @@ name = "yard_moves_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "estate_capacity_refresh"
+required-features = ["postgres"]
+
+[[test]]
+name = "estate_disks"
+required-features = ["postgres"]
+
+[[test]]
 name = "estate_readers_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "estate_comparison_pg"
 required-features = ["postgres"]
 
 [[test]]
@@ -191,6 +273,10 @@ required-features = ["postgres"]
 
 [[test]]
 name = "job_metadata_patch_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "an_owed_proof_payment_is_judged_under_the_row_lock_pg"
 required-features = ["postgres"]
 
 [[test]]
@@ -247,6 +333,14 @@ required-features = ["postgres"]
 
 [[test]]
 name = "a_created_step_replays_at_its_plugin_version_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_dark_bus_still_serves_and_records_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_lost_gate_handback_sent_twice_is_one_item_pg"
 required-features = ["postgres"]
 
 [[test]]
@@ -322,6 +416,14 @@ name = "a_stale_step_write_erases_nothing_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "a_release_lifts_only_the_hold_it_read_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_step_merge_lands_only_on_the_hold_its_writer_judged_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "an_active_step_keeps_its_holder_pg"
 required-features = ["postgres"]
 
@@ -331,6 +433,10 @@ required-features = ["postgres"]
 
 [[test]]
 name = "step_claim_admits_an_aliased_holder_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_claim_clears_only_for_the_executor_a_step_names"
 required-features = ["postgres"]
 
 [[test]]
@@ -379,6 +485,10 @@ required-features = ["postgres"]
 
 [[test]]
 name = "a_set_of_packets_reads_in_one_query_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_scope_census_reads_the_set_its_scope_admits_pg"
 required-features = ["postgres"]
 
 [[test]]
@@ -490,10 +600,6 @@ name = "a_station_claim_reads_every_role_the_record_holds_pg"
 required-features = ["postgres"]
 
 [[test]]
-name = "a_claim_past_the_agents_concurrent_run_cap_is_refused_pg"
-required-features = ["postgres"]
-
-[[test]]
 name = "the_inbox_outlives_the_session_that_filled_it_pg"
 required-features = ["postgres"]
 
@@ -503,6 +609,10 @@ required-features = ["postgres"]
 
 [[test]]
 name = "the_health_reads_the_schema_ledger_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_database_pool_observation_never_waits_for_the_pool"
 required-features = ["postgres"]
 
 [[test]]
@@ -539,4 +649,8 @@ required-features = ["postgres"]
 
 [[test]]
 name = "historical_packet_receipts_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "last_firings_order_pg"
 required-features = ["postgres"]

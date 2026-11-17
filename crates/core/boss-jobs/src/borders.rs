@@ -684,9 +684,9 @@ fn flow_of(spec: &BorderSpec, r: &RegionInputs<'_>, w: &Windows, stuck: &BTreeSe
             // within its limit whose flow the cube cannot see, the stuck
             // block's `unknown` arm), then a person to take it.
             let classes = HoldsByClass::of(standing.iter().map(|id| {
-                let blind = stations.iter().any(|s| {
-                    !s.over_limit && s.served.is_none() && s.members.iter().any(|m| m == *id)
-                });
+                let blind = stations
+                    .iter()
+                    .any(|s| s.served.is_none() && s.members.iter().any(|m| m == *id));
                 class_of(
                     id,
                     if blind {
@@ -1123,8 +1123,9 @@ fn ordinal(n: i32) -> String {
 }
 
 /// Where a car in the shed stands, in the words its place already has
-/// ([`crate::regions::shed_place`]).
-fn shed_words(md: &Value) -> String {
+/// ([`crate::regions::shed_place`]). Also the words an item's build is
+/// refused in while its car stands here (`crate::item_awaits_its_car`).
+pub(crate) fn shed_words(md: &Value) -> String {
     match shed_place(md) {
         crate::regions::ShedPlace::ProbePending { last: Some(why) } => {
             format!("its probe is FAILING — {why}")
@@ -2995,6 +2996,7 @@ mod tests {
             reason: "held for the restart".to_string(),
             kind: crate::yard::CarHoldKind::Operator,
             release: None,
+            auto_release: None,
         });
         status.gates.queued.push(crate::yard::QueuedGate {
             branch: "fix/in-line".to_string(),
