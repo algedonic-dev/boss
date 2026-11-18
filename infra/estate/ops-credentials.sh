@@ -32,6 +32,9 @@
 #                                              found
 #     unmeasured: <dir> is not searchable by <user>, and the privileged
 #                 door refused: <its own words>
+#     unmeasured: <dir> is not searchable by <user>, and the privileged
+#                 door was cut off by its timeout (exit <124|137>,
+#                 bound <n>s): <its last words>
 #                                              this reader cannot tell —
 #                                              neither directly nor
 #                                              through the door below;
@@ -58,6 +61,10 @@
 #     first so a line for it proves the container saw inside: without
 #     it the answer is the door's refusal, not two absences;
 #   - `--network none`, and the image ops_kubectl already pulls;
+#   - `--log-driver=none`: it mounts the whole credential directory, so
+#     it is held to the rule every credential-mounting container is
+#     (backlog ff957587) — what it prints, docker's refusals with it,
+#     is never also kept in the daemon's container log;
 #   - `sudo -n`, so a reader on a timer never waits at a prompt;
 #   - bounded twice, because this runs inside the forge's OWN host
 #     reading, the one the boarding check reads and the one a stalled
@@ -67,20 +74,28 @@
 #     a CLI wedged on its daemon can outlive it; and `timeout 10` on stat
 #     INSIDE the container, as ops_talosctl bounds talosctl, because
 #     killing the host-side client leaves a container running (review
-#     of 058b1ef1, M1). The directory's mode is never touched (design
+#     of 058b1ef1, M1). The answer goes to a file, so neither bound can
+#     be outlived by a process timeout's KILL does not reach (c44ba179,
+#     ops_bounded below). The directory's mode is never touched (design
 #     835c0c9c).
 # Names are the CONTAINER's reading of /etc/passwd, so the numbers ride
 # beside them and are what is judged: uid 0 is root on both sides, and a
 # file owned by any other host account is named by its uid, not by a
 # name the image happens to give it (review of 058b1ef1, L2).
 #
-# EVERY STATUS HERE IS SWALLOWED ON PURPOSE. observe-host.sh runs this
-# under `set -eu` (dash), which keeps -e inside a command substitution:
-# a door that answers nonzero — stat's 1 for a missing credential, the
-# very case this reading exists to report, or a sudo or docker refusal —
+# NO STATUS HERE KILLS THE CALLER. observe-host.sh runs this under
+# `set -eu` (dash), which keeps -e inside a command substitution: a door
+# that answers nonzero — stat's 1 for a missing credential, the very
+# case this reading exists to report, or a sudo or docker refusal —
 # would kill the function's subshell with nothing printed and take the
 # whole host reading down with it, disk and all (review of 058b1ef1,
-# H1). The words are the answer; `|| :` keeps them.
+# H1). So ops_bounded keeps the status rather than acting on it, and
+# the words are the answer — with ONE exception, timeout's own two
+# codes. Until 2026-11-17 those were swallowed with the rest, so a door
+# cut off after printing only its `/ops/.` line read `not ready:
+# talosconfig:absent kubeconfig:absent`: two files nobody had stat'ed,
+# reported as looked-for and missing (review e4325ecd of car d92554d9,
+# L1). Cut off is `unmeasured`, naming the bound.
 # The converge runs as root and never takes this branch, so one
 # definition still answers both readers.
 ops_credentials_state() {
@@ -88,12 +103,27 @@ ops_credentials_state() {
     _oc_dir="${BOSS_OPS_DIR:-/etc/boss-ops}"
     _oc_door=""
     if [ -d "$_oc_dir" ] && [ ! -x "$_oc_dir" ]; then
-        _oc_door="$(timeout -k 5 "${BOSS_OPS_DOOR_TIMEOUT_S:-30}" sudo -n docker run --rm --network none \
+        _oc_who="$(id -un 2>/dev/null || id -u)" || :
+        _oc_t="${BOSS_OPS_DOOR_TIMEOUT_S:-30}"
+        ops_bounded "$_oc_t" sudo -n docker run --rm --log-driver=none --network none \
             --mount "type=bind,src=$_oc_dir,dst=/ops,readonly" alpine/k8s:1.33.3 \
-            timeout 10 stat -c '%n %U:%G %a %u:%g' /ops/. /ops/talosconfig /ops/kubeconfig 2>&1)" || :
+            timeout 10 stat -c '%n %U:%G %a %u:%g' /ops/. /ops/talosconfig /ops/kubeconfig || {
+            echo "unmeasured: $_oc_dir is not searchable by $_oc_who, and no scratch file could hold the privileged door's answer: $_ob_out"
+            return 0
+        }
+        _oc_door="$_ob_out"
+        _oc_why="$(printf '%s\n' "$_oc_door" | awk 'NF { l = $0 } END { print l }')"
+        case "$_ob_rc" in
+            124|137)
+                # 124 from the host-side bound's TERM or from stat's own
+                # inside the container (docker passes it on); 137 when
+                # only the -k KILL ended it.
+                echo "unmeasured: $_oc_dir is not searchable by $_oc_who, and the privileged door was cut off by its timeout (exit $_ob_rc, bound ${_oc_t}s): ${_oc_why:-no answer}"
+                return 0
+                ;;
+        esac
         if [ -z "$(printf '%s\n' "$_oc_door" | sed -n '/^\/ops\/\. /p')" ]; then
-            _oc_why="$(printf '%s\n' "$_oc_door" | awk 'NF { l = $0 } END { print l }')"
-            echo "unmeasured: $_oc_dir is not searchable by $(id -un 2>/dev/null || id -u), and the privileged door refused: ${_oc_why:-no answer}"
+            echo "unmeasured: $_oc_dir is not searchable by $_oc_who, and the privileged door refused: ${_oc_why:-no answer}"
             return 0
         fi
     fi
@@ -123,6 +153,55 @@ ops_credentials_state() {
     else
         echo "present"
     fi
+}
+
+# ops_bounded <seconds> <command…>
+#   Runs the command under `timeout -k 5 <seconds>`, its stdout and
+#   stderr into a scratch FILE, then sets _ob_out to what it printed and
+#   _ob_rc to timeout's status — 124 when the bound's TERM ended it, 137
+#   when only the KILL five seconds later did. Status 0 whatever the
+#   command answered; status 1, with mktemp's or the shell's own words in
+#   _ob_out, when no scratch file could be made, and then the command
+#   never ran. Run it bare, never inside `$(…)`: the two variables are
+#   its answer.
+#
+# A FILE, NEVER A `$(…)` PIPE (backlog c44ba179, 2026-11-16; 4b1b1ff5).
+# A command substitution waits for EOF from every process holding its
+# pipe, not for timeout, so a bound read through one held only as far as
+# timeout's KILL reached: a real sudo runs docker in a new session on a
+# pty (use_pty, sudo-rs), outside timeout's process group, and on the
+# public mirror's Ubuntu 26 a stand-in door's TERM-ignoring child kept
+# the pipe — and the reading — for its full 30s. Redirected, the shell
+# waits for timeout alone; a survivor writes to a file nobody reads
+# again. Car d92554d9 fixed the credential door that way; the image
+# pull below kept the old shape, with no -k at all, until this.
+#
+# OPENED, UNLINKED, THEN RUN (review e4325ecd of car d92554d9, L2). The
+# file was removed after timeout returned, so a caller killed while it
+# waited — systemd stopping the unit, or its start timeout — never
+# reached the rm, and every such kill left a file in the caller's TMPDIR.
+# Now the file is open for writing (fd 3) and for reading (fd 4) and its
+# name gone before the command starts, so there is nothing left to leak,
+# whoever dies when. Not a trap: this file is sourced, and a trap set in
+# a function replaces the caller's own. The redirections are the brace
+# group's, so the caller's fds 3 and 4 are its own again afterwards; the
+# command gets neither (only its stdout and stderr, which are the file),
+# and cat of a file stops at its end, whoever is still writing to it.
+ops_bounded() {
+    _ob_t="$1"
+    shift
+    _ob_out=""
+    _ob_rc=0
+    _ob_f="$(mktemp 2>&1)" || { _ob_out="$_ob_f"; return 1; }
+    {
+        rm -f "$_ob_f"
+        timeout -k 5 "$_ob_t" "$@" >&3 2>&1 3>&- 4<&- || _ob_rc=$?
+        _ob_out="$(cat <&4 3>&- 4<&-)" || :
+    } 3>"$_ob_f" 4<"$_ob_f" || {
+        rm -f "$_ob_f"
+        _ob_out="the scratch file $_ob_f could not be opened"
+        return 1
+    }
 }
 
 # WHICH CREDENTIALS A HOST IS DECLARED TO HOLD (design 835c0c9c,
@@ -215,7 +294,8 @@ ops_credentials_declared() {
 # ops_image_ready
 #   Makes ops_image PRESENT and PINNED before an acting loop reads, and
 #   prints one line saying which. PRESENT: `docker image inspect`, else
-#   a pull bounded by BOSS_OPS_PULL_TIMEOUT_S (default 120) — a registry
+#   a pull bounded by BOSS_OPS_PULL_TIMEOUT_S (default 120, then a KILL
+#   5s later; its answer read from a file, ops_bounded) — a registry
 #   that accepts the connection and stalls used to hold `docker run`'s
 #   own pull until systemd killed the unit, which files nothing; now it
 #   is a named refusal the caller reports as blind. PINNED: a stopped
@@ -254,12 +334,23 @@ ops_image_ready() {
     _oir_pin=boss-ops-image-pin
     _oir_how=present
     if ! sudo -n docker image inspect "$_oir_img" >/dev/null 2>&1; then
+        # Through ops_bounded, never `$(timeout … docker pull)` (backlog
+        # 4b1b1ff5): this ran in that shape, with no -k, after car
+        # d92554d9 moved the credential door off it, so a pull whose
+        # command left timeout's process group held every acting loop's
+        # first step for as long as a survivor kept the pipe.
         _oir_t="${BOSS_OPS_PULL_TIMEOUT_S:-120}"
-        _oir_out="$(timeout "$_oir_t" sudo -n docker pull "$_oir_img" 2>&1)"
-        _oir_rc=$?
-        if [ "$_oir_rc" -ne 0 ]; then
-            case "$_oir_rc" in 124) _oir_why="timed out after ${_oir_t}s" ;; *) _oir_why="exit $_oir_rc" ;; esac
-            echo "ops-credentials: $_oir_img is not on this daemon and the pull from the forge registry failed ($_oir_why): $(printf '%s' "$_oir_out" | tail -3 | tr '\n' ' ')— by hand: $(ops_image_fallback)" >&2
+        if ! ops_bounded "$_oir_t" sudo -n docker pull "$_oir_img"; then
+            echo "ops-credentials: $_oir_img is not on this daemon, and no scratch file could hold the pull's answer: $_ob_out — by hand: $(ops_image_fallback)" >&2
+            return 1
+        fi
+        if [ "$_ob_rc" -ne 0 ]; then
+            case "$_ob_rc" in
+                124) _oir_why="timed out after ${_oir_t}s" ;;
+                137) _oir_why="timed out after ${_oir_t}s, and KILLed 5s later" ;;
+                *) _oir_why="exit $_ob_rc" ;;
+            esac
+            echo "ops-credentials: $_oir_img is not on this daemon and the pull from the forge registry failed ($_oir_why): $(printf '%s' "$_ob_out" | tail -3 | tr '\n' ' ')— by hand: $(ops_image_fallback)" >&2
             return 1
         fi
         _oir_how=pulled

@@ -409,7 +409,7 @@ test.describe('/ux/warehouse — State B: the Inventory tab', () => {
 test.describe('/ux/warehouse — State B: every link lands on a catalogued route, and back', () => {
   test('the four link placements keep PO availability separate from Warehouse-gated Vendors and Parts', async () => {
     expect(landing(`${ROUTE_CATALOG.parts.path}/ING-HOPS-01`)).toEqual({ kind: 'part', section: 'parts', module: 'parts' });
-    expect(landing('/ux/purchase-orders/PO-101')).toEqual({ kind: 'po', section: 'purchase-order', module: null });
+    expect(landing('/finance/purchase-orders/PO-101')).toEqual({ kind: 'po', section: 'purchase-order', module: null });
     expect(landing(`${ROUTE_CATALOG.vendors.path}/v-riverside`)).toEqual({ kind: 'vendor', section: 'vendors', module: 'warehouse' });
   });
 
@@ -472,7 +472,7 @@ test.describe('/ux/warehouse — State B: every link lands on a catalogued route
     await expect(poLinks).toHaveText(['PO-101', 'PO-102', 'PO-103']);
     await expect(vendorLinks).toHaveText(['v-riverside', 'v-riverside', 'v-canco']);
     for (const [i, id] of ['PO-101', 'PO-102', 'PO-103'].entries()) {
-      await expect(poLinks.nth(i)).toHaveAttribute('href', `/ux/purchase-orders/${id}`);
+      await expect(poLinks.nth(i)).toHaveAttribute('href', `/finance/purchase-orders/${id}`);
     }
     for (const [i, id] of ['v-riverside', 'v-riverside', 'v-canco'].entries()) {
       await expect(vendorLinks.nth(i)).toHaveAttribute('href', `${ROUTE_CATALOG.vendors.path}/${id}`);
@@ -480,7 +480,7 @@ test.describe('/ux/warehouse — State B: every link lands on a catalogued route
     await expect(body(page).locator('a')).toHaveCount(6);
 
     await poLinks.nth(0).click();
-    await expect.poll(() => new URL(page.url()).pathname).toBe('/ux/purchase-orders/PO-101');
+    await expect.poll(() => new URL(page.url()).pathname).toBe('/finance/purchase-orders/PO-101');
     await expect(page.locator('h1.detail-title')).toHaveText('v-riverside');
     await page.goBack();
     await expect.poll(() => new URL(page.url()).pathname).toBe(PATH);
@@ -510,7 +510,7 @@ test.describe('/ux/warehouse — State B: every link lands on a catalogued route
 
     await tab(page, 'Receiving').click();
     await body(page).locator('.list-section tbody tr').first().locator('td').nth(2).click();
-    await expect.poll(() => new URL(page.url()).pathname).toBe('/ux/purchase-orders/PO-101');
+    await expect.poll(() => new URL(page.url()).pathname).toBe('/finance/purchase-orders/PO-101');
   });
 
   // Gap 12 (481d7939): the department's packets are not linked from the
@@ -527,7 +527,8 @@ test.describe('/ux/warehouse — State B: every link lands on a catalogued route
     expect(hrefs).toHaveLength(2 + 5 + 6);
     expect(hrefs.filter((h) => h.startsWith(departmentJobsPath('warehouse').split('?')[0]!))).toEqual([]);
     for (const h of hrefs) {
-      expect(h, h).toMatch(/^\/ux\/(parts|purchase-orders|vendors)\//);
+      // POs and vendors are Finance's pages, at its address (c7ef4728).
+      expect(h, h).toMatch(/^\/(ux\/parts|finance\/purchase-orders|finance\/vendors)\//);
     }
   });
 

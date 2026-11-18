@@ -3,9 +3,10 @@
 //!
 //! An interactive ssh login used to exec straight into the one durable
 //! tmux session, `dev` (the Remote Control / drain session). It now
-//! offers five: 1 Claude + Claude Code (`dev`), 2 GPT + Codex (`codex`),
+//! offers six: 1 Claude + Claude Code (`dev`), 2 GPT + Codex (`codex`),
 //! 3 Gemini + Code Assist (`gemini`), 4 Shell (`shell`), 5 Claude B +
-//! Claude Code (`claude-b`, a second account's own login). Each joins its
+//! Claude Code (`claude-b`, a second account's own login), 6 GPT + Codex
+//! as the supervised factory loop (`codex-factory`, 628dc540). Each joins its
 //! session when it runs and creates it when it does not, and Enter or the
 //! timeout is option 1, so anything that relied on landing in `dev` still
 //! lands there. The selector is VERSIONED in the checkout and the
@@ -1117,4 +1118,505 @@ fn option_five_prepares_its_home_and_never_copies_a_credential() {
         !b.join(".credentials.json").exists(),
         "a credential must never be copied into the second account's home: {out}"
     );
+}
+
+/// Option 6 is the factory loop (backlog 628dc540): the SAME codex
+/// identity as option 2, running infra/dev/factory-loop.sh rather than
+/// the TUI, in its own session. Joined when it runs, created when not.
+#[test]
+fn option_six_runs_the_factory_loop_as_codex() {
+    let codex = "codex@algedonic.dev";
+    for running in ["", "codex-factory"] {
+        let f = Fixture::new(&format!("opt6-{}", running.len()), &["codex"]);
+        let (rc, out) = f.run(running, "6\n", &[]);
+        assert_eq!(rc, 0, "{out}");
+        assert_eq!(
+            f.attached(),
+            format!(
+                "tmux new-session -A -s codex-factory -c {} {} {}/infra/dev/factory-loop.sh HOME={}",
+                f.boss(),
+                identity(codex, "Codex (engineering)", running.is_empty()),
+                f.boss(),
+                f.home()
+            ),
+            "sessions `{running}`: {out}"
+        );
+    }
+}
+
+/// The TUI and the loop sign as one agent, so neither is CREATED while
+/// the other runs — two CLIs on one identity would race for one queue.
+/// The refusal names the other session and goes back to the menu.
+#[test]
+fn the_codex_tui_and_the_factory_loop_never_start_beside_each_other() {
+    for (choice, wanted, other) in [
+        ("6", "codex-factory", "codex"),
+        ("2", "codex", "codex-factory"),
+    ] {
+        let f = Fixture::new(&format!("exclusive-{wanted}"), &["codex"]);
+        let (rc, out) = f.run(other, &format!("{choice}\n4\n"), &[]);
+        assert_eq!(rc, 0, "{out}");
+        assert!(
+            out.contains(&format!(
+                "tmux `{other}` is running and signs as the same agent"
+            )),
+            "{out}"
+        );
+        assert!(
+            f.attached().starts_with("tmux new-session -A -s shell "),
+            "the refusal returns to the menu: {}",
+            f.log()
+        );
+        assert!(!f.log().contains(&format!("-s {wanted} ")), "{}", f.log());
+    }
+}
+
+/// `--detached 6` (backlog ccd985ef): `boss factory restart`, through
+/// infra/dev/agent-pane.sh, starts the factory loop with option 6's own
+/// command — the same session, identity and loop — in a DETACHED session,
+/// from inside the conductor's tmux and with no terminal, and prints the
+/// session and its pane pid. No menu is shown.
+#[test]
+fn detached_six_starts_option_six_without_a_terminal() {
+    let codex = "codex@algedonic.dev";
+    let f = Fixture::new("detached-6", &["codex"]);
+    let tmux = format!("{},1,0", f.root.join("tmux-socket").display());
+    let out = f
+        .cmd("dev", &[("TMUX", &tmux)])
+        .args(["--detached", "6"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run dev-session.sh");
+    let (rc, out) = collect(out);
+    assert_eq!(rc, 0, "{out}");
+    assert!(!out.contains("1)"), "no menu: {out}");
+    assert_eq!(
+        f.attached(),
+        format!(
+            "tmux new-session -d -P -F #{{session_name}} #{{pane_pid}} -s codex-factory -c {} {} \
+             {}/infra/dev/factory-loop.sh HOME={}",
+            f.boss(),
+            identity(codex, "Codex (engineering)", true),
+            f.boss(),
+            f.home()
+        )
+    );
+}
+
+/// `--detached 2` and `--detached 5` (backlog 2a2d11b2, David
+/// 2026-11-10): after a pod roll the interactive Codex and Claude B wait
+/// for an interactive login, so `boss session start` starts them with the
+/// menu's own option — the same session, identity check, config and
+/// command — DETACHED, and prints the session and its pane pid. Option 5
+/// prepares its login home as the menu does; the registry is read, so
+/// each signs as its own registered alias.
+#[test]
+fn detached_two_and_five_start_their_options_without_a_terminal() {
+    for (option, cli) in [("2", "codex"), ("5", "claude")] {
+        let f = Fixture::new(&format!("detached-{option}"), &[cli]);
+        let command = if option == "2" {
+            format!(
+                "-s codex -c {} {} codex",
+                f.boss(),
+                identity("codex@algedonic.dev", "Codex (engineering)", true)
+            )
+        } else {
+            format!(
+                "-s claude-b -c {} {} -e CLAUDE_CONFIG_DIR={}/.claude-b claude",
+                f.boss(),
+                identity(
+                    "claude-b@algedonic.dev",
+                    "Claude (engineering, account B)",
+                    true
+                ),
+                f.home()
+            )
+        };
+        let expected = format!(
+            "tmux new-session -d -P -F #{{session_name}} #{{pane_pid}} {command} HOME={}",
+            f.home()
+        );
+        let out = f
+            .cmd("dev", &[])
+            .args(["--detached", option])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run dev-session.sh");
+        let (rc, out) = collect(out);
+        assert_eq!(rc, 0, "option {option}: {out}");
+        assert!(!out.contains("1)"), "no menu: {out}");
+        assert_eq!(f.attached(), expected, "option {option}: {out}");
+        assert!(
+            f.log().contains("boss-api GET /api/agents"),
+            "option {option}: the alias is checked against the registry: {}",
+            f.log()
+        );
+        if option == "5" {
+            assert!(
+                Path::new(&f.home()).join(".claude-b").is_dir(),
+                "option 5 prepares its login home detached as on the menu: {out}"
+            );
+        }
+    }
+}
+
+/// `--detached` takes options 2, 5 and 6 alone — never 1 (the drain's
+/// `dev`, which the boot owns), 3 or 4 — and never joins: a running
+/// session, a running session on the same codex identity, or a missing
+/// CLI is refused with nothing started and no install offered.
+#[test]
+fn detached_refuses_anything_but_a_fresh_session() {
+    for (name, args, sessions, clis, said) in [
+        (
+            "other",
+            vec!["--detached", "3"],
+            "",
+            vec!["codex", "gemini"],
+            "takes only 2, 5 or 6",
+        ),
+        (
+            "dev",
+            vec!["--detached", "1"],
+            "",
+            vec!["claude"],
+            "takes only 2, 5 or 6",
+        ),
+        (
+            "shell",
+            vec!["--detached", "4"],
+            "",
+            vec![],
+            "takes only 2, 5 or 6",
+        ),
+        (
+            "none",
+            vec!["--detached"],
+            "",
+            vec!["codex"],
+            "takes only 2, 5 or 6",
+        ),
+        (
+            "tui-running",
+            vec!["--detached", "2"],
+            "codex",
+            vec!["codex"],
+            "already running",
+        ),
+        (
+            "tui-beside-factory",
+            vec!["--detached", "2"],
+            "codex-factory",
+            vec!["codex"],
+            "signs as the same agent",
+        ),
+        (
+            "tui-nocli",
+            vec!["--detached", "2"],
+            "",
+            vec![],
+            "not installed",
+        ),
+        (
+            "claude-b-running",
+            vec!["--detached", "5"],
+            "claude-b",
+            vec!["claude"],
+            "already running",
+        ),
+        (
+            "claude-b-nocli",
+            vec!["--detached", "5"],
+            "",
+            vec![],
+            "not installed",
+        ),
+        (
+            "running",
+            vec!["--detached", "6"],
+            "codex-factory",
+            vec!["codex"],
+            "already running",
+        ),
+        (
+            "tui",
+            vec!["--detached", "6"],
+            "codex",
+            vec!["codex"],
+            "signs as the same agent",
+        ),
+        (
+            "nocli",
+            vec!["--detached", "6"],
+            "",
+            vec![],
+            "not installed",
+        ),
+    ] {
+        let f = Fixture::new(&format!("detached-refused-{name}"), &clis);
+        let out = f
+            .cmd(sessions, &[])
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run dev-session.sh");
+        let (rc, out) = collect(out);
+        assert_ne!(rc, 0, "{name}: {out}");
+        assert!(out.contains(said), "{name}: {out}");
+        assert!(!out.contains("1)"), "{name}: no menu: {out}");
+        assert!(!f.log().contains("new-session"), "{name}: {}", f.log());
+        assert!(!f.log().contains("npm "), "{name}: {}", f.log());
+        assert!(!f.log().contains("curl "), "{name}: {}", f.log());
+    }
+}
+
+/// The seats of infra/dev/seats.tsv, as `(seat, cli, twin)`, in order.
+fn seats() -> Vec<(String, String, String)> {
+    std::fs::read_to_string(repo_root().join("infra/dev/seats.tsv"))
+        .expect("infra/dev/seats.tsv")
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            assert_eq!(f.len(), 6, "a seat row has six columns: {l}");
+            (f[0].to_string(), f[1].to_string(), f[5].to_string())
+        })
+        .collect()
+}
+
+/// A CLI stub that answers its login check (`codex login status`,
+/// `claude auth status`) with `rc`, recording the login home it was
+/// asked in.
+fn login_stub(f: &Fixture, cli: &str, rc: i32) {
+    write_exec(
+        &Path::new(&f.home()).join(".local/bin").join(cli),
+        &format!(
+            "#!/usr/bin/env bash\necho \"{cli} $* config=${{CLAUDE_CONFIG_DIR:-}}\" >> \"$STUB_LOG\"\nexit {rc}\n"
+        ),
+    );
+}
+
+/// `--boot` (backlog b513514c, David's morning plan 2026-11-17 item 3):
+/// a pod roll brings back EVERY seat of infra/dev/seats.tsv, not only
+/// Codex's factory — on 2026-11-17 the conductor and Claude B stood idle
+/// 7.5 h with nothing supervising them (5627a4e1). Each seat is started
+/// detached through join(), as its interactive twin's identity, running
+/// factory-loop.sh with its own name (the first seat, option 6, with the
+/// bare path agent-pane.sh proves); each start is one `seat` line.
+#[test]
+fn boot_starts_every_seat_of_the_list_supervised() {
+    let f = Fixture::new("boot", &["codex", "claude"]);
+    login_stub(&f, "codex", 0);
+    login_stub(&f, "claude", 0);
+    let out = f
+        .cmd("dev", &[])
+        .arg("--boot")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run dev-session.sh");
+    let (rc, out) = collect(out);
+    assert_eq!(rc, 0, "{out}");
+    assert!(!out.contains("1)"), "no menu: {out}");
+    let log = f.log();
+    let seats = seats();
+    assert!(
+        seats
+            .iter()
+            .any(|(s, c, _)| s == "conductor" && c == "claude")
+            && seats
+                .iter()
+                .any(|(s, c, t)| s == "claude-b-factory" && c == "claude" && t == "claude-b")
+            && seats[0] == ("codex-factory".into(), "codex".into(), "codex".into()),
+        "the list seats the conductor and Claude B beside Codex's factory: {seats:?}"
+    );
+    for (i, (seat, _, _)) in seats.iter().enumerate() {
+        assert!(
+            out.contains(&format!("seat {seat}: started")),
+            "{seat} is started: {out}"
+        );
+        let loop_cmd = if i == 0 {
+            format!("{}/infra/dev/factory-loop.sh HOME=", f.boss())
+        } else {
+            format!("{}/infra/dev/factory-loop.sh {seat} HOME=", f.boss())
+        };
+        let line = log
+            .lines()
+            .find(|l| {
+                l.starts_with("ATTACHED tmux new-session -d -P -F")
+                    && l.contains(&format!(" -s {seat} "))
+            })
+            .unwrap_or_else(|| panic!("{seat} has a detached new-session: {log}"));
+        assert!(line.contains(&loop_cmd), "{seat} runs its loop: {line}");
+    }
+    let session = |seat: &str| {
+        log.lines()
+            .find(|l| l.starts_with("ATTACHED ") && l.contains(&format!(" -s {seat} ")))
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(
+        session("claude-b-factory").contains(&identity(
+            "claude-b@algedonic.dev",
+            "Claude (engineering, account B)",
+            true
+        )) && session("claude-b-factory")
+            .contains(&format!("-e CLAUDE_CONFIG_DIR={}/.claude-b ", f.home())),
+        "Claude B's seat signs as Claude B, in its own login home: {log}"
+    );
+    assert!(
+        session("codex-factory").contains(&identity(
+            "codex@algedonic.dev",
+            "Codex (engineering)",
+            true
+        )),
+        "{log}"
+    );
+    assert!(
+        !session("conductor").contains("BOSS_ACTOR"),
+        "the conductor signs as the pod's Claude, the server's own identity: {log}"
+    );
+    assert!(
+        log.contains(&format!("claude auth status config={}/.claude-b", f.home()))
+            && log.contains("claude auth status config=\n")
+            && log.contains("codex login status"),
+        "each seat's login is its CLI's own answer, in the seat's login home: {log}"
+    );
+}
+
+/// A seat that cannot run is named and the rest still start: a CLI with
+/// no login, a running seat, and a seat whose interactive twin holds the
+/// identity are each one line, and `--boot` exits 0 for the boot.
+#[test]
+fn boot_names_each_seat_it_does_not_start_and_starts_the_rest() {
+    let f = Fixture::new("boot-refused", &["codex", "claude"]);
+    login_stub(&f, "codex", 1);
+    login_stub(&f, "claude", 0);
+    let out = f
+        .cmd("dev claude-b conductor", &[])
+        .arg("--boot")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run dev-session.sh");
+    let (rc, out) = collect(out);
+    assert_eq!(rc, 0, "{out}");
+    for said in [
+        "seat codex-factory: not started - codex is not logged in",
+        "seat claude-b-factory: not started (exit 1): tmux `claude-b` is running and signs as the same agent",
+        "seat conductor: already running",
+    ] {
+        assert!(out.contains(said), "{said}: {out}");
+    }
+    assert!(!f.log().contains("new-session"), "{}", f.log());
+
+    let none = Fixture::new("boot-nocli", &[]);
+    let out = none
+        .cmd("", &[])
+        .arg("--boot")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run dev-session.sh");
+    let (rc, out) = collect(out);
+    assert_eq!(rc, 0, "{out}");
+    for (seat, cli, _) in seats() {
+        assert!(
+            out.contains(&format!(
+                "seat {seat}: not started - {cli} is not installed"
+            )),
+            "{seat}: {out}"
+        );
+    }
+    assert!(!none.log().contains("new-session"), "{}", none.log());
+    assert!(
+        !none.log().contains("npm "),
+        "never installs: {}",
+        none.log()
+    );
+}
+
+/// Review ce8970ce N2, N3, N4. A seat with its off switch on the PVC
+/// stays off across a roll (N3); `--boot --except <seat>` never starts
+/// that seat, which is how the boot keeps the conductor's seat from
+/// draining beside tmux `dev` when the boot left the drain there (N2);
+/// and a seat whose identity the registry did not confirm says on its
+/// own line that it started UNSIGNED (N4).
+#[test]
+fn boot_skips_an_off_or_excepted_seat_and_names_an_unsigned_start() {
+    let f = Fixture::new("boot-off", &["codex", "claude"]);
+    login_stub(&f, "codex", 0);
+    login_stub(&f, "claude", 0);
+    let off = Path::new(&f.home()).join(".config/boss/seat-off");
+    boss_testing::create_dir(&off);
+    std::fs::write(off.join("codex-factory"), "").expect("the off switch");
+    let out = f
+        .cmd("dev", &[("STUB_AGENTS", "")])
+        .args(["--boot", "--except", "conductor"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run dev-session.sh");
+    let (rc, out) = collect(out);
+    assert_eq!(rc, 0, "{out}");
+    assert!(
+        out.contains(&format!(
+            "seat codex-factory: off - {}/codex-factory exists",
+            off.display()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains("seat conductor: not started - the boot left the drain in tmux dev"),
+        "{out}"
+    );
+    assert!(
+        out.contains("seat claude-b-factory: started UNSIGNED"),
+        "{out}"
+    );
+    let log = f.log();
+    for seat in ["codex-factory", "conductor"] {
+        assert!(
+            !log.lines()
+                .any(|l| l.contains("new-session") && l.contains(&format!(" -s {seat} "))),
+            "{seat} is not started: {log}"
+        );
+    }
+}
+
+/// The refusal beside a running seat names the switch that keeps the
+/// seat off across a roll (N3), since otherwise every roll brings the
+/// seat back and the refusal with it.
+#[test]
+fn the_refusal_beside_a_seat_names_its_off_switch() {
+    let f = Fixture::new("claude-b-beside-seat-off", &["claude"]);
+    let out = f
+        .cmd("claude-b-factory", &[])
+        .args(["--detached", "5"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run dev-session.sh");
+    let (_, out) = collect(out);
+    assert!(
+        out.contains(&format!(
+            "touch {}/.config/boss/seat-off/claude-b-factory",
+            f.home()
+        )),
+        "{out}"
+    );
+}
+
+/// Option 5 is refused while Claude B's seat runs, as option 2 is beside
+/// the factory: one identity, one queue.
+#[test]
+fn claude_b_is_never_started_beside_its_seat() {
+    let f = Fixture::new("claude-b-beside-seat", &["claude"]);
+    let out = f
+        .cmd("claude-b-factory", &[])
+        .args(["--detached", "5"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run dev-session.sh");
+    let (rc, out) = collect(out);
+    assert_ne!(rc, 0, "{out}");
+    assert!(
+        out.contains("tmux `claude-b-factory` is running and signs as the same agent"),
+        "{out}"
+    );
+    assert!(!f.log().contains("new-session"), "{}", f.log());
 }

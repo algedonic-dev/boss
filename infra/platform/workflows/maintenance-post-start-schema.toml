@@ -1,0 +1,39 @@
+[[workflow]]
+kind = "maintenance-post-start-schema"
+label = "Post-start schema indexes"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "Retry exact byte-pinned optional concurrent indexes after the instance serves. Missing schema_migrations rows remain debt; a failed attempt records failure and a later supervised tick retries. Boot never records deferred work as applied."
+metadata = { owner = "9660c60f-eb47-4405-ae08-fcbb30c71e5f", department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
+
+[[workflow.step]]
+title = "scheduled"
+kind = "trigger"
+ready_when = "true"
+title_template = "Post-start index retry"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "cluster-cronjob" }
+
+[[workflow.step]]
+title = "run"
+kind = "task"
+ready_when = "steps.scheduled.done"
+title_template = "Run to completion"
+audience = { individual = "automation:boss-step" }
+fields = [{ name = "result", field_type = "string", required = true }]
+
+[[workflow.step]]
+title = "completed"
+kind = "outcome"
+ready_when = "steps.run.done AND steps.run.metadata.result = \"ok\""
+title_template = "Post-start indexes applied"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "completed" }
+
+[[workflow.step]]
+title = "failed"
+kind = "outcome"
+ready_when = "steps.run.done AND steps.run.metadata.result != \"ok\""
+title_template = "Post-start indexes still owed"
+metadata_defaults = { outcome_kind = "aborted" }
+terminal = { outcome = "failed" }

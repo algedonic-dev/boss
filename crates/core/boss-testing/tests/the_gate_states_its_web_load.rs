@@ -106,11 +106,14 @@ fn the_gate_names_the_timings_file_the_web_tree_writes_before_its_first_web_chec
         "the receipt's web_timings does not record {load}, the load the runner declared"
     );
     let sh = printed("infra/gate.sh");
+    // The phase opens at web_touched's definition: since a244c6e7 its
+    // unit checks run on every tree, before the `if` that scopes the
+    // browser, so the timings file must be named before them.
     let phase = sh
-        .find("if [ \"$AUTO\" -eq 0 ] || [ \"$(web_touched)\" = \"yes\" ]; then")
-        .expect("gate.sh opens its web phase on web_touched");
+        .find("\nweb_touched() {\n")
+        .expect("gate.sh opens its web phase with web_touched()");
     let begin = sh[phase..]
-        .find("web_timings_begin")
+        .find("\nweb_timings_begin\n")
         .map(|i| phase + i)
         .expect("the web phase calls web_timings_begin");
     let install = sh

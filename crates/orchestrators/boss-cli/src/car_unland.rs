@@ -149,12 +149,9 @@ pub(crate) fn read_main(
 ) -> Result<MainReading, String> {
     let merge = merge.trim();
     let line = git_ok(repo, &["ls-remote", "origin", "refs/heads/main"])?;
-    let main = line
-        .split_whitespace()
-        .next()
+    let main = crate::receipt::exact_ref_head(&line, "refs/heads/main")
         .filter(|s| is_full_sha(s))
-        .ok_or_else(|| format!("the forge answered no main (ls-remote said {line:?})"))?
-        .to_string();
+        .ok_or_else(|| format!("the forge answered no main (ls-remote said {line:?})"))?;
     if commit_here(repo, &main).is_none() {
         git_ok(repo, &["fetch", "-q", "origin", "refs/heads/main"])?;
     }
@@ -515,11 +512,11 @@ pub(crate) mod tests {
         let root = boss_testing::scratch::scratch_dir("unland-auth");
         git_in(&root, &["init", "-q"]);
         let auth = crate::git_auth::ForgeAuth {
-            key: "http.http://forge.test/.extraHeader".to_string(),
+            forge: "http://forge.test/".to_string(),
             value: "Authorization: token t".to_string(),
         };
         let out = git_command(&root, Some(&auth))
-            .args(["config", "--get", &auth.key])
+            .args(["config", "--get", &auth.header_key()])
             .output()
             .unwrap();
         assert!(
@@ -670,15 +667,73 @@ pub(crate) mod tests {
         }
     }
 
+    /// The one robot [`serve`] registers: it records the model class the
+    /// bundle's backlog-item `build` demands, so a test whose executor
+    /// claims that step signs as a robot the claim door admits.
+    pub(crate) const BUILDER_ROBOT: &str = "agent-builder";
+
     pub(crate) async fn serve() -> String {
+        use boss_core::publish::PublishMode;
+        use boss_core::publisher::EventStamp;
         use boss_jobs::WorkflowRegistry;
+        use boss_jobs::agents::AgentsRegistry;
+        use boss_jobs::pools::PoolRegistry;
+        use boss_jobs::step_executor::{ExecutorDemand, demanded_by};
         use boss_policy_client::{Action, FakePolicyClient, PolicyClient, Resource, Scope};
         use std::sync::Arc;
         let kinds = Arc::new(boss_jobs::InMemoryWorkflows::for_fixture());
-        for spec in boss_jobs::registry::seedable_platform_workflows() {
+        let platform = boss_jobs::registry::seedable_platform_workflows();
+        // THE EXECUTORS THE BUNDLE NAMES (design ccfe87ff pass item 1,
+        // backlog 446ab559). backlog-item `build` names a model class, so
+        // the claim door admits only a robot whose agents row records it,
+        // judged against the active `robots:<class>` pools. The bundle
+        // is served with the pools the tree declares and one robot of the
+        // class the row demands — read off the row, so the fixture follows
+        // a change of class rather than pinning a second copy of it.
+        let class = platform
+            .iter()
+            .find(|w| w.kind == "backlog-item")
+            .and_then(|w| demanded_by(w, Some("build")).expect("a well-formed declaration"))
+            .and_then(|demand| match demand {
+                // A set admits a robot of any class in it; the first is one.
+                ExecutorDemand::Model(classes) => classes.into_iter().next(),
+                _ => None,
+            });
+        for spec in platform {
             kinds.seed(spec).expect("seed platform kind");
         }
-        let jobs = Arc::new(boss_jobs::InMemoryJobs::new());
+        let test = boss_core::actor::ActorId::Automation("test".into());
+        let pools = Arc::new(boss_jobs::pools::InMemoryPools::default());
+        for spec in boss_jobs::pools::load_pools(boss_jobs::pools::platform_pools_path())
+            .expect("the platform pools parse")
+        {
+            pools
+                .publish_declared(spec, &test, chrono::Utc::now())
+                .await
+                .expect("seed platform pool");
+        }
+        let agents = Arc::new(boss_jobs::agents::InMemoryAgents::new());
+        agents
+            .publish(
+                &[boss_jobs::agents::types::AgentInput {
+                    factory_rotation: Some(true),
+                    id: BUILDER_ROBOT.into(),
+                    display_name: "Builder".into(),
+                    default_model: "opus-5-5".into(),
+                    model_class: class,
+                    aliases: Vec::new(),
+                    role: Some("platform-admin".into()),
+                    department: None,
+                    hourly_budget_usd_micros: None,
+                    max_concurrent_runs: None,
+                    stations: None,
+                }],
+                PublishMode::Take,
+                &EventStamp::new("jobs", test),
+            )
+            .await
+            .expect("the builder robot registers");
+        let jobs = Arc::new(boss_jobs::InMemoryJobs::new().with_resource_pools(pools));
         let mut policy = FakePolicyClient::builder();
         for (action, resource) in [
             (Action::Create, Resource::job()),
@@ -694,6 +749,10 @@ pub(crate) mod tests {
         let state = boss_jobs::http::JobsApiState {
             kind_registry: Some(kinds as Arc<dyn WorkflowRegistry>),
             roster: Some(Arc::new(AdminRoster)),
+            agent_budget: Some(Arc::new(boss_jobs::agent_budget::BudgetDoor {
+                agents,
+                runs: Arc::new(boss_jobs::agent_runs::InMemoryAgentRuns::new(Vec::new())),
+            })),
             ..boss_jobs::http::JobsApiState::minimal(
                 jobs,
                 bus,

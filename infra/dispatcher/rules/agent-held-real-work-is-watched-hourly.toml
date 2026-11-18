@@ -27,6 +27,9 @@
 # platform protocol. ~200 agent-held backlog builds were days old on
 # 2026-09-24; an alarm per build would be the flat list again, shouted.
 # The shipped-rule test refuses a `backlog-item` declaration by name.
+# URGENT items are watched elsewhere, scoped by priority and not by
+# wait: `an-urgent-item-is-released-when-unrun-and-rescoped-when-long`
+# (backlog 9788e22d), which the same test requires to exist.
 #
 # ONE PLATFORM STEP, NARROWED (version 2, backlog c851ed24): `hours.
 # ship-a-change.landed-review`, 24h. Since option A (bd331d38, David
@@ -42,6 +45,24 @@
 # and a car's review older than that has fallen out of the cycle.
 # Measured from the car's last movement (its boarding, or its proof
 # landing later), so the alarm can be late and is never early.
+#
+# TWO MORE PLATFORM STEPS, NARROWED (version 3, design 62f27539 C1,
+# backlog 44caee88): `hours.publish-to-github.measure`, 2h, and
+# `hours.publish-to-github.review`, 4h. Packet d91c2b7b's `review` went
+# ready on 2026-11-09 00:03:55Z, was assigned to agent-claude a second
+# later, and sat there seven days with nothing aging it — the unheld
+# watch reads only steps NOBODY holds, and this one named no publish
+# step. Each hour is the step's own `duration_hours` on the row
+# (infra/platform/workflows/publish-to-github.toml), held equal by
+# platform_bundle_publish_to_github.rs (CLAUDE.md 9a: the watch reads its
+# args, not the row). Both stay under a day ON PURPOSE: the daily
+# `a-stale-unsigned-publish-is-superseded-daily` closes an unsigned packet
+# once the tree moves, so a day's bound would let every packet close
+# before its alarm could fire. `measure` is landed by machine within
+# seconds of a clean reading; two hours open means the machine declined
+# and the analyst has not measured. The rest of the workflow stays
+# undeclared: `approve` is David's, and the machine steps are watched by
+# their own verbs' answers.
 #
 # HOURLY, NOT DAILY: the tightest bound is four hours, and a daily read
 # would let a late payout sit up to a day past it — the handler refuses
@@ -60,10 +81,12 @@ step (never twice for a step), withdraws it once the step no longer
 waits, and never touches the late step itself. Version 2 (backlog
 c851ed24) adds one narrowed declaration: a landed car's owed
 `landed-review`, past a day — the item it carries is held open until
-it completes, and nothing else ages that debt into a packet.
+it completes, and nothing else ages that debt into a packet. Version 3
+(backlog 44caee88) adds the publish protocol's two analyst steps, past
+their rows' own bounds: d91c2b7b's review sat seven days on the agent.
 """
-version = 2
+version = 3
 schedule = { cadence = "hourly", anchor_date = "2026-09-24" }
 [[rule.do]]
 handler = "jobs.agent_step_overdue"
-args = { "hours.receive-a-payout" = "4", "hours.receive-a-sponsorship" = "24", "hours.receive-an-inquiry" = "24", "hours.close-a-period" = "72", "hours.ship-a-change.landed-review" = "24" }
+args = { "hours.receive-a-payout" = "4", "hours.receive-a-sponsorship" = "24", "hours.receive-an-inquiry" = "24", "hours.close-a-period" = "72", "hours.ship-a-change.landed-review" = "24", "hours.publish-to-github.measure" = "2", "hours.publish-to-github.review" = "4" }

@@ -15,6 +15,13 @@ the historical cutoff. A fresh diagnosis uses a new request identity and the
 versioned source fingerprint; retained older diagnoses and raw moves remain
 unchanged.
 
+The registered-agent-handoff-v3 model (backlog f9cbf891) keeps every v2
+binding and reads a pinned protocol version as unavailable when it was
+never published (WorkflowStatus::was_published), so a rejected version
+reads as the draft it was; v2 read only a draft. A v2 receipt is retained
+whole and replays as recorded, but no longer reproduces, so it clears
+nothing; a fresh diagnosis takes a new request identity under v3.
+
 Correction input names request_id, diagnosis_id and proof_request only.
 BOSS resolves proof_request through the existing JobsRepository: a closed
 ops-request for forge/run-car-probe, its completed execute step, its pinned

@@ -82,10 +82,11 @@ use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 use chrono::{DateTime, Utc};
 use serde_json::{Value as Json, json};
 
+use super::alarm_item::{self, Occurrence, Raised};
 use super::common::{
     RECOVERED_AT, Retraction, api_client, complete_step, get_json, open_jobs_of_kind,
-    owner_for_filing, post_json, recovery_note, relapse_patch, retraction, rows_or_refuse,
-    with_lane, withdrawal_fields, write_json,
+    owner_for_filing, recovery_note, retraction, rows_or_refuse, with_lane, withdrawal_fields,
+    write_json,
 };
 
 /// How often a runner polls, in seconds — `OnUnitActiveSec=1min` in
@@ -526,49 +527,44 @@ impl OpsQueueAlarm {
     ) -> Result<&'static str, HandlerError> {
         let owner = owner_for_filing(self.owner.as_ref(), rule).await;
         let body = alarm_body(f, &owner, now);
-        match open {
-            Some(a) if a.reason == f.condition.reason() => {
-                if a.told {
-                    // The condition is back on a routed alarm that was
-                    // told it had recovered: that note is now false.
-                    write_json(
-                        &self.client,
-                        reqwest::Method::PATCH,
-                        &format!("{}/api/jobs/{}/metadata", self.base(), a.id),
-                        &relapse_patch(),
-                        rule,
-                    )
-                    .await?;
-                    return Ok("relapsed");
-                }
-                Ok("held")
+        // Through the one helper every alarm raises with (backlog
+        // f4b0ad41). The same reason holds the alarm as it is; a changed
+        // reason refreshes the diagnosis on it; and the condition back on
+        // a routed alarm that was told it had recovered is an occurrence,
+        // which withdraws that now-false note.
+        let refresh = match open {
+            Some(a) if a.reason != f.condition.reason() => {
+                body["metadata"].as_object().cloned().unwrap_or_default()
             }
-            Some(a) => {
-                let mut patch = body["metadata"].clone();
-                if let (Some(m), Json::Object(relapse)) = (patch.as_object_mut(), relapse_patch()) {
-                    m.extend(relapse);
-                }
-                write_json(
-                    &self.client,
-                    reqwest::Method::PATCH,
-                    &format!("{}/api/jobs/{}/metadata", self.base(), a.id),
-                    &patch,
-                    rule,
-                )
-                .await?;
-                Ok("refreshed")
-            }
-            None => {
-                post_json(
-                    &self.client,
-                    &format!("{}/api/jobs", self.base()),
-                    &body,
-                    rule,
-                )
-                .await?;
-                Ok("raised")
-            }
-        }
+            _ => Default::default(),
+        };
+        let occ = Occurrence::new(
+            now.to_rfc3339(),
+            format!(
+                "{}: {} open, {} waiting, oldest {}s",
+                f.condition.reason(),
+                f.queue.open,
+                f.queue.waiting,
+                f.oldest_wait_s
+            ),
+        );
+        let refreshed = !refresh.is_empty();
+        let raised = alarm_item::raise(
+            &self.client,
+            self.base(),
+            open.map(|a| &a.row),
+            body,
+            &occ,
+            refresh,
+            rule,
+        )
+        .await?;
+        Ok(match raised {
+            Raised::Filed(_) => "raised",
+            Raised::Appended(_) => "relapsed",
+            Raised::Held(_) if refreshed => "refreshed",
+            Raised::Held(_) => "held",
+        })
     }
 
     async fn recover(
@@ -1023,7 +1019,12 @@ mod tests {
         handler(&stub).invoke(&[], &ctx()).await.unwrap();
         let sent = stub.sent();
         assert_eq!(sent.len(), 1, "{sent:?}");
-        assert_eq!(sent[0].1, relapse_patch());
+        for (key, withdrawn) in super::super::common::relapse_patch().as_object().unwrap() {
+            assert_eq!(&sent[0].1[key], withdrawn, "{key}: {sent:?}");
+        }
+        // The relapse is an occurrence on the open alarm (backlog f4b0ad41).
+        assert_eq!(sent[0].1[alarm_item::OCCURRENCES], 2);
+        assert_eq!(sent[0].1[alarm_item::OCCURRENCE_LOG][0]["relapse"], true);
     }
 
     #[tokio::test]

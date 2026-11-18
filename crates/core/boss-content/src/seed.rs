@@ -45,14 +45,14 @@ fn starters() -> &'static [SeedSection] {
 /// Create any starter section whose slug isn't already in the DB.
 /// Returns the number of sections inserted.
 pub async fn seed_starter_sections(repo: &dyn ContentRepository) -> Result<usize, ContentError> {
-    // Read the full tree once with a system user — starters use the
-    // default open audience, and we need to know which slugs exist.
+    // Unpublished work still owns its slug. Reading only published bodies
+    // tries to recreate an unfinished starter and refuses the next startup.
     let user = crate::types::UserContext {
         id: "automation:content-seed".into(),
         role: "hr-lead".into(),
         department: Some("hr".into()),
     };
-    let existing = repo.manual_tree(&user).await?;
+    let existing = repo.manual_index(&user).await?;
     let have: std::collections::HashSet<String> = existing.into_iter().map(|s| s.slug).collect();
 
     let mut inserted = 0;
@@ -68,6 +68,8 @@ pub async fn seed_starter_sections(repo: &dyn ContentRepository) -> Result<usize
             sort_order: s.sort,
             audience: Audience::all(),
             published: true,
+            owner_station: None,
+            authoring_job_id: None,
         };
         repo.create_section(draft, "automation:content-seed")
             .await?;

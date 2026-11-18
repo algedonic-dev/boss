@@ -1,6 +1,12 @@
 # The build plane manages itself: maintenance as protocol
 
-**Status**: in-review — the operating principle for internalizing
+**Status**: decided principle, awaiting its fold (re-statused
+2026-11-18, backlog 924de432). Q1 is resolved below; Q2–Q4 were never
+filed on a design packet, so no reader holds them. Its topic belongs to
+`docs/architecture-decisions.md` §Deployment, the forge, and the
+cluster, which fold car 79d0040f is editing, so this file is folded,
+or its still-open questions re-filed as a packet, after that car lands.
+Originally: the operating principle for internalizing
 build-system operations (David 2026-09-03: "write down the steps we
 perform for maintenance into protocol so we don't have to remember or
 relearn each time; trigger on both time and monitoring — this is the

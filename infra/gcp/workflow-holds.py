@@ -18,23 +18,26 @@ unrelated kinds.
 
 WHAT IS HELD
 ---------------------------------------------------------------------------
-1. BY DEFAULT, every kind whose row declares a field `writer` or a step
-   `executor` — a refusal row by construction (boss-jobs field_writer.rs,
-   credential_executor.rs). Derived from the row itself, so forgetting to
-   declare a hold cannot publish a refusal.
-2. BY DECLARATION, infra/platform/workflow-holds/<kind>.toml, one file per
-   kind so two cars never contend on a line (CLAUDE.md 9a):
+ONLY WHAT IS DECLARED: infra/platform/workflow-holds/<kind>.toml, one file
+per kind so two cars never contend on a line (CLAUDE.md 9a):
 
-       drift_publish = "held"        # or "released"
-       why = '''...'''                # required, a sentence
-       lifts = '...'                  # required when held: the item or
-                                      # design (an 8-hex id) that lifts it
+    drift_publish = "held"
+    why = '''...'''                # required, a sentence
+    lifts = '...'                  # required: the item or design (an
+                                   # 8-hex id) that lifts it
 
-   `held` holds any kind, and puts a why and a lift on a default hold.
-   `released` hands a default-held row back to the drift publish, on the
-   record. The kind is the FILE NAME — the file carries no `kind =` line, so
-   publish-workflow.sh's history walk (which greps infra/platform for one)
-   never reads a hold as a bundle.
+A hold is now a TIMING hold an author declares — "publish this after that
+reads back live", the deliberate publish with a positive control and a
+named rollback of design b08725c2 — and nothing else. Until backlog
+a4b57aca every row declaring a field `writer`, a step `executor` or a
+step `resources` bill was held BY DEFAULT, and a `released` file handed it
+back; both are retired. The APPROVAL half of a hold moved to the server:
+POST /api/workflows/{kind}/publish refuses a publish over a
+passkey-protected LIVE row without a passkey-signed publish-a-protocol
+packet (boss-jobs publish_passkey.rs), and every other row an agent may
+publish, the drift publish included. The kind is the FILE NAME — the file
+carries no `kind =` line, so publish-workflow.sh's history walk (which
+greps infra/platform for one) never reads a hold as a bundle.
 
 A hold binds EVERY UNATTENDED ROAD, and there are two (review R1 of the signer
 car, run 7cee49b9): `publish-drift`, and the one-kind `publish-workflow` verb,
@@ -50,13 +53,13 @@ is policy's question (and a passkey's), not this file's.
 FAIL CLOSED
 ---------------------------------------------------------------------------
 Anything here that cannot be read is a PROBLEM, never an absent hold: a file
-that does not parse, a key outside the three, a state outside the two, a
+that does not parse, a key outside the three, a state other than `held`
+(a `released` file released a default hold, and there is none now), a
 missing or empty `why`, a held file with no `lifts` naming an id, a file for
-a kind the bundle does not author, a `released` for a row that declares no
-writer or executor (it releases nothing — residue), any entry that is neither
+a kind the bundle does not author, any entry that is neither
 README.md nor <kind>.toml, a holds path that exists and is not a directory
-(a regular file, a dangling link), and a row file that does not parse (whether
-it declares a writer cannot be told). One problem and the answer is exit 1 with
+(a regular file, a dangling link). One problem
+and the answer is exit 1 with
 no rows; publish-drift.sh then refuses the whole run, in both modes.
 
 USAGE
@@ -64,10 +67,7 @@ USAGE
 
 OUTPUT, tab-separated, one line per kind that is not plainly open:
   held      <kind>  <source>  <why>  <lifts>
-  released  <kind>  <source>  <why>  -
-where <source> is `declared in infra/platform/workflow-holds/<kind>.toml` or
-`by default: step <slug> field <name> declares writer <w>` /
-`by default: step <slug> declares executor <e>`.
+where <source> is `declared in infra/platform/workflow-holds/<kind>.toml`.
 On a problem: `problem<TAB><text>` lines only.
 
 EXIT
@@ -84,7 +84,7 @@ BUNDLE_REL = "infra/platform/workflows"
 HOLDS_REL = "infra/platform/workflow-holds"
 KIND = re.compile(r"^[a-z][a-z0-9-]{1,60}$")
 KEYS = {"drift_publish", "why", "lifts"}
-STATES = ("held", "released")
+STATES = ("held",)
 WHY_MIN = 20
 ID = re.compile(r"(?<![0-9a-f])[0-9a-f]{8}(?![0-9a-f])")
 
@@ -93,25 +93,6 @@ def one_line(text):
     return " ".join(str(text).split())
 
 
-def refusal_declarations(doc):
-    """Every writer/executor a row file declares, as readable phrases."""
-    found = []
-    for wf in doc.get("workflow") or []:
-        if not isinstance(wf, dict):
-            continue
-        for step in wf.get("step") or []:
-            if not isinstance(step, dict):
-                continue
-            slug = step.get("title", "?")
-            executor = step.get("executor")
-            if executor not in (None, ""):
-                found.append(f"step {slug} declares executor {executor}")
-            for field in step.get("fields") or []:
-                if isinstance(field, dict) and field.get("writer") not in (None, ""):
-                    found.append(
-                        f"step {slug} field {field.get('name', '?')} declares writer {field['writer']}"
-                    )
-    return found
 
 
 def main(argv):
@@ -127,23 +108,6 @@ def main(argv):
 
     problems = []
     kinds = sorted(f[:-5] for f in os.listdir(bundle) if f.endswith(".toml"))
-
-    # The default, derived from each row.
-    default = {}
-    for kind in kinds:
-        path = os.path.join(bundle, f"{kind}.toml")
-        try:
-            with open(path, "rb") as fh:
-                doc = tomllib.load(fh)
-        except Exception as e:  # noqa: BLE001 — every failure is the same refusal
-            problems.append(
-                f"{BUNDLE_REL}/{kind}.toml could not be read ({one_line(e)}), so whether it declares a writer or an executor cannot be told"
-            )
-            continue
-        declared = refusal_declarations(doc)
-        if declared:
-            more = f" (and {len(declared) - 1} more)" if len(declared) > 1 else ""
-            default[kind] = f"by default: {declared[0]}{more}"
 
     # The declarations.
     declared_state = {}
@@ -186,13 +150,13 @@ def main(argv):
             state = doc.get("drift_publish")
             if state not in STATES:
                 problems.append(
-                    f"{rel}: `drift_publish` must be \"held\" or \"released\", and is {state!r}"
+                    f"{rel}: `drift_publish` must be \"held\", and is {state!r} (nothing is held by default since backlog a4b57aca, so nothing is released: delete the file to lift a hold)"
                 )
                 bad = True
             why = doc.get("why")
             if not isinstance(why, str) or len(one_line(why)) < WHY_MIN:
                 problems.append(
-                    f"{rel}: `why` is required — a sentence of at least {WHY_MIN} characters saying why the kind is {state if state in STATES else 'held or released'}"
+                    f"{rel}: `why` is required — a sentence of at least {WHY_MIN} characters saying why the kind is held"
                 )
                 bad = True
             lifts = doc.get("lifts")
@@ -203,11 +167,6 @@ def main(argv):
                 bad = True
             if lifts is not None and not isinstance(lifts, str):
                 problems.append(f"{rel}: `lifts` must be a string")
-                bad = True
-            if state == "released" and kind not in default and kind in kinds:
-                problems.append(
-                    f"{rel} releases nothing: {BUNDLE_REL}/{kind}.toml declares no writer and no executor, so the kind is not held — delete the file"
-                )
                 bad = True
             if not bad:
                 declared_state[kind] = (
@@ -226,18 +185,6 @@ def main(argv):
         if kind in declared_state:
             state, source, why, lifts = declared_state[kind]
             print("\t".join([state, kind, source, why, lifts]))
-        elif kind in default:
-            print(
-                "\t".join(
-                    [
-                        "held",
-                        kind,
-                        default[kind],
-                        "a row that declares a writer or an executor turns on a refusal, and a refusal goes live at a deliberate publish (design b08725c2)",
-                        f"a {HOLDS_REL}/{kind}.toml saying drift_publish = \"released\", landed by a car",
-                    ]
-                )
-            )
     return 0
 
 

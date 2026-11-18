@@ -9,3 +9,5 @@
 id = "automation:run-car-probe-reader"
 role = "audit-readonly"
 description = 'The identity a recorded car probe reads the system of record as (boss prove, and boss-sor-read on the forge). Reads only, and runs car-supplied shell, so it must never hold more than the read role.'
+# Host station: probe-shed (backlog 6ecb5480, station-tree.md section 6).
+station = "e24e53d8-62f9-4014-961f-dea0e428a3bb"

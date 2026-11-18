@@ -1,0 +1,35 @@
+# The SWEEP half of `a-hold-its-step-executor-refuses-is-released`
+# (backlog 231cb747, conductor order 20261105_1714Z): once an hour, every
+# held step on the open board — nominated (`ready`, assigned) or claimed
+# (`active`) — is judged against its packet's PINNED executor
+# declaration, and a holder the declaration refuses is released to the
+# step's role audience with the same `executor_refused` note.
+#
+# WHY A SWEEP AS WELL AS THE EVENT. The residue this was filed for
+# announces nothing: a hold made before the event rule existed, and a
+# hold carried onto a declaring version by `boss job convert`, which
+# re-pins a packet and assigns nobody, so no `step.assigned` marker ever
+# fires for it. A packet still pinned to a version that declares no
+# executor demands nothing and is left exactly where it stands.
+#
+# HOURLY: the residue is a level, not a transition, and an hour is the
+# cadence the neighbouring release rules (the dead-run reclaim, the
+# urgent-item watch) already hold a claimed step to. The board is read
+# slim; only a step the pinned row says demands an executor is judged,
+# and only a refused one is read whole.
+[[rule]]
+name = "a-standing-hold-its-step-executor-refuses-is-released-hourly"
+why = """
+A TIMER over a STATE, the standing exemption: a hold an executor
+declaration refuses can come to stand without any event saying so — it
+predates the event rule, or a convert moved its packet onto a declaring
+version and assigned nobody — so only a read of the board finds it.
+Measured 2026-11-05 (backlog 231cb747): 37 builds held by agent-codex,
+none of which an assignment marker would announce again. It adds no
+routing beyond the release its event twin makes: `ready`, unassigned,
+under the step's own authority role.
+"""
+version = 1
+schedule = { cadence = "hourly", anchor_date = "2026-11-05" }
+[[rule.do]]
+handler = "jobs.release_executor_refused"

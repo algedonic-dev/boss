@@ -89,6 +89,10 @@
 #   matches when it names no change, and a matching plan closes the
 #   request through its `nothing-to-do` terminal with the plan on it,
 #   never reaching the approve step (see `render_plan`).
+#   And a rendered approval is NOMINATED to the one approver its verb
+#   names (backlog 9f5132dd), through the step assignment PUT, so it
+#   reaches that person's queue rather than waiting unseen on the role
+#   (see `nominate_approver`).
 # - A VERB THAT ALSO DECLARES `requires_review` IS APPROVED ONLY OVER A
 #   CLOSED INDEPENDENT REVIEW OF THE SAME BYTES (backlog 84e7c3e4,
 #   design 9de0cd1c — Q1 answered by David 2026-10-04). The plan is
@@ -214,7 +218,24 @@ if [ -z "${BOSS_JOBS_URL:-}" ]; then
 fi
 BASE="$BOSS_JOBS_URL"
 
-VERBS_DIR="${OPS_VERBS_DIR:-$(dirname "$0")/verbs}"
+# THIS PASS'S OWN DIRECTORY, RESOLVED ONCE AND PHYSICALLY (backlog
+# 1dde630c, review a8b752d4 N2). On the forge the unit starts this file
+# as /var/lib/boss/tree/current/infra/ops/ops-runner.sh, and `current`
+# is a link root-tree.sh moves with one rename whenever main moves. Every
+# path below used to go through `$(dirname "$0")` — through the link, at
+# the moment of use — so a pass could read its allowlist and libraries
+# from one generation and exec a verb's script out of the next. `pwd -P`
+# names the generation itself, gen/<sha>, which is never written again,
+# so the allowlist, both libraries and every verb script of this pass
+# come from the tree the pass started in. On the DIRECTORY, not
+# `readlink -f "$0"`: a checkout that links this file in from elsewhere
+# (the test fixtures do) is still the checkout it was started from.
+RUNNER_DIR="$(cd "$(dirname "$0")" && pwd -P)" || {
+    echo "ops-runner: cannot resolve the directory $(dirname "$0") this runner was started from — refusing to run" >&2
+    exit 78
+}
+
+VERBS_DIR="${OPS_VERBS_DIR:-$RUNNER_DIR/verbs}"
 # THE CHECKOUT THIS RUNNER IS PART OF. A verb's script is named in its
 # verb file RELATIVE to the repo (infra/forge/disk-report.sh) and resolved
 # here, against the checkout the runner itself runs from — never an
@@ -224,7 +245,7 @@ VERBS_DIR="${OPS_VERBS_DIR:-$(dirname "$0")/verbs}"
 # file — two lints, the test harness — substituted that prefix for its
 # own: one assumption in four places (66077f9c, CLAUDE.md §9a). A bare
 # command (systemctl, df) stays a bare command, resolved on PATH.
-OPS_REPO_ROOT="${OPS_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+OPS_REPO_ROOT="${OPS_REPO_ROOT:-$(cd "$RUNNER_DIR/../.." && pwd -P)}"
 OPS_TIMEOUT="${OPS_TIMEOUT:-30}"
 OPS_OUTPUT_CAP="${OPS_OUTPUT_CAP:-102400}"
 # A STEP WRITE THE SYSTEM OF RECORD DID NOT ANSWER IS TRIED AGAIN (the
@@ -257,7 +278,7 @@ trap 'rm -rf "$workdir"' EXIT
 # the fault named by the assembler on stderr), never a partial
 # allowlist that refuses every packet as "unknown verb".
 VERBS_FILE="$workdir/allowlist.json"
-if ! sh "$(dirname "$0")/verbs-allowlist.sh" "$VERBS_DIR" > "$VERBS_FILE"; then
+if ! sh "$RUNNER_DIR/verbs-allowlist.sh" "$VERBS_DIR" > "$VERBS_FILE"; then
     echo "ops-runner: allowlist directory $VERBS_DIR could not be loaded — refusing to run" >&2
     exit 78
 fi
@@ -290,6 +311,16 @@ fi
 # A stamp dated this far ahead of the host's clock is a clock nobody can
 # reconcile, and an approval that cannot be dated cannot be time-boxed.
 APPROVAL_SKEW_S=60
+# THE EXECUTE-TIME RE-RENDER IS TRIED THREE TIMES when it renders
+# nothing (backlog 05d7c0b9; see `rerender_signed_plan`). The count is a
+# constant like the window; the wait between attempts may be set, since
+# the approval is judged again after every wait, so no wait can stretch
+# the window.
+RERENDER_ATTEMPTS=3
+OPS_RERENDER_BACKOFF_S="${OPS_RERENDER_BACKOFF_S:-5}"
+case ${OPS_RERENDER_BACKOFF_S:-empty} in
+    empty|*[!0-9]*) OPS_RERENDER_BACKOFF_S=5 ;;
+esac
 
 # THE SERVER'S SHAPE HASH, IN jq — `shape_hash_of <step json>`. The
 # presence stamp records `boss_core::job::step_shape_hash` of the step
@@ -305,13 +336,21 @@ APPROVAL_SKEW_S=60
 # Checked BEFORE the `.`: under /bin/sh (dash) a `.` of a missing file
 # is a special-builtin error that ends the shell with its own message,
 # not this one.
-SHAPE_LIB="$(dirname "$0")/../lib/step-shape.sh"
+SHAPE_LIB="$RUNNER_DIR/../lib/step-shape.sh"
 if [ ! -r "$SHAPE_LIB" ]; then
     echo "ops-runner: $SHAPE_LIB is missing — without the shape hash no approval can be verified; refusing to run" >&2
     exit 78
 fi
 # shellcheck source=infra/lib/step-shape.sh
 . "$SHAPE_LIB"
+
+JSON_LIB="$RUNNER_DIR/../lib/jq.sh"
+if [ ! -r "$JSON_LIB" ]; then
+    echo "ops-runner: $JSON_LIB is missing — cannot qualify an executed declaration; refusing to run" >&2
+    exit 78
+fi
+# shellcheck source=infra/lib/jq.sh
+. "$JSON_LIB"
 
 # THE MACHINE TOKEN RIDES TO curl IN A 0600 FILE, never in its argv,
 # where every local user of the host reads it in ps and
@@ -322,7 +361,7 @@ fi
 # after the EXIT trap above (the helper chains its cleanup in front of
 # it), because the writes below run inside $(…). Checked before the `.`
 # for the reason SHAPE_LIB is.
-SECRET_LIB="$(dirname "$0")/../lib/secret-header.sh"
+SECRET_LIB="$RUNNER_DIR/../lib/secret-header.sh"
 if [ ! -r "$SECRET_LIB" ]; then
     echo "ops-runner: $SECRET_LIB is missing — the machine token would have to ride in curl's command line; refusing to run" >&2
     exit 78
@@ -424,12 +463,18 @@ fi
 # claim can have run a write here, and so the only one a "claimed,
 # outcome unknown" record may name (security re-review, 2026-09-25).
 # `\z`, not `$`: Oniguruma reads `$` as "end, or before a final newline".
+# The credential door keeps exactly this id on a request it resolves to
+# THIS host, and rebinds any other to the account (backlog d16c2dae:
+# boss-jobs runner_credential::acting_id). Its tests run BOTH functions
+# below against the door, so a pid bound or a separator changed here
+# without the door turns that test red (backlog 043d15a2: the pid was
+# `[0-9]+` here and 1 to 10 digits there).
 mint_claimant() {
     printf '%s:%s:%s-%s' "$ACTOR" "$HOST_ID" "$(date -u +%Y%m%dT%H%M%SZ)" "$$"
 }
 is_runner_pass() {
     jq -rn --arg id "$1" --arg p "$ACTOR:$HOST_ID:" '
-        if ($id | startswith($p)) and ($id[($p | length):] | test("^[0-9]{8}T[0-9]{6}Z-[0-9]+\\z"))
+        if ($id | startswith($p)) and ($id[($p | length):] | test("^[0-9]{8}T[0-9]{6}Z-[0-9]{1,10}\\z"))
         then "yes" else "no" end'
 }
 
@@ -673,6 +718,15 @@ abort_request() {
 # it by name.
 STEP_CHANGED_CODE='step_changed'
 
+# The `code` of the step PUT's 409 when an `automatic_assignment` would
+# replace a step's holder or a newer explicit nomination — the outcome
+# `nominate_approver` wants when a person nominated the approval after
+# this pass read it (review R1 of car 91c8e709). Its definition is
+# boss_jobs::step_release::AUTOMATIC_ASSIGNMENT_SUPERSEDED; boss-testing's
+# a_person_who_assigns_the_approval_after_the_runners_read_keeps_it
+# answers the runner with that constant, so a drift here fails it.
+AUTOMATIC_ASSIGNMENT_SUPERSEDED_CODE='automatic_assignment_superseded'
+
 # DELETE AFTER ONE RELEASE (the review of car 24eb9471). The words a
 # server from before the code answered the same race with, and nothing
 # else: while a jobs API that predates the code can still be what this
@@ -698,7 +752,7 @@ step_write() {
     for sw_delay in $OPS_WRITE_BACKOFF end; do
         : > "$3"
         sw_t0=$(date -u +%s)
-        sw_code=$(curl -sS --max-time "$OPS_WRITE_MAX_TIME" -o "$3" -w '%{http_code}' -X "$1" \
+        sw_code=$(curl -q -sS --max-time "$OPS_WRITE_MAX_TIME" -o "$3" -w '%{http_code}' -X "$1" \
             -H "content-type: application/json" \
             -H "x-boss-user: $BOSS_USER" \
             ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
@@ -797,12 +851,29 @@ record_refused_completion() {
             last_at: $at,
             count: (($prev.count // 0) + 1),
             verb_ran: ($ran == "true")}}' > "$workdir/refused"
-    if ! rr_err=$(curl -fsS -X PATCH -H "content-type: application/json" \
+    if ! rr_err=$(curl -q -fsS -X PATCH -H "content-type: application/json" \
             -H "x-boss-user: $BOSS_USER" \
             ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
             --data-binary @"$workdir/refused" \
             "$BASE/api/jobs/$job_id/metadata" 2>&1 >/dev/null); then
         echo "ops-runner: could not record the refusal on $short — $rr_err" >&2
+    fi
+}
+
+# ends_of <file> — the file whole when it is 4,000 bytes or fewer, else
+# its first and last 2,000 with the count between them named. A plan
+# verb's refusal is written LAST, after whatever it printed on the way:
+# the head alone cut a 5-disk replica-move refusal off at byte 2,000
+# while its reason started at byte 3,102 (backlog 204e27ba, finding F3
+# of review 43b607db).
+ends_of() {
+    eo_n=$(wc -c < "$1")
+    if [ "$eo_n" -le 4000 ]; then
+        cat "$1"
+    else
+        head -c 2000 "$1"
+        printf ' [… %s bytes not shown …] ' "$((eo_n - 4000))"
+        tail -c 2000 "$1"
     fi
 }
 
@@ -816,8 +887,11 @@ record_refused_completion() {
 # parameters are the plan verb's argv, so the caller's are untouched.
 run_plan_verb() {
     rv_id=$1; rv_verb=$2; rv_args=$3
-    rv_why=""; rv_sha=""
+    # rv_rc and rv_said stay empty when the verb never ran (a refusal by
+    # the allowlist), so a caller can tell that from an exit.
+    rv_why=""; rv_sha=""; rv_rc=""; rv_said=""
     : > "$workdir/plan"
+    : > "$workdir/plan-err"
     rv_dec=$(decide "$rv_verb" "$rv_args" false)
     rv_why=$(printf '%s' "$rv_dec" | jq -r '.refuse // empty')
     if [ -z "$rv_why" ]; then
@@ -855,7 +929,7 @@ ARGV
     rv_sha=$(sha256sum "$workdir/plan" | cut -c1-64)
     rv_said=$(sed -n 's/^plan-sha256: \([0-9a-f]\{64\}\)$/\1/p' "$workdir/plan-err" | tail -n 1)
     if [ "$rv_rc" -ne 0 ]; then
-        rv_why="the plan verb $rv_verb refused (exit $rv_rc): $(head -c 2000 "$workdir/plan-err")$(head -c 2000 "$workdir/plan")"
+        rv_why="the plan verb $rv_verb refused (exit $rv_rc): $(ends_of "$workdir/plan-err")$(ends_of "$workdir/plan")"
     elif [ "$rv_n" -eq 0 ]; then
         rv_why="the plan verb $rv_verb rendered an empty plan, and an empty plan names nothing to approve"
     elif [ "$rv_n" -gt "$OPS_OUTPUT_CAP" ]; then
@@ -872,6 +946,131 @@ ARGV
         fi
     fi
     [ -z "$rv_why" ] || rv_sha=""
+}
+
+# rerender_signed_plan <request id> <plan verb> <args json> <job json>
+# <verb> <execute status> — `run_plan_verb` for the check against the
+# SIGNED plan, tried again when the render never happened (backlog
+# 05d7c0b9). On 2026-10-28 the execute-time re-render of expand request
+# 0e64cb59 answered exit 78 with no plan, the request closed refused and
+# David's single-use passkey approval was spent; a render two minutes
+# later (2d848539) answered exit 0 with the SAME hash, 63ff2b06. So:
+#
+# - ONLY a verb that ran, exited non-zero and named no plan-sha256 is
+#   tried again: nothing was rendered, so there is nothing yet to judge.
+#   A render that names a hash is judged on it at once, by the caller —
+#   a different hash is refused, never retried, because a retry could
+#   only render the moved state again. A refusal by the allowlist, an
+#   empty or oversized plan and a misnamed hash are answers, not
+#   absences, and are refused at once too. A plan verb that refuses for
+#   real refuses on every attempt, so it still refuses, after the last.
+# - RERENDER_ATTEMPTS in all, OPS_RERENDER_BACKOFF_S apart, and the
+#   approval is judged again (`verify_approval`, window included) AFTER
+#   each wait and before the next attempt: a retry never outlives the
+#   ten-minute window, and the re-read before the claim judges it once
+#   more. Nothing is claimed here, so single use is untouched — the
+#   claim is still the one use, made only after a render that matched.
+# - EVERY attempt is recorded in $workdir/rerender-attempts (a JSON
+#   array the execute step carries as `rerender_attempts`): its number,
+#   when it ran, its exit, the hash it rendered, why it failed, and its
+#   WHOLE stderr as a byte record — the refusal of 0e64cb59 kept one
+#   line cut at 2,000 bytes.
+#
+# On return, rv_why/rv_sha are the LAST attempt's, as `run_plan_verb`
+# left them, with the attempt count added to a failure's words.
+rerender_signed_plan() {
+    rs_n=0
+    printf '[]\n' > "$workdir/rerender-attempts"
+    while :; do
+        rs_n=$((rs_n + 1))
+        rs_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        run_plan_verb "$1" "$2" "$3"
+        rs_transient=no
+        case ${rv_rc:-empty} in
+            empty | 0) ;;
+            *) [ -n "$rv_said" ] || rs_transient=yes ;;
+        esac
+        if ! stream_record "$workdir/plan-err" > "$workdir/rerender-stderr"; then
+            printf 'null\n' > "$workdir/rerender-stderr"
+        fi
+        if jq -c --argjson n "$rs_n" --arg at "$rs_at" --arg rc "$rv_rc" \
+                --arg sha "$rv_sha" --arg why "$rv_why" --arg tr "$rs_transient" \
+                --slurpfile err "$workdir/rerender-stderr" \
+                '. + [{attempt: $n, at: $at,
+                       exit_code: (if $rc == "" then null else ($rc | tonumber) end),
+                       plan_sha256: (if $sha == "" then null else $sha end),
+                       refused: (if $why == "" then null else $why end),
+                       transient: ($tr == "yes"), stderr: $err[0]}]' \
+                "$workdir/rerender-attempts" > "$workdir/rerender-attempts.next"; then
+            mv "$workdir/rerender-attempts.next" "$workdir/rerender-attempts"
+        else
+            echo "ops-runner: could not record re-render attempt $rs_n — its exit was ${rv_rc:-none}" >&2
+        fi
+        [ "$rs_transient" = yes ] || return 0
+        if [ "$rs_n" -ge "$RERENDER_ATTEMPTS" ]; then
+            rv_why="$rv_why [after $rs_n attempts, each recorded under rerender_attempts on this step]"
+            return 0
+        fi
+        echo "ops-runner: the re-render of the signed plan by $2 for $1 exited $rv_rc and named no plan (attempt $rs_n of $RERENDER_ATTEMPTS) — trying again in ${OPS_RERENDER_BACKOFF_S}s" >&2
+        sleep "$OPS_RERENDER_BACKOFF_S"
+        rs_again=$(verify_approval "$4" "$5" "$6")
+        rs_again_why=$(printf '%s' "$rs_again" | jq -r '.refuse // empty' 2>/dev/null)
+        if [ -n "$rs_again_why" ]; then
+            rv_why="$rv_why [attempt $rs_n of $RERENDER_ATTEMPTS, recorded under rerender_attempts on this step; no further attempt was made, because $rs_again_why]"
+            return 0
+        fi
+    done
+}
+
+# plan_stderr_of <step json> — what the plan verb printed on stderr
+# beside the plan it just rendered ($workdir/plan-err), as the JSON
+# value the step's `plan_stderr` carries, into $workdir/plan-stderr.
+#
+# WHY (backlog 204e27ba, finding N1 of the review of car 7ea1937e). Ten
+# plan verbs keep their volatile figures OFF the signed bytes on
+# purpose — the ledger arithmetic behind a headroom verdict, a chore's
+# last schedule and running Jobs — and print them on stderr instead, so
+# that a figure moving does not void an unchanged verdict. This runner
+# read only the `plan-sha256:` line from that stderr and dropped the
+# rest, so David approved verdicts without the figures they were written
+# for: ops-request 07b03e32 (2026-11-11) carried its chore's last
+# schedule onto the record only at execute, 41 s after the decision.
+#
+# WHAT IT BINDS, said once here and in the row's own procedure: the key
+# sits on the approve step, so the passkey signs it with the rest of the
+# step's shape, exactly as shown. It is NOT in the plan bytes
+# `rendered_plan_sha256` names, and the execute-time re-render compares
+# only those — so the write runs on a matching plan even when these
+# figures have moved since, and records the figures it saw on its own
+# `rerender_attempts`.
+#
+# WRITTEN ONLY WHERE THE STEP RESERVES IT TO THIS RUNNER: `null` (no
+# key) unless the step's materialised fields declare `plan_stderr` with
+# writer `runner:ops`. A request admitted under a row that does not —
+# every one before the row declaring it is published — would carry the
+# figures unreserved, writable by anyone with Update on the step, and
+# without the procedure that says what they are; it renders exactly as
+# before. Bytes that do not survive a JSON string (not UTF-8), or more
+# than OPS_OUTPUT_CAP of them, are named by their count and hash instead
+# of shown cut or re-encoded: the approver reads what the verb printed,
+# or is told it is not here.
+plan_stderr_of() {
+    printf 'null\n' > "$workdir/plan-stderr"
+    pe_declared=$(printf '%s' "$1" | jq -r '
+        any((.fields // [])[]; .name == "plan_stderr" and .writer == "runner:ops")' 2>/dev/null)
+    [ "$pe_declared" = true ] || return 0
+    pe_n=$(wc -c < "$workdir/plan-err")
+    pe_sha=$(sha256sum "$workdir/plan-err" | cut -c1-64)
+    pe_back=$(jq -jn --rawfile e "$workdir/plan-err" '$e' | sha256sum | cut -c1-64)
+    if [ "$pe_n" -le "$OPS_OUTPUT_CAP" ] && [ "$pe_back" = "$pe_sha" ]; then
+        jq -n --rawfile e "$workdir/plan-err" '$e' > "$workdir/plan-stderr"
+    else
+        jq -n --arg n "$pe_n" --arg s "$pe_sha" --arg c "$OPS_OUTPUT_CAP" '
+            "the plan verb printed \($n) bytes on stderr (sha256 \($s)), not shown here: "
+            + (if ($n | tonumber) > ($c | tonumber)
+               then "more than OPS_OUTPUT_CAP=\($c)" else "they are not UTF-8" end)' \
+            > "$workdir/plan-stderr"
+    fi
 }
 
 # render_plan <job json> <plan verb> <args json> <approve step json>
@@ -955,10 +1154,13 @@ render_plan() {
         rp_why="the plan $rp_verb renders now hashes to $rv_sha, and review run $rp_review_run released the plan hashing to $rp_reviewed: something the plan names has moved since it was reviewed. Nothing is put in front of a passkey; file the request again for a fresh review and a fresh approval"
     else
         rp_sha=$rv_sha
+        plan_stderr_of "$rp_approve"
         jq -cn --rawfile p "$workdir/plan" --arg v "$rp_write" --arg h "$HOST_ID" \
             --argjson a "$rp_args" --arg s "$rp_sha" --arg rr "$rp_review_run" \
+            --slurpfile pe "$workdir/plan-stderr" \
             '{plan: $p, verb: $v, host: $h, args: $a, rendered_plan_sha256: $s}
-             + (if $rr == "" then {} else {review_run: $rr} end)' > "$workdir/plan-patch"
+             + (if $rr == "" then {} else {review_run: $rr} end)
+             + (if $pe[0] == null then {} else {plan_stderr: $pe[0]} end)' > "$workdir/plan-patch"
     fi
     if [ -n "$rp_why" ]; then
         if abort_request "$rp_job" "$rp_why"; then
@@ -967,7 +1169,7 @@ render_plan() {
         fi
         return 0
     fi
-    if ! rp_err=$(curl -fsS -X PATCH -H "content-type: application/json" \
+    if ! rp_err=$(curl -q -fsS -X PATCH -H "content-type: application/json" \
             -H "x-boss-user: $BOSS_USER" \
             ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
             --data-binary @"$workdir/plan-patch" \
@@ -981,6 +1183,95 @@ render_plan() {
         echo "ops-runner: rendered the plan for $rp_verb on $rp_short (plan-sha256 $rp_sha) — it waits for a passkey approval on its approve step"
     fi
     plan_outcome=planned
+}
+
+# nominate_approver <job json> <approve step json> <write verb>
+# <approvers json> — put a freshly rendered approval in front of the
+# person who may sign it. Called once, right after `render_plan` wrote the
+# plan onto `approve`; never for `review`, whose audience is the role its
+# dispatched tenant reviewer is drawn from.
+#
+# WHY (backlog 9f5132dd, David's request, 2026-11-05). David filed
+# rebuild-a-failed-replica (ops-request d326b6c7); this runner put the
+# plan on the approve step within a minute and left its assignee empty,
+# although the verb file names `approvers: ["emp-david"]`. A person's
+# queue shows the steps assigned to them, so the one act the chain exists
+# to put in front of him was invisible until the conductor nominated him
+# by hand. The render is the one place every filing path reaches — the
+# terminal's `boss ops`, the website's filing door — so it happens here.
+#
+# THROUGH THE ASSIGNMENT DOOR: a PUT of `assignee_id`, which the jobs API
+# records as STEP_UPDATED and `step.assigned.<kind>` (the event that
+# notifies the person), signed as this runner's own actor, and refuses
+# for anyone not on the roster of a human-only step. It writes no
+# metadata, so the shape the passkey signs is exactly the plan render's.
+# And with `automatic_assignment: true` (review R1 of car 91c8e709,
+# 2026-11-06): the step the guards below read is this pass's snapshot,
+# taken before the plan rendered, and a person may assign the still-ready
+# step after it. A bare PUT then REPLACED them — measured on the real
+# router, emp-ada overwritten by emp-david, 204. The flag asks for the
+# jobs API's matchmaking judgement (`assignment_refusal` in boss-jobs
+# http/steps.rs, the one the dispatcher's own nominations carry): on a
+# ready step it never replaces a current holder or a newer explicit
+# nomination, and it is judged under the same row-version write as the
+# assignment, so it holds at the server, not in this read. Its 409 is
+# the outcome this function wants, and is said as that.
+# NOT `boss step nominate`'s `nomination_requested` record as well: the
+# approve step is human-only, and the jobs API refuses a non-human
+# writing any key of it but the context keys and the runner's declared
+# fields — 403, measured on the declared row by boss-jobs'
+# the_runners_nomination_of_a_rendered_approval_lands_on_the_declared_row.
+# The reason is said here, in the journal, beside the event.
+#
+# ONE APPROVER IS NOMINATED; SEVERAL ARE NOT. A step holds one assignee,
+# and the role arm of a queue reads only an unheld step, so nominating
+# one of several would take the approval off every other approver's
+# queue. With several it stays on its role audience and the journal names
+# each. A step someone already holds keeps its holder: this fills an empty
+# audience, it never moves a person's nomination — one this pass read is
+# left by the guard below, one placed after it by the server's 409. Every
+# other refusal is said on stderr and the plan stays rendered — the
+# approval still waits on its role queue, as it did before this.
+nominate_approver() {
+    na_id=$(printf '%s' "$1" | jq -r '.id')
+    na_short=$(printf '%s' "$na_id" | cut -c1-8)
+    na_sid=$(printf '%s' "$2" | jq -r '.id')
+    na_holder=$(printf '%s' "$2" | jq -r '.assignee_id // "" | strings')
+    na_status=$(printf '%s' "$2" | jq -r '.status // "" | strings')
+    na_count=$(printf '%s' "$4" | jq -r 'length')
+    na_names=$(printf '%s' "$4" | jq -r 'join(", ")')
+    if [ "$na_count" != 1 ]; then
+        echo "ops-runner: $na_short — infra/ops/verbs/$3.json names $na_count approvers ($na_names), and a step holds one assignee, so its approve step stays on its role queue for each of them"
+        return 0
+    fi
+    na_who=$(printf '%s' "$4" | jq -r '.[0]')
+    if [ -n "$na_holder" ]; then
+        if [ "$na_holder" != "$na_who" ]; then
+            echo "ops-runner: $na_short — its approve step is already assigned to $na_holder, and is not moved to $na_who, the approver infra/ops/verbs/$3.json names"
+        fi
+        return 0
+    fi
+    if [ "$na_status" != ready ]; then
+        echo "ops-runner: $na_short — its approve step is '$na_status', not ready, so it is not nominated to $na_who (only a ready step is)" >&2
+        return 0
+    fi
+    jq -cn --arg w "$na_who" '{assignee_id: $w, automatic_assignment: true}' > "$workdir/assign"
+    step_write PUT "$workdir/assign" "$workdir/nominate-body" \
+        "$BASE/api/jobs/$na_id/steps/$na_sid"
+    case "${sw_code:-000}" in
+        2??)
+            echo "ops-runner: $na_short — nominated its approve step to $na_who, the one approver infra/ops/verbs/$3.json names, so the plan for their passkey is in their queue (backlog 9f5132dd)"
+            return 0 ;;
+        409)
+            if [ "$(jq -r '.code? // ""' "$workdir/nominate-body" 2>/dev/null)" = "$AUTOMATIC_ASSIGNMENT_SUPERSEDED_CODE" ]; then
+                na_held=$(jq -r '(.holder? // .nomination_requested?.assignee_id? // "someone") | tostring' \
+                    "$workdir/nominate-body" 2>/dev/null)
+                echo "ops-runner: $na_short — a person holds its approve step's nomination (${na_held:-someone}), placed after this pass read the step; the jobs API kept it ($AUTOMATIC_ASSIGNMENT_SUPERSEDED_CODE), and the runner left it rather than move it to $na_who"
+                return 0
+            fi ;;
+    esac
+    echo "ops-runner: could not assign $na_short's approve step to $na_who — PUT HTTP ${sw_code:-none}: $(head -c 2000 "$workdir/nominate-body" | tr '\n' ' ')$(cat "$workdir/put-err"); its approval waits on its role queue" >&2
+    return 1
 }
 
 # verify_review <job json> — whether the request's `review` step holds a
@@ -1048,12 +1339,12 @@ verify_review() {
     fi
     vr_run=$(printf '%s' "$vr_pre" | jq -r '.review_run')
     vr_src=$(printf '%s' "$vr_pre" | jq -r '.source_run')
-    if ! vr_rj=$(curl -fsS -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
+    if ! vr_rj=$(curl -q -fsS -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
             "$BASE/api/jobs/$vr_run" 2>&1); then
         jq -cn --arg r "$vr_run" --arg e "$vr_rj" '{wait: "the review run \($r) could not be read: \($e)"}'
         return 0
     fi
-    if ! vr_sj=$(curl -fsS -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
+    if ! vr_sj=$(curl -q -fsS -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
             "$BASE/api/jobs/$vr_src" 2>&1); then
         jq -cn --arg r "$vr_src" --arg e "$vr_sj" '{wait: "the source run \($r) could not be read: \($e)"}'
         return 0
@@ -1129,7 +1420,7 @@ review_run_refused() {
     rr_run=$(printf '%s' "$1" | jq -r '((.steps // []) | map(select(.spec_slug == "review")) | .[0].metadata.agent_run) // ""
         | strings | select(test("^[0-9a-f-]{36}$"))')
     [ -n "$rr_run" ] || return 0
-    if ! rr_rj=$(curl -fsS -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
+    if ! rr_rj=$(curl -q -fsS -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
             "$BASE/api/jobs/$rr_run" 2>&1); then
         echo "ops-runner: $rr_id's review run $rr_run could not be read, so whether it ended refused is unknown this pass: $rr_rj" >&2
         return 0
@@ -1307,7 +1598,7 @@ verify_approval() {
 # (crates/core/boss-jobs/src/runner_credential.rs).
 host_doc=$(jq -rn --arg h "$HOST_ID" '{host: $h} | tojson | @uri')
 QUEUE_PAGE=1000
-if ! jobs_json=$(curl -fsS -H "x-boss-user: $BOSS_USER" \
+if ! jobs_json=$(curl -q -fsS -H "x-boss-user: $BOSS_USER" \
         ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
         "$BASE/api/jobs?kind=ops-request&status=open&metadata=$host_doc&limit=$QUEUE_PAGE&full=true" 2>&1); then
     echo "ops-runner: jobs-api unreachable at $BASE — $jobs_json" >&2
@@ -1601,7 +1892,10 @@ while [ "$i" -lt "$n" ]; do
             "$(printf '%s' "$contract" | jq -r '.nothing_to_do // empty | strings')" \
             approve "$reviewed_sha" "$review_run_id"
         case "$plan_outcome" in
-            planned) planned=$((planned + 1)) ;;
+            planned)
+                planned=$((planned + 1))
+                nominate_approver "$job" "$approve" "$verb" \
+                    "$(printf '%s' "$contract" | jq -c '.approvers')" ;;
             nothing) nothing=$((nothing + 1)) ;;
             refused) refused=$((refused + 1)) ;;
             *) failed=$((failed + 1)) ;;
@@ -1718,7 +2012,7 @@ while [ "$i" -lt "$n" ]; do
                 claimed_by: $by, runner_host: $h, seen_at: $at,
                 reason: "execute was claimed by \($by) under a single-use passkey approval to run \($v), and no answer from this claimant was recorded: whether \($v) ran is unknown. It will not be run again (design 17835005 q4), and the request is NOT closed refused, because that would say nothing ran. The journal on \($h) says how far that pass got; to run \($v) again, file a new request and approve its fresh plan"}}' \
             > "$workdir/unknown"
-        if ! patch_err=$(curl -fsS -X PATCH -H "content-type: application/json" \
+        if ! patch_err=$(curl -q -fsS -X PATCH -H "content-type: application/json" \
                 -H "x-boss-user: $BOSS_USER" \
                 ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
                 --data-binary @"$workdir/unknown" \
@@ -1739,6 +2033,9 @@ while [ "$i" -lt "$n" ]; do
     # plan's hash as its last arg, appended here — the filer never
     # supplies it. Anything short of that is a refusal on the step.
     approved=false; approval_why=""; plan_sha=""; signed_at=""; claimant=""
+    # This packet's re-render attempts, or null when it had none — never
+    # an earlier packet's (see `rerender_signed_plan`).
+    printf 'null\n' > "$workdir/rerender-attempts"
     # A HELD EXECUTE IS REFUSED BY NAME, before any approval is judged
     # (security re-review, 2026-09-25). The claim door admits a READY
     # step only unheld or to its holder, so an execute somebody was
@@ -1781,10 +2078,22 @@ while [ "$i" -lt "$n" ]; do
         # re-render to catch.
         if [ -z "$approval_why" ]; then
             plan_verb=$(printf '%s' "$verdict" | jq -r '.plan_verb // empty')
-            run_plan_verb "$job_id" "$plan_verb" "$args"
+            rerender_signed_plan "$job_id" "$plan_verb" "$args" "$job" "$verb" "$step_status"
             if [ -n "$rv_why" ]; then
                 approval_why="verb $verb requires a passkey approval, and the signed plan could not be checked against a fresh render: $rv_why"
             elif [ "$rv_sha" != "$plan_sha" ]; then
+                # THE FRESH PLAN RIDES THE REFUSAL (backlog 204e27ba): the
+                # attempt that rendered other bytes keeps them as `plan`,
+                # beside its stderr, so a reader diffs them against the
+                # signed plan on the approve step. Two hashes alone could
+                # not name the field that moved (830c317a). Kept only on
+                # a mismatch: a matching render IS the signed plan.
+                if jq -c --rawfile p "$workdir/plan" '.[-1].plan = $p' \
+                        "$workdir/rerender-attempts" > "$workdir/rerender-attempts.next"; then
+                    mv "$workdir/rerender-attempts.next" "$workdir/rerender-attempts"
+                else
+                    echo "ops-runner: could not keep the fresh plan on $job_id's re-render record" >&2
+                fi
                 approval_why="verb $verb requires a passkey approval, and the signed plan hashes to $plan_sha while the plan verb $plan_verb renders $rv_sha on $HOST_ID now: the plan on the approve step is not what this runner renders here (written by someone else, or the state moved since it was signed). Nothing runs on it; file the request again and approve its fresh plan"
             # THE REVIEW, READ AGAIN BEFORE ANYTHING IS CLAIMED (backlog
             # 84e7c3e4, design 9de0cd1c Q1: "and again before any push"):
@@ -1811,6 +2120,8 @@ while [ "$i" -lt "$n" ]; do
     disp=""; rc_str=""; script=""; dur_ms=""
     eff_line=""; eff_unproven=""; eff_unread=""
     streamsf="$workdir/streams"
+    executedf="$workdir/executed"
+    printf 'null\n' > "$executedf"
     printf 'null\n' > "$streamsf"
     streams_unread=""
     reason=$(printf '%s' "$decision" | jq -r '.refuse // empty')
@@ -1872,7 +2183,7 @@ ARGV
     #   claimant, which the door refuses 409 naming the holder.
     if [ "$disp" != "refused" ] && [ "$approved" = true ]; then
         fresh=""
-        if ! fresh=$(curl -fsS -H "x-boss-user: $BOSS_USER" \
+        if ! fresh=$(curl -q -fsS -H "x-boss-user: $BOSS_USER" \
                 ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
                 "$BASE/api/jobs/$job_id" 2>&1); then
             echo "ops-runner: could not re-read $short before claiming its execute — $fresh — $verb NOT run" >&2
@@ -1910,7 +2221,7 @@ ARGV
         claim_user=$(jq -cn --arg id "$claimant" '{id: $id, role: "platform-admin", access_tier: "operator",
             territory_account_ids: [], direct_report_ids: [], department: "platform"}')
         : > "$workdir/claim-body"
-        claim_code=$(curl -sS -o "$workdir/claim-body" -w '%{http_code}' -X POST \
+        claim_code=$(curl -q -sS -o "$workdir/claim-body" -w '%{http_code}' -X POST \
                 -H "x-boss-user: $claim_user" \
                 ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
                 "$BASE/api/jobs/$job_id/steps/$step_id/claim" 2>"$workdir/claim-err") || claim_code=""
@@ -1925,9 +2236,26 @@ ARGV
         echo "ops-runner: claimed $short's execute as $claimant under a passkey approval signed at $signed_at (plan-sha256 $plan_sha)"
     fi
     if [ "$disp" != "refused" ]; then
+        # Freeze the exact reviewed verb file, not request metadata. A tree
+        # change after allowlist loading is a refusal, never mixed authority.
+        if ! cp "$VERBS_DIR/$verb.json" "$workdir/executed-spec" \
+            || ! jq_doc_file "$workdir/executed-spec" \
+            || ! jq_doc_file "$VERBS_FILE" \
+            || ! jq -e --arg verb "$verb" --slurpfile spec "$workdir/executed-spec" \
+                '.verbs[$verb] == $spec[0]' "$VERBS_FILE" >/dev/null; then
+            disp="refused"; rc_str=""
+            printf '%s' 'verb declaration changed or unread before execution' > "$outf"
+        fi
+    fi
+    if [ "$disp" != "refused" ]; then
         if [ -n "$script" ]; then
             shift; set -- "$script" "$@"
         fi
+        executed_sha=$(sha256sum "$workdir/executed-spec") || exit 1
+        executed_sha=${executed_sha%% *}
+        jq -cn --arg verb "$verb" --arg host "$HOST_ID" --arg sha "$executed_sha" \
+            --args '{verb:$verb,verb_file_sha256:$sha,host:$host,argv:$ARGS.positional}' \
+            -- "$@" > "$executedf" || exit 1
         # A verb may declare its own `timeout` in the allowlist (a
         # reviewed number, like its argv); otherwise the runner's
         # default applies. publish-github-pr's first push of the whole
@@ -2092,15 +2420,19 @@ ARGV
     # which the merge door reads as a delete: through that door an omitted
     # key keeps whatever an earlier pass left, and one record must not
     # mix two passes' answers (the re-review of car 59a6ade9).
+    # The execute-time re-render's attempts ride beside the answer they
+    # decided (backlog 05d7c0b9), null when this packet had none.
     payloadf="$workdir/payload"
-    jq -cn --rawfile out "$outf" --slurpfile streams "$streamsf" --arg su "$streams_unread" \
+    jq -cn --rawfile out "$outf" --slurpfile streams "$streamsf" --slurpfile executed "$executedf" --arg su "$streams_unread" \
+        --slurpfile rra "$workdir/rerender-attempts" \
         --arg d "$disp" --arg rc "$rc_str" --arg h "$HOST_ID" --arg ms "${dur_ms:-}" \
         --arg ps "$plan_sha" --arg sa "$signed_at" --arg ap "$approved" --arg ca "$claimant" \
         --arg el "$eff_line" --arg eu "$eff_unproven" --arg er "$eff_unread" \
         --arg rcs "$RC_STATE" '
-        {disposition: $d, output: $out, runner_host: $h, streams:$streams[0],
+        {disposition: $d, output: $out, runner_host: $h, streams:$streams[0], executed:$executed[0],
          runner_credential: (if $rcs == "" then null else $rcs end),
          streams_unread:(if $su == "" then null else $su end),
+         rerender_attempts: $rra[0],
          exit_code: (if $rc == "" then null else $rc end),
          duration_ms: (if $ms == "" then null else ($ms | tonumber) end),
          reason: (if $d == "refused" then $out else null end),
@@ -2146,7 +2478,7 @@ ARGV
         jq -cn --arg w "$wait_s" --argjson d "$depth" --arg exact "$depth_exact" '
             (if $exact == "true" then {queue_depth: $d} else {queue_depth_at_least: $d} end)
             + (if $w == "-" then {} else {queued_s: ($w | tonumber)} end)' > "$exitf"
-        if ! patch_err=$(curl -fsS -X PATCH -H "content-type: application/json" \
+        if ! patch_err=$(curl -q -fsS -X PATCH -H "content-type: application/json" \
                 -H "x-boss-user: $BOSS_USER" \
                 ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
                 --data-binary @"$exitf" \

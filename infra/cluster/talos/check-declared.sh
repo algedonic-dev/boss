@@ -33,13 +33,15 @@
 #              the summary, the exit status unchanged (review a79746c6)
 # Classes read for UNDECLARED: machine.files under /var/local, every
 # machine.kubelet.extraMounts entry, machine.kubelet.extraConfig imageGC*
-# keys, every machine.registries.mirrors host, every UserVolumeConfig.
+# keys, every machine.registries.mirrors host, every UserVolumeConfig,
+# every machine.nodeAnnotations key.
 #
 # USER VOLUMES (backlog 52ea56ac, 2026-09-30). A declaration is ONE
 # machine fragment plus any number of `kind: UserVolumeConfig`
 # documents after `---` (w-1's gate disk), compared by `name` in the
 # same vocabulary. Any other document kind in a declaration is REFUSED
-# (exit 2, naming it) rather than skipped. Live, a user volume is a
+# (exit 2, naming it) rather than skipped. A NARROWED patch (--narrowed,
+# below; backlog a93010a1) may be volumes alone. Live, a user volume is a
 # second document of the SAME config: `talosctl get machineconfig`
 # prints a multi-document config as a block-string spec, and `talosctl
 # read /system/state/config.yaml` prints the stored file itself, every
@@ -68,10 +70,25 @@
 #         traceback, and never exit 1, which callers read as findings
 #         (review be5ba8f7, finding 2);
 #       3 (--only-read-classes only) the declaration names an entry in no
-#         class this check reads or outside EXTRA_CONFIG_KEYS, each
+#         class this check reads or outside EXTRA_CONFIG_KEYS or
+#         NODE_ANNOTATION_KEYS, each
 #         printed as UNREAD, or a user volume whose diskSelector is not in
 #         the allowlist grammar (SELECTOR_TERM), printed as REFUSED;
+#       4 (--absent only) no declared entry is ABSENT live, so there is
+#         no narrowed patch; stdout is empty;
 #      78 python3 is not on this box.
+#
+# --absent <node> [live] (backlog 9cf1673d, built for 67e98635): the same
+# comparison, and instead of verdict lines it prints the DECLARATION
+# NARROWED to the entries that read ABSENT live — a declaration of its
+# own, re-emitted in canonical form from the DECLARED values (never a
+# live one), exit 0 — or nothing, exit 4. Talos's merge appends list
+# entries it cannot key, so a declaration whose list entries are live
+# cannot be re-applied whole (w-1: its seed file entry, mount, mirror and
+# gate volume are live); node-converge applies this narrowed patch
+# instead. A DRIFT or DOUBLED entry is not absent and is not printed: the
+# caller decides what a drift under an appending patch means. Read lines
+# and the UNVERIFIED warning go to stderr, so stdout is the patch alone.
 #
 # PARSING. The gate image and this pod carry python3 and no PyYAML
 # (infra/forge/boss-ci/required-tools.txt lists python3 alone), so the
@@ -93,9 +110,34 @@ set -u
 usage() {
     echo "usage: $0 <node> [live-machineconfig.yaml]   (stdin when no file)" >&2
     echo "       $0 --only-read-classes <node>          (the declaration alone; no live input)" >&2
+    echo "       $0 --absent <node> [live.yaml]         (print the declaration narrowed to its entries ABSENT live)" >&2
+    echo "       $0 --narrowed <any of the above>       (the file is a narrowed patch: UserVolumeConfig documents may stand alone)" >&2
     echo "  declarations: \${BOSS_TALOS_PATCHES:-<beside this script>/patches}/<node>.yaml" >&2
     exit 2
 }
+
+# --narrowed (backlog a93010a1; live, ops-request 797b0d0d, 2026-11-07
+# 18:45Z): the file read is a NARROWED PATCH that --absent printed, not a
+# declaration. When every machine entry of a declaration is live and only
+# a user volume is ABSENT — the volume-move's step 3, after
+# retire-a-user-volume removed it — --absent prints the UserVolumeConfig
+# document alone, and node-converge, reading that patch back, was refused
+# as "not one machine-config fragment". A narrowed patch may therefore
+# hold AT MOST one machine fragment and must hold at least one document;
+# every other document is still a named UserVolumeConfig. It is a flag,
+# not a relaxed rule, because a DECLARATION in patches/ is still exactly
+# one machine fragment plus volumes: a declaration with no machine
+# fragment is a mistake to refuse, and only the caller that built the
+# file knows it is a patch. Why no empty `machine: {}` instead: canonical
+# form has no block form for an empty mapping, and a volume-only patch is
+# the one document Talos adds — talosctl applies each patch document by
+# kind, so an empty v1alpha1 fragment beside it would be a merge of
+# nothing written into the signed plan as if it were a change.
+narrowed=0
+if [ "${1:-}" = "--narrowed" ]; then
+    narrowed=1
+    shift
+fi
 
 # --only-read-classes (backlog 9d56c616): judge the DECLARATION alone —
 # exit 0 when every entry it names sits in a class this check reads, 3
@@ -106,12 +148,16 @@ usage() {
 # then reads its effect back through this check, so an entry the check
 # cannot read is an effect nobody could prove; the verb refuses it
 # before anything is applied. The classes are READ_CLASSES below, the
-# same four the comparison walks — one definition, not two lists.
+# same five the comparison walks — one definition, not two lists.
 mode=compare
 if [ "${1:-}" = "--only-read-classes" ]; then
     mode=classes
     shift
     [ $# -eq 1 ] || usage
+elif [ "${1:-}" = "--absent" ]; then
+    mode=absent
+    shift
+    [ $# -eq 1 ] || [ $# -eq 2 ] || usage
 fi
 
 node="${1:-}"
@@ -139,7 +185,7 @@ fi
 # The program rides on fd 3, not stdin: stdin is the live config when no
 # file is named, and a heredoc on stdin would BE the program's stdin —
 # the check would read an empty document and refuse a healthy node.
-python3 /dev/fd/3 "$node" "$declared" "$live" "$mode" 3<<'PY'
+python3 /dev/fd/3 "$node" "$declared" "$live" "$mode" "$narrowed" 3<<'PY'
 import json
 import os
 import re
@@ -167,6 +213,7 @@ def _unreadable(etype, value, tb):
 sys.excepthook = _unreadable
 
 node, declared_path, live_path, mode = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+narrowed = sys.argv[5] == "1"
 
 
 class Unsupported(Exception):
@@ -642,11 +689,22 @@ def norm(v):
 
 
 findings = []  # (verdict, text)
+# Every declared entry that reads ABSENT, as (path, key, declared value):
+# path the class's key path, key the list's key value or the map's key
+# (None for a whole user-volume document). --absent prints these.
+absent = []
 
 
 def say(verdict, text):
     findings.append((verdict, text))
-    print(f"{verdict:<10} {text}")
+    if mode != "absent":
+        print(f"{verdict:<10} {text}")
+
+
+def note(text):
+    """A line that is not a verdict: stdout when comparing, stderr under
+    --absent, whose stdout is the narrowed patch and nothing else."""
+    print(text, file=sys.stderr if mode == "absent" else sys.stdout)
 
 
 def keyed_list(cfg, path, key):
@@ -677,6 +735,7 @@ def compare_list(name, dec, live, key, undeclared_when):
         label = f"{name}[{k}]"
         if not copies:
             say("ABSENT", f"{label}  declared, not live: {show(d)}")
+            absent.append((name, k, d))
             continue
         if len(copies) > 1:
             say("DOUBLED", f"{label}  live has {len(copies)} copies of a declared entry (declared once)")
@@ -700,6 +759,7 @@ def compare_map(name, dec, live, undeclared_when):
         label = f"{name}.{k}" if not isinstance(d, dict) else f"{name}[{k}]"
         if k not in live_map:
             say("ABSENT", f"{label}  declared, not live: {show(d)}")
+            absent.append((name, k, d))
         elif norm(live_map[k]) != norm(d):
             say("DRIFT", f"{label}  declared {show(d)}  live {show(live_map[k])}")
         else:
@@ -724,6 +784,7 @@ def compare_user_volumes(dec_docs, live_docs):
         copies = [it for kk, it in live_items if kk == k]
         if not copies:
             say("ABSENT", f"{label}  declared, not live: {show(d)}")
+            absent.append((None, None, d))
             continue
         if len(copies) > 1:
             say("DOUBLED", f"{label}  live has {len(copies)} copies of a declared document (declared once)")
@@ -747,11 +808,19 @@ except Unsupported as e:
 # (w-1's gate volume, backlog 52ea56ac). Any other document is REFUSED
 # by kind: a comparator that skipped half its declaration would report
 # a clean node it never compared.
+# A NARROWED PATCH (--narrowed, backlog a93010a1) may hold no machine
+# fragment, when it holds at least one document; the loop below still
+# refuses anything in it but a named UserVolumeConfig. Its machine side is
+# then empty: no machine entry is declared, so none reads ABSENT or MATCH.
 dec_machine = [d for d in dec_docs if is_machine(d)]
-if len(dec_machine) != 1:
+if narrowed:
+    if len(dec_machine) > 1 or not dec_docs:
+        print(f"check-declared: {declared_path} is not a narrowed patch: at most one machine-config fragment (`machine:` at the top) and at least one document", file=sys.stderr)
+        sys.exit(2)
+elif len(dec_machine) != 1:
     print(f"check-declared: {declared_path} is not one machine-config fragment (`machine:` at the top)", file=sys.stderr)
     sys.exit(2)
-dec = dec_machine[0]
+dec = dec_machine[0] if dec_machine else {}
 dec_volumes = []
 for d in dec_docs:
     if d is dec:
@@ -770,15 +839,16 @@ if _fault:
     print(f"check-declared: {declared_path} is not in canonical form — {_fault}. A declaration is held to the one block form this reader re-emits from what it parsed, so nothing it might misread reaches a node (review a7fa61ec)", file=sys.stderr)
     sys.exit(2)
 
-# The classes this check reads — the four the comparison below walks, and
+# The classes this check reads — the five the comparison below walks, and
 # the only entries whose presence live it can prove.
 READ_CLASSES = (
     "machine.files",
     "machine.kubelet.extraMounts",
     "machine.kubelet.extraConfig",
     "machine.registries.mirrors",
+    "machine.nodeAnnotations",
 )
-FILES, MOUNTS, EXTRA_CONFIG, MIRRORS = READ_CLASSES
+FILES, MOUNTS, EXTRA_CONFIG, MIRRORS, NODE_ANNOTATIONS = READ_CLASSES
 
 
 def unread_paths(d, path=()):
@@ -815,6 +885,27 @@ def unmanaged_extra_config(d):
         # this list admits (review a7fa61ec, recommendation 2).
         return [f"{EXTRA_CONFIG} (a {type(ec).__name__}, not a mapping of kubelet keys)"]
     return [f"{EXTRA_CONFIG}.{k}" for k in ec if str(k) not in EXTRA_CONFIG_KEYS]
+
+
+# The Kubernetes node annotations a declaration may carry (backlog
+# e14a472d): the Longhorn TAG annotation alone, which hands a node's
+# Longhorn tags to the dev-build volume class's nodeSelector. Talos sets
+# whatever it is given on the Node object, and controllers read their own
+# keys there — Longhorn's node.longhorn.io/default-disks-config CREATES
+# disks at the paths it names, a control plane's system disk among them,
+# which is what infra/forge/longhorn-disk.sh bounds. So node-converge
+# applies only this key; a new one is a reviewed edit here, as
+# EXTRA_CONFIG_KEYS is.
+NODE_ANNOTATION_KEYS = ("node.longhorn.io/default-node-tags",)
+
+
+def unmanaged_node_annotations(d):
+    na = get(d, *NODE_ANNOTATIONS.split("."))
+    if na is None:
+        return []
+    if not isinstance(na, dict):
+        return [f"{NODE_ANNOTATIONS} (a {type(na).__name__}, not a mapping of annotation keys)"]
+    return [f"{NODE_ANNOTATIONS}.{k}" for k in na if str(k) not in NODE_ANNOTATION_KEYS]
 
 
 # THE SELECTOR GRAMMAR a converge may apply — an ALLOWLIST (review
@@ -877,11 +968,14 @@ def unsafe_volumes(vols):
 if mode == "classes":
     for p in unmanaged_extra_config(dec):
         print(f"UNREAD     {p}  declared, outside the kubelet keys a declaration may carry ({', '.join(EXTRA_CONFIG_KEYS)})")
+    for p in unmanaged_node_annotations(dec):
+        print(f"UNREAD     {p}  declared, outside the node annotations a declaration may carry ({', '.join(NODE_ANNOTATION_KEYS)})")
     for p in unread_paths(dec):
         print(f"UNREAD     {p}  declared, in no class this check reads ({', '.join(READ_CLASSES)})")
     for label, why in unsafe_volumes(dec_volumes):
         print(f"REFUSED    {label}  {why}")
-    unread = unmanaged_extra_config(dec) + unread_paths(dec) + [label for label, _ in unsafe_volumes(dec_volumes)]
+    unread = (unmanaged_extra_config(dec) + unmanaged_node_annotations(dec) + unread_paths(dec)
+              + [label for label, _ in unsafe_volumes(dec_volumes)])
     if unread:
         print(f"check-declared: {node}: {len(unread)} declared entr{'y' if len(unread) == 1 else 'ies'} a converge may not apply")
         sys.exit(3)
@@ -905,7 +999,7 @@ hostname = get(live, "machine", "network", "hostname")
 if hostname is not None and str(hostname) != node:
     print(f"check-declared: the live config says hostname {hostname!r}; asked to check {node!r} — refusing to compare another node's config", file=sys.stderr)
     sys.exit(2)
-print(f"read       machineconfig id={rid or '(raw)'} ({len(configs)} config document(s) in input; hostname {hostname or '(unset)'}) against {declared_path}")
+note(f"read       machineconfig id={rid or '(raw)'} ({len(configs)} config document(s) in input; hostname {hostname or '(unset)'}) against {declared_path}")
 # THE NODE IS UNVERIFIED without a hostname (review a79746c6, finding 7).
 # The stored config (`talosctl read /system/state/config.yaml`) carries
 # no `node:` field, and a declaration names neither address nor machine
@@ -916,13 +1010,14 @@ print(f"read       machineconfig id={rid or '(raw)'} ({len(configs)} config docu
 # than letting a wrong node's MATCH read as this one's.
 unverified = hostname is None
 if unverified:
-    print(f"UNVERIFIED the live config names no machine.network.hostname — nothing here proves it is {node}'s; confirm the -n address before trusting any verdict below")
+    note(f"UNVERIFIED the live config names no machine.network.hostname — nothing here proves it is {node}'s; confirm the -n address before trusting any verdict below")
 
 try:
     compare_list(FILES, dec, live, "path", lambda p: p.startswith("/var/local/"))
     compare_list(MOUNTS, dec, live, "destination", lambda _d: True)
     compare_map(EXTRA_CONFIG, dec, live, lambda k: str(k).startswith("imageGC"))
     compare_map(MIRRORS, dec, live, lambda _h: True)
+    compare_map(NODE_ANNOTATIONS, dec, live, lambda _k: True)
     compare_user_volumes(dec_volumes, live_siblings)
 except Unsupported as e:
     print(f"check-declared: cannot compare: {e}", file=sys.stderr)
@@ -931,6 +1026,44 @@ except Unsupported as e:
 counts = {v: 0 for v in ("MATCH", "DRIFT", "ABSENT", "DOUBLED", "UNDECLARED")}
 for v, _ in findings:
     counts[v] += 1
+
+if mode == "absent":
+    # The narrowed patch: each ABSENT entry under its own class path, in
+    # the order the comparison met them, a list entry as one item of its
+    # list, a map entry as its key, a user volume as its own document.
+    # Built from the DECLARED value `d`, never a live one, and emitted by
+    # the one canonical writer above, so the patch is itself a canonical
+    # declaration node-converge can judge and read back like any other.
+    if not absent:
+        print(f"check-declared: {node}: no declared entry is ABSENT live ({counts['MATCH']} match, {counts['DRIFT']} drift, {counts['DOUBLED']} doubled) — there is no narrowed patch", file=sys.stderr)
+        sys.exit(4)
+    frag = {}
+    volumes = []
+    for path, key, d in absent:
+        if path is None:
+            volumes.append(d)
+            continue
+        *parents, leaf = path.split(".")
+        at = frag
+        for p in parents:
+            at = at.setdefault(p, {})
+        if path in (FILES, MOUNTS):
+            at.setdefault(leaf, []).append(d)
+        else:
+            at.setdefault(leaf, {})[key] = d
+    out = []
+    try:
+        if frag:
+            _emit_map(frag, 0, out)
+        for v in volumes:
+            if out:
+                out.append("---")
+            _emit_map(v, 0, out)
+    except NotCanonical as e:
+        print(f"check-declared: {node}: the narrowed patch has no canonical form — {e}", file=sys.stderr)
+        sys.exit(2)
+    print("\n".join(out))
+    sys.exit(0)
 hard = counts["DRIFT"] + counts["ABSENT"] + counts["DOUBLED"]
 verdict = "every declared entry matches" if hard == 0 else f"{hard} finding(s) against the declaration"
 if unverified:

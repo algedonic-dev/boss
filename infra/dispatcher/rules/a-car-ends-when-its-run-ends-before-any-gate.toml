@@ -1,0 +1,32 @@
+# The other end of an admitted car (backlog 366c9fb1, design 689d1f7f
+# car 1).
+#
+# WHY. `boss dispatch --started` admits a builder run's car at `build`,
+# so the engineering station shows work in build. A builder that then
+# stops without building ends its RUN `refused` (by hand), and one that
+# goes silent is ended `died` (agent-run-dies-when-building-is-silent);
+# neither wrote anything on the CAR, which stood open at `build` for
+# ever. This ends it through ship-a-change's `abandoned` terminal.
+#
+# WHAT IT LEAVES ALONE. `boss_jobs::car::ending_claim` decides, and
+# pins: only a car no gate ever ran for (`build` not handed in, no
+# `gate_run` on its gate step) whose `agent_run` still names this run. A
+# red gate ends its run `refused` too (agent-run-is-refused-on-gate-red);
+# that car was gated and waits at its gate for the repair. The ending's
+# claim and a gate launch's stamp are fenced on one gate-step key, so
+# exactly one of them lands; a redelivery finishes a claimed ending.
+[[rule]]
+name = "a-car-ends-when-its-run-ends-before-any-gate"
+why = """
+A CROSS-PROTOCOL REACTOR: an `agent-run` packet's refused or died
+terminal ends the `ship-a-change` car admitted for it — two protocols,
+so no single Workflow definition can declare it. Measured by builder run
+d659981f on car 0d04ee3e (2026-11-09): a run refused before its gate
+left its admitted car open at build with no bounded cleanup.
+"""
+version = 1
+on_event = "jobs.job.closed"
+when = 'kind = "agent-run" AND (outcome = "refused" OR outcome = "died")'
+[[rule.do]]
+handler = "jobs.end_unlaunched_car"
+args = { by = "\"run\"" }

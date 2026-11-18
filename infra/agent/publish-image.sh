@@ -66,7 +66,7 @@ http_get() {
     local args=(--silent --show-error --connect-timeout 10 --max-time 360 --max-filesize 2147483648 --dump-header "$headers" --output "$body" --write-out '%{http_code}')
     [ -z "$accept" ] || args+=(-H "Accept: $accept")
     [ -z "${TOKEN_HDR:-}" ] || args+=(-H "$TOKEN_HDR")
-    code=$(/usr/bin/env -i PATH=/usr/bin:/bin HOME="$stage/home" /usr/bin/curl "${args[@]}" "$registry_url") || rc=$?
+    code=$(/usr/bin/env -i PATH=/usr/bin:/bin HOME="$stage/home" /usr/bin/curl -q "${args[@]}" "$registry_url") || rc=$?
     printf '%s\n' "$code"; return "$rc"
 }
 fetch_image() {

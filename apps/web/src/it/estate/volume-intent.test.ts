@@ -11,6 +11,31 @@ test('the estate retains the comparator capacity intent and its assignment, sepa
 const assignment = { packet: '32e7cf87-7d8e-4764-94a3-3b0cfa8548c4', step: 'a40668dd-27d0-467b-822c-10f5d28b657a', question: 'Q1', decided_by: 'emp-david', decided_at: '2026-10-02T23:53:23.553088Z' };
 const matching = { verdict: 'match', desired_bytes: 32212254720, requested_bytes: 32212254720, assignment, reason: null };
 
+test('standalone manifest drift is visible separately from assigned intent and an unmounted filesystem', () => {
+  const recorded = {
+    verdict: 'drift', namespace: 'boss', claim: 'boss-files',
+    file: 'infra/cluster/manifests/boss.yaml', line: 245,
+    declared_bytes: 21474836480, live_bytes: 42949672960,
+  };
+  const read = (comparison: unknown) => parseVolumeReadings([{ payload: {
+    scope: 'instance-volumes', observed_at: '', volumes: [{
+      id: 'boss/boss-files', requested: '40Gi', capacity_bytes: null, free_bytes: null,
+      capacity_intent: matching, standalone_declaration_comparison: comparison,
+    }],
+  } }])[0]!.volumes[0]!;
+  const row = read(recorded);
+  expect(capacityIntentLine(row)).toContain('infra/cluster/manifests/boss.yaml:245');
+  expect(capacityIntentLine(row)).toContain('tree write-back owed');
+  expect(capacityIntentLine(row)).toContain('42949672960');
+  expect(row.capacity_bytes).toBeNull();
+  const covered = read({ ...recorded, verdict: 'covered', declared_bytes: 64424509440 });
+  expect(covered.standalone_declaration?.verdict).toBe('covered');
+  expect(capacityIntentLine(covered)).not.toContain('tree write-back owed');
+  for (const malformed of [{ ...recorded, namespace: 'other' }, { ...recorded, file: '../secret' }, { ...recorded, live_bytes: null }]) {
+    expect(capacityIntentLine(read(malformed))).toContain('Standalone manifest comparison unknown');
+  }
+});
+
 test('recorded drift and exact assignment survive, while hollow or contradictory success stays unknown', () => {
   const drift = { ...matching, verdict: 'drift' as const, requested_bytes: 21474836480 };
   expect(parseCapacityIntent(drift)).toEqual(drift);

@@ -4,11 +4,10 @@
 to gates and the dev pod running off the control plane. Written
 2026-08-23, ahead of the node David ordered (decision recorded on
 design packet `95e9492a`: one small dedicated worker, hookup
-2026-08-25). Why it matters is in
-[build-capacity](../design/build-capacity.md): the cluster has no
-worker nodes, so every heavy build has shared a machine with etcd and
-the system of record's Longhorn replicas — the direct cause of the
-2026-08-22 control-plane incidents.
+2026-08-25). Why it mattered, as that packet records it: the cluster
+then had no worker nodes, so every heavy build shared a machine with
+etcd and the system of record's Longhorn replicas — the direct cause
+of the 2026-08-22 control-plane incidents.
 
 ## Before the node arrives
 

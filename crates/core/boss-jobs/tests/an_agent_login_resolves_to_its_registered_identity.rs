@@ -62,8 +62,11 @@ impl RosterLookup for AdminRoster {
 /// ambient actor is taken from the resolved header.
 /// Returns the app, the outbox (where the handlers' domain events
 /// record — the in-memory analogue of in-transaction recording) and
-/// the bus (where the door's count is published).
-fn app() -> (axum::Router, Arc<InMemoryJobs>, Arc<RecordingEventBus>) {
+/// the agents registry, where the door's count is staged — the
+/// in-memory analogue of the Pg adapter's outbox row. It was the bus
+/// until 2026-11-10, when a dark bus was measured dropping the count
+/// (backlog 2e45840a, design ad9519bc part d).
+fn app() -> (axum::Router, Arc<InMemoryJobs>, Arc<InMemoryAgents>) {
     let jobs = Arc::new(InMemoryJobs::new());
     let policy: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
@@ -101,13 +104,13 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>, Arc<RecordingEventBus>) {
         )
     };
     let registry = Arc::new(InMemoryAgents::new().with_agent(AGENT, [ALIAS]));
-    let door = Arc::new(LoginDoor::new(registry, publisher));
+    let door = Arc::new(LoginDoor::new(registry.clone(), publisher));
     let app = router(state)
         .layer(axum::middleware::from_fn(
             boss_policy_client::request_context_middleware,
         ))
         .layer(axum::middleware::from_fn_with_state(door, resolve_login));
-    (app, jobs, bus)
+    (app, jobs, registry)
 }
 
 /// The header the pod's `boss-api` door builds (infra/dev/boss-api):
@@ -193,8 +196,9 @@ async fn scope_step(app: &axum::Router, job_id: &str) -> serde_json::Value {
         .clone()
 }
 
-fn unresolved_events(bus: &RecordingEventBus) -> Vec<boss_core::event::Event> {
-    bus.events()
+fn unresolved_events(agents: &InMemoryAgents) -> Vec<boss_core::event::Event> {
+    agents
+        .recorded_events()
         .into_iter()
         .filter(|e| e.kind == UNRESOLVED_LOGIN)
         .collect()
@@ -205,7 +209,7 @@ fn unresolved_events(bus: &RecordingEventBus) -> Vec<boss_core::event::Event> {
 /// address.
 #[tokio::test]
 async fn a_claim_and_a_completion_signed_with_the_alias_carry_the_agent_id() {
-    let (app, jobs, bus) = app();
+    let (app, jobs, agents) = app();
     let (job_id, scope_id) = open_packet(&app, ALIAS).await;
 
     let (status, claimed) = send(
@@ -271,7 +275,7 @@ async fn a_claim_and_a_completion_signed_with_the_alias_carry_the_agent_id() {
         "every emitted event is signed by the registered agent, got {actors:?}"
     );
     assert!(
-        unresolved_events(&bus).is_empty(),
+        unresolved_events(&agents).is_empty(),
         "a resolved login is not an unresolved one"
     );
 }
@@ -281,7 +285,7 @@ async fn a_claim_and_a_completion_signed_with_the_alias_carry_the_agent_id() {
 /// countable fact naming what arrived and where.
 #[tokio::test]
 async fn an_unmatched_address_is_admitted_and_counted_on_a_write() {
-    let (app, _, bus) = app();
+    let (app, _, agents) = app();
     let (job_id, scope_id) = open_packet(&app, STRANGER).await;
 
     let (status, claimed) = send(
@@ -303,7 +307,7 @@ async fn an_unmatched_address_is_admitted_and_counted_on_a_write() {
         "unresolved means unchanged — the address survives, which is the defect the count measures"
     );
 
-    let counted = unresolved_events(&bus);
+    let counted = unresolved_events(&agents);
     assert_eq!(
         counted.len(),
         2,
@@ -326,7 +330,7 @@ async fn an_unmatched_address_is_admitted_and_counted_on_a_write() {
 /// not a login — neither is counted.
 #[tokio::test]
 async fn reads_and_non_address_ids_count_nothing() {
-    let (app, jobs, bus) = app();
+    let (app, jobs, agents) = app();
     let (job_id, _) = open_packet(&app, ALIAS).await;
 
     let (status, _) = send(
@@ -340,12 +344,15 @@ async fn reads_and_non_address_ids_count_nothing() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(unresolved_events(&bus).is_empty(), "a read is not counted");
+    assert!(
+        unresolved_events(&agents).is_empty(),
+        "a read is not counted"
+    );
 
     let (_, _) = open_packet(&app, "emp-bootstrap-admin").await;
     let (_, _) = open_packet(&app, "automation:train-conductor").await;
     assert!(
-        unresolved_events(&bus).is_empty(),
+        unresolved_events(&agents).is_empty(),
         "an employee id and an automation slug are identities, not logins"
     );
     let actors: Vec<String> = jobs

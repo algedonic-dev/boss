@@ -1291,6 +1291,121 @@ async fn a_claim_for_an_agents_login_holds_its_registered_id() {
     assert_eq!(holds[0].subject, Subject::new("employee", AGENT));
 }
 
+/// A REGISTERED ROBOT'S SELF-CLAIM THROUGH ITS LOGIN RECORDS ROBOT
+/// (backlog 43ca3b3a; Codex's landed review 0f89947f of T1 car
+/// eec11034). The claim door stamped the claim fact's executor kind off
+/// the RAW holder, and a login is an address, which the actor parse reads
+/// as a person — so `claude@algedonic.dev` claiming for itself recorded
+/// `person` on the immutable fact while `agent-claude` recorded `robot`,
+/// one executor, two kinds. Measured RED on 9657e5a9: the login leg
+/// recorded `person`. (The binary's login door rewrites a registered
+/// alias in the header before this handler runs; the router itself must
+/// not depend on that layer for what it writes on an immutable fact.)
+///
+/// AND THE RECORD AGREES WITH THE FOLD: the claims history, reading the
+/// canonical claim with its recorded kind taken off, derives the kind
+/// from the id (`derived-from-id`); the recorded kind of BOTH spellings
+/// must equal it, so a door that records a kind the log's own derivation
+/// would not give for the same executor cannot pass silently again (the
+/// one-kind check over the history judges only that each holder string
+/// has one kind, which a false recorded kind satisfies).
+#[tokio::test]
+async fn a_registered_robots_self_claim_through_its_login_records_robot() {
+    use boss_jobs::claims_console::{
+        ClaimsHistory, HistoryBatch, InMemoryClaimsHistory, SequencedFact,
+    };
+    let mut recorded = Vec::new();
+    for who in [AGENT, AGENT_LOGIN] {
+        let (app, jobs, _calendar) = build_app();
+        let (job, step) = scheduled(&jobs, None, serde_json::json!({})).await;
+        let before = jobs.recorded_events().len();
+        let (status, body) = claim(&app, &job, &step, &user(who, "technician"), None).await;
+        assert_eq!(status, StatusCode::OK, "{who}: {body}");
+        let fact = jobs.recorded_events()[before..]
+            .iter()
+            .find(|e| e.kind == boss_jobs::events::STEP_UPDATED)
+            .cloned()
+            .expect("a claim records jobs.step.updated");
+        assert_eq!(
+            fact.payload[boss_jobs::events::EXECUTOR_KIND_KEY],
+            "robot",
+            "registered agent {who} claiming for itself: {}",
+            fact.payload
+        );
+        recorded.push((who, job, step, fact));
+    }
+
+    // Fold the two claims: the canonical one with its recorded kind
+    // removed (so the history derives it from the id), the login one as
+    // recorded.
+    let mut facts = Vec::new();
+    for (seq, (who, job, _, fact)) in (1_i64..).step_by(2).zip(&recorded) {
+        let mut payload = fact.payload.clone();
+        if *who == AGENT
+            && let Some(body) = payload.as_object_mut()
+        {
+            body.remove(boss_jobs::events::EXECUTOR_KIND_KEY);
+        }
+        for (seq, kind, payload) in [
+            (seq, "jobs.job.created", serde_json::to_value(job).unwrap()),
+            (seq + 1, fact.kind.as_str(), payload),
+        ] {
+            let event = boss_core::event::Event::new("jobs", kind, payload, fact.timestamp);
+            facts.push(SequencedFact {
+                seq,
+                recorded_at: fact.timestamp,
+                event_id: event.id,
+                event_at: event.timestamp,
+                source: event.source,
+                kind: event.kind,
+                payload: serde_json::to_string(&event.payload).unwrap(),
+                original_group: None,
+            });
+        }
+    }
+    let at = recorded
+        .iter()
+        .map(|(_, _, _, f)| f.timestamp)
+        .max()
+        .unwrap();
+    let history = InMemoryClaimsHistory::default();
+    history
+        .materialize(&HistoryBatch {
+            through: facts.len() as i64,
+            through_at: at,
+            facts,
+        })
+        .await
+        .unwrap();
+    let wire = serde_json::to_value(history.read(None, 24, at).await.unwrap()).unwrap();
+    let claim_of = |step: &Step| {
+        wire["claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["step_id"] == step.id.to_string())
+            .cloned()
+            .unwrap_or_else(|| panic!("no open claim for {}: {wire:#}", step.id))
+    };
+    let derived = claim_of(&recorded[0].2);
+    assert_eq!(
+        derived["executor_kind_basis"], "derived-from-id",
+        "{derived}"
+    );
+    let login = claim_of(&recorded[1].2);
+    assert_eq!(login["executor_kind_basis"], "recorded", "{login}");
+    for (who, _, step, fact) in &recorded {
+        assert_eq!(
+            fact.payload[boss_jobs::events::EXECUTOR_KIND_KEY],
+            derived["executor_kind"],
+            "{who}'s recorded kind differs from the fold's derived kind for the same executor"
+        );
+        if *who == AGENT_LOGIN {
+            assert_eq!(claim_of(step)["executor_kind"], derived["executor_kind"]);
+        }
+    }
+}
+
 /// S2: a nominee neither the roster nor the agents registry knows is
 /// refused, with nothing reserved or stored.
 #[tokio::test]

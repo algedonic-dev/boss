@@ -291,3 +291,121 @@ fn the_estate_page_asks_for_a_short_lived_certificate() {
         "{DOOR_DATA} must carry the ssh-config command with --short-lived-cert"
     );
 }
+
+/// The sshd_config the boot path renders: the body of its
+/// `cat > /work/ssh/sshd_config <<'SD'` heredoc, as `(keyword, value)`
+/// pairs with the keyword lowercased, because sshd reads keywords
+/// case-insensitively and so must this.
+fn rendered_sshd_config(manifest: &str) -> Vec<(String, String)> {
+    manifest
+        .lines()
+        .skip_while(|l| !l.trim_end().ends_with("cat > /work/ssh/sshd_config <<'SD'"))
+        .skip(1)
+        .map(str::trim)
+        .take_while(|l| *l != "SD")
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let (k, v) = l.split_once(char::is_whitespace).unwrap_or((l, ""));
+            (k.to_ascii_lowercase(), v.trim().to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn the_door_keeps_a_session_alive_and_logs_why_each_one_ended() {
+    // Backlog 98c6514e, David 2026-11-02: trouble keeping SSH to the dev
+    // pod. Measured by the conductor on the live pod: the config set no
+    // ClientAliveInterval (OpenSSH's default 0: the server sends nothing
+    // on an idle session), so an idle session carried no traffic across
+    // WireGuard, the LB and node NAT, and every one of David's sessions
+    // ended "disconnected by user" — the client gave up. 30 s x 4 keeps
+    // the session alive and reaps a dead client within two minutes.
+    // sshd takes the FIRST value of a repeated keyword, so each is
+    // spelled exactly once: a second line below the first changes
+    // nothing while reading as though it did.
+    let m = read("infra/cluster/manifests/boss-dev.yaml");
+    let config = rendered_sshd_config(&m);
+    assert!(
+        config
+            .iter()
+            .any(|(k, v)| k == "hostkey" && v == "/work/ssh/ssh_host_ed25519_key"),
+        "the parser must find the rendered sshd_config heredoc (found {config:?})"
+    );
+    let value = |keyword: &str| -> String {
+        let found: Vec<&String> = config
+            .iter()
+            .filter(|(k, _)| k == &keyword.to_ascii_lowercase())
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "{keyword} must appear exactly once in the rendered sshd_config (found {found:?})"
+        );
+        found[0].clone()
+    };
+    let interval: u32 = value("ClientAliveInterval")
+        .parse()
+        .expect("ClientAliveInterval is seconds");
+    let count: u32 = value("ClientAliveCountMax")
+        .parse()
+        .expect("ClientAliveCountMax is a count");
+    assert_eq!(
+        (interval, count),
+        (30, 4),
+        "the door probes the client every 30 s and reaps it after 4 unanswered probes"
+    );
+    assert!(
+        interval > 0 && interval * count <= 120,
+        "a dead client must be detected within about two minutes"
+    );
+    // The REASON is already logged: measured on the live pod 2026-11-02
+    // (131,495 lines of /work/ssh/sshd.log at LogLevel INFO), every
+    // session end is "Received disconnect ... 11: disconnected by user",
+    // "Disconnected from user ...", or a reaped client's "Timeout,
+    // client not responding". What INFO lacks is a TIMESTAMP — sshd -E
+    // writes none — so session lengths could not be read from it.
+    assert_eq!(
+        value("LogLevel"),
+        "INFO",
+        "INFO already names why each session ended; a louder level adds bytes, not reasons"
+    );
+    // The timestamp comes from a reader the boot path starts beside sshd:
+    // it follows sshd's own log by name and copies each session-end line
+    // to /work/ssh/sessions.log with the UTC time it was observed. It
+    // never sits between sshd and its log (a FIFO reader that died would
+    // block sshd's next log write), and it skips the LoadBalancer health
+    // check's preauth closes, which were 33,103 of those lines.
+    let reader = m
+        .find("tail -n 0 -F /work/ssh/sshd.log")
+        .expect("the boot path must follow sshd's log by name to timestamp session ends");
+    let sshd = m
+        .find("/usr/sbin/sshd -f /work/ssh/sshd_config -E /work/ssh/sshd.log")
+        .expect("the sshd invocation");
+    assert!(
+        reader > sshd,
+        "the session-end reader starts after sshd, so a refused start is still judged by sshd's own exit"
+    );
+    let block = &m[reader..];
+    let block = &block[..block
+        .find("sessions.log")
+        .expect("the reader writes /work/ssh/sessions.log")
+        + "sessions.log".len()];
+    for needed in [
+        "Received disconnect",
+        "Timeout, client not responding",
+        "Disconnected from",
+        "[preauth]",
+        "date -u",
+        "/work/ssh/sessions.log",
+    ] {
+        assert!(
+            block.contains(needed),
+            "the session-end reader must mention {needed:?} between its tail and its log: {block}"
+        );
+    }
+    assert!(
+        m.contains("ssh door: session ends are timestamped in /work/ssh/sessions.log"),
+        "the boot log says the reader started"
+    );
+}

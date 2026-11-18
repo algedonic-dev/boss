@@ -414,6 +414,7 @@ pub(crate) async fn bootstrap_email(
 /// is minted.
 pub(crate) async fn session_role(
     audit: &crate::audit::AuthAudit,
+    classes_timeout: std::time::Duration,
     method: crate::audit::AuthMethod,
     idp: Option<&str>,
     email: &str,
@@ -427,7 +428,8 @@ pub(crate) async fn session_role(
         None => {
             let url =
                 std::env::var("BOSS_CLASSES_URL").unwrap_or_else(|_| boss_ports::url("classes"));
-            let classes = boss_classes_client::ReqwestClassesClient::new(url);
+            let classes =
+                boss_classes_client::ReqwestClassesClient::with_timeout(url, classes_timeout);
             let class_ref = boss_core::primitives::ClassRef::new("employee", row_role);
             match classes.class_exists_on(&class_ref, "role").await {
                 Ok(registered) => employee_session_role(row_role, registered),
@@ -511,6 +513,14 @@ pub struct LocalAuthState {
     /// stamped with the machine token, redirects off (design 6805c764
     /// car 2, review S2: this lookup sent no token at all).
     pub machine: crate::machine_client::MachineClient,
+    /// How long a login waits on the Class registry for whether the
+    /// row's role is live ([`session_role`]) before refusing it 503.
+    /// Production passes `boss_core::http_client::CLIENT_TIMEOUT`, the
+    /// timeout every registry client has; it is state so a test of the
+    /// login owns the clock it waits on instead of the gate drive's
+    /// (backlog ac3a347c: on gate 1f46ec58 a loopback double answered
+    /// past 5 s and the role test read 503 as the login's answer).
+    pub classes_timeout: std::time::Duration,
     /// Auth events for the edge (docs/architecture-decisions.md
     /// §Policy & auth). Always
     /// present; a deployment without the staging pool carries the
@@ -690,6 +700,7 @@ pub async fn login(
     };
     let role = match session_role(
         &state.audit,
+        state.classes_timeout,
         crate::audit::AuthMethod::Password,
         None,
         &email,
@@ -1199,6 +1210,7 @@ mod tests {
             http: reqwest::Client::new(),
             machine: crate::machine_client::MachineClient::unstamped(reqwest::Client::builder())
                 .unwrap(),
+            classes_timeout: crate::login_doubles::UPSTREAM_TIMEOUT,
             audit: crate::audit::AuthAudit::disabled(),
             guest_access: GuestAccess::Off,
             oidc: None,
@@ -1307,6 +1319,7 @@ mod tests {
             http: reqwest::Client::new(),
             machine: crate::machine_client::MachineClient::unstamped(reqwest::Client::builder())
                 .unwrap(),
+            classes_timeout: crate::login_doubles::UPSTREAM_TIMEOUT,
             audit: crate::audit::AuthAudit::disabled(),
             guest_access: access,
             oidc: None,
@@ -1339,6 +1352,7 @@ mod tests {
             http: reqwest::Client::new(),
             machine: crate::machine_client::MachineClient::unstamped(reqwest::Client::builder())
                 .unwrap(),
+            classes_timeout: crate::login_doubles::UPSTREAM_TIMEOUT,
             audit: crate::audit::AuthAudit::spawn(cap.clone()),
             guest_access: GuestAccess::Off,
             oidc: None,
@@ -1378,23 +1392,39 @@ mod tests {
     // ----------------------------------------------------------------
 
     use crate::login_doubles::{
-        CLASSES_VAR, PEOPLE_VAR, UpstreamEnv, asked, mock_classes, mock_people_as,
+        CLASSES_VAR, PEOPLE_VAR, UPSTREAM_TIMEOUT, UpstreamEnv, asked, mock_classes,
+        mock_classes_after, mock_people_as,
     };
 
-    /// What one password login left behind.
+    /// What one password login left behind. `body` is what the login
+    /// answered in words, so an assertion on `status` can print why
+    /// (backlog ac3a347c: gate 1f46ec58's red said only `left: 503`).
     struct PasswordLogin {
         status: StatusCode,
+        body: String,
         sess: Option<Session>,
         events: Vec<boss_core::event::Event>,
     }
 
     /// Sign `op@example.com` in by password, its people row carrying
     /// `row_role` and the registry at `classes`, with the upstream
-    /// addresses held by `env` until it drops.
+    /// addresses held by `env` until it drops. The login waits on the
+    /// registry for the test's own [`UPSTREAM_TIMEOUT`], never the
+    /// drive's.
     async fn password_login_with_row_role(
         env: &mut UpstreamEnv,
         row_role: &'static str,
         classes: &str,
+    ) -> PasswordLogin {
+        password_login_waiting(env, row_role, classes, UPSTREAM_TIMEOUT).await
+    }
+
+    /// [`password_login_with_row_role`] with the registry wait given.
+    async fn password_login_waiting(
+        env: &mut UpstreamEnv,
+        row_role: &'static str,
+        classes: &str,
+        classes_timeout: std::time::Duration,
     ) -> PasswordLogin {
         let people = mock_people_as(row_role).await;
         env.set(PEOPLE_VAR, &people);
@@ -1413,6 +1443,7 @@ mod tests {
             http: reqwest::Client::new(),
             machine: crate::machine_client::MachineClient::unstamped(reqwest::Client::builder())
                 .unwrap(),
+            classes_timeout,
             audit: crate::audit::AuthAudit::spawn(cap.clone()),
             guest_access: GuestAccess::Off,
             oidc: None,
@@ -1434,9 +1465,14 @@ mod tests {
             .get(header::SET_COOKIE)
             .map(|_| cookie_value(&resp))
             .and_then(|v| Session::decode(&v, &st.session_key).ok());
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_else(|e| format!("(body unread: {e})"));
         let events = crate::audit::testing::drain(&cap, 1).await;
         PasswordLogin {
             status,
+            body,
             sess,
             events,
         }
@@ -1451,7 +1487,12 @@ mod tests {
         let mut env = UpstreamEnv::lock().await;
         let (classes, counter) = mock_classes(Some(vec![("role", "quartermaster")])).await;
         let got = password_login_with_row_role(&mut env, "quartermaster", &classes).await;
-        assert_eq!(got.status, StatusCode::OK);
+        assert_eq!(
+            got.status,
+            StatusCode::OK,
+            "the login answered: {}",
+            got.body
+        );
         let sess = got.sess.expect("a session is minted");
         assert_eq!(sess.username, "op@example.com", "email lowercased");
         assert_eq!(sess.employee_id.as_deref(), Some("emp-op"));
@@ -1472,7 +1513,12 @@ mod tests {
         let mut env = UpstreamEnv::lock().await;
         let (classes, _) = mock_classes(Some(vec![("department", "quartermaster")])).await;
         let got = password_login_with_row_role(&mut env, "quartermaster", &classes).await;
-        assert_eq!(got.status, StatusCode::OK);
+        assert_eq!(
+            got.status,
+            StatusCode::OK,
+            "the login answered: {}",
+            got.body
+        );
         let sess = got.sess.expect("a session is minted");
         assert_eq!(sess.role.as_deref(), Some(boss_core::roles::VISITOR_ROLE));
         assert_eq!(
@@ -1493,7 +1539,12 @@ mod tests {
         let mut env = UpstreamEnv::lock().await;
         let (classes, counter) = mock_classes(Some(vec![("role", "break-glass")])).await;
         let got = password_login_with_row_role(&mut env, "break-glass", &classes).await;
-        assert_eq!(got.status, StatusCode::OK);
+        assert_eq!(
+            got.status,
+            StatusCode::OK,
+            "the login answered: {}",
+            got.body
+        );
         let sess = got.sess.expect("a session is minted");
         assert_eq!(sess.role.as_deref(), Some(boss_core::roles::VISITOR_ROLE));
         assert!(!boss_core::roles::can_administer_auth(
@@ -1513,7 +1564,12 @@ mod tests {
         let mut env = UpstreamEnv::lock().await;
         let (classes, counter) = mock_classes(None).await;
         let got = password_login_with_row_role(&mut env, "platform-admin", &classes).await;
-        assert_eq!(got.status, StatusCode::OK);
+        assert_eq!(
+            got.status,
+            StatusCode::OK,
+            "the login answered: {}",
+            got.body
+        );
         assert_eq!(
             got.sess.expect("minted").role.as_deref(),
             Some(boss_core::roles::PLATFORM_ADMIN_ROLE)
@@ -1531,7 +1587,12 @@ mod tests {
         let mut env = UpstreamEnv::lock().await;
         let (classes, counter) = mock_classes(None).await;
         let got = password_login_with_row_role(&mut env, "quartermaster", &classes).await;
-        assert_eq!(got.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            got.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the login answered: {}",
+            got.body
+        );
         assert!(got.sess.is_none(), "no session is minted");
         assert!(asked(&counter) > 0);
         assert_eq!(got.events.len(), 1, "{:?}", got.events);
@@ -1541,6 +1602,45 @@ mod tests {
         assert_eq!(e.payload["method"], "password");
         assert_eq!(e.payload["email_claimed"], "op@example.com");
         assert!(e.payload.get("employee_id").is_none());
+    }
+
+    /// Backlog ac3a347c: the registry wait is the state's
+    /// `classes_timeout` and nothing else's. A registry slower than it
+    /// is refused 503, and the refusal names the registry, so a test
+    /// that sets a generous one (every other test here, through
+    /// [`UPSTREAM_TIMEOUT`]) owns the clock its 200 depends on. Until
+    /// this the wait was `CLIENT_TIMEOUT`'s 5 s, built inside
+    /// `session_role`, and on gate 1f46ec58 a loaded drive spent it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_registry_wait_is_the_states_classes_timeout() {
+        let mut env = UpstreamEnv::lock().await;
+        let slow = std::time::Duration::from_millis(1500);
+        let (classes, counter) =
+            mock_classes_after(Some(vec![("role", "quartermaster")]), slow).await;
+
+        let short = std::time::Duration::from_millis(100);
+        let got = password_login_waiting(&mut env, "quartermaster", &classes, short).await;
+        assert_eq!(
+            got.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a {short:?} wait on a {slow:?} registry must refuse; the login answered: {}",
+            got.body
+        );
+        assert!(
+            got.body.contains("Class registry could not confirm"),
+            "the refusal names the registry: {}",
+            got.body
+        );
+        assert!(asked(&counter) > 0);
+
+        let got =
+            password_login_waiting(&mut env, "quartermaster", &classes, UPSTREAM_TIMEOUT).await;
+        assert_eq!(
+            got.status,
+            StatusCode::OK,
+            "the same {slow:?} registry inside the state's wait mints; the login answered: {}",
+            got.body
+        );
     }
 
     /// Q2: the guest mint is an unauthenticated capability; counting
@@ -1555,6 +1655,7 @@ mod tests {
             http: reqwest::Client::new(),
             machine: crate::machine_client::MachineClient::unstamped(reqwest::Client::builder())
                 .unwrap(),
+            classes_timeout: crate::login_doubles::UPSTREAM_TIMEOUT,
             audit: crate::audit::AuthAudit::spawn(cap.clone()),
             guest_access: GuestAccess::Basic,
             oidc: None,
@@ -1849,6 +1950,7 @@ mod tests {
             http: reqwest::Client::new(),
             machine: crate::machine_client::MachineClient::unstamped(reqwest::Client::builder())
                 .unwrap(),
+            classes_timeout: crate::login_doubles::UPSTREAM_TIMEOUT,
             audit: crate::audit::AuthAudit::disabled(),
             guest_access: access,
             oidc: None,
@@ -2030,6 +2132,7 @@ mod tests {
             http: reqwest::Client::new(),
             machine: crate::machine_client::MachineClient::unstamped(reqwest::Client::builder())
                 .unwrap(),
+            classes_timeout: crate::login_doubles::UPSTREAM_TIMEOUT,
             audit: crate::audit::AuthAudit::spawn(rec.clone()),
             guest_access: GuestAccess::Off,
             oidc: None,

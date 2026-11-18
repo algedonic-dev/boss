@@ -62,19 +62,46 @@ struct Live {
     /// spec as a block string (the only way two documents fit under one
     /// `spec:` key) — the other shape find_configs was written to read.
     gate_volume: Option<&'static str>,
+    /// The `scratch` UserVolumeConfig document, by its disk selector
+    /// (design 3c475a19 car 2, backlog 46328c3a): w-1's Kingston as the
+    /// Longhorn scratch disk. Printed after the gate volume.
+    scratch_volume: Option<&'static str>,
+    /// `machine.nodeAnnotations` carrying the Longhorn tag annotation
+    /// (backlog e14a472d): the node's disks may hold a dev-build
+    /// worker's replica.
+    longhorn_tag: bool,
 }
+
+/// The Longhorn tag every worker declares, as Talos prints the
+/// annotation: a JSON list in a single-quoted YAML string.
+const LONGHORN_TAG_LINE: &str = r#"node.longhorn.io/default-node-tags: '["dev-build"]'"#;
 
 /// The selector design 8457c07b decided for the gate disk: never a
 /// serial or a kernel name, because adding a disk renumbered the forge's
-/// devices on 2026-09-21.
-const GATE_SELECTOR: &str = r#"!system_disk && disk.transport == "nvme" && disk.size > 500u * GB"#;
+/// devices on 2026-09-21. The fourth term (design 121f44a1, backlog
+/// 88b35891) keeps the Kingston SNV3S1000G out by MODEL, so a volume
+/// provisioned anew lands on a Micron and never again on the budget
+/// drive that bottlenecked the gates.
+const GATE_SELECTOR: &str = r#"!system_disk && disk.transport == "nvme" && disk.size > 500u * GB && disk.model != "KINGSTON SNV3S1000G""#;
+
+/// The selector design 3c475a19 car 2 gives the scratch volume (backlog
+/// 46328c3a): the one disk the gate selector's fourth term refuses, by
+/// the same model string, so exactly one of the two volumes can take
+/// the Kingston and neither can take the other's disk.
+const SCRATCH_SELECTOR: &str =
+    r#"!system_disk && disk.transport == "nvme" && disk.model == "KINGSTON SNV3S1000G""#;
 
 /// The `gate` user volume as a second config document, at column 0.
 fn gate_volume_doc(selector: &str) -> String {
+    user_volume_doc("gate", selector)
+}
+
+/// One user volume document as w-1 declares them, at column 0.
+fn user_volume_doc(name: &str, selector: &str) -> String {
     format!(
         "apiVersion: v1alpha1\n\
          kind: UserVolumeConfig\n\
-         name: gate\n\
+         name: {name}\n\
          provisioning:\n\
          \x20   diskSelector:\n\
          \x20       match: '{selector}'\n\
@@ -186,6 +213,10 @@ fn machine_section(live: &Live) -> String {
              \x20                       - http://10.20.0.15:3000\n",
         );
     }
+    if live.longhorn_tag {
+        s.push_str("        nodeAnnotations:\n");
+        s.push_str(&format!("            {LONGHORN_TAG_LINE}\n"));
+    }
     s.push_str("        features:\n");
     s.push_str("            rbac: true\n");
     s.push_str("            stableHostname: true\n");
@@ -200,8 +231,12 @@ fn raw_config(live: &Live) -> String {
         .lines()
         .map(|l| format!("{}\n", l.strip_prefix("    ").unwrap_or(l)))
         .collect();
-    match live.gate_volume {
+    let body = match live.gate_volume {
         Some(sel) => format!("{body}---\n{}", gate_volume_doc(sel)),
+        None => body,
+    };
+    match live.scratch_volume {
+        Some(sel) => format!("{body}---\n{}", user_volume_doc("scratch", sel)),
         None => body,
     }
 }
@@ -212,7 +247,7 @@ fn raw_config(live: &Live) -> String {
 /// its spec as a mapping; a multi-document one (a user volume beside
 /// v1alpha1) as a block string holding every document.
 fn resource(node_ip: &str, id: &str, live: &Live) -> String {
-    let spec = if live.gate_volume.is_some() {
+    let spec = if live.gate_volume.is_some() || live.scratch_volume.is_some() {
         format!("spec: |\n{}", indent(&raw_config(live), 4))
     } else {
         format!("spec:\n{}", config_body(live))
@@ -280,18 +315,57 @@ fn w1_as_found() -> Live {
         other_mount: false,
         gate_mount: false,
         gate_volume: None,
+        scratch_volume: None,
+        longhorn_tag: false,
     }
 }
 
 /// w-1 as its declaration says it should be once David has applied the
-/// gate volume (52ea56ac) and removed the doubled seed file entry. No
-/// /var/mnt/gate kubelet mount: review a79746c6 withdrew it.
+/// gate volume (52ea56ac), the image-GC pair (67e98635) and removed the
+/// doubled seed file entry. No /var/mnt/gate kubelet mount: review
+/// a79746c6 withdrew it. The Longhorn tag (e14a472d) is declared too,
+/// and the Kingston's scratch volume (46328c3a).
 fn w1_as_declared() -> Live {
     Live {
         seed_file_copies: 1,
+        image_gc: Some((50, 40)),
         gate_volume: Some(GATE_SELECTOR),
+        scratch_volume: Some(SCRATCH_SELECTOR),
+        longhorn_tag: true,
         ..w1_as_found()
     }
+}
+
+/// w-1 as it stood on 2026-10-19 when its Longhorn disk fell under the
+/// scheduling floor (backlog 67e98635): the gate volume applied, the
+/// seed file entry still doubled as far as anything has read, and NO
+/// image-GC pair, so the kubelet ran its 85% default.
+fn w1_before_the_gc_pair() -> Live {
+    Live {
+        gate_volume: Some(GATE_SELECTOR),
+        // Not live on 2026-10-19 either — declared later, for e14a472d
+        // and 46328c3a — and set here so each case on this fixture
+        // isolates the GC pair.
+        scratch_volume: Some(SCRATCH_SELECTOR),
+        longhorn_tag: true,
+        ..w1_as_found()
+    }
+}
+
+/// The image-GC pair a declaration carries, read off its text.
+fn gc_pair(body: &str, node: &str) -> (u32, u32) {
+    let pct = |key: &str| -> u32 {
+        let prefix = format!("{key}: ");
+        body.lines()
+            .find_map(|l| l.trim().strip_prefix(prefix.as_str()))
+            .unwrap_or_else(|| panic!("{node}.yaml declares {key}:\n{body}"))
+            .parse()
+            .unwrap()
+    };
+    (
+        pct("imageGCHighThresholdPercent"),
+        pct("imageGCLowThresholdPercent"),
+    )
 }
 
 fn run(args: &[&str], stdin: &str, patches: Option<&Path>, path_env: Option<&Path>) -> Output {
@@ -380,12 +454,16 @@ fn w1_deduped_equals_the_declaration_and_exits_0() {
     );
     assert_eq!(
         lines_with(&out, "MATCH").len(),
-        4,
-        "file, the seed mount, mirror, the gate volume:\n{t}"
+        8,
+        "file, the seed mount, the two GC keys, mirror, the Longhorn tag, the gate and scratch volumes:\n{t}"
     );
     assert!(
         t.contains("MATCH      UserVolumeConfig[gate]"),
         "the user volume is read out of the multi-document spec:\n{t}"
+    );
+    assert!(
+        t.contains("MATCH      UserVolumeConfig[scratch]"),
+        "and the third document beside it:\n{t}"
     );
     for v in ["DRIFT", "ABSENT", "DOUBLED", "UNDECLARED"] {
         assert!(lines_with(&out, v).is_empty(), "no {v} expected:\n{t}");
@@ -401,8 +479,9 @@ fn the_stored_config_reads_like_the_resource_and_finds_the_gate_volume() {
     let out = run(&["w-1"], &raw_config(&w1_as_declared()), None, None);
     let t = text(&out);
     assert_eq!(code(&out), 0, "{t}");
-    assert_eq!(lines_with(&out, "MATCH").len(), 4, "{t}");
+    assert_eq!(lines_with(&out, "MATCH").len(), 8, "{t}");
     assert!(t.contains("MATCH      UserVolumeConfig[gate]"), "{t}");
+    assert!(t.contains("MATCH      UserVolumeConfig[scratch]"), "{t}");
     assert!(t.contains("id=(raw)"), "says which document it read:\n{t}");
 }
 
@@ -424,8 +503,48 @@ fn before_the_apply_the_gate_volume_reads_absent() {
             .any(|l| l.contains("UserVolumeConfig[gate]") && l.contains("500u * GB")),
         "ABSENT prints the declared document:\n{t}"
     );
-    assert_eq!(lines_with(&out, "MATCH").len(), 3, "{t}");
+    assert_eq!(lines_with(&out, "MATCH").len(), 7, "{t}");
     assert_eq!(code(&out), 1, "{t}");
+}
+
+/// The state the scratch-disk car lands in (backlog 46328c3a): w-1 as
+/// it runs today, everything applied but the Kingston's `scratch`
+/// volume, reads that one document ABSENT — and `--absent` narrows the
+/// patch node-converge applies to it alone, so the converge adds the
+/// volume and touches nothing live.
+#[test]
+fn before_its_converge_the_scratch_volume_reads_absent_and_narrows_to_itself() {
+    let live = Live {
+        scratch_volume: None,
+        ..w1_as_declared()
+    };
+    let out = run(&["w-1"], &live_yaml("10.20.0.14", &live), None, None);
+    let t = text(&out);
+    let absent = lines_with(&out, "ABSENT");
+    assert_eq!(absent.len(), 1, "{t}");
+    assert!(
+        absent[0].contains("UserVolumeConfig[scratch]")
+            && absent[0].contains("KINGSTON SNV3S1000G"),
+        "ABSENT prints the declared document:\n{t}"
+    );
+    assert_eq!(lines_with(&out, "MATCH").len(), 7, "{t}");
+    assert_eq!(code(&out), 1, "{t}");
+
+    let out = run(
+        &["--absent", "w-1"],
+        &live_yaml("10.20.0.14", &live),
+        None,
+        None,
+    );
+    let t = text(&out);
+    assert_eq!(code(&out), 0, "{t}");
+    let frag = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        frag.starts_with("apiVersion: v1alpha1\nkind: UserVolumeConfig\nname: scratch\n"),
+        "the scratch document, first and alone:\n{frag}"
+    );
+    assert!(!frag.contains("name: gate"), "{frag}");
+    assert!(!frag.contains("machine:"), "{frag}");
 }
 
 /// A /var/mnt/gate kubelet mount found live — the withdrawn entry,
@@ -625,20 +744,326 @@ fn w2_declares_an_image_gc_pair_that_fires_before_longhorns_floor() {
     let out = run(&["w-2"], &live_yaml("10.20.0.16", &before), None, None);
     let t = text(&out);
     assert_eq!(code(&out), 1, "not applied yet: {t}");
-    assert_eq!(lines_with(&out, "ABSENT").len(), 2, "both GC keys:\n{t}");
+    let absent = lines_with(&out, "ABSENT");
+    assert_eq!(absent.len(), 3, "both GC keys and the Longhorn tag:\n{t}");
+    assert!(
+        absent
+            .iter()
+            .any(|l| l.contains("machine.nodeAnnotations.node.longhorn.io/default-node-tags")),
+        "the Longhorn tag is a declared entry read like any other:\n{t}"
+    );
     let after = Live {
         image_gc: Some((50, 40)),
+        longhorn_tag: true,
         ..before
     };
     let out = run(&["w-2"], &live_yaml("10.20.0.16", &after), None, None);
     let t = text(&out);
     assert_eq!(code(&out), 0, "applied: {t}");
-    assert_eq!(lines_with(&out, "MATCH").len(), 2, "both GC keys:\n{t}");
+    assert_eq!(
+        lines_with(&out, "MATCH").len(),
+        3,
+        "both GC keys and the tag:\n{t}"
+    );
     let undeclared = lines_with(&out, "UNDECLARED");
     assert!(
         undeclared.len() == 1 && undeclared[0].contains("10.20.0.15:3000"),
         "the live mirror is reported, never failed:\n{t}"
     );
+}
+
+/// w-1's Longhorn disk fell under its scheduling floor on 2026-10-19
+/// (backlog 67e98635; ops-request c4331d4a, node-disk-usage w-1 at
+/// 14:56Z): 231.2 GiB available of 928.9 against Longhorn's 25%
+/// minimal-available floor of 232.2, imagefs 535.2 GiB used, and no
+/// image-GC pair declared, so the kubelet's default 85% line lay past
+/// Longhorn's 75%-used refusal and never fired. Every new worker volume
+/// provisioned and never got a replica. The pair is w-2's and cp-1's —
+/// the one that holds w-2 at 44.6% used today (ops-request 9984007c) —
+/// and the check reads it ABSENT on w-1 as it stands, MATCH once applied.
+#[test]
+fn w1_declares_an_image_gc_pair_that_fires_before_longhorns_floor() {
+    let body = std::fs::read_to_string(patches_dir().join("w-1.yaml")).unwrap();
+    let (high, low) = gc_pair(&body, "w-1");
+    assert!(high < 75, "GC starts at {high}% used, past Longhorn's 75%");
+    assert!(low < high, "GC frees to {low}%, below its {high}% start");
+    let w2 = std::fs::read_to_string(patches_dir().join("w-2.yaml")).unwrap();
+    assert_eq!(
+        (high, low),
+        gc_pair(&w2, "w-2"),
+        "one worker pair, not a third"
+    );
+
+    let out = run(
+        &["w-1"],
+        &live_yaml("10.20.0.14", &w1_before_the_gc_pair()),
+        None,
+        None,
+    );
+    let t = text(&out);
+    let absent = lines_with(&out, "ABSENT");
+    assert_eq!(absent.len(), 2, "both GC keys, nothing else:\n{t}");
+    assert!(
+        absent.iter().all(|l| l.contains("imageGC")),
+        "only the GC pair is absent:\n{t}"
+    );
+    let out = run(
+        &["w-1"],
+        &live_yaml("10.20.0.14", &w1_as_declared()),
+        None,
+        None,
+    );
+    assert_eq!(code(&out), 0, "applied and de-duplicated: {}", text(&out));
+}
+
+/// THE NARROWED PATCH (backlog 9cf1673d's first half, built for
+/// 67e98635). Talos's merge appends list entries it cannot key, so a
+/// declaration whose list entries are already live cannot be re-applied
+/// whole — w-1's, the node whose Longhorn floor stopped dev isolation.
+/// `--absent` prints the declaration narrowed to the entries ABSENT live,
+/// re-emitted in canonical form from the DECLARED values (never a live
+/// one), and node-converge applies exactly that.
+#[test]
+fn absent_prints_only_the_declared_entries_absent_live_in_canonical_form() {
+    // w-1's own declaration against w-1 as it stood: the doubled seed
+    // file, the mount, the mirror and the gate volume are live; the
+    // GC pair is what is missing, and the whole of what is printed.
+    let out = run(
+        &["--absent", "w-1"],
+        &live_yaml("10.20.0.14", &w1_before_the_gc_pair()),
+        None,
+        None,
+    );
+    let t = text(&out);
+    assert_eq!(code(&out), 0, "{t}");
+    let body = std::fs::read_to_string(patches_dir().join("w-1.yaml")).unwrap();
+    let (high, low) = gc_pair(&body, "w-1");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            "machine:\n  kubelet:\n    extraConfig:\n      imageGCHighThresholdPercent: {high}\n      imageGCLowThresholdPercent: {low}\n"
+        ),
+        "exactly the absent entries, canonical:\n{t}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .all(|l| l.starts_with("read ")),
+        "stderr carries the read line and no verdict: {t}"
+    );
+
+    // Several classes absent at once, a user volume among them: each is
+    // printed under its own path, the volume as its own document, and
+    // the printed fragment is itself a canonical declaration.
+    let live = Live {
+        hostname: Some("w-1"),
+        mirror: true,
+        ..Live::default()
+    };
+    let out = run(
+        &["--absent", "w-1"],
+        &live_yaml("10.20.0.14", &live),
+        None,
+        None,
+    );
+    let t = text(&out);
+    assert_eq!(code(&out), 0, "{t}");
+    let frag = String::from_utf8_lossy(&out.stdout).to_string();
+    for want in [
+        "  files:\n    - content: |\n",
+        "      path: /var/local/gate-seed/.declared-by-talos\n",
+        "    extraMounts:\n      - destination: /var/local/gate-seed\n",
+        "    extraConfig:\n      imageGCHighThresholdPercent: ",
+        "  nodeAnnotations:\n    node.longhorn.io/default-node-tags: '[\"dev-build\"]'\n",
+        "\n---\napiVersion: v1alpha1\nkind: UserVolumeConfig\nname: gate\n",
+        "\n---\napiVersion: v1alpha1\nkind: UserVolumeConfig\nname: scratch\n",
+    ] {
+        assert!(
+            frag.contains(want),
+            "the fragment carries {want:?}:\n{frag}"
+        );
+    }
+    assert!(
+        !frag.contains("10.20.0.15:3000"),
+        "the live mirror is not re-applied:\n{frag}"
+    );
+    assert!(
+        !frag.contains("REDACTED") && !frag.contains("hostname"),
+        "no live value:\n{frag}"
+    );
+    let dir = scratch("absent-fragment");
+    let patches = dir.join("patches");
+    std::fs::create_dir_all(&patches).unwrap();
+    std::fs::write(patches.join("w-1.yaml"), &frag).unwrap();
+    let classes = run(&["--only-read-classes", "w-1"], "", Some(&patches), None);
+    assert_eq!(
+        code(&classes),
+        0,
+        "the fragment is a declaration a converge may apply: {}",
+        text(&classes)
+    );
+    let narrowed = run(
+        &["w-1"],
+        &live_yaml("10.20.0.14", &live),
+        Some(&patches),
+        None,
+    );
+    assert!(
+        lines_with(&narrowed, "MATCH").is_empty() && lines_with(&narrowed, "ABSENT").len() == 7,
+        "read against the same node, every entry of the fragment is ABSENT: {}",
+        text(&narrowed)
+    );
+
+    // Nothing absent — every entry live, the seed file still doubled:
+    // nothing to narrow to, said, and nothing printed.
+    let none = run(
+        &["--absent", "w-1"],
+        &live_yaml(
+            "10.20.0.14",
+            &Live {
+                seed_file_copies: 2,
+                ..w1_as_declared()
+            },
+        ),
+        None,
+        None,
+    );
+    assert_eq!(code(&none), 4, "{}", text(&none));
+    assert!(none.stdout.is_empty(), "{}", text(&none));
+    assert!(text(&none).contains("ABSENT"), "says why: {}", text(&none));
+
+    // A DRIFT is not absent: it is left out, and the caller decides.
+    let drifted = Live {
+        image_gc: Some((85, 80)),
+        ..w1_before_the_gc_pair()
+    };
+    let out = run(
+        &["--absent", "w-1"],
+        &live_yaml("10.20.0.14", &drifted),
+        None,
+        None,
+    );
+    assert_eq!(code(&out), 4, "{}", text(&out));
+
+    // Another node's config is refused, as the comparison refuses it.
+    let out = run(
+        &["--absent", "w-2"],
+        &live_yaml("10.20.0.14", &w1_as_found()),
+        None,
+        None,
+    );
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    assert!(out.stdout.is_empty(), "{}", text(&out));
+}
+
+/// Backlog a93010a1, live 2026-11-07 18:45Z (ops-request 797b0d0d): with
+/// w-1's gate volume retired, every machine entry of its declaration is
+/// live and the volume is the one ABSENT entry, so `--absent` prints the
+/// UserVolumeConfig document ALONE — and re-read, that patch was refused
+/// as "not one machine-config fragment", so node-converge could not
+/// provision the volume the move retired. A narrowed patch (`--narrowed`,
+/// which node-converge passes for the patch it builds) may now be
+/// UserVolumeConfig documents with no machine fragment; a DECLARATION is
+/// still exactly one machine fragment plus volumes.
+#[test]
+fn a_volume_only_narrowing_is_a_narrowed_patch_and_never_a_declaration() {
+    let retired = Live {
+        gate_volume: None,
+        ..w1_as_declared()
+    };
+    let out = run(
+        &["--absent", "w-1"],
+        &live_yaml("10.20.0.14", &retired),
+        None,
+        None,
+    );
+    let t = text(&out);
+    assert_eq!(code(&out), 0, "{t}");
+    let frag = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        frag.starts_with("apiVersion: v1alpha1\nkind: UserVolumeConfig\nname: gate\n"),
+        "the volume document, first and alone:\n{frag}"
+    );
+    assert!(!frag.contains("machine:"), "no machine fragment:\n{frag}");
+    assert!(!frag.contains("---"), "one document:\n{frag}");
+
+    let dir = scratch("volume-only-narrowing");
+    let patches = dir.join("patches");
+    std::fs::create_dir_all(&patches).unwrap();
+    std::fs::write(patches.join("w-1.yaml"), &frag).unwrap();
+
+    // As the narrowed patch node-converge applies: admitted and read back.
+    let classes = run(
+        &["--narrowed", "--only-read-classes", "w-1"],
+        "",
+        Some(&patches),
+        None,
+    );
+    assert_eq!(code(&classes), 0, "{}", text(&classes));
+    let before = run(
+        &["--narrowed", "w-1"],
+        &live_yaml("10.20.0.14", &retired),
+        Some(&patches),
+        None,
+    );
+    assert_eq!(code(&before), 1, "{}", text(&before));
+    let absent = lines_with(&before, "ABSENT");
+    assert_eq!(absent.len(), 1, "{}", text(&before));
+    assert!(
+        absent[0].contains("UserVolumeConfig[gate]"),
+        "{}",
+        text(&before)
+    );
+    assert!(lines_with(&before, "MATCH").is_empty(), "{}", text(&before));
+    let after = run(
+        &["--narrowed", "w-1"],
+        &live_yaml("10.20.0.14", &w1_as_declared()),
+        Some(&patches),
+        None,
+    );
+    assert_eq!(code(&after), 0, "applied, it reads MATCH: {}", text(&after));
+    assert!(
+        text(&after).contains("MATCH      UserVolumeConfig[gate]"),
+        "{}",
+        text(&after)
+    );
+
+    // As a declaration it is still refused: one machine fragment.
+    for args in [&["--only-read-classes", "w-1"][..], &["w-1"][..]] {
+        let o = run(
+            args,
+            &live_yaml("10.20.0.14", &retired),
+            Some(&patches),
+            None,
+        );
+        assert_eq!(code(&o), 2, "{args:?}: {}", text(&o));
+        assert!(
+            text(&o).contains("machine-config fragment"),
+            "{args:?}: {}",
+            text(&o)
+        );
+    }
+
+    // And a narrowed patch is still held to its shape: a kind-less
+    // document, a second machine fragment, or no document at all refuses.
+    for (case, body) in [
+        ("kind-less", "apiVersion: v1alpha1\nname: gate\n".to_string()),
+        (
+            "two-machines",
+            "machine:\n  kubelet:\n    extraConfig:\n      imageGCHighThresholdPercent: 50\n---\nmachine:\n  kubelet:\n    extraConfig:\n      imageGCLowThresholdPercent: 40\n".to_string(),
+        ),
+        ("volume-and-kind-less", format!("{frag}---\napiVersion: v1alpha1\nname: x\n")),
+        ("empty", String::new()),
+    ] {
+        std::fs::write(patches.join("w-1.yaml"), &body).unwrap();
+        let o = run(
+            &["--narrowed", "--only-read-classes", "w-1"],
+            "",
+            Some(&patches),
+            None,
+        );
+        assert_eq!(code(&o), 2, "{case}: {}", text(&o));
+    }
 }
 
 #[test]
@@ -1345,7 +1770,11 @@ fn the_tree_declares_every_node_the_registry_names_as_a_talos_machine() {
 fn w1_declares_the_gate_volume_by_what_the_disk_is() {
     let w1 = std::fs::read_to_string(patches_dir().join("w-1.yaml")).unwrap();
     let docs: Vec<&str> = w1.split("\n---\n").collect();
-    assert_eq!(docs.len(), 2, "the machine fragment and one user volume");
+    assert_eq!(
+        docs.len(),
+        3,
+        "the machine fragment, the gate volume and the scratch volume"
+    );
     let uvc = docs[1];
     assert!(uvc.contains("\nkind: UserVolumeConfig\n"), "{uvc}");
     assert!(uvc.contains("\nname: gate\n"), "mounted at /var/mnt/gate");
@@ -1388,5 +1817,223 @@ fn w1_declares_the_gate_volume_by_what_the_disk_is() {
     assert!(
         local.contains("claimRef: {namespace: boss-dev, name: gate}"),
         "the gate PV is pre-bound to its claim both ways"
+    );
+}
+
+/// THE SCRATCH VOLUME (design 3c475a19 section 4 car 2, backlog
+/// 46328c3a). w-1's Kingston SNV3S1000G, which the gate selector keeps
+/// out by model, is declared as its own xfs user volume `scratch`
+/// (Talos mounts it at /var/mnt/scratch; add-longhorn-disk makes it
+/// Longhorn disk u-scratch). It is chosen by the SAME model string the
+/// gate selector refuses, so the two selectors partition w-1's
+/// non-system NVMe disks: the Kingston only for scratch, every other
+/// disk only for the gate. Like the gate's, never a serial or kernel
+/// name, no kubelet extraMount for its path, and in the selector grammar
+/// node-converge and add-longhorn-disk both demand.
+#[test]
+fn w1_declares_the_scratch_volume_on_the_kingston_alone() {
+    let w1 = std::fs::read_to_string(patches_dir().join("w-1.yaml")).unwrap();
+    let docs: Vec<&str> = w1.split("\n---\n").collect();
+    let scratch = docs
+        .iter()
+        .find(|d| d.contains("\nkind: UserVolumeConfig\n") && d.contains("\nname: scratch\n"))
+        .unwrap_or_else(|| panic!("w-1 declares a `scratch` user volume:\n{w1}"));
+    assert!(
+        scratch.contains(&format!("match: '{SCRATCH_SELECTOR}'")),
+        "the Kingston, by model:\n{scratch}"
+    );
+    assert!(scratch.contains("  type: xfs"), "{scratch}");
+    let model = r#""KINGSTON SNV3S1000G""#;
+    assert!(
+        GATE_SELECTOR.contains(&format!("disk.model != {model}"))
+            && SCRATCH_SELECTOR.contains(&format!("disk.model == {model}")),
+        "one model string: the gate refuses exactly the disk scratch takes"
+    );
+    let fields: String = scratch
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for named in ["/dev/", "serial", "nvme0", "nvme1", "wwid"] {
+        assert!(
+            !fields.contains(named),
+            "the scratch disk is never named by `{named}`:\n{fields}"
+        );
+    }
+    let machine: String = docs[0]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !machine.contains("/var/mnt/scratch"),
+        "no kubelet mount for the scratch path:\n{machine}"
+    );
+    let out = run(&["--only-read-classes", "w-1"], "", None, None);
+    assert_eq!(
+        code(&out),
+        0,
+        "a declaration node-converge and add-longhorn-disk admit: {}",
+        text(&out)
+    );
+}
+
+/// THE DATA NODE'S TWO MICRONS ARE TOLD APART BY SERIAL (backlog
+/// 4d1caddb, design 3c475a19 section 2). w-3 carries two Micron 7400 PRO
+/// 960 GB drives, the same model and the same size, so a selector of
+/// what the disk IS (w-1's gate shape) matches both, and Talos
+/// provisions on the first candidate in unsorted arrival order: the
+/// system of record's volume could land on either drive, and both
+/// volumes on one. Each volume therefore names ONE drive by serial,
+/// beside the one `!system_disk` the converge grammar demands; the two
+/// serials differ, so no drive can take both.
+///
+/// WHICH drive is which is not free (review 9cc23d69 of car 0d0bad39).
+/// node-maintenance-window ba305b66 records 220133DDBEDB as w-1's former
+/// gate volume, still carrying its u-gate partition, which fills the
+/// disk, and 220133E4E1CC as blank. Talos makes a user volume only in
+/// free space, so a volume on the u-gate drive reads `waiting` until
+/// plan-a-partition-wipe / wipe-a-partition drops that partition. The
+/// system of record's volume takes the blank drive, and the `data`
+/// document names the wipe that must come first.
+#[test]
+fn w3_declares_postgres_and_data_each_on_its_own_micron_by_serial() {
+    let w3 = std::fs::read_to_string(patches_dir().join("w-3.yaml")).unwrap();
+    let docs: Vec<&str> = w3.split("\n---\n").collect();
+    assert_eq!(
+        docs.len(),
+        3,
+        "the machine fragment and two user volumes:\n{w3}"
+    );
+    let mut serials = Vec::new();
+    for (doc, name) in docs[1..].iter().zip(["postgres", "data"]) {
+        assert!(doc.contains("\nkind: UserVolumeConfig\n"), "{doc}");
+        assert!(
+            doc.contains(&format!("\nname: {name}\n")),
+            "mounted at /var/mnt/{name}, Longhorn disk u-{name}:\n{doc}"
+        );
+        assert!(doc.contains("  type: xfs"), "{doc}");
+        let selector = doc
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("match: "))
+            .unwrap_or_else(|| panic!("{name} has a diskSelector match:\n{doc}"));
+        let serial = selector
+            .strip_prefix(r#"'!system_disk && disk.serial == ""#)
+            .and_then(|s| s.strip_suffix(r#""'"#))
+            .unwrap_or_else(|| {
+                panic!("{name} is chosen by !system_disk and one serial, nothing else: {selector}")
+            });
+        assert!(
+            !serial.is_empty() && serial.chars().all(|c| c.is_ascii_alphanumeric()),
+            "{name}: a serial is one plain token: {serial:?}"
+        );
+        serials.push(serial.to_string());
+    }
+    assert_ne!(
+        serials[0], serials[1],
+        "postgres and data sit on two different drives"
+    );
+    assert_eq!(
+        [serials[0].as_str(), serials[1].as_str()],
+        ["220133E4E1CC", "220133DDBEDB"],
+        "postgres on the drive window ba305b66 records blank, data on the one \
+         still carrying w-1's old u-gate partition"
+    );
+    for door in ["plan-a-partition-wipe", "wipe-a-partition w-3"] {
+        assert!(
+            docs[2].contains(door),
+            "the data document names the {door} that drops the stale u-gate \
+             partition before data can provision:\n{}",
+            docs[2]
+        );
+    }
+}
+
+/// THE LONGHORN TAG IS A CONVERGED ENTRY (backlog e14a472d). A dev-build
+/// worker's volume class selects Longhorn nodes by tag, and the tag
+/// reaches Longhorn as the `node.longhorn.io/default-node-tags`
+/// annotation Talos sets from `machine.nodeAnnotations`. node-converge
+/// can only apply what this check reads back, so the annotation is a
+/// fifth class: ABSENT before the apply, MATCH after, and narrowed to
+/// itself, in canonical form, when it is the one entry missing.
+#[test]
+fn a_declared_longhorn_tag_reads_absent_then_match_and_narrows_to_itself() {
+    let before = Live {
+        longhorn_tag: false,
+        ..w1_as_declared()
+    };
+    let out = run(&["w-1"], &live_yaml("10.20.0.14", &before), None, None);
+    let t = text(&out);
+    assert_eq!(code(&out), 1, "{t}");
+    let absent = lines_with(&out, "ABSENT");
+    assert_eq!(absent.len(), 1, "{t}");
+    assert!(
+        absent[0].contains("machine.nodeAnnotations.node.longhorn.io/default-node-tags")
+            && absent[0].contains(r#"[\"dev-build\"]"#),
+        "ABSENT names the annotation and its declared value:\n{t}"
+    );
+
+    let out = run(
+        &["--absent", "w-1"],
+        &live_yaml("10.20.0.14", &before),
+        None,
+        None,
+    );
+    let t = text(&out);
+    assert_eq!(code(&out), 0, "{t}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("machine:\n  nodeAnnotations:\n    {LONGHORN_TAG_LINE}\n"),
+        "the narrowed patch is the annotation alone:\n{t}"
+    );
+
+    let out = run(
+        &["w-1"],
+        &live_yaml("10.20.0.14", &w1_as_declared()),
+        None,
+        None,
+    );
+    let t = text(&out);
+    assert_eq!(code(&out), 0, "{t}");
+    assert!(
+        t.contains("MATCH      machine.nodeAnnotations.node.longhorn.io/default-node-tags"),
+        "{t}"
+    );
+}
+
+/// Only the TAG annotation may be converged. Longhorn reads another,
+/// `node.longhorn.io/default-disks-config`, to CREATE disks at any path
+/// it names — a control plane's system disk among them, the placement
+/// this tag exists to prevent — and other controllers read annotations of
+/// their own. So under nodeAnnotations the check admits one key, as it
+/// admits only the image-GC pair under extraConfig (review 9cb9af67
+/// finding 10), and names any other UNREAD, exit 3, before any door.
+#[test]
+fn only_read_classes_admits_the_longhorn_tag_annotation_and_no_other() {
+    let dir = scratch("only-the-tag-annotation");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("n-1.yaml"),
+        format!("machine:\n  nodeAnnotations:\n    {LONGHORN_TAG_LINE}\n"),
+    )
+    .unwrap();
+    let out = run(&["--only-read-classes", "n-1"], "", Some(&dir), None);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+
+    std::fs::write(
+        dir.join("n-2.yaml"),
+        format!(
+            "machine:\n  nodeAnnotations:\n    {LONGHORN_TAG_LINE}\n    node.longhorn.io/default-disks-config: '[{{\"path\":\"/var/lib/longhorn\"}}]'\n"
+        ),
+    )
+    .unwrap();
+    let out = run(&["--only-read-classes", "n-2"], "", Some(&dir), None);
+    let t = text(&out);
+    assert_eq!(code(&out), 3, "{t}");
+    let unread = lines_with(&out, "UNREAD");
+    assert_eq!(unread.len(), 1, "{t}");
+    assert!(
+        unread[0].contains(" machine.nodeAnnotations.node.longhorn.io/default-disks-config "),
+        "{t}"
     );
 }

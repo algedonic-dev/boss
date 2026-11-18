@@ -7,7 +7,7 @@
   // active), the unassigned claimable pool, which authority-role lens
   // each pile belongs to, and how long the oldest wait has run. A hot
   // node is a deep queue — the algedonic depth signal from
-  // queue-visibility Q4 drawn on the map (feedback 9fe2fe66,
+  // queue-visibility Q4 (now in the decision record) drawn on the map (feedback 9fe2fe66,
   // change 1; thresholds/telemetry are change 2, gated on Q4).
   //
   // Polls on a 10s interval, per the SSE policy's bucket (b): depth
@@ -544,8 +544,7 @@
     margin: 8px 0;
     font-size: 13px;
   }
-  .fleet-stale,
-  .fleet-note.load-failed {
+  .fleet-stale {
     color: var(--warn);
   }
   .fleet-unread {

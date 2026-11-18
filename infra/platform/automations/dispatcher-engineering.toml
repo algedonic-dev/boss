@@ -1,0 +1,12 @@
+# dispatcher-engineering: the dispatcher's Engineering row, one of three rows of
+# one binary (docs/design/station-tree.md section 6, "the dispatcher becomes
+# three rows of one binary, each in a different station"; backlog 6ecb5480).
+# The root row (dispatcher.toml) keeps signs_for: a family signs as ONE
+# automation. This row is DECLARED ONLY until the binary takes its id from
+# its station's config: the handlers (crates/orchestrators/boss-dispatcher-handlers/
+# src/handlers/common.rs) still sign every firing as automation:dispatcher.
+[[automation]]
+id = "automation:dispatcher-engineering"
+role = "platform-admin"
+description = 'The dispatcher in Engineering: the same binary as automation:dispatcher, provisioned in the engineering station for its discipline (station-tree.md section 6). Declared; the binary does not yet sign as this id.'
+station = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5"

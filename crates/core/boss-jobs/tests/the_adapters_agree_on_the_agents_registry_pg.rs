@@ -128,7 +128,223 @@ boss_testing::adapters_agree! {
         a_batch_naming_one_id_twice_inserts_it_once,
         an_unpriced_model_refuses_the_batch_only_when_it_would_be_written,
         a_row_the_schema_refuses_refuses_the_whole_batch,
+        rotation_is_data_without_changing_identity_or_losing_its_fact,
+        a_model_class_lands_keeps_and_takes_like_every_declared_column,
+        a_blank_model_class_refuses_the_whole_batch,
+        seats_land_in_order_and_only_a_declaration_naming_them_moves_them,
     }
+}
+
+/// An executor's seats (design 506e0a1c car 1, backlog 1a74c2bc) land in
+/// the order declared — the order is which station is served first, so
+/// Postgres's TEXT[] must hand back what the double's Vec holds; a held
+/// row KEEPS them under the default naming the difference; take moves
+/// them naming the change; a declaration that names no seats keeps the
+/// held ones even under take (the column is COALESCEd, like
+/// `factory_rotation`), and `[]` unseats. The fact a write leaves carries
+/// them. Whether each names an active station is the batch door's check.
+async fn seats_land_in_order_and_only_a_declaration_naming_them_moves_them<W: World>(
+    w: &W,
+    adapter: &str,
+) {
+    let mut first = agent("agent-suite-seated", &[]);
+    first.stations = Some(vec!["landed-review".into(), "design-review".into()]);
+    publish(w, std::slice::from_ref(&first), PublishMode::default())
+        .await
+        .expect("a seated declaration lands");
+    assert_eq!(
+        suite_row(w, "agent-suite-seated").await,
+        Some(row_of(&first, &[])),
+        "{adapter}: the seats read back in the order declared"
+    );
+    let facts = w.facts().await;
+    assert_eq!(
+        facts[0].1["stations"],
+        serde_json::json!(["landed-review", "design-review"]),
+        "{adapter}"
+    );
+    let bare = agent("agent-suite-bare", &[]);
+    publish(w, std::slice::from_ref(&bare), PublishMode::default())
+        .await
+        .expect("an unseated declaration lands");
+    assert_eq!(
+        suite_row(w, "agent-suite-bare").await.map(|r| r.stations),
+        Some(vec![]),
+        "{adapter}: a new row that names no seats is seated nowhere"
+    );
+
+    let mut reordered = first.clone();
+    reordered.stations = Some(vec!["design-review".into(), "landed-review".into()]);
+    let out = publish(w, std::slice::from_ref(&reordered), PublishMode::default())
+        .await
+        .expect("a held row is kept");
+    assert_eq!(
+        shape(&out),
+        outcome(1, 0, &[], &[("agent-suite-seated", &["stations"])], 0),
+        "{adapter}"
+    );
+    let out = publish(w, std::slice::from_ref(&reordered), PublishMode::Take)
+        .await
+        .expect("take moves them");
+    assert_eq!(
+        shape(&out),
+        outcome(1, 0, &[("agent-suite-seated", &["stations"])], &[], 0),
+        "{adapter}"
+    );
+    assert_eq!(
+        suite_row(w, "agent-suite-seated").await,
+        Some(row_of(&reordered, &[])),
+        "{adapter}: the new order is the order held"
+    );
+
+    let mut silent = reordered.clone();
+    silent.stations = None;
+    let out = publish(w, std::slice::from_ref(&silent), PublishMode::Take)
+        .await
+        .expect("a declaration naming no seats lands");
+    assert_eq!(
+        shape(&out),
+        outcome(1, 0, &[], &[], 1),
+        "{adapter}: naming no seats changes nothing, even under take"
+    );
+    assert_eq!(
+        suite_row(w, "agent-suite-seated").await,
+        Some(row_of(&reordered, &[])),
+        "{adapter}"
+    );
+
+    let mut unseated = reordered.clone();
+    unseated.stations = Some(vec![]);
+    let out = publish(w, std::slice::from_ref(&unseated), PublishMode::Take)
+        .await
+        .expect("take unseats");
+    assert_eq!(
+        shape(&out),
+        outcome(1, 0, &[("agent-suite-seated", &["stations"])], &[], 0),
+        "{adapter}"
+    );
+    assert_eq!(
+        suite_row(w, "agent-suite-seated").await.map(|r| r.stations),
+        Some(vec![]),
+        "{adapter}"
+    );
+}
+
+/// The schema refuses a blank class (`agents_model_class_nonempty`,
+/// migration 20261104123507) on every declared row, held or not, and
+/// rolls the whole batch back, so the double must too: a batch that
+/// pairs a valid row with a blank class lands NEITHER row and leaves no
+/// fact, under either mode (review 55a8acff R1 on car 116357de — the
+/// double refused only the id and cap CHECKs, and inserted both).
+async fn a_blank_model_class_refuses_the_whole_batch<W: World>(w: &W, adapter: &str) {
+    let held = agent("agent-suite-held", &[]);
+    publish(w, std::slice::from_ref(&held), PublishMode::default())
+        .await
+        .expect("the held row lands");
+    let mut blank = agent("agent-suite-blank", &[]);
+    blank.model_class = Some(String::new());
+    let mut held_blank = held.clone();
+    held_blank.model_class = Some("  ".into());
+    for bad in [blank, held_blank] {
+        for mode in [PublishMode::InsertIfAbsent, PublishMode::Take] {
+            let err = publish(
+                w,
+                &[
+                    agent("agent-suite-alongside", &["alongside@suite.test"]),
+                    bad.clone(),
+                ],
+                mode,
+            )
+            .await
+            .expect_err("the schema refuses a blank model class");
+            assert!(
+                matches!(err, AgentsError::Storage(_)),
+                "{adapter}: {} under {mode:?}: {err:?}",
+                bad.id
+            );
+            assert_eq!(
+                suite_rows(w).await,
+                vec![row_of(&held, &[])],
+                "{adapter}: {} under {mode:?} landed nothing",
+                bad.id
+            );
+            assert_eq!(
+                resolves(w, "alongside@suite.test").await,
+                None,
+                "{adapter}: {}",
+                bad.id
+            );
+        }
+    }
+    assert_eq!(
+        fact_ids(w).await,
+        pairs(&[(AGENT_DECLARED, "agent-suite-held")]),
+        "{adapter}: no refused batch left a fact"
+    );
+}
+
+/// A robot's model class (T2d, backlog 06d8988b) is a column like the
+/// rest: it lands as declared, a held row KEEPS it under the default and
+/// names the difference, take moves it (and clears it, since the
+/// declaration is the whole row) naming the change, and the fact the
+/// write leaves carries it. Whether the class names an active pool is
+/// the batch door's check, not the adapters'.
+async fn a_model_class_lands_keeps_and_takes_like_every_declared_column<W: World>(
+    w: &W,
+    adapter: &str,
+) {
+    let mut first = agent("agent-suite-classed", &[]);
+    first.model_class = Some("opus".into());
+    publish(w, std::slice::from_ref(&first), PublishMode::default())
+        .await
+        .expect("a classed declaration lands");
+    assert_eq!(
+        suite_row(w, "agent-suite-classed").await,
+        Some(row_of(&first, &[])),
+        "{adapter}: the class reads back as declared"
+    );
+    let facts = w.facts().await;
+    assert_eq!(facts[0].1["model_class"], "opus", "{adapter}");
+
+    let mut moved = first.clone();
+    moved.model_class = Some("sonnet".into());
+    let out = publish(w, std::slice::from_ref(&moved), PublishMode::default())
+        .await
+        .expect("a held row is kept");
+    assert_eq!(
+        shape(&out),
+        outcome(1, 0, &[], &[("agent-suite-classed", &["model_class"])], 0),
+        "{adapter}"
+    );
+    assert_eq!(
+        suite_row(w, "agent-suite-classed")
+            .await
+            .and_then(|r| r.model_class),
+        Some("opus".into()),
+        "{adapter}: the instance is the truth"
+    );
+
+    let out = publish(w, std::slice::from_ref(&moved), PublishMode::Take)
+        .await
+        .expect("take moves it");
+    assert_eq!(
+        shape(&out),
+        outcome(1, 0, &[("agent-suite-classed", &["model_class"])], &[], 0),
+        "{adapter}"
+    );
+    assert_eq!(out.updated[0].changes[0].from, "opus", "{adapter}");
+    assert_eq!(out.updated[0].changes[0].to, "sonnet", "{adapter}");
+
+    let mut cleared = moved.clone();
+    cleared.model_class = None;
+    publish(w, std::slice::from_ref(&cleared), PublishMode::Take)
+        .await
+        .expect("take clears it");
+    assert_eq!(
+        suite_row(w, "agent-suite-classed").await,
+        Some(row_of(&cleared, &[])),
+        "{adapter}: a declaration without a class records none"
+    );
 }
 
 // ----- fixtures ------------------------------------------------------------
@@ -142,29 +358,128 @@ fn stamp() -> EventStamp {
 
 fn agent(id: &str, aliases: &[&str]) -> AgentInput {
     AgentInput {
+        factory_rotation: Some(true),
         id: id.into(),
         display_name: format!("{id} as first declared"),
         default_model: PRICED.into(),
+        model_class: None,
         aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
         role: None,
         department: None,
         hourly_budget_usd_micros: None,
         max_concurrent_runs: None,
+        stations: None,
     }
 }
 
 /// The row a declaration lands as, with the aliases it will hold.
 fn row_of(a: &AgentInput, aliases: &[&str]) -> AgentRow {
     AgentRow {
+        factory_rotation: a.factory_rotation.unwrap_or(true),
         id: a.id.clone(),
         display_name: a.display_name.clone(),
         default_model: a.default_model.clone(),
+        model_class: a.model_class.clone(),
         role: a.role.clone(),
         department: a.department.clone(),
         hourly_budget_usd_micros: a.hourly_budget_usd_micros,
         max_concurrent_runs: a.max_concurrent_runs,
         aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
+        stations: a.stations.clone().unwrap_or_default(),
     }
+}
+
+async fn rotation_is_data_without_changing_identity_or_losing_its_fact<W: World>(
+    w: &W,
+    adapter: &str,
+) {
+    let mut declared = agent("agent-suite-rotation", &["rotation@example.test"]);
+    publish(w, &[declared.clone()], PublishMode::default())
+        .await
+        .unwrap();
+    declared.factory_rotation = Some(false);
+    let kept = publish(w, &[declared.clone()], PublishMode::default())
+        .await
+        .unwrap();
+    assert_eq!(kept.kept[0].differs, vec!["factory_rotation"], "{adapter}");
+    assert!(
+        suite_row(w, &declared.id)
+            .await
+            .unwrap()
+            .in_factory_rotation()
+    );
+    let changed = publish(w, &[declared.clone()], PublishMode::Take)
+        .await
+        .unwrap();
+    assert_eq!(
+        changed.updated[0].changes[0].field, "factory_rotation",
+        "{adapter}"
+    );
+    assert!(
+        !suite_row(w, &declared.id)
+            .await
+            .unwrap()
+            .in_factory_rotation()
+    );
+    assert_eq!(
+        w.repo()
+            .resolve_login("rotation@example.test")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(declared.id.as_str())
+    );
+    let mut old_declaration = serde_json::to_value(&declared).unwrap();
+    old_declaration
+        .as_object_mut()
+        .unwrap()
+        .remove("factory_rotation");
+    let old_declaration: AgentInput = serde_json::from_value(old_declaration).unwrap();
+    publish(w, &[old_declaration], PublishMode::Take)
+        .await
+        .unwrap();
+    assert!(
+        !suite_row(w, &declared.id)
+            .await
+            .unwrap()
+            .in_factory_rotation(),
+        "{adapter}: an older publisher must not silently re-enable a held rotation value"
+    );
+    let facts = w.facts().await;
+    let (_, payload) = facts
+        .iter()
+        .find(|(kind, p)| kind == AGENT_UPDATED && p["id"] == declared.id)
+        .unwrap();
+    assert_eq!(payload["factory_rotation"], false, "{adapter}");
+    // The actual immutable event payload reconstructs the declaration;
+    // this does not claim an agents rebuilder exists where none does.
+    let mut payload = payload.clone();
+    for key in ["changes", "updated_by", "_actor", "_simulated"] {
+        payload.as_object_mut().unwrap().remove(key);
+    }
+    // The fact is the ROW after, so it states the seats the row holds
+    // where the declaration omitted them and so kept them (design
+    // 506e0a1c car 1): this row was never seated, and the fact says `[]`
+    // rather than leaving a rebuilder to guess between "keep" and
+    // "unseat". The declaration it reconstructs is the one with the
+    // seats spelled out.
+    assert_eq!(payload["stations"], serde_json::json!([]), "{adapter}");
+    let restored: AgentInput = serde_json::from_value(payload).unwrap();
+    assert_eq!(
+        restored,
+        AgentInput {
+            stations: Some(vec![]),
+            ..declared.clone()
+        },
+        "{adapter}"
+    );
+    assert_eq!(
+        publish(w, &[declared], PublishMode::Take)
+            .await
+            .unwrap()
+            .unchanged,
+        1
+    );
 }
 
 fn outcome(

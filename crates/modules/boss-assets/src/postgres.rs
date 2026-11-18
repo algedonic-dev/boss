@@ -11,13 +11,20 @@
 //! is the cost of having a queryable current-state view; the alternative
 //! (recomputing on every read) doesn't scale to the per-account and
 //! per-sku queries the rest of the asset needs.
+//!
+//! `record` and `batch_record` — the HTTP doors' writes — stage each
+//! stored event's fact on the transactional outbox in that same
+//! transaction; `append`, the bus ingress's re-application of a fact
+//! already staged, stages none (backlog 2e45840a, design ad9519bc).
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use std::collections::HashSet;
 use std::time::Instant;
 
+use crate::bridge::asset_event_to_core;
 use crate::port::{
     AssetsError, AssetsRepository, BatchAppendStats, model_named,
     refuse_an_actor_that_reads_back_as_another, refuse_negative_page, refuse_nul_in_event,
@@ -69,81 +76,44 @@ fn kind_tag(kind: &AssetEventKind) -> &'static str {
 #[async_trait]
 impl AssetsRepository for PgAssets {
     async fn append(&self, event: AssetEvent) -> Result<(), AssetsError> {
-        refuse_nul_in_event(&event)?;
-        refuse_an_actor_that_reads_back_as_another(&event)?;
-        let kind = kind_tag(&event.kind);
-        let payload =
-            serde_json::to_value(&event.kind).map_err(|e| AssetsError::Storage(e.to_string()))?;
-        let serial = event.asset_id.clone();
-
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| AssetsError::Storage(e.to_string()))?;
-
-        sqlx::query(
-            r#"
-            INSERT INTO asset_events (id, asset_id, ts, actor_id, kind, payload)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            "#,
-        )
-        .bind(&event.id.0)
-        .bind(&event.asset_id.0)
-        .bind(event.ts)
-        .bind(event.actor_id.to_string())
-        .bind(kind)
-        .bind(&payload)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            if is_unique_violation(&e) {
-                AssetsError::DuplicateEvent(event.id.0.clone())
-            } else {
-                AssetsError::Storage(e.to_string())
-            }
-        })?;
-        // Judged after the insert, so a redelivery is a duplicate
-        // whatever it names; the refusal drops the transaction.
-        refuse_unknown_models(&mut tx, model_named(&event.kind).into_iter().collect()).await?;
-
-        // Read existing projection state. This is one indexed lookup,
-        // not a full event-log scan.
-        let existing = fetch_system_state(&mut tx, &serial).await?;
-
-        if sorts_before_the_projection(
-            &mut tx,
-            existing.as_ref(),
-            &event,
-            std::slice::from_ref(&event.id.0),
-        )
-        .await?
-        {
-            // Out-of-order arrival: full reprojection from the serial's
-            // complete event log (which already includes the row we
-            // just inserted). full_reproject_system does the upsert
-            // and the open-tickets rebuild itself.
-            full_reproject_system(&mut tx, &serial).await?;
-        } else {
-            // Fast path: read just the open ticket ids and apply the
-            // new event incrementally. Order matters: upsert the
-            // asset row first, then mutate asset_open_tickets
-            // (which has an FK to assets(asset_id)).
-            let open_ids = fetch_open_ticket_ids(&mut tx, &serial).await?;
-            let (state, ticket_op) = apply_event(&serial, existing.as_ref(), &open_ids, &event);
-            upsert_system(&mut tx, &state).await?;
-            apply_ticket_op_to_table(&mut tx, &serial, &ticket_op).await?;
-        }
-
+        append_in_tx(&mut tx, &event).await?;
         tx.commit()
             .await
-            .map_err(|e| AssetsError::Storage(e.to_string()))?;
+            .map_err(|e| AssetsError::Storage(e.to_string()))
+    }
 
-        Ok(())
+    async fn record(
+        &self,
+        event: AssetEvent,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<(), AssetsError> {
+        // The asset and its fact in ONE transaction: committed, the
+        // relay delivers the fact whether or not the bus is up now.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AssetsError::Storage(e.to_string()))?;
+        append_in_tx(&mut tx, &event).await?;
+        boss_events::outbox::record_event_in_tx(&mut tx, &asset_event_to_core(&event, recorded_at))
+            .await
+            .map_err(AssetsError::Storage)?;
+        tx.commit()
+            .await
+            .map_err(|e| AssetsError::Storage(e.to_string()))
     }
 
     #[tracing::instrument(skip(self, events), fields(n = events.len()))]
-    async fn batch_append(&self, events: Vec<AssetEvent>) -> Result<BatchAppendStats, AssetsError> {
+    async fn batch_record(
+        &self,
+        events: Vec<AssetEvent>,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<BatchAppendStats, AssetsError> {
         if events.is_empty() {
             return Ok(BatchAppendStats::default());
         }
@@ -248,6 +218,20 @@ impl AssetsRepository for PgAssets {
             stored.iter().filter_map(|e| model_named(&e.kind)).collect(),
         )
         .await?;
+        // One fact per event STORED, in input order, in this same
+        // transaction: a redelivered event stages none, and a batch
+        // that fails stages nothing (backlog 2e45840a, design ad9519bc
+        // part d — the door used to publish every event of the batch,
+        // duplicates included, straight to the bus, dropping them all
+        // on a dark one).
+        for event in &stored {
+            boss_events::outbox::record_event_in_tx(
+                &mut tx,
+                &asset_event_to_core(event, recorded_at),
+            )
+            .await
+            .map_err(AssetsError::Storage)?;
+        }
         let mut by_serial: std::collections::BTreeMap<String, Vec<AssetEvent>> =
             std::collections::BTreeMap::new();
         for e in stored {
@@ -676,6 +660,77 @@ impl SystemRow {
             oem_serial: self.oem_serial,
         }
     }
+}
+
+/// Append one event inside the caller's transaction: the log row, then
+/// the projection. Shared by `append` (the bus ingress's re-application,
+/// which stages nothing) and `record` (the HTTP door, which stages the
+/// fact in the same transaction), so the two cannot store differently.
+/// Refuses as the port's `append` says, before the caller commits.
+async fn append_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    event: &AssetEvent,
+) -> Result<(), AssetsError> {
+    refuse_nul_in_event(event)?;
+    refuse_an_actor_that_reads_back_as_another(event)?;
+    let kind = kind_tag(&event.kind);
+    let payload =
+        serde_json::to_value(&event.kind).map_err(|e| AssetsError::Storage(e.to_string()))?;
+    let serial = event.asset_id.clone();
+
+    sqlx::query(
+        r#"
+        INSERT INTO asset_events (id, asset_id, ts, actor_id, kind, payload)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        "#,
+    )
+    .bind(&event.id.0)
+    .bind(&event.asset_id.0)
+    .bind(event.ts)
+    .bind(event.actor_id.to_string())
+    .bind(kind)
+    .bind(&payload)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| {
+        if is_unique_violation(&e) {
+            AssetsError::DuplicateEvent(event.id.0.clone())
+        } else {
+            AssetsError::Storage(e.to_string())
+        }
+    })?;
+    // Judged after the insert, so a redelivery is a duplicate
+    // whatever it names; the refusal drops the transaction.
+    refuse_unknown_models(tx, model_named(&event.kind).into_iter().collect()).await?;
+
+    // Read existing projection state. This is one indexed lookup,
+    // not a full event-log scan.
+    let existing = fetch_system_state(tx, &serial).await?;
+
+    if sorts_before_the_projection(
+        tx,
+        existing.as_ref(),
+        event,
+        std::slice::from_ref(&event.id.0),
+    )
+    .await?
+    {
+        // Out-of-order arrival: full reprojection from the serial's
+        // complete event log (which already includes the row we
+        // just inserted). full_reproject_system does the upsert
+        // and the open-tickets rebuild itself.
+        full_reproject_system(tx, &serial).await?;
+    } else {
+        // Fast path: read just the open ticket ids and apply the
+        // new event incrementally. Order matters: upsert the
+        // asset row first, then mutate asset_open_tickets
+        // (which has an FK to assets(asset_id)).
+        let open_ids = fetch_open_ticket_ids(tx, &serial).await?;
+        let (state, ticket_op) = apply_event(&serial, existing.as_ref(), &open_ids, event);
+        upsert_system(tx, &state).await?;
+        apply_ticket_op_to_table(tx, &serial, &ticket_op).await?;
+    }
+    Ok(())
 }
 
 /// Read the projection row for a serial. None if no row exists yet.

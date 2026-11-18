@@ -1,0 +1,477 @@
+#!/usr/bin/env bash
+# factory-loop.sh — the factory's builder CLI, supervised (backlog
+# 628dc540, David's request 2026-10-28).
+#
+# THE CASE. On 2026-10-28 agent-codex, the factory, stopped on a
+# temporary model-capacity limit at about 06:42Z and nothing restarted it
+# until David did at about 19:20Z — the factory down about 12.5 h — and
+# again from about 20:57Z to 22:38Z. It ran as the interactive TUI in the
+# `codex` tmux session (dev-session.sh option 2), and on a capacity error
+# that TUI waits at an error prompt and never exits, so even a
+# restart-on-exit loop around it would never fire.
+#
+# WHAT THIS DOES INSTEAD. It runs the CLI's NON-INTERACTIVE mode one turn
+# at a time, forever:
+#   - each turn is `codex exec`, driven by the factory prompt
+#     (infra/dev/factory-drain.md), and after the first turn it RESUMES
+#     the same codex session (`codex exec resume <id> -`), so the factory
+#     keeps its context across turns and across restarts. The id is read
+#     off the turn's HEADER only — the line `session id: <uuid>` in its
+#     first lines, as codex-cli 0.159.3 prints it (measured offline
+#     2026-10-29) — never a uuid the turn's own work printed later (a
+#     work-session id read as the codex session; review 97bb7698
+#     finding 5). It may be pinned with FACTORY_CODEX_SESSION. A resume
+#     id is dropped after two resumed turns in a row fail ON THE ID
+#     ITSELF: measured, a resume of an id codex has no rollout for
+#     prints one `Error: thread/resume: ... no rollout found ...` line
+#     and exits 1 at once, every time, so a bad id kept would cost the
+#     30-minute rung forever. A limit or any other failure never counts
+#     toward the drop (review 1c7ab966 N3): in a capacity outage, the
+#     case this file exists for, the old any-failure count dropped the
+#     session on the second limited turn, about 7 minutes in, and the
+#     factory came back cold. No id means a fresh turn, which is
+#     correct, only colder;
+#   - every turn runs with approval_policy "never" (finding 8). Measured
+#     offline 2026-10-29 with a dead local provider and a scratch
+#     CODEX_HOME holding infra/dev/cli/codex-config.toml: under that
+#     config's "on-request", `codex exec` 0.159.3 printed
+#     `approval: never` in its header — exec answers no approval prompt.
+#     The loop states it rather than inherit an exec default a later CLI
+#     may change, because a turn waiting on an approval nobody is there
+#     to give is the stall this file exists to end;
+#   - a turn that exits non-zero, or whose CLI says it hit a rate or
+#     capacity limit, is a FAILED turn: the loop writes a restart note on
+#     the factory's open work-session and waits 2, 5, 10, 20 minutes,
+#     then 30 minutes every time after, and never gives up. A clean turn
+#     resets the ladder. The limit words are read only on a non-zero exit
+#     (the turn's last lines) or on the CLI's OWN error line (`ERROR: `
+#     or `Error: `, as codex prints one): a clean turn whose final
+#     message relays a restart note's reason is not a limit (finding 4);
+#   - at every turn START and END the loop stamps `last_active_at` on the
+#     factory's open work-session beside a `factory_turn` key (decided
+#     2026-10-29 on 628dc540): work-session-ends-when-silent ends a
+#     session six hours after its last `last_active_at`, and codex has no
+#     prompt hook to write one, so without this a healthy factory's
+#     session closed about 6 h after it opened. The `factory_turn` key
+#     marks the write as the supervisor's, which the silent-session rule
+#     ignores, so a loop relaunching a limited CLI never reads as the
+#     factory speaking;
+#   - every turn's output is tee'd into this pane and appended to the log
+#     (FACTORY_LOG), so David can still watch it live and read it after.
+#     The log is rotated whenever it passes 10 MB — at a turn's start and
+#     AS a turn writes it (review 1c7ab966 N5: one 4 h turn could grow it
+#     past the bound) — keeping five files, the log and .1 to .4
+#     (finding 6: it grew on the /work PVC without bound).
+#
+# THE RESTART NOTE IS VISIBILITY, NOT A DEPENDENCY. It goes through the
+# pod's boss-api door onto the newest open work-session whose `actor` is
+# FACTORY_SESSION_ACTOR (agent-codex), under a NEW key per restart,
+# `factory_restart_<YYYYMMDDTHHMMSSZ>`: the reason, the exit code, the
+# wait and the log. When the API is dark the note is skipped with a line
+# in the log and the loop goes on — a supervisor that needs the system it
+# reports to is not a supervisor (CLAUDE.md, "an arm that needs the
+# patient is not an arm"). The `factory_restart_` prefix is the one the
+# rule a-silent-factory-holding-claimed-work-is-alarmed ignores, so these
+# notes never read as the factory speaking; the handler's test holds the
+# two equal.
+#
+# THE INTERACTIVE PATH STAYS. dev-session.sh keeps option 2 (`codex`, the
+# TUI) and adds this as option 6 (`codex-factory`); the two refuse to
+# start beside each other, because two CLIs signing as one agent would
+# race each other for the same queue.
+#
+# EVERY SEAT, NOT ONLY CODEX (backlog b513514c, 2026-11-17). On
+# 2026-11-17 the factory stood idle 07:10Z-14:45Z (item 5627a4e1): this
+# loop supervised Codex alone, while the conductor's interactive session
+# ended its last background watch and Claude B sat at its prompt, and
+# nothing woke either. So the loop now takes a SEAT, `factory-loop.sh
+# <seat>`, a row of infra/dev/seats.tsv naming its CLI, the actor its
+# work-session carries, its prompt and its pause. With no seat it is the
+# file's first row, codex-factory, with exactly the defaults below, so
+# option 6's command and agent-pane.sh's proof of it are unchanged.
+# A `claude` seat runs Claude Code's non-interactive mode the same way:
+# `claude -p --permission-mode auto`, the first turn under a session id
+# the loop chooses (`--session-id`), every later turn `--resume` of it.
+# Measured on Claude Code 2.1.326, 2026-11-17, against a scratch config
+# home: an unknown resume id prints `No conversation found with session
+# ID: <id>` and exits 1, and a home with no login prints `Not logged in ·
+# Please run /login` and exits 1; both read as the CLI's own error line
+# here, and only the first counts toward dropping the id.
+#
+# A CLAUDE SEAT OWNS ITS WORK-SESSION (review ce8970ce B1, 2026-11-17).
+# Claude Code -p fires SessionStart AND SessionEnd (reason "other") on
+# EVERY turn — measured on 2.1.326 by that review, with hooks that only
+# copied their payloads — and the project's session-end hook completed
+# the work-session's terminal `active` step at each one, so every turn
+# filed and closed its own packet and no heartbeat here ever found one
+# open. So the loop marks its turns BOSS_SEAT=<seat>, which
+# session-end.sh honours by leaving the packet open, and runs the
+# packet's life through the same two hooks, by hand: before a turn it
+# FILES the conversation's packet when it has none open
+# (session-start.sh, `source` seat), and it ENDS it (session-end.sh,
+# unmarked) when the conversation ends — a dropped resume id, the turn
+# bound, a signal. The packet is the one the hooks remember under the
+# conversation id the loop chose, in the hooks' state directory, which
+# the loop exports as BOSS_HOOK_STATE so it and every hook its turns
+# fire read one place. Never another session of the same actor: tmux
+# `dev`, the Remote Control door, signs as the conductor too.
+#
+# The seams, unset on the pod: FACTORY_CLI (the CLI to run), FACTORY_SLEEP
+# (what waits), FACTORY_MAX_TURNS (stop after n turns; 0 is forever),
+# FACTORY_TURN_PAUSE (seconds between clean turns), FACTORY_TURN_TIMEOUT
+# (seconds before a turn that never returns is killed and counted as
+# failed), FACTORY_PROMPT_FILE, FACTORY_LOG, FACTORY_LOG_MAX_BYTES and
+# FACTORY_LOG_KEEP, and FACTORY_SEATS (the seat list).
+
+set -u
+
+here=${0%/*}
+# This file's own age (backlog 0b36dd65): it runs from the main checkout.
+# Warn and proceed — a factory stopped by a door is the defect this file
+# exists to end.
+if [ -r "$here/door-freshness.sh" ]; then
+  # shellcheck source=door-freshness.sh
+  . "$here/door-freshness.sh"
+  if stale=$(door_is_stale "$0"); then
+    echo "factory-loop: WARNING - $stale" >&2
+  fi
+fi
+
+# The seat: its row of seats.tsv, or with none, codex-factory's values
+# (the first row; dev_session_sh.rs holds the two equal).
+seat=${1:-}
+seats=${FACTORY_SEATS:-$here/seats.tsv}
+kind=codex
+seat_actor=agent-codex
+seat_prompt=$here/factory-drain.md
+seat_pause=60
+if [ -n "$seat" ]; then
+  row=$(awk -v s="$seat" '$1 !~ /^#/ && $1 == s { print $2, $3, $4, $5; exit }' "$seats" 2>/dev/null)
+  if [ -z "$row" ]; then
+    echo "factory-loop: REFUSED: no seat '$seat' in $seats - nothing is run" >&2
+    exit 64
+  fi
+  read -r kind seat_actor seat_prompt seat_pause <<<"$row"
+  seat_prompt=$here/../../$seat_prompt
+fi
+case $kind in
+  codex | claude) ;;
+  *)
+    echo "factory-loop: REFUSED: seat '$seat' names CLI '$kind'; a turn is defined only for codex and claude" >&2
+    exit 64
+    ;;
+esac
+
+seat_name=${seat:-codex-factory}
+cli=${FACTORY_CLI:-$kind}
+prompt_file=${FACTORY_PROMPT_FILE:-$seat_prompt}
+log=${FACTORY_LOG:-$HOME/.local/state/boss/factory-loop${seat:+-$seat}.log}
+actor=${FACTORY_SESSION_ACTOR:-$seat_actor}
+pause=${FACTORY_TURN_PAUSE:-$seat_pause}
+turn_timeout=${FACTORY_TURN_TIMEOUT:-14400}
+sleep_cmd=${FACTORY_SLEEP:-sleep}
+max_turns=${FACTORY_MAX_TURNS:-0}
+session=${FACTORY_CODEX_SESSION:-}
+log_max=${FACTORY_LOG_MAX_BYTES:-10485760}
+log_keep=${FACTORY_LOG_KEEP:-5}
+
+# A claude seat's turns are marked as the seat's, and the hooks' state
+# root is the loop's (see the header): lib.sh reads BOSS_HOOK_STATE
+# first, so exporting the value it would default to makes the hooks
+# and this loop read one directory by construction.
+hooks=$here/hooks
+if [ "$kind" = claude ]; then
+  export BOSS_SEAT=$seat_name
+  export BOSS_HOOK_STATE=${BOSS_HOOK_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/boss/sessions}
+fi
+
+# The approval every turn runs under (see the header): exec has nobody
+# to ask.
+policy='approval_policy="never"'
+
+# The waits after a failed turn, in seconds: 2, 5, 10, 20, then 30
+# minutes for every failure after (628dc540's decision).
+backoff=(120 300 600 1200 1800)
+
+# A limit, as codex-cli 0.159.3 words one: read off the installed binary
+# ("rate limit exceeded", "flex capacity unavailable", "server
+# overloaded", "Quota exceeded", "usage limit", "too many requests",
+# "Codex is currently experiencing high load."), matched case-blind on
+# a failed turn's LAST lines or on the CLI's own error line — never on a
+# clean turn's work, which may mention capacity or relay a restart note.
+limit_re='rate[ _-]?limit|usage[ _-]?limit|capacity[ _-]?(limit|unavailable)|at capacity|model capacity|overloaded|too many requests|quota exceeded|currently experiencing high load'
+
+# A resume that failed on the ID, read only off the CLI's own error line:
+# "no rollout found for thread id" is codex-cli 0.159.3's measured words
+# for an unknown id (2026-10-29, offline); the rest name an id the CLI
+# no longer has (not found, unknown, expired).
+resume_re='no rollout found|thread/resume failed|(thread|session|conversation)( id)? (not found|is unknown|has expired|expired)|unknown (thread|session|conversation)|no conversation found'
+
+# The CLI's OWN error line, which a clean turn's work never starts with:
+# codex prints `ERROR: ` or `Error: `; Claude Code -p prints `API Error: `
+# for a refused model call and, measured on 2.1.326, the bare `No
+# conversation found with session ID:` and `Not logged in` lines. A
+# Claude limit is `Claude AI usage limit reached` or an API error
+# naming rate_limit or overloaded, which limit_re reads with the words
+# below.
+case $kind in
+  codex) err_re='^(ERROR|Error): ' ;;
+  claude)
+    err_re='^(API Error|Error|ERROR): |^No conversation found|^Not logged in'
+    limit_re="$limit_re|limit reached"
+    ;;
+esac
+
+mkdir -p "${log%/*}"
+turn_out=$log.turn
+note_body=$log.note.json
+beat_body=$log.beat.json
+
+say() { printf 'factory-loop %s: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$log"; }
+
+# Five files of 10 MB: the log, then .1 (newest) to .4 (oldest).
+rotate_log() {
+  local size i
+  size=$(stat -c %s "$log" 2>/dev/null || echo 0)
+  [ "$size" -ge "$log_max" ] || return 0
+  i=$((log_keep - 1))
+  rm -f "$log.$i"
+  while [ "$i" -gt 1 ]; do
+    [ -e "$log.$((i - 1))" ] && mv -f "$log.$((i - 1))" "$log.$i"
+    i=$((i - 1))
+  done
+  mv -f "$log" "$log.1"
+}
+
+# Echo a turn's output to this pane and append it to the log, rotating
+# whenever the log passes its bound mid-turn. The size is counted as
+# lines are written (one stat at the start and after each rotation, never
+# a fork per line). Each line is opened for append on its own, so a
+# rotation's mv never leaves a writer on the old file.
+log_turn() {
+  local line size
+  size=$(stat -c %s "$log" 2>/dev/null || echo 0)
+  while IFS= read -r line || [ -n "$line" ]; do
+    printf '%s\n' "$line"
+    printf '%s\n' "$line" >>"$log"
+    size=$((size + ${#line} + 1))
+    if [ "$size" -ge "$log_max" ]; then
+      rotate_log
+      size=$(stat -c %s "$log" 2>/dev/null || echo 0)
+    fi
+  done
+}
+
+if [ ! -s "$prompt_file" ]; then
+  say "REFUSED: the factory prompt $prompt_file is missing or empty - no turn can be driven"
+  exit 66
+fi
+
+# The seat's open work-session. Codex's: the newest open one its actor
+# carries. A claude seat's: the one the hooks remember for the
+# conversation the loop chose, which own_session has checked open
+# before the turn — never another session of the same actor (the `dev`
+# door). Before that conversation has a packet there is none.
+open_session() {
+  local q body
+  if [ "$kind" = claude ]; then
+    [ -n "$session" ] || return 1
+    tr -d '[:space:]' <"$BOSS_HOOK_STATE/$session/packet" 2>/dev/null
+    return 0
+  fi
+  q=$(jq -rn --arg a "$actor" '{actor: $a} | tojson | @uri')
+  body=$(boss-api GET "/api/jobs?kind=work-session&status=open&order=newest&full=false&limit=5&metadata=$q" 2>/dev/null) || return 1
+  jq -r '.data[0].id // empty' <<<"$body"
+}
+
+# A claude seat's packet, OPEN before its turn (B1; see the header). The
+# packet the hooks remember is judged off its own `active` step; one
+# that has ended (the six-hour silent-session clock after a dark API,
+# or a hand) is forgotten, and a conversation with none is given one
+# through session-start.sh exactly as Claude Code would fire it. An
+# answer that cannot be read judges nothing: the packet is kept, and a
+# conversation the hook could not file for is filed on a later turn —
+# Claude Code's own SessionStart files it meanwhile when it can.
+own_session() {
+  local dir=$BOSS_HOOK_STATE/$session packet job state
+  packet=$(tr -d '[:space:]' <"$dir/packet" 2>/dev/null)
+  if [ -n "$packet" ]; then
+    job=$(boss-api GET "/api/jobs/$packet" 2>/dev/null) || return 0
+    state=$(jq -r 'if (.steps | type) == "array" and (.steps | length) > 0
+      then (if any(.steps[]; .spec_slug == "active" and (.status == "ready" or .status == "active"))
+        then "open" else "ended" end)
+      else "unknown" end' <<<"$job" 2>/dev/null)
+    [ "$state" = ended ] || return 0
+    say "work-session $packet of seat $seat_name has ended - the seat files a new one for conversation $session"
+    rm -f "$dir/packet"
+  fi
+  jq -nc --arg s "$session" --arg cwd "$PWD" \
+    '{session_id: $s, source: "seat", cwd: $cwd, hook_event_name: "SessionStart"}' |
+    "$hooks/session-start.sh" >>"$log" 2>&1
+  packet=$(tr -d '[:space:]' <"$dir/packet" 2>/dev/null)
+  if [ -n "$packet" ]; then
+    say "work-session $packet is seat $seat_name's, for conversation $session"
+  else
+    say "work-session NOT filed for seat $seat_name: the session-start hook's line above says why"
+  fi
+}
+
+# The end of a claude seat's conversation ends its packet: session-end.sh
+# with the seat's mark taken off, the one end that hook does not keep
+# open. Best-effort, like every write here; a packet this cannot end is
+# ended by the six-hour clock.
+end_session() {
+  local why=$1 packet
+  [ "$kind" = claude ] && [ -n "$session" ] || return 0
+  packet=$(tr -d '[:space:]' <"$BOSS_HOOK_STATE/$session/packet" 2>/dev/null)
+  [ -n "$packet" ] || return 0
+  jq -nc --arg s "$session" --arg r "$why" --arg cwd "$PWD" \
+    '{session_id: $s, reason: $r, cwd: $cwd, hook_event_name: "SessionEnd"}' |
+    env -u BOSS_SEAT "$hooks/session-end.sh" >>"$log" 2>&1
+  say "work-session $packet of seat $seat_name: ended ($why)"
+}
+
+# The restart note: reason, exit code, wait, log. Best-effort.
+note_restart() {
+  local reason=$1 code=$2 wait=$3 sid stamp note_key
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  note_key=factory_restart_$stamp
+  if ! sid=$(open_session) || [ -z "$sid" ]; then
+    say "restart note NOT written: no open work-session for $actor could be read"
+    return 0
+  fi
+  jq -n --arg k "$note_key" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg by "$actor" \
+    --arg reason "$reason" --argjson code "$code" --argjson wait "$wait" --arg log "$log" \
+    --arg cli "$cli" --arg seat "$seat_name" \
+    '{($k): {at: $at, by: ($by + " factory-loop"), seat: $seat, reason: $reason, exit_code: $code,
+      backoff_seconds: $wait, cli: $cli, log: $log}}' >"$note_body"
+  if boss-api PATCH "/api/jobs/$sid/metadata" "$note_body" >/dev/null 2>&1; then
+    say "restart note $note_key written on work-session $sid"
+  else
+    say "restart note NOT written: PATCH /api/jobs/$sid/metadata refused or unreachable"
+  fi
+}
+
+# The turn heartbeat: `last_active_at`, which the six-hour age-out reads,
+# beside `factory_turn`, which marks it as the supervisor's. Best-effort,
+# like the restart note.
+heartbeat() {
+  local phase=$1 sid now
+  if ! sid=$(open_session) || [ -z "$sid" ]; then
+    say "heartbeat ($phase) NOT written: no open work-session for $actor could be read"
+    return 0
+  fi
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  jq -n --arg at "$now" --arg phase "$phase" --argjson turn "$turn" --arg by "$actor" \
+    --arg seat "$seat_name" \
+    '{last_active_at: $at,
+      factory_turn: {turn: $turn, phase: $phase, seat: $seat, at: $at, by: ($by + " factory-loop")}}' \
+    >"$beat_body"
+  if ! boss-api PATCH "/api/jobs/$sid/metadata" "$beat_body" >/dev/null 2>&1; then
+    say "heartbeat ($phase) NOT written: PATCH /api/jobs/$sid/metadata refused or unreachable"
+  fi
+}
+
+turn=0
+failures=0
+resume_failures=0
+
+# A claude seat stopped by a signal — a pod roll's TERM, a tmux
+# kill-session's HUP, a ^C — ends its conversation's packet on the way
+# out, so the record never shows a stopped seat as an open session for
+# the six hours the silent-session clock would take to say otherwise.
+# Bash runs the trap once the turn in flight returns.
+stop() {
+  say "stopped by SIG$1"
+  end_session "seat loop stopped by SIG$1"
+  exit $((128 + $2))
+}
+if [ "$kind" = claude ]; then
+  trap 'stop HUP 1' HUP
+  trap 'stop INT 2' INT
+  trap 'stop TERM 15' TERM
+fi
+
+while :; do
+  turn=$((turn + 1))
+  rotate_log
+  resumed=$session
+  if [ "$kind" = claude ]; then
+    # The loop names the conversation itself, so the id is known before
+    # the turn prints anything: a fresh turn creates it, every later one
+    # resumes it. `auto` is the permission mode the interactive seats
+    # run under; -p has nobody to answer a prompt either.
+    if [ -n "$session" ]; then
+      cmd=("$cli" -p --permission-mode auto --resume "$session")
+    else
+      session=$(cat /proc/sys/kernel/random/uuid)
+      cmd=("$cli" -p --permission-mode auto --session-id "$session")
+    fi
+  elif [ -n "$session" ]; then
+    cmd=("$cli" exec resume -c "$policy" "$session" -)
+  else
+    cmd=("$cli" exec -c "$policy" -)
+  fi
+  [ "$kind" = claude ] && own_session
+  heartbeat start
+  say "turn $turn: ${cmd[*]} < $prompt_file"
+  timeout --kill-after=60 "$turn_timeout" "${cmd[@]}" <"$prompt_file" 2>&1 | tee "$turn_out" | log_turn
+  code=${PIPESTATUS[0]}
+  heartbeat end
+
+  # The header's own line, in the turn's first lines, first match only.
+  # Codex's only: a claude seat's id is the one the loop chose.
+  if [ "$kind" = codex ]; then
+    seen=$(sed -n '1,40{/^session id: [0-9a-fA-F-]\{36\}$/{s/^session id: //p;q}}' "$turn_out")
+    if [ -n "$seen" ] && [ "$seen" != "$session" ]; then
+      session=$seen
+      resume_failures=0
+    fi
+  fi
+
+  cli_errors=$(grep -E "$err_re" "$turn_out")
+  last=$(tail -n 20 "$turn_out")
+  reason=''
+  if grep -Eiq "$limit_re" <<<"$cli_errors"; then
+    reason='model rate or capacity limit'
+  elif [ "$code" -ne 0 ] && grep -Eiq "$limit_re" <<<"$last"; then
+    reason='model rate or capacity limit'
+  elif [ "$code" -ne 0 ]; then
+    reason="exit $code"
+  fi
+
+  if [ -z "$reason" ]; then
+    failures=0
+    resume_failures=0
+    say "turn $turn ended cleanly; next turn in ${pause}s"
+    wait_s=$pause
+  else
+    # Only a failure ON THE ID counts toward dropping it (N3): the CLI's
+    # own error line names an unknown or expired id, and the turn was not
+    # a limit. A limit or any other failure leaves the count alone.
+    if [ -n "$resumed" ] && [ "$resumed" = "$session" ] &&
+      [ "$reason" != 'model rate or capacity limit' ] &&
+      grep -Eiq "$resume_re" <<<"$cli_errors"; then
+      resume_failures=$((resume_failures + 1))
+      if [ "$resume_failures" -ge 2 ]; then
+        say "dropping resume id $session: $resume_failures resumed turns failed on the id itself (unknown or expired); the next turn starts fresh"
+        end_session "seat loop dropped conversation $session: its CLI no longer has it"
+        session=''
+        resume_failures=0
+      fi
+    fi
+    i=$failures
+    [ "$i" -ge "${#backoff[@]}" ] && i=$((${#backoff[@]} - 1))
+    wait_s=${backoff[$i]}
+    failures=$((failures + 1))
+    say "turn $turn FAILED ($reason, exit $code); relaunching in ${wait_s}s (failure $failures in a row)"
+    note_restart "$reason" "$code" "$wait_s"
+  fi
+
+  if [ "$max_turns" -gt 0 ] && [ "$turn" -ge "$max_turns" ]; then
+    say "stopping after $turn turn(s) (FACTORY_MAX_TURNS)"
+    end_session "seat loop stopped after $turn turn(s) (FACTORY_MAX_TURNS)"
+    exit 0
+  fi
+  "$sleep_cmd" "$wait_s"
+done

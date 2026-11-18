@@ -1,6 +1,6 @@
 # Design: the physical layer, virtualized — nodes and instances as data
 
-**Status**: approved — in-review — open questions tracked at `/system/design` (2026-08-18).
+**Status**: decided, awaiting its fold (re-statused 2026-11-18, backlog 924de432). All five questions are resolved (see Decisions); the `/system/design` route this line used to name was deleted on 2026-09-10. Its decisions belong in `docs/architecture-decisions.md` §Deployment, the forge, and the cluster, which fold car 79d0040f is editing, so this file is folded and deleted after that car lands. The estate registry (`GET /api/estate…`) answers what the hardware is today; this file does not.
 **Origin**: David, 2026-08-16: *"I have wanted a view on the physical
 infrastructure for a while, and it is because I figured we have
 confusion in this area about exactly what resources we had under what
@@ -10,7 +10,7 @@ without having the data available to BossNET."* Immediately preceded
 by: *"Let's clean up our network topology and understanding... We want
 a unified understanding even if we have physical nodes designated for
 specific things."*
-**Related**: [deployment-as-network.md](./deployment-as-network.md)
+**Related**: [deployment-as-network, folded into the decision record](../architecture-decisions.md)
 (how intent reaches a node) · [dev-cluster.md](./dev-cluster.md) ·
 [the-three-layers.md](./the-three-layers.md) (this doc is about the
 substrate layer) · `crates/core/boss-ports` (service → port, the one

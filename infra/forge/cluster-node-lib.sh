@@ -1,7 +1,9 @@
 # cluster-node-lib.sh — the ONE reading of which cluster node a node
 # verb acts on, and whether it may (backlog f0aaa72f; design 8457c07b,
 # the w-1 second-NVMe window). Sourced by cordon-node.sh, shutdown-node.sh,
-# talos-get.sh, node-status.sh, node-disk-usage.sh and node-converge.sh, so the verbs cannot disagree about
+# talos-get.sh, talos-read-diskstats.sh, node-status.sh, node-disk-usage.sh,
+# node-converge.sh, wipe-a-partition.sh, node-labels.sh, node-pods.sh and
+# registry-probe.sh, so the verbs cannot disagree about
 # what a worker is, which pods a drain evicts, or which budgets hold it
 # (CLAUDE.md §9a).
 #
@@ -85,7 +87,7 @@ node_read_registry() {
     fi
     # The status is KEPT (node-roles.sh's lesson): a 403 read as "no such
     # node" would be a confident wrong answer. `000` is a file:// fixture.
-    if ! out="$(curl -sS --max-time 15 \
+    if ! out="$(curl -q -sS --max-time 15 \
             ${NODE_MT_HDR:+-H "$NODE_MT_HDR"} \
             -H "x-boss-user: $(sor_reader_header "automation:$ME")" \
             -w '\n%{http_code}' "$url" 2> "$WORK/registry.err")"; then
@@ -106,6 +108,9 @@ node_read_registry() {
     [ "$retired" = false ] || node_refuse "the estate registry marks $id retired (retired=$retired) — a retired machine is history, not a target"
     NODE_ROLE="$(jq -r '.[0].role // ""' <<< "$rows")"
     NODE_ADDRESS="$(jq -r '.[0].address // ""' <<< "$rows")"
+    # The row's prose, where a node's purpose label is declared today
+    # (`boss.dev/purpose=database`); node-labels compares it to the Node.
+    NODE_NOTES="$(jq -r '.[0].notes // ""' <<< "$rows")"
     # ONE address literal, or no door is opened (observe-nodefs.sh's rule,
     # review of 4327d1a3): `talosctl -n` takes a comma list and a hostname
     # would have apid proxy to whatever it resolves to.

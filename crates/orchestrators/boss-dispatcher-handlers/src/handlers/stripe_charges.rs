@@ -1332,6 +1332,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review_optional_read_context_keeps_existing_stripe_transport_unchanged() {
+        let (base, seen) = stub_stripe(200).await;
+        let source = StripeCharges::new(base);
+        let since = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let original = source.read("rk_test_good", Some(since)).await.unwrap();
+        let requests = seen.lock().unwrap().clone();
+        for context in [
+            None,
+            Some(super::super::sensor_poll::SourceReadContext {
+                witnessed: vec![boss_jobs::sensors::CursorWitness {
+                    message_key: "unrelated".into(),
+                    at: since,
+                }],
+            }),
+        ] {
+            seen.lock().unwrap().clear();
+            assert_eq!(
+                source
+                    .read_with_context("rk_test_good", Some(since), context.as_ref())
+                    .await
+                    .unwrap(),
+                original
+            );
+            assert_eq!(*seen.lock().unwrap(), requests);
+        }
+        assert!(!source.supports_read_context());
+    }
+
+    #[tokio::test]
     async fn a_read_pages_from_the_cursor_inclusive_with_the_key_as_bearer() {
         let (base, seen) = stub_stripe(200).await;
         let src = StripeCharges::new(base);

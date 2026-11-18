@@ -207,6 +207,15 @@ impl CadenceRegistry for PgCadence {
             .collect()
     }
 
+    async fn lineage_names(&self) -> Result<Vec<String>, CadenceError> {
+        sqlx::query_scalar(
+            "SELECT name FROM cadence_rules GROUP BY name ORDER BY name COLLATE \"C\"",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)
+    }
+
     async fn publish_declared(
         &self,
         mut spec: CadenceRuleSpec,

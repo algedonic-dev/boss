@@ -1,12 +1,12 @@
 # Design: the system took its own record-keeper down, and did not notice
 
-**Status**: in-review — protocol proposals need David's call
+**Status**: awaiting its disposition (re-statused 2026-11-18, backlog 924de432). No reader holds its four questions for David: they predate the design-doc packet, and the in-app review that used to show them was deleted on 2026-09-10. Several were overtaken by what was built later (the schema directory replaced the manifest, and migrations are append-only by lint). The file's topic belongs to `docs/architecture-decisions.md` §Deployment, the forge, and the cluster, which fold car 79d0040f is editing and which also edits this file, so this file is folded, or its still-open questions re-filed as a packet, after that car lands.
 **Origin:** David, 2026-08-13 (verbatim): "Losing the communication
 because of a bad push but not even realizing we were the cause is a
 big problem." And: "I want to understand thoroughly what happened here
 so that we can implement a protocol to avoid it."
 **Related**: [packet-loss, folded into the decision record](../architecture-decisions.md) ·
-[deployment-as-network.md](./deployment-as-network.md) ·
+[deployment-as-network, folded into the decision record](../architecture-decisions.md) ·
 [design-conformance.md](./design-conformance.md) ·
 [schema-migrations.md](./schema-migrations.md)
 

@@ -1,0 +1,63 @@
+# ---------------------------------------------------------------------------
+# probe-shed — landed cars waiting for their recorded probe: every open
+# ship-a-change car whose `proven` step is ready or being worked.
+#
+# An EQUIPMENT station (design ccfe87ff, decided by David 2026-11-05:
+# question first-executors, "record-verdict and the probe by equipment",
+# and question converge-stations; pass item 2, backlog 364b27a3). The
+# third of the three: the equipment that runs a car's probe against the
+# converged tree. Its automaton is the ops runner, which answers the
+# `run-car-probe` ops-request (infra/ops/verbs/run-car-probe.json) with
+# `boss prove <car> --from-car --unattended` as the account boss-probe,
+# and completes `proven` with the proof record. Measured 2026-11-05: all
+# 60 of the 60 newest closed cars, and all 11 open cars already proven,
+# record automation:ops-runner as the completer. What it holds is the
+# probe account, its read-only view of the converged checkout and the
+# reader credential — nothing the deploy or the converge use.
+#
+# ONE BAY, because there is one such runner and it runs one request at a
+# time. The verb names one host (`"hosts": ["forge"]`), the runner unit
+# there is `Type=oneshot` (infra/ops/boss-ops-runner.service), and its
+# walk is serial (infra/ops/ops-runner.sh: "The walk is serial and has
+# no per-verb fairness"; backlog 1ffb3305, b81ff4ca). A second probe
+# waits for the first, and so does a converge behind them.
+#
+# To change this station, bump `version`.
+#
+# Version 2 (T2 of design 4b27a65a, backlog 3f58c823; bumped from the
+# LIVE newest, v1): the station stands in the tree — its stable `id`, its
+# `parent` /algedonic/engineering (handoff section 7: the shed is where
+# landed cars prove, under Engineering), its mode, and its seats, the
+# same number as its bays. Nothing else changed.
+#
+# Version 3 (backlog a1c0a0ff, design deba3000; bumped from the tree's
+# v2): the hand-typed `[station.upstream]` is gone. It named a /system
+# route the IT consolidation retired on 2026-08-31, so the walk upstream
+# led to a not-found page. A station's upstream is now DERIVED from the
+# tree, as its parent station's page (`upstreamOf` in
+# apps/web/src/it/tree/station-page.ts), and the seed refuses a declared
+# one. The retired department label is removed with its floor reader
+# (backlog aa82eb11); the station's parent places it in the tree.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "probe-shed"
+version = 4
+id = "e24e53d8-62f9-4014-961f-dea0e428a3bb"
+parent = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5"
+mode = "standing"
+capacity = 1
+status = "active"
+title = "Probe shed — landed cars waiting for their probe"
+kind = "equipment"
+automaton = "automation:ops-runner"
+bays = 1
+discipline = ["age"]
+
+[station.predicate]
+kind = "ship-a-change"
+status = "open"
+
+[station.predicate.step]
+slug = "proven"
+status_in = ["ready", "active"]

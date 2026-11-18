@@ -1,5 +1,5 @@
-//! Rebuild `search_index` from the core identity tables, which are
-//! themselves projections of `audit_log`.
+//! Rebuild `search_index` from the core identity tables and
+//! `event_facts`, which are themselves projections of `audit_log`.
 //!
 //! TRUNCATE-then-replay, one transaction, advisory-locked — the same
 //! shape as every other rebuilder, and registered in `boss-rebuild-all`
@@ -94,55 +94,63 @@ pub async fn rebuild_search(pool: &PgPool) -> Result<RebuildSearchReport, Search
     // an event you cannot trace to a thing is not a search result, it
     // is noise.
     //
-    // The candidate filter requires the COMPLETE (kind, id) pair. A
-    // candidate can resolve an id with no kind (a payload carrying
-    // `subject_id` alone, or a subject_edges row whose target_kind and
-    // target_kind_path both come up empty) — and `NULL || ' ' || id`
-    // is NULL, so one such event nulled `body` and aborted the whole
-    // rebuild on the NOT NULL constraint. Measured 2026-08-19: the
-    // reindex timer had been crash-looping on exactly this while the
-    // index it was rebuilding fell behind.
-    // Subject resolution matches boss-views' event_facts exactly:
-    // flat keys, then the `subject_edges` registry, then the Job the
-    // event names — with kind and id taken as a pair from whichever
-    // source produced the id. Reading only the flat keys left this
-    // index holding 3,694 event rows against 776,629 in the log, so
-    // "what happened to this Subject" was answerable for almost
-    // nothing.
+    // A COMPLETE (kind, id) pair is required. A row with an id and no
+    // kind (a payload carrying `subject_id` alone) would make
+    // `NULL || ' ' || id` NULL, and one such event nulled `body` and
+    // aborted the whole rebuild on the NOT NULL constraint — measured
+    // 2026-08-19, a reindex timer crash-looping while the index fell
+    // behind.
+    //
+    // Read from `event_facts`, not `audit_log` (backlog 832386eb,
+    // 2026-11-11). Until then this statement resolved every log row's
+    // Subject itself and ranked the whole log with ROW_NUMBER() OVER
+    // (PARTITION BY subject ORDER BY id DESC) to keep 50 each: a sort of
+    // the entire log, every hour, which wrote 13.0 GB of temp files per
+    // run (47.6 M temp blocks over 30 calls, queryid
+    // 3112194067547126450) onto a pgdata volume with 5.7 GiB free.
+    // `event_facts` already holds that resolution — flat keys, then the
+    // `subject_edges` registry, then the Job the event names — and its
+    // `event_facts_subject (subject_kind, subject_id, audit_id DESC)`
+    // index IS the order the cap needs. So the Subjects are walked off
+    // that index one at a time (each step a LIMIT 1 past the last), and
+    // each one's newest 50 are a LIMIT read off the same index. Nothing
+    // log-sized is sorted or held: the planner may still top-N a single
+    // Subject's rows in memory under its LIMIT, and the one thing kept
+    // is the Subject list, one narrow row per Subject. Pinned by
+    // tests/rebuild_events_plan_pg.rs.
+    //
+    // Two differences, both accepted. Freshness: `event_facts` trails
+    // the log by one `boss-views-catchup` (every five minutes), inside
+    // the hour this index already lags. Resolution: event_facts takes
+    // the first candidate with an id, where this took the first with a
+    // kind AND an id, so an event whose first id-bearing candidate has
+    // no kind is skipped here rather than falling through to a later
+    // source.
     let events = sqlx::query(
-        "INSERT INTO search_index \
+        "WITH RECURSIVE subject AS ( \
+             (SELECT f.subject_kind, f.subject_id FROM event_facts f \
+              WHERE f.subject_kind IS NOT NULL AND f.subject_id IS NOT NULL \
+              ORDER BY f.subject_kind, f.subject_id LIMIT 1) \
+             UNION ALL \
+             SELECT next.subject_kind, next.subject_id \
+             FROM subject previous CROSS JOIN LATERAL ( \
+                 SELECT f.subject_kind, f.subject_id FROM event_facts f \
+                 WHERE f.subject_kind IS NOT NULL AND f.subject_id IS NOT NULL \
+                   AND (f.subject_kind, f.subject_id) \
+                       > (previous.subject_kind, previous.subject_id) \
+                 ORDER BY f.subject_kind, f.subject_id LIMIT 1 \
+             ) next \
+         ) \
+         INSERT INTO search_index \
             (ref_kind, ref_id, subject_kind, subject_id, title, body, occurred_at) \
-         SELECT 'event', ranked.id::text, ranked.subject_kind, ranked.subject_id, \
-                ranked.kind, ranked.subject_kind || ' ' || ranked.subject_id, \
-                ranked.timestamp \
-         FROM ( \
-             SELECT a.id, a.kind, a.timestamp, sub.subject_kind, sub.subject_id, \
-                    ROW_NUMBER() OVER ( \
-                        PARTITION BY sub.subject_kind, sub.subject_id \
-                        ORDER BY a.id DESC \
-                    ) AS rn \
-             FROM audit_log a \
-             LEFT JOIN LATERAL ( \
-                 SELECT field_path, target_kind, target_kind_path \
-                 FROM subject_edges WHERE source_kind = a.kind \
-                 ORDER BY field_path LIMIT 1 \
-             ) se ON TRUE \
-             LEFT JOIN jobs j \
-               ON j.id::text = COALESCE(a.payload->>'job_id', a.payload->>'id') \
-             LEFT JOIN LATERAL ( \
-                 SELECT k AS subject_kind, i AS subject_id \
-                 FROM (VALUES \
-                     (a.payload->>'subject_kind', a.payload->>'subject_id'), \
-                     (COALESCE(se.target_kind, \
-                               a.payload #>> string_to_array(se.target_kind_path, '.')), \
-                      a.payload #>> string_to_array(se.field_path, '.')), \
-                     (j.subject_kind, j.subject_id) \
-                 ) AS candidates(k, i) \
-                 WHERE k IS NOT NULL AND i IS NOT NULL LIMIT 1 \
-             ) sub ON TRUE \
-             WHERE sub.subject_id IS NOT NULL \
-         ) ranked \
-         WHERE ranked.rn <= $1",
+         SELECT 'event', newest.audit_id::text, s.subject_kind, s.subject_id, \
+                newest.kind, s.subject_kind || ' ' || s.subject_id, \
+                newest.occurred_at \
+         FROM subject s CROSS JOIN LATERAL ( \
+             SELECT f.audit_id, f.kind, f.occurred_at FROM event_facts f \
+             WHERE f.subject_kind = s.subject_kind AND f.subject_id = s.subject_id \
+             ORDER BY f.audit_id DESC LIMIT $1 \
+         ) newest",
     )
     .bind(EVENTS_PER_SUBJECT)
     .execute(&mut *tx)

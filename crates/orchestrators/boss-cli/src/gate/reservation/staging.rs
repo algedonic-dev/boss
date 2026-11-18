@@ -36,6 +36,33 @@ pub(super) async fn policy_on(doors: &Doors<'_>) -> Result<Value> {
     Ok(row)
 }
 
+/// The active `gates` equipment station row — whose `bays` are the gate
+/// capacity (item 0a78f8f8) — read strictly, like the policy above: an
+/// unreadable lineage, no active row, or a row that is not the gates
+/// equipment refuses, and never becomes the compiled fallback. A
+/// reservation or a resident pass that cannot read the bound does not
+/// guess one.
+pub(super) async fn gates_on(doors: &Doors<'_>) -> Result<Value> {
+    let versions = api(
+        doors,
+        reqwest::Method::GET,
+        &crate::gate::gates_versions_path(),
+        None,
+    )
+    .await?
+    .context("the gates station is unavailable")?;
+    let row = crate::gate::active_station_row(&versions)
+        .context("the gates station has no active row")?
+        .clone();
+    if row.get("name").and_then(Value::as_str) != Some(boss_jobs::stations::GATES_STATION)
+        || row.get("kind").and_then(Value::as_str)
+            != Some(boss_jobs::StationKind::Equipment.as_str())
+    {
+        bail!("the gates station row is not the gates equipment station: {row}");
+    }
+    Ok(row)
+}
+
 fn fields(schema: &Value, name: &str) -> Result<Vec<String>> {
     let Some(value) = schema.get(name) else {
         return Ok(vec![]);

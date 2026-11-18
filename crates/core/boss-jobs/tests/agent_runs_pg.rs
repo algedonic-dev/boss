@@ -746,8 +746,12 @@ async fn an_over_cap_run_is_a_row_whose_budget_reads_deny() {
     assert_eq!(denied, 0, "nothing was refused");
 }
 
+/// The row's `max_concurrent_runs` is still a column, and the recorder
+/// no longer reads it (backlog 3e927996: a robot's runs are bounded by
+/// its `robots:<model>` pool alone). A cap of one with an overlapping run
+/// reads as allowed.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_run_started_while_another_was_in_flight_reads_over_the_concurrency_cap() {
+async fn a_run_started_while_another_was_in_flight_is_not_read_against_the_retired_cap() {
     let db = TestDb::new().await;
     cap_the_agent(&db, None, Some(1)).await;
     let log = PgAgentRuns::new(db.pool.clone());
@@ -763,16 +767,13 @@ async fn a_run_started_while_another_was_in_flight_reads_over_the_concurrency_ca
         .await
         .expect("recorded, one of one in flight at 01:05");
     assert!(
-        matches!(&mid.run.budget, Some(BudgetDecision::Deny { reason }) if reason.contains("in flight")),
+        matches!(&mid.run.budget, Some(BudgetDecision::Allow { .. })),
         "{:?}",
         mid.run.budget
     );
-    log.record_run(&priced_run("run-after", 1, 11), &filer())
-        .await
-        .expect("nothing in flight at 01:11");
 }
 
-/// The seeded row has both caps NULL, and that is the live shape: the
+/// The seeded row has its caps NULL, and that is the live shape: the
 /// run is admitted with nothing to count down, never refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_seeded_agent_is_unbudgeted_and_admitted() {
@@ -1241,5 +1242,50 @@ async fn a_work_profile_survives_a_rebuild_and_a_re_report_replaces_it() {
     assert!(
         window(later, at).await.is_err(),
         "an inverted window is refused, not answered empty"
+    );
+}
+
+/// The per-protocol reading's one read of the jobs table (backlog
+/// 05bf580b): `jobs.kind` for each id the table holds, and an id it
+/// does not hold ABSENT rather than an error or a dropped answer — the
+/// caller buckets that run as an unknown packet.
+#[tokio::test(flavor = "multi_thread")]
+async fn job_kinds_names_each_held_packets_protocol_and_omits_the_rest() {
+    let db = TestDb::new().await;
+    let log = PgAgentRuns::new(db.pool.clone());
+    let seed = |kind: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            let id = uuid::Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO jobs (id, kind, subject_kind, subject_id, title, owner_id, priority, status, opened_on) \
+                 VALUES ($1, $2, 'custom', 'main', 'T', 'emp-o', 'standard', 'open', CURRENT_DATE)",
+            )
+            .bind(id)
+            .bind(kind)
+            .execute(&pool)
+            .await
+            .expect("job");
+            id
+        }
+    };
+    let backlog = seed("backlog-item").await;
+    let design = seed("design-doc").await;
+    let unheld = uuid::Uuid::new_v4();
+
+    let kinds = log
+        .job_kinds(&[backlog, design, unheld])
+        .await
+        .expect("reads");
+    assert_eq!(kinds.len(), 2, "{kinds:?}");
+    assert_eq!(
+        kinds.get(&backlog).map(String::as_str),
+        Some("backlog-item")
+    );
+    assert_eq!(kinds.get(&design).map(String::as_str), Some("design-doc"));
+    assert!(!kinds.contains_key(&unheld), "an unheld id is absent");
+    assert!(
+        log.job_kinds(&[]).await.expect("reads").is_empty(),
+        "no ids, no kinds"
     );
 }

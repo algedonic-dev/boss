@@ -113,6 +113,24 @@ pub fn split_in_force(job: &Job) -> Option<(String, ExperimentSplit)> {
     Some((kind, declared_split(job)?))
 }
 
+/// The open experiment whose split in force still admits packets to
+/// `(kind, version)` on either arm — lowest id first, so the answer is
+/// one every reader agrees on. Backlog 50ded63d: a candidate is
+/// rejected only once its experiment is concluded; rejecting it while
+/// the split still names it would quietly turn its share of admissions
+/// back to the active version, and the cohort the experiment measures
+/// with it.
+pub fn splitting_onto(experiments: &[Job], kind: &str, version: i32) -> Option<JobId> {
+    experiments
+        .iter()
+        .filter_map(|j| split_in_force(j).map(|(k, s)| (j.id, k, s)))
+        .filter(|(_, k, s)| {
+            k == kind && (s.control_version == version || s.candidate_version == version)
+        })
+        .map(|(id, _, _)| id)
+        .min_by_key(|id| id.to_string())
+}
+
 /// What a write to a packet NEWLY puts in force: the split `after`
 /// declares, when `before` (`None` for an admission) did not already
 /// have exactly that split in force. `None` when the write leaves every
@@ -236,6 +254,30 @@ mod tests {
         assert_eq!(got.control_version, 2);
         assert_eq!(got.candidate_version, 3);
         assert_eq!(got.split, 20);
+    }
+
+    /// Backlog 50ded63d: a version an open experiment still splits
+    /// traffic onto is not concluded, so the reject door asks this
+    /// first. Either arm counts; another kind, another version, or a
+    /// closed experiment does not.
+    #[test]
+    fn an_open_split_names_both_its_arms_and_nothing_else() {
+        let e = experiment(serde_json::json!({
+            "kind_under_test": "agent-run",
+            "control_version": 2,
+            "candidate_version": 3,
+        }));
+        let all = std::slice::from_ref(&e);
+        assert_eq!(splitting_onto(all, "agent-run", 3), Some(e.id));
+        assert_eq!(splitting_onto(all, "agent-run", 2), Some(e.id));
+        assert_eq!(splitting_onto(all, "agent-run", 4), None);
+        assert_eq!(splitting_onto(all, "backlog-item", 3), None);
+        let mut closed = e.clone();
+        closed.status = JobStatus::Closed;
+        assert_eq!(
+            splitting_onto(std::slice::from_ref(&closed), "agent-run", 3),
+            None
+        );
     }
 
     #[test]

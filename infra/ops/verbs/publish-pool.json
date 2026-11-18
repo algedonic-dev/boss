@@ -1,0 +1,21 @@
+{
+  "about": "MUTATING — publish ONE resource pool row through the live pools door (POST /api/pools/{name}/publish, by `boss pool publish`), from the bytes a publish-a-protocol packet its owner signed carries, on boss-gcp (infra/gcp/publish-pool.sh). WHY: until backlog f399458f a pool row reached the registry only through the platform seed on a converge, so a value change — robots:opus 4 to 6, item 89b17d21 — rode a code car, a gate and a train; David, 2026-11-08: 'we should be able to make these registry changes via a different protocol than the code changes.' Ask 1 built the door, this verb is the automaton step behind the website approval (ask 2). IT PUBLISHES NOTHING UNSIGNED: the one arg is the pool name, pattern-checked by the runner and again by the script, and the row's bytes are never argv — the script follows the request it answers (OPS_REQUEST_ID) through metadata.for_protocol_publish, written by the dispatcher rule publish-a-protocol-files-its-pool-publish, to a publish-a-protocol packet it READS BACK and judges with infra/lib/signed-publish.jq, the same program publish-workflow.sh runs: open, registry pool, this pool, its publish-pool step not done, approve completed `approved` with a presence stamp per required role bound to approve's CURRENT shape by an employee this file's `approvers` names and no live stamp by anyone else, the signed spec_path infra/platform/pools/<name>.toml, the signed spec_sha256 equal to the sha256 of the packet's row_toml (the bytes it then publishes), and a numeric signed live_version. Any failed check refuses 9 before the CLI runs. The publish itself is the CLI's checked sequence with `--over <signed live_version>`: the seed's loader reads the row, the door's _validate lints it, a lineage whose newest is not the signed version is refused (a diff signed against vN is no approval to publish over vM), the publish posts the row, and the lineage is read back — a 200 that landed nothing is NOT CONFIRMED (exit 7). The confirmed line names both versions, which the rule complete-pool-publish-on-publish-pool-answered copies onto the packet. Signs as the account running it (BOSS_ACTOR, default automation:ops-runner); the approving human is the packet's signer. The tree write-back (infra/platform/pools/<name>.toml) is NOT this verb's: it is the drift comparator's data car. Authorization: David 2026-11-08, backlog f399458f; admitted by name in infra/lint/a-verb-declares-the-hosts-it-serves.sh and flagged for review, the same per-verb process as publish-workflow.",
+  "hosts": [
+    "boss-gcp"
+  ],
+  "approvers": [
+    "emp-david"
+  ],
+  "argv": [
+    "infra/gcp/publish-pool.sh",
+    "{1}"
+  ],
+  "params": [
+    {
+      "name": "pool",
+      "pattern": "^[a-z][a-z0-9_-]{0,40}(:[a-z0-9][a-z0-9_.-]{0,40})?$"
+    }
+  ],
+  "timeout": 120,
+  "effect": "^publish-pool: .+ live at .+ — confirmed by reading the lineage back"
+}

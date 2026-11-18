@@ -205,11 +205,12 @@ pub enum Prior {
 /// `refused` since ff5b9634, but every run recorded before it — every
 /// landed car — says `failed` for a gate that refused before any check
 /// ran, while its receipt says `verdict: refused` and carries the
-/// reason. The receipt
-/// is the specific record and it wins here, exactly as it already does
-/// in `train_gate::standing`, which reads the same two fields to spare
-/// the cars aboard a train. §Diagnosis: an infrastructure refusal is
-/// not a consist failure.
+/// reason. The explicit refusal receipt wins over that legacy red word
+/// here and in `train_gate::standing`. Their classifications differ:
+/// the train reader also handles unreadable receipts and recorded
+/// unjudged failure facts; this prior reader considers only red runs
+/// and their explicit refusal receipts. §Diagnosis: an infrastructure
+/// refusal is not a consist failure.
 ///
 /// FILTERED HERE AS WELL AS AT THE SERVER. The caller narrows the read
 /// with `metadata={"branch":…,"sha":…}`, but a server that does not know

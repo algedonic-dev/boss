@@ -207,6 +207,97 @@ fn a_current_mirror_still_measures_as_nothing_to_publish() {
         stdout.contains("\"scanned_sha\":\"none\""),
         "no scan ran, and the JSON must say so as a string: {stdout}"
     );
+    // What stays behind is reported even when it is nothing: a zero is
+    // printed, not omitted (design f7087b8c D1).
+    assert!(
+        stdout.contains("\"internal_excluded\":0"),
+        "the reading must say how many internal/ files stay behind: {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// WHAT LEAVES IS THE PUBLIC TREE (design f7087b8c D1, backlog e7f062d3).
+// How Algedonic runs its estate lives under one top-level `internal/`,
+// which the snapshot omits — so the measure compares the mirror with the
+// source's tree WITHOUT it, counts what it leaves behind, and still scans
+// the full tree for secrets.
+// ---------------------------------------------------------------------
+
+/// Forge-only files are counted as excluded, never as changed.
+#[test]
+fn internal_files_are_counted_as_excluded_and_never_as_changed() {
+    let work = fixture_with_source(
+        "internal-excluded",
+        &[
+            (
+                "internal/operating.md",
+                "how Algedonic runs it\n".to_string(),
+            ),
+            ("internal/lint/a.sh", "#!/bin/sh\nexit 0\n".to_string()),
+            ("NOTES", "a public change\n".to_string()),
+        ],
+    );
+    let out = run(&work, "publish-src", true);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains("\"internal_excluded\":2"),
+        "both internal/ files are what the snapshot omits: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"files_changed\":1"),
+        "only NOTES would leave; internal/ is not a change to the mirror: {stdout}"
+    );
+    assert!(stdout.contains("\"has_drift\":true"), "{stdout}");
+}
+
+/// A train that touched only `internal/` moves the source ref ahead and
+/// leaves the public tree exactly as the mirror reads it: no drift, so
+/// the packet closes nothing-to-publish rather than opening an empty PR.
+#[test]
+fn an_internal_only_change_is_no_drift() {
+    let work = fixture_with_source(
+        "internal-only",
+        &[(
+            "internal/operating.md",
+            "how Algedonic runs it\n".to_string(),
+        )],
+    );
+    let out = run(&work, "publish-src", true);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains("\"has_drift\":false"),
+        "the public tree is the mirror's tree: {stdout}"
+    );
+    assert!(stdout.contains("\"commits_ahead\":1"), "{stdout}");
+    assert!(stdout.contains("\"files_changed\":0"), "{stdout}");
+    assert!(stdout.contains("\"internal_excluded\":1"), "{stdout}");
+}
+
+/// The secrets scan reads the FULL source tree, a superset of what
+/// leaves: a credential under `internal/` still blocks the publish.
+#[test]
+fn a_secret_under_internal_still_blocks() {
+    let work = fixture_with_source(
+        "secret-in-internal",
+        &[
+            ("internal/leak.env", planted_secret()),
+            ("NOTES", "a public change\n".to_string()),
+        ],
+    );
+    let out = run(&work, "publish-src", true);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a secret anywhere in the source tree blocks; stdout={stdout} stderr={stderr}"
+    );
+    assert!(stdout.contains("\"secrets_scan\":\"FAILED\""), "{stdout}");
+    assert!(stderr.contains("internal/leak.env"), "{stderr}");
 }
 
 // ---------------------------------------------------------------------

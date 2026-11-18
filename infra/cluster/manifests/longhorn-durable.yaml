@@ -1,0 +1,38 @@
+# The durable Longhorn class (design 3c475a19 D2, section 4 car 2;
+# backlog 46328c3a). Three replicas, as Longhorn's default `longhorn`
+# class keeps every durable volume today, and `diskSelector: durable`, so
+# a replica is placed only on a disk the disk-tag door has tagged
+# `durable`: the default disks, and the data node's Microns as they join.
+# Never the scratch disk (w-1's Kingston, tag `scratch`), which holds
+# only disposable dev-build worker volumes (design D3).
+#
+# Why a class at all: Longhorn places a volume whose class names no disk
+# selector on ANY schedulable disk, so once a scratch disk exists a
+# durable volume's next replica could land there. A selector is how a
+# volume says where it may live, and this class is that selector for
+# every durable claim made from here on.
+#
+# WHAT IT DOES NOT DO YET. No claim names it in this car: the durable
+# claims alive today were made from `longhorn`, a claim's class is
+# immutable, and a StatefulSet's volumeClaimTemplates cannot be edited
+# in place, so pointing boss.yaml's templates at it would fail the
+# converge. And until the default disks carry the `durable` tag, a
+# volume cut from it could not place at all — which waits for design
+# car 5: the disk-tag door (backlog aa650aaf) refuses the control
+# planes' disks, and every durable volume has a replica there. The order
+# is in infra/cluster/talos/README.md (the scratch disk's sequence); the
+# existing volumes take the same selector on the Longhorn volume itself,
+# not through this class. dev_build_volume_class.rs pins it.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: longhorn-durable
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  numberOfReplicas: "3"
+  diskSelector: "durable"
+  staleReplicaTimeout: "30"
+  fsType: "ext4"

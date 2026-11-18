@@ -5,3 +5,5 @@
 id = "automation:read-publish-checks"
 role = "platform-admin"
 description = 'Reads the GitHub publish PR checks and answers its step (infra/forge/read-publish-checks.sh).'
+# Host station: forge (backlog 6ecb5480, station-tree.md section 6).
+station = "b8f8a23b-f8da-428f-8df2-731be4ae597a"

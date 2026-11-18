@@ -22,6 +22,9 @@
 #      the authorized_keys line David places on boss-gcp: authorizing a
 #      key is his signed act, not a Job's. A Secret that already holds a
 #      key the mount does not show yet is left alone.
+#      A mounted key's whole authorized_keys line is printed on every
+#      run, so the packet records which key boss-gcp is to hold (backlog
+#      403d9d7e; see THE KEY THIS RUN HOLDS below).
 #   2. THE KUBECONFIG, assembled in memory-backed scratch from Secret
 #      break-glass-operator-token (token + ca.crt) and the address
 #      boss-gcp dials, $BOSS_DEPOSIT_API_SERVER.
@@ -178,7 +181,10 @@ if [ ! -s "$KEY" ]; then
     fi
     held="$(jq -r '.data["id_ed25519"] // empty' "$WORK/key.json")"
     if [ -n "$held" ]; then
-        jq -r '.data["id_ed25519.pub"] // empty' "$WORK/key.json" | base64 -d > "$WORK/key.pub" 2>/dev/null || :
+        printf '%s' "$held" | base64 -d > "$WORK/held-key" 2>"$ERR" \
+            || refuse "Secret $NS/$KEY_SECRET carries an unreadable private key; nothing minted or deposited"
+        ssh-keygen -y -P '' -f "$WORK/held-key" > "$WORK/key.pub" 2>"$ERR" \
+            || refuse "the held deposit key's public half could not be derived; nothing minted or deposited"
         if [ -s "$WORK/key.pub" ]; then
             authorize "$WORK/key.pub"
             stop "Secret $NS/$KEY_SECRET already holds a deposit key this pod's mount does not show (minted after the pod started); nothing minted — the next run deposits with it, once boss-gcp holds the line above"
@@ -203,6 +209,27 @@ if [ ! -s "$KEY" ]; then
     MINTED=1
     say "minted a deposit key into Secret $NS/$KEY_SECRET; the private half never left this pod"
     authorize "$WORK/minted.pub"
+fi
+# Record and authorise the identity the SSH leg actually presents. A
+# neighbouring .pub file can name an unrelated key (backlog 203c2a72).
+if [ "$MINTED" = 0 ]; then
+    PUB="$WORK/derived.pub"
+    ssh-keygen -y -P '' -f "$KEY" > "$PUB" 2>"$ERR" \
+        || refuse "the mounted deposit key's public half could not be derived; nothing deposited"
+fi
+# THE KEY THIS RUN HOLDS, NAMED WHOLE ON ITS OWN PACKET (backlog
+# 403d9d7e). This key has no prepare packet — this Job mints it — so the
+# line below is its record: boss-gcp's converge reads it off these
+# packets (infra/gcp/prepared-deposit-keys.sh) and judges every
+# authorized_keys line carrying this key by its fingerprint, bound to the
+# kubeconfig receiver, as it judges every key the broker prepares. A run
+# that minted named the key on its authorize line above. Before anything
+# is verified, so a refused run names it too; the public half only, on a
+# plain line — a RED line would file an item every day.
+if [ "$MINTED" = 0 ] && [ -s "$PUB" ]; then
+    publine=""
+    IFS= read -r publine < "$PUB" || :
+    say "the deposit key, as boss-gcp holds it: $FORCED $publine"
 fi
 
 # --- 2. the kubeconfig --------------------------------------------------

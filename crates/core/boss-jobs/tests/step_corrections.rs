@@ -389,6 +389,53 @@ async fn the_job_get_hands_each_step_its_own_corrections() {
 }
 
 #[tokio::test]
+async fn the_step_list_hands_each_step_the_same_corrections_as_the_job_get() {
+    let (app, jobs) = build_app();
+    let (job, triage, build) = seed(&jobs, "00000000-0000-0000-0000-00000000c010").await;
+    let uri = corrections_uri(&job, &triage);
+    let (status, _) = send(&app, "POST", &uri, Some(the_fix())).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = send(
+        &app,
+        "POST",
+        &uri,
+        Some(json!({ "withdraws": 0, "why": "keep the original" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, listed) = send(&app, "GET", &format!("/api/jobs/{}/steps", job.id), None).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let steps = listed.as_array().expect("the list retains its array shape");
+    assert_eq!(steps.len(), 2);
+    let corrected = steps
+        .iter()
+        .find(|s| s["id"] == triage.id.to_string())
+        .unwrap();
+    assert_eq!(
+        corrected["corrections"]
+            .as_array()
+            .expect("correction history")
+            .len(),
+        2
+    );
+    assert_eq!(corrected["corrections"][1]["withdraws"], 0);
+    assert_eq!(corrected["metadata"]["evidence"], DAMAGED);
+    let untouched = steps
+        .iter()
+        .find(|s| s["id"] == build.id.to_string())
+        .unwrap();
+    assert!(untouched.get("corrections").is_none());
+    let (status, detail) = send(&app, "GET", &format!("/api/jobs/{}", job.id), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed, detail["steps"]);
+    assert_eq!(
+        jobs.get_step(&triage.id).await.unwrap().unwrap().metadata["evidence"],
+        DAMAGED
+    );
+}
+
+#[tokio::test]
 async fn the_metadata_patch_refuses_the_reserved_key_naming_the_door() {
     let (app, jobs) = build_app();
     let (job, triage, _) = seed(&jobs, "00000000-0000-0000-0000-00000000c00a").await;

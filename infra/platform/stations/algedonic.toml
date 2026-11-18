@@ -1,0 +1,45 @@
+# ---------------------------------------------------------------------------
+# algedonic — the company: the ROOT of the station tree (T2 of design
+# 4b27a65a, backlog 3f58c823; the handoff's section 1, decided by David
+# 2026-11-06, bundle_decision_20261106_1944Z).
+#
+# THE ROOT HOLDS THE POOLS WHOLE. It names no parent, and it declares no
+# allocation: what the company holds is each pool's own capacity
+# (infra/platform/pools/), and every station beneath it draws from
+# those. boss_jobs::station_tree::validate_station_tree refuses a tree
+# with any number of roots but one, at the platform seed, before any row
+# is published.
+#
+# A CONTAINER, NOT A QUEUE, until resolution (T6, baac0b65) routes work
+# by the tree. Its predicate matches a packet tagged for this station
+# and nothing else, and no packet carries the tag: the company's packets
+# stand in its children. The predicate names no `kind`, no metadata and
+# no step, so the yard's walk seeds nothing from it and places nothing
+# here, and the floor of the stations under it does not draw it (no
+# `department`).
+#
+# The address /algedonic is derived from this row's name and stored
+# nowhere. To change this station, bump `version`; `id` never changes.
+#
+# Version 2 (backlog 85cb2103, design c4854fd4; bumped from the LIVE
+# newest, v1): `line = "company"`, the Design token its card rail draws,
+# night ink (--map-line-company in apps/web/src/styles.css). A station
+# with no line of its own draws the nearest one up its parents. Held by
+# every_top_level_station_names_a_line_the_stylesheet_declares. Nothing
+# else changed.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "algedonic"
+version = 2
+status = "active"
+title = "Algedonic — the company"
+kind = "group"
+discipline = ["priority", "age"]
+id = "00b04483-90c6-46b9-b911-8e19d2a0b410"
+mode = "standing"
+machines = ["automation:dispatcher"]
+line = "company"
+
+[station.predicate]
+tags_any = ["station:algedonic"]

@@ -153,7 +153,6 @@
         { id: 'my-day', label: 'My Day', path: '/' },
         ROUTE_CATALOG.inbox,
         ROUTE_CATALOG.schedule,
-        ROUTE_CATALOG['company-map'],
         ROUTE_CATALOG.manual,
       ],
     },

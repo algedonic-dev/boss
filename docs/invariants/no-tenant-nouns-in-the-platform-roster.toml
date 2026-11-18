@@ -1,7 +1,7 @@
 [[invariant]]
 id = "no-tenant-nouns-in-the-platform-roster"
 claim = "A tenant's vocabulary never ships in Tier 1: the platform protocol set carries platform kinds only, and tenant kinds seed from examples/<tenant>/."
-source = "CLAUDE.md §10; David 2026-08-16 (\"We don't want brewery nouns in core no matter what\"); protocols-as-data.md Q5"
+source = "CLAUDE.md §10; David 2026-08-16 (\"We don't want brewery nouns in core no matter what\"); protocols-as-data Q5, docs/architecture-decisions.md §Jobs, Workflows, Steps"
 enforcement = "enforced"
 mechanism = "crates/core/boss-jobs/src/registry.rs"
 last_verified = ""

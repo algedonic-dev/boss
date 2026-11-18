@@ -1,0 +1,12 @@
+# break-glass-enrolment is passkey-protected on the server: its
+# `authorise` step declares assurance_required = "presence"
+# (crates/core/boss-jobs/src/publish_passkey.rs, clause 1). Car db099d49
+# (design c0ae096f, backlog baac0b65) moves its owner to operations.
+# Unheld, the drift publish's dry run reads it "would publish", the real
+# run leaves a refused draft that blocks every later check, and no one is
+# asked to sign (review 6254feec, B1). This file makes
+# `publish-drift --file-held` open the publish-a-protocol packet its
+# owner signs, as the ops-request and publish-a-protocol files do.
+drift_publish = "held"
+lifts = 'Kept as backlog a4b57aca kept ops-request and publish-a-protocol: the server protects this row, and this file is what makes publish-drift --file-held open the signing packet for an edit of it (review 6254feec on backlog baac0b65). A car that derives --file-held from the server protected set deletes it; never a car on its own.'
+why = '''This row authorises a break-glass enrolment, a step the server holds to a person present with a passkey. Its edits, the owner move of design c0ae096f among them, go live at the platform owner's signed publish from the website, never on an unattended drift publish, which the server would refuse and which would leave a draft blocking the drift road for every kind.'''

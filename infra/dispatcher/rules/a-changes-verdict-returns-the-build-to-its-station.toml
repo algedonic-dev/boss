@@ -1,0 +1,70 @@
+# A reviewer's CHANGES verdict on a held car returns its item's build to
+# the item's station, where a builder pulls it as that car's repair
+# (backlog c2b21676, part 2 of eb86a174 "the factory routes stranded
+# work itself").
+#
+# WHAT HAPPENED. A CHANGES verdict woke one rule,
+# `release-a-held-car-on-its-reviewer-verdict`, whose release door
+# refuses it and writes the refusal onto the car's review step as
+# `auto_release`. Nothing else moved: the item's `build` step stayed
+# ACTIVE on the actor that had dispatched it, naming the builder run
+# that had already landed on its green. The repair door existed —
+# `boss dispatch <item>` admits a current CHANGES as the car's REPAIR
+# and briefs the findings verbatim — but nothing walked anyone to it,
+# so the builder learned of the verdict only when a conductor read the
+# car. Measured 2026-11-15 20:04Z: review run cc5a878a recorded
+# `changes` on car 1d5379b5, and item 76f89301's build stood active on
+# agent-claude, its run e5191d86 closed, with no step anywhere asking
+# for the repair.
+#
+# WHAT IT DOES. On the verdict's own write (the trigger the release rule
+# reads, narrowed to `changes`), the handler reads the car and asks the
+# repair door's own facts of it: open, held at its review step, the
+# verdict from the reviewer that step was dispatched to and not the
+# car's builder run, at the head the hold stands at, and naming its
+# item as `backlog_item` or, for one piece of it, `partial_item`
+# (backlog 390f9e55). Then the item's `build`: an ACTIVE build whose
+# run edge names no OPEN run is released to `ready` and nobody's — the
+# state its station holds unplaced work in — with a
+# `returned_for_changes` note naming the review run, the car, the head
+# and its builder; a build already READY gets the note alone.
+#
+# WHY THE STATION AND NOT THE BUILDER'S NAME. The packet offered either.
+# The dispatcher nominates nobody (backlog e1eaf72b, David 2026-11-11:
+# work sits at the admission queue of a station, not at a name); the
+# builder's session may be gone, and the repair brief carries the
+# findings, the car, its branch and its head, so any builder the claim
+# admits can do the repair. The builder is named in the note for the
+# reader, not as an assignee.
+#
+# WHAT IT LEAVES. A RELEASE (the release rule's), a car not held or
+# held at another head (the repair is in, or owes a review), a verdict
+# from a run the review step does not name, a car answering no item
+# (the repair door reads `backlog_item` and `partial_item`), an item
+# build not open, and a build whose run edge names an
+# open run — a repair already running, or the builder's own run still
+# unreported. Each is logged; none is written. The door judges again
+# when the step is pulled.
+#
+# ANY LATER WRITE TO THE RUN FIRES IT AGAIN (its report, its landing),
+# and finds the note already there for that review at that head and the
+# step no longer active: nothing is written twice.
+[[rule]]
+name = "a-changes-verdict-returns-the-build-to-its-station"
+why = """
+A CROSS-PROTOCOL REACTOR: an `agent-run` packet's recorded CHANGES
+verdict on a `ship-a-change` car moves a step on a third packet, the
+`backlog-item` the car answers. Three protocols, so no single Workflow
+definition can declare it. Measured 2026-11-15 (backlog c2b21676):
+review run cc5a878a asked for changes on car 1d5379b5 at 20:04Z and
+item 76f89301's build stayed active on an actor whose run had closed,
+so the repair the door would admit was reachable only by a conductor
+reading the car. The reaction is a return to the station, never a
+nomination; the repair door (`boss dispatch`) judges the repair when
+the step is pulled.
+"""
+version = 1
+on_event = "jobs.job.updated"
+when = 'kind = "agent-run" AND metadata.review.car > "" AND metadata.review.verdict = "changes"'
+[[rule.do]]
+handler = "jobs.changes_return_the_build"

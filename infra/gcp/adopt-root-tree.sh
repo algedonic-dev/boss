@@ -63,7 +63,7 @@ else
     reader=$(sor_reader_header automation:boss-gcp-converge)
     for pair in prepare-the-root-tree-deposit-key:root-tree-deposit-key rotate-a-credential:boss-gcp-root-tree-token; do
         kind=${pair%%:*}; subject=${pair#*:}
-        curl --noproxy '*' -fsS --max-time 15 --max-redirs 0 --proto '=http,https' \
+        curl -q --noproxy '*' -fsS --max-time 15 --max-redirs 0 --proto '=http,https' \
             ${MT:+-H "$MT"} -H "x-boss-user: $reader" \
             "$BOSS_JOBS_URL/api/jobs?kind=$kind&subject_id=$subject&limit=100&full=true" > "$work/lifecycle" \
             || refuse lifecycle-read
@@ -88,7 +88,7 @@ else
     [[ "$value" =~ ^[a-zA-Z0-9_-]+$ ]] || refuse scoped-credential
     secret_header FH "Authorization: token $value" || refuse forge-header
     unset auth value
-    code=$(curl --noproxy '*' -sS --max-time 30 --max-redirs 0 --proto '=http,https' \
+    code=$(curl -q --noproxy '*' -sS --max-time 30 --max-redirs 0 --proto '=http,https' \
         -H "$FH" -o "$work/repository" -w '%{http_code}' "$BOSS_FORGE_URL/api/v1/repos/david/boss") || refuse forge-authentication
     [ "$code" = 200 ] && jq_doc_file "$work/repository" \
         && jq -e '.full_name == "david/boss"' "$work/repository" >/dev/null || refuse forge-identity

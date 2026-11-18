@@ -394,7 +394,7 @@ struct SourcesToml {
     source: Vec<IdentitySource>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct IdentitySource {
     event_kind: String,
     subject_kind: String,
@@ -425,6 +425,10 @@ struct IdentitySource {
 ///    table's name, as it does in the live table.
 pub async fn rebuild_subjects(pool: &PgPool) -> Result<u64, String> {
     let sources: SourcesToml = toml::from_str(IDENTITY_SOURCES_TOML).map_err(|e| e.to_string())?;
+    rebuild_with_sources(pool, &sources.source).await
+}
+
+async fn rebuild_with_sources(pool: &PgPool, sources: &[IdentitySource]) -> Result<u64, String> {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(REBUILD_LOCK_KEY)
@@ -441,39 +445,41 @@ pub async fn rebuild_subjects(pool: &PgPool) -> Result<u64, String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    let mut total = 0u64;
-    for src in &sources.source {
-        let label_expr = match &src.label_field {
-            Some(f) => format!("payload->>'{f}'"),
-            None => "NULL".to_string(),
-        };
-        // One row per subject id, NEWEST event (highest audit id)
-        // winning the label. `*.upserted` kinds emit many events per
-        // id, and a single INSERT … ON CONFLICT DO UPDATE that hits
-        // the same (kind, id) twice aborts the whole rebuild
-        // ("cannot affect row a second time") — dedup must happen
-        // inside the statement.
-        let sql = format!(
-            "INSERT INTO subjects (kind, id, label) \
-             SELECT $1, ev.subject_id, ev.label FROM ( \
-                 SELECT DISTINCT ON (payload->>'{id}') \
-                        payload->>'{id}' AS subject_id, {label_expr} AS label \
-                   FROM audit_log \
-                  WHERE kind = $2 AND payload->>'{id}' IS NOT NULL \
-                  ORDER BY payload->>'{id}', id DESC \
-             ) ev \
+    // File order cannot decide a shared identity's label (5bdaf9d6).
+    // Deduplicate across ALL registered sources, selecting the newest
+    // non-null label by audit id, as the live COALESCE write does. An
+    // all-null history still proves existence. Registry fields stay
+    // data rather than being interpolated into the SQL.
+    let declarations = serde_json::to_value(sources).map_err(|e| e.to_string())?;
+    let count: i64 = sqlx::query_scalar(
+        "WITH matched AS ( \
+             SELECT src.ordinal AS source_ordinal, \
+                    src.definition->>'subject_kind' AS subject_kind, \
+                    ev.payload->>(src.definition->>'id_field') AS subject_id, \
+                    ev.payload->>(src.definition->>'label_field') AS label, \
+                    ev.id AS audit_id \
+               FROM jsonb_array_elements($1::jsonb) WITH ORDINALITY AS src(definition, ordinal) \
+               JOIN audit_log ev ON ev.kind = src.definition->>'event_kind' \
+              WHERE ev.payload->>(src.definition->>'id_field') IS NOT NULL \
+         ), restored AS ( \
+             INSERT INTO subjects (kind, id, label) \
+             SELECT DISTINCT ON (subject_kind, subject_id) subject_kind, subject_id, label \
+               FROM matched \
+              ORDER BY subject_kind, subject_id, label IS NULL, audit_id DESC \
              ON CONFLICT (kind, id) DO UPDATE \
-                SET label = COALESCE(EXCLUDED.label, subjects.label)",
-            id = src.id_field,
-        );
-        let res = sqlx::query(&sql)
-            .bind(&src.subject_kind)
-            .bind(&src.event_kind)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| format!("event pass {}: {e}", src.event_kind))?;
-        total += res.rows_affected();
-    }
+                SET label = COALESCE(EXCLUDED.label, subjects.label) \
+             RETURNING 1 \
+         ) \
+         SELECT (SELECT COUNT(DISTINCT (source_ordinal, subject_id)) FROM matched) \
+           FROM (SELECT COUNT(*) FROM restored) finished",
+    )
+    .bind(declarations)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| format!("registered identity event pass: {e}"))?;
+    // Keep the existing diagnostic count: one contribution per source
+    // and distinct id, even when several sources share one stored row.
+    let mut total = u64::try_from(count).map_err(|e| e.to_string())?;
 
     // The jobs.job.created payload nests the subject:
     // `{"subject": {"id": ..., "subject_kind": ...}}` (boss-core's
@@ -558,3 +564,7 @@ pub async fn rebuild_subjects(pool: &PgPool) -> Result<u64, String> {
     tx.commit().await.map_err(|e| e.to_string())?;
     Ok(total)
 }
+
+#[cfg(test)]
+#[path = "subjects/rebuild_tests.rs"]
+mod rebuild_tests;

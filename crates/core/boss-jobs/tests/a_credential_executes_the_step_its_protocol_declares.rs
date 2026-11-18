@@ -344,6 +344,134 @@ async fn simultaneous_credential_claims_leave_one_assignment_fact() {
     );
 }
 
+/// A request through the REAL credential door: `fixture-credential` is
+/// forge's, and `id` is what x-boss-user asserts.
+async fn through_the_door(
+    jobs: Arc<InMemoryJobs>,
+    step: &Step,
+    method: &str,
+    suffix: &str,
+    body: Value,
+    id: &str,
+) -> StatusCode {
+    let dir = boss_testing::scratch_dir("executor-pass-door");
+    boss_testing::write_file(&dir.join("forge.current"), "fixture-credential");
+    let r = boss_jobs::runner_credential::mount(app(jobs, None), dir);
+    let user = json!({"id":id,"role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"});
+    r.oneshot(
+        Request::builder()
+            .method(method)
+            .uri(format!(
+                "/api/jobs/{}/steps/{}{}",
+                step.job_id, step.id, suffix
+            ))
+            .header("x-boss-user", user.to_string())
+            .header(boss_jobs::runner_credential::HEADER, "fixture-credential")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+    .status()
+}
+
+/// TWO PASSES ARE TWO CLAIMANTS (backlog d16c2dae). The runner signs its
+/// claim as a claimant unique to the pass (ops-runner.sh `mint_claimant`)
+/// because the claim door is idempotent for its holder; the door used to
+/// rebind every resolved request to `automation:ops-runner`, so two passes
+/// of one host were one holder and both claims answered 200 — single use
+/// rested on systemd never overlapping two oneshot passes — and the
+/// runner's `is_runner_pass` never recognised its own hold. Measured RED
+/// on origin/main 675bb1faf: both 200, holder `automation:ops-runner`.
+#[tokio::test]
+async fn two_runner_passes_through_the_real_door_are_two_claimants() {
+    let (jobs, step) = fixture(true).await;
+    let first = "automation:ops-runner:forge:20261018T095500Z-4242";
+    let second = "automation:ops-runner:forge:20261018T095501Z-4243";
+    let (a, b) = tokio::join!(
+        through_the_door(jobs.clone(), &step, "POST", "/claim", json!({}), first),
+        through_the_door(jobs.clone(), &step, "POST", "/claim", json!({}), second)
+    );
+    let mut answers = [a, b];
+    answers.sort();
+    assert_eq!(answers, [StatusCode::OK, StatusCode::CONFLICT]);
+    let won = if a == StatusCode::OK { first } else { second };
+    let held = jobs.get_step(&step.id).await.unwrap().unwrap();
+    assert_eq!(held.assignee_id.as_deref(), Some(won));
+    let events = jobs.recorded_events();
+    let assigned: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == "step.assigned.task")
+        .collect();
+    assert_eq!(assigned.len(), 1, "{events:?}");
+    assert_eq!(assigned[0].payload["_actor"], won);
+
+    // The same pass asking again is its own holder, as before.
+    assert_eq!(
+        through_the_door(jobs.clone(), &step, "POST", "/claim", json!({}), won).await,
+        StatusCode::OK
+    );
+    // The answer is signed as the runner's account (BOSS_USER), and the
+    // credential still names who completed it.
+    assert_eq!(
+        through_the_door(
+            jobs.clone(),
+            &step,
+            "PUT",
+            "",
+            json!({"status":"completed"}),
+            "automation:ops-runner"
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let done = jobs.get_step(&step.id).await.unwrap().unwrap();
+    assert_eq!(
+        done.completed_by.map(|a| a.to_string()).as_deref(),
+        Some("automation:ops-runner")
+    );
+}
+
+/// ONLY A PASS OF THE RESOLVED HOST'S RUNNER KEEPS ITS ID (d16c2dae). The
+/// credential proves the account and the host; the pass is the runner's
+/// own label inside them. Any other id — another host's pass, the account
+/// itself, a different account, a pass in any shape but the one
+/// `mint_claimant` mints — is rebound to the account, as every resolved
+/// request was before.
+#[tokio::test]
+async fn an_id_that_is_not_a_pass_of_the_resolved_host_is_rebound_to_the_account() {
+    for id in [
+        "automation:ops-runner:boss-gcp:20261018T095500Z-4242",
+        "automation:ops-runner",
+        "automation:ops-runner:forge:",
+        "automation:ops-runner:forge:whenever",
+        "automation:ops-runner:forge:20261018T095500Z-",
+        "automation:ops-runner:forge:20261018T095500Z-4242\n",
+        "automation:ops-runner:forge:20261018T095500Z-4242:x",
+        "automation:ops-runnerx:forge:20261018T095500Z-4242",
+        "automation:forged-proxy",
+        "emp-david",
+    ] {
+        let (jobs, step) = fixture(true).await;
+        assert_eq!(
+            through_the_door(jobs.clone(), &step, "POST", "/claim", json!({}), id).await,
+            StatusCode::OK,
+            "{id:?}"
+        );
+        assert_eq!(
+            jobs.get_step(&step.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .assignee_id
+                .as_deref(),
+            Some("automation:ops-runner"),
+            "{id:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_real_door_refuses_absent_ambiguous_and_repeated_credentials() {
     for mode in ["absent", "ambiguous", "repeated", "invalid"] {

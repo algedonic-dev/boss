@@ -185,8 +185,8 @@
     <div class="dx-head-right">
       {#if data && !error}
         <div class="dx-stats">
-          <span>{counts.rules} rules</span>
-          <span>{counts.handlers} handlers</span>
+          <span>{counts.rules} {counts.rules === 1 ? 'rule' : 'rules'}</span>
+          <span>{counts.handlers} {counts.handlers === 1 ? 'handler' : 'handlers'}</span>
           <span class="dx-stat-cycle">{counts.cycleNodes} in cycles</span>
         </div>
       {/if}
@@ -466,7 +466,7 @@
     border-radius: 999px;
     padding: 2px 4px 2px 10px;
     color: var(--signal);
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: var(--font-mono);
     font-size: 0.72rem;
   }
   .dx-chip-x {

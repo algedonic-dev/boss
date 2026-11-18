@@ -87,6 +87,17 @@ async fn claim_and_read_event(
     step: StepId,
     as_: &str,
 ) -> serde_json::Value {
+    claim_and_read_payload(jobs, job, step, as_).await["metadata"].clone()
+}
+
+/// Claim through the route and return the whole `jobs.step.updated`
+/// payload the claim recorded.
+async fn claim_and_read_payload(
+    jobs: Arc<InMemoryJobs>,
+    job: JobId,
+    step: StepId,
+    as_: &str,
+) -> serde_json::Value {
     let before = jobs.recorded_events().len();
     let resp = app(jobs.clone())
         .oneshot(
@@ -103,7 +114,39 @@ async fn claim_and_read_event(
         .iter()
         .find(|e| e.kind == boss_jobs::events::STEP_UPDATED)
         .expect("a claim records jobs.step.updated");
-    updated.payload["metadata"].clone()
+    updated.payload.clone()
+}
+
+/// THE CLAIM RECORDS ITS EXECUTOR'S KIND (factory taxonomy M1, backlog
+/// 3ff2ef60): the claim's fact names the holder's kind beside its
+/// actor, in the `_`-family the resource rewrite keeps, and NOT on the
+/// step's metadata — the row is unchanged by it, so a rebuild puts back
+/// exactly what the CAS wrote. One holder per class of `ActorId`.
+#[tokio::test]
+async fn a_claim_records_its_holders_executor_kind_on_the_fact_not_the_row() {
+    for (holder, kind) in [
+        ("emp-person", "person"),
+        ("agent-builder", "robot"),
+        ("claude:opus-5", "robot"),
+        ("automation:boss-step", "automaton"),
+    ] {
+        let jobs = Arc::new(InMemoryJobs::new());
+        let (job, step) = seeded(&jobs, StepStatus::Ready, None).await;
+        let fact = claim_and_read_payload(jobs.clone(), job, step, holder).await;
+        assert_eq!(fact["assignee_id"], holder);
+        assert_eq!(
+            fact[boss_jobs::events::EXECUTOR_KIND_KEY],
+            kind,
+            "{holder}: {fact}"
+        );
+        assert!(fact["metadata"].get("executor_kind").is_none());
+        let row = jobs.get_step(&step).await.unwrap().unwrap();
+        assert!(
+            row.metadata
+                .get(boss_jobs::events::EXECUTOR_KIND_KEY)
+                .is_none()
+        );
+    }
 }
 
 #[tokio::test]

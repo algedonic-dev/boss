@@ -83,13 +83,16 @@ async fn main() -> Result<()> {
     let hub = SseHub::new();
     let (cancel_tx, cancel_rx) = watch::channel(false);
 
-    // Build the publisher: bus + (optional) Postgres audit writer.
-    let mut publisher = boss_core::publisher::DomainPublisher::new(
+    // The publisher only STAMPS now: every write here stages its fact on
+    // the transactional outbox in its own transaction, and the relay
+    // writes audit_log and publishes. Its audit writer went with the
+    // event doors' direct publish (backlog 2e45840a, design ad9519bc
+    // part d), the last thing that published through it.
+    let publisher = boss_core::publisher::DomainPublisher::new(
         bus.clone() as std::sync::Arc<dyn boss_core::port::EventBus>,
         "assets",
     );
 
-    // The Postgres pool is shared across PgAssets and PgAuditWriter.
     if let Some(ref pg_url) = cfg.postgres_url {
         info!("using Postgres assets storage");
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -97,10 +100,6 @@ async fn main() -> Result<()> {
             .connect(pg_url)
             .await
             .with_context(|| "connecting to Postgres")?;
-        publisher = publisher.with_audit(std::sync::Arc::new(boss_events::PgAuditWriter::new(
-            pool.clone(),
-        )));
-        info!("audit_log persistence enabled");
         let assets = Arc::new(boss_assets::PgAssets::new(pool.clone()));
         return run_server(
             assets,
@@ -211,19 +210,15 @@ async fn run_server<R: AssetsRepository + 'static>(
     );
     let policy = wiring.policy;
 
-    // The Parts writes stage their facts stamped by the same publisher
-    // (and so the same sim probe) as the event doors.
-    let parts_app = boss_assets::asset_parts::asset_parts_router(
-        pool.clone(),
-        publisher.clone(),
-        policy.clone(),
-    );
+    // The Parts writes stage their facts stamped by this publisher (and
+    // so its sim probe).
+    let parts_app =
+        boss_assets::asset_parts::asset_parts_router(pool.clone(), publisher, policy.clone());
 
     // Start axum HTTP server.
     let state = AssetsApiState {
         assets,
         bus,
-        publisher,
         people_client,
         classes_client: Some(classes_client),
         hub,
@@ -298,112 +293,178 @@ async fn run_server<R: AssetsRepository + 'static>(
 /// Redelivery is safe: `append` dedups on the event id
 /// (`DuplicateEvent` → ACK). A failed append NAKs for redelivery
 /// instead of logging into the void. If the durable consumer cannot
-/// be opened, degrade loudly to the old at-most-once subscription.
+/// be opened yet (a dark bus, a stream not ensured), it retries with
+/// capped backoff until it can — never degrading to at-most-once,
+/// which since car 1 a dark NATS at boot made permanent for the life
+/// of the process (backlog 2e45840a, design ad9519bc car 2).
 async fn run_nats_ingress<R: AssetsRepository + 'static>(
     bus: Arc<NatsEventBus>,
     assets: Arc<R>,
-    mut cancel: watch::Receiver<bool>,
+    cancel: watch::Receiver<bool>,
 ) -> Result<()> {
-    use boss_core::port::EventBus;
+    let js = bus.jetstream();
+    ingest_bound(
+        || {
+            boss_nats::durable::open_durable(
+                &js,
+                boss_nats::durable::STREAM_NAME,
+                "assets-ingress",
+                vec!["asset.>".to_string()],
+            )
+        },
+        assets,
+        cancel,
+    )
+    .await;
+    Ok(())
+}
+
+/// Bind the ingress's durable consumer with `open` and append what it
+/// delivers, until `cancel` says stop.
+///
+/// A bound stream that ENDS is opened again
+/// (`boss_nats::durable::keep_bound`; backlog 2e45840a, design ad9519bc,
+/// the remainder of car 3's part b): the ingress used to return then,
+/// and no asset event reached the repository again until a restart.
+/// Since the binding never ends by itself, a shutdown ends it from
+/// outside — while the bus is still dark, between two opens, or in the
+/// middle of an append. The last drops that append's transaction
+/// unacked, so the message is redelivered to the next process and the
+/// event-id dedup makes a second delivery harmless.
+async fn ingest_bound<R, Open, OpenFut, OpenErr, S, E>(
+    open: Open,
+    assets: Arc<R>,
+    mut cancel: watch::Receiver<bool>,
+) where
+    R: AssetsRepository,
+    Open: FnMut() -> OpenFut,
+    OpenFut: std::future::Future<Output = Result<S, OpenErr>>,
+    OpenErr: std::fmt::Display,
+    S: futures::Stream<Item = Result<async_nats::jetstream::Message, E>>,
+    E: std::fmt::Display,
+{
+    let bound = boss_nats::durable::keep_bound("assets-ingress", open, |messages| {
+        ingest(&*assets, messages)
+    });
+    tokio::select! {
+        never = bound => match never {},
+        _ = cancel.wait_for(|stop| *stop) => {}
+    }
+}
+
+/// One bound session: append every asset event the consumer delivers,
+/// until its stream ends.
+async fn ingest<R, S, E>(assets: &R, messages: S)
+where
+    R: AssetsRepository,
+    S: futures::Stream<Item = Result<async_nats::jetstream::Message, E>>,
+    E: std::fmt::Display,
+{
+    use boss_assets::port::AssetsError;
+    use boss_nats::durable::Settle;
     use futures::StreamExt;
 
-    let js = bus.jetstream();
-    match boss_nats::durable::open_durable(
-        &js,
-        boss_nats::durable::STREAM_NAME,
-        "assets-ingress",
-        vec!["asset.>".to_string()],
-    )
-    .await
-    {
-        Ok(messages) => {
-            info!("assets ingress: durable consumer 'assets-ingress' on asset.>");
-            let mut messages = std::pin::pin!(messages);
-            loop {
-                tokio::select! {
-                    _ = cancel.changed() => {
-                        if *cancel.borrow() { break; }
-                    }
-                    maybe_msg = messages.next() => {
-                        let Some(msg) = maybe_msg else { break; };
-                        let msg = match msg {
-                            Ok(m) => m,
-                            Err(e) => {
-                                warn!(error = %e, "assets ingress: message stream error");
-                                continue;
-                            }
-                        };
-                        let core_event: boss_core::event::Event =
-                            match serde_json::from_slice(&msg.payload) {
-                                Ok(ev) => ev,
-                                Err(e) => {
-                                    warn!(error = %e, "assets ingress: non-Event payload (ACK)");
-                                    let _ = msg.ack().await;
-                                    continue;
-                                }
-                            };
-                        use boss_assets::port::AssetsError;
-                        use boss_nats::durable::Settle;
-                        let outcome = match core_event_to_system(&core_event) {
-                            // Not an asset system event (unknown kind) —
-                            // nothing to append, done with the message.
-                            None => Settle::Ack,
-                            Some(system_event) => match assets.append(system_event).await {
-                                Ok(()) => Settle::Ack,
-                                // Redelivered and already applied — the
-                                // dedup doing its job.
-                                Err(AssetsError::DuplicateEvent(id)) => {
-                                    warn!(event_id = %id, "duplicate event (redelivery), skipping");
-                                    Settle::Ack
-                                }
-                                // A refusal fails the same on every
-                                // redelivery (backlog be459ab9: Postgres
-                                // answered both as Storage, so they spent
-                                // the whole retry budget first).
-                                Err(e @ (AssetsError::UnknownModel(_) | AssetsError::Invalid(_))) => {
-                                    Settle::Permanent(format!("append: {e}"))
-                                }
-                                Err(e) => Settle::Retry(format!("append: {e}")),
-                            },
-                        };
-                        boss_nats::durable::settle_classified(&msg, outcome).await;
-                    }
-                }
+    info!("assets ingress: durable consumer 'assets-ingress' on asset.>");
+    let mut messages = std::pin::pin!(messages);
+    while let Some(msg) = messages.next().await {
+        let msg = match msg {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "assets ingress: message stream error");
+                continue;
             }
-        }
-        Err(e) => {
-            warn!(
-                error = %e,
-                "assets ingress: durable consumer unavailable — falling back to \
-                 at-most-once core subscription (a dropped event is a missing \
-                 repository row on this deployment)"
-            );
-            let mut stream = bus
-                .subscribe("asset.>")
-                .await
-                .map_err(|e| anyhow::anyhow!("subscribing to asset.>: {e}"))?;
-            loop {
-                tokio::select! {
-                    _ = cancel.changed() => {
-                        if *cancel.borrow() { break; }
-                    }
-                    maybe_event = stream.next() => {
-                        let Some(core_event) = maybe_event else { break; };
-                        if let Some(system_event) = core_event_to_system(&core_event) {
-                            match assets.append(system_event).await {
-                                Ok(()) => {}
-                                Err(boss_assets::port::AssetsError::DuplicateEvent(id)) => {
-                                    warn!(event_id = %id, "duplicate event from NATS, skipping");
-                                }
-                                Err(e) => {
-                                    error!(error = %e, "failed to append ingress event");
-                                }
-                            }
-                        }
-                    }
-                }
+        };
+        let core_event: boss_core::event::Event = match serde_json::from_slice(&msg.payload) {
+            Ok(ev) => ev,
+            Err(e) => {
+                warn!(error = %e, "assets ingress: non-Event payload (ACK)");
+                let _ = msg.ack().await;
+                continue;
             }
-        }
+        };
+        let outcome = match core_event_to_system(&core_event) {
+            // Not an asset system event (unknown kind) —
+            // nothing to append, done with the message.
+            None => Settle::Ack,
+            Some(system_event) => match assets.append(system_event).await {
+                Ok(()) => Settle::Ack,
+                // Redelivered and already applied — the
+                // dedup doing its job.
+                Err(AssetsError::DuplicateEvent(id)) => {
+                    warn!(event_id = %id, "duplicate event (redelivery), skipping");
+                    Settle::Ack
+                }
+                // A refusal fails the same on every
+                // redelivery (backlog be459ab9: Postgres
+                // answered both as Storage, so they spent
+                // the whole retry budget first).
+                Err(e @ (AssetsError::UnknownModel(_) | AssetsError::Invalid(_))) => {
+                    Settle::Permanent(format!("append: {e}"))
+                }
+                Err(e) => Settle::Retry(format!("append: {e}")),
+            },
+        };
+        boss_nats::durable::settle_classified(&msg, outcome).await;
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    type Ended = futures::stream::Empty<Result<async_nats::jetstream::Message, String>>;
+
+    /// Backlog 2e45840a (outage 05fd165a, design ad9519bc): the ingress
+    /// opened its consumer once, so a bound stream that ENDED — the
+    /// client ends a pull stream whose consumer the server deleted —
+    /// stopped asset events reaching the repository for the life of the
+    /// process. Every stream here ends the moment it opens; the ingress
+    /// must still be bound at the end of the window, having opened again.
+    #[tokio::test(start_paused = true)]
+    async fn the_ingress_opens_its_consumer_again_when_its_stream_ends() {
+        let opens = AtomicU32::new(0);
+        let (_stop, cancel) = watch::channel(false);
+        let ingested = tokio::time::timeout(
+            Duration::from_secs(100),
+            ingest_bound(
+                || {
+                    opens.fetch_add(1, Ordering::SeqCst);
+                    async { Ok::<Ended, String>(futures::stream::empty()) }
+                },
+                Arc::new(boss_assets::in_memory::InMemoryAssets::new()),
+                cancel,
+            ),
+        )
+        .await;
+        assert!(
+            ingested.is_err(),
+            "the ingress returned when its stream ended; it must open the consumer again"
+        );
+        let opens = opens.load(Ordering::SeqCst);
+        assert!(
+            opens > 1,
+            "opened {opens} time(s) in 100 s of ended streams"
+        );
+    }
+
+    /// The other half: a binding that never ends by itself must still
+    /// end on shutdown, or the process waits on it forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_ends_the_ingress_between_two_opens() {
+        let (stop, cancel) = watch::channel(false);
+        let ingress = ingest_bound(
+            || async { Ok::<Ended, String>(futures::stream::empty()) },
+            Arc::new(boss_assets::in_memory::InMemoryAssets::new()),
+            cancel,
+        );
+        let mut ingress = std::pin::pin!(ingress);
+        let bound = tokio::time::timeout(Duration::from_secs(10), &mut ingress).await;
+        assert!(bound.is_err(), "still bound before the shutdown");
+        stop.send(true).expect("the ingress holds the receiver");
+        tokio::time::timeout(Duration::from_secs(1), ingress)
+            .await
+            .expect("a shutdown ends the ingress");
+    }
 }

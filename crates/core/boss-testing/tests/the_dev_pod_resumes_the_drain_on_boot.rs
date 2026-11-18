@@ -206,6 +206,162 @@ fn read_argv(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The boot with the switch on, the drain prompt in the checkout, and
+/// `/work/drain-seat` holding `drain_seat` (or absent): the decision
+/// the postStart made once, before dev-claude.sh ran (review ce8970ce
+/// N2).
+fn boot_seated(drain_seat: Option<&str>) -> Booted {
+    let root = scratch_dir("drain-on-boot-seated");
+    let work = root.join("work");
+    let rooted = |p: &str| -> PathBuf { root.join(p.trim_start_matches('/')) };
+    let bin = work.join("home/.local/bin");
+    create_dir(&bin);
+    create_dir(&work.join("ssh"));
+    write_exec(
+        &bin.join("claude"),
+        "#!/usr/bin/env bash\nprintf '%s\\0' \"$@\" > \"$HOME/argv\"\n",
+    );
+    let switch = rooted(SWITCH);
+    create_dir(switch.parent().expect("switch has a parent"));
+    write_file(&switch, "");
+    create_dir(&work.join("boss/infra/dev"));
+    write_file(&rooted(PROMPT), &drain_prompt());
+    if let Some(seat) = drain_seat {
+        write_file(&work.join("drain-seat"), &format!("{seat}\n"));
+    }
+    let script = root.join("dev-claude.sh");
+    let body = dev_claude_sh().replace("/work/", &format!("{}/", work.display()));
+    write_exec(&script, &body);
+    let out = Command::new("bash")
+        .arg(&script)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CEILING_DIRECTORIES", &root)
+        .output()
+        .unwrap_or_else(|e| panic!("run {}: {e}", script.display()));
+    assert!(
+        out.status.success(),
+        "dev-claude.sh exited {:?}",
+        out.status.code()
+    );
+    Booted {
+        argv: read_argv(&work.join("home/argv")),
+        log: std::fs::read_to_string(rooted(BOOT_LOG)).unwrap_or_default(),
+    }
+}
+
+/// The drain moves to its supervised seat (backlog b513514c): when the
+/// boot gave the drain to the conductor's seat, `dev-session.sh --boot`
+/// runs it in tmux `conductor` under factory-loop.sh, so `dev` starts
+/// as David's Remote Control door with no prompt — one drain, never two
+/// on one agent — and the log says where the drain went. dev-claude.sh
+/// reads the boot's ONE decision, /work/drain-seat, never the checkout
+/// a fast-forward may have moved since (review ce8970ce N2).
+#[test]
+fn with_a_conductor_seat_the_drain_runs_in_its_seat_and_dev_starts_idle() {
+    let b = boot_seated(Some("conductor"));
+    assert_eq!(
+        b.argv,
+        ["--remote-control", "boss-dev"],
+        "the drain runs in its seat; dev is the idle Remote Control door"
+    );
+    assert!(
+        b.log
+            .contains("the drain runs supervised in tmux conductor"),
+        "{}",
+        b.log
+    );
+    let unseated = boot_seated(None);
+    assert_eq!(
+        unseated.argv[..2],
+        ["--remote-control", "boss-dev"],
+        "{:?}",
+        unseated.argv
+    );
+    assert_eq!(
+        unseated.argv.len(),
+        3,
+        "without the boot's decision for the seat the drain prompt is dev's first prompt, as before"
+    );
+    assert!(
+        !dev_claude_sh().contains("seats.tsv"),
+        "dev-claude.sh never reads the checkout's seat list for itself: the boot decided once"
+    );
+}
+
+/// The postStart lines that decide, once, where the drain runs — from
+/// `rm -f /work/drain-seat` to the `fi` that closes the decision — with
+/// the YAML block's indentation taken off.
+fn drain_seat_decision() -> String {
+    let m = manifest();
+    let lines: Vec<&str> = m.lines().collect();
+    let first = lines
+        .iter()
+        .position(|l| l.trim() == "rm -f /work/drain-seat")
+        .expect("the postStart decides where the drain runs, once, into /work/drain-seat");
+    let indent = lines[first].len() - lines[first].trim_start().len();
+    let len = lines[first..]
+        .iter()
+        .position(|l| l.trim() == "fi")
+        .expect("the decision closes with fi")
+        + 1;
+    lines[first..first + len]
+        .iter()
+        .map(|l| l.get(indent..).unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
+/// The decision itself (review ce8970ce N1, N2): the drain goes to the
+/// conductor's seat only when the switch is on AND the CHECKOUT's door
+/// can start seats AND its seat list holds a conductor — the checkout,
+/// because the seat runs the checkout's scripts, so a roll whose
+/// checkout predates `--boot` drains in dev exactly as before. Every
+/// other case leaves no file, which both boot scripts read as `dev`.
+#[test]
+fn the_boot_gives_the_drain_to_the_seat_only_when_the_checkout_can_run_it() {
+    let seats_with = "conductor claude claude@algedonic.dev infra/dev/drain.md 600 -\n";
+    let seats_without = "codex-factory codex agent-codex p 60 codex\n";
+    for (label, switch_on, boot_door, seats, want) in [
+        ("seated", true, true, seats_with, Some("conductor")),
+        ("old checkout", true, false, seats_with, None),
+        ("no conductor row", true, true, seats_without, None),
+        ("switch off", false, true, seats_with, None),
+    ] {
+        let root = scratch_dir("drain-seat-decision");
+        let work = root.join("work");
+        let dev = work.join("boss/infra/dev");
+        create_dir(&dev);
+        if switch_on {
+            let switch = root.join(SWITCH.trim_start_matches('/'));
+            create_dir(switch.parent().expect("switch has a parent"));
+            write_file(&switch, "");
+        }
+        let door = if boot_door {
+            "if [ \"${1:-}\" = --boot ]; then :; fi\n"
+        } else {
+            "if [ \"${1:-}\" = --detached ]; then :; fi\n"
+        };
+        write_file(&dev.join("dev-session.sh"), door);
+        write_file(&dev.join("seats.tsv"), seats);
+        write_file(&work.join("drain-seat"), "stale\n");
+        let script = root.join("decide.sh");
+        let body = drain_seat_decision().replace("/work/", &format!("{}/", work.display()));
+        write_exec(&script, &body);
+        let out = Command::new("bash")
+            .arg(&script)
+            .output()
+            .unwrap_or_else(|e| panic!("run {}: {e}", script.display()));
+        assert!(out.status.success(), "{label}: {out:?}");
+        let got = std::fs::read_to_string(work.join("drain-seat")).ok();
+        assert_eq!(
+            got.as_deref().map(str::trim),
+            want,
+            "{label}: a stale decision never survives a boot"
+        );
+    }
+}
+
 #[test]
 fn without_the_switch_the_boot_is_unchanged() {
     assert_eq!(
@@ -408,6 +564,137 @@ fn the_drain_prompt_names_its_verbs_and_cannot_be_read_as_a_flag() {
     }
 }
 
+/// The drain keeps its state on packets, never in agent memory (backlog
+/// 38db9ebe, 2026-10-18). Until this car the prompt told a cold session
+/// to read MEMORY.md and its READ FIRST overnight entry, to take its
+/// owed post-land acts from that entry, and to append a line to it on
+/// every wake — the session-state class the decision record deletes
+/// outright ("Agent memory and the record", design a5368918), and the
+/// opposite of David's 2026-10-09 rule that handoff state lives on the
+/// item packets and the work-session packet. A memory file is
+/// unversioned, outside the log and mutable in place; the next session
+/// inherits it only if it happens to load the same file. So the prompt
+/// names no memory at all, and names the packet doors instead: the
+/// work-session list it reads the last handoff from, the one `handoff`
+/// key, and the metadata merge door it writes it through.
+///
+/// One key, REPLACED each wake (backlog e18b0b44, design e17c81c9,
+/// 2026-11-16): a `handoff_<YYYYMMDD>_<HHMM>Z` key per wake grew session
+/// 2d013092 to 738,325 bytes, 97% of its metadata handoffs, until the
+/// packet budget refused the very write this prompt requires. Every
+/// write's `jobs.job.updated` carries the whole row, so the wakes before
+/// are in the log, not lost.
+#[test]
+fn the_drain_keeps_its_state_on_packets_not_in_memory() {
+    let p = drain_prompt();
+    let memory: Vec<&str> = p
+        .lines()
+        .filter(|l| l.to_lowercase().contains("memory"))
+        .collect();
+    assert!(
+        memory.is_empty(),
+        "drain.md reads or writes agent memory; session state lives on packets:\n{}",
+        memory.join("\n")
+    );
+    for needle in [
+        "kind=work-session",
+        "`handoff`",
+        "PATCH /api/jobs/",
+        "/metadata",
+    ] {
+        assert!(
+            p.contains(needle),
+            "drain.md no longer names `{needle}`: the packet door its state goes through"
+        );
+    }
+    assert!(
+        !p.contains("handoff_<YYYYMMDD>_<HHMM>Z"),
+        "drain.md still writes a new handoff key every wake; the session keeps ONE `handoff`, replaced"
+    );
+}
+
+/// The reader decides by which keys are present and newer, never by the
+/// day a session opened (review 2f225d2e of car a9e8e486, finding 1).
+/// Measured 2026-11-16 ~15:25Z: session 48c007cc, opened that morning,
+/// held 7 `handoff_*` keys and no `handoff`, so a fallback reserved for
+/// sessions "opened before 2026-11-16" left tomorrow's drain reading an
+/// empty handoff. A session writes the old keys until it loads the new
+/// text — a merge, a fast-forward and a relaunch later — not at midnight.
+///
+/// And the drain is the coordinator, the conductor of these sessions, so
+/// it is told where its own orders go (finding 2): a session-wide order
+/// is the session's ONE `order` key, an order about an item a
+/// nomination on it. Until this text the only writer told about `order`
+/// was roll-the-dev-pod's quiesce step, and the conductor wrote
+/// `conductor_order_add_20261116_1509Z` onto the factory's session the
+/// same afternoon.
+#[test]
+fn the_drain_reads_handoffs_by_key_and_writes_one_order() {
+    // Whitespace collapsed, so a needle the prose wraps still matches.
+    let p = drain_prompt()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !p.contains("opened before 2026-"),
+        "drain.md keys its fallback on a session's opening date; key it on which keys are present and newer"
+    );
+    for needle in ["newest `handoff_*`", "absent or older"] {
+        assert!(
+            p.contains(needle),
+            "drain.md no longer names `{needle}`: the fallback to the per-wake keys a session still holds"
+        );
+    }
+    for needle in [
+        "ONE `order` key",
+        "`{by, at, text}`",
+        "boss step nominate",
+        "never a new `conductor_order_add_*`",
+    ] {
+        assert!(
+            p.contains(needle),
+            "drain.md no longer names `{needle}`: where the conductor writes an order"
+        );
+    }
+    // The successor path names its door and the field the next drain
+    // finds it by (review 2f225d2e, non-blocking).
+    for needle in ["boss job file --kind work-session", "`started_at`"] {
+        assert!(
+            p.contains(needle),
+            "drain.md's successor path no longer names `{needle}`"
+        );
+    }
+}
+
+/// A CAPACITY REFUSAL IS A QUEUE, NOT A STOP (backlog a3bb1743, measured
+/// 2026-11-16 03:31Z). Section 7 said "never bypass or retry around a
+/// refusal" with no line between the claim door's 409 "resource claim
+/// refused" (pool exhausted, the step queued in its line) and a policy or
+/// permission refusal, and the factory read the first as the second for
+/// hours while slots stood free. The section names the difference and the
+/// act: other ready work now, the claim again on the next wake.
+#[test]
+fn the_drain_names_a_capacity_refusal_a_queue_not_a_stop() {
+    let raw = drain_prompt();
+    let p = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let never = p
+        .split_once("## 7. Never")
+        .map(|(_, rest)| rest.split("## ").next().unwrap_or(rest))
+        .expect("drain.md has its Never section");
+    for needle in [
+        "resource claim refused",
+        "a capacity refusal is a queue",
+        "other ready work",
+        "next wake",
+    ] {
+        assert!(
+            never.contains(needle),
+            "section 7 must carry `{needle}`: a capacity refusal is a queue, not a refusal to \
+             file and stop on:\n{never}"
+        );
+    }
+}
+
 /// The drain's post-land acts name `boss workflow publish` for a row a
 /// car changed — and the hand publish is the ONE door a hold does not
 /// bind (infra/platform/workflow-holds/README.md). A session resuming
@@ -446,4 +733,46 @@ fn the_drain_never_publishes_a_held_kind() {
         1,
         "a second place naming the publish needs the same exception"
     );
+}
+
+/// The prompt drifted from the tree it drives (backlog abd1c796,
+/// measured 2026-11-09 on origin/main 6c9f2d0cd). Last edited
+/// 2026-10-18, it still said a row declaring a `writer` or an
+/// `executor` is held "by default because" of it — a default a4b57aca
+/// retired, so a cold session would hold kinds nothing holds. It never
+/// named the shared checkout's renewal door under dev isolation, it
+/// ordered work oldest-first against the urgent-first door (90bff1f3),
+/// and it capped builders at 5 where David set 8 on 2026-11-09. Each
+/// claim is pinned to the words a resuming session acts on.
+#[test]
+fn the_drain_follows_the_tree_it_drives() {
+    let p = drain_prompt();
+    let at = p
+        .find("boss workflow publish")
+        .expect("drain.md names the publish among its post-land acts");
+    let publish = p[at..].split("\n\n").next().unwrap();
+    assert!(
+        !publish.contains("by default because"),
+        "drain.md still holds writer/executor rows by default, which a4b57aca retired:\n{publish}"
+    );
+    assert!(
+        publish.contains("a4b57aca"),
+        "the publish paragraph names the item that retired the default hold:\n{publish}"
+    );
+    for needle in ["renew-checkout", "boss dispatch --next"] {
+        assert!(p.contains(needle), "drain.md no longer names `{needle}`");
+    }
+    let force = p
+        .lines()
+        .find(|l| l.contains("--force-standard"))
+        .expect("drain.md names `--force-standard`, the urgent-first door's escape");
+    assert!(
+        force.contains("Never pass"),
+        "`--force-standard` is named only to forbid it:\n{force}"
+    );
+    assert!(
+        p.contains("up to 8 builder") && p.contains("The cap is 8"),
+        "the builder cap is 8 (David, 2026-11-09)"
+    );
+    assert!(!p.contains("at most 5 builder"), "the old cap of 5 is gone");
 }

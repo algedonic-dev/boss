@@ -13,8 +13,12 @@
 //! rows in id order → INSERT into `audit_log` (the chain-hash trigger
 //! runs there exactly as for legacy writers; the relay's short batch
 //! transaction is the only holder of the chain lock per batch) →
-//! commit → publish to the bus → stamp `delivered_at`. Every crash
-//! point retries safely:
+//! commit → publish to the bus → stamp `delivered_at`. The stamp waits
+//! for the bus to CONFIRM the publish: the NATS adapter answers Ok for a
+//! stream-captured subject only on the stream's PubAck, so an event
+//! buffered in the client before a disconnect, or sent while the stream
+//! was absent, is never stamped (backlog 2e45840a). Every crash point
+//! retries safely:
 //!
 //! - crash before the audit commit → rows untouched, re-drained.
 //! - crash between audit commit and publish → audit row exists, row
@@ -115,12 +119,23 @@ pub async fn record_event_in_tx(
     record_event_with_budget_in_tx(tx, event, None).await
 }
 
+/// The size [`MAX_STAGED_EVENT_BYTES`] judges: the relay's own encoding
+/// of the event, envelope included. Public so a writer that keeps a
+/// budget UNDER the bound (the jobs service's packet budget, design
+/// 6ab85352) measures exactly what the bound measures, never a copy of
+/// the measure that could drift from it.
+pub fn encoded_len(event: &Event) -> Result<usize, String> {
+    serde_json::to_vec(event)
+        .map(|bytes| bytes.len())
+        .map_err(|e| e.to_string())
+}
+
 pub async fn record_event_with_budget_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     event: &Event,
     budget: Option<crate::statement_budget::StatementBudget>,
 ) -> Result<(), String> {
-    let size = serde_json::to_vec(event).map_err(|e| e.to_string())?.len();
+    let size = encoded_len(event)?;
     if size > MAX_STAGED_EVENT_BYTES {
         return Err(format!(
             "event kind {} encodes to {size} bytes, over the {MAX_STAGED_EVENT_BYTES}-byte \
@@ -173,6 +188,52 @@ pub async fn dead_lettered_count(pool: &PgPool) -> Result<i64, String> {
     .map_err(|e| e.to_string())
 }
 
+/// Every row the bus still owes — neither delivered nor dead-lettered —
+/// and how long the oldest has waited: the relay's report (design
+/// ad9519bc part c, backlog 2e45840a).
+///
+/// [`Undrained`] cannot answer this. The relay writes audit_log BEFORE it
+/// publishes, so through a dark bus every row reaches audit_log and none
+/// is delivered: `undrained` reads empty for the whole outage, and the
+/// relay's heartbeat counted only deliveries, so a dark bus read exactly
+/// like an idle one. Here the depth grows with every write and the age
+/// grows with the outage.
+///
+/// The age is read against the WALL, unlike `Undrained`'s head-anchored
+/// span, because a bus that went dark after the last write must still
+/// age; and it is the database's clock, the one that stamped
+/// `created_at` (`DEFAULT NOW()`), so no pod's clock skews it.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct Undelivered {
+    /// Rows owed to the bus — the same rows as [`pending_count`].
+    pub count: i64,
+    /// `created_at` of the oldest owed row.
+    pub oldest_created_at: Option<DateTime<Utc>>,
+    /// Seconds the oldest owed row has waited. `None` when nothing is
+    /// owed — never a zero, which would read as an instant relay.
+    pub oldest_age_seconds: Option<f64>,
+}
+
+/// Measure [`Undelivered`]. Walks the `event_outbox_pending` partial
+/// index, so the relay can afford it on every heartbeat.
+pub async fn undelivered(pool: &PgPool) -> Result<Undelivered, String> {
+    let (count, oldest_created_at, oldest_age_seconds): (i64, Option<DateTime<Utc>>, Option<f64>) =
+        sqlx::query_as(
+            "SELECT COUNT(*)::BIGINT, MIN(created_at), \
+                EXTRACT(EPOCH FROM NOW() - MIN(created_at))::FLOAT8 \
+             FROM event_outbox \
+             WHERE delivered_at IS NULL AND dead_lettered_at IS NULL",
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Undelivered {
+        count,
+        oldest_created_at,
+        oldest_age_seconds,
+    })
+}
+
 /// Committed writes whose event has not yet reached `audit_log`: how
 /// many, and since when (backlog 72c50b8b). This is the exposure window
 /// of every audit_log reader — a rebuild replaying the log now misses
@@ -205,6 +266,21 @@ const UNDRAINED_ROWS: &str = "FROM event_outbox o \
                          AND a.source = o.source \
                          AND a.kind = o.kind \
                          AND a.payload = o.payload)";
+
+/// Source-owned readers use the same exact drainage predicate inside their
+/// snapshot, without confusing another producer's lag with their own.
+pub async fn source_undrained_count<'e, E>(executor: E, source: &str) -> Result<i64, String>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar(&format!(
+        "SELECT COUNT(*)::BIGINT {UNDRAINED_ROWS} AND o.source = $1"
+    ))
+    .bind(source)
+    .fetch_one(executor)
+    .await
+    .map_err(|e| e.to_string())
+}
 
 /// The ONE query for [`Undrained`] (CLAUDE.md §9a): the events door
 /// serves it on the pool, and design b046f510's rebuild runs it on its

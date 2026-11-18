@@ -204,6 +204,17 @@ impl CadenceRegistry for InMemoryCadence {
         Ok(out)
     }
 
+    async fn lineage_names(&self) -> Result<Vec<String>, CadenceError> {
+        let names: std::collections::BTreeSet<String> = self
+            .rules
+            .read()
+            .await
+            .iter()
+            .map(|r| r.name().to_string())
+            .collect();
+        Ok(names.into_iter().collect())
+    }
+
     async fn publish_declared(
         &self,
         mut spec: CadenceRuleSpec,

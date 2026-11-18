@@ -303,11 +303,7 @@ fn run_one_lint(
     // A train's lints are branch code: no name a door handed this CLI,
     // and no token the conductor holds, rides into them (crate::door_env,
     // review ef2da426 F1; NoTokenInReach, backlog 0491b7d6).
-    let out = env
-        .apply(&mut Command::new("bash"))
-        .arg(script)
-        .current_dir(tree)
-        .output();
+    let out = lint_command(tree, script, env).output();
     let out = match out {
         Ok(out) => out,
         Err(e) => return LintResult::Unrunnable(format!("could not spawn bash: {e}")),
@@ -333,6 +329,15 @@ fn run_one_lint(
             LintResult::Failed(text.trim().to_string())
         }
     }
+}
+
+/// The actual command/environment boundary, shared with the causal
+/// fake-capability control. Output handling stays with the operation owner.
+#[cfg(test)]
+fn lint_command(tree: &Path, script: &Path, env: &NoTokenInReach) -> Command {
+    let mut command = Command::new("bash");
+    env.apply(&mut command).arg(script).current_dir(tree);
+    command
 }
 
 /// The decision. Pure over what the lints said, so the verdict is
@@ -553,55 +558,221 @@ mod tests {
     /// This is a fake capability and an isolated loopback receiver only.
     #[test]
     fn the_replaced_local_boundary_can_read_and_use_a_fake_token() {
+        fake_token_can_be_read_and_used(Duration::ZERO);
+    }
+
+    #[test]
+    fn fixture_preparation_does_not_spend_the_fake_clients_http_budget() {
+        fake_token_can_be_read_and_used(Duration::from_secs(6));
+    }
+
+    fn fake_token_can_be_read_and_used(before_client: Duration) {
         use std::io::{Read, Write};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
         let (_guard, tree) = consist_fixture("direct-token-read", &twelve_migrations());
         let token = tree.join("held-fake-machine-token");
         fs::write(&token, "fake-consist-control").expect("fake credential");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fake receiver");
         listener.set_nonblocking(true).expect("bounded accept");
         let port = listener.local_addr().expect("receiver address").port();
-        let receiver = std::thread::spawn(move || {
+        let script = tree.join("infra/lint/direct-read-and-use.sh");
+        fs::write(&script, format!("set -euo pipefail\nvalue=$(cat '{}')\nprintf 'DIRECT-READ:%s\\n' \"$value\"\ncurl --max-time 3 -fsS -H \"x-boss-machine-token: $value\" http://127.0.0.1:{port}/fake-capability\n",token.display())).expect("direct-read fixture");
+        let environment = NoTokenInReach::new().expect("stripped environment");
+        let command = lint_command(&tree, &script, &environment);
+        let client_done = Arc::new(AtomicBool::new(false));
+        let receiver_done = client_done.clone();
+        // This independent deadman covers the deliberate pre-client delay
+        // and both unchanged 3s network bounds. Normal accept termination is
+        // owned by the actual client's completion, not fixture wall age.
+        let overall_bound = before_client + Duration::from_secs(3 + 3);
+        let receiver = std::thread::spawn(move || -> Result<String, String> {
             let began = std::time::Instant::now();
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::WouldBlock
-                            && began.elapsed() < Duration::from_secs(5) =>
-                    {
-                        std::thread::sleep(Duration::from_millis(5))
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if receiver_done.load(Ordering::SeqCst) {
+                            return Err("fake client ended without a request".into());
+                        }
+                        if began.elapsed() >= overall_bound {
+                            return Err(
+                                "fake receiver's independent overall watchdog expired".into()
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
                     }
-                    Err(error) => panic!("fake receiver did not get its bounded request: {error}"),
+                    Err(error) => return Err(format!("fake receiver accept: {error}")),
                 }
             };
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
-                .expect("bounded read");
+                .map_err(|e| e.to_string())?;
+            stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .map_err(|e| e.to_string())?;
             let mut bytes = [0; 4096];
-            let count = stream.read(&mut bytes).expect("fake request");
+            let count = stream.read(&mut bytes).map_err(|e| e.to_string())?;
             let request = String::from_utf8_lossy(&bytes[..count]).to_string();
             stream
                 .write_all(
                     b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
-                .expect("fake response");
-            request
+                .map_err(|e| e.to_string())?;
+            Ok(request)
         });
-        let script = tree.join("infra/lint/direct-read-and-use.sh");
-        fs::write(&script, format!("set -euo pipefail\nvalue=$(cat '{}')\nprintf 'DIRECT-READ:%s\\n' \"$value\"\ncurl --max-time 3 -fsS -H \"x-boss-machine-token: $value\" http://127.0.0.1:{port}/fake-capability\n",token.display())).expect("direct-read fixture");
-        let environment = NoTokenInReach::new().expect("stripped environment");
-        let result = run_one_lint(&tree, &script, 4096, &environment);
-        assert_eq!(
-            result,
-            LintResult::Passed,
-            "the old boundary must reproduce the original exposure"
+        std::thread::sleep(before_client);
+        let (output, expired, _) =
+            owned_fake_client(command, client_done, Duration::from_secs(3 + 3));
+        let request = receiver.join().expect("fake receiver joined");
+        assert!(
+            !expired,
+            "the fake client's independent owner watchdog expired"
         );
-        let request = receiver.join().expect("fake receiver result");
+        assert!(
+            output.status.success(),
+            "old boundary did not reproduce exposure: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let request = request.expect("actual fake request before client completion");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("DIRECT-READ:fake-consist-control")
+        );
         assert!(
             request.contains("x-boss-machine-token: fake-consist-control"),
             "{request}"
         );
-        println!("OLD-BOUNDARY-DIRECT-READ-AND-USE: reproduced with fake credential only");
+    }
+
+    /// Only a synthetic command built by this test is given to this owner.
+    /// The watchdog owns the actual child and process group through wait/reap.
+    fn owned_fake_client(
+        mut command: Command,
+        done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        bound: Duration,
+    ) -> (std::process::Output, bool, u32) {
+        use std::io::Read;
+        use std::os::unix::process::CommandExt;
+        struct Done(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let done = Done(done);
+        let mut child = command
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("owned synthetic child");
+        let pid = child.id();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let stdout = std::thread::spawn(move || {
+            let mut b = Vec::new();
+            stdout.read_to_end(&mut b).unwrap();
+            b
+        });
+        let stderr = std::thread::spawn(move || {
+            let mut b = Vec::new();
+            stderr.read_to_end(&mut b).unwrap();
+            b
+        });
+        let owner = std::thread::spawn(move || {
+            let _done = done;
+            let began = std::time::Instant::now();
+            loop {
+                if let Some(status) = child.try_wait().expect("observe owned child") {
+                    return (status, false);
+                }
+                if began.elapsed() >= bound {
+                    let group = rustix::process::Pid::from_raw(pid as i32).unwrap();
+                    // This exact group was created by Command::process_group(0).
+                    let kill =
+                        rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+                    return (reap_fake_client_after_kill(&mut child, kill), true);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let (status, expired) = owner.join().expect("actual client owner joined");
+        (
+            std::process::Output {
+                status,
+                stdout: stdout.join().unwrap(),
+                stderr: stderr.join().unwrap(),
+            },
+            expired,
+            pid,
+        )
+    }
+
+    fn reap_fake_client_after_kill(
+        child: &mut std::process::Child,
+        kill: rustix::io::Result<()>,
+    ) -> std::process::ExitStatus {
+        // Preserve custody even when kill races with natural exit. Judge the
+        // syscall only after the actual owned child has been reaped.
+        let status = child.wait().expect("reap owned synthetic child");
+        if let Err(error) = kill {
+            assert_eq!(
+                error,
+                rustix::io::Errno::SRCH,
+                "kill only owned synthetic group"
+            );
+        }
+        status
+    }
+
+    #[test]
+    fn a_kill_racing_with_exit_still_reaps_the_owned_fake_client() {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.kill().unwrap();
+        // A kill can report ESRCH after the owned process has already exited.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reap_fake_client_after_kill(&mut child, Err(rustix::io::Errno::SRCH))
+        }));
+        let reaped_before_cleanup = !Path::new(&format!("/proc/{pid}")).exists();
+        // Preserve cleanup even on the deliberately failing implementation.
+        let _ = child.wait();
+        assert!(
+            result.is_ok() && reaped_before_cleanup,
+            "a racing kill error skipped actual reaping"
+        );
+    }
+
+    #[test]
+    fn a_nonfinishing_fake_client_is_killed_reaped_and_ends_its_receiver_custody() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let (_guard, tree) = consist_fixture("direct-token-watchdog", &twelve_migrations());
+        let script = tree.join("infra/lint/hung-fake-client.sh");
+        fs::write(&script, "exec sleep 60\n").unwrap();
+        let environment = NoTokenInReach::new().unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let (output, expired, pid) = owned_fake_client(
+            lint_command(&tree, &script, &environment),
+            done.clone(),
+            Duration::from_millis(100),
+        );
+        assert!(expired && !output.status.success());
+        assert!(done.load(Ordering::SeqCst));
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "owned fake client remained alive or zombie"
+        );
     }
 
     // -- a machine cancellation says why -------------------------------

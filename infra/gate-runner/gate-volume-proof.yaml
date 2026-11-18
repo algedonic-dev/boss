@@ -1,0 +1,167 @@
+# gate-volume-proof — the Job that proves the claim `gate` is the gate
+# disk, and only then writes the marker run.sh refuses to gate without.
+#
+# WHY IT IS A FILE (backlog ae59464b, 2026-11-07). run.sh's gate-disk
+# guard (gate_disk_guard) refuses every gate whose runs directory carries
+# no /gate-runs/.gate-volume, because "not EPHEMERAL" is only a negative:
+# the marker is the positive half, written once by a pod that has SHOWN
+# the volume is one filesystem, not the install disk, writable as the
+# gate and able to reflink (review 635317c5, C1 and C3). The one proof
+# ever run — Job gate-volume-proof-4dss4 on w-1, 2026-09-30, backlog
+# 52ea56ac — was made by hand from a run and never reached the tree, so a
+# fresh gate volume (a replaced disk, a reformat, the move onto a Micron
+# 7400 PRO David ordered on 2026-11-07) stopped every gate with no door
+# to start them again. This file is that Job; `prove-gate-volume <node>`
+# (infra/forge/prove-gate-volume.sh, infra/ops/verbs/) applies it through
+# the forge's ops_kubectl door and reads its log back.
+#
+# WHAT IS HELD EQUAL, and by what (CLAUDE.md §9a). The claim and its two
+# mounts, the uid/gid/fsGroup, the image and its pull secret are the
+# `gate` container's in gate-runner.yaml; the three paths the script
+# compares are the arguments run.sh's own call of gate_disk_guard passes;
+# the marker is that function's "$2/.gate-volume". Each is read out of
+# those files by crates/core/boss-testing/tests/prove_gate_volume_sh.rs,
+# never typed there, so a proof cannot vouch for a layout the gate does
+# not use.
+#
+# ONE SUBSTITUTION. $GATE_PROOF_NODE is the verb's node, filled in by the
+# script after the estate registry and the cluster have agreed it is a
+# worker; nothing else here comes from a caller.
+#
+# A FIXED NAME. The name is gate-volume-proof, so the API server itself
+# refuses a second proof while one stands (AlreadyExists). A FINISHED one
+# goes by its ttlSecondsAfterFinished, an hour (the floor
+# every_job_bounds_its_finished_history.rs holds every Job to, so a failed
+# proof's log outlives its failure) — or sooner, when the verb runs again:
+# it prints that Job's whole log onto its own ops-request and only then
+# removes it, by uid. A Job still running is never removed; it ends at its
+# deadline. It is declared here, so delete-orphan-object, which removes
+# only what the tree does NOT declare, refuses it by design.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gate-volume-proof
+  namespace: boss-dev
+  labels:
+    app: gate-volume-proof
+spec:
+  backoffLimit: 0
+  # Five minutes: the proof writes and copies one MiB. A pod that cannot
+  # start (a cordon, an image that will not pull, a volume the node cannot
+  # mount) fails the Job here, which the verb reports with the reason.
+  activeDeadlineSeconds: 300
+  # An hour, the tree's floor for a Job's finished history: the pod's log
+  # stays readable by hand that long after the verb has printed it. A
+  # proof re-run sooner does not wait for it (see the head of this file).
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels: {app: gate-volume-proof}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - {name: forgejo-registry}
+      # THE NODE THE VERB NAMES, AND NEVER A CONTROL PLANE. The claim's
+      # local PV already binds the pod to its node; naming the node here
+      # as well makes "the node the verb proved" and "the node the pod ran
+      # on" one fact the verb can read back (spec.nodeName), and the
+      # control-plane term is the gate's own rule (incident a398c4d3).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: kubernetes.io/hostname, operator: In, values: ["$GATE_PROOF_NODE"]}
+                  - {key: node-role.kubernetes.io/control-plane, operator: DoesNotExist}
+      # The restricted profile, met as the gate runner meets it.
+      securityContext:
+        fsGroup: 1500
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: proof
+          # The gate container's own image: resident on the build node
+          # because every gate pulls it, GNU coreutils (cp --reflink,
+          # stat -c, cmp, df), and held equal to gate-runner.yaml's.
+          image: 10.20.0.15:3000/david/boss-ci:rust1.96
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsUser: 65534
+            runAsGroup: 1500
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {cpu: "1", memory: 256Mi}
+          env:
+            - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+          command: ["/bin/bash", "-c"]
+          # THE PROOF, in the order that makes it one: read the devices,
+          # refuse before writing anything if the seed and the runs
+          # directory are two filesystems or either is EPHEMERAL's; write
+          # a file as the gate's identity and read its owner back;
+          # reflink it from the seed into the runs directory and compare;
+          # print df; and only then write the marker, by rename, and read
+          # it back. The PROOF_* names are test seams: this pod's env sets
+          # none, so the paths are run.sh's. Every line it prints opens
+          # with `gate-volume-proof: `, which is what the verb parses.
+          args:
+            - |
+              set -u
+              ME=gate-volume-proof
+              say() { printf '%s: %s\n' "$ME" "$*"; }
+              SEED="${PROOF_SEED:-/gate-seed}"
+              RUNS="${PROOF_RUNS:-/gate-runs}"
+              EPHEMERAL="${PROOF_EPHEMERAL:-/etc/hosts}"
+              MARKER="$RUNS/.gate-volume"
+              NODE="${NODE_NAME:-}"
+              POD="${POD_NAME:-}"
+              WROTE=""
+              # A refusal after the marker was written takes it away again:
+              # its absence stops gates, an unproven one would let them run.
+              no() {
+                  if [ -n "$WROTE" ]; then rm -f "$MARKER"; say "the marker this run wrote was removed"; fi
+                  say "REFUSED — $*"
+                  say "no marker was written"
+                  exit 1
+              }
+              [ -n "$NODE" ] && [ -n "$POD" ] || no "NODE_NAME or POD_NAME is not set — the marker could not say where it was proven"
+              say "running as uid $(id -u) gid $(id -g) on node $NODE, pod $POD"
+              d_s=$(stat -c %d "$SEED") || no "cannot read the device of $SEED"
+              d_r=$(stat -c %d "$RUNS") || no "cannot read the device of $RUNS"
+              d_e=$(stat -c %d "$EPHEMERAL") || no "cannot read the device of $EPHEMERAL"
+              say "devices gate-seed=$d_s gate-runs=$d_r etc-hosts(EPHEMERAL)=$d_e"
+              [ "$d_s" = "$d_r" ] || no "$SEED (device $d_s) and $RUNS (device $d_r) are on different filesystems — the gate volume is not one mount, and the seeding copy could not be a reflink"
+              [ "$d_r" != "$d_e" ] || no "$RUNS is on the same filesystem as $EPHEMERAL (device $d_e), the pod's EPHEMERAL — the gate volume is not mounted on $NODE, and a gate here would write the install disk"
+              fstype=$(stat -f -c %T "$RUNS") || no "cannot read the filesystem type of $RUNS"
+              source=$(df -P "$RUNS" | awk 'NR == 2 { print $1 }')
+              say "filesystem $fstype on ${source:-an unread source}"
+              A="$SEED/.gate-volume-proof.$POD"
+              B="$RUNS/.gate-volume-proof.$POD"
+              trap 'rm -f "$A" "$B" "$MARKER.$POD"' EXIT
+              head -c 1048576 /dev/urandom > "$A" || no "cannot write $A as $(id -u):$(id -g)"
+              own=$(stat -c %u:%g "$A") || no "cannot read the owner of $A"
+              [ "$own" = 65534:1500 ] || no "$A was written as $own, not 65534:1500 — the gate's identity does not own what it writes here"
+              cp --reflink=always "$A" "$B" || no "cp --reflink=always from $SEED to $RUNS failed — this filesystem does not reflink, so every gate's seeding copy would be a full rewrite"
+              cmp "$A" "$B" || no "the reflinked copy in $RUNS differs from its source in $SEED"
+              say "wrote as 65534:1500, cp --reflink=always seed to runs succeeded, cmp equal"
+              df -h "$SEED" "$RUNS" | sed "s|^|$ME: df: |"
+              if [ -f "$MARKER" ]; then say "the previous marker read: $(cat "$MARKER")"; fi
+              line="proven $(date -u +%Y-%m-%dT%H:%M:%SZ) node=$NODE device=$d_r fstype=$fstype source=${source:-unread} pod=$POD"
+              printf '%s\n' "$line" > "$MARKER.$POD" || no "cannot write $MARKER.$POD"
+              mv -f "$MARKER.$POD" "$MARKER" || no "cannot rename the marker into place at $MARKER"
+              WROTE=1
+              back=$(cat "$MARKER") || no "the marker could not be read back"
+              [ "$back" = "$line" ] || no "the marker reads back '$back', not what was written"
+              [ "$(stat -c %d "$MARKER")" = "$d_r" ] || no "the marker is not on the device it proved ($d_r)"
+              say "PROOF-OK: wrote as 65534:1500, cp --reflink=always seed to runs succeeded, cmp equal, marker written"
+              say "marker $MARKER reads: $back"
+          # The claim, mounted as the gate mounts it — the seed and the
+          # runs directory, and NOT a workspace: this pod is no gate run.
+          volumeMounts:
+            - {name: gate-disk, mountPath: /gate-seed, subPath: seed}
+            - {name: gate-disk, mountPath: /gate-runs, subPath: runs}
+      volumes:
+        - name: gate-disk
+          persistentVolumeClaim: {claimName: gate}

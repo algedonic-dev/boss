@@ -90,9 +90,10 @@ use serde::Deserialize;
 use serde_json::{Value as Json, json};
 use tokio::io::AsyncWriteExt;
 
+use super::alarm_item::{self, Occurrence, Raised};
 use super::common::{
     StepEvent, api_client, complete_step, dispatcher_reader_header, get_json, owner_for_filing,
-    post_json, row_or_refuse, rows_or_refuse, sim_origin_value, write_json,
+    row_or_refuse, rows_or_refuse, sim_origin_value,
 };
 use super::credential_issuer::{
     AccessApp, AccessAppSpec, AccessApps, AccessPolicy, AccessPolicySpec, SecretStore,
@@ -1021,9 +1022,11 @@ pub fn alarm_refresh(observation_id: &str, r: &Reading) -> Json {
     })
 }
 
-/// The open packet already carrying `key`, if any, and whether the page
-/// that answered can be trusted to be complete.
-pub fn already_open(listing: &Json, key: &str) -> Result<Option<String>, String> {
+/// The open packet already carrying `key`, if any — found by the one
+/// definition every alarm reads (`alarm_item::open_item`, backlog
+/// f4b0ad41) — and whether the page that answered can be trusted to be
+/// complete.
+pub fn already_open(listing: &Json, key: &str) -> Result<Option<Json>, String> {
     // No `data` array refuses for what it is; it was held before only
     // by accident of the truncation check below (d4698bc2).
     let rows: Vec<Json> = rows_or_refuse(listing, "the dedup read (GET /api/jobs)")?;
@@ -1040,11 +1043,7 @@ pub fn already_open(listing: &Json, key: &str) -> Result<Option<String>, String>
             ));
         }
     }
-    Ok(rows
-        .iter()
-        .find(|j| j.pointer("/metadata/estate_finding").and_then(Json::as_str) == Some(key))
-        .and_then(|j| j.get("id").and_then(Json::as_str))
-        .map(str::to_string))
+    Ok(alarm_item::open_item(&rows, "estate_finding", key).cloned())
 }
 
 // ---------------------------------------------------------------------------
@@ -1471,30 +1470,34 @@ impl DnsObserve {
             rule,
         )
         .await?;
-        match already_open(&listing, &key).map_err(HandlerError::Downstream)? {
-            Some(open_id) => {
-                write_json(
-                    &self.client,
-                    reqwest::Method::PATCH,
-                    &format!("{}/api/jobs/{open_id}/metadata", self.base()),
-                    &alarm_refresh(observation_id, r),
-                    rule,
-                )
-                .await?;
-                tracing::info!(finding = %key, packet = %open_id, "dns.observe refreshed the open alarm");
-                Ok("refreshed")
-            }
-            None => {
-                let owner = owner_for_filing(self.owner.as_ref(), rule).await;
-                post_json(
-                    &self.client,
-                    &format!("{}/api/jobs", self.base()),
-                    &alarm_body(zone, observation_id, r, &owner),
-                    rule,
-                )
-                .await?;
+        let open = already_open(&listing, &key).map_err(HandlerError::Downstream)?;
+        // Through the one helper every alarm raises with (backlog
+        // f4b0ad41): an open alarm takes this reading as a refresh, and
+        // a drift back on one told it had recovered is an occurrence.
+        let owner = owner_for_filing(self.owner.as_ref(), rule).await;
+        let refresh = match alarm_refresh(observation_id, r) {
+            Json::Object(m) => m,
+            _ => Default::default(),
+        };
+        let occ = Occurrence::unstamped(r.summary());
+        match alarm_item::raise(
+            &self.client,
+            self.base(),
+            open.as_ref(),
+            alarm_body(zone, observation_id, r, &owner),
+            &occ,
+            refresh,
+            rule,
+        )
+        .await?
+        {
+            Raised::Filed(_) => {
                 tracing::info!(finding = %key, "dns.observe raised an alarm");
                 Ok("raised")
+            }
+            Raised::Appended(id) | Raised::Held(id) => {
+                tracing::info!(finding = %key, packet = %id, "dns.observe refreshed the open alarm");
+                Ok("refreshed")
             }
         }
     }
@@ -1849,7 +1852,7 @@ mod tests {
         });
         assert_eq!(
             already_open(&listing, "dns_drift:algedonic.dev").unwrap(),
-            Some("alarm-1".to_string())
+            Some(listing["data"][1].clone())
         );
         assert_eq!(
             already_open(&listing, "dns_drift:example.org").unwrap(),

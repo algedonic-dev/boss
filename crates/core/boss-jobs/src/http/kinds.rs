@@ -100,7 +100,19 @@ pub(super) async fn policy_check<R: JobsRepository, B: EventBus>(
 /// Create, Update or Publish on `workflow` — while every version that
 /// was published, active or retired, stays readable to Read: it is the
 /// record of what ran, packets are pinned to retired versions, and a
-/// step surface reads the version its packet runs under.
+/// step surface reads the version its packet runs under. A REJECTED
+/// candidate (backlog 50ded63d) is read the same way: it was never
+/// published, but packets ran it, so it is the record of what ran too.
+///
+/// THE FOURTH LEG (backlog f21804d8, design 600c07d7, decided
+/// 2026-10-17). Read on `workflow-draft` reads a draft and authors
+/// nothing. The movement observer captures the complete graph, and the
+/// graph reads draft definitions before it filters them; with authoring
+/// as the only way in, qualifying that read-only observer meant granting
+/// it Create, Update or Publish. It is a grant of its own, held by
+/// default only by the deploy superuser (who already reads drafts by
+/// authoring) and never a shipped resource, so no read-only role
+/// inherits it; neither an access tier nor workflow Read implies it.
 pub(super) async fn may_read_drafts<R: JobsRepository, B: EventBus>(
     state: &JobsApiState<R, B>,
     user: &boss_policy_client::User,
@@ -109,6 +121,7 @@ pub(super) async fn may_read_drafts<R: JobsRepository, B: EventBus>(
         controls::CREATE_WORKFLOW,
         controls::UPDATE_WORKFLOW,
         controls::PUBLISH_WORKFLOW,
+        controls::READ_WORKFLOW_DRAFT,
     ] {
         match state.policy.ask(user, control).await {
             Ok(Decision::Allow { .. }) => return Ok(true),
@@ -119,13 +132,15 @@ pub(super) async fn may_read_drafts<R: JobsRepository, B: EventBus>(
     Ok(false)
 }
 
-/// The refusal for a draft read by a caller who may not author one.
+/// The refusal for a draft read by a caller who holds none of the four
+/// legs of [`may_read_drafts`], naming the read-only one.
 pub(super) fn draft_refusal(what: &str, user: &boss_policy_client::User) -> Response {
     (
         StatusCode::FORBIDDEN,
         format!(
             "{what} is an unpublished draft, read only by who may author one (Create, Update or \
-             Publish on workflow); {} (role {}) holds none of those",
+             Publish on workflow) or holds Read on workflow-draft; {} (role {}) holds none of \
+             those",
             user.id, user.role
         ),
     )
@@ -356,10 +371,19 @@ pub(super) async fn update_kind<R: JobsRepository + 'static, B: EventBus + 'stat
 /// and leaves as 422 + the problem list (2026-08-13: publish used to
 /// accept anything, and the bad row surfaced as a dead API on the
 /// next pod roll).
+///
+/// THE PASSKEY RULE (backlog a4b57aca). Policy is not the whole answer:
+/// a publish over a LIVE row that is passkey-protected — a presence step
+/// on the row, or a protected child it admits or fulfils — is refused
+/// 409 unless the body names a publish-a-protocol packet signed for
+/// these exact bytes over this live version. The judgement runs inside
+/// the registry's write ([`crate::publish_passkey::judge`]). The body is
+/// optional; an unprotected publish sends none, as before.
 pub(super) async fn publish_kind<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(user): CurrentUser,
     Path(kind): Path<String>,
+    body: axum::body::Bytes,
 ) -> Response {
     let reg = match kind_registry_or_503(&state) {
         Ok(r) => r,
@@ -368,11 +392,261 @@ pub(super) async fn publish_kind<R: JobsRepository + 'static, B: EventBus + 'sta
     if let Err(r) = policy_check(&state, &user, controls::PUBLISH_WORKFLOW).await {
         return r;
     }
+    let request: PublishRequest = if body.iter().all(u8::is_ascii_whitespace) {
+        PublishRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "the publish body is not {{approval, spec_path, spec_toml}}: {e} — an \
+                         unprotected publish sends no body at all"
+                    ),
+                )
+                    .into_response();
+            }
+        }
+    };
+    let signed = match signed_publish(&state, &kind, request).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let guard = passkey_guard(&state, &user, signed.as_ref());
     let (actor, now) = write_stamp(&state, &user).await;
-    match reg.publish(&kind, &actor, now).await {
+    match reg.publish_guarded(&kind, &guard, &actor, now).await {
         Ok(spec) => Json(spec).into_response(),
         Err(e) => kind_err_response(e),
     }
+}
+
+/// `GET /api/workflows/{kind}/passkey` — whether an UNSIGNED publish of
+/// `kind` would be refused for want of a passkey, and why, in the
+/// judge's own words (backlog 5af64799). The same rule
+/// [`publish_kind`] enforces ([`crate::publish_passkey::protection`],
+/// the unsigned half of its judge), over the same baselines and the
+/// same live rule graph read as the caller, asked BEFORE a publish so
+/// the client roads route a protected kind to its owner's passkey
+/// instead of creating a draft the publish then refuses — the stranded
+/// publish-to-github v18 of 2026-11-18 (ops-request 489680c9).
+///
+/// `{kind, live_version, retired, protected, why}`: `live_version` is
+/// the baseline judged (null for a kind that never published, which
+/// nothing protects). An unread rule graph is 503, as the publish's,
+/// unless the row's own presence step already answers. A read, so it
+/// asks Read on `workflow`, and it is read-only: the publish judges
+/// again under its own lock, and this answer is never a licence.
+pub(super) async fn kind_passkey<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+    Path(kind): Path<String>,
+) -> Response {
+    let reg = match kind_registry_or_503(&state) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    if let Err(r) = policy_check(&state, &user, controls::READ_WORKFLOW).await {
+        return r;
+    }
+    let baselines = match reg.passkey_baseline_rows().await {
+        Ok(rows) => rows,
+        Err(e) => return kind_err_response(e),
+    };
+    let needs_rules = baselines
+        .iter()
+        .find(|s| s.kind == kind)
+        .is_some_and(|s| crate::publish_passkey::presence_step(s).is_none());
+    let rules = if needs_rules {
+        enforced_rules(state.publish_rules.as_deref(), &user).await
+    } else {
+        Ok(Vec::new())
+    };
+    let judged = crate::publish_passkey::protection(
+        &kind,
+        &baselines,
+        rules.as_deref().map_err(String::as_str),
+    );
+    let baseline = baselines.iter().find(|s| s.kind == kind);
+    match judged {
+        Ok(protection) => Json(serde_json::json!({
+            "kind": kind,
+            "live_version": baseline.map(|s| s.version),
+            "retired": baseline.is_some_and(|s| s.status == WorkflowStatus::Retired),
+            "protected": protection.is_some(),
+            "why": protection.map(|p| p.why),
+        }))
+        .into_response(),
+        Err(e) => kind_err_response(e),
+    }
+}
+
+/// The optional body of a publish: the publish-a-protocol packet that
+/// signs it, and the bytes it signed (the row file's text, and the tree
+/// path the approve step names).
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PublishRequest {
+    approval: Option<uuid::Uuid>,
+    spec_path: Option<String>,
+    spec_toml: Option<String>,
+}
+
+/// The passkey rule as a [`crate::registry::PublishGuard`], for both
+/// publish roads (this endpoint and the workflow-publish step). The rule
+/// graph is read INSIDE the guard, so the registry asks it under the
+/// passkey-edges fence — never a snapshot taken before the write, which
+/// an edge added in between made stale (review R3 of car 8715776d). The
+/// kind judged is the candidate's own: the row the write promotes.
+pub(super) fn passkey_guard<R: JobsRepository, B: EventBus>(
+    state: &JobsApiState<R, B>,
+    user: &boss_policy_client::User,
+    signed: Option<&crate::publish_passkey::Signed>,
+) -> impl Fn(
+    Vec<crate::registry::WorkflowSpec>,
+    crate::registry::WorkflowSpec,
+) -> crate::registry::PublishVerdict
++ Send
++ Sync
++ use<R, B> {
+    let (rules, user, signed) = (state.publish_rules.clone(), user.clone(), signed.cloned());
+    move |baselines, candidate| {
+        let (rules, user, signed) = (rules.clone(), user.clone(), signed.clone());
+        Box::pin(async move {
+            let rules = enforced_rules(rules.as_deref(), &user).await;
+            crate::publish_passkey::judge(
+                &candidate.kind,
+                &baselines,
+                &candidate,
+                rules.as_deref().map_err(String::as_str),
+                signed.as_ref(),
+            )
+        })
+    }
+}
+
+/// The live rule registry for the passkey rule's edges, read as the
+/// publisher (the dispatcher withholds its rules from a caller whose
+/// scope does not read every packet, and that refusal is carried, not
+/// swallowed). No dispatcher wired is no rule, so no edge.
+async fn enforced_rules(
+    rules: Option<&dyn crate::department::rules::DispatcherRules>,
+    user: &boss_policy_client::User,
+) -> Result<Vec<serde_json::Value>, String> {
+    match rules {
+        None => Ok(Vec::new()),
+        Some(rules) => rules.enforced_rules(user).await,
+    }
+}
+
+/// Judge the signature a publish request names, before the write:
+/// the packet read from the record, never trusted from the request, and
+/// judged by [`crate::publish_passkey::judge_signature`] (the port of
+/// `infra/lib/signed-publish.jq`); the bytes hashed and read by the
+/// platform seed's loader. What only the write can judge — the live
+/// version and the draft it promotes — is judged there.
+#[allow(
+    clippy::result_large_err,
+    reason = "idiomatic axum Response error; crate-wide Box<Response> cleanup tracked separately"
+)]
+async fn signed_publish<R: JobsRepository, B: EventBus>(
+    state: &JobsApiState<R, B>,
+    kind: &str,
+    request: PublishRequest,
+) -> Result<Option<crate::publish_passkey::Signed>, Response> {
+    let refuse = |status: StatusCode, msg: String| Err((status, msg).into_response());
+    let Some(packet_id) = request.approval else {
+        if request.spec_path.is_some() || request.spec_toml.is_some() {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                "spec_path and spec_toml ride only with the approval that signed them".into(),
+            );
+        }
+        return Ok(None);
+    };
+    let (Some(path), Some(text)) = (request.spec_path, request.spec_toml) else {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "approval {packet_id} names a signature, and a signature binds bytes: send \
+                 spec_path and spec_toml beside it"
+            ),
+        );
+    };
+    let id = boss_core::job::JobId::from_uuid(packet_id);
+    let job = match state.jobs.get_job(&id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => {
+            return refuse(
+                StatusCode::CONFLICT,
+                format!("approval {packet_id} names no packet, so nothing signs this publish"),
+            );
+        }
+        Err(e) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let steps = match state.jobs.list_steps(&id).await {
+        Ok(s) => s,
+        Err(e) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let mut packet = serde_json::to_value(&job).unwrap_or_default();
+    if let Some(o) = packet.as_object_mut() {
+        o.insert(
+            "steps".into(),
+            serde_json::to_value(&steps).unwrap_or_default(),
+        );
+    }
+    let shape = steps
+        .iter()
+        .find(|s| s.spec_slug.as_deref() == Some("approve"))
+        .map(|s| boss_core::job::step_shape_hash(&s.title, &s.metadata))
+        .unwrap_or_default();
+    let sha = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(text.as_bytes()))
+    };
+    let verdict = crate::publish_passkey::judge_signature(
+        &packet,
+        &shape,
+        &crate::publish_passkey::approvers(),
+        crate::publish_passkey::VERB_FILE,
+        "workflow",
+        kind,
+        &path,
+        &sha,
+        "publish",
+    )
+    .map_err(|why| {
+        (
+            StatusCode::CONFLICT,
+            format!(
+                "publish-a-protocol {packet_id} is not a signature of this publish: {why} — \
+                 nothing published"
+            ),
+        )
+            .into_response()
+    })?;
+    let spec = match crate::seed_loader::parse_workflows(&text, "platform", &path) {
+        Ok(specs) => specs.into_iter().find(|s| s.kind == kind),
+        Err(e) => {
+            return refuse(
+                StatusCode::CONFLICT,
+                format!("the signed bytes of {path} do not read as a workflow row: {e}"),
+            );
+        }
+    };
+    let Some(spec) = spec else {
+        return refuse(
+            StatusCode::CONFLICT,
+            format!("the signed bytes of {path} hold no {kind} row"),
+        );
+    };
+    Ok(Some(crate::publish_passkey::Signed {
+        packet: packet_id.to_string(),
+        by: verdict.by,
+        at: verdict.at,
+        live_version: verdict.live,
+        spec,
+    }))
 }
 
 /// `DELETE /api/workflows/{kind}/versions/{version}` — discard a DRAFT
@@ -425,6 +699,86 @@ pub(super) async fn discard_kind_version<R: JobsRepository + 'static, B: EventBu
             (StatusCode::CONFLICT, m).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `POST /api/workflows/{kind}/versions/{version}/reject` — set a draft
+/// that met traffic and lost to `rejected` (backlog 50ded63d). The
+/// discard above refuses such a draft, rightly, and until this door
+/// nothing else could move it, so a RETIRE verdict left the kind with
+/// a draft publish would promote and `boss workflow publish` refused
+/// to publish around. Rejected, it stays history for its pinned
+/// packets and publish never sees it again.
+///
+/// Refuses rather than guesses. 409 while an OPEN experiment's split
+/// still names the version on either arm — that experiment has not
+/// concluded, and rejecting under it would silently send its share of
+/// admissions back to the active version; 409 for an active or retired
+/// row (history) and for a draft no packet is pinned to (it met no
+/// traffic: discard it); 404 for a version that never existed; 503
+/// when the open experiments cannot all be read. Retire on `workflow`,
+/// the authority that takes a version out of service. 204 when the
+/// row is rejected, including when it already was.
+///
+/// THE EXPERIMENT CHECK IS NOT ATOMIC WITH THE FLIP (the review of car
+/// e3c4a326, N1). It reads the open experiments before, and outside,
+/// the registry transaction, so an experiment write that puts a split
+/// onto this version between the read and the flip still passes its own
+/// check (the row reads Draft then) and the reject lands under an open
+/// split. The window needs a concurrent experiment write; admission's
+/// fail-safe sends that split's candidate share to the active version,
+/// unstamped, so the cost is a skewed cohort, never a packet on a
+/// rejected protocol.
+pub(super) async fn reject_kind_version<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+    Path((kind, version)): Path<(String, i32)>,
+) -> Response {
+    let reg = match kind_registry_or_503(&state) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    if let Err(r) = policy_check(&state, &user, controls::RETIRE_WORKFLOW).await {
+        return r;
+    }
+    let open_experiments = crate::port::JobFilter {
+        kind: Some(crate::experiments::EXPERIMENT_KIND.to_string()),
+        status: Some(boss_core::job::JobStatus::Open),
+        ..Default::default()
+    };
+    // A limit is not a filter: every open experiment is read, or none
+    // is trusted to have been.
+    const PAGE: i64 = 500;
+    match state.jobs.list_jobs(&open_experiments, PAGE, 0).await {
+        Ok((rows, total)) if i64::try_from(rows.len()).unwrap_or(i64::MAX) < total => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "{total} open experiments and {} read — whether one still splits onto \
+                     {kind} v{version} is unknown, so nothing was rejected",
+                    rows.len()
+                ),
+            )
+                .into_response();
+        }
+        Ok((rows, _)) => {
+            if let Some(id) = crate::experiments::splitting_onto(&rows, &kind, version) {
+                return (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "{kind} v{version} cannot be rejected: open experiment {id} still \
+                         splits admissions onto it — conclude the experiment first"
+                    ),
+                )
+                    .into_response();
+            }
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+    let (actor, now) = write_stamp(&state, &user).await;
+    match reg.reject_draft(&kind, version, &actor, now).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => kind_err_response(e),
     }
 }
 

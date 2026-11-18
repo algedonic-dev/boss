@@ -147,9 +147,10 @@ fn git_output_line(
 
 /// Read the branch's base standing out of a git repository.
 ///
-/// Read-only: it fetches the two refs it needs into the remote-tracking
-/// namespace and then only `rev-parse` / `merge-base` / `rev-list` /
-/// `diff`. Never touches a working tree, an index or a local branch, so
+/// Read-only: it fetches the two refs it needs into a namespace of its
+/// own ([`PRIVATE_REFS`]), deleted after, and then only `rev-parse` /
+/// `merge-base` / `rev-list` / `diff`. Never touches the shared
+/// remote-tracking refs, `FETCH_HEAD`, a working tree, an index or a local branch, so
 /// it is safe in an operator's dirty checkout — which is where `boss
 /// gate` runs, and a verb that stashed or checked out there would be the
 /// `never-stash-while-a-gate-runs` defect with a new name.
@@ -157,38 +158,93 @@ fn git_output_line(
 /// Every failure is an [`Base::Unanswered`] carrying the reason, never a
 /// staleness finding.
 pub(crate) fn observe(repo: &Path, branch: &str) -> BaseObservation {
+    // INTO REFS OF THIS READ'S OWN, NOT `refs/remotes/origin/*` (backlog
+    // eee3bc52). git updates a ref by compare and swap, so when main has
+    // moved, overlapping fetches of the SHARED tracking ref — two
+    // sessions gating, a `dispatch --launch`, the hourly fast-forward
+    // sidecar, an operator's `git fetch` — all fail "cannot lock ref" but
+    // one (review fae63341: 2 at once lost 30 of 60 rounds, 8 at once
+    // 210 of 240), and a killed fetch's orphaned `git-remote-http` can
+    // hold `origin/main.lock` so every later fetch there fails. Here that
+    // read as Unanswered: the guard waved the car through with a note.
+    // No other writer names these refs, so there is nothing to contend,
+    // and a lock left by a killed read blocks only a name never used
+    // again — which is why no sweep follows it. The flags are the launch
+    // fetch's (`dispatch_launch::fetched_main`, car ff1b7a35):
+    // `--refmap=` stops git ALSO moving the configured tracking refs
+    // "opportunistically" (measured on git 2.39.5), `--no-tags` keeps
+    // auto-followed tags out of the shared `refs/tags`, and
+    // `--no-write-fetch-head` leaves the checkout's `FETCH_HEAD` alone.
+    //
+    // Precisely the two refs, so a big repository does not pay for a
+    // full fetch, and so a branch missing from the forge fails HERE with
+    // a reason rather than answering off a stale remote-tracking ref.
+    let own = private_prefix();
+    let main_ref = format!("{own}/main");
+    let head_ref = format!("{own}/head");
+    let fetched = git_line(
+        repo,
+        &[
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--refmap=",
+            "origin",
+            &format!("+refs/heads/main:{main_ref}"),
+            &format!("+refs/heads/{branch}:{head_ref}"),
+        ],
+    );
+    let obs = match fetched {
+        Ok(_) => read_base(repo, &main_ref, &head_ref),
+        Err(e) => BaseObservation {
+            standing: Base::Unanswered,
+            unreadable: Some(e),
+            ..Default::default()
+        },
+    };
+    // The objects stay; only the names go. A delete that fails leaves a
+    // ref no one reads under a name no one reuses — the cost is objects
+    // kept from gc, not a wrong answer — so it is not the read's verdict.
+    for r in [&main_ref, &head_ref] {
+        let _ = git(repo, &["update-ref", "-d", r]);
+    }
+    obs
+}
+
+/// A ref namespace no other read, process or account will name: the
+/// pid separates processes, the counter reads within one, the clock a
+/// pid the kernel has recycled.
+fn private_prefix() -> String {
+    static READ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{PRIVATE_REFS}/{}-{nanos}-{}",
+        std::process::id(),
+        READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// [`observe`]'s reading, once `main` and `head` hold the forge's refs.
+fn read_base(repo: &Path, main: &str, head: &str) -> BaseObservation {
     let unreadable = |why: String| BaseObservation {
         standing: Base::Unanswered,
         unreadable: Some(why),
         ..Default::default()
     };
-    // Precisely the two refs, so a big repository does not pay for a
-    // full fetch, and so a branch missing from the forge fails HERE with
-    // a reason rather than answering off a stale remote-tracking ref.
-    let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
-    if let Err(e) = git_line(
-        repo,
-        &[
-            "fetch",
-            "--quiet",
-            "origin",
-            "+refs/heads/main:refs/remotes/origin/main",
-            &refspec,
-        ],
-    ) {
-        return unreadable(e);
-    }
-    let head = format!("origin/{branch}");
-    let main_head = match git_line(repo, &["rev-parse", "origin/main"]) {
+    let main_head = match git_line(repo, &["rev-parse", main]) {
         Ok(s) => s,
         Err(e) => return unreadable(e),
     };
-    let base = match git_line(repo, &["merge-base", "origin/main", &head]) {
+    let base = match git_line(repo, &["merge-base", main, head]) {
         Ok(s) => s,
         Err(e) => return unreadable(e),
     };
     let standing = base_from_is_ancestor_code(
-        git(repo, &["merge-base", "--is-ancestor", "origin/main", &head])
+        git(repo, &["merge-base", "--is-ancestor", main, head])
             .ok()
             .and_then(|o| o.status.code()),
     );
@@ -205,20 +261,18 @@ pub(crate) fn observe(repo: &Path, branch: &str) -> BaseObservation {
             },
         };
     }
-    let behind_by = git_line(
-        repo,
-        &["rev-list", "--count", &format!("{head}..origin/main")],
-    )
-    .ok()
-    .and_then(|s| s.parse().ok())
-    .unwrap_or(0);
-    let mut untested: Vec<String> = git_line(repo, &["diff", "--name-only", &base, "origin/main"])
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect();
+    let behind_by = git_line(repo, &["rev-list", "--count", &format!("{head}..{main}")])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut untested: Vec<String> =
+        git_line(repo, &["diff", "--no-renames", "--name-only", &base, main])
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
     untested.sort();
     untested.dedup();
     BaseObservation {
@@ -235,6 +289,9 @@ pub(crate) fn observe(repo: &Path, branch: &str) -> BaseObservation {
 /// on this side of the language boundary (`infra/dev/door-freshness.sh`
 /// holds the shell's copy, pinned by its own test).
 pub(crate) const FRESHNESS_ENV: &str = "BOSS_DOOR_FRESHNESS";
+
+/// Where [`observe`] fetches what it reads (backlog eee3bc52).
+const PRIVATE_REFS: &str = "refs/boss-freshness";
 
 /// Has the operator silenced the freshness question for this process?
 pub(crate) fn freshness_silenced() -> bool {
@@ -404,24 +461,126 @@ pub(crate) struct Rebased {
     pub confirmed: bool,
 }
 
-/// One commit `--rebase` dropped because its patch is already on main:
-/// the predecessor car landed by squash, so the same change sits on main
-/// under another sha and the replay produces nothing.
+/// One commit `--rebase` dropped because main already holds its change:
+/// the predecessor car landed by squash, so the change sits on main under
+/// another sha and replaying it adds nothing ([`DroppedHow`] says how
+/// that was established).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Dropped {
     pub sha: String,
     pub title: String,
+    pub how: DroppedHow,
+}
+
+/// Why a commit was dropped rather than replayed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DroppedHow {
+    /// Its patch is already on main under another sha, so the cherry-pick
+    /// produced nothing (1cfab20e).
+    EmptyReplay,
+    /// It belongs to a prefix of `len` commits whose FINAL state main
+    /// already holds blob for blob: the predecessor landed as a squash of
+    /// a series (backlog 48bb0b42). Replayed one by one its intermediate
+    /// states would conflict; replayed as a whole it would change nothing.
+    LandedPrefix { len: usize },
 }
 
 impl Dropped {
     /// The one line the CLI prints per dropped commit.
     pub(crate) fn line(&self) -> String {
-        format!(
-            "rebase: dropped {} \"{}\" — its patch is already on main",
-            &self.sha[..7.min(self.sha.len())],
-            self.title
-        )
+        let short = &self.sha[..7.min(self.sha.len())];
+        match self.how {
+            DroppedHow::EmptyReplay => format!(
+                "rebase: dropped {short} \"{}\" — its patch is already on main",
+                self.title
+            ),
+            DroppedHow::LandedPrefix { len: 1 } => format!(
+                "rebase: skipped {short} \"{}\" — its final state is already on main (landed by \
+                 squash)",
+                self.title
+            ),
+            DroppedHow::LandedPrefix { len } => format!(
+                "rebase: skipped {short} \"{}\" — the {len}-commit series it belongs to is \
+                 already on main as one squash",
+                self.title
+            ),
+        }
     }
+}
+
+/// How many leading commits of `commits` (oldest first, cut at `base`)
+/// main already holds as ONE state: the longest prefix such that every
+/// path it touched has, at the prefix's last commit, exactly the blob
+/// `main` has. Zero when no prefix qualifies.
+///
+/// That is what a predecessor car leaves when it lands by SQUASH (backlog
+/// 48bb0b42; console car 3 on console car 2a, 2026-11-01): its commits sit
+/// on the stale car's branch one by one, main holds their SUM under one
+/// sha, and replaying them singly conflicts at the first intermediate
+/// state — an add/add on the file the series kept rewriting — so it never
+/// replays empty and 1cfab20e's drop never fires. Skipping the prefix is
+/// safe by CONSTRUCTION, not by patch text, which is the rule `boss
+/// rerail` and 6e38a79e refuse to drop on: main's tree equals the prefix's
+/// final tree on every path the prefix touched, so the suffix replays onto
+/// the very preimage it was written on; and a change main took and later
+/// reverted has different blobs, so it is not skipped and still stops as
+/// the conflict it is — and so does a series whose file a later train
+/// rewrote after the squash: a different blob on main is not landed, and
+/// the old conflict is the loud, safe answer. The paths are listed with
+/// rename detection OFF, so a rename carries its deleted source path and
+/// a prefix is never judged on its destination alone; and they are
+/// compared as git's own BYTES, never decoded, so a path that is not
+/// UTF-8 is the path it names.
+pub(crate) fn landed_prefix(
+    git: &dyn Fn(&[&str]) -> anyhow::Result<std::process::Output>,
+    main: &str,
+    base: &str,
+    commits: &[&str],
+) -> anyhow::Result<usize> {
+    use anyhow::bail;
+    use std::collections::BTreeSet;
+    // The paths two trees differ on, exactly as git names them. WITHOUT
+    // rename detection: with it on, a rename lists only its destination,
+    // so a prefix that renamed a file would be judged on the new path
+    // alone and skipped while main still held the old one — the car's
+    // deletion lost under a line claiming its final state is on main (the
+    // review of car 9ed6382f, run add8d092). And as BYTES: a git path is
+    // a byte string, and decoding `car-\xff.rs` lossily named
+    // `car-\u{fffd}.rs`, a path in neither tree, which then compared
+    // "same" — the prefix that added the file was skipped while main
+    // never held it, and the replay dropped it (the review of car
+    // 9ed6382f, run d033776b). Nothing here is handed back to git as a
+    // pathspec, so no path is ever re-spelled on its way to a verdict.
+    let differing = |from: &str, to: &str, what: &str| -> anyhow::Result<BTreeSet<Vec<u8>>> {
+        let out = git(&["diff", "--name-only", "-z", "--no-renames", from, to])?;
+        if !out.status.success() {
+            bail!("{what}: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(out
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect())
+    };
+    for len in (1..=commits.len()).rev() {
+        let last = commits[len - 1];
+        let touched = differing(
+            base,
+            last,
+            &format!("listing the paths {base}..{last} touched"),
+        )?;
+        if touched.is_empty() {
+            continue;
+        }
+        // Landed iff main and the prefix's last commit differ on NONE of
+        // the paths the prefix touched.
+        let moved = differing(main, last, &format!("comparing main with {last}"))?;
+        if touched.is_disjoint(&moved) {
+            return Ok(len);
+        }
+    }
+    Ok(0)
 }
 
 /// Replay a stale car onto origin/main and move its branch on the forge
@@ -551,6 +710,10 @@ fn replay_once(repo: &Path, branch: &str) -> anyhow::Result<Replay> {
         "listing the car's commits",
     )?;
     let commits: Vec<&str> = commits.lines().filter(|l| !l.is_empty()).collect();
+    let merge_base = ok(
+        &git(&["merge-base", "origin/main", &format!("origin/{branch}")])?,
+        "reading the merge-base",
+    )?;
     let behind = ok(
         &git(&[
             "rev-list",
@@ -633,7 +796,7 @@ fn replay_once(repo: &Path, branch: &str) -> anyhow::Result<Replay> {
             .with_context(|| format!("git {args:?} in {tmp_str}"))
     };
     let conflicted = || {
-        in_tmp(&["diff", "--name-only", "--diff-filter=U"])
+        in_tmp(&["diff", "--no-renames", "--name-only", "--diff-filter=U"])
             .map(|o| {
                 String::from_utf8_lossy(&o.stdout)
                     .trim()
@@ -708,8 +871,33 @@ fn replay_once(repo: &Path, branch: &str) -> anyhow::Result<Replay> {
         }
     }
     let mut dropped: Vec<Dropped> = Vec::new();
+    // What a replay has to account for: every commit, skipped or picked.
+    let total = if merge_forward { 0 } else { commits.len() };
+    // A prefix main already holds as one squash is skipped before the
+    // first pick (48bb0b42): replayed one by one it conflicts, not empty.
+    let skip = if merge_forward {
+        0
+    } else {
+        match landed_prefix(&git, &main_head, &merge_base, &commits) {
+            Ok(n) => n,
+            Err(e) => {
+                cleanup(&git);
+                return Err(e);
+            }
+        }
+    };
+    for c in &commits[..skip] {
+        let title = git(&["log", "-1", "--format=%s", c])
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|_| "(title unreadable)".to_string());
+        dropped.push(Dropped {
+            sha: c.to_string(),
+            title,
+            how: DroppedHow::LandedPrefix { len: skip },
+        });
+    }
     // A merge-forward replays nothing: the merge above is the whole move.
-    let to_replay: &[&str] = if merge_forward { &[] } else { &commits };
+    let to_replay: &[&str] = if merge_forward { &[] } else { &commits[skip..] };
     for c in to_replay {
         // cherry-pick keeps the car's AUTHOR; the COMMITTER is this
         // verb, acting for whoever runs it — set explicitly so the replay
@@ -747,10 +935,31 @@ fn replay_once(repo: &Path, branch: &str) -> anyhow::Result<Replay> {
                 dropped.push(Dropped {
                     sha: c.to_string(),
                     title,
+                    how: DroppedHow::EmptyReplay,
                 });
                 continue;
             }
             let said = String::from_utf8_lossy(&pick.stderr).trim().to_string();
+            // Main's twin of the stopped commit is looked for while the
+            // temporary worktree still exists, and only at a conflict: an
+            // empty replay is already handled above (backlog 6e38a79e).
+            let twin = if files.is_empty() {
+                String::new()
+            } else {
+                let title = in_tmp(&["log", "-1", "--format=%s", c])
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                twin_sentence(&TwinStop {
+                    wt: &tmp_str,
+                    main_head: &main_head,
+                    car_head: &old_head,
+                    branch,
+                    stopped: c,
+                    title: &title,
+                    commits: &commits,
+                    dropped: &dropped,
+                })
+            };
             let _ = in_tmp(&["cherry-pick", "--abort"]);
             cleanup(&git);
             if files.is_empty() {
@@ -765,7 +974,7 @@ fn replay_once(repo: &Path, branch: &str) -> anyhow::Result<Replay> {
             }
             bail!(
                 "boss gate --rebase: REFUSED — replaying {} onto origin/main@{} hit a conflict in: \
-                 {files}. Nothing was pushed; {branch} still points at {}. {MERGE_MAIN_PATH}",
+                 {files}. Nothing was pushed; {branch} still points at {}. {twin}{MERGE_MAIN_PATH}",
                 &c[..8.min(c.len())],
                 &main_head[..8],
                 &old_head[..8]
@@ -775,7 +984,7 @@ fn replay_once(repo: &Path, branch: &str) -> anyhow::Result<Replay> {
     // Every commit dropped: the branch is entirely on main. Nothing to
     // gate — pushing main's head to the branch would only manufacture a
     // car with no diff — so refuse, and point at the verb that proves it.
-    if !to_replay.is_empty() && dropped.len() == to_replay.len() {
+    if total > 0 && dropped.len() == total {
         cleanup(&git);
         let named = dropped
             .iter()
@@ -784,7 +993,7 @@ fn replay_once(repo: &Path, branch: &str) -> anyhow::Result<Replay> {
             .join(", ");
         bail!(
             "boss gate --rebase: REFUSED — {branch} is already landed: every commit it carries \
-             ({named}) replays empty onto origin/main@{}, so there is nothing to gate. Nothing \
+             ({named}) is already on origin/main@{}, so there is nothing to gate. Nothing \
              was pushed; {branch} still points at {}. Confirm with `boss merged {branch}`.",
             &main_head[..8],
             &old_head[..8]
@@ -869,13 +1078,136 @@ fn replay_once(repo: &Path, branch: &str) -> anyhow::Result<Replay> {
     Ok(Replay::Settled(Rebased {
         old_head,
         new_head,
-        replayed: to_replay.len() - dropped.len(),
+        // Skipped and dropped commits both count against the total.
+        replayed: total.saturating_sub(dropped.len()),
         dropped,
         merged: merge_forward,
         // An unreadable branch is not a finding either way: the caller
         // prints the move without vouching for it.
         confirmed: observed.is_some(),
     }))
+}
+
+/// A replay that stopped on a conflict, as [`twin_sentence`] reads it.
+struct TwinStop<'a> {
+    /// The temporary worktree, still mid-cherry-pick.
+    wt: &'a str,
+    /// The main the car is replayed onto.
+    main_head: &'a str,
+    /// The car's forge head: a twin is looked for on main, never among
+    /// the car's own commits.
+    car_head: &'a str,
+    branch: &'a str,
+    /// The commit git stopped on, and its subject.
+    stopped: &'a str,
+    title: &'a str,
+    /// Every commit the replay was to make, oldest first.
+    commits: &'a [&'a str],
+    /// The commits already skipped as empty: main holds those.
+    dropped: &'a [Dropped],
+}
+
+/// What a replay conflict says about main's twin of the stopped commit —
+/// ONE sentence-run with no newline, ending in a space so the refusal's
+/// way past ([`MERGE_MAIN_PATH`]) follows it — or "" when main never took
+/// that patch text.
+///
+/// THE GATE NAMES THE TWIN AS THE RERAIL DOES (backlog 6e38a79e,
+/// 2026-10-18). Car dd64f4ad stalled on exactly this stop; `boss rerail`
+/// learned to name main's twin there (ec05a62f) and `boss gate --rebase`,
+/// which the dock's re-gate runs, did not. The lookup is the rerail's own,
+/// [`crate::twin::twin_on_main`]. It DROPS NOTHING — the packet asked for a
+/// drop, which the three reviews of car fd13ddf2 had already removed from
+/// the rerail for being wrong every time they tried one — and the way to
+/// leave the commit out is builder rule 1's own re-base onto a fresh
+/// branch, because a force-push of this car is the act rule 1 forbids.
+///
+/// ONE LINE, because the dock keeps only a refusal's first line (the
+/// conductor's re-gate stamps `refused.lines().next()` on the held car),
+/// so a twin on a second line would never reach the reader the dock holds
+/// the car for.
+fn twin_sentence(stop: &TwinStop<'_>) -> String {
+    let short = |s: &str| s[..12.min(s.len())].to_string();
+    let TwinStop {
+        wt,
+        main_head,
+        car_head,
+        branch,
+        stopped,
+        title,
+        commits,
+        dropped,
+    } = stop;
+    let twin = match crate::twin::twin_on_main(wt, main_head, car_head, stopped) {
+        Ok(Some(twin)) => twin,
+        Ok(None) => return String::new(),
+        Err(e) => {
+            let why = format!("{e:#}").replace('\n', " ");
+            return format!(
+                "Whether main holds a twin of {} could not be read: {why}. ",
+                short(stopped)
+            );
+        }
+    };
+    // Not "it is not this commit's twin" (backlog 2f2caa8e, review
+    // 22073d6e, the rerail's note corrected on main): main's commit IS the
+    // twin when it landed on files main had already changed outside the
+    // hunk, so the sentence says what the match shows and no more.
+    if twin.found == crate::twin::TwinFound::Elsewhere {
+        return format!(
+            "Main's {} \"{}\" carries the same patch text as the stopped commit {} \"{title}\", \
+             but not the same blobs (git diff-tree --raw). So it may be this commit's twin, \
+             landed on files main had already changed outside the hunk, or the same text at \
+             another place in them; the patch text alone cannot tell which. Read it, then \
+             resolve the conflict as usual: git -C <your worktree> show {}. ",
+            short(&twin.sha),
+            twin.subject,
+            short(stopped),
+            short(&twin.sha),
+        );
+    }
+    // Leaving the stopped commit out keeps every OTHER commit main does
+    // not already hold: the ones replayed empty would stop the
+    // cherry-pick again for nothing.
+    let rest: Vec<String> = commits
+        .iter()
+        .filter(|c| **c != *stopped && !dropped.iter().any(|d| d.sha == **c))
+        .map(|c| short(c))
+        .collect();
+    // The log read is the evidence main still holds the change; `boss
+    // merged` answers MERGED off `git cherry` once main took the patch, a
+    // later revert or not, so it is named as the check that cannot fail
+    // (backlog 2f2caa8e, as the rerail's note says it).
+    let leave_out = if rest.is_empty() {
+        format!(
+            "If main holds it, the car carries nothing main lacks: gate nothing and close the \
+             car as landed, citing that read — `boss merged {branch}` answers MERGED once main \
+             has taken the patch, even if a later commit took it back out, so it cannot. "
+        )
+    } else {
+        format!(
+            "If main holds it, leave the commit out by re-basing as builder rule 1 does: git -C \
+             <your worktree> checkout -b {branch}-2 origin/main, then git -C <your worktree> \
+             cherry-pick {}, push that branch and gate it in this one's place. ",
+            rest.join(" ")
+        )
+    };
+    format!(
+        "The stopped commit {} \"{title}\" is main's {} \"{}\" byte for byte — the same paths, \
+         modes and blobs (git diff-tree --raw): main took this change once. Whether main STILL \
+         holds it is yours to decide — read what main did to its files since: git -C <your \
+         worktree> log -p {}..{} -- {}. {leave_out}Otherwise: ",
+        short(stopped),
+        short(&twin.sha),
+        twin.subject,
+        short(&twin.sha),
+        short(main_head),
+        twin.files
+            .iter()
+            .map(|f| crate::twin::sh_quote(f))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
 }
 
 pub(crate) fn stale_base_guard(
@@ -1459,6 +1791,8 @@ mod tests {
             "{err}"
         );
         assert!(!err.contains("git rebase"), "{err}");
+        // Main never took this commit's patch: no twin is named.
+        assert!(!err.contains("yours to decide"), "{err}");
         Forge::git(&f.clone, &["fetch", "-q", "origin"]);
         let forge_head = String::from_utf8_lossy(
             &Forge::git(&f.clone, &["rev-parse", "origin/car/overlaps"]).stdout,
@@ -1714,6 +2048,111 @@ mod tests {
             );
             Self { clone }
         }
+
+        /// The shape measured 2026-11-01 (backlog 48bb0b42: console car 3
+        /// on console car 2a): `car/first` is a SERIES, two commits on one
+        /// file, the second rewriting what the first added, landed by
+        /// squash, so main holds their sum under one sha and none of them
+        /// one by one; `car/second` was cut from car/first's head and adds
+        /// one commit of its own. Replaying car/first's first commit onto
+        /// main is an add/add conflict on first.rs, never an empty pick.
+        fn build_after_squashed_series(name: &str) -> Self {
+            let root = boss_testing::scratch::scratch_dir(name);
+            let origin = root.join("forge");
+            let clone = root.join("clone");
+            boss_testing::scratch::create_dir(&origin);
+            let w = |rel: &str, body: &str| {
+                boss_testing::scratch::write_file(&origin.join(rel), body);
+            };
+            Self::git(&origin, &["init", "-q", "-b", "main"]);
+            w("base.rs", "base\n");
+            Self::git(&origin, &["add", "."]);
+            Self::git(&origin, &["commit", "-qm", "base B"]);
+
+            Self::git(&origin, &["checkout", "-q", "-b", "car/first", "main"]);
+            w("first.rs", "fn first() {}\n");
+            Self::git(&origin, &["add", "."]);
+            Self::git(&origin, &["commit", "-qm", "first car: add first.rs"]);
+            w("first.rs", "fn first() -> u8 {\n    1\n}\n");
+            w("first_test.rs", "fn first_is_one() {}\n");
+            Self::git(&origin, &["add", "."]);
+            Self::git(&origin, &["commit", "-qm", "first car: first returns one"]);
+
+            Self::git(
+                &origin,
+                &["checkout", "-q", "-b", "car/second", "car/first"],
+            );
+            w("second.rs", "fn second() {}\n");
+            Self::git(&origin, &["add", "."]);
+            Self::git(&origin, &["commit", "-qm", "second car: second.rs"]);
+
+            // The train squash-merges the whole series: one sha for two.
+            Self::git(&origin, &["checkout", "-q", "main"]);
+            Self::git(&origin, &["merge", "-q", "--squash", "car/first"]);
+            Self::git(&origin, &["commit", "-qm", "train: first car lands"]);
+
+            Self::git(
+                &root,
+                &["clone", "-q", origin.to_str().expect("utf8 path"), "clone"],
+            );
+            Self { clone }
+        }
+    }
+
+    /// A predecessor that landed by squash as a SERIES replays nothing
+    /// empty: its first commit conflicts with main's sum of the series
+    /// (backlog 48bb0b42: console car 3 conflicted in five
+    /// predecessor-only files with zero overlap of its own, and was
+    /// rebased --onto by hand). Main holds the series' final state blob
+    /// for blob, so the whole prefix is skipped as landed and only the
+    /// car's own suffix replays.
+    #[test]
+    fn a_squash_landed_series_is_skipped_and_only_the_suffix_replays() {
+        let f = Forge::build_after_squashed_series("boss-cli-freshness-rebase-squashed-series");
+        let series: Vec<String> = String::from_utf8_lossy(
+            &Forge::git(
+                &f.clone,
+                &["rev-list", "--reverse", "origin/main..origin/car/first"],
+            )
+            .stdout,
+        )
+        .lines()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(series.len(), 2, "the predecessor is a two-commit series");
+        let done = rebase_onto_main(&f.clone, "car/second")
+            .expect("the landed series is skipped and the car's own commit replays");
+        assert_eq!(done.replayed, 1, "{done:?}");
+        assert_eq!(
+            done.dropped
+                .iter()
+                .map(|d| d.sha.clone())
+                .collect::<Vec<_>>(),
+            series,
+            "{done:?}"
+        );
+        for d in &done.dropped {
+            assert!(d.line().contains("already on main"), "{}", d.line());
+        }
+        Forge::git(&f.clone, &["fetch", "-q", "origin"]);
+        let above = String::from_utf8_lossy(
+            &Forge::git(
+                &f.clone,
+                &["log", "--format=%s", "origin/main..origin/car/second"],
+            )
+            .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(above, "second car: second.rs", "{above}");
+        assert_eq!(observe(&f.clone, "car/second").standing, Base::Current);
+        let wts = String::from_utf8_lossy(&Forge::git(&f.clone, &["worktree", "list"]).stdout)
+            .to_string();
+        assert_eq!(
+            wts.lines().count(),
+            1,
+            "the temporary worktree is gone: {wts}"
+        );
     }
 
     /// A commit main already holds (the predecessor car landed by squash)
@@ -1735,13 +2174,21 @@ mod tests {
         assert_eq!(done.dropped.len(), 1, "{done:?}");
         assert_eq!(done.dropped[0].sha, first_sha, "{done:?}");
         assert_eq!(done.dropped[0].title, "first car: first.rs", "{done:?}");
+        // Since 48bb0b42 the landed prefix is found from the trees before
+        // any pick, so a single landed commit is skipped, not picked empty;
+        // the line still says the commit, its title and that main has it.
         let line = done.dropped[0].line();
         assert!(
             line.starts_with(&format!(
-                "rebase: dropped {} \"first car: first.rs\" — its patch is already on main",
+                "rebase: skipped {} \"first car: first.rs\" — its final state is already on main",
                 &first_sha[..7]
             )),
             "{line}"
+        );
+        assert_eq!(
+            done.dropped[0].how,
+            DroppedHow::LandedPrefix { len: 1 },
+            "{done:?}"
         );
 
         Forge::git(&f.clone, &["fetch", "-q", "origin"]);
@@ -1773,6 +2220,216 @@ mod tests {
             1,
             "the temporary worktree is gone: {wts}"
         );
+    }
+
+    impl Forge {
+        /// Car dd64f4ad's shape (backlog ec05a62f, 6e38a79e): `car/stale`
+        /// carries a stale copy of a change that landed alone, then
+        /// `with` — the car's own further commits, (path, body, subject).
+        /// Main took the change as train #1015 and a later train amended
+        /// those lines, so the replay CONFLICTS rather than replaying
+        /// empty. Returns (clone, the twin's sha, main's head, the car's
+        /// commit shas oldest first).
+        fn build_stale_copy(
+            name: &str,
+            with: &[(&str, &str, &str)],
+        ) -> (Self, String, String, Vec<String>) {
+            let root = boss_testing::scratch::scratch_dir(name);
+            let origin = root.join("forge");
+            let clone = root.join("clone");
+            boss_testing::scratch::create_dir(&origin);
+            let w = |rel: &str, body: &str| {
+                boss_testing::scratch::write_file(&origin.join(rel), body);
+            };
+            let head = |dir: &Path| {
+                String::from_utf8_lossy(&Self::git(dir, &["rev-parse", "HEAD"]).stdout)
+                    .trim()
+                    .to_string()
+            };
+            Self::git(&origin, &["init", "-q", "-b", "main"]);
+            w("base.txt", "l1\nl2\nl3\nl4\nl5\n");
+            Self::git(&origin, &["add", "."]);
+            Self::git(&origin, &["commit", "-qm", "base B"]);
+
+            Self::git(&origin, &["checkout", "-q", "-b", "car/stale", "main"]);
+            w("base.txt", "l1\nl2\nFEATURE\nl4\nl5\n");
+            Self::git(&origin, &["commit", "-qam", "stale copy: feature"]);
+            let mut car = vec![head(&origin)];
+            for (rel, body, subject) in with {
+                w(rel, body);
+                Self::git(&origin, &["add", "."]);
+                Self::git(&origin, &["commit", "-qm", subject]);
+                car.push(head(&origin));
+            }
+
+            Self::git(&origin, &["checkout", "-q", "main"]);
+            w("base.txt", "l1\nl2\nFEATURE\nl4\nl5\n");
+            Self::git(
+                &origin,
+                &["commit", "-qam", "train: 2026-10-09 (1 changes) (#1015)"],
+            );
+            let twin = head(&origin);
+            w("base.txt", "l1\nl2\nFEATURE2\nl4\nl5\n");
+            Self::git(&origin, &["commit", "-qam", "train: amend (#1016)"]);
+            let main = head(&origin);
+
+            Self::git(
+                &root,
+                &["clone", "-q", origin.to_str().expect("utf8 path"), "clone"],
+            );
+            (Self { clone }, twin, main, car)
+        }
+    }
+
+    /// THE GATE NAMES MAIN'S TWIN AS THE RERAIL DOES (backlog 6e38a79e).
+    /// Car dd64f4ad sat 87 windows on a replay stop because nothing told
+    /// its reader that main had taken the stopped commit's change once;
+    /// `boss rerail` learned to say so (ec05a62f) and `boss gate --rebase`
+    /// — which the dock re-gate also runs — did not. The refusal now names
+    /// the twin through the SAME lookup, drops nothing, and stays ONE line,
+    /// because the dock keeps only a refusal's first line.
+    #[test]
+    fn a_conflict_on_a_stale_copy_names_main_twin_and_drops_nothing() {
+        let (f, twin, main, car) = Forge::build_stale_copy(
+            "boss-cli-freshness-rebase-twin",
+            &[("w.txt", "w\n", "car: w.txt")],
+        );
+        let old_head = f.head("origin/car/stale");
+        let err = rebase_onto_main(&f.clone, "car/stale")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains('\n'), "one line, for the dock: {err}");
+        for want in [
+            "REFUSED",
+            "conflict in: base.txt",
+            "\"stale copy: feature\"",
+            "\"train: 2026-10-09 (1 changes) (#1015)\"",
+            &twin[..12],
+            "byte for byte",
+            "Whether main STILL holds it is yours to decide",
+            &format!(
+                "git -C <your worktree> log -p {}..{} -- 'base.txt'",
+                &twin[..12],
+                &main[..12]
+            ),
+            // The way to leave it out is builder rule 1's own re-base.
+            "git -C <your worktree> checkout -b car/stale-2 origin/main",
+            &format!("git -C <your worktree> cherry-pick {}", &car[1][..12]),
+            MERGE_MAIN_PATH,
+        ] {
+            assert!(err.contains(want), "missing {want:?} in: {err}");
+        }
+        assert!(!err.contains("nothing main lacks"), "{err}");
+        Forge::git(&f.clone, &["fetch", "-q", "origin"]);
+        assert_eq!(f.head("origin/car/stale"), old_head, "nothing pushed");
+        assert_eq!(f.worktrees(), 1, "no temporary worktree left behind");
+    }
+
+    /// When the stopped commit is the only change the car carries, leaving
+    /// it out leaves nothing to gate: the refusal says so rather than
+    /// point at a branch with no commits on it. The evidence it cites is
+    /// the log read, never `boss merged`, which answers MERGED off `git
+    /// cherry` once main took the patch, a later revert or not — the
+    /// rerail's note was corrected for that on main (backlog 2f2caa8e)
+    /// and the gate's says the same.
+    #[test]
+    fn a_stale_copy_that_is_the_whole_car_says_the_car_carries_nothing() {
+        let (f, twin, _, _) = Forge::build_stale_copy("boss-cli-freshness-rebase-twin-only", &[]);
+        let err = rebase_onto_main(&f.clone, "car/stale")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains('\n'), "one line, for the dock: {err}");
+        for want in [
+            "REFUSED",
+            &twin[..12],
+            "the car carries nothing main lacks",
+            "close the car as landed, citing that read",
+            "`boss merged car/stale` answers MERGED once main has taken the patch, even if a \
+             later commit took it back out, so it cannot",
+        ] {
+            assert!(err.contains(want), "missing {want:?} in: {err}");
+        }
+        assert!(!err.contains("confirm with `boss merged"), "{err}");
+        assert!(!err.contains("checkout -b car/stale-2"), "{err}");
+    }
+
+    /// The same patch TEXT alone is named as a match that may or may not
+    /// be this commit's twin (review 0a5496cb, finding 1, which the shared
+    /// lookup carries): patch-id drops the @@ line numbers, so a car
+    /// changing the FIRST of two equal stanzas has the patch-id of main's
+    /// change to the SECOND — and the same text-only match is also what
+    /// the car's very change looks like when it landed on a file main had
+    /// already changed outside the hunk. So the refusal says it cannot
+    /// tell which, never "not this commit's twin" (backlog 2f2caa8e,
+    /// review 22073d6e, corrected in the rerail's note on main), offers no
+    /// way to leave the car's commit out, and the conflict is the ordinary
+    /// one.
+    #[test]
+    fn the_same_patch_text_alone_is_named_as_a_possible_twin() {
+        let root = boss_testing::scratch::scratch_dir("boss-cli-freshness-rebase-elsewhere");
+        let origin = root.join("forge");
+        let clone = root.join("clone");
+        boss_testing::scratch::create_dir(&origin);
+        let stanza = |k: &str| format!("p\nq\nr\nk={k}\nr\nq\np\n");
+        let file = |first: &str, second: &str| {
+            let filler: String = (1..=8).map(|n| format!("f{n}\n")).collect();
+            format!("{}{filler}{}", stanza(first), stanza(second))
+        };
+        let w = |body: &str| boss_testing::scratch::write_file(&origin.join("reg.toml"), body);
+        let head = || f_head(&origin);
+        Forge::git(&origin, &["init", "-q", "-b", "main"]);
+        w(&file("1", "1"));
+        Forge::git(&origin, &["add", "."]);
+        Forge::git(&origin, &["commit", "-qm", "base B"]);
+        Forge::git(&origin, &["checkout", "-q", "-b", "car/elsewhere", "main"]);
+        w(&file("2", "1"));
+        Forge::git(&origin, &["commit", "-qam", "car: first stanza to 2"]);
+        let car = head();
+        Forge::git(&origin, &["checkout", "-q", "main"]);
+        w(&file("1", "2"));
+        Forge::git(&origin, &["commit", "-qam", "train: second stanza to 2"]);
+        let text_twin = head();
+        w(&file("3", "2"));
+        Forge::git(&origin, &["commit", "-qam", "train: first stanza to 3"]);
+        Forge::git(
+            &root,
+            &["clone", "-q", origin.to_str().expect("utf8 path"), "clone"],
+        );
+        let f = Forge { clone };
+        let err = rebase_onto_main(&f.clone, "car/elsewhere")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains('\n'), "one line, for the dock: {err}");
+        for want in [
+            "REFUSED",
+            "conflict in: reg.toml",
+            &format!("Main's {} \"train: second stanza to 2\"", &text_twin[..12]),
+            &format!(
+                "the stopped commit {} \"car: first stanza to 2\", but not the same blobs",
+                &car[..12]
+            ),
+            "So it may be this commit's twin",
+            "the patch text alone cannot tell which",
+            &format!("git -C <your worktree> show {}", &text_twin[..12]),
+            MERGE_MAIN_PATH,
+        ] {
+            assert!(err.contains(want), "missing {want:?} in: {err}");
+        }
+        for not in [
+            "not this commit's twin",
+            "byte for byte",
+            "yours to decide",
+            "checkout -b",
+            "nothing main lacks",
+        ] {
+            assert!(!err.contains(not), "{not:?} in: {err}");
+        }
+    }
+
+    fn f_head(dir: &Path) -> String {
+        String::from_utf8_lossy(&Forge::git(dir, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string()
     }
 
     /// A branch whose EVERY commit main already holds has nothing to gate:
@@ -1901,6 +2558,61 @@ mod tests {
         let obs = observe(&f.clone, "car/never-pushed");
         assert_eq!(obs.standing, Base::Unanswered, "{obs:?}");
         assert!(obs.unreadable.is_some(), "{obs:?}");
+    }
+
+    /// THE SHARED TRACKING REF IS NOT THE READ'S TO WRITE (backlog
+    /// eee3bc52). Review fae63341 measured fetches of
+    /// `+refs/heads/main:refs/remotes/origin/main` racing in one
+    /// checkout once main moved — "cannot lock ref" for all but one —
+    /// and a killed fetch's transport left holding `origin/main.lock`,
+    /// failing every later fetch there. The planted lock is that
+    /// holder, or a sibling mid-update: with main moved on the forge,
+    /// the read must still answer, off main as the forge has it NOW,
+    /// and leave the shared ref and the checkout's refs as it found
+    /// them.
+    #[test]
+    fn a_held_origin_main_lock_does_not_stop_the_read_and_nothing_shared_moves() {
+        let f = Forge::build("boss-cli-freshness-private-refs");
+        let forge = f.clone.parent().expect("clone has a parent").join("forge");
+        boss_testing::scratch::write_file(&forge.join("later.rs"), "fn later() {}\n");
+        Forge::git(&forge, &["add", "."]);
+        Forge::git(&forge, &["commit", "-qm", "train: main moves again"]);
+        let rev = |dir: &Path, r: &str| {
+            String::from_utf8_lossy(&Forge::git(dir, &["rev-parse", r]).stdout)
+                .trim()
+                .to_string()
+        };
+        let forge_main = rev(&forge, "main");
+        let shared_before = rev(&f.clone, "refs/remotes/origin/main");
+        assert_ne!(forge_main, shared_before, "the fixture moved main");
+        let lock = f.clone.join(".git/refs/remotes/origin/main.lock");
+        boss_testing::scratch::write_file(&lock, "held by an orphaned transport\n");
+
+        let obs = observe(&f.clone, "car/ahead");
+
+        assert!(obs.unreadable.is_none(), "{obs:?}");
+        assert_eq!(obs.standing, Base::Behind, "{obs:?}");
+        assert_eq!(obs.main_head, forge_main, "main as the forge has it now");
+        assert_eq!(obs.behind_by, 1, "{obs:?}");
+        assert_eq!(obs.untested, vec!["later.rs".to_string()], "{obs:?}");
+        assert_eq!(
+            rev(&f.clone, "refs/remotes/origin/main"),
+            shared_before,
+            "the shared tracking ref is untouched"
+        );
+        let left = Forge::git(
+            &f.clone,
+            &["for-each-ref", "--format=%(refname)", PRIVATE_REFS],
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&left.stdout).trim(),
+            "",
+            "the read's private refs are deleted after use"
+        );
+        assert!(
+            !f.clone.join(".git/FETCH_HEAD").exists(),
+            "the checkout's FETCH_HEAD is not written"
+        );
     }
 
     /// A directory that is not a git repository at all: the same.
@@ -2336,6 +3048,203 @@ mod tests {
         assert!(
             unrecorded_tree_note(&current, false).contains("abcdef0"),
             "it names the tree even when nothing is wrong"
+        );
+    }
+
+    // -- the landed prefix is judged on a COMPLETE path list (review of car
+    //    9ed6382f, run add8d092) --------------------------------------------
+
+    /// A plain repository for `landed_prefix` alone, with no forge: the
+    /// rule reads trees by sha, so a clone adds nothing here.
+    fn prefix_repo(name: &str) -> std::path::PathBuf {
+        let root = boss_testing::scratch::scratch_dir(name);
+        let repo = root.join("repo");
+        boss_testing::scratch::create_dir(&repo);
+        Forge::git(&repo, &["init", "-q", "-b", "main"]);
+        repo
+    }
+
+    /// The git `landed_prefix` is handed: the raw output, because the rule
+    /// reads git's path listing as bytes and judges its exit status itself.
+    fn prefix_git(repo: &Path) -> impl Fn(&[&str]) -> anyhow::Result<std::process::Output> + '_ {
+        move |args: &[&str]| {
+            Ok(std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()?)
+        }
+    }
+
+    fn sha_of(repo: &Path, rev: &str) -> String {
+        String::from_utf8_lossy(&Forge::git(repo, &["rev-parse", rev]).stdout)
+            .trim()
+            .to_string()
+    }
+
+    /// The review's reproduction: the car's first commit RENAMES a.rs to
+    /// b.rs, main holds b.rs byte for byte, and main still holds a.rs. With
+    /// rename detection on, the commit's path list is `b.rs` alone, main
+    /// matches on it, and the prefix is skipped: the replay keeps a.rs and
+    /// the car's deletion is lost under a line claiming its final state is
+    /// already on main. The list must carry the source path, so that a.rs
+    /// differs and nothing is skipped.
+    #[test]
+    fn a_rename_in_the_prefix_is_not_skipped_while_main_still_holds_the_source() {
+        let repo = prefix_repo("boss-cli-freshness-landed-prefix-rename");
+        let w = |rel: &str, body: &str| boss_testing::scratch::write_file(&repo.join(rel), body);
+        w("a.rs", "fn a() {}\n");
+        Forge::git(&repo, &["add", "."]);
+        Forge::git(&repo, &["commit", "-qm", "base B"]);
+        let base = sha_of(&repo, "HEAD");
+        Forge::git(&repo, &["checkout", "-q", "-b", "car"]);
+        Forge::git(&repo, &["mv", "a.rs", "b.rs"]);
+        Forge::git(&repo, &["commit", "-qm", "car: rename a.rs to b.rs"]);
+        let c1 = sha_of(&repo, "HEAD");
+        w("c.rs", "fn c() {}\n");
+        Forge::git(&repo, &["add", "."]);
+        Forge::git(&repo, &["commit", "-qm", "car: add c.rs"]);
+        let c2 = sha_of(&repo, "HEAD");
+        // main takes b.rs with the very content and KEEPS a.rs.
+        Forge::git(&repo, &["checkout", "-q", "main"]);
+        w("b.rs", "fn a() {}\n");
+        Forge::git(&repo, &["add", "."]);
+        Forge::git(&repo, &["commit", "-qm", "train: b.rs lands, a.rs stays"]);
+        let main = sha_of(&repo, "main");
+        let git = prefix_git(&repo);
+        assert_eq!(
+            landed_prefix(&git, &main, &base, &[&c1, &c2]).expect("judged"),
+            0,
+            "main still holds a.rs, which the first commit deletes: nothing is landed"
+        );
+        // The control: once main drops a.rs too, the rename IS landed and
+        // the suffix alone is left to replay.
+        Forge::git(&repo, &["rm", "-q", "a.rs"]);
+        Forge::git(&repo, &["commit", "-qm", "train: a.rs goes"]);
+        let main = sha_of(&repo, "main");
+        assert_eq!(
+            landed_prefix(&git, &main, &base, &[&c1, &c2]).expect("judged"),
+            1
+        );
+    }
+
+    /// The review's reproduction (car 9ed6382f, run d033776b): a git path
+    /// is a byte string, and one that is not UTF-8 was decoded lossily,
+    /// so `car-\xff.rs` became `car-\u{fffd}.rs` — a path in NEITHER tree
+    /// — and `diff --quiet` on it answered "same". The prefix that added
+    /// the file was skipped while main never held it, and the replay
+    /// dropped it. The comparison must be on the path's own bytes.
+    #[test]
+    fn a_path_that_is_not_utf8_is_compared_as_its_own_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let repo = prefix_repo("boss-cli-freshness-landed-prefix-non-utf8");
+        let w = |rel: &str, body: &str| boss_testing::scratch::write_file(&repo.join(rel), body);
+        let odd = repo.join(std::ffi::OsStr::from_bytes(b"car-\xff.rs"));
+        w("base.rs", "base\n");
+        Forge::git(&repo, &["add", "."]);
+        Forge::git(&repo, &["commit", "-qm", "base B"]);
+        let base = sha_of(&repo, "HEAD");
+        Forge::git(&repo, &["checkout", "-q", "-b", "car"]);
+        boss_testing::scratch::write_file(&odd, "fn car() {}\n");
+        Forge::git(&repo, &["add", "."]);
+        Forge::git(
+            &repo,
+            &["commit", "-qm", "car: add a path that is not UTF-8"],
+        );
+        let c1 = sha_of(&repo, "HEAD");
+        w("suffix.rs", "fn suffix() {}\n");
+        Forge::git(&repo, &["add", "."]);
+        Forge::git(&repo, &["commit", "-qm", "car: add suffix.rs"]);
+        let c2 = sha_of(&repo, "HEAD");
+        Forge::git(&repo, &["checkout", "-q", "main"]);
+        w("main.rs", "fn main() {}\n");
+        Forge::git(&repo, &["add", "."]);
+        Forge::git(&repo, &["commit", "-qm", "train: main moves on its own"]);
+        let main = sha_of(&repo, "main");
+        // A real git path, not a decoded approximation of one.
+        assert_eq!(
+            Forge::git(
+                &repo,
+                &["diff", "--name-only", "-z", "--no-renames", &base, &c1]
+            )
+            .stdout,
+            b"car-\xff.rs\0"
+        );
+        let git = prefix_git(&repo);
+        assert_eq!(
+            landed_prefix(&git, &main, &base, &[&c1, &c2]).expect("judged"),
+            0,
+            "main never held car-\\xff.rs: nothing is landed, and the file replays"
+        );
+        // The control: main takes the very bytes under the very name, and
+        // the first commit IS landed.
+        boss_testing::scratch::write_file(&odd, "fn car() {}\n");
+        Forge::git(&repo, &["add", "."]);
+        Forge::git(&repo, &["commit", "-qm", "train: car-\\xff.rs lands"]);
+        let main = sha_of(&repo, "main");
+        assert_eq!(
+            landed_prefix(&git, &main, &base, &[&c1, &c2]).expect("judged"),
+            1
+        );
+    }
+
+    /// A series main took by squash is skipped only while main HOLDS its
+    /// final state: a later train that touches one of its files, or a
+    /// revert of the squash, leaves different blobs, so the prefix is not
+    /// skipped and the replay stops as the conflict it is (loud, safe).
+    #[test]
+    fn a_landed_series_is_skipped_only_while_main_holds_its_final_state() {
+        let repo = prefix_repo("boss-cli-freshness-landed-prefix-series");
+        let w = |rel: &str, body: &str| boss_testing::scratch::write_file(&repo.join(rel), body);
+        w("base.rs", "base\n");
+        Forge::git(&repo, &["add", "."]);
+        Forge::git(&repo, &["commit", "-qm", "base B"]);
+        let base = sha_of(&repo, "HEAD");
+        Forge::git(&repo, &["checkout", "-q", "-b", "car/first"]);
+        w("first.rs", "fn first() {}\n");
+        Forge::git(&repo, &["add", "."]);
+        Forge::git(&repo, &["commit", "-qm", "first car: add first.rs"]);
+        let f1 = sha_of(&repo, "HEAD");
+        w("first.rs", "fn first() -> u8 {\n    1\n}\n");
+        w("first_test.rs", "fn first_is_one() {}\n");
+        Forge::git(&repo, &["add", "."]);
+        Forge::git(&repo, &["commit", "-qm", "first car: first returns one"]);
+        let f2 = sha_of(&repo, "HEAD");
+        Forge::git(&repo, &["checkout", "-q", "-b", "car/second"]);
+        w("second.rs", "fn second() {}\n");
+        Forge::git(&repo, &["add", "."]);
+        Forge::git(&repo, &["commit", "-qm", "second car: second.rs"]);
+        let s1 = sha_of(&repo, "HEAD");
+        Forge::git(&repo, &["checkout", "-q", "main"]);
+        Forge::git(&repo, &["merge", "-q", "--squash", "car/first"]);
+        Forge::git(&repo, &["commit", "-qm", "train: first car lands"]);
+        let squash = sha_of(&repo, "main");
+        let git = prefix_git(&repo);
+        let commits = [f1.as_str(), f2.as_str(), s1.as_str()];
+        assert_eq!(
+            landed_prefix(&git, &squash, &base, &commits).expect("judged"),
+            2,
+            "the two-commit series is on main as one squash"
+        );
+        // A later train rewrites a file of the series: the blobs differ.
+        w("first.rs", "fn first() -> u8 {\n    2\n}\n");
+        Forge::git(&repo, &["commit", "-qam", "train: first returns two"]);
+        let touched = sha_of(&repo, "main");
+        assert_eq!(
+            landed_prefix(&git, &touched, &base, &commits).expect("judged"),
+            0,
+            "main moved a predecessor file after the squash: not landed, the conflict stays loud"
+        );
+        // The squash reverted: main holds none of it.
+        Forge::git(&repo, &["reset", "-q", "--hard", &squash]);
+        Forge::git(&repo, &["revert", "--no-edit", "HEAD"]);
+        let reverted = sha_of(&repo, "main");
+        assert_eq!(
+            landed_prefix(&git, &reverted, &base, &commits).expect("judged"),
+            0,
+            "a reverted predecessor is not landed"
         );
     }
 }

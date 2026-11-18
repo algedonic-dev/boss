@@ -396,7 +396,7 @@ const EMPTIED: ReadonlyArray<readonly [RegExp, unknown]> = [
 /// window.print() opens the browser's print dialog — a native dialog the
 /// user sees, so a response under THE JUDGING RULE — but Playwright's
 /// `dialog` event covers alert, confirm, prompt and beforeunload only,
-/// and headless Chromium shows nothing, so /ux/finance's Print / PDF
+/// and headless Chromium shows nothing, so /finance's Print / PDF
 /// read "no observable response" the day the route left DEFERRED (page
 /// audit 3f964c57, 2026-09-25). The call is counted instead, and not
 /// made: a headed debugging run would block on the real dialog.

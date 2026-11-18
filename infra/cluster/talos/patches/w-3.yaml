@@ -1,0 +1,109 @@
+# w-3 (the data node, boss.dev/purpose=database, design 3c475a19; the
+# Dell Precision 5820) — the non-secret Talos machine-config entries the
+# pipeline depends on (README.md beside this file says how they are
+# applied: the forge's plan-a-node-converge / node-converge).
+#
+# WHY IT EXISTS (backlog 9323f4bf). w-3 joined 2026-11-11 (join-a-node
+# aca68557) and its estate row landed with this file: every Talos node
+# the estate declares has a declaration here, and the pins in
+# talos_check_declared_sh.rs and dev_build_volume_class.rs hold the two
+# sets equal. Declared to be APPLIED, not as found — its live config had
+# not been read when this was written; the first
+# `check-declared.sh w-3` read says which entries are already live.
+#
+# The entries are the forge registry mirror and the 50/40 image-GC pair
+# (w-1 and w-2, backlogs 67e98635 and 666e0570), and, after `---`, the
+# two user volumes on its Microns (below). NOT the Longhorn
+# dev-build tag the other workers declare (backlog e14a472d): that tag
+# makes a node's disks eligible for a disposable dev-build replica, and
+# design 3c475a19 gives this node's Microns to the system of record and
+# durable Longhorn, never to build storage. Its first draft carried the
+# tag because the placement pin demanded it of every worker; review
+# 7178449c of car f0add3fb refused it, and dev_build_volume_class.rs now
+# requires its absence here (backlog 1011f72f).
+machine:
+  kubelet:
+    extraConfig:
+      imageGCHighThresholdPercent: 50
+      imageGCLowThresholdPercent: 40
+  # Every image the cluster runs is pulled through the forge's registry
+  # (infra/forge; plain http on the LAN).
+  registries:
+    mirrors:
+      10.20.0.15:3000:
+        endpoints:
+          - http://10.20.0.15:3000
+---
+# THE TWO MICRONS — design 3c475a19 section 2 (placement), backlog
+# 4d1caddb. w-3 carries two Micron 7400 PRO 960 GB drives in PCIe
+# adapter cards, fitted 2026-11-11, moved there from w-1. One becomes
+# the user volume `postgres` (Longhorn disk u-postgres: the system of
+# record's data) and the other `data` (u-data: durable replicas moving
+# off the control planes). Each is one xfs filesystem Talos mounts at
+# /var/mnt/<name>; `add-longhorn-disk w-3 <name>` then registers it.
+# The 480 GB SATA system disk is not a Longhorn disk and the 1 TB
+# rotational drive is in no placement.
+#
+# WHICH DRIVE IS WHICH IS NOT FREE (review 9cc23d69, backlog 4d1caddb).
+# node-maintenance-window ba305b66 records 220133DDBEDB as w-1's gate
+# volume until the window, and 220133E4E1CC as blank. Nothing has wiped
+# the first since, so it still carries the u-gate partition, which
+# grew to fill the disk. Talos makes a user volume only in free space
+# and keeps an existing labelled partition whatever a selector says, so
+# a volume on that drive reads `waiting` until the partition is gone.
+# postgres therefore takes the blank 220133E4E1CC, and data takes
+# 220133DDBEDB after plan-a-partition-wipe / wipe-a-partition w-3 drops
+# the stale u-gate partition (see the data document below).
+#
+# CHOSEN BY SERIAL, unlike w-1's gate volume (chosen by what the disk
+# is). The two drives are the same model and the same size, so a
+# selector of model, size or transport matches BOTH, and Talos
+# provisions on the first candidate in arrival order, which is
+# unsorted (backlog 88b35891): postgres could land on either drive and
+# data on the same one. Only an identity tells them apart. Serial, not
+# wwid: the serials are what was recorded when the drives were fitted
+# (printed on each drive's label), and `talosctl get disks` prints the
+# serial in its own column; talos-get w-3 disks (ops-request 0797d89f,
+# 2026-11-12) reads both drives with exactly these serials, with no
+# padding. A drive serial is no credential: no-secrets.sh has no
+# pattern for one, and estate.toml already carries the system disk's
+# wwid in this publicly mirrored tree. Kernel names are not used: they
+# renumber when a disk is added (the forge, 2026-09-21).
+#
+# What a serial costs is the replacement: a swapped drive matches
+# nothing, and the volume reads `waiting` in `talosctl get
+# volumestatus` until this file names the new serial. That is the
+# point here — a new disk must not take the system of record's volume
+# by accident. A selector chooses only where a NEW volume is made;
+# an existing u-postgres partition is found by its label first.
+apiVersion: v1alpha1
+kind: UserVolumeConfig
+name: postgres
+provisioning:
+  diskSelector:
+    match: '!system_disk && disk.serial == "220133E4E1CC"'
+  minSize: 500GB
+  grow: true
+filesystem:
+  type: xfs
+---
+# The Micron that was w-1's gate volume: durable Longhorn (u-data). See
+# the note above. It provisions only after the stale u-gate partition
+# on 220133DDBEDB is dropped, and that comes BEFORE the converge that
+# applies this file: `talos-get w-3 disks` names the disk carrying this
+# serial (kernel names renumber, so read it, never assume it), then
+# plan-a-partition-wipe w-3 <its partition>, whose plan must name parent
+# serial 220133DDBEDB and label u-gate before anyone signs, then
+# wipe-a-partition w-3 <partition> <plan_sha256> under David's passkey.
+# Its bound admits exactly this: a single u-<name> partition on a
+# non-system NVMe disk, no volume owning it, nothing mounted from it.
+apiVersion: v1alpha1
+kind: UserVolumeConfig
+name: data
+provisioning:
+  diskSelector:
+    match: '!system_disk && disk.serial == "220133DDBEDB"'
+  minSize: 500GB
+  grow: true
+filesystem:
+  type: xfs

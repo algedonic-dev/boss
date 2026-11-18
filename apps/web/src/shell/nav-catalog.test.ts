@@ -148,7 +148,7 @@ describe('nav catalog — app assignment', () => {
     // machine is doing, Flow answers what the people got through.
     // Fleet — every in-flight Job of a kind on its Workflow's DAG.
     // Beside Flow deliberately: Flow is throughput, Fleet is where
-    // the work is piling up (queue-visibility Q4's depth signal).
+    // the work is piling up (queue-visibility Q4's depth signal, now in the decision record).
     'system-fleet',
     // The Crew Board, the Receiving Yard and the Marshalling Yard were
     // rows here (04c5bbc0, 92921c2f) and LEFT the catalog with car N1
@@ -161,7 +161,7 @@ describe('nav catalog — app assignment', () => {
     // Its car landed without this line; added when the map arrived.
     'system-yard',
     // The network map — every registry station as a node
-    // (stations.md: priority queues, stations, and network nodes are
+    // (station-tree.md: priority queues, stations, and network nodes are
     // one concept). No edges until motion is evented.
     // Incidents — active incident packets to respond to,
     // plus the closed ones rendered as a durable archive (David:

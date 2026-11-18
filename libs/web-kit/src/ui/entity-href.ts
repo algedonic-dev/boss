@@ -43,16 +43,16 @@ export function entityHref(kind: EntityKind, id: string): string {
     case 'account': return href(`/ux/accounts/${encoded}`);
     case 'employee': return href(`/ux/people/${encoded}`);
     case 'job': return href(`/ux/jobs/${encoded}`);
-    case 'invoice': return href(`/ux/finance/${encoded}`);
+    case 'invoice': return href(`/finance/invoices/${encoded}`);
     case 'asset': return href(`/ux/assets/${encoded}`);
     case 'part': return href(`/ux/parts/${encoded}`);
     case 'product': return href(`/ux/products/${encoded}`);
-    case 'vendor': return href(`/ux/vendors/${encoded}`);
-    case 'po': return href(`/ux/purchase-orders/${encoded}`);
-    case 'vendor-invoice': return href(`/ux/vendor-invoices/${encoded}`);
+    case 'vendor': return href(`/finance/vendors/${encoded}`);
+    case 'po': return href(`/finance/purchase-orders/${encoded}`);
+    case 'vendor-invoice': return href(`/finance/vendor-invoices/${encoded}`);
     case 'shipment': return href(`/ux/shipments/${encoded}`);
-    case 'fact': return href(`/ux/finance?fact=${encoded}`);
-    case 'ledger-entry': return href(`/ux/finance?entry=${encoded}`);
+    case 'fact': return href(`/finance?fact=${encoded}`);
+    case 'ledger-entry': return href(`/finance?entry=${encoded}`);
     case 'marketing-asset': return href(`/ux/marketing-assets/${encoded}`);
   }
 }

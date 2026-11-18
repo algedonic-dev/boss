@@ -89,21 +89,34 @@ impl boss_policy_client::postgres::StatementRefresh for SelectionStatementRefres
 }
 
 /// One monotonic budget, carried from ingress rather than restarted per query.
+/// It is the ingress origin and that ingress's own budget (f10419f9), so
+/// the deadline and the evidence naming its ingress cannot disagree.
 #[derive(Clone, Copy)]
-pub struct SelectionDeadline(tokio::time::Instant);
+pub struct SelectionDeadline {
+    ingress: tokio::time::Instant,
+    budget: std::time::Duration,
+}
 
 impl SelectionDeadline {
     pub fn at_ingress() -> Self {
-        Self(tokio::time::Instant::now() + crate::station_claim::SELECTION_PRE_COMMIT_BUDGET)
+        Self {
+            ingress: tokio::time::Instant::now(),
+            budget: crate::station_claim::SELECTION_PRE_COMMIT_BUDGET,
+        }
     }
+    /// Read off the ingress's one deadline, so the two cannot disagree.
     pub fn from_ingress(ingress: &crate::station_claim::AuthenticatedSelectionIngress) -> Self {
-        Self(
-            tokio::time::Instant::from_std(ingress.started())
-                + crate::station_claim::SELECTION_PRE_COMMIT_BUDGET,
-        )
+        let origin = tokio::time::Instant::from_std(ingress.started());
+        Self {
+            ingress: origin,
+            budget: ingress.deadline().duration_since(origin),
+        }
+    }
+    fn at(&self) -> tokio::time::Instant {
+        self.ingress + self.budget
     }
     pub fn remaining(&self) -> Result<std::time::Duration, JobsError> {
-        self.0
+        self.at()
             .checked_duration_since(tokio::time::Instant::now())
             .filter(|remaining| !remaining.is_zero())
             .ok_or_else(|| {
@@ -129,10 +142,10 @@ impl SelectionDeadline {
             #[cfg(test)]
             let mut trace = SelectionPhase::start(
                 format!("pre_dispatch@{caller}"),
-                deadline.0.into_std() - crate::station_claim::SELECTION_PRE_COMMIT_BUDGET,
+                deadline.ingress.into_std(),
             );
             deadline.remaining()?;
-            let result = tokio::time::timeout_at(deadline.0, work)
+            let result = tokio::time::timeout_at(deadline.at(), work)
                 .await
                 .map_err(|_| {
                     JobsError::SelectionConflict(
@@ -146,7 +159,7 @@ impl SelectionDeadline {
         }
     }
     pub fn sql_budget(&self) -> boss_events::statement_budget::StatementBudget {
-        boss_events::statement_budget::StatementBudget::until(self.0)
+        boss_events::statement_budget::StatementBudget::until(self.at())
     }
     #[track_caller]
     pub fn constrain_sql<'a, 'c>(
@@ -158,10 +171,8 @@ impl SelectionDeadline {
         let caller = std::panic::Location::caller();
         async move {
             #[cfg(test)]
-            let mut trace = SelectionPhase::start(
-                format!("sql_refresh@{caller}"),
-                deadline.0.into_std() - crate::station_claim::SELECTION_PRE_COMMIT_BUDGET,
-            );
+            let mut trace =
+                SelectionPhase::start(format!("sql_refresh@{caller}"), deadline.ingress.into_std());
             let result = deadline
                 .sql_budget()
                 .refresh(tx)
@@ -178,20 +189,35 @@ impl SelectionDeadline {
 
 pub enum NativeSelectionAcquisition {
     Replayed(crate::station_claim::SelectionReceipt),
-    Fresh(Transaction<'static, Postgres>),
+    Fresh(
+        Transaction<'static, Postgres>,
+        crate::step_executor::StationBayLock,
+    ),
 }
 
 #[derive(Clone)]
 pub struct NativeSelectionStore {
     pool: PgPool,
     identity: Arc<()>,
+    #[cfg(test)]
+    expiry_clock: Option<Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>>>,
 }
 impl NativeSelectionStore {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
             identity: Arc::new(()),
+            #[cfg(test)]
+            expiry_clock: None,
         }
+    }
+    // A test clock belongs to one constructor, never the process or another claim.
+    fn expiry_now(&self) -> chrono::DateTime<chrono::Utc> {
+        #[cfg(test)]
+        if let Some(clock) = &self.expiry_clock {
+            return *clock.lock().unwrap();
+        }
+        boss_policy_client::engine::expiry_now()
     }
     pub(crate) fn pool(&self) -> PgPool {
         self.pool.clone()
@@ -244,12 +270,7 @@ impl NativeSelectionStore {
                     .await
                     .map_err(|error| JobsError::Storage(error.to_string()))?;
                 rules.retain(|rule| has_role && rule.role == user.role);
-                let scope = require_native_read(
-                    &user,
-                    &rules,
-                    &overrides,
-                    boss_policy_client::engine::expiry_now(),
-                )?;
+                let scope = require_native_read(&user, &rules, &overrides, self.expiry_now())?;
                 deadline.constrain_sql(&mut tx).await?;
                 let original =
                     original_selection_in(&mut tx, request_id, ingress.actor_id(), station).await?;
@@ -273,13 +294,7 @@ impl NativeSelectionStore {
                         ));
                     }
                 }
-                if require_native_read(
-                    &user,
-                    &rules,
-                    &overrides,
-                    boss_policy_client::engine::expiry_now(),
-                )? != scope
-                {
+                if require_native_read(&user, &rules, &overrides, self.expiry_now())? != scope {
                     return Err(JobsError::SelectionConflict(
                         "native read authority expired during original lookup".into(),
                     ));
@@ -334,7 +349,7 @@ impl NativeSelectionStore {
                     .await
                     .map_err(|error| JobsError::Storage(error.to_string()))?;
                 rules.retain(|rule| rule.role == user.role);
-                let observed_at = boss_policy_client::engine::expiry_now();
+                let observed_at = self.expiry_now();
                 let (_, scope) = require_native_policy(&user, &rules, &overrides, observed_at)?;
                 tx.rollback()
                     .await
@@ -408,7 +423,7 @@ impl NativeSelectionStore {
             ));
         }
         require_native_claim_constraints(observation, context)?;
-        let at = boss_policy_client::engine::expiry_now();
+        let at = self.expiry_now();
         let step_authority =
             require_native_step_authority(observation, &context.validated_step, at)?;
         let (decision, scope) = require_native_policy(&user, &rules, &overrides, at)?;
@@ -466,7 +481,7 @@ impl NativeSelectionStore {
             &observation.user,
             &observation.rules,
             &observation.overrides,
-            boss_policy_client::engine::expiry_now(),
+            self.expiry_now(),
         )?;
         let boss_policy_client::Decision::Allow {
             scope: update_scope,
@@ -491,16 +506,8 @@ impl NativeSelectionStore {
                 "native scope changed before commit dispatch".into(),
             ));
         }
-        require_native_step_authority(
-            observation,
-            &context.validated_step,
-            boss_policy_client::engine::expiry_now(),
-        )?;
-        native_calendar_request(
-            observation,
-            stored,
-            boss_policy_client::engine::expiry_now(),
-        )?;
+        require_native_step_authority(observation, &context.validated_step, self.expiry_now())?;
+        native_calendar_request(observation, stored, self.expiry_now())?;
         SelectionDeadline::from_ingress(&observation.ingress).verify_before_commit_dispatch()
     }
 
@@ -518,7 +525,7 @@ impl NativeSelectionStore {
                 "calendar consumption lacks its actual native constructor/caller".into(),
             ));
         }
-        let at = boss_policy_client::engine::expiry_now();
+        let at = self.expiry_now();
         let Some((request, decision)) = native_calendar_request(observation, stored, at)? else {
             return Ok(
                 serde_json::json!({"required": false, "reason": "stored step has no complete scheduling window"}),
@@ -543,76 +550,6 @@ impl NativeSelectionStore {
             serde_json::json!({"required": true, "request": request, "decision": decision, "evaluated_at": at, "consumed": write}),
         )
     }
-    pub(crate) fn consume_concurrency(
-        &self,
-        observation: &crate::station_claim::NativeAuthorityObservation,
-        context: &crate::station_claim::SelectionContext,
-        population: &[boss_core::job::Job],
-    ) -> Result<serde_json::Value, JobsError> {
-        if !self.observes(observation) {
-            return Err(JobsError::SelectionConflict(
-                "native concurrency owner belongs to another constructor".into(),
-            ));
-        }
-        let agent = observation.agents.iter().find(|agent| {
-            agent.id == observation.user.id
-                || agent
-                    .aliases
-                    .iter()
-                    .any(|alias| alias == &observation.user.id)
-        });
-        let resolved = crate::agent_spec::resolved(
-            &context.validated_step,
-            context.active_workflows.get(&context.validated_job.kind),
-        );
-        let Some(agent) = agent else {
-            return Ok(
-                serde_json::json!({"required": false, "reason": "authenticated actor has no registered-agent row"}),
-            );
-        };
-        let cap = agent
-            .max_concurrent_runs
-            .and_then(|cap| u32::try_from(cap).ok());
-        if !crate::agent_budget::declares_an_agent_run(&resolved.metadata) || cap.is_none() {
-            return Ok(
-                serde_json::json!({"required": false, "reason": "step declares no agent run or actor declares no concurrency cap",
-                "actor": agent, "declares_agent_run": crate::agent_budget::declares_an_agent_run(&resolved.metadata)}),
-            );
-        }
-        let held_by: Vec<String> = std::iter::once(agent.id.clone())
-            .chain(agent.aliases.iter().cloned())
-            .collect();
-        let open_runs: Vec<_> = population
-            .iter()
-            .filter(|job| job.kind == crate::agent_budget::RUN_KIND)
-            .cloned()
-            .collect();
-        let count = crate::agent_budget::in_flight_runs(&open_runs, &held_by);
-        let reading = crate::agent_budget::Concurrency::measure(&agent.id, cap, count);
-        if !reading.decision.is_allowed() {
-            return Err(JobsError::SelectionConflict(format!(
-                "native concurrency refuses selection: {}",
-                reading.refusal_body()
-            )));
-        }
-        // Copy every field the existing counter actually consumes, plus the
-        // packet identity. Unrelated packet payloads are not a counter input.
-        let rows: Vec<_> = open_runs
-            .iter()
-            .filter(|job| crate::agent_budget::counted_run(job, &held_by))
-            .map(|job| {
-                serde_json::json!({"id": job.id, "kind": job.kind, "status": job.status,
-                "agent": job.metadata.get(crate::agent_budget::RUN_AGENT_KEY),
-                "owner_id":job.owner_id,"subject":job.subject})
-            })
-            .collect();
-        Ok(
-            serde_json::json!({"required": true, "actor": agent, "held_by": held_by,
-            "rows_predicate":{"agent_in":held_by,"status":"open"},
-            "runs": rows, "reading": reading, "method": "complete OPEN jobs population under the actual native jobs writer fence"}),
-        )
-    }
-
     /// Join only constructor-related owners. Required authority evidence is separate.
     pub async fn begin_for(
         &self,
@@ -696,9 +633,21 @@ impl NativeSelectionStore {
         station: &str,
         deadline: SelectionDeadline,
     ) -> Result<NativeSelectionAcquisition, JobsError> {
+        self.acquire_selection_for_step_before(owner, request_id, actor, station, None, deadline)
+            .await
+    }
+    pub(crate) async fn acquire_selection_for_step_before(
+        &self,
+        owner: &Self,
+        request_id: uuid::Uuid,
+        actor: &str,
+        station: &str,
+        step: Option<&boss_core::job::Step>,
+        deadline: SelectionDeadline,
+    ) -> Result<NativeSelectionAcquisition, JobsError> {
         deadline
             .before_dispatch(
-                self.acquire_selection_inner(owner, request_id, actor, station, deadline),
+                self.acquire_selection_inner(owner, request_id, actor, station, step, deadline),
             )
             .await
     }
@@ -708,6 +657,7 @@ impl NativeSelectionStore {
         request_id: uuid::Uuid,
         actor: &str,
         station: &str,
+        step: Option<&boss_core::job::Step>,
         deadline: SelectionDeadline,
     ) -> Result<NativeSelectionAcquisition, JobsError> {
         let mut tx = self
@@ -729,6 +679,15 @@ impl NativeSelectionStore {
                 "native owner belongs to a different constructor instance".into(),
             ));
         }
+        // Match plain claims and declared publishers: the station lineage
+        // precedes every definition/population fence and every step row lock.
+        let bay_lock = match step {
+            Some(step) => {
+                crate::step_executor::lock_bay_in_tx(&mut tx, step, Some(deadline.sql_budget()))
+                    .await?
+            }
+            None => crate::step_executor::StationBayLock::none(),
+        };
         deadline.constrain_sql(&mut tx).await?;
         sqlx::query("LOCK TABLE workflows, stations IN SHARE MODE")
             .execute(&mut *tx)
@@ -756,7 +715,7 @@ impl NativeSelectionStore {
             return Ok(NativeSelectionAcquisition::Replayed(receipt));
         }
         deadline.constrain_sql(&mut tx).await?;
-        Ok(NativeSelectionAcquisition::Fresh(tx))
+        Ok(NativeSelectionAcquisition::Fresh(tx, bay_lock))
     }
     /// Read complete native definition inputs, not an authorization decision.
     pub async fn active_definitions_in(
@@ -952,8 +911,13 @@ mod tests {
     #[tokio::test]
     async fn shared_policy_refresh_does_not_restart_the_original_deadline() {
         let db = boss_testing::TestDb::new().await;
-        let deadline = SelectionDeadline::at_ingress();
+        // A test budget: the claim is that the second statement is cut from
+        // the ORIGINAL deadline, which holds for any length (f10419f9).
+        let deadline = deadline_with(ANSWER_BUDGET);
         let mut tx = db.pool.begin().await.unwrap();
+        // Sampled before the call: the second statement follows a 1.2 s
+        // sleep, so a deadline it did not restart leaves it at most this.
+        let unrestarted_ms = deadline.remaining().unwrap().as_millis() as i64 - 1200;
         let refresh = DelayedPolicyRefresh {
             budget: SelectionStatementRefresh(deadline.sql_budget()),
             calls: std::sync::atomic::AtomicUsize::new(0),
@@ -968,16 +932,117 @@ mod tests {
         assert_eq!(refresh.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         let configured_ms: i64 = sqlx::query_scalar("SELECT (extract(epoch FROM current_setting('statement_timeout')::interval) * 1000)::bigint")
             .fetch_one(&mut *tx).await.unwrap();
-        let remaining_ms = deadline.remaining().unwrap().as_millis() as i64;
         assert!(
-            configured_ms <= remaining_ms + 100 && configured_ms < 4000,
-            "second policy query retained {configured_ms}ms; original ingress has {remaining_ms}ms"
+            configured_ms > 0 && configured_ms <= unrestarted_ms,
+            "second policy query retained {configured_ms}ms; the original deadline allowed at most {unrestarted_ms}ms after the delay"
         );
         tx.rollback().await.unwrap();
     }
 
+    /// The budget a test that judges an ANSWER runs its claim under. Gate
+    /// bb1fbbde (2026-10-19) failed 24 of these on the production five
+    /// seconds while the gate's PostgreSQL served two ~299 s binaries and a
+    /// seed copy beside them; the same 55 passed in 39 s idle (f10419f9).
+    /// Their answers do not depend on the length, so they state their own.
+    /// A test whose subject IS the deadline names the budget it proves:
+    /// `SELECTION_PRE_COMMIT_BUDGET` where the production value must fire.
+    const ANSWER_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
     async fn resolved_ingress() -> crate::station_claim::AuthenticatedSelectionIngress {
+        resolved_ingress_and_gate()
+            .await
+            .0
+            .with_budget(ANSWER_BUDGET)
+    }
+    async fn production_ingress() -> crate::station_claim::AuthenticatedSelectionIngress {
         resolved_ingress_and_gate().await.0
+    }
+    /// The production budget, pinned on both sides. The answer tests state
+    /// their own budget, and the deadline tests judge a cut at
+    /// `SELECTION_PRE_COMMIT_BUDGET` or a refusal after at least it, so a
+    /// longer constant (anything under the pool's 30 s acquire timeout) would
+    /// pass every one of them (review a0fd6902 N2). The credential door must
+    /// admit exactly five seconds from the ingress origin: the literal is the
+    /// point, not the constant.
+    #[tokio::test]
+    async fn the_credential_door_admits_exactly_the_five_second_production_budget() {
+        let ingress = production_ingress().await;
+        assert_eq!(
+            ingress
+                .deadline()
+                .duration_since(tokio::time::Instant::from_std(ingress.started())),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(ingress.observation()["pre_dispatch_budget_ms"], 5000);
+    }
+    /// The production budget against the io.full stall gate-run 7563df44
+    /// measured (334 s of its 1572 s test phase), stated by the ingress
+    /// clock rather than waited for: a preparation read refuses with the
+    /// gate's own words, and so does the commit-dispatch reader, because
+    /// both read one deadline. The integration answer tests run under a
+    /// fixture budget, so this is where production's refusal stays pinned
+    /// (backlog d7e5b016).
+    #[tokio::test]
+    async fn the_production_budget_refuses_a_preparation_that_lost_the_measured_stall() {
+        let stall = std::time::Duration::from_secs(334);
+        let ingress = production_ingress().await.with_time_already_spent(stall);
+        assert_eq!(
+            ingress
+                .prepare(std::future::ready(()))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "station selection refused: selection ingress deadline expired during preparation"
+        );
+        assert_eq!(
+            SelectionDeadline::from_ingress(&ingress)
+                .remaining()
+                .unwrap_err()
+                .to_string(),
+            "station selection refused: selection ingress deadline expired before commit dispatch"
+        );
+        // The same request under the fixture's budget is still inside it.
+        let fixture = ingress.with_budget(stall * 3);
+        assert!(fixture.prepare(std::future::ready(())).await.is_ok());
+        assert!(
+            SelectionDeadline::from_ingress(&fixture)
+                .remaining()
+                .is_ok()
+        );
+    }
+    /// A deadline cut at "now" with a test's own budget, for the tests of
+    /// budget arithmetic: their assertions compare against what remains,
+    /// so they hold for any length (f10419f9).
+    fn deadline_with(budget: std::time::Duration) -> SelectionDeadline {
+        SelectionDeadline {
+            ingress: tokio::time::Instant::now(),
+            budget,
+        }
+    }
+    /// Arrival of `task` at a PostgreSQL wait `sql` observes, judged by the
+    /// task's own progress rather than a clock: a task that ends first is
+    /// the failure (f10419f9 — a two-second loop here went red as `Elapsed`
+    /// on gate bb1fbbde while the claim was still working).
+    async fn wait_for_backend<T>(
+        pool: &PgPool,
+        sql: &str,
+        task: &mut tokio::task::JoinHandle<Result<T, JobsError>>,
+    ) {
+        loop {
+            tokio::select! {
+                result = &mut *task => panic!(
+                    "task ended before reaching its observed wait: {:?}",
+                    result.map(|answer| answer.err())
+                ),
+                waiting = sqlx::query_scalar::<_, bool>(sql).fetch_one(pool) => {
+                    if waiting.unwrap() {
+                        assert!(!task.is_finished(), "task escaped its observed wait");
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
     async fn resolved_ingress_and_gate() -> (
         crate::station_claim::AuthenticatedSelectionIngress,
@@ -1086,6 +1151,1229 @@ mod tests {
     async fn native_claim_fixture() -> NativeClaimFixture {
         native_claim_fixture_with_preparation_delay(std::time::Duration::ZERO).await
     }
+    async fn equipment_claim_fixture() -> (NativeClaimFixture, boss_core::job::Step) {
+        use crate::{JobsRepository, StationRegistry, WorkflowRegistry};
+        let mut fixture = native_claim_fixture().await;
+        let spec = crate::registry::WorkflowSpec::platform_seed(
+            "fixture",
+            "Equipment fixture",
+            "test",
+            vec!["custom".into()],
+            ["work", "elsewhere"]
+                .into_iter()
+                .map(|slug| crate::registry::StepSpec {
+                    title: slug.into(),
+                    title_template: slug.into(),
+                    kind: "task".into(),
+                    ready_when: "true".into(),
+                    terminal: Some(crate::registry::Terminal {
+                        outcome: slug.into(),
+                    }),
+                    executor: Some("equipment:kettle".into()),
+                    ..Default::default()
+                })
+                .collect(),
+        );
+        crate::PgWorkflows::for_fixture(fixture.db.pool.clone())
+            .publish_authored(
+                spec,
+                boss_core::job::JobId::new(),
+                fixture.stamp.actor(),
+                fixture.stamp.timestamp,
+            )
+            .await
+            .unwrap();
+        let mut station = crate::StationSpec::draft(
+            "kettle",
+            "Kettle",
+            crate::StationKind::Equipment,
+            fixture.context.station.predicate.clone(),
+            fixture.stamp.timestamp,
+        );
+        station.automaton = Some(crate::runner_credential::ACTOR.into());
+        station.bays = Some(2);
+        let stations = crate::PgStations::new(fixture.db.pool.clone());
+        stations
+            .create_draft(station, fixture.stamp.actor(), fixture.stamp.timestamp)
+            .await
+            .unwrap();
+        fixture.context.station = stations
+            .publish("kettle", fixture.stamp.actor(), fixture.stamp.timestamp)
+            .await
+            .unwrap();
+        let mut job = boss_core::job::Job::new(
+            "fixture",
+            boss_core::job::Subject::new("custom", "elsewhere"),
+            "Elsewhere",
+            "emp-owner",
+            boss_core::job::Priority::Standard,
+            fixture.stamp.timestamp.date_naive(),
+        );
+        job.status = boss_core::job::JobStatus::Open;
+        fixture
+            .repo
+            .create_job_at(&job, fixture.stamp.timestamp, &[])
+            .await
+            .unwrap();
+        let mut step = boss_core::job::Step::new(job.id, "task", "Elsewhere", 0);
+        step.spec_slug = Some("elsewhere".into());
+        step.status = boss_core::job::StepStatus::Ready;
+        fixture
+            .repo
+            .add_step_at(&step, fixture.stamp.timestamp, &[])
+            .await
+            .unwrap();
+        fixture.context.active_workflows = crate::PgWorkflows::new(fixture.db.pool.clone())
+            .list_active(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.kind.clone(), row))
+            .collect();
+        fixture.context.native_authority = Some(Arc::new(
+            fixture
+                .store
+                .observe_authority(
+                    resolved_ingress().await,
+                    fixture.context.request_id,
+                    "kettle",
+                )
+                .await
+                .unwrap(),
+        ));
+        (fixture, step)
+    }
+
+    async fn wait_for_advisory_waiters(pool: &PgPool, count: i64) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database()) AND locktype = 'advisory' AND NOT granted")
+                    .fetch_one(pool).await.unwrap();
+                if waiting >= count { return; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("claims must actually reach the station lineage lock");
+    }
+
+    #[tokio::test]
+    async fn native_and_plain_claims_take_station_lineage_before_population_locks() {
+        use crate::JobsRepository;
+        let (fixture, elsewhere) = equipment_claim_fixture().await;
+        let mut gate = fixture.db.pool.begin().await.unwrap();
+        crate::declared_version::lock_and_read_newest(&mut gate, "stations", "name", "kettle")
+            .await
+            .unwrap();
+        let plain_repo = crate::PgJobs::new(fixture.db.pool.clone());
+        let plain_stamp = fixture.stamp.clone();
+        let plain = tokio::spawn(async move {
+            plain_repo
+                .claim_step_displacing_at(
+                    &elsewhere.id,
+                    crate::runner_credential::ACTOR,
+                    &[],
+                    &plain_stamp,
+                    &[],
+                )
+                .await
+        });
+        wait_for_advisory_waiters(&fixture.db.pool, 1).await;
+        let native_repo = crate::PgJobs::for_native_selection(fixture.store.clone());
+        let context = fixture.context;
+        let stamp = fixture.stamp;
+        let native = tokio::spawn(async move {
+            native_repo
+                .claim_station_head_at(&context, crate::runner_credential::ACTOR, &[], &stamp, &[])
+                .await
+        });
+        wait_for_advisory_waiters(&fixture.db.pool, 2).await;
+        gate.commit().await.unwrap();
+        let (plain, native) = tokio::join!(plain, native);
+        assert!(
+            plain.unwrap().is_ok(),
+            "plain claim must not deadlock with native population fencing"
+        );
+        assert!(matches!(
+            native.unwrap().unwrap(),
+            crate::station_claim::SelectionResult::Claimed { .. }
+        ));
+        let active: i64 = sqlx::query_scalar("SELECT count(*) FROM steps WHERE status = 'active'")
+            .fetch_one(&fixture.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(active, 2);
+    }
+
+    #[tokio::test]
+    async fn native_claim_waits_for_station_publish_before_fencing_definitions() {
+        use crate::JobsRepository;
+        let (fixture, _) = equipment_claim_fixture().await;
+        let mut publisher = fixture.db.pool.begin().await.unwrap();
+        crate::declared_version::lock_and_read_newest(&mut publisher, "stations", "name", "kettle")
+            .await
+            .unwrap();
+        let repo = fixture.repo;
+        let context = fixture.context;
+        let stamp = fixture.stamp;
+        let native = tokio::spawn(async move {
+            repo.claim_station_head_at(&context, crate::runner_credential::ACTOR, &[], &stamp, &[])
+                .await
+        });
+        wait_for_advisory_waiters(&fixture.db.pool, 1).await;
+        sqlx::query("SET LOCAL lock_timeout = '250ms'")
+            .execute(&mut *publisher)
+            .await
+            .unwrap();
+        // The declared station publisher holds this lineage before its DML.
+        let updated = sqlx::query("UPDATE stations SET title = title WHERE name = 'kettle'")
+            .execute(&mut *publisher)
+            .await;
+        publisher.rollback().await.unwrap();
+        let result = native.await.unwrap();
+        assert!(
+            updated.is_ok(),
+            "native must not hold a definition fence while waiting behind its publisher: {updated:?}"
+        );
+        assert!(matches!(
+            result.unwrap(),
+            crate::station_claim::SelectionResult::Claimed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn plain_claim_reserves_its_population_write_before_waiting_for_a_step_row() {
+        use crate::JobsRepository;
+        let fixture = native_claim_fixture().await;
+        let id = fixture.context.validated_step.id;
+        let mut blocker = fixture.db.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM steps WHERE id = $1 FOR UPDATE")
+            .bind(*id.inner().as_uuid())
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let repo = fixture.repo;
+        let stamp = fixture.stamp;
+        let mut claim = tokio::spawn(async move {
+            repo.claim_step_displacing_at(&id, crate::runner_credential::ACTOR, &[], &stamp, &[])
+                .await
+        });
+        wait_for_backend(&fixture.db.pool,
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event = 'transactionid' AND query LIKE 'SELECT title, metadata FROM steps%')",
+            &mut claim).await;
+        let reserved: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a USING (pid) WHERE a.datname = current_database() AND a.wait_event = 'transactionid' AND l.relation = 'steps'::regclass AND l.mode = 'RowExclusiveLock' AND l.granted)",
+        ).fetch_one(&fixture.db.pool).await.unwrap();
+        blocker.rollback().await.unwrap();
+        claim.await.unwrap().unwrap();
+        assert!(
+            reserved,
+            "a plain row holder must not subsequently wait behind native population fencing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_moved_while_its_claim_waits_for_lineage_refuses_without_claiming() {
+        use crate::{JobsError, JobsRepository};
+        let (fixture, _) = equipment_claim_fixture().await;
+        let id = fixture.context.validated_step.id;
+        let mut gate = fixture.db.pool.begin().await.unwrap();
+        crate::declared_version::lock_and_read_newest(&mut gate, "stations", "name", "kettle")
+            .await
+            .unwrap();
+        let repo = fixture.repo;
+        let stamp = fixture.stamp;
+        let claim = tokio::spawn(async move {
+            repo.claim_step_displacing_at(&id, crate::runner_credential::ACTOR, &[], &stamp, &[])
+                .await
+        });
+        wait_for_advisory_waiters(&fixture.db.pool, 1).await;
+        sqlx::query("UPDATE steps SET spec_slug = NULL WHERE id = $1")
+            .bind(*id.inner().as_uuid())
+            .execute(&fixture.db.pool)
+            .await
+            .unwrap();
+        gate.commit().await.unwrap();
+        assert!(
+            matches!(claim.await.unwrap(), Err(JobsError::SelectionConflict(message)) if message.contains("equipment demand changed"))
+        );
+        let active: i64 = sqlx::query_scalar("SELECT count(*) FROM steps WHERE status = 'active'")
+            .fetch_one(&fixture.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(active, 0);
+    }
+
+    #[tokio::test]
+    async fn every_step_writer_reserves_its_write_mode_before_waiting_for_a_row() {
+        use crate::JobsRepository;
+        let mut unreserved = Vec::new();
+        for writer in [
+            "put",
+            "merge",
+            "first-record",
+            "sign-off",
+            "repin",
+            "close",
+            "claim",
+        ] {
+            let fixture = native_claim_fixture().await;
+            let id = fixture.context.validated_step.id;
+            let (mut step, version) = fixture.repo.get_step_versioned(&id).await.unwrap().unwrap();
+            let mut job = fixture.context.validated_job.clone();
+            let mut blocker = fixture.db.pool.begin().await.unwrap();
+            sqlx::query("SELECT id FROM steps WHERE id = $1 FOR UPDATE")
+                .bind(*id.inner().as_uuid())
+                .execute(&mut *blocker)
+                .await
+                .unwrap();
+            let repo = fixture.repo;
+            let stamp = fixture.stamp;
+            let mut task = tokio::spawn(async move {
+                match writer {
+                    "put" => {
+                        step.notes = Some("writer reservation control".into());
+                        repo.update_step_if_unchanged_at(&step, version, stamp.timestamp, &[])
+                            .await
+                    }
+                    "merge" => repo
+                        .merge_step_metadata_at(
+                            &id,
+                            &serde_json::Map::from_iter([(
+                                "writer_control".into(),
+                                serde_json::json!(true),
+                            )]),
+                            &stamp,
+                        )
+                        .await
+                        .map(|_| ()),
+                    "first-record" => repo
+                        .record_step_metadata_at(
+                            &id,
+                            "writer.control",
+                            &serde_json::json!({"observed":true}),
+                            &stamp,
+                        )
+                        .await
+                        .map(|_| ()),
+                    "sign-off" => {
+                        repo.append_sign_off(
+                            &id,
+                            &boss_core::job::SignOffStamp {
+                                authority_id: "emp-fixture".into(),
+                                role: "fixture".into(),
+                                stamped_at: stamp.timestamp,
+                                shape_hash: step.shape_hash(),
+                                assurance: boss_core::job::Assurance::Session,
+                                presence_nonce: None,
+                                voided_at: None,
+                                voided_by_event: None,
+                            },
+                            &stamp,
+                            &[],
+                        )
+                        .await
+                    }
+                    "repin" => {
+                        step.metadata["writer_control"] = serde_json::json!(true);
+                        let plan = crate::repin::RepinPlan {
+                            reprojected: vec![crate::repin::Reprojected {
+                                step,
+                                changed: vec!["writer_control".into()],
+                                kept: vec![],
+                                unskipped: false,
+                                read: Some(version),
+                            }],
+                            inserted: vec![],
+                        };
+                        repo.repin_workflow_version_at(
+                            &job.id,
+                            job.workflow_version,
+                            &plan,
+                            &serde_json::json!({"control":"writer-lock-order"}),
+                            &stamp,
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                    "close" => {
+                        job.status = boss_core::job::JobStatus::Cancelled;
+                        repo.update_job_at(
+                            &job,
+                            boss_core::job::JobStatus::Open,
+                            stamp.timestamp,
+                            &[],
+                        )
+                        .await
+                    }
+                    "claim" => repo
+                        .claim_step_displacing_at(
+                            &id,
+                            crate::runner_credential::ACTOR,
+                            &[],
+                            &stamp,
+                            &[],
+                        )
+                        .await
+                        .map(|_| ()),
+                    _ => unreachable!(),
+                }
+            });
+            wait_for_backend(&fixture.db.pool,
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event IN ('transactionid','tuple') AND query LIKE '%FROM steps%FOR UPDATE%')",
+                &mut task,
+            ).await;
+            let reserved: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a USING(pid) WHERE a.datname=current_database() AND a.wait_event IN ('transactionid','tuple') AND l.relation='steps'::regclass AND l.mode='RowExclusiveLock' AND l.granted)",
+            ).fetch_one(&fixture.db.pool).await.unwrap();
+            let mut native_fence = fixture.db.pool.begin().await.unwrap();
+            sqlx::query("SET LOCAL lock_timeout='100ms'")
+                .execute(&mut *native_fence)
+                .await
+                .unwrap();
+            let fenced = sqlx::query("LOCK TABLE steps IN SHARE ROW EXCLUSIVE MODE")
+                .execute(&mut *native_fence)
+                .await;
+            native_fence.rollback().await.unwrap();
+            blocker.rollback().await.unwrap();
+            task.await.unwrap().unwrap();
+            if !reserved || fenced.is_ok() {
+                unreserved.push((writer, reserved, fenced.is_ok()));
+            }
+        }
+        assert!(
+            unreserved.is_empty(),
+            "row holders let native population fencing pass before their write: {unreserved:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_http_claim_reports_a_changed_equipment_demand_as_conflict() {
+        use crate::JobsRepository;
+        use boss_core::{port::EventBus, publisher::DomainPublisher};
+        use boss_policy_client::{Action, FakePolicyClient, Resource, Scope};
+        use tower::ServiceExt;
+        let (fixture, _) = equipment_claim_fixture().await;
+        let id = fixture.context.validated_step.id;
+        let user = fixture
+            .context
+            .native_authority
+            .as_ref()
+            .unwrap()
+            .user
+            .clone();
+        let bus = boss_testing::RecordingEventBus::new();
+        let bus_dyn: Arc<dyn EventBus> = bus.clone();
+        let policy = Arc::new(
+            FakePolicyClient::builder()
+                .allow("platform-admin", Action::Read, Resource::job(), Scope::All)
+                .allow(
+                    "platform-admin",
+                    Action::Update,
+                    Resource::step(),
+                    Scope::All,
+                )
+                .build(),
+        );
+        let app = crate::http::router(crate::http::JobsApiState {
+            stations: Some(Arc::new(crate::PgStations::new(fixture.db.pool.clone()))),
+            kind_registry: Some(Arc::new(crate::PgWorkflows::new(fixture.db.pool.clone()))),
+            agent_budget: Some(Arc::new(crate::agent_budget::BudgetDoor {
+                agents: Arc::new(crate::agents::PgAgents::new(fixture.db.pool.clone())),
+                runs: Arc::new(crate::agent_runs::PgAgentRuns::new(fixture.db.pool.clone())),
+            })),
+            ..crate::http::JobsApiState::minimal(
+                Arc::new(crate::PgJobs::with_urls(
+                    fixture.db.pool.clone(),
+                    "postgres://fixture-only".into(),
+                    "nats://fixture-only".into(),
+                )),
+                bus,
+                DomainPublisher::new(bus_dyn, "jobs"),
+                policy,
+                Arc::new(boss_clock_client::WallClockClient),
+            )
+        });
+        let mut gate = fixture.db.pool.begin().await.unwrap();
+        crate::declared_version::lock_and_read_newest(&mut gate, "stations", "name", "kettle")
+            .await
+            .unwrap();
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/api/jobs/{}/steps/{id}/claim",
+                fixture.context.validated_job.id
+            ))
+            .header("x-boss-user", serde_json::to_string(&user).unwrap())
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let mut claim = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+        tokio::select! {
+            early = &mut claim => panic!("HTTP claim ended before waiting on its declared station lineage: {:?}", early.map(|response| response.status())),
+            _ = wait_for_advisory_waiters(&fixture.db.pool, 1) => {},
+        }
+        sqlx::query("UPDATE steps SET spec_slug = NULL WHERE id = $1")
+            .bind(*id.inner().as_uuid())
+            .execute(&fixture.db.pool)
+            .await
+            .unwrap();
+        gate.commit().await.unwrap();
+        let response = claim.await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("equipment demand changed"), "{body}");
+        let step = fixture.repo.get_step(&id).await.unwrap().unwrap();
+        assert_eq!(step.status, boss_core::job::StepStatus::Ready);
+        assert!(step.assignee_id.is_none());
+    }
+
+    async fn native_machine_http_fixture(
+        mode: boss_core::machine_gate::Mode,
+        robot: bool,
+    ) -> (NativeClaimFixture, axum::Router) {
+        use boss_core::{port::EventBus, publisher::DomainPublisher};
+        let fixture = native_claim_fixture().await;
+        if robot {
+            use crate::agents::AgentsRegistry;
+            use boss_policy_client::{Action, PolicyRepository, PolicyRule, Resource, Scope};
+            sqlx::query("INSERT INTO agent_rate_card (model, input_usd_micros_per_mtok, output_usd_micros_per_mtok, note) VALUES ('native-machine-model', 1, 1, 'synthetic owning fixture, not measured provider pricing')")
+                .execute(&fixture.db.pool).await.unwrap();
+            crate::agents::PgAgents::new(fixture.db.pool.clone())
+                .publish(
+                    &[crate::agents::AgentInput {
+                        factory_rotation: Some(true),
+                        id: "agent-machine-native".into(),
+                        display_name: "Native machine fixture".into(),
+                        default_model: "native-machine-model".into(),
+                        model_class: None,
+                        aliases: vec![],
+                        role: Some("engineering-agent".into()),
+                        department: None,
+                        hourly_budget_usd_micros: None,
+                        max_concurrent_runs: Some(1),
+                        stations: None,
+                    }],
+                    boss_core::publish::PublishMode::InsertIfAbsent,
+                    &fixture.stamp,
+                )
+                .await
+                .unwrap();
+            let policy = boss_policy_client::postgres::PgPolicy::new(fixture.db.pool.clone());
+            for (action, resource) in [
+                (Action::Read, Resource::job()),
+                (Action::Update, Resource::step()),
+            ] {
+                policy
+                    .upsert_rule(
+                        &PolicyRule {
+                            id: boss_policy_client::types::rule_id(
+                                "engineering-agent",
+                                &resource,
+                                action,
+                            ),
+                            role: "engineering-agent".into(),
+                            resource,
+                            action,
+                            scope: Scope::All,
+                            active: true,
+                        },
+                        "native-machine-fixture",
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let bus = boss_testing::RecordingEventBus::new();
+        let bus_dyn: Arc<dyn EventBus> = bus.clone();
+        let app = crate::http::router(crate::http::JobsApiState {
+            stations: Some(Arc::new(crate::PgStations::new(fixture.db.pool.clone()))),
+            kind_registry: Some(Arc::new(crate::PgWorkflows::new(fixture.db.pool.clone()))),
+            agent_budget: Some(Arc::new(crate::agent_budget::BudgetDoor {
+                agents: Arc::new(crate::agents::PgAgents::new(fixture.db.pool.clone())),
+                runs: Arc::new(crate::agent_runs::PgAgentRuns::new(fixture.db.pool.clone())),
+            })),
+            ..crate::http::JobsApiState::minimal(
+                Arc::new(crate::PgJobs::with_urls(
+                    fixture.db.pool.clone(),
+                    "postgres://fixture-only".into(),
+                    "nats://fixture-only".into(),
+                )),
+                bus,
+                DomainPublisher::new(bus_dyn, "jobs"),
+                // A native claim must consume its actual policy owner,
+                // not the asserted header role or this denied cache.
+                Arc::new(boss_policy_client::FakePolicyClient::builder().build()),
+                Arc::new(boss_clock_client::WallClockClient),
+            )
+        });
+        let dir = boss_testing::scratch_dir("native-machine-and-runner-ingress");
+        boss_testing::write_file(&dir.join("forge.current"), "native-runner-fixture-key");
+        let app = crate::runner_credential::mount(app, dir);
+        let gate = Arc::new(boss_core::machine_gate::MachineGate::new(
+            "jobs",
+            &[],
+            boss_core::machine_gate::Reading::new(
+                mode,
+                boss_core::machine_gate::Slots::new(
+                    Some("native-machine-fixture-key".into()),
+                    None,
+                    None,
+                ),
+            ),
+        ));
+        (fixture, boss_core::machine_gate::gated(app, gate))
+    }
+
+    fn native_machine_request(
+        request_id: uuid::Uuid,
+        actor: &str,
+        machine: Option<&str>,
+        runner: bool,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut user = boss_policy_client::User::anonymous();
+        user.id = actor.into();
+        user.role = "untrusted-asserted-role".into();
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/stations/fixture/claim-next")
+            .header("x-boss-user", serde_json::to_string(&user).unwrap())
+            .header("content-type", "application/json");
+        if let Some(machine) = machine {
+            request = request.header(boss_core::machine_token::HEADER, machine);
+        }
+        if runner {
+            request = request.header(
+                crate::runner_credential::HEADER,
+                "native-runner-fixture-key",
+            );
+        }
+        request
+            .body(axum::body::Body::from(
+                serde_json::json!({"request_id":request_id}).to_string(),
+            ))
+            .unwrap()
+    }
+
+    async fn native_tree_http_fixture() -> (NativeClaimFixture, axum::Router) {
+        use crate::WorkflowRegistry;
+        let (fixture, app) =
+            native_machine_http_fixture(boss_core::machine_gate::Mode::Enforce, true).await;
+        let root_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(r#"UPDATE stations SET id = $1, predicate = '{"tags_any":["station:fixture"]}'::jsonb WHERE name = 'fixture'"#)
+            .bind(&root_id)
+            .execute(&fixture.db.pool)
+            .await
+            .unwrap();
+        let registry = crate::PgWorkflows::for_fixture(fixture.db.pool.clone());
+        let launch_model = crate::agent_spec::known_models().first().unwrap().clone();
+        sqlx::query("UPDATE agents SET default_model = $1 WHERE id = 'agent-machine-native'")
+            .bind(&launch_model)
+            .execute(&fixture.db.pool)
+            .await
+            .unwrap();
+        let protocol = crate::registry::WorkflowSpec::platform_seed(
+            "fixture",
+            "Fixture",
+            "test",
+            vec!["custom".into()],
+            vec![crate::registry::StepSpec {
+                title: "work".into(),
+                title_template: "Work".into(),
+                kind: "task".into(),
+                ready_when: "true".into(),
+                terminal: Some(crate::registry::Terminal {
+                    outcome: "done".into(),
+                }),
+                metadata_defaults: serde_json::json!({"at": root_id}),
+                agent: Some(crate::agent_spec::AgentSpec {
+                    profile: "builder".into(),
+                    model: launch_model,
+                    budget_usd: 5.0,
+                    effort: crate::agent_spec::Effort::High,
+                    executor_provenance: Default::default(),
+                }),
+                ..Default::default()
+            }],
+        );
+        registry
+            .create_draft(protocol, fixture.stamp.actor(), fixture.stamp.timestamp)
+            .await
+            .unwrap();
+        registry
+            .publish("fixture", fixture.stamp.actor(), fixture.stamp.timestamp)
+            .await
+            .unwrap();
+        (fixture, app)
+    }
+
+    #[tokio::test]
+    async fn native_http_robot_pulls_a_declared_root_without_a_step_predicate() {
+        use tower::ServiceExt;
+        let (fixture, app) = native_tree_http_fixture().await;
+        let response = app
+            .oneshot(native_machine_request(
+                uuid::Uuid::new_v4(),
+                "agent-machine-native",
+                Some("native-machine-fixture-key"),
+                false,
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(receipt["actor"], "agent-machine-native");
+        assert_eq!(
+            receipt["selected"]["step_id"],
+            fixture.context.validated_step.id.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_http_robot_root_pull_records_a_countable_legacy_fallback() {
+        use tower::ServiceExt;
+        let (fixture, app) = native_tree_http_fixture().await;
+        sqlx::query("UPDATE workflows SET steps = steps #- '{0,metadata_defaults,at}', metadata = metadata - 'owner' WHERE kind = 'fixture'")
+            .execute(&fixture.db.pool).await.unwrap();
+        let response = app
+            .oneshot(native_machine_request(
+                uuid::Uuid::new_v4(),
+                "agent-machine-native",
+                Some("native-machine-fixture-key"),
+                false,
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let original = crate::station_claim::SelectionReceipt::from_json(
+            String::from_utf8(body.to_vec()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(original["actor"], "agent-machine-native");
+        assert_eq!(original["claim_station"]["id"], original["station"]["id"]);
+        assert_eq!(original["station_resolution"], "root-fallback");
+        assert_eq!(
+            original["station_resolution_reason"],
+            "unaddressed legacy packet"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_tree_claim_consumes_the_historical_protocol_before_claiming() {
+        use crate::{JobsRepository, StationRegistry, WorkflowRegistry};
+        for changed in [false, true] {
+            let (mut fixture, _app) = native_tree_http_fixture().await;
+            let workflows = crate::PgWorkflows::for_fixture(fixture.db.pool.clone());
+            // Keep the packet on v1 while the active routing block is v2.
+            // A check of active definitions alone cannot detect the mutation.
+            let next = workflows.get_active("fixture").await.unwrap();
+            workflows
+                .create_draft(next, fixture.stamp.actor(), fixture.stamp.timestamp)
+                .await
+                .unwrap();
+            workflows
+                .publish("fixture", fixture.stamp.actor(), fixture.stamp.timestamp)
+                .await
+                .unwrap();
+            let stations = crate::PgStations::new(fixture.db.pool.clone());
+            fixture.context.station = stations.get_active("fixture").await.unwrap();
+            fixture.context.active_workflows = workflows
+                .list_active(None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.kind.clone(), row))
+                .collect();
+            let pinned = workflows
+                .get_version("fixture", fixture.context.validated_job.workflow_version)
+                .await
+                .unwrap();
+            assert_ne!(
+                pinned.version,
+                fixture.context.active_workflows["fixture"].version
+            );
+            // As in the owning fixture, database setup is outside the
+            // request whose unchanged ingress budget is being judged.
+            let observation = fixture
+                .store
+                .observe_authority(
+                    resolved_ingress().await,
+                    fixture.context.request_id,
+                    "fixture",
+                )
+                .await
+                .unwrap();
+            fixture.context.tree_selection = Some(crate::station_claim::TreeSelection {
+                inputs: crate::station_claim::TreePullInputs {
+                    stations: stations.list_active().await.unwrap(),
+                    protocols: vec![pinned.clone()],
+                },
+                executor: observation.pull_executor(),
+            });
+            fixture.context.native_authority = Some(Arc::new(observation));
+            if changed {
+                // An actual historical-row writer, with active v2 unchanged.
+                // Consuming only the prepared copy would claim at the old address.
+                sqlx::query("UPDATE workflows SET steps = jsonb_set(steps, '{0,metadata_defaults,at}', to_jsonb('another-station'::text)) WHERE kind = 'fixture' AND version = $1")
+                    .bind(pinned.version).execute(&fixture.db.pool).await.unwrap();
+            }
+            let before: i64 = sqlx::query_scalar("SELECT count(*) FROM event_outbox")
+                .fetch_one(&fixture.db.pool)
+                .await
+                .unwrap();
+            let result = fixture
+                .repo
+                .claim_station_head_at(
+                    &fixture.context,
+                    crate::runner_credential::ACTOR,
+                    &[],
+                    &fixture.stamp,
+                    &[],
+                )
+                .await;
+            if changed {
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("a stale historical input must not claim"),
+                };
+                assert!(
+                    error.to_string().contains("pinned protocol inputs changed"),
+                    "{error}"
+                );
+                assert!(
+                    fixture
+                        .repo
+                        .station_claim_receipt(fixture.context.request_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    fixture
+                        .repo
+                        .get_step(&fixture.context.validated_step.id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    fixture.context.validated_step
+                );
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM event_outbox")
+                        .fetch_one(&fixture.db.pool)
+                        .await
+                        .unwrap(),
+                    before
+                );
+            } else {
+                let crate::station_claim::SelectionResult::Claimed { receipt, .. } =
+                    result.unwrap()
+                else {
+                    panic!("unchanged historical input is claimable");
+                };
+                assert_eq!(
+                    receipt["owner_consumption"]["pinned_protocols"][0]["version"],
+                    pinned.version
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_http_machine_ingress_claims_as_the_registered_robot_in_every_mode() {
+        use crate::JobsRepository;
+        use boss_core::machine_gate::Mode;
+        use tower::ServiceExt;
+        let mut refused = Vec::new();
+        for mode in [Mode::Off, Mode::Report, Mode::Enforce] {
+            let (fixture, app) = native_machine_http_fixture(mode, true).await;
+            let request_id = uuid::Uuid::new_v4();
+            let request = || {
+                native_machine_request(
+                    request_id,
+                    "agent-machine-native",
+                    Some("native-machine-fixture-key"),
+                    false,
+                )
+            };
+            let response = app.clone().oneshot(request()).await.unwrap();
+            let status = response.status();
+            let original = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            if status != axum::http::StatusCode::CREATED {
+                refused.push((mode, status, String::from_utf8(original.to_vec()).unwrap()));
+                continue;
+            }
+            let receipt: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            assert_eq!(receipt["actor"], "agent-machine-native");
+            assert_eq!(
+                receipt["claimed_step"]["assignee_id"],
+                "agent-machine-native"
+            );
+            assert_eq!(
+                receipt
+                    .pointer("/owner_consumption/ingress/actor_id")
+                    .unwrap(),
+                "agent-machine-native"
+            );
+            assert_eq!(
+                receipt
+                    .pointer("/owner_consumption/ingress/pre_dispatch_budget_ms")
+                    .unwrap(),
+                5000
+            );
+            assert_eq!(
+                receipt
+                    .pointer("/owner_consumption/ingress/machine_mode")
+                    .unwrap(),
+                mode.name()
+            );
+            assert_eq!(
+                receipt
+                    .pointer("/owner_consumption/consumed_inputs/agents/0/id")
+                    .unwrap(),
+                "agent-machine-native"
+            );
+            assert_eq!(
+                receipt
+                    .pointer("/owner_consumption/consumed_inputs/user/role")
+                    .unwrap(),
+                "engineering-agent"
+            );
+            assert_eq!(
+                receipt
+                    .pointer("/owner_consumption/ingress/principal")
+                    .unwrap(),
+                "machine:estate"
+            );
+            assert!(
+                receipt
+                    .pointer("/owner_consumption/ingress/host")
+                    .unwrap()
+                    .is_null()
+            );
+            assert!(
+                fixture
+                    .repo
+                    .station_claim_receipt(request_id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            let after_first: i64 = sqlx::query_scalar("SELECT count(*) FROM event_outbox")
+                .fetch_one(&fixture.db.pool)
+                .await
+                .unwrap();
+            let retry = app.clone().oneshot(request()).await.unwrap();
+            assert_eq!(retry.status(), axum::http::StatusCode::CREATED);
+            let replay = axum::body::to_bytes(retry.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                replay, original,
+                "the machine path must conserve the original receipt"
+            );
+            let empty_id = uuid::Uuid::new_v4();
+            let empty = app
+                .oneshot(native_machine_request(
+                    empty_id,
+                    "agent-machine-native",
+                    Some("native-machine-fixture-key"),
+                    false,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(empty.status(), axum::http::StatusCode::NO_CONTENT);
+            assert!(
+                fixture
+                    .repo
+                    .station_claim_receipt(empty_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM event_outbox")
+                    .fetch_one(&fixture.db.pool)
+                    .await
+                    .unwrap(),
+                after_first
+            );
+        }
+        assert!(
+            refused.is_empty(),
+            "authenticated robot machine requests were refused: {refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_http_machine_ingress_does_not_replace_the_runner_credential_identity() {
+        use boss_core::machine_gate::Mode;
+        use tower::ServiceExt;
+        for mode in [Mode::Off, Mode::Report, Mode::Enforce] {
+            let (_fixture, app) = native_machine_http_fixture(mode, false).await;
+            let response = app
+                .oneshot(native_machine_request(
+                    uuid::Uuid::new_v4(),
+                    "agent-machine-native",
+                    Some("native-machine-fixture-key"),
+                    true,
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                axum::http::StatusCode::CREATED,
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+            let receipt: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(receipt["actor"], crate::runner_credential::ACTOR);
+            assert_eq!(
+                receipt
+                    .pointer("/owner_consumption/ingress/principal")
+                    .unwrap(),
+                crate::runner_credential::PRINCIPAL
+            );
+            assert_eq!(
+                receipt.pointer("/owner_consumption/ingress/host").unwrap(),
+                "forge"
+            );
+            assert_eq!(
+                receipt
+                    .pointer("/owner_consumption/ingress/pre_dispatch_budget_ms")
+                    .unwrap(),
+                5000
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_http_machine_ingress_requires_an_actual_estate_match_and_a_named_registry_actor()
+     {
+        use crate::JobsRepository;
+        use boss_core::machine_gate::Mode;
+        use tower::ServiceExt;
+        let mut wrong = Vec::new();
+        for mode in [Mode::Off, Mode::Report, Mode::Enforce] {
+            let (fixture, app) = native_machine_http_fixture(mode, true).await;
+            let before: i64 = sqlx::query_scalar("SELECT count(*) FROM event_outbox")
+                .fetch_one(&fixture.db.pool)
+                .await
+                .unwrap();
+            for token in [None, Some("wrong-machine-fixture-key")] {
+                let request_id = uuid::Uuid::new_v4();
+                let response = app
+                    .clone()
+                    .oneshot(native_machine_request(
+                        request_id,
+                        "agent-machine-native",
+                        token,
+                        false,
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+                assert!(
+                    fixture
+                        .repo
+                        .station_claim_receipt(request_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            for unnamed in ["", boss_policy_client::User::ANONYMOUS_ID] {
+                let request_id = uuid::Uuid::new_v4();
+                let response = app
+                    .clone()
+                    .oneshot(native_machine_request(
+                        request_id,
+                        unnamed,
+                        Some("native-machine-fixture-key"),
+                        false,
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+                assert!(
+                    fixture
+                        .repo
+                        .station_claim_receipt(request_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            let unknown_id = uuid::Uuid::new_v4();
+            let response = app
+                .clone()
+                .oneshot(native_machine_request(
+                    unknown_id,
+                    "agent-not-registered",
+                    Some("native-machine-fixture-key"),
+                    false,
+                ))
+                .await
+                .unwrap();
+            if response.status() != axum::http::StatusCode::CONFLICT {
+                wrong.push((mode, "unregistered", response.status()));
+            }
+            assert!(
+                fixture
+                    .repo
+                    .station_claim_receipt(unknown_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            sqlx::query("UPDATE agents SET role=NULL WHERE id='agent-machine-native'")
+                .execute(&fixture.db.pool)
+                .await
+                .unwrap();
+            let roleless_id = uuid::Uuid::new_v4();
+            let response = app
+                .oneshot(native_machine_request(
+                    roleless_id,
+                    "agent-machine-native",
+                    Some("native-machine-fixture-key"),
+                    false,
+                ))
+                .await
+                .unwrap();
+            if response.status() != axum::http::StatusCode::CONFLICT {
+                wrong.push((mode, "roleless", response.status()));
+            }
+            assert!(
+                fixture
+                    .repo
+                    .station_claim_receipt(roleless_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM event_outbox")
+                    .fetch_one(&fixture.db.pool)
+                    .await
+                    .unwrap(),
+                before
+            );
+            assert_eq!(
+                fixture
+                    .repo
+                    .get_step(&fixture.context.validated_step.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                boss_core::job::StepStatus::Ready
+            );
+        }
+        assert!(
+            wrong.is_empty(),
+            "machine identity was not judged against the native actor owner: {wrong:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_http_machine_ingress_does_not_grant_the_runner_writer_principal() {
+        use crate::JobsRepository;
+        use tower::ServiceExt;
+        let (mut fixture, app) =
+            native_machine_http_fixture(boss_core::machine_gate::Mode::Enforce, false).await;
+        fixture.context.validated_job.metadata[crate::field_writer::HOST_KEY] =
+            serde_json::json!("forge");
+        fixture.context.validated_step.metadata[crate::credential_executor::KEY] =
+            serde_json::json!(crate::runner_credential::PRINCIPAL);
+        fixture
+            .repo
+            .update_job(&fixture.context.validated_job)
+            .await
+            .unwrap();
+        fixture
+            .repo
+            .update_step_at(
+                &fixture.context.validated_step,
+                fixture.stamp.timestamp,
+                &[],
+            )
+            .await
+            .unwrap();
+        let request_id = uuid::Uuid::new_v4();
+        let response = app
+            .clone()
+            .oneshot(native_machine_request(
+                request_id,
+                crate::runner_credential::ACTOR,
+                Some("native-machine-fixture-key"),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        assert!(
+            fixture
+                .repo
+                .station_claim_receipt(request_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            fixture
+                .repo
+                .get_step(&fixture.context.validated_step.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            boss_core::job::StepStatus::Ready
+        );
+        let runner = app
+            .oneshot(native_machine_request(
+                uuid::Uuid::new_v4(),
+                crate::runner_credential::ACTOR,
+                Some("native-machine-fixture-key"),
+                true,
+            ))
+            .await
+            .unwrap();
+        let status = runner.status();
+        let body = axum::body::to_bytes(runner.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
     async fn native_claim_fixture_with_preparation_delay(
         preparation_delay: std::time::Duration,
     ) -> NativeClaimFixture {
@@ -1107,6 +2395,8 @@ mod tests {
                     role: "platform-admin".into(),
                     description: "native claim owning fixture".into(),
                     signs_for: None,
+                    access_tier: None,
+                    station: None,
                 }],
                 &stamp,
             )
@@ -1168,7 +2458,7 @@ mod tests {
         let station = crate::StationSpec::draft(
             "fixture",
             "Fixture",
-            crate::StationKind::Batch,
+            crate::StationKind::Group,
             crate::station_queue::StationPredicate {
                 kind: Some("fixture".into()),
                 step: Some(crate::station_queue::StepMatch {
@@ -1213,6 +2503,7 @@ mod tests {
             station,
             scope: crate::port::JobScope::All,
             active_workflows,
+            tree_selection: None,
             validated_job,
             validated_step,
         };
@@ -1228,16 +2519,25 @@ mod tests {
     #[tokio::test]
     async fn fixture_preparation_does_not_spend_the_native_claim_ingress_budget() {
         use crate::JobsRepository;
+        let delay =
+            crate::station_claim::SELECTION_PRE_COMMIT_BUDGET + std::time::Duration::from_secs(1);
+        let fixture_began = std::time::Instant::now();
         let NativeClaimFixture {
             db: _db,
             repo,
             stamp,
             context,
             ..
-        } = native_claim_fixture_with_preparation_delay(
-            crate::station_claim::SELECTION_PRE_COMMIT_BUDGET + std::time::Duration::from_secs(1),
-        )
-        .await;
+        } = native_claim_fixture_with_preparation_delay(delay).await;
+        // The claim runs under the test's answer budget, so its success no
+        // longer proves the wait was unspent. The ingress origin does: it
+        // must stand after the whole preparation wait (f10419f9).
+        let admitted = context.native_authority.as_ref().unwrap().ingress.started();
+        assert!(
+            admitted >= fixture_began + delay,
+            "the request budget began {:?} into a {delay:?} fixture wait",
+            admitted.duration_since(fixture_began)
+        );
         let result = repo
             .claim_station_head_at(&context, crate::runner_credential::ACTOR, &[], &stamp, &[])
             .await
@@ -1544,31 +2844,127 @@ mod tests {
             panic!("original replay must precede fresh owner retirement")
         };
         assert_eq!(receipt.json(), original);
-        // Even the replay read spends the original request's pool budget.
-        // Occupy every actual connection; a repository read must not silently
-        // add six seconds before it reaches the owner/deadline checks.
+        pool_exhaustion_is_cut_at_the_ingress_boundary(
+            &db,
+            &repo,
+            &stamp,
+            &context,
+            std::time::Duration::ZERO,
+        )
+        .await;
+    }
+    /// The standing control for f10419f9: the runtime thread is descheduled
+    /// past the whole ingress budget while the replay read waits on the
+    /// exhausted pool, as a loaded gate pod does to it. Under the old 5.8 s
+    /// wall bound this failed with the gates' own message (6.0003 s).
+    #[tokio::test]
+    async fn pool_exhaustion_is_cut_at_the_ingress_boundary_after_a_host_deschedule() {
+        let NativeClaimFixture {
+            db,
+            repo,
+            stamp,
+            context,
+            ..
+        } = native_claim_fixture().await;
+        pool_exhaustion_is_cut_at_the_ingress_boundary(
+            &db,
+            &repo,
+            &stamp,
+            &context,
+            crate::station_claim::SELECTION_PRE_COMMIT_BUDGET + std::time::Duration::from_secs(1),
+        )
+        .await;
+    }
+    /// Even the replay read spends its request's ingress budget. Occupy every
+    /// actual connection; a repository read must not silently add six seconds
+    /// before it reaches the owner/deadline checks.
+    ///
+    /// Until 2026-10-22 this released the pool after six real seconds and
+    /// judged the refusal by a 5.8 s wall bound from the call, so a loaded
+    /// gate pod that serviced the deadline timer late failed it on cars that
+    /// never touched this file (f10419f9). The pool is now held until the
+    /// verdict, and the cut is judged against the request's own ingress
+    /// boundary on a paused clock, as the slow-port HTTP test judges its own.
+    async fn pool_exhaustion_is_cut_at_the_ingress_boundary(
+        db: &boss_testing::TestDb,
+        repo: &crate::PgJobs,
+        stamp: &boss_core::publisher::EventStamp,
+        context: &crate::station_claim::SelectionContext,
+        deschedule: std::time::Duration,
+    ) {
+        use crate::JobsRepository;
         let mut held = Vec::new();
         for _ in 0..db.pool.options().get_max_connections() {
             held.push(db.pool.acquire().await.unwrap());
         }
-        let release = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-            drop(held);
-        });
-        let began = tokio::time::Instant::now();
-        let blocked = repo
-            .claim_station_head_at(&context, crate::runner_credential::ACTOR, &[], &stamp, &[])
-            .await;
-        let elapsed = began.elapsed();
-        release.await.unwrap();
-        assert!(
-            blocked.is_err(),
-            "pool exhaustion must refuse within the ingress budget"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_millis(5800),
-            "receipt lookup exceeded the ingress budget: {elapsed:?}"
-        );
+        // A request of its own, so the budget the read is judged against
+        // starts here rather than inside the fixture's earlier claims, which
+        // a contended gate PostgreSQL can make take the whole five seconds.
+        // Its subject is the production deadline, so it is admitted under
+        // it, not the answer tests' budget (f10419f9).
+        let mut observation = context.native_authority.as_deref().unwrap().clone();
+        observation.ingress = production_ingress().await;
+        let boundary = tokio::time::Instant::from_std(observation.ingress.started())
+            + crate::station_claim::SELECTION_PRE_COMMIT_BUDGET;
+        let context = crate::station_claim::SelectionContext {
+            native_authority: Some(Arc::new(observation)),
+            ..context.clone()
+        };
+        // Admission and first repository poll must be observably distinct:
+        // restarting the repository budget here must extend the cut and fail.
+        tokio::time::pause();
+        tokio::time::advance(PRE_PORT_GAP).await;
+        tokio::time::resume();
+        let claim =
+            repo.claim_station_head_at(&context, crate::runner_credential::ACTOR, &[], stamp, &[]);
+        tokio::pin!(claim);
+        // One poll parks the read on the exhausted pool. Ending here is a
+        // refusal only if the budget was already gone, which is still the
+        // contract and is judged below like any other.
+        let parked = tokio::select! {
+            biased;
+            result = &mut claim => Some(result),
+            () = std::future::ready(()) => None,
+        };
+        // A host deschedule of the runtime thread: real time the request has
+        // spent, which the paused clock below must not count a second time.
+        std::thread::sleep(deschedule);
+        let blocked = match parked {
+            Some(result) => result,
+            None => {
+                tokio::time::pause();
+                // tokio's timer wheel rounds a deadline up to its next
+                // millisecond, so 2 ms past the boundary the ingress cut has
+                // fired; a read waiting on the pool under a budget of its own
+                // (the 30 s acquire timeout, or six more seconds) is still
+                // waiting here.
+                tokio::time::advance(
+                    boundary.saturating_duration_since(tokio::time::Instant::now())
+                        + std::time::Duration::from_millis(2),
+                )
+                .await;
+                let verdict = tokio::select! {
+                    biased;
+                    result = &mut claim => result,
+                    () = std::future::ready(()) => panic!(
+                        "the replay read was still waiting on the pool 2 ms after its ingress boundary: it was given a budget of its own"
+                    ),
+                };
+                tokio::time::resume();
+                verdict
+            }
+        };
+        drop(held);
+        match blocked {
+            Err(JobsError::SelectionConflict(message)) => assert!(
+                message.contains("ingress deadline expired"),
+                "pool exhaustion must be refused by the ingress deadline: {message}"
+            ),
+            Err(other) => {
+                panic!("pool exhaustion must be refused by the ingress deadline, not: {other}")
+            }
+            Ok(_) => panic!("pool exhaustion must refuse within the ingress budget"),
+        }
     }
     #[tokio::test]
     async fn commit_completion_is_not_canceled_by_the_pre_dispatch_sql_budget() {
@@ -1580,19 +2976,91 @@ mod tests {
             context,
             ..
         } = native_claim_fixture().await;
-        sqlx::raw_sql("CREATE FUNCTION slow_native_receipt_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(6); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER slow_native_receipt_commit AFTER INSERT ON station_claim_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION slow_native_receipt_commit()")
+        // The deferred owning trigger holds COMMIT on a lock the test owns.
+        // It replaces a six-second pg_sleep that needed all pre-dispatch
+        // work to fit in five wall-clock seconds, which gate bb1fbbde's
+        // contended PostgreSQL did not (f10419f9).
+        sqlx::raw_sql("CREATE FUNCTION hold_native_receipt_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(hashtext(current_database()), 1421); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER hold_native_receipt_commit AFTER INSERT ON station_claim_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION hold_native_receipt_commit()")
             .execute(&db.pool).await.unwrap();
-        let began = tokio::time::Instant::now();
-        let result = repo
-            .claim_station_head_at(&context, crate::runner_credential::ACTOR, &[], &stamp, &[])
-            .await;
+        let mut barrier = db.pool.acquire().await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock(hashtext(current_database()), 1421)")
+            .execute(&mut *barrier)
+            .await
+            .unwrap();
+        let repo = Arc::new(repo);
+        let claimant = repo.clone();
+        let request = context.clone();
+        let claim_stamp = stamp.clone();
+        let mut claim = tokio::spawn(async move {
+            claimant
+                .claim_station_head_at(
+                    &request,
+                    crate::runner_credential::ACTOR,
+                    &[],
+                    &claim_stamp,
+                    &[],
+                )
+                .await
+        });
+        wait_for_backend(
+            &db.pool,
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event = 'advisory' AND query ILIKE 'COMMIT%')",
+            &mut claim,
+        )
+        .await;
+        // The original ingress is a standard-clock instant. Deliberately
+        // hold real COMMIT past production's budget too: an illicit
+        // started().elapsed() post-COMMIT check must fail this same control.
+        // This is a lower-bound wait, never an upper bound on the scheduler.
+        tokio::time::sleep(
+            crate::station_claim::SELECTION_PRE_COMMIT_BUDGET + std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(
+            context
+                .native_authority
+                .as_ref()
+                .unwrap()
+                .ingress
+                .started()
+                .elapsed()
+                >= crate::station_claim::SELECTION_PRE_COMMIT_BUDGET
+        );
+        // COMMIT is dispatched and held. Carry the clock every deadline
+        // reads past the whole budget, then let COMMIT finish: nothing after
+        // dispatch may consult the expired budget and cancel it. The
+        // spinner keeps the paused clock from auto-advancing on its own.
+        // This runs under the answer budget, not production's five seconds;
+        // what makes it a test of every deadline reader is that the ingress
+        // deadline is a tokio Instant, so no reader can compare it with a
+        // clock this advance does not move. Until review a0fd6902 it was a
+        // std Instant, and a post-COMMIT std-clock check survived here.
+        let ingress = &context.native_authority.as_ref().unwrap().ingress;
+        let deadline = SelectionDeadline::from_ingress(ingress);
+        let keep_clock = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::time::pause();
+        tokio::time::advance(
+            deadline.remaining().unwrap_or_default() + std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert!(
+            deadline.remaining().is_err() && tokio::time::Instant::now() >= ingress.deadline(),
+            "the ingress budget must have expired while COMMIT was held"
+        );
+        sqlx::query("SELECT pg_advisory_unlock(hashtext(current_database()), 1421)")
+            .execute(&mut *barrier)
+            .await
+            .unwrap();
+        let result = claim.await.unwrap();
+        keep_clock.abort();
+        tokio::time::resume();
         let crate::station_claim::SelectionResult::Claimed { receipt, .. } = result.unwrap() else {
             panic!("fresh native commit must return its original receipt")
         };
-        assert!(
-            began.elapsed() >= std::time::Duration::from_secs(6),
-            "the actual COMMIT must exercise its deferred owning trigger"
-        );
         assert_eq!(
             repo.station_claim_receipt(context.request_id)
                 .await
@@ -1609,19 +3077,77 @@ mod tests {
             boss_core::job::StepStatus::Active
         );
     }
+    /// statement_timeout does not cancel COMMIT, but lock_timeout does
+    /// (measured by review run a0fd6902 on PostgreSQL 16): a deferred
+    /// trigger that waits on a lock past the remaining pre-commit budget
+    /// aborted the selection the design means to let complete (0325ca3e).
+    #[tokio::test]
+    async fn commit_lock_wait_is_not_canceled_by_the_pre_dispatch_lock_budget() {
+        use crate::JobsRepository;
+        let NativeClaimFixture {
+            db,
+            repo,
+            stamp,
+            context,
+            ..
+        } = native_claim_fixture().await;
+        sqlx::raw_sql("CREATE FUNCTION locked_native_receipt_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(325325); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER locked_native_receipt_commit AFTER INSERT ON station_claim_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION locked_native_receipt_commit()")
+            .execute(&db.pool).await.unwrap();
+        let mut holder = db.pool.acquire().await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock(325325)")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let released = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            sqlx::query("SELECT pg_advisory_unlock(325325)")
+                .execute(&mut *holder)
+                .await
+                .unwrap();
+        });
+        let began = tokio::time::Instant::now();
+        let result = repo
+            .claim_station_head_at(&context, crate::runner_credential::ACTOR, &[], &stamp, &[])
+            .await;
+        released.await.unwrap();
+        let crate::station_claim::SelectionResult::Claimed { receipt, .. } = result.unwrap() else {
+            panic!("a COMMIT that waits on a lock past the budget must still commit")
+        };
+        assert!(
+            began.elapsed() >= std::time::Duration::from_secs(6),
+            "the actual COMMIT must wait on its deferred trigger's lock"
+        );
+        assert_eq!(
+            repo.station_claim_receipt(context.request_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            receipt
+        );
+    }
     #[tokio::test]
     async fn joined_claim_holds_the_real_policy_writer_until_receipt_commit() {
         use crate::JobsRepository;
         use boss_policy_client::{Action, PolicyRepository, Resource};
         let NativeClaimFixture {
             db,
-            repo,
+            repo: _,
             stamp,
             policy,
-            context,
-            store,
+            mut context,
+            store: _,
         } = native_claim_fixture().await;
-        assert!(store.observes(context.native_authority.as_ref().unwrap()));
+        let repo = crate::PgJobs::with_urls(
+            db.pool.clone(),
+            "postgres://fixture-only".into(),
+            "nats://fixture-only".into(),
+        );
+        context.native_authority = Some(Arc::new(
+            repo.prepare_native_selection(resolved_ingress().await, context.request_id, "fixture")
+                .await
+                .unwrap()
+                .expect("serving constructor must own native selection authority"),
+        ));
         sqlx::raw_sql("CREATE FUNCTION pause_native_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(hashtext(current_database()), 1419); RETURN NEW; END $$; CREATE TRIGGER pause_native_receipt BEFORE INSERT ON station_claim_receipts FOR EACH ROW EXECUTE FUNCTION pause_native_receipt()")
             .execute(&db.pool).await.unwrap();
         let mut barrier = db.pool.acquire().await.unwrap();
@@ -1633,7 +3159,7 @@ mod tests {
         let claimant = repo.clone();
         let request = context.clone();
         let claim_stamp = stamp.clone();
-        let claim = tokio::spawn(async move {
+        let mut claim = tokio::spawn(async move {
             claimant
                 .claim_station_head_at(
                     &request,
@@ -1644,13 +3170,12 @@ mod tests {
                 )
                 .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event = 'advisory' AND query LIKE 'INSERT INTO station_claim_receipts%')").fetch_one(&db.pool).await.unwrap();
-                if waiting { break; }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        }).await.unwrap();
+        wait_for_backend(
+            &db.pool,
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event = 'advisory' AND query LIKE 'INSERT INTO station_claim_receipts%')",
+            &mut claim,
+        )
+        .await;
         let rule_id =
             boss_policy_client::types::rule_id("platform-admin", &Resource::step(), Action::Update);
         let mut writer = tokio::spawn(async move {
@@ -1682,18 +3207,59 @@ mod tests {
         };
         assert_eq!(receipt.json(), original.json());
     }
+    async fn expire_at_receipt_insert(
+        db: &boss_testing::TestDb,
+        repo: Arc<crate::PgJobs>,
+        context: crate::station_claim::SelectionContext,
+        stamp: boss_core::publisher::EventStamp,
+        clock: Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>>,
+    ) -> Result<crate::station_claim::SelectionResult, JobsError> {
+        use crate::JobsRepository;
+        sqlx::raw_sql("CREATE FUNCTION pause_expiring_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(hashtext(current_database()), 1451); RETURN NEW; END $$; CREATE TRIGGER pause_expiring_receipt BEFORE INSERT ON station_claim_receipts FOR EACH ROW EXECUTE FUNCTION pause_expiring_receipt()")
+            .execute(&db.pool).await.unwrap();
+        let mut barrier = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext(current_database()), 1451)")
+            .execute(&mut *barrier)
+            .await
+            .unwrap();
+        let mut claim = tokio::spawn(async move {
+            repo.claim_station_head_at(&context, crate::runner_credential::ACTOR, &[], &stamp, &[])
+                .await
+        });
+        wait_for_backend(
+            &db.pool,
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event = 'advisory' AND query LIKE 'INSERT INTO station_claim_receipts%')",
+            &mut claim,
+        )
+        .await;
+        // Only this store's expiry clock moves, after real SQL reached the fence.
+        *clock.lock().unwrap() += chrono::Duration::milliseconds(801);
+        eprintln!(
+            "expiry_trace: actual receipt INSERT advisory wait observed; store clock advanced 801ms"
+        );
+        barrier.rollback().await.unwrap();
+        claim.await.unwrap()
+    }
+
     #[tokio::test]
     async fn policy_expiring_during_joined_sql_rolls_back_step_receipt_and_outbox() {
         use crate::JobsRepository;
         use boss_policy_client::{Action, PolicyRepository, Resource, Scope, UserOverride};
         let NativeClaimFixture {
             db,
-            repo,
+            repo: _,
             stamp,
             policy,
             store,
             mut context,
         } = native_claim_fixture().await;
+        let clock = Arc::new(std::sync::Mutex::new(chrono::Utc::now()));
+        let store = NativeSelectionStore {
+            expiry_clock: Some(clock.clone()),
+            ..store
+        };
+        let repo = Arc::new(crate::PgJobs::for_native_selection(store.clone()));
+        let expires_at = *clock.lock().unwrap() + chrono::Duration::milliseconds(800);
         policy
             .deactivate_rule(
                 &boss_policy_client::types::rule_id(
@@ -1714,10 +3280,15 @@ mod tests {
                     action: Action::Update,
                     scope: Scope::All,
                     reason: "actual timed grant owning control".into(),
-                    expires_at: Some(chrono::Utc::now() + chrono::Duration::milliseconds(800)),
+                    expires_at: Some(expires_at),
                 },
                 "expiry-fixture",
             )
+            .await
+            .unwrap();
+        // Setup may be arbitrarily slow; authority must expire in the SQL phase.
+        sqlx::query("SELECT pg_sleep(1.2)")
+            .execute(&db.pool)
             .await
             .unwrap();
         context.native_authority = Some(Arc::new(
@@ -1726,20 +3297,12 @@ mod tests {
                 .await
                 .unwrap(),
         ));
-        sqlx::raw_sql("CREATE FUNCTION delay_native_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1.2); RETURN NEW; END $$; CREATE TRIGGER delay_native_receipt BEFORE INSERT ON station_claim_receipts FOR EACH ROW EXECUTE FUNCTION delay_native_receipt()")
-            .execute(&db.pool).await.unwrap();
         let before: i64 = sqlx::query_scalar("SELECT count(*) FROM event_outbox")
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        let began = tokio::time::Instant::now();
-        let result = repo
-            .claim_station_head_at(&context, crate::runner_credential::ACTOR, &[], &stamp, &[])
-            .await;
-        assert!(
-            began.elapsed() >= std::time::Duration::from_secs(1),
-            "the refusal must follow the actual SQL delay, not fail at preparation"
-        );
+        let result =
+            expire_at_receipt_insert(&db, repo.clone(), context.clone(), stamp, clock).await;
         assert!(
             matches!(result, Err(JobsError::SelectionConflict(ref reason)) if reason == "native policy refuses current step update authority"),
             "a grant that expires during real SQL must refuse at the final policy check"
@@ -1772,12 +3335,20 @@ mod tests {
         use boss_policy_client::{Action, PolicyRepository, Resource, Scope, UserOverride};
         let NativeClaimFixture {
             db,
-            repo,
+            repo: _,
             stamp,
             policy,
             store,
             mut context,
         } = native_claim_fixture().await;
+        let clock = Arc::new(std::sync::Mutex::new(chrono::Utc::now()));
+        let store = NativeSelectionStore {
+            expiry_clock: Some(clock.clone()),
+            ..store
+        };
+        let repo = crate::PgJobs::for_native_selection(store.clone());
+        let repo = Arc::new(repo);
+        let expires_at = *clock.lock().unwrap() + chrono::Duration::milliseconds(800);
         context.validated_step.metadata["authority_role"] = serde_json::json!("native-signature");
         repo.update_step_at(&context.validated_step, stamp.timestamp, &[])
             .await
@@ -1791,10 +3362,14 @@ mod tests {
                     action: Action::SignOff,
                     scope: Scope::All,
                     reason: "actual step authority expiry".into(),
-                    expires_at: Some(chrono::Utc::now() + chrono::Duration::milliseconds(800)),
+                    expires_at: Some(expires_at),
                 },
                 "step-authority-fixture",
             )
+            .await
+            .unwrap();
+        sqlx::query("SELECT pg_sleep(1.2)")
+            .execute(&db.pool)
             .await
             .unwrap();
         context.native_authority = Some(Arc::new(
@@ -1803,17 +3378,12 @@ mod tests {
                 .await
                 .unwrap(),
         ));
-        sqlx::raw_sql("CREATE FUNCTION delay_native_step_authority() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1.2); RETURN NEW; END $$; CREATE TRIGGER delay_native_step_authority BEFORE INSERT ON station_claim_receipts FOR EACH ROW EXECUTE FUNCTION delay_native_step_authority()")
-            .execute(&db.pool).await.unwrap();
         let before: i64 = sqlx::query_scalar("SELECT count(*) FROM event_outbox")
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        let began = tokio::time::Instant::now();
-        let result = repo
-            .claim_station_head_at(&context, crate::runner_credential::ACTOR, &[], &stamp, &[])
-            .await;
-        assert!(began.elapsed() >= std::time::Duration::from_secs(1));
+        let result =
+            expire_at_receipt_insert(&db, repo.clone(), context.clone(), stamp, clock).await;
         assert!(
             matches!(result, Err(JobsError::SelectionConflict(ref reason)) if reason.contains("step authority")),
             "expired step authority must refuse at actual commit dispatch"
@@ -1944,6 +3514,8 @@ mod tests {
                     role: unrelated.into(),
                     description: unrelated.into(),
                     signs_for: None,
+                    access_tier: None,
+                    station: None,
                 }],
                 &stamp,
             )
@@ -2005,14 +3577,17 @@ mod tests {
         crate::agents::PgAgents::new(fixture.db.pool.clone())
             .publish(
                 &[crate::agents::AgentInput {
+                    factory_rotation: Some(true),
                     id: "agent-native-alias".into(),
                     display_name: "Native alias fixture".into(),
                     default_model: "native-alias-model".into(),
+                    model_class: None,
                     aliases: vec![crate::runner_credential::ACTOR.into()],
                     role: Some("platform-admin".into()),
                     department: None,
                     hourly_budget_usd_micros: Some(1),
                     max_concurrent_runs: Some(1),
+                    stations: None,
                 }],
                 boss_core::publish::PublishMode::InsertIfAbsent,
                 &fixture.stamp,
@@ -2107,103 +3682,61 @@ mod tests {
             }
         }
     }
+    /// THE PG NATIVE CLAIM IS BOUNDED BY ITS POOL ALONE (backlog
+    /// 3e927996; David, design a3c5e58a Q3). This test used to prove the
+    /// row's cap of one refused a claim when one OPEN run was committed
+    /// under the jobs writer fence. That cap was a second bound beside the
+    /// `robots:<model>` pool and is retired: the same committed run now
+    /// admits the claim, and the receipt records no `concurrency` reading.
     #[tokio::test]
-    async fn native_alias_cap_uses_complete_real_open_run_population_at_commit() {
+    async fn native_alias_claim_past_the_rows_declared_cap_is_admitted() {
         use crate::JobsRepository;
-        for in_flight in [true, false] {
-            let NativeClaimFixture {
-                db,
-                repo,
-                stamp,
-                mut context,
-                ..
-            } = declared_native_agent_alias_fixture().await;
-            context.validated_step.metadata[crate::agent_spec::MODEL_KEY] =
-                serde_json::json!("native-alias-model");
-            repo.update_step_at(&context.validated_step, stamp.timestamp, &[])
-                .await
-                .unwrap();
-            if in_flight {
-                let mut run = boss_core::job::Job::new(
-                    crate::agent_budget::RUN_KIND,
-                    boss_core::job::Subject::new("custom", "native-cap"),
-                    "Counted actual native run",
-                    "agent-native-alias",
-                    boss_core::job::Priority::Standard,
-                    stamp.timestamp.date_naive(),
-                );
-                run.status = boss_core::job::JobStatus::Open;
-                run.metadata[crate::agent_budget::RUN_AGENT_KEY] =
-                    serde_json::json!("agent-native-alias");
-                repo.create_job_at(
-                    &run,
-                    stamp.timestamp,
-                    &[stamp.event(
-                        crate::events::JOB_CREATED,
-                        serde_json::to_value(&run).unwrap(),
-                    )],
-                )
-                .await
-                .unwrap();
-            }
-            let before: i64 = sqlx::query_scalar("SELECT count(*) FROM event_outbox")
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
-            let result = repo
-                .claim_station_head_at(&context, crate::runner_credential::ACTOR, &[], &stamp, &[])
-                .await;
-            if in_flight {
-                assert!(
-                    matches!(result, Err(JobsError::SelectionConflict(ref reason)) if reason.contains("concurrency")),
-                    "real native cap must count the committed OPEN run under its actual jobs writer fence"
-                );
-                assert_eq!(
-                    repo.get_step(&context.validated_step.id)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                    context.validated_step
-                );
-                assert!(
-                    repo.station_claim_receipt(context.request_id)
-                        .await
-                        .unwrap()
-                        .is_none()
-                );
-                assert_eq!(
-                    before,
-                    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM event_outbox")
-                        .fetch_one(&db.pool)
-                        .await
-                        .unwrap()
-                );
-            } else {
-                let crate::station_claim::SelectionResult::Claimed { receipt, .. } =
-                    result.unwrap()
-                else {
-                    panic!("unchanged free capacity");
-                };
-                assert_eq!(
-                    receipt
-                        .pointer("/owner_consumption/concurrency/reading/in_flight")
-                        .unwrap(),
-                    0
-                );
-                assert_eq!(
-                    receipt
-                        .pointer("/owner_consumption/concurrency/reading/max_concurrent_runs")
-                        .unwrap(),
-                    1
-                );
-                assert_eq!(
-                    receipt
-                        .pointer("/owner_consumption/concurrency/runs")
-                        .unwrap(),
-                    &serde_json::json!([])
-                );
-            }
-        }
+        // The database lives for the test: an unbound field would drop it.
+        let NativeClaimFixture {
+            db: _db,
+            repo,
+            stamp,
+            mut context,
+            ..
+        } = declared_native_agent_alias_fixture().await;
+        context.validated_step.metadata[crate::agent_spec::MODEL_KEY] =
+            serde_json::json!("native-alias-model");
+        repo.update_step_at(&context.validated_step, stamp.timestamp, &[])
+            .await
+            .unwrap();
+        let mut run = boss_core::job::Job::new(
+            crate::agent_budget::RUN_KIND,
+            boss_core::job::Subject::new("custom", "native-cap"),
+            "An open run the retired cap would have counted",
+            "agent-native-alias",
+            boss_core::job::Priority::Standard,
+            stamp.timestamp.date_naive(),
+        );
+        run.status = boss_core::job::JobStatus::Open;
+        run.metadata[crate::agent_budget::RUN_AGENT_KEY] = serde_json::json!("agent-native-alias");
+        repo.create_job_at(
+            &run,
+            stamp.timestamp,
+            &[stamp.event(
+                crate::events::JOB_CREATED,
+                serde_json::to_value(&run).unwrap(),
+            )],
+        )
+        .await
+        .unwrap();
+        let result = repo
+            .claim_station_head_at(&context, crate::runner_credential::ACTOR, &[], &stamp, &[])
+            .await;
+        let crate::station_claim::SelectionResult::Claimed { receipt, .. } =
+            result.expect("one open run against a declared cap of one bounds nothing")
+        else {
+            panic!("a fresh claim");
+        };
+        assert!(
+            receipt.pointer("/owner_consumption/concurrency").is_none(),
+            "no concurrency reading is recorded: {}",
+            receipt.json()
+        );
     }
     #[tokio::test]
     async fn joined_native_claim_audit_rebuild_conserves_exact_receipt_step_and_calendar() {
@@ -2263,6 +3796,7 @@ mod tests {
             .into_iter()
             .map(
                 |(audit_id, event_id, kind, ts, payload)| boss_events::replay::ReplayEvent {
+                    raw_payload: None,
                     audit_id,
                     event_id,
                     kind,
@@ -2444,20 +3978,17 @@ mod tests {
             .await
             .unwrap();
         let ingress = resolved_ingress().await;
-        let started = std::time::Instant::now();
         let request_id = context.request_id;
-        let reader =
+        let mut reader =
             tokio::spawn(
                 async move { store.read_selection(&ingress, request_id, "fixture").await },
             );
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'SELECT receipt FROM station_claim_receipts%'")
-                    .fetch_one(&db.pool).await.unwrap();
-                if waiting > 0 { break; }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        }).await.expect("actual receipt SELECT must reach its lock wait before expiry");
+        wait_for_backend(
+            &db.pool,
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'SELECT receipt FROM station_claim_receipts%')",
+            &mut reader,
+        )
+        .await;
         assert!(
             chrono::Utc::now() < expires,
             "must observe granted read before expiry"
@@ -2467,8 +3998,11 @@ mod tests {
         }
         blocker.rollback().await.unwrap();
         let result = reader.await.unwrap();
+        // Read expiry, not the ingress deadline, must be what refused: named
+        // by the refusal itself rather than a five-second wall bound
+        // (f10419f9).
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            !matches!(result, Err(JobsError::SelectionConflict(ref reason)) if reason.contains("deadline")),
             "exercise read expiry, not ingress timeout"
         );
         assert!(
@@ -2482,6 +4016,7 @@ mod tests {
         inner: crate::PgStations,
         slow: bool,
         entered: Arc<tokio::sync::Notify>,
+        entered_count: Arc<std::sync::atomic::AtomicUsize>,
     }
     #[async_trait::async_trait]
     impl crate::stations::StationRegistry for SlowNativeStations {
@@ -2490,6 +4025,8 @@ mod tests {
             name: &str,
         ) -> Result<crate::stations::StationSpec, crate::stations::StationError> {
             if self.slow {
+                self.entered_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.entered.notify_one();
                 tokio::time::sleep(std::time::Duration::from_secs(6)).await;
             }
@@ -2559,6 +4096,17 @@ mod tests {
         native_http_control(true, true, false, false).await;
     }
     #[tokio::test]
+    async fn native_http_retry_ignores_a_previous_attempts_stored_port_permit() {
+        native_http_control_with_pause_delay(
+            true,
+            true,
+            false,
+            false,
+            NativeHttpAdversity::StaleAttemptSignal,
+        )
+        .await;
+    }
+    #[tokio::test]
     async fn native_http_slow_read_keeps_its_ingress_cut_after_observer_descheduling() {
         native_http_control_with_pause_delay(
             true,
@@ -2566,6 +4114,26 @@ mod tests {
             false,
             false,
             NativeHttpAdversity::ObserverPause(std::time::Duration::from_millis(900)),
+        )
+        .await;
+    }
+    /// The standing control for f10419f9: the first request meets a
+    /// preparation slower than the whole budget and is refused before the
+    /// port, the second meets 3.5 s — more than the three seconds the old
+    /// two-second fixture wait left — and must still be cut at its own
+    /// original boundary.
+    #[tokio::test]
+    async fn native_http_slow_read_keeps_its_ingress_cut_when_preparation_is_contended() {
+        native_http_control_with_pause_delay(
+            true,
+            true,
+            false,
+            false,
+            NativeHttpAdversity::PreparationContention(vec![
+                crate::station_claim::SELECTION_PRE_COMMIT_BUDGET
+                    + std::time::Duration::from_secs(1),
+                std::time::Duration::from_millis(3500),
+            ]),
         )
         .await;
     }
@@ -2602,10 +4170,27 @@ mod tests {
     }
     enum NativeHttpAdversity {
         None,
+        StaleAttemptSignal,
         ObserverPause(std::time::Duration),
         FixturePreparation(std::time::Duration),
         BudgetInputWait,
+        /// Extra waits, one per authenticated request in order, spent
+        /// after ingress and before the handler — where a contended
+        /// gate PostgreSQL spends them.
+        PreparationContention(Vec<std::time::Duration>),
     }
+    /// The real wait the slow-port fixture puts between ingress and the
+    /// handler, so a port handed a fresh budget would be cut at least
+    /// this much after the original boundary. It was two seconds until
+    /// 2026-10-22, judged against a 5.8 s wall bound; a loaded gate's
+    /// PostgreSQL then spent the other three before the port was reached,
+    /// on cars that never touched this file (gate 38307649, f10419f9).
+    /// The cut is now judged against the exact boundary on a paused
+    /// clock, where a quarter second discriminates as well as two did.
+    const PRE_PORT_GAP: std::time::Duration = std::time::Duration::from_millis(250);
+    /// Requests the slow-port fixture sends before it names a preparation
+    /// that never reached the port. Each refused one is judged in full.
+    const PORT_ATTEMPTS: usize = 3;
     async fn native_http_control(
         external_allow: bool,
         slow_station: bool,
@@ -2678,52 +4263,125 @@ mod tests {
         } else {
             builder.build()
         });
-        let slow_station_entered = Arc::new(tokio::sync::Notify::new());
-        let station_registry: Arc<dyn crate::stations::StationRegistry> =
-            Arc::new(SlowNativeStations {
-                inner: crate::PgStations::new(db.pool.clone()),
-                slow: slow_station,
-                entered: slow_station_entered.clone(),
-            });
-        let app = crate::http::router(crate::http::JobsApiState {
-            stations: Some(station_registry),
-            kind_registry: Some(Arc::new(crate::PgWorkflows::new(db.pool.clone()))),
-            agent_budget: Some(Arc::new(crate::agent_budget::BudgetDoor {
-                agents: Arc::new(crate::agents::PgAgents::new(db.pool.clone())),
-                runs: Arc::new(crate::agent_runs::PgAgentRuns::new(db.pool.clone())),
-            })),
-            ..crate::http::JobsApiState::minimal(
-                Arc::new(repo),
-                bus,
-                DomainPublisher::new(bus_dyn, "jobs"),
-                policy,
-                Arc::new(boss_clock_client::WallClockClient),
-            )
-        });
-        let dir = boss_testing::scratch_dir("native-http-selection-ingress");
-        let app = if slow_station {
-            // Make an actual earlier preparation wait visible: the slow port
-            // must inherit ingress's remaining budget, not receive five more.
-            app.layer(axum::middleware::from_fn(
-                |request: axum::extract::Request, next: axum::middleware::Next| async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    next.run(request).await
-                },
-            ))
-        } else {
-            app
-        };
-        boss_testing::write_file(&dir.join("forge.current"), "native-http-fixture-key");
-        let app = crate::runner_credential::mount(app, dir);
-        let gate = Arc::new(boss_core::machine_gate::MachineGate::new(
-            "jobs",
-            &[],
-            boss_core::machine_gate::Reading::new(
-                boss_core::machine_gate::Mode::Off,
-                Default::default(),
-            ),
+        // Exercise the constructor used by the serving binary, rather than
+        // enabling native selection only in a test-specific composition.
+        let repo = Arc::new(crate::PgJobs::with_urls(
+            db.pool.clone(),
+            "postgres://fixture-only".into(),
+            "nats://fixture-only".into(),
         ));
-        let app = boss_core::machine_gate::gated(app, gate);
+        let dir = boss_testing::scratch_dir("native-http-selection-ingress");
+        boss_testing::write_file(&dir.join("forge.current"), "native-http-fixture-key");
+        let admitted = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+        let contention = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+            match &adversity {
+                NativeHttpAdversity::PreparationContention(waits) => waits.clone(),
+                _ => Vec::new(),
+            },
+        )));
+        // Business inputs are shared; a notification or ingress observation
+        // belongs to exactly one actual HTTP attempt (e8219e1d).
+        let make_app = |slow_station_entered: Arc<tokio::sync::Notify>,
+                        ingress_started: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+                        entered_count: Arc<std::sync::atomic::AtomicUsize>| {
+            let station_registry: Arc<dyn crate::stations::StationRegistry> =
+                Arc::new(SlowNativeStations {
+                    inner: crate::PgStations::new(db.pool.clone()),
+                    slow: slow_station,
+                    entered: slow_station_entered.clone(),
+                    entered_count: entered_count.clone(),
+                });
+            let app = crate::http::router(crate::http::JobsApiState {
+                stations: Some(station_registry),
+                kind_registry: Some(Arc::new(crate::PgWorkflows::new(db.pool.clone()))),
+                agent_budget: Some(Arc::new(crate::agent_budget::BudgetDoor {
+                    agents: Arc::new(crate::agents::PgAgents::new(db.pool.clone())),
+                    runs: Arc::new(crate::agent_runs::PgAgentRuns::new(db.pool.clone())),
+                })),
+                ..crate::http::JobsApiState::minimal(
+                    repo.clone(),
+                    bus.clone(),
+                    DomainPublisher::new(bus_dyn.clone(), "jobs"),
+                    policy.clone(),
+                    Arc::new(boss_clock_client::WallClockClient),
+                )
+            });
+            // The original ingress instant, as the authenticated request carried
+            // it past the credential door: the boundary the slow port is judged
+            // against, read rather than estimated from the observer's own clock.
+            let app = if slow_station {
+                let observed = ingress_started.clone();
+                let contention = contention.clone();
+                // Make an actual earlier preparation wait visible: the slow port
+                // must inherit ingress's remaining budget, not receive five more.
+                app.layer(axum::middleware::from_fn(
+                    move |request: axum::extract::Request, next: axum::middleware::Next| {
+                        let observed = observed.clone();
+                        let contention = contention.clone();
+                        async move {
+                            let started = request
+                                .extensions()
+                                .get::<crate::station_claim::AuthenticatedSelectionIngress>()
+                                .map(crate::station_claim::AuthenticatedSelectionIngress::started);
+                            if started.is_some() {
+                                *observed.lock().unwrap() = started;
+                                let contended = contention.lock().unwrap().pop_front();
+                                tokio::time::sleep(PRE_PORT_GAP + contended.unwrap_or_default())
+                                    .await;
+                            }
+                            next.run(request).await
+                        }
+                    },
+                ))
+            } else {
+                app
+            };
+            // A control that judges the ANSWER runs under the test's budget, set
+            // on the very ingress the credential door admitted; the two whose
+            // subject is the deadline keep production's (f10419f9). The origin
+            // is recorded so a "does not spend" control proves it causally.
+            let app = if slow_station || matches!(adversity, NativeHttpAdversity::BudgetInputWait) {
+                app
+            } else {
+                let admitted = admitted.clone();
+                app.layer(axum::middleware::from_fn(
+                    move |mut request: axum::extract::Request, next: axum::middleware::Next| {
+                        let admitted = admitted.clone();
+                        async move {
+                            if let Some(ingress) =
+                                request
+                                    .extensions_mut()
+                                    .remove::<crate::station_claim::AuthenticatedSelectionIngress>()
+                            {
+                                *admitted.lock().unwrap() = Some(ingress.started());
+                                request
+                                    .extensions_mut()
+                                    .insert(ingress.with_budget(ANSWER_BUDGET));
+                            }
+                            next.run(request).await
+                        }
+                    },
+                ))
+            };
+            let app = crate::runner_credential::mount(app, dir.clone());
+            let gate = Arc::new(boss_core::machine_gate::MachineGate::new(
+                "jobs",
+                &[],
+                boss_core::machine_gate::Reading::new(
+                    boss_core::machine_gate::Mode::Off,
+                    Default::default(),
+                ),
+            ));
+            boss_core::machine_gate::gated(app, gate)
+        };
+        let slow_station_entered = Arc::new(tokio::sync::Notify::new());
+        let ingress_started = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+        let entered_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = make_app(
+            slow_station_entered.clone(),
+            ingress_started.clone(),
+            entered_count.clone(),
+        );
         let asserted = context.native_authority.as_ref().unwrap().user.clone();
         for credential in [None, Some("foreign-http-fixture-key")] {
             let request_id = uuid::Uuid::new_v4();
@@ -2767,9 +4425,12 @@ mod tests {
             );
         }
         let user = boss_policy_client::User::service("forged-header-owner");
-        if let NativeHttpAdversity::FixturePreparation(delay) = adversity {
+        let preparation_ended = if let NativeHttpAdversity::FixturePreparation(delay) = adversity {
             tokio::time::sleep(delay).await;
-        }
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let mut budget_blocker = if matches!(adversity, NativeHttpAdversity::BudgetInputWait) {
             let mut tx = db.pool.begin().await.unwrap();
             sqlx::query("LOCK TABLE agent_runs IN ACCESS EXCLUSIVE MODE")
@@ -2780,50 +4441,117 @@ mod tests {
         } else {
             None
         };
+        let claim = |app: axum::Router| {
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/stations/fixture/claim-next")
+                    .header(crate::runner_credential::HEADER, "native-http-fixture-key")
+                    .header("x-boss-user", serde_json::to_string(&user).unwrap())
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"request_id": context.request_id}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+        };
         let began = tokio::time::Instant::now();
-        let request = app.clone().oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/api/stations/fixture/claim-next")
-                .header(crate::runner_credential::HEADER, "native-http-fixture-key")
-                .header("x-boss-user", serde_json::to_string(&user).unwrap())
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::json!({"request_id": context.request_id}).to_string(),
-                ))
-                .unwrap(),
-        );
-        tokio::pin!(request);
+        if matches!(adversity, NativeHttpAdversity::StaleAttemptSignal) {
+            // Reproduce a prior request finishing before its observer sees
+            // the slow-port notification: its permit and ingress survive.
+            slow_station_entered.notify_one();
+            *ingress_started.lock().unwrap() = Some(std::time::Instant::now());
+        }
         let response = if slow_station {
-            tokio::select! {
-                result = &mut request => panic!(
-                    "native HTTP fixture ended before its slow port was exercised: {}",
-                    result.unwrap().status()
-                ),
-                () = slow_station_entered.notified() => {}
-            }
-            // Preparation has already spent real ingress time. Advancing
-            // another five seconds would test a freshly restarted budget.
+            // The production budget may run out before the slow port is
+            // reached: a contended gate PostgreSQL spent all of it there on
+            // gate 38307649 (f10419f9). That refusal is the contract, so it is
+            // judged in full; but only a request that reaches the port can
+            // judge the cut, so the fixture asks again rather than read the
+            // scheduler's delay as the port's defect.
+            let mut starved = Vec::new();
+            let (mut request, attempt_ingress, attempt_entries) = loop {
+                let attempt_entered = Arc::new(tokio::sync::Notify::new());
+                let attempt_ingress = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+                let attempt_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let attempt_app = make_app(
+                    attempt_entered.clone(),
+                    attempt_ingress.clone(),
+                    attempt_entries.clone(),
+                );
+                let sent = tokio::time::Instant::now();
+                let mut request = Box::pin(claim(attempt_app));
+                tokio::select! {
+                    result = &mut request => {
+                        let response = result.unwrap();
+                        let status = response.status();
+                        let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+                        let body = String::from_utf8_lossy(&body).into_owned();
+                        assert!(
+                            status == axum::http::StatusCode::CONFLICT && body.contains("deadline"),
+                            "native HTTP fixture ended before its slow port was exercised, and not on its ingress deadline: {status}: {body}"
+                        );
+                        let repo = crate::PgJobs::new(db.pool.clone());
+                        assert_eq!(
+                            repo.get_step(&context.validated_step.id).await.unwrap().unwrap(),
+                            context.validated_step
+                        );
+                        assert!(repo.station_claim_receipt(context.request_id).await.unwrap().is_none());
+                        starved.push(sent.elapsed());
+                        assert!(
+                            starved.len() < PORT_ATTEMPTS,
+                            "every request spent its whole ingress budget before the slow port: {starved:?}"
+                        );
+                    },
+                    () = attempt_entered.notified() => break (request, attempt_ingress, attempt_entries),
+                }
+            };
+            assert!(
+                attempt_entries.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                "a previous attempt notification must not stand in for this request reaching its slow port"
+            );
             if let NativeHttpAdversity::ObserverPause(delay) = adversity {
                 std::thread::sleep(delay);
             }
+            // Freeze the observer, then read how far the boundary is: a host
+            // deschedule before the pause (the variant above) is real ingress
+            // time already spent and must not be counted a second time.
             tokio::time::pause();
-            // Freeze the observer first: a host deschedule between reading
-            // remaining and pausing must not be counted a second time when
-            // the virtual clock advances to the original ingress boundary.
-            let remaining =
-                crate::station_claim::SELECTION_PRE_COMMIT_BUDGET.saturating_sub(began.elapsed());
-            tokio::time::advance(remaining).await;
-            request.await.unwrap()
+            let started = attempt_ingress
+                .lock()
+                .unwrap()
+                .expect("the authenticated request crossed the fixture's observer");
+            let boundary = tokio::time::Instant::from_std(started)
+                + crate::station_claim::SELECTION_PRE_COMMIT_BUDGET;
+            // tokio's timer wheel rounds a deadline up to its next
+            // millisecond, so 2 ms past the boundary the original cut has
+            // fired; a port handed a fresh budget is cut PRE_PORT_GAP later
+            // at the earliest, and is still running here.
+            tokio::time::advance(
+                boundary.saturating_duration_since(tokio::time::Instant::now())
+                    + std::time::Duration::from_millis(2),
+            )
+            .await;
+            tokio::select! {
+                biased;
+                result = &mut request => result.unwrap(),
+                () = std::future::ready(()) => panic!(
+                    "the slow port read was still running 2 ms after the original ingress boundary: it was given a budget of its own"
+                ),
+            }
         } else if budget_blocker.is_some() {
+            let request = claim(app.clone());
+            tokio::pin!(request);
             // Both the real HTTP request and PostgreSQL must be running;
             // observing a pending task alone does not establish its SQL wait.
             loop {
                 tokio::select! {
-                    result = &mut request => panic!(
-                        "native budget request ended before its SQL wait: {}",
-                        result.unwrap().status()
-                    ),
+                    result = &mut request => {
+                        let response = result.unwrap();
+                        let status = response.status();
+                        let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+                        panic!("native budget request ended before its SQL wait: {status}: {}", String::from_utf8_lossy(&body));
+                    },
                     waiting = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database()) AND relation = 'agent_runs'::regclass AND NOT granted)").fetch_one(&db.pool) => {
                         if waiting.unwrap() { break; }
                     }
@@ -2832,21 +4560,15 @@ mod tests {
             }
             request.await.unwrap()
         } else {
-            request.await.unwrap()
+            claim(app.clone()).await.unwrap()
         };
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 65536)
             .await
             .unwrap();
         if slow_station || budget_blocker.is_some() {
-            let elapsed = began.elapsed();
             if slow_station {
                 tokio::time::resume();
-                assert!(
-                    elapsed < std::time::Duration::from_millis(5800),
-                    "native preparation must cancel its real port read within original five seconds, elapsed {:?}",
-                    elapsed
-                );
             }
             if let Some(blocker) = budget_blocker.take() {
                 blocker.rollback().await.unwrap();
@@ -2876,6 +4598,16 @@ mod tests {
             began.elapsed(),
             String::from_utf8_lossy(&body)
         );
+        if let Some(preparation_ended) = preparation_ended {
+            let admitted = admitted
+                .lock()
+                .unwrap()
+                .expect("the credential door admitted an ingress");
+            assert!(
+                admitted >= preparation_ended,
+                "the request budget must begin after the fixture wait, not inside it"
+            );
+        }
         if with_budget {
             let receipt: serde_json::Value = serde_json::from_slice(&body).unwrap();
             let reading = receipt
@@ -2956,6 +4688,57 @@ mod tests {
                 "unsigned asserted actor must not read an authentic original receipt"
             );
         }
+        let empty_request = uuid::Uuid::new_v4();
+        let receipts_before: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM station_claim_receipts")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let facts_before: i64 = sqlx::query_scalar("SELECT count(*) FROM event_outbox")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let empty = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/stations/fixture/claim-next")
+                    .header(crate::runner_credential::HEADER, "native-http-fixture-key")
+                    .header("x-boss-user", serde_json::to_string(&user).unwrap())
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"request_id":empty_request}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            empty.status(),
+            axum::http::StatusCode::NO_CONTENT,
+            "the serving constructor must preserve empty-station 204 after its only ready step was claimed"
+        );
+        assert!(
+            repo.station_claim_receipt(empty_request)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM station_claim_receipts")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+            receipts_before
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM event_outbox")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+            facts_before
+        );
         let policy = boss_policy_client::postgres::PgPolicy::new(db.pool.clone());
         policy
             .deactivate_rule(
@@ -3447,7 +5230,7 @@ mod tests {
             .execute(&mut *barrier)
             .await
             .unwrap();
-        let claim = tokio::spawn(async move {
+        let mut claim = tokio::spawn(async move {
             repo.claim_station_head_at(
                 &context,
                 crate::runner_credential::ACTOR,
@@ -3460,13 +5243,12 @@ mod tests {
             )
             .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event = 'advisory' AND query LIKE 'INSERT INTO station_claim_receipts%')").fetch_one(&db.pool).await.unwrap();
-                if waiting { break; }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        }).await.unwrap();
+        wait_for_backend(
+            &db.pool,
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event = 'advisory' AND query LIKE 'INSERT INTO station_claim_receipts%')",
+            &mut claim,
+        )
+        .await;
         let calendar = boss_calendar::PgCalendar::new(db.pool.clone());
         let writer_stamp = boss_core::publisher::EventStamp::new(
             "calendar",
@@ -3513,6 +5295,8 @@ mod tests {
                     role: "platform-admin".into(),
                     description: "native authority owning fixture".into(),
                     signs_for: None,
+                    access_tier: None,
+                    station: None,
                 }],
                 &stamp,
             )
@@ -3564,12 +5348,13 @@ mod tests {
             station: crate::stations::StationSpec::draft(
                 "fixture",
                 "Fixture",
-                crate::stations::StationKind::Batch,
+                crate::stations::StationKind::Group,
                 Default::default(),
                 stamp.timestamp,
             ),
             scope: crate::port::JobScope::All,
             active_workflows: Default::default(),
+            tree_selection: None,
             validated_job: job,
             validated_step: step,
         };
@@ -3584,7 +5369,7 @@ mod tests {
             .await
             .unwrap()
         {
-            NativeSelectionAcquisition::Fresh(tx) => tx,
+            NativeSelectionAcquisition::Fresh(tx, _) => tx,
             NativeSelectionAcquisition::Replayed(_) => panic!("fixture has no original receipt"),
         };
         let consumed = store
@@ -3696,13 +5481,19 @@ mod tests {
             .unwrap();
         let foreign_db = boss_testing::TestDb::new().await;
         let unavailable = NativeSelectionStore::new(foreign_db.pool.clone());
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            store.acquire_selection_for(&unavailable, request_id, "emp-worker", "fixture"),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        // No one-second clock around it, and the test's own budget
+        // (f10419f9): a replay that waited on the locked owners would end at
+        // that deadline as an error, and the unwrap below names it.
+        let result = store
+            .acquire_selection_before(
+                &unavailable,
+                request_id,
+                "emp-worker",
+                "fixture",
+                deadline_with(ANSWER_BUDGET),
+            )
+            .await
+            .unwrap();
         let NativeSelectionAcquisition::Replayed(receipt) = result else {
             panic!("original receipt must precede new owner acquisition")
         };
@@ -3729,25 +5520,28 @@ mod tests {
             .connect_with((*db.pool.connect_options()).clone())
             .await
             .unwrap();
+        // This is the test that the PRODUCTION deadline fires, so it runs
+        // under `SELECTION_PRE_COMMIT_BUDGET` (`at_ingress`). The one
+        // connection stays held until the request ends, so the request can
+        // end only by that deadline — a pool wait outside it would end at
+        // the 30 s acquire timeout as a Storage error. Judged by which, and
+        // by a lower bound load cannot violate, rather than an upper bound
+        // the gate's scheduler stretched (f10419f9).
         let held = pool.acquire().await.unwrap();
-        let release = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-            drop(held);
-        });
         let store = NativeSelectionStore::new(pool);
         let started = std::time::Instant::now();
         let result = store
             .acquire_selection_for(&store, uuid::Uuid::new_v4(), "emp-worker", "fixture")
             .await;
         let elapsed = started.elapsed();
-        release.await.unwrap();
+        drop(held);
         assert!(
-            result.is_err(),
-            "an expired pool wait must never dispatch selection work"
+            matches!(result, Err(JobsError::SelectionConflict(ref reason)) if reason.contains("deadline")),
+            "an expired pool wait must refuse at the selection deadline and never dispatch selection work"
         );
         assert!(
-            elapsed < std::time::Duration::from_millis(5500),
-            "pool waiting is inside the total deadline: {elapsed:?}"
+            elapsed >= crate::station_claim::SELECTION_PRE_COMMIT_BUDGET,
+            "the production budget must be spent before the refusal: {elapsed:?}"
         );
     }
     #[tokio::test]
@@ -3804,6 +5598,8 @@ mod tests {
             role: "platform-admin".into(),
             description: "owning native selector control".into(),
             signs_for: None,
+            access_tier: None,
+            station: None,
         };
         let writer_registry = registry.clone();
         let mut writer = tokio::spawn(async move {
@@ -3829,14 +5625,16 @@ mod tests {
     #[tokio::test]
     async fn owning_agent_reads_refresh_the_budget_after_their_real_wait() {
         let db = boss_testing::TestDb::new().await;
-        let deadline = SelectionDeadline::at_ingress();
+        // Budget arithmetic: the bound below is what remained at release,
+        // which holds for any length, so the test states its own (f10419f9).
+        let deadline = deadline_with(ANSWER_BUDGET);
         let mut blocker = db.pool.begin().await.unwrap();
         sqlx::query("LOCK TABLE agents IN ACCESS EXCLUSIVE MODE")
             .execute(&mut *blocker)
             .await
             .unwrap();
         let pool = db.pool.clone();
-        let reading = tokio::spawn(async move {
+        let mut reading = tokio::spawn(async move {
             let mut tx = pool.begin().await.unwrap();
             deadline.constrain_sql(&mut tx).await.unwrap();
             crate::agents::PgAgents::selection_rows_budgeted_in(
@@ -3852,14 +5650,7 @@ mod tests {
             tx.rollback().await.unwrap();
             configured_ms
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database()) AND relation = 'agents'::regclass AND NOT granted)")
-                    .fetch_one(&db.pool).await.unwrap();
-                if waiting { break; }
-                tokio::task::yield_now().await;
-            }
-        }).await.unwrap();
+        wait_for_actual_writer(&db.pool, "agents", &mut reading).await;
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         // The blocked owner cannot refresh until this lock is released. Sample
         // that causal upper bound, not a later observer's scheduling instant.
@@ -3889,7 +5680,9 @@ mod tests {
             .unwrap();
         // Installing the test's blocker is fixture setup, before admission.
         // The target's real owner wait still consumes its original budget.
-        let deadline = SelectionDeadline::at_ingress();
+        // Its length is the test's: the bound is what remained at release,
+        // and the acquisition must succeed after it (f10419f9).
+        let deadline = deadline_with(ANSWER_BUDGET);
         let acquiring_store = store.clone();
         let mut acquiring = tokio::spawn(async move {
             tokio::time::sleep(arrival_delay).await;
@@ -3908,7 +5701,7 @@ mod tests {
         let release_budget_ms = deadline.remaining().unwrap().as_millis() as i64;
         blocker.rollback().await.unwrap();
         let mut tx = match acquiring.await.unwrap().unwrap() {
-            NativeSelectionAcquisition::Fresh(tx) => tx,
+            NativeSelectionAcquisition::Fresh(tx, _) => tx,
             NativeSelectionAcquisition::Replayed(_) => panic!("no original receipt"),
         };
         // Deliberately exercise a descheduled observer after the owner refreshed.
@@ -4090,14 +5883,17 @@ mod tests {
             boss_core::actor::ActorId::automation("native-owner-control"),
         );
         let input = AgentInput {
+            factory_rotation: Some(true),
             id: "agent-native-fence".into(),
             display_name: "Original".into(),
             default_model: "opus-5[1m]".into(),
+            model_class: None,
             aliases: vec!["native-fence@example.test".into()],
             role: None,
             department: None,
             hourly_budget_usd_micros: Some(10),
             max_concurrent_runs: Some(1),
+            stations: None,
         };
         registry
             .publish(std::slice::from_ref(&input), PublishMode::Take, &stamp)
@@ -4120,6 +5916,7 @@ mod tests {
         );
         assert_eq!(observed.max_concurrent_runs, input.max_concurrent_runs);
         let changed = AgentInput {
+            factory_rotation: Some(true),
             display_name: "Changed".into(),
             max_concurrent_runs: Some(2),
             ..input.clone()
@@ -4232,7 +6029,7 @@ mod tests {
                     StationSpec::draft(
                         "native-station-control",
                         "Native station",
-                        StationKind::Batch,
+                        StationKind::Group,
                         crate::station_queue::StationPredicate::default(),
                         chrono::Utc::now(),
                     ),

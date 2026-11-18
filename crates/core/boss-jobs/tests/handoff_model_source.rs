@@ -1,4 +1,4 @@
-//! v2 content-address inputs are immutable model data, not an editable test harness.
+//! v2 and v3 content-address inputs are immutable model data, not an editable test harness.
 const CANONICAL: &str = include_str!("../src/moves/dispatch.rs");
 const LIVE: &str = include_str!("../src/moves/dispatch_live.rs");
 const BOUNDARY: &str = "\n#[cfg(test)]\nmod tests {\n";
@@ -40,8 +40,14 @@ fn production_changes_and_missing_or_ambiguous_boundaries_refuse() {
     assert!(same_production(CANONICAL, &appended).is_err());
 }
 
+/// The identifier ADVANCED, deliberately, once: v2 read a pinned version as
+/// unavailable only when it was a `Draft`, so a rejected one passed (backlog
+/// f9cbf891); v3 reads `was_published()`. `dispatch.rs` is byte-identical
+/// under both, and v2's identifier is kept where its receipts are replayed
+/// whole (`move_admission_observation_http.rs`). The next production change
+/// to any hashed input is v4, never an edit of this string.
 #[test]
-fn test_only_changes_preserve_production_and_the_original_v2_identifier() {
+fn test_only_changes_preserve_production_and_the_v3_identifier() {
     let tests = include_str!("../src/moves/dispatch_tests.rs");
     let changed = tests.replacen(
         "internal_protocols: None,",
@@ -52,6 +58,6 @@ fn test_only_changes_preserve_production_and_the_original_v2_identifier() {
     same_production(CANONICAL, LIVE).unwrap();
     assert_eq!(
         boss_jobs::move_diagnosis::model(),
-        "registered-agent-handoff-v2:da0c4a6ddef6fa9120bf8bc663c5d37bb13c1437d2106425d7cb28848a2c5bdf"
+        "registered-agent-handoff-v3:f37435b887121bfea4806304d68f2f7e0817fd288a13f2338622dc3a0d7183a6"
     );
 }

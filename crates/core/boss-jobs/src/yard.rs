@@ -605,7 +605,7 @@ pub(crate) fn red_trains_count(stamp: Option<&Value>) -> u32 {
 /// the ship-a-change and its stamp is when the car parked. One list
 /// holding both would carry two meanings under one name — the drift §9a
 /// exists to stop, in its worst form. What they genuinely share is the
-/// MARKER reading, and that is shared: [`crate::stranded::hold_reason`].
+/// MARKER reading, and that is shared: [`crate::stranded::marked`].
 ///
 /// It is a [`DockCar`] plus its reason, flattened, so the wire shape is
 /// a dock row and a surface draws it with the fields it already draws
@@ -633,6 +633,55 @@ pub struct HeldCar {
     /// and on a payload from an older server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release: Option<crate::car_release::Decision>,
+    /// The release rule's own record of why it LEFT this car held — the
+    /// door's refusal as the door said it, written once on the review
+    /// step as [`crate::car::AUTO_RELEASE`] (backlog 60993cda). A held
+    /// car the rule tried and failed to release looked the same as one
+    /// nobody tried; "a troubled packet must look troubled". `None` when
+    /// the rule never refused this car, and on an older payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_release: Option<AutoRelease>,
+}
+
+/// The release rule's refusal record on a held car's review step
+/// (`{review, outcome, why, by, at}`, written by the dispatcher's
+/// `jobs.release_on_review`), as the yard's row carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoRelease {
+    /// The reviewer's run the rule asked about.
+    pub review: Option<String>,
+    /// `refused` — the only outcome the rule records.
+    pub outcome: Option<String>,
+    /// Why, in the door's (or the rule's) own words.
+    pub why: String,
+    /// The rule, as `automation:rule:<name>`.
+    pub by: Option<String>,
+    /// When the rule fired.
+    pub at: Option<String>,
+}
+
+/// The [`AutoRelease`] record on these steps' review step, when there is
+/// one. A record not in the rule's shape is still SHOWN, never dropped:
+/// its whole text becomes the `why`, so an unreadable note reads as one.
+pub fn car_auto_release(steps: &[Step]) -> Option<AutoRelease> {
+    let rec = find_step(steps, &REVIEW)?
+        .metadata
+        .get(crate::car::AUTO_RELEASE)
+        .filter(|v| !v.is_null())?;
+    let text = |k: &str| {
+        rec.get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Some(AutoRelease {
+        review: text("review"),
+        outcome: text("outcome"),
+        why: text("why").unwrap_or_else(|| format!("an unreadable release-rule record: {rec}")),
+        by: text("by"),
+        at: text("at"),
+    })
 }
 
 /// The two brakes that hold a car on the dock ([`dock_lanes`]).
@@ -658,7 +707,7 @@ impl CarHoldKind {
 
 /// The dock brake on a car: the `hold` marker on its REVIEW step, read
 /// through the one definition of what a marker is
-/// ([`crate::stranded::hold_reason`] — `null`, `false` and `""` are NO
+/// ([`crate::stranded::marked`] — `null`, `false` and `""` are NO
 /// marker, `true` is a marker with no reason, a non-blank string is the
 /// reason).
 ///
@@ -666,7 +715,7 @@ impl CarHoldKind {
 /// an annotation about that step, and a lane that froze a car over one
 /// would turn any note into a brake.
 pub fn car_hold_reason(steps: &[Step]) -> Option<String> {
-    crate::stranded::hold_reason(&find_step(steps, &REVIEW)?.metadata)
+    crate::stranded::marked(&find_step(steps, &REVIEW)?.metadata, "hold")
 }
 
 /// These steps with the `hold` marker taken off every one of them — the
@@ -749,6 +798,7 @@ pub fn dock_lanes(dock_cars: &[(Job, Vec<Step>)]) -> (Vec<DockCar>, Vec<HeldCar>
                 reason,
                 kind,
                 release: None,
+                auto_release: car_auto_release(steps),
             }),
             None => parked.push(dock_car(job)),
         }
@@ -2119,6 +2169,10 @@ fn failing_checks(receipt: &Value) -> Option<Vec<String>> {
 /// has the whole excerpt.
 const FAILED_LINE_CHARS: usize = 200;
 
+// Kept equal to the inline runner's RE_ERROR by the test below: the
+// runner is delivered as one ConfigMap file, so it cannot import Rust.
+const ERROR_LINE_PATTERN: &str = r"^\s*(error(\[E\d{4}\])?|Error|ERROR)[: ]";
+
 /// WHY the red gate-run failed, in one line: the first line of the
 /// failed check's `fails_excerpt` that reads as the failure. Since #372
 /// (backlog 5708cbd5) the receipt carries `fails_excerpt: {check: text}`
@@ -2131,7 +2185,8 @@ const FAILED_LINE_CHARS: usize = 200;
 /// matches the head of the car's `failed_check`; a receipt naming no
 /// checks reads the first excerpt in key order. Within it, the line is
 /// the first that MARKS the failure, the markers tried in the order
-/// `panicked at`, `assertion`, `error:`, `FAILED` — the runner's own
+/// `panicked at`, `assertion`, error (including `error[E0308]:`),
+/// `FAILED` — causes before cargo summaries, like the runner's own
 /// extractor's, ranked — so a test excerpt yields its panic line, not
 /// its `---- stdout ----` header and not the `test … FAILED` roll-call
 /// the runner's 40 lines of context can carry above it, and a clippy
@@ -2150,9 +2205,19 @@ fn failed_line(steps: &[Step]) -> Option<String> {
         .find_map(|check| excerpts.get(check).and_then(Value::as_str))
         .or_else(|| excerpts.values().find_map(Value::as_str))?;
     let lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
-    let marked = ["panicked at", "assertion", "error:", "FAILED"]
+    let error = regex::Regex::new(ERROR_LINE_PATTERN).ok()?;
+    let marked = ["panicked at", "assertion"]
         .iter()
-        .find_map(|m| lines.clone().find(|l| l.contains(m)));
+        .find_map(|m| lines.clone().find(|l| l.contains(m)))
+        .or_else(|| {
+            lines.clone().find(|l| {
+                error.is_match(l)
+                    && !l.starts_with("error: could not compile")
+                    && !l.starts_with("error: aborting due to")
+            })
+        })
+        .or_else(|| lines.clone().find(|l| error.is_match(l)))
+        .or_else(|| lines.clone().find(|l| l.contains("FAILED")));
     let line = marked.or_else(|| lines.clone().find(|l| !l.starts_with("... (")))?;
     let mut bounded: String = line.chars().take(FAILED_LINE_CHARS).collect();
     if line.chars().count() > FAILED_LINE_CHARS {
@@ -2168,11 +2233,15 @@ fn failed_line(steps: &[Step]) -> Option<String> {
 pub struct ActiveGate {
     pub branch: String,
     pub packet_id: String,
-    /// When the gate-run opened: the `opened_at` instant `boss gate`
-    /// stamps (RFC3339) when the packet carries one, else the row's
-    /// `opened_on` date (see [`opened_since`]). A string either way — a
-    /// reader that parses an instant gets the elapsed time a gate bay
-    /// needs; one that only knew the date keeps reading.
+    /// When the run began occupying its bay: its [`LAUNCHED_AT`] stamp
+    /// (its Job was created), else — a run with no launch stamp, filed
+    /// and started in one act — the `opened_at` instant `boss gate`
+    /// stamps (RFC3339), else the row's `opened_on` date (see
+    /// [`opened_since`]). A string either way — a reader that parses an
+    /// instant gets the elapsed time a gate bay needs; one that only knew
+    /// the date keeps reading. Never the filing of a run that waited in
+    /// line: on 2026-10-17 a bay read "since 16:37" for a gate launched
+    /// after 19:40 (backlog e6e72ee7); its wait is [`Self::queued_seconds`].
     pub since: String,
     /// True when this run has been "active" longer than a gate Job can
     /// physically live: it is not gating, it is a corpse holding a slot.
@@ -2457,9 +2526,17 @@ fn queued_gates(
             }
         })
         .collect();
+    // ONE LINE ACROSS BOTH OWNERS (backlog b56bfc29): by the instant
+    // each place was taken — a legacy `queued_at`, a resident's original
+    // acceptance — as the supervisor and a legacy waiter now both count
+    // it, and never every legacy place first. Compared as instants, not
+    // strings: the two owners write different fractional precisions. A
+    // resident whose acceptance cannot be read has no instant and goes
+    // last, unnumbered (`unknown_order` below).
     waiting.sort_by(|a, b| {
-        a.3.cmp(&b.3)
-            .then_with(|| a.0.cmp(&b.0))
+        let (ta, tb) = (parse_instant(&a.0), parse_instant(&b.0));
+        (ta.is_none(), ta)
+            .cmp(&(tb.is_none(), tb))
             .then_with(|| a.1.cmp(&b.1))
     });
     let unknown_order = waiting
@@ -2581,10 +2658,10 @@ fn opened_since(g: &Job) -> String {
 }
 
 /// The in-flight gates, sized to the policy's capacity. Active gate-runs
-/// (open, no verdict yet) are sorted by `since` then `branch` so slot
-/// assignment is deterministic — the same run lands in the same slot
-/// across polls. (`since` is a whole-second `Z` stamp or a date, so the
-/// string order is the time order.)
+/// (open, no verdict yet) are sorted by `since` — the launch, else the
+/// filing — then `branch` so slot assignment is deterministic — the same
+/// run lands in the same slot across polls. (`since` is an RFC3339 UTC
+/// stamp or a date, so the string order is the time order.)
 pub fn gates(
     gate_runs: &[(Job, Vec<Step>)],
     capacity: i32,
@@ -2627,7 +2704,10 @@ pub fn gates_with_acceptances(
             Some(ActiveGate {
                 branch: branch.to_string(),
                 packet_id: g.id.to_string(),
-                since: opened_since(g),
+                // The bay is occupied from its Job, never from the run's
+                // place in line (backlog e6e72ee7): the wait is
+                // `queued_seconds`, not the bay's age.
+                since: launched.map_or_else(|| opened_since(g), str::to_string),
                 stale: match (dead_before, started) {
                     (Some(cutoff), Some(at)) => at < cutoff,
                     _ => false,
@@ -3002,12 +3082,12 @@ pub struct YardStatus {
     pub sidings: Vec<landing::SidingCar>,
 }
 
-/// How many trains each of the handler's two train reads fetches: every
-/// in-flight train (a handful, bounded by policy) and the recent tail.
-/// Named here, beside `RECENT_LIMIT`, so the test that pins the window
-/// (`a_day_of_arrivals_does_not_push_the_open_train_off_the_board`)
-/// seeds exactly one window of arrivals rather than a second copy of
-/// this number (CLAUDE.md §9a).
+/// How many trains the handler's recent-tail read fetches. The in-flight
+/// read is NOT cut at it: it pages to the total (`list_every`), because
+/// one window of open trains with the total dropped hid the rest
+/// (backlog 5d96c12d). Named here, beside `RECENT_LIMIT`, so the tests
+/// that pin both reads seed exactly one window rather than a second
+/// copy of this number (CLAUDE.md §9a).
 pub const TRAIN_WINDOW: i64 = 60;
 
 /// How many gate-runs the handler's RECENCY read fetches — the slots,
@@ -3020,21 +3100,6 @@ pub const TRAIN_WINDOW: i64 = 60;
 /// last two days, so this window is about half a busy day — which is
 /// why a held green is read by its HOLD, never by its place in here.
 pub const GATE_RUN_WINDOW: i64 = 60;
-
-/// The HELD read's page and how many pages it will turn. Not a recency
-/// window — the filter is the hold itself (`metadata_has = "hold"`) —
-/// and the read follows `total` across pages rather than trusting one,
-/// because the newest page is exactly where a long-held green is NOT.
-/// Measured 2026-09-15: 44 gate-runs carry a `hold`, 43 of them train
-/// gates (128b5496 stamps one on every train's own run), accruing at
-/// the train cadence (~20/day) — so one page holds today's record ten
-/// times over and the cap is ~100 days of train gates away. Past it the
-/// read warns rather than pretends; the durable fix is a hold marker
-/// the train gate does not share, or a filter that can say "not a train
-/// gate". Public for the same reason `GATE_RUN_WINDOW` is: the test
-/// that pins the page turn seeds one page plus one.
-pub const HELD_RUN_PAGE: i64 = 400;
-pub const HELD_RUN_PAGES: i64 = 5;
 
 /// How many recent trains the status carries. Enough to read a trend in
 /// arrivals/cancellations without turning the surface into a history log
@@ -3077,6 +3142,12 @@ pub struct YardInputs<'a> {
     pub board_firings: BoardFirings<'a>,
     /// The active delivery policy, if any.
     pub policy: Option<&'a DeliveryPolicyRow>,
+    /// The `bays` of the active `gates` equipment station — the gate
+    /// capacity, drawn as slots (item 0a78f8f8). `None` when the row
+    /// could not be read: the slots are then the compiled fallback
+    /// [`crate::stations::COMPILED_GATE_BAYS`], the bound a gate obeys
+    /// against a dark registry.
+    pub gate_bays: Option<i32>,
     /// Recent gate-runs with their steps — the stranded/held/garage/limbo
     /// lanes, and the gate slots.
     pub gate_runs: &'a [(Job, Vec<Step>)],
@@ -3147,6 +3218,7 @@ pub fn build_status_for(
         rules,
         board_firings,
         policy,
+        gate_bays,
         gate_runs,
         gate_acceptances,
         car_branches,
@@ -3210,11 +3282,13 @@ pub fn build_status_for(
         .take(RECENT_LIMIT)
         .map(|(j, s)| recent_train(j, s))
         .collect();
-    // Gate capacity is the policy's `gate_max_concurrent` — the number
-    // `boss gate` enforces, drawn as slots here so the two never drift.
-    // No policy → the CLI's own compiled fallback, so the page shows the
-    // same bound a gate would obey with an unreachable registry.
-    let capacity = policy.map_or(COMPILED_GATE_MAX_CONCURRENT, |p| p.gate_max_concurrent);
+    // Gate capacity is the `gates` equipment station's `bays` — the
+    // number `boss gate` enforces, drawn as slots here so the two never
+    // drift (item 0a78f8f8; it was the delivery policy's
+    // `gate_max_concurrent` until that key was dropped). No row → the
+    // one compiled fallback, so the page shows the same bound a gate
+    // would obey with an unreachable registry.
+    let capacity = gate_bays.unwrap_or(crate::stations::COMPILED_GATE_BAYS);
     // The sidings: the open trains (a merged one past its image roll
     // may already have a config car landed), then the recent arrivals
     // the board draws — the same `RECENT_LIMIT` tail `recent` lists, so
@@ -3247,19 +3321,6 @@ pub fn build_status_for(
         sidings,
     }
 }
-
-/// The compiled gate-concurrency fallback, mirrored here for the
-/// no-policy case. It equals `boss-cli`'s `DEFAULT_MAX_CONCURRENT` /
-/// `COMPILED_GATE_MAX_CONCURRENT` (3 since policy v7, backlog 17f6170c,
-/// 2026-10-07, until the untrimmed gate drive is fixed and four is
-/// measured under load — four under v5 and v6, three under v4 while
-/// each gate's workspace, and its 160Gi request, sat on w-1's install
-/// disk; four under v3 before that): a page with no policy shows the
-/// same bound a gate obeys with an unreachable registry, and boss-cli's
-/// pin `the_yard_no_policy_capacity_equals_the_cli_compiled_bound` names
-/// this if it ever drifts (CLAUDE.md §9a — the two live in different
-/// crates, so equality is the mechanism).
-pub const COMPILED_GATE_MAX_CONCURRENT: i32 = 3;
 
 #[cfg(test)]
 mod tests {
@@ -5399,7 +5460,6 @@ mod tests {
             blip_cause_budget: 200,
             ci_host_floor_gb: 10,
             gate_queue_owner: crate::delivery::legacy_gate_queue_owner(),
-            gate_max_concurrent: 3,
             channels: serde_json::Value::Null,
         };
         let t = policy_thresholds(Some(&policy));
@@ -5645,6 +5705,7 @@ mod tests {
             verdict: "failed".into(),
             checks: vec!["test".into()],
             garaged: false,
+            returned: false,
         };
         let mut reds = car("feat/top-board", review(json!({})));
         reds.0.metadata[crate::dock_red::BASE_REGATE] =
@@ -5679,7 +5740,7 @@ mod tests {
     /// hold — an operator clearing the brake by writing the marker off
     /// rather than deleting the key — and a `truthy`/`is_some` reading of
     /// it strands the car in the held lane forever. The marker semantics
-    /// live once, in `stranded::hold_reason` (`null`/`false`/`""` are no
+    /// live once, in `stranded::marked` (`null`/`false`/`""` are no
     /// marker), and this lane reads them there; a hold/no-hold test alone
     /// is green with the bug.
     #[test]
@@ -6212,11 +6273,57 @@ mod tests {
             Some(at("2026-09-28T02:44:00Z")),
         );
         let a = &g.active[0];
-        assert_eq!(a.since, "2026-09-28T01:44:00Z", "since stays the filing");
+        assert_eq!(
+            a.since, "2026-09-28T02:30:00Z",
+            "a bay is occupied from its launch, never from its place in line"
+        );
         assert_eq!(a.launched_at.as_deref(), Some("2026-09-28T02:30:00Z"));
         assert_eq!(a.queued_seconds, Some(46 * 60), "46 minutes in line");
         assert_eq!(a.running_seconds, Some(14 * 60), "14 minutes running");
         assert!(!a.troubled, "no measured median judges nothing");
+    }
+
+    /// A RUNNING BAY IS DATED FROM ITS LAUNCH (backlog e6e72ee7).
+    /// Measured live 2026-10-19 04:13Z: gate-run f34769a4 took its place
+    /// in line at 03:53:47Z, was filed 03:54:11Z and launched 04:09:22Z,
+    /// and /api/yard/regions labelled bay 3 "gating … since 03:54:11" —
+    /// fifteen minutes of queue read as fifteen minutes of gate. The
+    /// 2026-10-17 case was three hours. The line keeps the wait
+    /// (`queued_seconds`); the bay's `since` is the Job's start, and only
+    /// a run with no launch stamp falls back to its filing, the one
+    /// instant it has (exact for the conductor's train gates, which are
+    /// filed and launched in one act). An unparseable launch stamp is no
+    /// stamp. Slots order by the same instant.
+    #[test]
+    fn a_running_bay_is_dated_from_its_launch_never_its_place_in_line() {
+        let mut waited = gate_run_on("fix/waited", 2);
+        waited.metadata["opened_at"] = json!("2026-10-19T03:54:11.094382901+00:00");
+        waited.metadata[LAUNCHED_AT] = json!("2026-10-19T04:09:22Z");
+        let mut train = gate_run_on("train/20261019-0347", 2);
+        train.metadata["opened_at"] = json!("2026-10-19T03:50:21.360459300+00:00");
+        let mut garbled = gate_run_on("fix/garbled", 2);
+        garbled.metadata["opened_at"] = json!("2026-10-19T04:00:00Z");
+        garbled.metadata[LAUNCHED_AT] = json!("soon-ish");
+        let runs = vec![
+            (waited, vec![in_flight_step()]),
+            (train, vec![in_flight_step()]),
+            (garbled, vec![in_flight_step()]),
+        ];
+        let g = gates(&runs, 3, Some(at("2026-10-19T04:13:00Z")));
+        let by = |b: &str| g.active.iter().find(|a| a.branch == b).unwrap();
+        assert_eq!(by("fix/waited").since, "2026-10-19T04:09:22Z");
+        assert_eq!(by("fix/waited").queued_seconds, Some(15 * 60 + 10));
+        assert_eq!(by("fix/waited").running_seconds, Some(3 * 60 + 38));
+        assert_eq!(
+            by("train/20261019-0347").since,
+            "2026-10-19T03:50:21.360459300+00:00"
+        );
+        assert_eq!(by("fix/garbled").since, "2026-10-19T04:00:00Z");
+        let order: Vec<&str> = g.active.iter().map(|a| a.branch.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["train/20261019-0347", "fix/garbled", "fix/waited"]
+        );
     }
 
     /// A run with no launch stamp — filed before 2026-09-28 — is running
@@ -6456,6 +6563,21 @@ mod tests {
             .as_deref(),
             Some("error: unused variable `x`")
         );
+        assert_eq!(
+            failed_line(&with("error[E0308]: mismatched types\n --> crates/b/src/l.rs:2:5\nerror: could not compile `boss-b` (lib test) due to 1 previous error")).as_deref(),
+            Some("error[E0308]: mismatched types")
+        );
+        assert_eq!(
+            failed_line(&with(
+                "error: could not compile `boss-a`\nerror[E0308]: mismatched types"
+            ))
+            .as_deref(),
+            Some("error[E0308]: mismatched types")
+        );
+        assert_eq!(
+            failed_line(&with("error: could not compile `boss-a`")).as_deref(),
+            Some("error: could not compile `boss-a`")
+        );
         // The runner keeps up to 40 lines of context above the first
         // header, and cargo's roll-call sits there: the panic outranks
         // the `test … FAILED` line that names the same test.
@@ -6476,6 +6598,32 @@ mod tests {
         assert!(got.ends_with('…'), "{got}");
         // Nothing but whitespace is no line.
         assert_eq!(failed_line(&with("  \n\n")), None);
+    }
+
+    #[test]
+    fn compiler_error_pattern_matches_the_runners_definition() {
+        let runner =
+            std::fs::read_to_string(boss_testing::repo_root().join("infra/gate-runner/run.sh"))
+                .unwrap();
+        let definition = format!("RE_ERROR = re.compile(r\"{ERROR_LINE_PATTERN}\")");
+        assert_eq!(runner.lines().filter(|line| *line == definition).count(), 1);
+        let re = regex::Regex::new(ERROR_LINE_PATTERN).unwrap();
+        for line in [
+            "error[E0308]: mismatch",
+            "error: unused",
+            " Error: failed",
+            "ERROR failed",
+        ] {
+            assert!(re.is_match(line), "{line}");
+        }
+        for line in [
+            "warning[E0308]: mismatch",
+            "error[E12345]: mismatch",
+            "error[lint]: mismatch",
+            "note: error[E0308]: mismatch",
+        ] {
+            assert!(!re.is_match(line), "{line}");
+        }
     }
 
     /// Two failed checks: the line comes from the FIRST failed check the
@@ -7152,7 +7300,6 @@ mod tests {
             blip_cause_budget: 200,
             ci_host_floor_gb: 10,
             gate_queue_owner: crate::delivery::legacy_gate_queue_owner(),
-            gate_max_concurrent: 3,
             channels: serde_json::Value::Null,
         };
 
@@ -7164,6 +7311,7 @@ mod tests {
             dock_cars: &dock,
             rules: &rules,
             policy: Some(&policy),
+            gate_bays: Some(3),
             gate_runs: &[stranded_run],
             car_branches: &["feat/a".into(), "feat/b".into()],
             now: fixed_now(),
@@ -7199,30 +7347,64 @@ mod tests {
         assert_eq!(status.policy.stall_hours, Some(6));
         assert_eq!(status.policy.max_red_trains, Some(2));
 
-        // Gate capacity is the policy's gate_max_concurrent, drawn as
-        // slots — not a constant. The one gate-run here is green, so it
-        // occupies no slot and garages nothing.
+        // Gate capacity is the gates station's bays, drawn as slots —
+        // not a constant. The one gate-run here is green, so it occupies
+        // no slot and garages nothing.
         assert_eq!(status.gates.capacity, 3);
         assert!(status.gates.active.is_empty());
         assert!(status.garage.is_empty());
     }
 
     #[test]
-    fn no_policy_draws_the_compiled_gate_capacity() {
-        // With no delivery policy the page shows the same bound a gate
+    fn no_gates_row_draws_the_compiled_gate_capacity() {
+        // With no gates row read the page shows the same bound a gate
         // obeys against an unreachable registry — never a fabricated
         // number.
         let status = build_status(YardInputs {
             now: fixed_now(),
             ..Default::default()
         });
-        assert_eq!(status.gates.capacity, COMPILED_GATE_MAX_CONCURRENT);
+        assert_eq!(status.gates.capacity, crate::stations::COMPILED_GATE_BAYS);
+    }
+
+    /// The policy no longer sizes the gates (item 0a78f8f8): a policy
+    /// row with no gates row read draws the compiled bays, and a gates
+    /// row draws its own bays whatever the policy says.
+    #[test]
+    fn the_gate_capacity_is_the_gates_bays_not_the_policy() {
+        let policy = DeliveryPolicyRow {
+            name: "train-conductor".into(),
+            version: 12,
+            max_red_trains: 2,
+            stall_hours: 6,
+            consist_budget_secs: 600,
+            consist_output_budget: 2000,
+            consist_files_named: 5,
+            skip_reason_file_budget: 200,
+            blip_cause_budget: 200,
+            ci_host_floor_gb: 10,
+            gate_queue_owner: crate::delivery::legacy_gate_queue_owner(),
+            channels: serde_json::Value::Null,
+        };
+        let status = |gate_bays| {
+            build_status(YardInputs {
+                policy: Some(&policy),
+                gate_bays,
+                now: fixed_now(),
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            status(None).gates.capacity,
+            crate::stations::COMPILED_GATE_BAYS
+        );
+        assert_eq!(status(Some(5)).gates.capacity, 5);
     }
 
     #[test]
     fn build_status_fills_the_slots_and_the_garage_from_the_gate_runs() {
         // One in-flight gate (a slot) and one red (the garage), plus a
-        // policy sizing the capacity to 4.
+        // gates row sizing the capacity to 4.
         let in_flight = (gate_run_on("feat/gating", 3), vec![in_flight_step()]);
         let red = (
             gate_run_on("feat/broken", 3),
@@ -7243,11 +7425,11 @@ mod tests {
             blip_cause_budget: 200,
             ci_host_floor_gb: 10,
             gate_queue_owner: crate::delivery::legacy_gate_queue_owner(),
-            gate_max_concurrent: 4,
             channels: serde_json::Value::Null,
         };
         let status = build_status(YardInputs {
             policy: Some(&policy),
+            gate_bays: Some(4),
             gate_runs: &[in_flight, red],
             now: fixed_now(),
             ..Default::default()
@@ -7983,6 +8165,36 @@ mod resident_queue_tests {
                 .queued
                 .iter()
                 .any(|q| q.waiting_seconds.is_none() && q.queued_at.is_empty())
+        );
+    }
+
+    /// Backlog b56bfc29. The yard drew every resident request behind
+    /// every legacy place, the same rule the resident supervisor counted
+    /// by — so resident dec70bf9, accepted 05:42:37Z on 2026-10-19,
+    /// rendered behind a legacy place taken an hour after it. One line
+    /// across both owners: a legacy place at its `queued_at`, a resident
+    /// one at its original acceptance, oldest first.
+    #[test]
+    fn the_line_interleaves_both_owners_by_when_each_place_was_taken() {
+        let (resident, receipt) = accepted("resident", "2026-10-19T05:42:37Z");
+        let legacy = |branch: &str, queued: &str| {
+            let (mut row, _) = accepted(branch, "2026-10-19T00:00:00Z");
+            row.metadata = json!({"branch": branch, QUEUED_AT: queued});
+            (row, vec![])
+        };
+        let rows = vec![
+            legacy("later-legacy", "2026-10-19T06:43:13Z"),
+            (resident, vec![]),
+            legacy("earlier-legacy", "2026-10-19T05:30:00Z"),
+        ];
+        let view =
+            gates_with_acceptances(&rows, 3, parse_instant("2026-10-19T06:50:00Z"), &[receipt]);
+        assert_eq!(
+            view.queued
+                .iter()
+                .map(|q| (q.branch.as_str(), q.position))
+                .collect::<Vec<_>>(),
+            vec![("earlier-legacy", 1), ("resident", 2), ("later-legacy", 3)]
         );
     }
 

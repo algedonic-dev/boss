@@ -1,0 +1,41 @@
+# AN EXHAUSTED POOL MEANS WAIT, AND A RELEASE ENDS ONE (backlog
+# 587f395a, allocation item 1 of design 012822ea).
+#
+# Measured on origin/main 3a7be357: a claim refused capacity-exhausted
+# wrote `metadata.waiting_on` on its step and answered 409, and nothing
+# read either that or `jobs.step.released` — only the claims console and
+# the rebuild did. So "exhausted" meant "refused and tagged", and a step
+# waiting on a pool waited for nobody. David's steer on the design:
+# queues are everywhere, so this is only sequencing, and an exhausted
+# pool must mean wait. The conductor's reading
+# (decided_questions_20261106_1507Z on 35e9babf): wait is both halves —
+# the claim answers its place in the pool's line, and a rule subscribed
+# to `jobs.step.released` re-offers.
+#
+# This is the second half. On every release it re-offers, per pool the
+# release returned, the step that has waited longest in that pool's line
+# and is not already re-offered: a merge of `reoffered_at` and
+# `reoffered_by` onto that step's `waiting_on`, judged against the wait
+# it read. It CLAIMS NOTHING — the claim door is still the one act that
+# takes capacity, and it may refuse again, which keeps the step's place.
+# What changes is that claim-next's head, which passes over a step
+# holding its place, offers this one again, and the update reaches the
+# dispatcher's assignment loop and the nominee's queue read.
+#
+# Inert until a protocol bills a pool: today no live workflow row
+# declares `resources`, so no claim reserves, no release is recorded and
+# this rule never fires. The bill is allocation item 5's deliberate
+# publish, with David present.
+[[rule]]
+name = "jobs-reoffer-waiting-on-release"
+why = """
+A CROSS-PACKET REACTOR: capacity one packet's step returns is offered
+to ANOTHER packet's step waiting in the same pool's line (backlog
+587f395a). No Workflow can declare it — a protocol names its own steps,
+never which other packet waits on a pool its step frees — so the wake
+lives here, beside the clear-waiting reactor that does the same for a
+closed packet's waiters.
+"""
+on_event = "jobs.step.released"
+[[rule.do]]
+handler = "jobs.reoffer_waiting"

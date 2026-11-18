@@ -15,7 +15,8 @@
 // and marshalling open their queue board under the same zoomed world.
 // Nothing is deleted; every panel is one click deeper.
 
-import { fetchRemote, type Remote } from '../../data/remote';
+import type { Remote } from '../../data/remote';
+import { fetchMapReading } from './map-reading';
 import { parseRecordedWaits, type RecordedWait } from './waits';
 
 // ---------------------------------------------------------------------
@@ -106,9 +107,13 @@ export type Trend = Readonly<{
  *
  *  `withheld` is neither: the record that would say is withheld from
  *  this caller by policy scope (backlog 1805bac0) — the policy working,
- *  drawn neutral and never counted as trouble. */
-export type MachineState = 'running' | 'idle' | 'failed' | 'unknown' | 'withheld';
-const MACHINE_STATES: ReadonlyArray<MachineState> = ['running', 'idle', 'failed', 'unknown', 'withheld'];
+ *  drawn neutral and never counted as trouble.
+ *
+ *  `stale` is a reading that stopped refreshing (backlog 4db21aaf): the
+ *  why names the generation it stopped at. Drawn apart from `unknown`,
+ *  because a dark projection must look dark. */
+export type MachineState = 'running' | 'idle' | 'failed' | 'unknown' | 'stale' | 'withheld';
+const MACHINE_STATES: ReadonlyArray<MachineState> = ['running', 'idle', 'failed', 'unknown', 'stale', 'withheld'];
 
 export type Machine = Readonly<{
   /** Stable within the region, so a glyph keeps its place between
@@ -126,6 +131,15 @@ export type Region = Readonly<{
   /** What is here. `null` when the region could not be read — the
    *  state is then `troubled` and `why` names the read. */
   count: number | null;
+  /** THE LINE (backlog 357fe1da) — members waiting for what the bound
+   *  counts, today gate-runs waiting for a bay — and THE JUDGED (backlog
+   *  bce67f09) — a train at the gates whose own gate has spoken. Two
+   *  figures beside the count, never summed into it: count + waiting +
+   *  judged is what the partition places here (`boss_jobs::regions::
+   *  Region`). Absent where none stands, and on an older server; the
+   *  card drew neither until backlog d43c0be2. */
+  waiting?: number;
+  judged?: number;
   /** The bound the count is read against, where the region has one. */
   bound: number | null;
   /** What the bound is; null with the bound, and on an older server —
@@ -200,6 +214,9 @@ export type MachineSummary = Readonly<{
   idle: number;
   failed: number;
   unknown: number;
+  /** Readings that stopped refreshing (backlog 4db21aaf) — named among
+   *  `failed_or_unknown`. The server omits it when zero. */
+  stale: number;
   /** Withheld from this caller by policy scope (backlog 1805bac0) —
    *  never among `failed_or_unknown`. The server omits it when zero. */
   withheld: number;
@@ -365,9 +382,13 @@ function parseRegion(raw: unknown): Region {
   if (kind !== undefined && kind !== null && !(BOUND_KINDS as ReadonlyArray<unknown>).includes(kind)) {
     throw new Error(`region ${name}: unknown bound kind ${JSON.stringify(kind)}`);
   }
+  const waiting = numberOrNull(o.waiting);
+  const judged = numberOrNull(o.judged);
   return {
     name: String(o.name ?? ''),
     count: numberOrNull(o.count),
+    ...(waiting === null ? {} : { waiting }),
+    ...(judged === null ? {} : { judged }),
     bound: numberOrNull(o.bound),
     bound_kind: (kind ?? null) as BoundKind | null,
     unit: String(o.unit ?? ''),
@@ -431,6 +452,8 @@ function parseMachineSummary(raw: unknown): MachineSummary | null {
     idle: count('idle'),
     failed: count('failed'),
     unknown: count('unknown'),
+    // Sent only when non-zero, as `withheld` is.
+    stale: numberOrNull(o.stale) ?? 0,
     // Sent only when non-zero (a full scope's payload carries none).
     withheld: numberOrNull(o.withheld) ?? 0,
     total: count('total'),
@@ -585,7 +608,7 @@ export function parseRegions(raw: unknown): Regions {
 }
 
 export async function fetchRegions(): Promise<Remote<Regions>> {
-  return fetchRemote('/api/yard/regions', parseRegions);
+  return fetchMapReading('/api/yard/regions', parseRegions);
 }
 
 // ---------------------------------------------------------------------
@@ -655,14 +678,24 @@ export function lampOf(state: RegionState): 'ok' | 'warn' | 'err' {
 /** What is here, in its unit, against its bound — "3 / 3 bays in use"
  *  for a capacity, "6 cars parked · threshold 1" for a threshold, so a
  *  trigger never reads as room (decision 5). "no reading" for a count
- *  the server could not take — never 0. */
+ *  the server could not take — never 0. The line and the judged follow
+ *  as their own figures — "3 / 3 bays in use · 2 waiting · 1 judged" —
+ *  so a full line or a judged train never reads as an empty gate
+ *  (backlog d43c0be2). */
 export function countText(r: Region): string {
   if (r.count === null) return 'no reading';
   const unit = r.unit === '' ? '' : ` ${r.unit}`;
-  if (r.bound === null) return `${r.count}${unit}`;
-  return r.bound_kind === 'threshold'
-    ? `${r.count}${unit} · threshold ${r.bound}`
-    : `${r.count} / ${r.bound}${unit}`;
+  const count =
+    r.bound === null
+      ? `${r.count}${unit}`
+      : r.bound_kind === 'threshold'
+        ? `${r.count}${unit} · threshold ${r.bound}`
+        : `${r.count} / ${r.bound}${unit}`;
+  const beside = [
+    r.waiting === undefined ? null : `${r.waiting} waiting`,
+    r.judged === undefined ? null : `${r.judged} judged`,
+  ].filter((s): s is string => s !== null);
+  return [count, ...beside].join(' · ');
 }
 
 /** The count as a territory has room for it: the number against its

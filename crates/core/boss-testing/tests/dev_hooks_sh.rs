@@ -13,7 +13,10 @@
 //! - `prompt-submit.sh` writes the heartbeat (`boss job patch`:
 //!   `last_active_at`, `prompt_count`) and NEVER the prompt text —
 //!   the one privacy rule this car ships, pinned below by planting a
-//!   sentence and asserting it reaches nothing.
+//!   sentence and asserting it reaches nothing. Then it prints the
+//!   session's working window, read off the packet by `boss session
+//!   window` (backlog 37e3295c) — the one line it puts on the model's
+//!   context, so the session's end comes from the record.
 //! - `agent-start.sh` pipes a PreToolUse payload into `boss dispatch
 //!   <session> --from-hook`, prints the verb's stdout (the updatedInput
 //!   answer) and nothing else, and stores the run id the verb names
@@ -46,6 +49,10 @@ const HOOKS: &str = "infra/dev/hooks";
 const SETTINGS: &str = ".claude/settings.json";
 const SESSION: &str = "7a1e2b3c-0000-4000-8000-00000000abcd";
 const RUN: &str = "5b1d2c3e-0000-4000-8000-000000000001";
+/// What the stub `boss session window` answers: the verb's own one line,
+/// which the prompt hook hands to the model's context verbatim.
+const WINDOW_LINE: &str =
+    "work-session 7a1e2b3c window: until 2026-10-19T20:00:00Z (in 7h46m) — set by agent-claude";
 
 struct Fixture {
     root: PathBuf,
@@ -83,6 +90,7 @@ impl Fixture {
                  {exit_early}\n\
                  case \"$1 $2\" in\n\
                    'job file') echo 'boss job: filed {SESSION}  \"Session: emp-david on boss-dev-0\" — confirmed by reading it back' ;;\n\
+                   'session window') echo '{WINDOW_LINE}' ;;\n\
                    'dispatch {SESSION}'|'dispatch -') \n\
                       if grep -q Packet: \"$d/stdin\"; then\n\
                         echo 'agent_run={RUN}' >&2\n\
@@ -192,6 +200,17 @@ impl Fixture {
     /// Run one hook with `payload` on stdin and the stub bin dir on
     /// PATH (`with_bin`), or a PATH with no `boss` at all.
     fn run(&self, hook: &str, payload: &str, with_bin: bool) -> (i32, String, String) {
+        self.run_with(hook, payload, with_bin, &[])
+    }
+
+    /// `run`, with `env` added to the hook's environment.
+    fn run_with(
+        &self,
+        hook: &str,
+        payload: &str,
+        with_bin: bool,
+        env: &[(&str, &str)],
+    ) -> (i32, String, String) {
         let path = if with_bin {
             format!("{}:/usr/bin:/bin", self.bin.display())
         } else {
@@ -203,6 +222,7 @@ impl Fixture {
             .env("HOME", &self.root)
             .env("BOSS_HOOK_STATE", &self.state)
             .env("BOSS_ACTOR", "emp-david")
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -405,15 +425,36 @@ fn prompt_submit_heartbeats_without_the_prompt_text() {
     for _ in 0..2 {
         let (code, out, err) = f.run("prompt-submit.sh", &payload, true);
         assert_eq!(code, 0, "{err}");
-        assert_eq!(out, "", "stdout would be added to the model's context");
+        // THE WINDOW, FROM THE PACKET (backlog 37e3295c): stdout here is
+        // added to the model's context, so the ONE thing printed is the
+        // window verb's own line — the session takes its end from its
+        // packet on every prompt, never from an hour said in chat.
+        assert_eq!(
+            out,
+            format!("{WINDOW_LINE}\n"),
+            "stdout is the window verb's answer and nothing else"
+        );
         assert!(!err.contains(secret));
     }
     let calls = f.calls("boss-calls");
-    assert_eq!(calls.len(), 2, "{calls:?}");
-    for (i, (argv, _)) in calls.iter().enumerate() {
+    assert_eq!(
+        calls.len(),
+        4,
+        "a heartbeat and a window read per prompt: {calls:?}"
+    );
+    let (heartbeats, windows): (Vec<_>, Vec<_>) =
+        calls.iter().partition(|(argv, _)| argv[0] == "job");
+    for (argv, _) in &windows {
+        assert_eq!(
+            argv,
+            &["session", "window", SESSION],
+            "read the session's own packet"
+        );
+    }
+    for (i, (argv, body)) in heartbeats.iter().enumerate() {
         assert_eq!(&argv[..3], ["job", "patch", SESSION]);
         let patch: serde_json::Value =
-            serde_json::from_str(&calls[i].1).expect("the patch file handed to the verb is JSON");
+            serde_json::from_str(body).expect("the patch file handed to the verb is JSON");
         assert_eq!(patch["prompt_count"], (i + 1) as u64);
         assert!(
             patch["last_active_at"]
@@ -761,6 +802,41 @@ fn session_end_completes_active_as_clean_through_boss_api() {
     assert!(
         !f.state.join("s-1").exists(),
         "the session's state is cleared"
+    );
+}
+
+/// A seat's turn is not its session's end (review ce8970ce B1): Claude
+/// Code -p fires SessionEnd at the end of EVERY turn, so under
+/// infra/dev/factory-loop.sh, which marks its turns BOSS_SEAT, the hook
+/// writes nothing and keeps the session's state — the seat's loop owns
+/// the packet and ends it itself, through this hook unmarked.
+#[test]
+fn session_end_leaves_a_seats_session_open_for_its_loop() {
+    let f = Fixture::new("end-seat");
+    f.stub_boss(false);
+    std::fs::create_dir_all(f.state.join("s-1")).unwrap();
+    std::fs::write(f.state.join("s-1").join("packet"), format!("{SESSION}\n")).unwrap();
+    let payload = r#"{"session_id":"s-1","cwd":"/work/boss","hook_event_name":"SessionEnd","reason":"other"}"#;
+    let (code, out, err) = f.run_with(
+        "session-end.sh",
+        payload,
+        true,
+        &[("BOSS_SEAT", "claude-b-factory")],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "");
+    assert!(
+        f.calls("api-calls").is_empty(),
+        "a seat's turn end writes nothing: {:?}",
+        f.calls("api-calls")
+    );
+    assert!(
+        f.state.join("s-1").join("packet").is_file(),
+        "the seat's next turn finds its packet"
+    );
+    assert!(
+        err.contains("seat claude-b-factory") && err.contains("stays open"),
+        "{err}"
     );
 }
 

@@ -89,5 +89,11 @@ spec:
                       key: database-url
                 - name: BOSS_JOBS_URL
                   value: http://boss-jobs-internal.boss.svc.cluster.local:7900
+                # The packet open tries 3 times, not the wrap's default 1
+                # (backlog a2ae9f39: one failed read lost the backup's
+                # packet on 10-26 and 10-27). Pinned by
+                # every_maintenance_wrap_caller_retries_its_open.rs.
+                - name: BOSS_WRAP_OPEN_RETRY
+                  value: "3"
                 - name: BOSS_MACHINE_TOKEN_HOSTS
                   value: ".boss.svc.cluster.local"

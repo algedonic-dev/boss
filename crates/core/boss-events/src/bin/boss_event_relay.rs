@@ -36,11 +36,11 @@ use boss_core::port::EventBus;
 use boss_core::rebuild::resolve_database_url;
 use boss_events::outbox::{
     DEFAULT_OUTBOX_RETENTION, DEFAULT_PRUNE_BATCH, DEFAULT_PRUNE_MAX_ROWS, drain_outbox_once,
-    prune_delivered_outbox,
+    prune_delivered_outbox, undelivered,
 };
 use clap::Parser;
 use sqlx::postgres::PgPoolOptions;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -128,6 +128,41 @@ async fn retention_loop(pool: sqlx::PgPool, retention: Duration, every: Duration
             ),
             Err(e) => error!(error = %e, "outbox retention pass failed — retrying next interval"),
         }
+    }
+}
+
+/// The relay's minute report: what it delivered, what the outbox still
+/// owes the bus and how long the oldest owed event has waited, and the
+/// bus's state (design ad9519bc part c, backlog 2e45840a). Until it the
+/// heartbeat counted deliveries alone, so a dark bus read `last_minute=0`
+/// exactly like a quiet one. A minute that delivered nothing while rows
+/// are owed is the dark-bus signature, and is a WARN.
+async fn heartbeat(pool: &sqlx::PgPool, total_delivered: u64, last_minute: u64) {
+    let bus = boss_core::startup::bus_state();
+    match undelivered(pool).await {
+        Ok(owed) if owed.count > 0 && last_minute == 0 => warn!(
+            total_delivered,
+            last_minute,
+            outbox_depth = owed.count,
+            oldest_undelivered_age_s = owed.oldest_age_seconds,
+            ?bus,
+            "relay heartbeat: the outbox is HOLDING events it cannot deliver"
+        ),
+        Ok(owed) => info!(
+            total_delivered,
+            last_minute,
+            outbox_depth = owed.count,
+            oldest_undelivered_age_s = owed.oldest_age_seconds,
+            ?bus,
+            "relay heartbeat"
+        ),
+        Err(e) => error!(
+            total_delivered,
+            last_minute,
+            ?bus,
+            error = %e,
+            "relay heartbeat: could not read the outbox depth"
+        ),
     }
 }
 
@@ -229,11 +264,7 @@ async fn main() -> Result<()> {
             }
         }
         if last_heartbeat.elapsed() >= Duration::from_secs(60) {
-            info!(
-                total_delivered,
-                last_minute = since_heartbeat,
-                "relay heartbeat"
-            );
+            heartbeat(&pool, total_delivered, since_heartbeat).await;
             since_heartbeat = 0;
             last_heartbeat = std::time::Instant::now();
         }

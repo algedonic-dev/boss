@@ -99,7 +99,7 @@ test.describe('department and role labels come from their registries beyond the 
 
   test("HR's headcount table prints the department's display_name", async ({ page }) => {
     await install(page);
-    await mountPage(page, '/ux/hr');
+    await mountPage(page, '/people/hr');
     await page.getByRole('tab', { name: 'Headcount', exact: true }).click();
     await expect(page.locator('table.data-table tbody tr').first().locator('td').first())
       .toHaveText('Sales & Sponsorships');

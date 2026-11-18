@@ -45,13 +45,11 @@
     canOfferCancel,
     cancelRequestBody,
     disciplineLabel,
-    dockUpstream,
     readYard,
     splitAtDeparture,
     trainGateLabel,
     trainGateTroubled,
     troubleLabel,
-    wipAdvisory,
     type CancelRequest,
     type Eta,
     type EtaPhase,
@@ -83,7 +81,6 @@
     sinceText,
     STAGES,
     type Feeds,
-    type FloorSelection,
     type Scene,
   } from './yard-floor';
   import {
@@ -128,31 +125,9 @@
   // the map's name for the region; regions.ts maps it to the selection
   // the entity deck opens on, and an unknown name falls back to the
   // track, as the bare /it/yard always has.
-  //
-  // `onfloor` hands the scene up (design d2154293, car 3) so the region
-  // map above draws its slice from the reads this deck already makes,
-  // rather than a second copy of them.
-  //
-  // DESIGN fe77a1d2, CAR 2: the deck draws NO map. The region map
-  // above it draws that region's slice of the floor, clickable, so the
-  // whole-floor YardMap that stood here — every region's wagons again,
-  // under a map already showing this region's — is deleted.
-  // `onselection` hands the selection up with the one function that
-  // changes it, so a click on the region map opens the same entity
-  // panel, and loads the same packet, a click here always did.
-  //
-  // CAR 3: no header, and no prop to switch one on. The page this was
-  // drew one only when mounted bare, and nothing mounted it bare any
-  // more; the map page's own header is the one above the deck.
-  let {
-    focus = 'track',
-    onfloor = (_scene: Scene | null) => {},
-    onselection = (_s: FloorSelection) => {},
-  }: Readonly<{
-    focus?: string;
-    onfloor?: (scene: Scene | null) => void;
-    onselection?: (s: FloorSelection) => void;
-  }> = $props();
+  // The retired region map no longer receives this deck's scene or
+  // selection (cfd67b9e); both remain local to the drawer.
+  let { focus = 'track' }: Readonly<{ focus?: string }> = $props();
 
   let yardReading = $state(emptyYardReading());
   const yard = $derived(yardReading.data);
@@ -225,12 +200,6 @@
 
   // THE FLOOR: the pure scene both the map and the board draw.
   const floor = $derived<Scene | null>(yard ? sceneOf(yard, statusData, nowMs, feeds) : null);
-  // Handed up to the map page (d2154293 car 3, then fe77a1d2 car 2: the
-  // region map above draws its slice from the SAME wagons this floor
-  // does, from one read rather than a second copy of it).
-  $effect(() => {
-    onfloor(floor);
-  });
   const wagonById = $derived(new Map((floor?.wagons ?? []).map(w => [w.id, w])));
   // The shed and its two sidings, in the order the board reads them —
   // the inspection panel's rows.
@@ -385,12 +354,6 @@
       entityJobError = null;
     }
   }
-  // Handed up to the region map above (car 2): what is selected, and
-  // `select` itself — the map's clicks go through the same function
-  // the board's and the alerts' do.
-  $effect(() => {
-    onselection({ selected, select });
-  });
 
   // The condensed packet panel (David, fc67bed2) — the "open packet"
   // verb, and what a double-click on any packet card does here.
@@ -429,11 +392,6 @@
     packetLoading = false;
   }
 
-  // The dock's walk upstream, when its registry row declares one.
-  // Nothing station-specific lives here: the row says where upstream
-  // is, so a station that names a different queue tomorrow moves this
-  // button with it, and one that names none renders nothing.
-  const upstream = $derived(yard ? dockUpstream(yard.dockStation) : null);
   // The departure line is the merge (0bba59f7): pre-merge trains are
   // yard work where red is status, post-merge is transit where green
   // holds by construction.
@@ -927,13 +885,11 @@
           {/if}
         {:else if sel.kind === 'dock'}
           <h2 class="yard-panel-h">Entity · loading dock</h2>
-          <!-- The dock is a station rendered (stations.md): when the
+          <!-- The dock is a station rendered (station-tree.md): when the
                registry served, the header carries the station's own
-               facts — the ordering discipline (Q2) and the advisory
-               WIP verdict (Q3: warn, don't enforce). The walk upstream
-               (David, feedback 3ccb79f5) sits beside them: a queue that
-               isn't filling is diagnosed upstream. Navigation, not
-               content. -->
+               ordering discipline. The walk upstream is the station
+               page's, derived from the tree (design deba3000), not a
+               button here. -->
           {#if yard.dockStation.source !== 'station'}
             <!-- NO READING. The dock's membership is the loading-dock
                  row's to state — the predicate plus the hold clause —
@@ -951,13 +907,7 @@
           {:else}
             <div class="yard-entity-title">{yard.dock.length} car{yard.dock.length === 1 ? '' : 's'} parked</div>
             <div class="yard-entity-sub yard-dock-facts">
-              {#if upstream}
-                <button type="button" class="yard-upstream" title={upstream.title} onclick={() => navigate(upstream.href)}>{upstream.label}</button>
-              {/if}
               <span class="yard-discipline" title="queue discipline">{disciplineLabel(yard.dockStation.discipline)}</span>
-              {#if wipAdvisory(yard.dockStation)}
-                <span class="yard-wip" title="over the station's advisory WIP limit">{wipAdvisory(yard.dockStation)}</span>
-              {/if}
             </div>
           {/if}
           <dl class="yard-kv">
@@ -1735,32 +1685,8 @@
   }
   .yard-section::after { content: ''; flex: 1; border-top: 1px solid var(--hairline); }
   .yard-n { color: var(--static); }
-  /* Station facts in the dock's header: discipline stays quiet
-     (static grey, same mono caps), the WIP advisory wears --warn —
-     the one state color, present only when the queue exceeds its
-     declared bandwidth. */
+  /* Station discipline in the dock's header stays quiet. */
   .yard-discipline { font-family: var(--font-mono); font-size: 11px; color: var(--static); letter-spacing: var(--ls-nav); text-transform: uppercase; }
-  .yard-wip { font-family: var(--font-mono); font-size: 11px; color: var(--warn); border: 1px solid var(--warn);
-    padding: 1px 7px; letter-spacing: 0.1em; }
-  /* The walk upstream: the chip grammar exactly (mono caps, hairline,
-     radius 0, --static) — an instrument, not a call to action. It
-     brightens to --signal on hover and focus. */
-  .yard-upstream {
-    font: inherit;
-    font-family: var(--font-mono);
-    font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
-    color: var(--static);
-    background: transparent;
-    border: 1px solid var(--hairline);
-    border-radius: 0;
-    padding: 2px 8px;
-    cursor: pointer;
-    white-space: nowrap;
-    transition: color 120ms ease, border-color 120ms ease;
-  }
-  .yard-upstream:hover, .yard-upstream:focus-visible {
-    color: var(--signal); border-color: var(--signal);
-  }
   .yard-board { width: 100%; border-collapse: collapse; background: var(--card);
     border: 1px solid var(--hairline); font-size: 14px; }
   .yard-board th { font-family: var(--font-mono); font-size: 11px;
@@ -2012,6 +1938,5 @@
   @media (max-width: 1000px) { .yard-deck { grid-template-columns: 1fr; } }
   @media (prefers-reduced-motion: reduce) {
     .yard-dot, .yard-lamp-dot { animation: none; }
-    .yard-upstream { transition: none; }
   }
 </style>

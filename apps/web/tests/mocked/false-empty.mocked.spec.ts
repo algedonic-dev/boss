@@ -198,7 +198,7 @@ async function hrMocks(page: Page, steps: (r: Route) => Promise<void>) {
 }
 
 async function openHrWorkflows(page: Page) {
-  await page.goto('/ux/hr');
+  await page.goto('/people/hr');
   await page.getByRole('tab', { name: 'Workflows' }).click();
   await expect(page.getByRole('button', { name: 'View tasks' })).toBeVisible();
   await page.getByRole('button', { name: 'View tasks' }).click();
@@ -237,7 +237,7 @@ test('a Job that genuinely has no steps still reads as empty, not as a failure',
 test('a failed workflow-registry read says so — never "No HR workflows are published"', async ({ page }) => {
   await hrMocks(page, (r) => json(r, [HR_STEP]));
   await page.route(/\/api\/workflows$/, (r) => json(r, 'registry down', 500));
-  await page.goto('/ux/hr');
+  await page.goto('/people/hr');
   await page.getByRole('tab', { name: 'Workflows' }).click();
 
   const failed = page.locator('.load-failed').filter({ hasText: "Couldn't load HR workflows" });
@@ -250,7 +250,7 @@ test('a failed workflow-registry read says so — never "No HR workflows are pub
 test('a failed open-Jobs read says so — never "No active workflows."', async ({ page }) => {
   await hrMocks(page, (r) => json(r, [HR_STEP]));
   await page.route(/\/api\/jobs\?kind=onboarding/, (r) => json(r, 'jobs down', 500));
-  await page.goto('/ux/hr');
+  await page.goto('/people/hr');
   await page.getByRole('tab', { name: 'Workflows' }).click();
 
   const failed = page.locator('.load-failed').filter({ hasText: "Couldn't load active workflows" });

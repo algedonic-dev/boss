@@ -1,0 +1,23 @@
+# budget:robots — what the company spends on robots per hour, the rate
+# pool at the root of the station tree (T5 of design 4b27a65a, backlog
+# 3f58c823; handoff section 1 names it `budget:robots (rate)`). Named
+# budget:, not robots:<model>: the robots:<model> rows are the per-model
+# concurrency pools T5 renamed from model-slot:<class> (backlog 84f570a1),
+# and what a robot of any model spends draws on this one rate.
+#
+# FROM THE BUDGET, and the budget is per robot today: each agents-registry
+# row's `hourly_budget_usd_micros`, judged at the claim door
+# (crates/core/boss-jobs/src/agent_budget.rs). No reader sums those into
+# a company rate yet, so the capacity stands unknown — unknown is not
+# zero — until the car that derives it.
+# v2 (backlog 84f570a1): `capacity_from` says where the capacity number
+# comes from, for the console to show beside it (station-tree.md section 3).
+[[pool]]
+name = "budget:robots"
+version = 2
+status = "active"
+unit = "USD/h"
+kind = "flow"
+shape = "rate"
+capacity = { state = "unknown" }
+capacity_from = 'Unknown until a reader derives it: the robot rate of the company is the sum of hourly_budget_usd_micros over the robots of the agents registry (GET /api/agents), each judged per robot at the claim door (crates/core/boss-jobs/src/agent_budget.rs); no reader sums them into this row yet.'

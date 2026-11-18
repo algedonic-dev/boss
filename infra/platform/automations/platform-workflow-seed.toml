@@ -8,3 +8,5 @@
 id = "automation:platform-workflow-seed"
 role = "platform-admin"
 description = 'Publishes the infra/platform/ bundles into their registries at every start, insert-if-missing (boss-platform-workflow-seed).'
+# Host station: deploy (backlog 6ecb5480, station-tree.md section 6).
+station = "57b72e1f-490e-443a-9a9f-870a9977c9fb"

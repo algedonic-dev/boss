@@ -41,8 +41,8 @@ import { isPageWrite } from './_smokeMocks';
 //                    240×54 the layout reserves, so neighbours overlapped
 //                    — FIXED: each node is the page's own type, sized
 //                    to its layout box;
-// One finding no item owns, marked UNFILED where it is asserted:
-//   the stats say "1 rules" and "1 handlers" in the singular.
+//   covered B (3bfafd28): the stats use singular nouns for one rule
+//                    and one handler, retaining plurals for zero and many.
 //
 // THE FIXTURE. The payload is the server's shape: rules, the handler
 // roster as the dispatcher build declares it (boss-dispatcher-handlers
@@ -794,14 +794,11 @@ test.describe('/it/registry/dispatcher — loading, empty and failed are three p
     await expect(page.getByRole('link', { name: 'Edit rules →' })).toHaveCount(1);
   });
 
-  test('UNFILED: one rule and one handler are counted in the plural', async ({ page }) => {
-    // The words finding no item owns: the stats have no singular, where
-    // the rule list's header ("1 active rule") and this page's own
-    // filter note ("1 trigger") do.
+  test('one rule and one handler use singular nouns', async ({ page }) => {
     await install(page, [ASSIGNED]);
     await mountPage(page, PAGE, { titleMatch: new RegExp(TITLE) });
     await expect(page.locator('.svelte-flow__node')).toHaveCount(3);
-    await expect(page.locator('.dx-stats span')).toHaveText(['1 rules', '1 handlers', '0 in cycles']);
+    await expect(page.locator('.dx-stats span')).toHaveText(['1 rule', '1 handler', '0 in cycles']);
   });
 
   test('a read that never answers is a marked failure, not the empty line', async ({ page }) => {

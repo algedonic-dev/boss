@@ -98,6 +98,23 @@ pub fn unregistered(sku: &str) -> ProductsError {
 /// microsecond.
 #[async_trait]
 pub trait ProductsRepository: Send + Sync {
+    /// Append the next complete immutable SKU version. An identical
+    /// redelivery returns false without another fact; a conflicting
+    /// payload or a skipped version is refused without a write.
+    /// Unsupported adapters refuse rather than claim an empty catalog.
+    async fn append_sku_version(
+        &self,
+        _row: &crate::sku::SkuVersion,
+        _stamp: &EventStamp,
+    ) -> Result<bool, ProductsError> {
+        Err(ProductsError::Storage("SKU versions unsupported".into()))
+    }
+
+    /// All versions, ordered by SKU bytes then numeric version.
+    async fn sku_versions(&self) -> Result<Vec<crate::sku::SkuVersion>, ProductsError> {
+        Err(ProductsError::Storage("SKU versions unsupported".into()))
+    }
+
     /// All catalog rows, in byte order of SKU. `active_only=true`
     /// filters out retired SKUs.
     async fn list_products(&self, active_only: bool) -> Result<Vec<Product>, ProductsError>;

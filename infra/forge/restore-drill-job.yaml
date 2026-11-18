@@ -1,0 +1,141 @@
+# restore-drill-job.yaml — the one-shot Job the ops verb
+# `drill-gcs-restore` creates to restore the newest offsite dump into a
+# scratch database on the data node's postgres disk
+# (infra/forge/drill-gcs-restore.sh; backlog 156eb6e5, design 3c475a19
+# car 4's risk section).
+#
+# The verb fills in exactly one word, the forge registry
+# ($BOSS_FORGE_REGISTRY_HOST, from /etc/boss/sor.env, so no address is
+# spelled here), and creates a ConfigMap of the same name, owned by this
+# Job, carrying infra/forge/gcs-readback.py and
+# infra/forge/restore-drill-pod.sh.
+#
+# PLACEMENT. nodeSelector boss.dev/purpose=database is the label the
+# estate registry gives w-3 (infra/estate/estate.toml) and the postgres
+# move selects; the verb refuses unless exactly one Node carries it. The
+# scratch claim is a generic EPHEMERAL volume of StorageClass
+# longhorn-restore-drill (infra/cluster/manifests/
+# longhorn-restore-drill.yaml: one replica, diskSelector postgres, which
+# is Longhorn disk u-postgres), so Kubernetes makes it for the pod and
+# deletes it with the pod — nothing outlives the Job by construction.
+#
+# NOTHING HERE CAN TOUCH THE LIVE DATABASE'S POD OR VOLUME: this pod
+# mounts neither, and the live side is reached only as read-only SQL
+# sessions over the postgres Service, with the URL from Secret
+# boss-secrets key database-url as an environment variable.
+#
+# NOT under infra/cluster/manifests: the converge applies that directory,
+# and this Job runs only when a packet asks.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: boss-restore-drill
+  namespace: boss
+  labels:
+    app: boss-restore-drill
+spec:
+  # One attempt: a retry is a second pod, and the first one's log is the
+  # record. A Failed pod is KEPT by the controller, log and all.
+  backoffLimit: 0
+  # THE DEADLINES, SIZED FROM THE ONE MEASUREMENT THERE IS (backlog
+  # a1cbd16c). Ops-request 24fd49e7 (2026-11-14) ran 2700 s against the
+  # 7.5 GB dump and had NOT finished; the Job controller then deleted the
+  # pod for DeadlineExceeded, and its log with it. No restore of that dump
+  # has finished yet, so there is no rate to size from — only ">2700 s".
+  # The restore container therefore ends ITSELF at its inner deadline,
+  # DRILL_RESTORE_DEADLINE_S below: 14400 s (4 h), more than five times
+  # the unfinished measurement, and it prints its progress every 60 s, so
+  # even a run that hits it leaves a Failed pod saying how far it got.
+  # activeDeadlineSeconds is only the backstop, 3600 s above it: the fetch
+  # leg and initdb were done inside 18 minutes on 24fd49e7, and the counts
+  # after the restore take seconds. When a drill finishes, its receipt's
+  # restore_seconds and restored_bytes are the number to resize both from.
+  activeDeadlineSeconds: 18000
+  # A FINISHED drill waits here for read-restore-drill, a second request:
+  # a day, not the tree's one-hour floor, because the TTL deletes the pod
+  # and its log, and a 4 h restore can finish in the night. Within the
+  # bound every_job_bounds_its_finished_history.rs holds (1 h to 7 d).
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: {app: boss-restore-drill}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        boss.dev/purpose: database
+      imagePullSecrets:
+        - {name: forgejo-registry}
+      initContainers:
+        # The same selection and validation check-gcs-backup runs, in the
+        # uploader's own image, keeping the verified bytes on the claim.
+        # Root, as the uploader's leg is: its key is mounted 0400.
+        - name: fetch
+          image: google/cloud-sdk:alpine
+          command: ["/google-cloud-sdk/platform/bundledpythonunixmusl/bin/python3", "/drill/gcs-readback.py", "/scratch/dump.sql.gz"]
+          env:
+            - {name: CLOUDSDK_CONFIG, value: /tmp/gcloud}
+            - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {memory: 2Gi}
+          volumeMounts:
+            - {name: gcs-key, mountPath: /gcs, readOnly: true}
+            - {name: scripts, mountPath: /drill, readOnly: true}
+            - {name: scratch, mountPath: /scratch}
+            - {name: work, mountPath: /work}
+            - {name: tmp, mountPath: /tmp}
+      containers:
+        # The dump's own image (boss-backup.yaml's pg_dump), so its psql
+        # reads every line that pg_dump wrote; major version 16, the
+        # system of record's (boss.yaml's postgres:16).
+        - name: restore
+          image: $BOSS_FORGE_REGISTRY_HOST/david/postgres:16-alpine
+          command: ["/bin/sh", "/drill/restore-drill.sh"]
+          env:
+            - name: LIVE_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: boss-secrets, key: database-url}}
+            # The inner deadline (see activeDeadlineSeconds above); the
+            # verb reads this line too and refuses a backstop below it.
+            - {name: DRILL_RESTORE_DEADLINE_S, value: "14400"}
+          # Root only to own its directories on the claim; every server
+          # command drops to the image's postgres user (su-exec).
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"], add: ["CHOWN", "SETUID", "SETGID"]}
+          resources:
+            requests: {cpu: "2", memory: 2Gi}
+            limits: {memory: 8Gi}
+          volumeMounts:
+            - {name: scripts, mountPath: /drill, readOnly: true}
+            - {name: scratch, mountPath: /scratch}
+      volumes:
+        - name: gcs-key
+          secret: {secretName: boss-gcs-offsite, defaultMode: 0400}
+        - name: scripts
+          configMap: {name: boss-restore-drill, defaultMode: 0444}
+        - name: work
+          emptyDir: {medium: Memory, sizeLimit: 64Mi}
+        - name: tmp
+          emptyDir: {medium: Memory, sizeLimit: 64Mi}
+        - name: scratch
+          ephemeral:
+            volumeClaimTemplate:
+              metadata:
+                labels: {app: boss-restore-drill}
+              spec:
+                accessModes: [ReadWriteOnce]
+                storageClassName: longhorn-restore-drill
+                resources:
+                  # The dump and the database restored from it. Longhorn
+                  # provisions thin; the claim is gone with the pod.
+                  # Checked for 24fd49e7's 7.5 GB dump (a1cbd16c): the dump
+                  # file, a restored copy of a database whose live claim
+                  # boss.yaml declares at 20Gi, and max_wal_size 8GB fit
+                  # with room; restored_bytes on the receipt re-checks it.
+                  requests: {storage: 100Gi}

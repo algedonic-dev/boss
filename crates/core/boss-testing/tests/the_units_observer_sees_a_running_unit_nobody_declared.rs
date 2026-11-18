@@ -39,8 +39,22 @@ use std::process::Command;
 /// `STUB_LIST=fail` (systemctl refuses).
 const SYSTEMCTL: &str = r#"#!/bin/sh
 if [ "$1" = "list-units" ]; then
+    printf '%s\n' "$@" > "$STUB_DIR/list-args"
     case "${STUB_LIST:-ml-api}" in
     fail) echo "Failed to connect to bus: No such file or directory" >&2; exit 1 ;;
+    forge)
+        echo "forge-converge.timer loaded active waiting converge"
+        echo "forge-netboot-http.service loaded active running netboot"
+        echo "estate-observe-units.service loaded activating start observer"
+        echo "forge-unplanned.service loaded active running unplanned"
+        echo "cluster-unplanned.timer loaded activating start unplanned"
+        echo "boss-ops-runner-wake.service loaded active running retired-runner"
+        echo "ssh.service loaded active running unrelated"
+        exit 0 ;;
+    orchard)
+        echo "orchard-unplanned.service loaded active running unplanned"
+        echo "forge-unrelated.service loaded active running unrelated"
+        exit 0 ;;
     esac
     echo "boss-gcp-converge.timer loaded active waiting BOSS: converge this host"
     echo "boss-estate-observe-units.service loaded activating start BOSS: observe this host's units"
@@ -106,6 +120,7 @@ impl Host {
         );
         let mut cmd = Command::new("sh");
         cmd.arg(repo_root().join("infra/estate/observe-units.sh"))
+            .current_dir(&self.dir)
             .env("PATH", path)
             .env("HOST_ID", "boss-gcp")
             .env("JOBS_API", "http://jobs.test:7900")
@@ -170,6 +185,101 @@ fn a_running_unit_the_roster_does_not_declare_rides_the_observation() {
 }
 
 #[test]
+fn the_forge_scans_its_installer_families_instead_of_only_boss_units() {
+    let host = Host::new("forge-families");
+    std::fs::write(host.dir.join("forge-local-file"), "not a unit").unwrap();
+    let installer = repo_root().join("infra/forge/install.sh");
+    let run = host.observe(&[
+        ("HOST_ID", "forge"),
+        ("BOSS_NODE_ROLES", "ops-runner"),
+        ("OBSERVE_UNITS_INSTALLER", installer.to_str().unwrap()),
+        ("STUB_LIST", "forge"),
+    ]);
+    assert_eq!(run.rc, 0, "{}", run.text);
+    let node = host.node();
+    assert_eq!(
+        node["undeclared_units"],
+        json!([
+            {"unit":"forge-unplanned.service", "active_state":"active", "sub_state":"running"},
+            {"unit":"cluster-unplanned.timer", "active_state":"activating", "sub_state":"start"}
+        ]),
+        "installer families include unprefixed forge units; declared, excluded and unrelated units stay out: {node}"
+    );
+    let args = std::fs::read_to_string(host.dir.join("list-args")).unwrap();
+    for pattern in ["boss-*", "forge-*", "cluster-*"] {
+        assert_eq!(
+            args.lines().filter(|arg| *arg == pattern).count(),
+            1,
+            "{pattern}: {args}"
+        );
+    }
+    assert_eq!(node["healthy"], true, "{node}");
+}
+
+#[test]
+fn a_retired_runner_stays_visible_after_the_forge_loses_its_role() {
+    let host = Host::new("forge-without-runner-role");
+    let installer = repo_root().join("infra/forge/install.sh");
+    let run = host.observe(&[
+        ("HOST_ID", "forge"),
+        ("BOSS_NODE_ROLES", "cluster-operator"),
+        ("OBSERVE_UNITS_INSTALLER", installer.to_str().unwrap()),
+        ("STUB_LIST", "forge"),
+    ]);
+    assert_eq!(run.rc, 0, "{}", run.text);
+    let node = host.node();
+    assert_eq!(
+        node["undeclared_units"],
+        json!([
+            {"unit":"forge-unplanned.service", "active_state":"active", "sub_state":"running"},
+            {"unit":"cluster-unplanned.timer", "active_state":"activating", "sub_state":"start"},
+            {"unit":"boss-ops-runner-wake.service", "active_state":"active", "sub_state":"running"}
+        ]),
+        "removing the role must not hide a runner that is still active: {node}"
+    );
+    assert_eq!(
+        node["healthy"], true,
+        "undeclared units remain paperwork: {node}"
+    );
+    let args = std::fs::read_to_string(host.dir.join("list-args")).unwrap();
+    assert_eq!(
+        args.lines().filter(|arg| *arg == "boss-*").count(),
+        1,
+        "{args}"
+    );
+}
+
+#[test]
+fn a_new_installer_family_enters_the_scan_without_an_observer_edit() {
+    let host = Host::new("new-family");
+    let infra = host.dir.join("source/infra");
+    let source = infra.join("custom");
+    boss_testing::create_dir(&source);
+    for extension in ["service", "timer"] {
+        std::fs::write(source.join(format!("orchard-watch.{extension}")), "fixture").unwrap();
+    }
+    let installer = source.join("install.sh");
+    write_exec(
+        &installer,
+        "#!/bin/sh\ncase \"$1\" in\nrows) echo orchard-watch:custom;;\nroster) echo 'in-role orchard-watch';;\nbeyond-rows) :;;\n*) exit 2;;\nesac\n",
+    );
+    let run = host.observe(&[
+        ("OBSERVE_UNITS_INSTALLER", installer.to_str().unwrap()),
+        ("STUB_LIST", "orchard"),
+    ]);
+    assert_eq!(run.rc, 0, "{}", run.text);
+    let node = host.node();
+    assert_eq!(
+        node["undeclared_units"],
+        json!([{"unit":"orchard-unplanned.service", "active_state":"active", "sub_state":"running"}]),
+        "the custom installer supplies the scope, including filtering another host's family: {node}"
+    );
+    let args = std::fs::read_to_string(host.dir.join("list-args")).unwrap();
+    assert!(args.lines().any(|arg| arg == "orchard-*"), "{args}");
+    assert!(!args.lines().any(|arg| arg == "forge-*"), "{args}");
+}
+
+#[test]
 fn a_host_running_only_its_roster_reports_an_empty_undeclared_list() {
     let host = Host::new("clean");
     let run = host.observe(&[("STUB_LIST", "clean")]);
@@ -213,5 +323,32 @@ fn a_hand_run_with_its_own_units_makes_no_undeclared_claim() {
     assert!(
         node.get("undeclared_units").is_none() && node.get("undeclared_unread").is_none(),
         "a hand list is not the declaration, so nothing outside it is undeclared: {node}"
+    );
+}
+
+/// boss-gcp runs an ops-request runner and deliberately NO waker (backlog
+/// 2eae38d4): its runner starts through the root tree's launcher, which
+/// holds the tree's shared lock for the life of what it starts, and a
+/// waker never exits — so `install-ops-runner.sh` installs none there.
+/// The observer asks the same predicate, so it watches the runner's pair
+/// and not a waker that would read not-found every five minutes.
+#[test]
+fn boss_gcp_watches_its_runner_and_no_waker_it_never_installs() {
+    let host = Host::new("no-waker");
+    let run = host.observe(&[("STUB_LIST", "clean")]);
+    assert_eq!(run.rc, 0, "{}", run.text);
+    let node = host.node();
+    let watched: Vec<&str> = node["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|u| u["unit"].as_str())
+        .collect();
+    for runner in ["boss-ops-runner.timer", "boss-ops-runner.service"] {
+        assert!(watched.contains(&runner), "{runner}: {node}");
+    }
+    assert!(
+        !watched.contains(&"boss-ops-runner-wake.service"),
+        "boss-gcp installs no waker, so it must not watch one: {node}"
     );
 }

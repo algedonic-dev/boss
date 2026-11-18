@@ -25,7 +25,7 @@ import { exitFailed, failedChecks, NOT_YET_EXIT, stampAt, type JobLite, type Ste
 /** How many signals the panel shows. */
 export const SIGNALS_SHOWN = 10;
 
-export type SignalWho = 'conductor' | 'dispatcher' | 'gate-runner' | 'ops-runner' | 'operator';
+export type SignalWho = 'unread' | 'conductor' | 'dispatcher' | 'gate-runner' | 'ops-runner' | 'operator' | 'sweeper' | 'reclaimer' | 'broker' | 'projector' | 'watchdog' | 'converge' | `rule:${string}`;
 
 export type Signal = Readonly<{
   id: string;
@@ -151,6 +151,21 @@ function gateSignals(j: JobLite): Signal[] {
 }
 
 function opsSignals(j: JobLite): Signal[] {
+  const who = maintenanceWho(j);
+  if (who === null && j.kind.startsWith('maintenance-')) {
+    const at = closedAt(j) ?? openedAt(j) ?? j.opened_at;
+    return at ? [{ id: `${j.id}:who-unread`, at, who: 'unread', what: `${j.kind} · WHO unread`, sev: 'warn', hand: false, packetId: j.id }] : [];
+  }
+  if (who !== null) {
+    return (j.steps ?? []).flatMap((step): Signal[] => {
+      const at = stampAt(step);
+      if (step.status !== 'completed' || at === null) return [];
+      const code = str(stepMd(step).exit_code);
+      return [{ id: `${j.id}:${step.spec_slug ?? step.title}`, at, who,
+        what: `${j.title} · ${step.title}${code === null ? '' : ` · exit ${code}`}`,
+        sev: exitFailed(code) ? 'err' : code === String(NOT_YET_EXIT) ? 'warn' : 'ok', hand: false, packetId: j.id }];
+    });
+  }
   const m = md(j);
   const verb = str(m.verb) ?? 'request';
   const host = str(m.host) ?? '?';
@@ -188,6 +203,28 @@ function opsSignals(j: JobLite): Signal[] {
     out.push({ id: `${j.id}:execute`, at: answeredAt, who: 'ops-runner', what, sev, hand: false, packetId: j.id });
   }
   return out;
+}
+
+/** Exact declared packet kinds, never words guessed from a packet's title. */
+export const MAINTENANCE_WHO: Readonly<Record<string, SignalWho>> = {
+    'maintenance-disk-floor-sweep': 'sweeper', 'maintenance-sweep': 'sweeper',
+    'maintenance-dev-scratch-reclaim': 'reclaimer', 'maintenance-files-gc': 'reclaimer',
+    'maintenance-reap-ci-jobs': 'reclaimer', 'maintenance-machine-token-push': 'broker',
+    'maintenance-views-catchup': 'projector', 'maintenance-cluster-watchdog': 'watchdog',
+    'maintenance-cluster-converge': 'converge', 'maintenance-forge-converge': 'converge',
+    'maintenance-boss-gcp-converge': 'converge',
+};
+
+function maintenanceWho(job: JobLite): SignalWho | null {
+  const declared = MAINTENANCE_WHO[job.kind];
+  if (declared) return declared;
+  const rule = str(md(job).spawned_by_rule);
+  return job.kind.startsWith('maintenance-') && rule !== null ? `rule:${rule}` : null;
+}
+
+/** Routine activity is opt-in; failures and hand intervention always remain visible. */
+export function visibleSignals(signals: readonly Signal[], routine: boolean): readonly Signal[] {
+  return routine ? signals : signals.filter((signal) => signal.hand || signal.sev !== 'ok');
 }
 
 /** The newest `limit` signals across every source, by instant. */

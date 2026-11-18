@@ -1,0 +1,36 @@
+# ---------------------------------------------------------------------------
+# executive — the one human's desk (T2 of design 4b27a65a, backlog
+# 3f58c823; handoff section 1 and its question "/executive: station or
+# role?" — a station, so the one real bottleneck is one place).
+#
+# Every human step in the factory is hosted here by hand-off. The queues
+# that are a human's today stand in it: the design review and its
+# decided board, the landed cars that owe their review, the operator's
+# task station and the watchlist (proposal section 6).
+#
+# A CONTAINER, NOT A QUEUE: the tagged predicate holds no packet (see
+# algedonic.toml); its children are the queues. It allocates nothing yet:
+# people:platform-admin is a roster read with no observation, and an
+# unknown capacity cannot be allocated from (handoff section 5: "0
+# reserved; 1 floating per human step"). To change this station, bump
+# `version`.
+#
+# Version 2 (backlog 85cb2103, design c4854fd4; bumped from the LIVE
+# newest, v1): `line = "executive"`, so its card rail and every station
+# under it stay night ink. Nothing else changed.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "executive"
+version = 2
+status = "active"
+title = "Executive — the human steps"
+kind = "group"
+discipline = ["priority", "age"]
+id = "5f922a2a-31f5-4f07-acf1-41dc140687a4"
+parent = "00b04483-90c6-46b9-b911-8e19d2a0b410"
+mode = "standing"
+line = "executive"
+
+[station.predicate]
+tags_any = ["station:executive"]

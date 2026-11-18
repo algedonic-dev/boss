@@ -26,16 +26,13 @@ import { VENDOR_CRAWL_PATH } from '../fixtures/vendor';
 export const ROUTES: ReadonlyArray<string> = [
   // User Experiences perspective — bare / is the public home alias; the
   // operator surfaces are re-rooted under /ux/*.
-  '/', '/ux/me', '/ux/inbox', '/ux/jobs', '/ux/accounts', '/ux/vendors', '/ux/people', '/ux/parts',
+  '/', '/ux/me', '/ux/inbox', '/ux/jobs', '/ux/accounts', '/finance/vendors', '/ux/people', '/ux/parts',
   // e9c8e28d: focused specs already open VendorPage; shared crawls need
   // their own answered representative of the same native detail route.
   VENDOR_CRAWL_PATH,
   //6d6f88bd separates Finance detail availability from Vendors. These
   // concrete addresses open the catalog's native route-field patterns.
-  '/ux/purchase-orders/po-review', '/ux/vendor-invoices/bill-review',
-  // Approved company orientation (d4dada70, 2026-10-02): real registry
-  // regions, one connected IT example. All shared crawls exercise it.
-  '/map',
+  '/finance/purchase-orders/po-review', '/finance/vendor-invoices/bill-review',
   // An employee's page — the persona's own row, which _smokeMocks.ts
   // seeds at EMPLOYEE_DETAIL (backlog 1a83fe98). Until then only
   // employee-page-roster-read.mocked.spec.ts checked what it says when
@@ -43,7 +40,7 @@ export const ROUTES: ReadonlyArray<string> = [
   '/ux/people/emp-001',
   '/ux/products', '/ux/shipping', '/ux/assets', '/ux/catalog',
   '/ux/marketing-assets', '/ux/marketing-assets/ma-1', '/ux/calendar/me',
-  '/ux/support', '/ux/service', '/ux/qa', '/ux/hr', '/ux/sales',
+  '/ux/support', '/ux/service', '/ux/qa', '/ux/sales',
   '/ux/shop', '/ux/manual',
   // The executive overview — DEFERRED until 2026-09-27 for `.find` /
   // `.length` over object-shaped summaries. Page audit a1d62870 moved
@@ -56,7 +53,7 @@ export const ROUTES: ReadonlyArray<string> = [
   // 3f964c57, backlog e0732f75). Under the empty leg every statement
   // answers its well-formed empty body; under the outage, Overview's
   // two failure lines wear the marker.
-  '/ux/finance',
+  '/finance',
   // The IT department — six surfaces, families as tabs (1f6d55e0).
   // /system is GONE (David's Q1/Q4: no legacy users, no redirects), so
   // this list crawls exactly what the catalog declares and nothing
@@ -145,7 +142,7 @@ export const ROUTES: ReadonlyArray<string> = [
   // catch-all; the manual renders its docs chrome with the fetch
   // failing honestly. Both pin chrome + no-crash, same bar as every
   // other row.
-  '/hr',
+  '/people/hr',
   '/manual',
   // The estate page under the mock's catch-all: every /api/estate/*
   // fetch fails or reads empty, and the page's whole design is that
@@ -201,6 +198,9 @@ export const RETIRED_ROUTES: ReadonlyArray<string> = [
   '/it/yard/receiving', '/it/yard/marshalling', '/it/crew',
   '/it/operate/receiving', '/it/operate/marshalling', '/it/operate/yard-status',
   '/it/operate/conductor', '/it/design/feedback', '/it/design/backlog', '/it/design/codebase',
+  // The department floor (backlog 858e62aa, 2026-11-08): the recursive
+  // station view at /it/tree is the surface it was a flat copy of.
+  '/it/floor/hosting',
 ];
 
 /// Routes the crawls cannot cover yet, each with why. Shrinking this

@@ -1,6 +1,13 @@
 # The cluster is the system: three planes, one operator
 
-**Status**: in-review — the target architecture for internalizing BOSS's
+**Status**: decided direction, awaiting its fold (re-statused
+2026-11-18, backlog 924de432). No reader holds its open questions: they
+were never filed on a design packet, and Q1 is answered in place (the
+second stack was retired on 2026-09-15). Its topic belongs to
+`docs/architecture-decisions.md` §Deployment, the forge, and the
+cluster, which fold car 79d0040f is editing, so this file is folded,
+or its still-open questions re-filed as a packet, after that car lands.
+Originally: the target architecture for internalizing BOSS's
 own operations, decided by David 2026-09-03 ("I want the conductor
 moved... everything that can be part of the cluster should be part of
 the cluster. boss-gcp is for bastion and public website access. The

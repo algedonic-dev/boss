@@ -3,10 +3,19 @@
 [![CI](https://github.com/algedonic-dev/boss/actions/workflows/ci.yml/badge.svg)](https://github.com/algedonic-dev/boss/actions/workflows/ci.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/algedonic-dev/boss/badge)](https://scorecard.dev/viewer/?uri=github.com/algedonic-dev/boss)
 
+**BOSS is open-source software for one coordination problem: how
+to use a limited set of assets, plus a work force of people,
+robots and automatons, to perform complex jobs.** Its answer is to
+break every complex job into simple steps, write down exactly what
+each step needs and how to tell it is done, and then, as each step
+comes up, reserve the right resources and the right executor for
+it — and keep a record that proves what happened.
+
 > ⚠ **Preliminary release.** An early, opinionated cut shared to
-> get reactions to the idea — direct-modeling, the four primitives
-> (Subjects, Jobs, Steps, Events), the human-plus-agents executor
-> model. A prototype that proves the shape, not a stable product:
+> get reactions to the idea — the coordination model below (resource
+> pools, executors, jobs of simple steps, stations, protocols, an
+> audit record), run by people and AI agents together. A prototype
+> that proves the shape, not a stable product:
 > APIs, schemas, and registry contracts will move before the first
 > non-preliminary tag. Expect rough edges — half-built surfaces,
 > wired-but-unsurfaced code, intentional `TODO`s
@@ -18,10 +27,130 @@
 > designer's direction (who has read the whole tree); expect the
 > odd quirk.
 >
-> **The audit log is load-bearing, not the code.** It's the
+> **The audit record is load-bearing, not the code.** It's the
 > event-sourced system of record, third-party-verifiable without
 > running any BOSS software (the [five-property correctness
 > protocol](docs/design/correctness-protocol.md)).
+
+## The coordination problem
+
+Every organization that does real work has the same problem. It has
+**constrained assets** — vessels, machines, floor space, servers,
+stock on the shelf, money — and a **work force** to use them with:
+people, and more and more often software that can do part of the
+work itself. It has to put the two together to get **complex jobs**
+done: brew today's batch, fill an order, hire a brewer, ship a
+change to its software. No single person can hold all of that in
+their head, so the real plan usually lives in spreadsheets, chat
+threads and whoever happens to remember.
+
+BOSS models the problem with eight things:
+
+- **Resource pools** — the constrained assets. A pool is something
+  work draws on: hours on the brewhouse, a fermenter, CPU and memory
+  on a server, kegs in the warehouse, a daily budget. Some of it
+  comes back when the work ends (a vessel, a CPU), some is used up
+  (malt, disk space), and some is spent (dollars).
+- **Executors** — whoever or whatever does the work, and there are
+  exactly three kinds: a **human**; a **robot**, meaning an AI
+  agent; and an **automaton**, meaning ordinary deterministic
+  software. People are pool capacity too: a role has as many people
+  as the roster says, and every human step waits on one of them.
+- **Jobs**, made of **steps**. A job is one bounded piece of work.
+  It is broken into simple steps, and each step names what it
+  needs — which kind of executor, which resources — and ends with an
+  objective test that says it is done.
+- **Protocols** — the exact instructions a job follows: which steps,
+  in what order, under what conditions, with each step's completion
+  test. A protocol is versioned data, not code, and a job stays on
+  the version it started under, so changing how the company works
+  is publishing a new version.
+- **Stations** — just a place to temporarily reserve the right
+  resources and executors to do a step according to its protocol.
+  A station holds a share of the pools, given to it by the station
+  above it, and seats the executors who work there.
+- **Machines** — software set up at a station to support the work
+  there: a controller, a test runner, a dispatcher that routes
+  waiting steps. A machine serves its station; it never takes a step
+  itself.
+- **The audit record** — every change, written down once and never
+  edited: each job opened, each step claimed and finished, each
+  reservation, release and wait. Every screen, report and ledger in
+  BOSS is computed from it, which is how BOSS proves what happened
+  rather than asserting it.
+
+### A worked example
+
+The demo tenant is a brewery, Algedonic Ales. Its daily brewing job,
+shortened and written in those terms:
+
+| Step | Executor | Needs | Done when |
+|---|---|---|---|
+| 1. Check demand | automaton | — | the brew-or-skip decision is recorded with the stock figures behind it |
+| 2. Plan the brew | human: senior brewer | — | the recipe and batch size are set |
+| 3. Mash in | human: brewer | the brewhouse; 196 bags of pale malt and the rest of the grain bill | the ingredients have left inventory |
+| 4. Boil | human: brewer | the brewhouse | the boil is logged and the gravity measured |
+| 5. Ferment | human: brewer | one fermenter, for seven days | the yeast is pitched and the vessel named |
+| 6. Check quality | human: QA technician | — | pH, final gravity and the microbial test are inside tolerance |
+| 7. Package | human: packaging crew | the packaging line; empty kegs | the kegs are counted into finished stock |
+
+When step 3 comes up, the brewhouse station — which holds the
+brewhouse and seats the brewing crew — reserves the brewhouse for
+it. A brewer claims the step, does the work and records the result.
+When the completion test passes, the station releases the brewhouse
+and the protocol makes step 4 ready. If the brewhouse is still busy
+with yesterday's batch, step 3 waits, and the record says what it is
+waiting on. If the quality check fails, the protocol opens a hold job
+for the batch instead of sending it to packaging.
+
+Nobody had to decide who does what next: the protocol and the pools
+did. And the record now holds the whole batch — who did each step,
+on which vessel, how much malt left inventory, what the gravity read
+— written as it happened, not reconstructed afterwards. Inventory,
+cost of goods and the dashboards are all computed from that same
+record. (The full job is the demo's `morning-brew` protocol, in
+[`examples/brewery/seeds/workflows.toml`](examples/brewery/seeds/workflows.toml).)
+
+### Stations form a tree
+
+Stations nest. The company is the root station and holds every
+constraint: all the hardware, the whole roster, the budget. Each
+station below it is defined by what its parent gives it — a
+department gets a share, a standing station inside the department
+(the brewhouse, the packaging line) gets a share of that, and a
+station can be set up for a single step and released afterwards. No
+station can be given more than its parent holds, so nothing is
+double-booked. When nothing is free, the step waits, and the record
+names the constraint it is waiting on — so the constraint that work
+waits on most is a number you can read, and the one worth buying
+more of. Reorganizing — a new department, moving capacity between
+two — is editing station rows, not code.
+
+BOSS's own development runs the same way: coding agents are robot
+executors, the build servers are pools, and every change is tested
+at a standing station with a fixed number of seats, so a change
+that finds them full waits its turn. Read further:
+
+- [docs/design/factory-taxonomy-v2.md](docs/design/factory-taxonomy-v2.md)
+  — the eight primitives and the rules that connect them.
+- [docs/design/station-tree.md](docs/design/station-tree.md) — the
+  tree applied to the company that builds BOSS: which stations
+  exist, what each holds, who owns which protocol.
+- [docs/design/the-three-layers.md](docs/design/the-three-layers.md)
+  — the reading frame (below).
+
+**Where the code stands.** This model is the decided design, and
+the code is moving onto it one file at a time. BOSS's own
+development is where the station tree is first being put to work;
+the brewery demo still runs its jobs without stations of its own,
+so the example above is the model's reading of it, not yet its
+configuration. BOSS's first model named four primitives —
+Subjects, Jobs, Steps and Events — and the source still uses those
+names in many places: a *Workflow* is a protocol, the *event log*
+(`audit_log`) is the audit record, and a *Subject* is the thing a
+job is about (an account, an asset, an employee).
+
+## Why
 
 **BOSS exists to help the people running a business operate it
 better — and to make the basic software that running a business
@@ -30,10 +159,7 @@ enterprise stack.** Beer Open Source Software for System
 Modeling, named in tribute to **Stafford Beer**, the British
 cybernetician whose work on the Viable System Model and Project
 Cybersyn shaped how I thought about modeling organizations while
-designing BOSS. Event-sourced and network-shaped: **the network is
-the substrate, the fat protocols dictate the current operating
-model, the actors run it** — built around describing real-world
-organizations directly.
+designing BOSS.
 
 **The thesis: a reasonably-sized business — a brewery, a
 device-refurb shop, a dental practice, a 200-tech field-service
@@ -50,45 +176,48 @@ reconciliation nobody has time for. Each tool holds a partial,
 approximate shadow of the business, and keeping the shadows in
 sync *is* the overhead.
 
-BOSS collapses the patchwork into one model. A **Subject** (an
-account, an asset, an employee), a **Job** (a sale, a service
-visit, a hiring pipeline), a **Step** (a typed transition gated
-by ownership and sign-off), and the **Event** log over all of it
-are one fabric — so an account, the job running against it, and
-the GL entry that job posted cross-reference in a single record.
-Modeling directly, instead of bending the business into generic
-tools, buys three things the patchwork can't:
+BOSS collapses the patchwork into one model. The pools, the
+executors, the jobs, the protocols they follow and the stations
+where they are worked all write to one audit record — so an
+account, the job running against it, and the ledger entry that job
+posted cross-reference in a single record. Modeling directly,
+instead of bending the business into generic tools, buys three
+things the patchwork can't:
 
 - **Fidelity — the model is the business, not an approximation
-  of it.** A Step is a real person signing off; a Job is a real
-  unit of work. The audit log records what the company did in the
+  of it.** A step is a real person signing off; a job is a real
+  unit of work. The audit record holds what the company did in the
   company's own vocabulary, not an analytics derivative
   reconstructed afterward. Operators reason about the software
   the way they reason about the operation, because they're the
   same shape.
 - **Adaptability — the model bends as the business does, in
-  data, not code.** New work types are Workflow rows; new
+  data, not code.** New work types are protocol rows; new
   categories — roles, account tiers, asset models — are registry
-  entries; new step UX is a plugin. Reshaping the model is
-  editing data, not forking a codebase — which is what keeps a
-  small team able to follow the operation as it changes.
+  entries; a reorganization is station rows; new step UX is a
+  plugin. Reshaping the model is editing data, not forking a
+  codebase — which is what keeps a small team able to follow the
+  operation as it changes.
 - **Coherence — one model where a generic stack keeps three.**
-  Sales, work, assets, people, and the ledger share Subjects and
-  one event log, so the cross-system reconciliation that eats
+  Sales, work, assets, people, and the ledger share one audit
+  record, so the cross-system reconciliation that eats
   operational time mostly stops existing.
 
 Underneath, the model is event-sourced and third-party-verifiable
 (above) — replay rebuilds every projection from t=0 — so
 durability, auditability, and a one-policy-gate security posture
 come from the foundation, not from operator discipline. It reads
-in three layers, each replaceable without disturbing the others:
-the **network** is the substrate — packets, the queues that hold
-them, routes, the log, one admission edge — and has no opinion
-about what the work means; the **protocols** are fat and carry the
-meaning, which is why changing how the company works is publishing
-a versioned registry row rather than shipping code; and the
-**actors** — humans plus agents — are the CPUs that run it,
-executing Steps inside the same schema, policy gate, and sign-off
+in three layers, each replaceable without disturbing the others —
+**the network is the substrate, the fat protocols dictate the
+current operating model, the actors run it**
+([the-three-layers.md](docs/design/the-three-layers.md)). The
+**network** is jobs, the stations that hold them until there is
+capacity, the routes between stations, and the record, and it has
+no opinion about what the work means; the **protocols** are fat and
+carry the meaning, which is why changing how the company works is
+publishing a versioned registry row rather than shipping code; and
+the **actors** — the human, robot and automaton executors — run it,
+working steps inside the same schema, policy gate, and sign-off
 rules, never in the request path.
 
 The codebase is structured to be conducive to rapid customization
@@ -133,6 +262,7 @@ stack.
 | If you want to … | Read |
 |---|---|
 | See it in a browser | [Quick start](#quick-start) below — `docker compose up` |
+| Understand the coordination model | [docs/design/factory-taxonomy-v2.md](docs/design/factory-taxonomy-v2.md) — the eight primitives and their rules; [docs/design/station-tree.md](docs/design/station-tree.md) — a worked station tree |
 | Understand the architecture | [docs/architecture-diagram.md](docs/architecture-diagram.md) — four diagrams, conceptual to concrete |
 | Read the BOSS core domain | [CLAUDE.md §Primitives + §Supporting concepts](CLAUDE.md#primitives) |
 | See the public demo tenant | [examples/brewery/DOMAIN.md](examples/brewery/DOMAIN.md) — Algedonic Ales |
@@ -148,8 +278,8 @@ stack.
 The workspace splits into four tiers (see CLAUDE.md):
 
 - **Core state-machine OS** — `crates/core/`. The generic primitives every deployment uses:
-  Subjects, Jobs, Steps, the audit log + projection rebuilders,
-  the Workflow / StepType / StepPlugin registries, policy,
+  jobs and their steps, the audit log + projection rebuilders,
+  the protocol (Workflow) / StepType / StepPlugin registries, policy,
   gateway/auth/NATS, calendar, and the two taxonomy registries.
   Tenant-neutral.
 - **Company-modeling layer** — `crates/modules/`. Useful for modeling a company on top of the core:
@@ -287,7 +417,7 @@ script, full mode, on every publish PR
 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)), beside the
 CodeQL and Scorecard security scans — so its green check means the tree
 passed the gate, not only that static analysis found nothing. It gates
-nothing: trains merge on the forge. Every merged train converges the cluster on its own
+nothing: changes merge on the internal forge. Every merge converges the cluster on its own
 (the forge builds the image for the merge sha and rolls it;
 [`docs/runbooks/operator.md`](docs/runbooks/operator.md) §Deploy).
 

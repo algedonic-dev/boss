@@ -227,9 +227,9 @@ Two deliberate non-targets, recorded so passes don't re-open them:
 - `employees.skill_level` is **not a Class** — it's a numeric range
   (1..=5), not a closed enum, so its CHECK stays.
 - `employees.location` resolves to the **Location primitive**, not a
-  Class: `WorkLocation::{Hq, Remote, Field}` becomes an FK into a
-  `locations` table with hierarchy + geo + timezone (see TODO.md),
-  not a `classes` row.
+  Class: a Location id in the `locations` registry (`boss-locations`,
+  with hierarchy + geo + timezone), which `boss-people` validates on
+  every write (`validate_location`), not a `classes` row.
 
 `accounts.account_type` has its CHECK dropped, `account_type` Class
 rows seeded, and the `accounts.rs` write path validates it against the

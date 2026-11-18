@@ -39,7 +39,7 @@
   import AccountDrillDown from './AccountDrillDown.svelte';
   import EntryDetail from './EntryDetail.svelte';
 
-  // The entry a link opened: /ux/finance?entry=<id> (NewJournalEntryPage
+  // The entry a link opened: /finance?entry=<id> (NewJournalEntryPage
   // lands there after a post; entity-href's ledger-entry kind) or
   // ?fact=<id> (entity-href's fact kind), resolved to the entry that
   // fact posted. Empty is none; an entry wins over a fact (2ab44d55).

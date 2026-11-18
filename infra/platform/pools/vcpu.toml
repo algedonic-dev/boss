@@ -1,0 +1,10 @@
+# v2 (backlog 84f570a1): `capacity_from` says where the capacity number
+# comes from, for the console to show beside it (station-tree.md section 3).
+[[pool]]
+name = "vcpu"
+version = 2
+status = "active"
+unit = "vCPU"
+kind = "flow"
+capacity = { state = "unknown" }
+capacity_from = 'Unknown, and not a constraint: one vCPU pool summed across boxes is a HUD number, because a reservation is only real on one box (station-tree.md section 3); the capacity of each box is its host:<node> pool.'

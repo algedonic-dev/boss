@@ -97,7 +97,7 @@ async function openHr(page: Page, people: (r: Route) => Promise<void>): Promise<
     json(r, { data: [job('job-leave', 'offboarding', 'emp-david')], total: 1 }));
   await page.route(/\/api\/jobs\/job-hire\/steps$/, (r) => json(r, [step('s-hire', 'Issue a laptop')]));
   await page.route(/\/api\/jobs\/job-leave\/steps$/, (r) => json(r, [step('s-leave', 'Return the laptop')]));
-  await mountPage(page, '/hr');
+  await mountPage(page, '/people/hr');
 }
 
 const title = (page: Page) => page.locator('.exec-title');

@@ -133,6 +133,24 @@ export type HeldCar = Readonly<{
    *  cannot read, or an older server. Optional so the rows other lenses
    *  build (the floor's fixtures) need not invent one. */
   release?: ReleaseDecision | null;
+  /** The release rule's own record of why it LEFT this car held — the
+   *  door's refusal, as the door said it (`boss_jobs::yard::AutoRelease`,
+   *  backlog 60993cda). A held car the rule tried and failed to release
+   *  must not look like one nobody tried. `null` when the rule never
+   *  refused it, or on an older server. */
+  auto_release?: AutoRelease | null;
+}>;
+
+/** `boss_jobs::yard::AutoRelease`: the rule that releases a held car on
+ *  its reviewer's verdict, saying why it did not. */
+export type AutoRelease = Readonly<{
+  /** The reviewer's run the rule asked about. */
+  review: string | null;
+  outcome: string | null;
+  why: string;
+  /** The rule, as `automation:rule:<name>`. */
+  by: string | null;
+  at: string | null;
 }>;
 
 /** `boss_jobs::car_release::Decision`, as the server states it. Nothing
@@ -593,7 +611,28 @@ function parseRedTrains(raw: unknown): number | undefined {
 function parseHeldCar(raw: unknown): HeldCar {
   const o = asObjectOrEmpty(raw);
   const reason = typeof o.reason === 'string' && o.reason !== '' ? o.reason : 'no reason recorded';
-  return { ...parseDockCar(raw), reason, release: parseReleaseDecision(o.release) };
+  return {
+    ...parseDockCar(raw),
+    reason,
+    release: parseReleaseDecision(o.release),
+    auto_release: parseAutoRelease(o.auto_release),
+  };
+}
+
+/** The release rule's record, or `null` when the server stated none. A
+ *  record with no readable `why` is still a record: it is shown, said as
+ *  unreadable, rather than dropped (the server does the same). */
+export function parseAutoRelease(raw: unknown): AutoRelease | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const o = raw as Record<string, unknown>;
+  const str = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null);
+  return {
+    review: str(o.review),
+    outcome: str(o.outcome),
+    why: str(o.why) ?? 'an unreadable release-rule record',
+    by: str(o.by),
+    at: str(o.at),
+  };
 }
 
 /** The server's decision, or `null` when it stated none. `releasable`
@@ -632,11 +671,21 @@ export function releasableHeld(held: readonly HeldCar[]): readonly HeldCar[] {
   return held.filter(h => h.release?.releasable === true && h.release.review !== null);
 }
 
-/** The exact body the yard's Release control posts to the door. It names
- *  the review it rests on and nothing else: the head is the one the
- *  hold was placed at, and `by` is the session the API authenticated. */
-export function releaseBody(d: ReleaseDecision): Readonly<{ review: string }> | null {
-  return d.review === null ? null : { review: d.review };
+/** What the yard's Release control posts: the review it rests on, and
+ *  the hold the row SHOWED — its reason and the head it was placed at —
+ *  so the door lifts that hold or refuses (review 792b871a N1). A hold
+ *  rewritten between the 15 s read and the click is refused, never
+ *  lifted on a review that did not judge it. No head (the door judges
+ *  at the hold's) and no actor (the session the API authenticated). */
+export type ReleaseBody = Readonly<{
+  review: string;
+  hold: Readonly<{ reason: string; sha: string | null }>;
+}>;
+
+export function releaseBody(h: HeldCar): ReleaseBody | null {
+  const d = h.release;
+  if (d === null || d === undefined || d.review === null) return null;
+  return { review: d.review, hold: { reason: h.reason, sha: d.head } };
 }
 
 /** Did the reviewer answer "no" on its SAFE TO RELEASE WITHOUT DAVID

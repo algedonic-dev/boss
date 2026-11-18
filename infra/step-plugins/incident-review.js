@@ -28,7 +28,10 @@
 // raw JSON. `sectionsFor` below is a deliberate near-copy of
 // apps/web/src/it/incidents/postMortemDoc.ts — plugins are standalone
 // JS bundles by design (no imports from the SPA), so the ordering is
-// duplicated. Change one, change both.
+// duplicated. apps/web/src/it/incidents/postMortemDoc.pin.test.ts reads
+// this file's KNOWN_LABELS, READING_ORDER and PLUMBING literals and fails,
+// naming the entry, when one drifts from the page's (backlog 3b9544e1).
+// Keep them single-quoted literals: the pin refuses text it cannot parse.
 //
 // WHY A NEW KIND AND NOT A PLUGIN ON `task`. Plugins register by step
 // kind and the SPA mounts by kind; registering for `task` would hijack
@@ -237,10 +240,16 @@
   }
 
   // Plumbing keys that are not findings: authority gating and trigger
-  // bookkeeping, plus agent hand-off records.
+  // bookkeeping, plus agent hand-off records, plus the protocol's own
+  // declarations on the review and terminal steps (human_only,
+  // outcome_kind — added with the post-mortem archive's copy of this
+  // set, backlog 434b6e0d). The same set as `PLUMBING` in
+  // apps/web/src/it/incidents/postMortemDoc.ts, held equal by its
+  // postMortemDoc.pin.test.ts (backlog 3b9544e1).
   const PLUMBING = new Set([
     'authority_role', 'trigger_kind', 'trigger_name',
     'agent_requested_at', 'agent_requested_by',
+    'human_only', 'outcome_kind',
   ]);
 
   function sectionNode(s) {

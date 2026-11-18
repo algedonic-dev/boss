@@ -426,7 +426,12 @@ def io_delta(before, after, major_minor):
 
 
 # These native projections deliberately do not export Pod env/args or secrets.
-PODS = r'jsonpath={"continue\t"}{.metadata.continue}{"\n"}{range .items[*]}{.metadata.name}{"\t"}{.metadata.uid}{"\t"}{.status.phase}{"\t"}{.spec.nodeName}{"\t"}{.metadata.ownerReferences[?(@.controller==true)].kind}{"\t"}{.metadata.ownerReferences[?(@.controller==true)].name}{"\t"}{.metadata.ownerReferences[?(@.controller==true)].uid}{"\t"}{.status.containerStatuses[?(@.name=="gate")].containerID}{"\t"}{.status.containerStatuses[?(@.name=="gate")].restartCount}{"\n"}{end}'
+# The gate container's identity is read from EITHER status list: on the
+# judged-init layout `gate` is an init container (backlog 3e2c8ddc; design
+# b4bf8bba). Exactly one of the two lists names it, so the pair prints one
+# value; a pod naming `gate` in both prints two run together, which the
+# containerd:// shape check in cohort() refuses rather than guess.
+PODS = r'jsonpath={"continue\t"}{.metadata.continue}{"\n"}{range .items[*]}{.metadata.name}{"\t"}{.metadata.uid}{"\t"}{.status.phase}{"\t"}{.spec.nodeName}{"\t"}{.metadata.ownerReferences[?(@.controller==true)].kind}{"\t"}{.metadata.ownerReferences[?(@.controller==true)].name}{"\t"}{.metadata.ownerReferences[?(@.controller==true)].uid}{"\t"}{.status.initContainerStatuses[?(@.name=="gate")].containerID}{.status.containerStatuses[?(@.name=="gate")].containerID}{"\t"}{.status.initContainerStatuses[?(@.name=="gate")].restartCount}{.status.containerStatuses[?(@.name=="gate")].restartCount}{"\n"}{end}'
 JOBS = r'jsonpath={"continue\t"}{.metadata.continue}{"\n"}{range .items[*]}{.metadata.name}{"\t"}{.metadata.uid}{"\t"}{.metadata.labels.boss\.dev/packet}{"\n"}{end}'
 
 

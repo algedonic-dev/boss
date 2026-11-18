@@ -710,9 +710,14 @@ test.describe('/ux/jobs — the new-job form', () => {
     expect(seen.writes[0]!.method()).toBe('POST');
     expect(new URL(seen.writes[0]!.url()).pathname).toBe('/api/jobs');
     expect(body['opened_on']).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    // A custom subject is {subject_kind, id}, the shape every kind
+    // takes: boss_core::job::Subject has no other. This spec pinned
+    // {custom_kind, ref_id} until backlog a8844a57, a body the jobs API
+    // refuses 422 for want of `id`, so the form could file no custom-
+    // subject Job while its mocked spec stayed green.
     expect({ ...body, opened_on: 'today' }).toEqual({
       kind: 'page-audit',
-      subject: { subject_kind: 'custom', custom_kind: 'custom', ref_id: '/ux/vendors' },
+      subject: { subject_kind: 'custom', id: '/ux/vendors' },
       title: 'Page audit — /ux/vendors',
       owner_id: 'emp-001',
       status: 'open',

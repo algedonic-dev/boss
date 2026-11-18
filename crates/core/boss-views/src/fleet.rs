@@ -6,7 +6,7 @@
 //! active), how much of it is unassigned and claimable, which
 //! authority-role lens each pile belongs to, and how long the oldest
 //! wait has run. A hot node here is a deep queue: this is the
-//! algedonic depth signal from queue-visibility Q4 rendered as data
+//! algedonic depth signal from queue-visibility Q4 (now in the decision record) rendered as data
 //! the overlay can draw (feedback `9fe2fe66`, scope change 1 — the
 //! threshold/telemetry half is change 2, gated on the Q4 decision).
 //!

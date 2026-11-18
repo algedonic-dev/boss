@@ -100,7 +100,11 @@ impl Repo {
             .current_dir(&self.0)
             // The fixture has only `main`; naming it keeps the test
             // independent of any remote-tracking ref.
-            .env("BOSS_TRUNK_REF", "main");
+            .env("BOSS_TRUNK_REF", "main")
+            // The public mirror runs this suite with BOSS_TRUNK=none
+            // declared (backlog 2d28df78), refused beside the ref above;
+            // every case here is a car that has a trunk.
+            .env_remove("BOSS_TRUNK");
         for (k, v) in env {
             cmd.env(k, v);
         }

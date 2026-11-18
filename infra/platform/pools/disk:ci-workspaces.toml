@@ -1,0 +1,22 @@
+# v4 (backlog 5ece507d, conductor order 20261106_0829Z): reclaimer_kind
+# names the packet kind the reclaimer's runs file, the key its last run is
+# read by — the kind infra/forge/reap-dead-ci-jobs.service hands the
+# maintenance wrap. It carries v3's `station = "forge-ci"` (backlog
+# c9b9bacc): the equipment station whose runner's job workspaces this
+# stock is, so the operations floor binds the two (the pool station
+# field, backlog 56efd9c2). v4 over the live v3: a changed row bumps from
+# the live newest, and republishing writes the station onto the claims
+# read without a projection rebuild.
+# v5 (backlog 84f570a1): `capacity_from` says where the capacity number
+# comes from, for the console to show beside it (station-tree.md section 3).
+[[pool]]
+name = "disk:ci-workspaces"
+version = 5
+status = "active"
+unit = "GiB"
+kind = "stock"
+reclaimer = "infra/forge/reap-dead-ci-jobs.sh"
+reclaimer_kind = "maintenance-reap-ci-jobs"
+capacity = { state = "unknown" }
+capacity_from = 'Unknown until an observer publishes it: the workspace disk of the forge CI runner; no observer writes it into this row yet. The stock is recovered by its reclaimer, infra/forge/reap-dead-ci-jobs.sh.'
+station = "forge-ci"

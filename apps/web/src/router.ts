@@ -8,11 +8,12 @@
 import { safeSitePath } from '@boss/web-kit/links';
 import { readFinanceView, type FinanceView } from './finance/financeQuery';
 import { departmentLanding } from './shell/nav-catalog';
+import { treeQuery } from './it/tree/station-tree';
+import { stationOfPath } from './it/tree/station-page';
 
 export type Route =
   /// The landing page (the System Model live view), at /ux/system-model.
   | { kind: 'home' }
-  | { kind: 'companyMap' }
   /// A path nothing in the app answers — rendered in place, naming the
   /// path as it was asked for (design ee3a3a2f). `department` is set
   /// only by the registry check (sections.ts `withRoster`): the path is
@@ -113,7 +114,20 @@ export type Route =
   /** The Department Map — the IT landing (design e765b3fc, car N1): the
    *  map on top, and below it the detail of `at`, the station the query
    *  selects (`/it?at=gates`). Absent, nothing is selected. */
-  | { kind: 'systemYard'; at?: string; overview?: true; detail?: true }
+  | { kind: 'systemYard'; at?: string }
+  // 'systemConsole' (/it/console) retired with the transit map (R3,
+  // backlog 23a4b4d7): its review screen read the floor at a past
+  // sequence, and the visuals show real, current activity only (David,
+  // 2026-11-08 00:50Z).
+  /** The station tree floor (T7 of design 4b27a65a, backlog 94a9dad4):
+   *  one card drawn recursively from the tree read under `under` (an id
+   *  or a name; absent, the root), `depth` levels deep, with the
+   *  recorded moves riding it. Additive: the Department Map stays. */
+  | { kind: 'systemTree'; under?: string; depth?: number }
+  /** The station page (design c4854fd4 E2, backlog 72d58e00): what
+   *  opening one station shows — its constraints, its parts, In /
+   *  Working / Out — at /it/tree/<name>. */
+  | { kind: 'systemStation'; station: string }
   // 'systemYardFloor' (/it/yard/<region>), 'systemCrew' (/it/crew),
   // 'systemYardStatus', 'systemMonitoringConductor', 'systemFeedback'
   // and 'systemBacklog' retired 2026-09-25 with car N3 of design
@@ -219,7 +233,10 @@ export function notFoundBack(pathname: string, department?: string): { href: str
 export function parseRoute(pathname: string, search = ''): Route {
   const raw = routable(pathname);
   if (raw === '/login') return { kind: 'login' };
-  if (raw === '/map') return { kind: 'companyMap' };
+  // '/map' (the flat company map, backlog 759da6bc) and
+  // '/it/floor/<code>' (the department floor, 858e62aa) retired 2026-11-09:
+  // the recursive root station view (/it/tree) is the company index;
+  // both addresses now fall through to notFound.
 
   // ===== The IT department — /it/* =====
   //
@@ -251,9 +268,12 @@ export function parseRoute(pathname: string, search = ''): Route {
       const r: Route = { kind: 'systemYard' };
       const at = new URLSearchParams(search).get('at');
       if (at) (r as { at?: string }).at = at;
-      if (new URLSearchParams(search).get('view') === 'overview') (r as { overview?: true }).overview = true;
-      if (r.overview && new URLSearchParams(search).get('detail') === '1') r.detail = true;
       return r;
+    }
+    if (p === '/tree') return { kind: 'systemTree', ...treeQuery(search) };
+    if (p.startsWith('/tree/')) {
+      const station = stationOfPath(p.slice('/tree/'.length));
+      if (station !== null) return { kind: 'systemStation', station };
     }
     // 2. Operate — incidents lead; audit/perf/atlas/bottlenecks tabs.
     if (p === '/operate') return { kind: 'incidents' };
@@ -314,6 +334,34 @@ export function parseRoute(pathname: string, search = ''): Route {
   // invoice, job or employee for a department that has all three.
   const deptJobsM = unprefixed ? p.match(/^\/([^/]+)\/jobs$/) : null;
   if (deptJobsM) return { kind: 'department', code: segment(deptJobsM[1]!) };
+  // ===== Finance — its pages under its own address (car 4 of design
+  // 8c3e9599, backlog c7ef4728; design deba3000: a page belongs to the
+  // station that hosts it, and the URL is that station's address). Each
+  // detail page sits under its slug, never /finance/<id>. Matched on
+  // `raw`, never on `p`: the /ux spellings (/ux/finance, /ux/vendors,
+  // /ux/purchase-orders/<id>, /ux/vendor-invoices/<id>) and the
+  // unprefixed ones they shadowed retired with no alias and no redirect
+  // (David, 2026-09-25: no shims before 1.0.0), so each falls to
+  // not-found below. /finance/jobs is the department view above.
+  if (raw === '/finance') return { kind: 'finance', view: readFinanceView(search) };
+  // ===== Engineering — its station page at its own address (backlog
+  // 950ad972, David 2026-11-12: "As a test, I would love to see this
+  // under /engineering too"; design deba3000: pages live in their
+  // station). The same page as /it/tree/engineering, which stays.
+  // Matched on `raw`, like /finance: /ux/engineering is not this page.
+  if (raw === '/engineering') return { kind: 'systemStation', station: 'engineering' };
+  if (raw === '/finance/invoices/new') return { kind: 'newInvoice' };
+  if (raw === '/finance/journal-entries/new') return { kind: 'newJournalEntry' };
+  // Wildcard after /invoices/new, which it would otherwise eclipse.
+  const invM = raw.match(/^\/finance\/invoices\/([^/]+)$/);
+  if (invM) return { kind: 'invoice', invoiceId: segment(invM[1]!) };
+  if (raw === '/finance/vendors') return { kind: 'vendors' };
+  const vm = raw.match(/^\/finance\/vendors\/([^/]+)$/);
+  if (vm) return { kind: 'vendor', vendorLookup: segment(vm[1]!) };
+  const poM = raw.match(/^\/finance\/purchase-orders\/([^/]+)$/);
+  if (poM) return { kind: 'po', poId: segment(poM[1]!) };
+  const viM = raw.match(/^\/finance\/vendor-invoices\/([^/]+)$/);
+  if (viM) return { kind: 'vendorInvoice', vendorInvoiceId: segment(viM[1]!) };
   // User Experiences lands on My Day by default — the actor's personal
   // work view, not a marketing landing.
   //
@@ -336,10 +384,12 @@ export function parseRoute(pathname: string, search = ''): Route {
   const cm = p.match(/^\/accounts\/([^/]+)$/);
   if (cm) return { kind: 'account', accountId: segment(cm[1]!) };
 
-  if (p === '/vendors') return { kind: 'vendors' };
-  const vm = p.match(/^\/vendors\/([^/]+)$/);
-  if (vm) return { kind: 'vendor', vendorLookup: segment(vm[1]!) };
-
+  // Car 5 of 8c3e9599: HR belongs to People. Match the native address
+  // before the employee wildcard; retired addresses have no aliases.
+  if (raw === '/people/hr') return { kind: 'hr' };
+  if (raw === '/hr' || raw === '/ux/hr' || raw === '/ux/people/hr') {
+    return { kind: 'notFound', path: pathname };
+  }
   if (p === '/people') return { kind: 'people' };
   const em = p.match(/^\/people\/([^/]+)$/);
   if (em) return { kind: 'employee', empId: segment(em[1]!) };
@@ -353,14 +403,6 @@ export function parseRoute(pathname: string, search = ''): Route {
   }
   const prodM = p.match(/^\/products\/([^/]+)$/);
   if (prodM) return { kind: 'product', productSku: segment(prodM[1]!) };
-
-  if (p === '/finance') return { kind: 'finance', view: readFinanceView(search) };
-  if (p === '/finance/new') return { kind: 'newInvoice' };
-  if (p === '/finance/journal-entries/new') return { kind: 'newJournalEntry' };
-  // Wildcard MUST come after every specific `/finance/X` case above —
-  // it matches any one-segment tail and would otherwise eclipse /new.
-  const invM = p.match(/^\/finance\/([^/]+)$/);
-  if (invM) return { kind: 'invoice', invoiceId: segment(invM[1]!) };
 
   if (p === '/shipping') return { kind: 'shipping' };
   const shipM = p.match(/^\/shipments\/([^/]+)$/);
@@ -387,10 +429,6 @@ export function parseRoute(pathname: string, search = ''): Route {
   // `(.+)` on purpose: a manual slug may hold a slash (see above).
   const mManual = p.match(/^\/manual\/(.+)$/);
   if (mManual) return { kind: 'manualSection', slug: segment(mManual[1]!) };
-  const poM = p.match(/^\/purchase-orders\/([^/]+)$/);
-  if (poM) return { kind: 'po', poId: segment(poM[1]!) };
-  const viM = p.match(/^\/vendor-invoices\/([^/]+)$/);
-  if (viM) return { kind: 'vendorInvoice', vendorInvoiceId: segment(viM[1]!) };
   if (p === '/watchlist') return { kind: 'watchlist' };
   if (p === '/shop') return { kind: 'shop' };
   const shopM = p.match(/^\/shop\/([^/]+)$/);
@@ -401,7 +439,6 @@ export function parseRoute(pathname: string, search = ''): Route {
     return { kind: 'search', q: sp.get('q') ?? '' };
   }
 
-  if (p === '/hr') return { kind: 'hr' };
   if (p === '/qa') return { kind: 'qa' };
 
   if (p === '/service') return { kind: 'service' };

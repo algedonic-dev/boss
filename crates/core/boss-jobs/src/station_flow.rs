@@ -1,6 +1,13 @@
 //! Legacy distinct-step flow, explicitly requested as `step-events`.
-//! The default packet-membership basis is [`crate::membership_replay`];
+//! The default basis is `step-window-v1`, counted over the step stamps
+//! (design 7b8ed079, which also retired the packet-membership replay);
 //! eligible Steps and packet crossings are different units.
+//!
+//! ITS ONE READER is `GET /api/stations/flow?basis=step-events`. The IT
+//! map read it too, until item ab09f1af's car 2 (2026-10-20) moved the
+//! marshalling region onto the membership basis: every station of the
+//! shapes below drew `?` there, while the membership reader could count
+//! them. The map's two-window pass over this cube went with it.
 //!
 //! `GET /api/stations/load` already answers depth and the age of the
 //! oldest packet, and its own header says why that is not enough:

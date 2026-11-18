@@ -4,7 +4,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use boss_core::{
-    job::{Job, Priority, Step, StepField, StepStatus, Subject},
+    job::{Job, Step, StepField, StepStatus},
     port::EventBus,
     publisher::DomainPublisher,
 };
@@ -19,50 +19,40 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use tower::ServiceExt;
 
-async fn build_app(allowed: bool) -> (Router, Arc<InMemoryJobs>, Job, Step) {
-    let mut policy = FakePolicyClient::builder();
-    if allowed {
-        policy = policy.allow("service-tech", Action::Update, Resource::step(), Scope::All);
+#[path = "support/first_record_fixture.rs"]
+mod first_record_fixture;
+use first_record_fixture::{
+    build_app, build_app_with_policy, build_app_with_roster, post, post_as,
+};
+
+#[tokio::test]
+async fn operational_timing_is_separate_from_a_refused_first_records_command_state() {
+    use boss_core::request_latency::{Recorder, RecorderError, Sample};
+    struct Timings(std::sync::Mutex<Vec<Sample>>);
+    #[async_trait::async_trait]
+    impl Recorder for Timings {
+        async fn record(&self, samples: &[Sample]) -> Result<(), RecorderError> {
+            self.0.lock().unwrap().extend_from_slice(samples);
+            Ok(())
+        }
     }
-    build_app_with_policy(Arc::new(policy.build())).await
-}
-
-async fn build_app_with_policy(
-    policy: Arc<dyn boss_policy_client::PolicyClient>,
-) -> (Router, Arc<InMemoryJobs>, Job, Step) {
-    build_app_with_roster(policy, None).await
-}
-
-async fn build_app_with_roster(
-    policy: Arc<dyn boss_policy_client::PolicyClient>,
-    roster: Option<Arc<dyn boss_jobs::owner_resolution::RosterLookup>>,
-) -> (Router, Arc<InMemoryJobs>, Job, Step) {
-    let jobs = Arc::new(InMemoryJobs::new());
-    let job = Job::new(
-        "user-feedback",
-        Subject::new("custom", "record-control"),
-        "Record evidence",
-        "emp-1",
-        Priority::Standard,
-        chrono::NaiveDate::from_ymd_opt(2026, 10, 4).unwrap(),
+    let sink = Arc::new(Timings(std::sync::Mutex::new(Vec::new())));
+    first_record_fixture::assert_refusal_is_unchanged(
+        sink.clone(),
+        Arc::new(boss_clock_client::wall_now),
+    )
+    .await;
+    let recorded = sink.0.lock().unwrap();
+    let recorded = recorded
+        .iter()
+        .filter(|s| s.class != boss_core::request_latency::Class::Recording)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the separate operational sensor still receives the refusal"
     );
-    jobs.create_job(&job).await.unwrap();
-    let mut step = Step::new(job.id, "task", "Record", 0);
-    step.status = StepStatus::Active;
-    jobs.add_step(&step).await.unwrap();
-    let bus = RecordingEventBus::new();
-    let bus_dyn: Arc<dyn EventBus> = bus.clone();
-    let state = JobsApiState {
-        roster,
-        ..JobsApiState::minimal(
-            jobs.clone(),
-            bus,
-            DomainPublisher::new(bus_dyn, "jobs"),
-            policy,
-            Arc::new(boss_clock_client::WallClockClient),
-        )
-    };
-    (router(state), jobs, job, step)
+    assert_eq!(recorded[0].status, 422);
 }
 
 struct ActiveEmployees(Vec<&'static str>);
@@ -238,42 +228,6 @@ async fn first_record_policy_outage_reads_nothing_and_narrowed_scope_writes_noth
             .get("evidence")
             .is_none()
     );
-}
-
-async fn post(app: &Router, job: &Job, step: &Step, body: Value) -> (StatusCode, Value) {
-    post_as(app, job, step, body, "emp-1").await
-}
-
-async fn post_as(
-    app: &Router,
-    job: &Job,
-    step: &Step,
-    body: Value,
-    actor: &str,
-) -> (StatusCode, Value) {
-    let user = json!({"id":actor,"role":"service-tech","access_tier":"user","territory_account_ids":[],"direct_report_ids":[],"department":"service"});
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!(
-                    "/api/jobs/{}/steps/{}/metadata/records",
-                    job.id, step.id
-                ))
-                .header("content-type", "application/json")
-                .header("x-boss-user", user.to_string())
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = response.status();
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-    )
 }
 
 #[tokio::test]
@@ -1038,6 +992,32 @@ mod rejection_count_controls {
             self.calls.lock().unwrap().push("update_job_at");
             self.inner.update_job_at(job, read, now, events).await
         }
+        async fn update_job_expecting_at(
+            &self,
+            job: &Job,
+            read: JobStatus,
+            expect: Option<&serde_json::Map<String, serde_json::Value>>,
+            now: DateTime<Utc>,
+            events: &[boss_core::event::Event],
+        ) -> Result<(), JobsError> {
+            self.calls.lock().unwrap().push("update_job_at");
+            self.inner
+                .update_job_expecting_at(job, read, expect, now, events)
+                .await
+        }
+        async fn merge_job_metadata_expecting_at(
+            &self,
+            id: &JobId,
+            patch: &serde_json::Map<String, serde_json::Value>,
+            judged_on: Option<&Job>,
+            expect: Option<&serde_json::Map<String, serde_json::Value>>,
+            stamp: &boss_core::publisher::EventStamp,
+        ) -> Result<Job, JobsError> {
+            self.calls.lock().unwrap().push("merge_job_metadata_at");
+            self.inner
+                .merge_job_metadata_expecting_at(id, patch, judged_on, expect, stamp)
+                .await
+        }
         async fn merge_job_metadata_at(
             &self,
             id: &JobId,
@@ -1071,6 +1051,20 @@ mod rejection_count_controls {
         ) -> Result<(Job, usize), JobsError> {
             self.calls.lock().unwrap().push("append_step_correction_at");
             self.inner.append_step_correction_at(id, entry, stamp).await
+        }
+        async fn append_input_classification_at(
+            &self,
+            id: &JobId,
+            entry: &serde_json::Value,
+            stamp: &boss_core::publisher::EventStamp,
+        ) -> Result<(Job, usize), JobsError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("append_input_classification_at");
+            self.inner
+                .append_input_classification_at(id, entry, stamp)
+                .await
         }
         async fn list_estate_nodes(&self) -> Result<Vec<EstateNode>, JobsError> {
             self.calls.lock().unwrap().push("list_estate_nodes");

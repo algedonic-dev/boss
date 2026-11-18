@@ -1,0 +1,55 @@
+# A car the dock stopped re-gating — its re-gate red twice in a row on the
+# same check — returns its item's build to the item's station with the
+# failing check attached, where any build seat pulls it as that car's
+# repair (backlog 8f3d731a).
+#
+# WHAT HAPPENED. The dock re-gated garaged car aab5f34e red nine times in
+# a row, 23:16Z on 2026-11-17 to 10:11Z on 2026-11-18 (3237b597, 33f1a846,
+# 3ab67062, 2499c4b7, b6be7263, 12a37f2c, cab20ea0, 4dc20491, 8e820f5d),
+# every time on `test` and the same pin — about three hours of gate time on a car
+# that could not pass without a code change. The garage (backlog 2fccbfd6)
+# stopped only the same-head retry; each main move was one more fresh
+# base. And nothing turned the repeat into a repair: the red-gate return
+# (`a-red-gate-returns-the-build-to-its-station`) frees the build of a run
+# a red gate ENDED, and a dock re-gate ends no run. The drain session
+# dispatched the repair by hand (run 37fd4a74).
+#
+# WHAT IT DOES. The conductor now stops at the second red in a row that
+# names a check the red before it named — on a main move too — and
+# writes the car's re-gate red `returned` (`boss_jobs::dock_red`). On that
+# write the handler reads the car as it stands and asks the repair door's
+# facts of it: open, the returned red standing at the head its stamp
+# holds, and an item named as `backlog_item`. Then the item's `build`, by
+# the CHANGES return's own plan (`jobs_changes_return_the_build`): an
+# ACTIVE build whose run edge names no OPEN run goes back to `ready` and
+# nobody's, judged on the edge as read, and a READY one gets the note
+# alone. The note is the red-gate return's carry shape — `returned_for_red`
+# with the red as `gate_run: {id, branch}` — plus the failing `checks`, the
+# head and the main; the next builder's brief prints it verbatim.
+#
+# WHAT IT LEAVES. A red the dock still retries, a car closed or re-gating
+# another head, a car answering a `partial_item` or no item, an item or
+# build not open, and a build whose run edge names an open run — a repair
+# already running, or the builder's own run still unreported. Each is
+# logged; none is written. The conductor writes a hold only when it
+# changes, so a returned red fires this once; a build left for an open
+# run is the door's to reach by hand (`boss dispatch <item>` admits a
+# garaged dock red as the car's repair).
+[[rule]]
+name = "a-dock-red-returns-the-build-to-its-station"
+why = """
+A CROSS-PROTOCOL REACTOR: the conductor's write on a `ship-a-change` car
+moves a step on another packet, the `backlog-item` the car answers. Two
+protocols, and the fact is the conductor's, so no single Workflow
+definition can declare it. Measured 2026-11-18 (backlog 8f3d731a): car
+aab5f34e was re-gated red nine times on the same check, about three
+hours of gate time, and its repair was dispatched by hand because the item's
+build stood active on the coordinator. The reaction is a return to the
+station, never a nomination; the repair door (`boss dispatch`) judges
+the repair when a build seat pulls it.
+"""
+version = 1
+on_event = "jobs.job.updated"
+when = 'kind = "ship-a-change" AND metadata.base_regate.red.returned = true'
+[[rule.do]]
+handler = "jobs.dock_red_returns_the_build"

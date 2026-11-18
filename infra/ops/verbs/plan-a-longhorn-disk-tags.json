@@ -1,0 +1,28 @@
+{
+  "about": "READ-ONLY: renders what `set-longhorn-disk-tags` WOULD do to set the tags of ONE Longhorn disk a worker already has, and does nothing (infra/forge/longhorn-disk-tags.sh --plan <node> <disk> <tags>; backlog aa650aaf, measured on origin/main 6b2bd7c48 2026-11-12: design 3c475a19 needs w-3's u-postgres tagged durable,postgres, u-data durable and every default disk durable before car 4 selects with diskSelector [postgres], and no door wrote a disk's tags — add-longhorn-disk always writes [] and reregister-longhorn-disk re-adds the tags it found). It runs every bound the write runs — the node is one the estate registry declares, not retired, as a talos-worker with one IPv4 address, and the cluster agrees on its address and carries no control-plane label; the disk is already in the node's nodes.longhorn.io spec.disks, named u-<volume> at exactly /var/mnt/<volume> (what add-longhorn-disk places) or the node's ONE default-disk-<hex> at exactly /var/lib/longhorn; the tags are one of the script's fixed spellings, durable, durable,postgres, scratch, or none for the untagged disk (design 3c475a19's vocabulary; a scratch disk is never durable, a postgres disk always is); Longhorn reads the node Ready=True and the disk Ready=True and Schedulable=True with a diskUUID; the disk does not already carry those tags; and no replicas.longhorn.io on the disk (by diskID, or by node and path) belongs to a volume whose diskSelector the new tags would no longer hold, because Longhorn moves nothing when tags change — and then prints the plan: the node, its address, role and Node uid, the Longhorn node's disks now (spec only), the disk with its path and diskUUID, its tags now and after, the replica verdict, the value Longhorn's allow-empty-disk-selector-volume was read at (read, never assumed: false, a tagged disk takes no replica of a volume with no diskSelector, so such a replica on the disk strands and is refused), every volume with a replica on the disk and its diskSelector, what placement the tags change, the one compare-and-set patch, and the read-back. No clock, no live free space and no replica count in the bytes (they ride stderr); its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1). Every read goes through the forge's ops_kubectl door; a read that could not look is CANNOT ANSWER (exit 1), never a plan. Any refusal renders no plan (exit 78). Timeout 300: the registry read (15 s), a bounded first pull of the door's image (120 s), and the Node, Longhorn node, allow-empty-disk-selector-volume setting, replica and volume reads (20-30 s each; 275 s at worst).",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/longhorn-disk-tags.sh",
+    "--plan",
+    "{1}",
+    "{2}",
+    "{3}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    {
+      "name": "disk",
+      "pattern": "^(u-[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?|default-disk-[0-9a-f]+)$"
+    },
+    {
+      "name": "tags",
+      "pattern": "^[a-z]+(,[a-z]+){0,2}$"
+    }
+  ],
+  "timeout": 300
+}

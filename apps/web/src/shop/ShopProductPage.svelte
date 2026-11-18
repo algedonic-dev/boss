@@ -79,6 +79,7 @@
   let submitting = $state(false);
   let submittedJobId = $state<string | null>(null);
   let error = $state<string | null>(null);
+  let orderWarnings = $state<ReadonlyArray<string>>([]);
 
   let canSubmit = $derived.by(() => {
     if (!product) return false;
@@ -94,6 +95,7 @@
     if (!product || !canSubmit) return;
     submitting = true;
     error = null;
+    orderWarnings = [];
     try {
       const todayIso = appToday();
       // The buyer gets a durable home first (boss-customers, Q4b):
@@ -164,9 +166,9 @@
       // shipment-done; commerce.invoice.issue on billing-done)
       // see them in step metadata. Job.metadata.line_items is not
       // automatically copied into step metadata by
-      // materialize_steps. Best-effort: failure here just means
-      // the operator clicks the step open and pastes line_items
-      // before completing — the Job is still created.
+      // materialize_steps. The Job survives a refused overlay, but
+      // the buyer must see that its processing details need attention
+      // rather than place another order (36132827).
       //
       // The shipment overlay also sets `consumes_products` (the
       // products.consume handler reads this to decrement
@@ -175,7 +177,9 @@
       if (submittedJobId) {
         try {
           const stepsResp = await fetch(`/api/jobs/${submittedJobId}/steps`);
-          if (stepsResp.ok) {
+          if (!stepsResp.ok) {
+            orderWarnings = [`Order saved, but its processing details could not be read (HTTP ${stepsResp.status}).`];
+          } else {
             const steps = (await stepsResp.json()) as Array<{ id: string; kind: string }>;
             const shipmentStep = steps.find((s) => surfaceOf(s.kind) === 'shipment');
             const billingStep = steps.find((s) => surfaceOf(s.kind) === 'billing');
@@ -189,18 +193,24 @@
             // e39a9d2a, Stage 2): the PUT of a spread of the step's
             // metadata re-wrote whatever this page had read of it.
             if (shipmentStep) {
-              await saveStep(submittedJobId, shipmentStep.id, {
+              const shipmentResult = await saveStep(submittedJobId, shipmentStep.id, {
                 metadata: { line_items: lineItems, consumes_products: consumesProducts },
               });
+              if (shipmentResult.kind === 'failed') {
+                orderWarnings = [...orderWarnings, `Order saved, but shipment details could not be saved: ${shipmentResult.error}`];
+              }
             }
             if (billingStep) {
-              await saveStep(submittedJobId, billingStep.id, {
+              const billingResult = await saveStep(submittedJobId, billingStep.id, {
                 metadata: { line_items: lineItems, amount_cents: totalCents },
               });
+              if (billingResult.kind === 'failed') {
+                orderWarnings = [...orderWarnings, `Order saved, but billing details could not be saved: ${billingResult.error}`];
+              }
             }
           }
-        } catch {
-          // Silent — Job is created; metadata overlay is opportunistic.
+        } catch (e) {
+          orderWarnings = [...orderWarnings, `Order saved, but preparing its processing details failed: ${e instanceof Error ? e.message : String(e)}`];
         }
       }
     } catch (e) {
@@ -271,6 +281,9 @@
             packing within one business day. We'll send tracking to
             <strong>{email}</strong> once the keg leaves the cooler.
           </p>
+          {#each orderWarnings as warning}
+            <p class="shop-order-error" role="alert">{warning}</p>
+          {/each}
         </div>
       </div>
     {:else if inStock || !invLoaded || invFailed}

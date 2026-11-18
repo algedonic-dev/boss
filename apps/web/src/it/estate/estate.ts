@@ -21,6 +21,11 @@ import { fetchRemote, type Remote } from '../../data/remote';
 import { sinceText } from '../yard/yard-floor';
 import { journeyText } from '../yard/yard-status';
 
+export type EstateDisk = Readonly<{
+  model: string;
+  size_bytes: number | null;
+}>;
+
 export type EstateNode = Readonly<{
   id: string;
   label: string;
@@ -34,6 +39,9 @@ export type EstateNode = Readonly<{
   cpu: number | null;
   memory_gb: number | null;
   disk_gb: number | null;
+  /** Physical declarations, separate from observed filesystem capacity.
+   * Older readings can name a drive without an exact byte measurement. */
+  disks: readonly EstateDisk[];
   notes: string | null;
   retired: boolean;
 }>;
@@ -80,6 +88,7 @@ export type ComparisonCounts = Readonly<{
    *  it; this is the count that keeps going blind distinguishable from
    *  having room. */
   disk_unmeasured?: number;
+  pvc_declaration_unmeasured?: number;
   /** Observed machines reporting NotReady (ea5e0e8b). The server counts
    *  them since that car; an older row carries only the finding, and
    *  the parser counts that instead. */
@@ -282,7 +291,24 @@ export type VolumeRow = Readonly<{
   unread: string | null;
   requested: string | null;
   capacity_intent: CapacityIntent;
+  standalone_declaration?: Readonly<{ verdict: 'covered' | 'drift' | 'unknown'; text: string }>;
 }>;
+
+function standaloneDeclaration(raw: unknown, id: string): VolumeRow['standalone_declaration'] {
+  if (raw === undefined) return undefined;
+  const unknown = (reason: string): NonNullable<VolumeRow['standalone_declaration']> => ({ verdict: 'unknown', text: `Standalone manifest comparison unknown: ${reason}` });
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return unknown('record malformed');
+  const row = raw as Record<string, unknown>;
+  if (row.verdict === 'unknown') return unknown(typeof row.reason === 'string' ? row.reason : 'declaration or live PVC capacity unread');
+  const declared = byteCount(row.declared_bytes);
+  const live = byteCount(row.live_bytes);
+  if (typeof row.namespace !== 'string' || typeof row.claim !== 'string' || `${row.namespace}/${row.claim}` !== id
+    || typeof row.file !== 'string' || !/^infra\/cluster\/manifests\/[A-Za-z0-9][A-Za-z0-9_.-]*\.yaml$/.test(row.file)
+    || typeof row.line !== 'number' || !Number.isSafeInteger(row.line) || row.line <= 0 || declared === null || live === null
+    || !((row.verdict === 'covered' && live <= declared) || (row.verdict === 'drift' && live > declared))) return unknown('record malformed or contradictory');
+  const verdict = row.verdict === 'drift' ? 'drift' : 'covered';
+  return { verdict, text: `Standalone manifest ${verdict}: ${row.file}:${row.line} declares ${declared} bytes; live PVC ${live} bytes${verdict === 'drift' ? ' — tree write-back owed' : ''}` };
+}
 
 export type CapacityAssignment = Readonly<{
   packet: string;
@@ -351,6 +377,7 @@ export function parseVolumeReadings(raw: unknown): readonly VolumeReading[] {
         unread: str(o.unread),
         requested: str(o.requested),
         capacity_intent: parseCapacityIntent(o.capacity_intent),
+        standalone_declaration: standaloneDeclaration(o.standalone_declaration_comparison, o.id),
       }];
     });
     return [{ observed_at: p.observed_at, observer: str(p.observer) ?? '?', volumes }];
@@ -363,9 +390,10 @@ export function capacityIntentLine(v: VolumeRow): string {
   const c = v.capacity_intent;
   const desired = c.desired_bytes === null ? 'unknown' : `${c.desired_bytes} bytes`;
   const requested = v.requested ?? 'unread';
-  return c.verdict === 'unknown'
+  const line = c.verdict === 'unknown'
     ? `Capacity intent unknown: ${c.reason ?? 'no comparison evidence'} · desired ${desired} · requested ${requested}`
     : `Capacity ${c.verdict}: desired ${desired} · requested ${requested} (${c.requested_bytes} bytes)`;
+  return [line, v.standalone_declaration?.text].filter(Boolean).join(' · ');
 }
 
 /** One claim's line. Unread unless the row carries the comparator's
@@ -644,6 +672,21 @@ function asArray(raw: unknown): readonly unknown[] {
   throw new Error('expected an array or {data: [...]}');
 }
 
+function parseDisks(raw: unknown): readonly EstateDisk[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) throw new Error('estate node disks is not an array');
+  return raw.map((row: unknown) => {
+    if (!row || typeof row !== 'object') throw new Error('estate disk missing model');
+    const disk = row as Record<string, unknown>;
+    if (typeof disk.model !== 'string' || !disk.model.trim()) throw new Error('estate disk missing model');
+    return {
+      model: disk.model,
+      size_bytes: typeof disk.size_bytes === 'number' && Number.isSafeInteger(disk.size_bytes) && disk.size_bytes > 0
+        ? disk.size_bytes : null,
+    };
+  });
+}
+
 export function parseNodes(raw: unknown): readonly EstateNode[] {
   return asArray(raw).map((r) => {
     const o = r as Record<string, unknown>;
@@ -659,6 +702,7 @@ export function parseNodes(raw: unknown): readonly EstateNode[] {
       cpu: typeof o.cpu === 'number' ? o.cpu : null,
       memory_gb: typeof o.memory_gb === 'number' ? o.memory_gb : null,
       disk_gb: typeof o.disk_gb === 'number' ? o.disk_gb : null,
+      disks: parseDisks(o.disks),
       notes: typeof o.notes === 'string' ? o.notes : null,
       retired: o.retired === true,
     };
@@ -710,6 +754,7 @@ export function parseComparisons(raw: unknown): readonly Comparison[] {
         // would render "no drift" over a full build node.
         disk_tight: n('disk_tight'),
         disk_unmeasured: n('disk_unmeasured'),
+        pvc_declaration_unmeasured: n('pvc_declaration_unmeasured'),
         // GAPS 5 AND 6 (ea5e0e8b, c2373cc4): dropped here until
         // 2026-09-27, so a NotReady node and a dispatcher losing dead
         // letters both read "no drift". A row from before the server
@@ -849,6 +894,7 @@ export function comparisonVerdict(c: Comparison): { ok: boolean; text: string } 
   // so "no drift" must not render beside it (a520737f).
   if ((k.disk_tight ?? 0) > 0) problems.push(`${k.disk_tight} short of disk`);
   if ((k.disk_unmeasured ?? 0) > 0) problems.push(`${k.disk_unmeasured} with no free-space reading`);
+  if ((k.pvc_declaration_unmeasured ?? 0) > 0) problems.push(`${k.pvc_declaration_unmeasured} standalone declaration${k.pvc_declaration_unmeasured === 1 ? '' : 's'} unmeasured`);
   // The HARD findings estate.alarm raises on (ea5e0e8b, c2373cc4): a
   // sick declared node (the 2026-09-11 cp-2 + w-1 class) and a
   // dispatcher whose dead letters left no record, or could not be read.

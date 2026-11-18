@@ -24,6 +24,31 @@
 //! `boss` container and read the same read-only Secret mount, named by
 //! [`SESSION_KEY_ENV`]; [`parse_session_key`] is the one reading of that
 //! file's format.
+//!
+//! A TICKET IS SIGNED WITH ITS OWN KEY (backlog 19f00800, design
+//! c22f36c6, decided 2026-09-26). The session cookie is the same
+//! construction — `b64(json).b64(hmac(key, b64(json)))` — and both were
+//! keyed by the session key itself, so a cookie failed as a ticket only
+//! because its JSON lacked `s h n`: a session payload that also carried
+//! them, signed by the session codec, verified as presence. Tickets are
+//! now MAC'd under [`derived_key`]`(session key,`
+//! [`PRESENCE_TICKET_KEY_LABEL`]`)`, so no cookie verifies as a ticket
+//! and no ticket as a cookie, whatever their fields say. The session
+//! cookie stays on the root key, so nobody is signed out; the version
+//! lives in the label rather than on the wire. [`PresenceTicket::encode`]
+//! and [`PresenceTicket::decode`] still take the SESSION key and derive
+//! inside, so no caller can sign a ticket with the root key by mistake.
+//!
+//! WHAT STILL RESTS ON THE ONE CONTAINER. Every service runs as one uid
+//! in the one `boss` container with the key file mounted, so any process
+//! in it can read the session key and mint any gateway session, operator
+//! tier included — a taken-over jobs API among them. Nothing here
+//! changes that; the container is the boundary. The derived key is what
+//! would make a split effective for presence: a jobs API handed only the
+//! ticket key cannot run a one-way derivation backwards. It is not
+//! enough on its own today, because the jobs API also verifies gateway
+//! SESSIONS for signer writes (`boss-jobs` `http/signer.rs`, f623e425)
+//! with the root key, and an HMAC verifier is a signer.
 
 use std::path::PathBuf;
 
@@ -50,6 +75,55 @@ pub const DEFAULT_SESSION_KEY_PATH: &str = "/var/lib/boss-gateway/session.key";
 
 /// The shortest key the file may hold, in bytes.
 pub const MIN_SESSION_KEY_BYTES: usize = 32;
+
+/// The derivation label of the key presence tickets are MAC'd with.
+/// Changing it (to `v2`) invalidates every ticket in flight, and nothing
+/// else — the reason the version lives here and not on the wire.
+pub const PRESENCE_TICKET_KEY_LABEL: &str = "boss presence-ticket v1";
+
+/// The derivation label of the key the gateway's OIDC sign-in state
+/// cookie is MAC'd with (design c22f36c6 item 2: the third format the
+/// session key signed). Every label is spelled here, beside the other,
+/// so two purposes cannot pick the same one unseen.
+pub const OIDC_STATE_KEY_LABEL: &str = "boss oidc-state v1";
+
+/// HMAC-SHA256 over the concatenation of `parts` under `key`.
+fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> Option<Vec<u8>> {
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key).ok()?;
+    parts.iter().for_each(|p| mac.update(p));
+    Some(mac.finalize().into_bytes().to_vec())
+}
+
+/// HKDF-SHA256 (RFC 5869): extract a pseudorandom key from `ikm` under
+/// `salt` (empty means HashLen zeros), then expand `info` to `len` bytes.
+/// `None` past the RFC's bound of 255 blocks. Written on the `hmac` this
+/// crate already uses, pinned by the RFC's own vectors, because the
+/// `hkdf` crate in Cargo.lock is on the older `digest` line and would
+/// pull a second `sha2` into boss-core (design c22f36c6 item 3).
+pub fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Option<Vec<u8>> {
+    const HASH_LEN: usize = 32;
+    let blocks = u8::try_from(len.div_ceil(HASH_LEN)).ok()?;
+    let salt = if salt.is_empty() {
+        &[0u8; HASH_LEN][..]
+    } else {
+        salt
+    };
+    let prk = hmac_sha256(salt, &[ikm])?;
+    let (mut okm, _) = (1..=blocks).try_fold((Vec::new(), Vec::new()), |(okm, prev), i| {
+        let t = hmac_sha256(&prk, &[&prev, info, &[i]])?;
+        Some(([okm, t.clone()].concat(), t))
+    })?;
+    okm.truncate(len);
+    Some(okm)
+}
+
+/// The 32-byte key for one PURPOSE, derived one-way from the session key:
+/// `HKDF-SHA256(salt = none, ikm = session key, info = label)`. Holding it
+/// does not give the session key back, and a MAC under it verifies under
+/// no other purpose's key.
+pub fn derived_key(session_key: &[u8], label: &str) -> Option<Vec<u8>> {
+    hkdf_sha256(&[], session_key, label.as_bytes(), 32)
+}
 
 /// The key file's path, as every reader resolves it.
 pub fn session_key_path() -> PathBuf {
@@ -118,30 +192,36 @@ pub struct PresenceTicket {
 /// passkey-promotion ticket (`crate::passkey_promotion`) is signed with
 /// the same primitive under a domain prefix of its own.
 pub(crate) fn mac(key: &[u8], payload_b64: &str) -> Option<Vec<u8>> {
-    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key).ok()?;
-    mac.update(payload_b64.as_bytes());
-    Some(mac.finalize().into_bytes().to_vec())
+    hmac_sha256(key, &[payload_b64.as_bytes()])
+}
+
+/// The key a ticket is MAC'd with, from the session key.
+fn ticket_key(session_key: &[u8]) -> Option<Vec<u8>> {
+    derived_key(session_key, PRESENCE_TICKET_KEY_LABEL)
 }
 
 impl PresenceTicket {
-    /// `<base64url(json)>.<base64url(hmac_sha256(key, base64url(json)))>`.
-    /// `None` only if the ticket cannot be serialized or keyed, which
-    /// HMAC-SHA256 over a plain struct never is.
-    pub fn encode(&self, key: &[u8]) -> Option<String> {
+    /// `<base64url(json)>.<base64url(hmac_sha256(ticket key, base64url(json)))>`,
+    /// the ticket key derived from `session_key` (module doc). `None` only
+    /// if the ticket cannot be serialized or keyed, which HMAC-SHA256 over
+    /// a plain struct never is.
+    pub fn encode(&self, session_key: &[u8]) -> Option<String> {
         let payload = serde_json::to_vec(self).ok()?;
         let payload_b64 = URL_SAFE_NO_PAD.encode(&payload);
-        let sig_b64 = URL_SAFE_NO_PAD.encode(mac(key, &payload_b64)?);
+        let sig_b64 = URL_SAFE_NO_PAD.encode(mac(&ticket_key(session_key)?, &payload_b64)?);
         Some(format!("{payload_b64}.{sig_b64}"))
     }
 
-    /// The ticket, iff `value` was signed with `key` and is unexpired at
-    /// `now_epoch`. The signature is compared in constant time and
-    /// checked BEFORE the payload is parsed, so nothing an unsigned
-    /// value says is ever read.
-    pub fn decode(value: &str, key: &[u8], now_epoch: u64) -> Option<Self> {
+    /// The ticket, iff `value` was signed with the ticket key derived from
+    /// `session_key` and is unexpired at `now_epoch`. The signature is
+    /// compared in constant time and checked BEFORE the payload is parsed,
+    /// so nothing an unsigned value says is ever read. A value MAC'd with
+    /// the session key itself — every session cookie, and every ticket
+    /// minted before backlog 19f00800 — is refused here.
+    pub fn decode(value: &str, session_key: &[u8], now_epoch: u64) -> Option<Self> {
         let (payload_b64, sig_b64) = value.split_once('.')?;
         let sig = URL_SAFE_NO_PAD.decode(sig_b64).ok()?;
-        let expected = mac(key, payload_b64)?;
+        let expected = mac(&ticket_key(session_key)?, payload_b64)?;
         if expected.ct_eq(&sig).unwrap_u8() != 1 {
             return None;
         }
@@ -208,6 +288,96 @@ mod tests {
         let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&ticket(u64::MAX)).unwrap());
         let made_up = format!("{payload}.{}", URL_SAFE_NO_PAD.encode([0u8; 32]));
         assert!(PresenceTicket::decode(&made_up, KEY, now_epoch()).is_none());
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        hex::decode(s).unwrap()
+    }
+
+    /// RFC 5869 appendix A.1 and A.3 (SHA-256): the derivation is HKDF and
+    /// nothing like it — A.3 is the empty-salt, empty-info form
+    /// [`derived_key`] relies on for its salt.
+    #[test]
+    fn hkdf_is_the_rfc_5869_function() {
+        let okm = hkdf_sha256(
+            &unhex("000102030405060708090a0b0c"),
+            &[0x0b; 22],
+            &unhex("f0f1f2f3f4f5f6f7f8f9"),
+            42,
+        );
+        assert_eq!(
+            okm,
+            Some(unhex(
+                "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+            ))
+        );
+        assert_eq!(
+            hkdf_sha256(&[], &[0x0b; 22], &[], 42),
+            Some(unhex(
+                "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8"
+            ))
+        );
+        assert_eq!(hkdf_sha256(&[], KEY, &[], 255 * 32 + 1), None);
+        assert_eq!(
+            hkdf_sha256(&[], KEY, &[], 255 * 32).map(|k| k.len()),
+            Some(8160)
+        );
+    }
+
+    /// Each purpose has its own key, none of them the session key.
+    #[test]
+    fn every_purpose_derives_its_own_key() {
+        assert_ne!(PRESENCE_TICKET_KEY_LABEL, OIDC_STATE_KEY_LABEL);
+        let ticket = derived_key(KEY, PRESENCE_TICKET_KEY_LABEL).unwrap();
+        let oidc = derived_key(KEY, OIDC_STATE_KEY_LABEL).unwrap();
+        assert_eq!(ticket.len(), 32);
+        assert_ne!(ticket, oidc);
+        assert_ne!(ticket.as_slice(), KEY);
+        assert_ne!(
+            ticket,
+            derived_key(b"other-key", PRESENCE_TICKET_KEY_LABEL).unwrap()
+        );
+    }
+
+    /// THE CUTOVER, stated as a test (backlog 19f00800). A ticket MAC'd
+    /// with the session key itself — every ticket minted before this
+    /// change, and every session cookie — is refused. There is no window
+    /// accepting the old form: accepting it IS accepting a session cookie
+    /// that carries ticket fields, the defect itself, and a ticket lives
+    /// 120 seconds, so the deploy costs a ceremony re-run at most.
+    #[test]
+    fn a_ticket_macd_with_the_bare_session_key_is_refused() {
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&ticket(u64::MAX)).unwrap());
+        let old_form = format!(
+            "{payload}.{}",
+            URL_SAFE_NO_PAD.encode(mac(KEY, &payload).unwrap())
+        );
+        assert!(PresenceTicket::decode(&old_form, KEY, now_epoch()).is_none());
+    }
+
+    /// The reverse hostile case, here because boss-core holds the one
+    /// session verifier (`crate::session_claims::verify`): a payload that
+    /// carries EVERY session field as well as the ticket's, MAC'd as a
+    /// ticket, is no session — refused on its signature.
+    #[test]
+    fn a_ticket_carrying_session_fields_is_not_a_session() {
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "u": "david", "e": u64::MAX, "i": "emp-david", "t": "operator", "ea": 1,
+                "s": "step-1", "h": "hash", "n": "nonce",
+            }))
+            .unwrap(),
+        );
+        let sig = mac(&ticket_key(KEY).unwrap(), &payload).unwrap();
+        let hostile = format!("{payload}.{}", URL_SAFE_NO_PAD.encode(sig));
+        assert!(
+            PresenceTicket::decode(&hostile, KEY, now_epoch()).is_some(),
+            "the fixture is a genuine ticket"
+        );
+        assert_eq!(
+            crate::session_claims::verify(&hostile, KEY, now_epoch()).err(),
+            Some(crate::session_claims::SessionError::BadSignature)
+        );
     }
 
     #[test]

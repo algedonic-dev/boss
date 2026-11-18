@@ -97,7 +97,7 @@ fn execute_station() -> StationSpec {
     let mut s = StationSpec::draft(
         "ops-execute",
         "Ops requests ready to execute",
-        StationKind::Batch,
+        StationKind::Group,
         StationPredicate {
             kind: Some("ops-request".into()),
             step: Some(StepMatch {
@@ -169,17 +169,25 @@ async fn send(app: &Router, method: &str, uri: &str) -> (StatusCode, String) {
 #[tokio::test]
 async fn a_failed_steps_read_fails_the_list_naming_the_packet() {
     let (app, jobs, _) = seed().await;
-    let (status, body) = send(&app, "GET", "/api/jobs?kind=ops-request").await;
-    assert_eq!(status, StatusCode::OK, "control: both readable: {body}");
+    let paths = [
+        "/api/jobs?kind=ops-request",
+        "/api/jobs?kind=ops-request&human_required_view=true",
+    ];
+    for path in paths {
+        let (status, body) = send(&app, "GET", path).await;
+        assert_eq!(status, StatusCode::OK, "control: both readable: {body}");
+    }
 
     jobs.fail_steps_read(&id(UNREADABLE));
-    let (status, body) = send(&app, "GET", "/api/jobs?kind=ops-request").await;
-    assert_eq!(
-        status,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "a row with steps: [] is the row the ops-runner skips: {body}"
-    );
-    assert!(body.contains(UNREADABLE), "names the packet: {body}");
+    for path in paths {
+        let (status, body) = send(&app, "GET", path).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a row with steps: [] is the row the ops-runner skips: {body}"
+        );
+        assert!(body.contains(UNREADABLE), "names the packet: {body}");
+    }
 }
 
 #[tokio::test]

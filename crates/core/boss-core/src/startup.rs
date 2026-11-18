@@ -102,6 +102,76 @@ pub struct Capabilities {
         deserialize_with = "present_or_null"
     )]
     pub schema: Option<Option<Schema>>,
+    /// Whether this process's message bus is connected, READ on each
+    /// `/health` request from every bus the process holds ([`bus_state`]).
+    /// Absent when the process holds no bus. Design ad9519bc part (c),
+    /// backlog 2e45840a: since car 1 a service on a dark bus boots and
+    /// serves from Postgres instead of exiting, so the process looking
+    /// healthy no longer means its events reach anyone — "a degraded
+    /// service must look degraded". It is a FIELD, never the status:
+    /// `status` stays `ok` and the answer stays 200, because a probe that
+    /// failed on the bus would dark the record exactly as the crash did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bus: Option<BusState>,
+}
+
+/// What [`Capabilities::bus`] says about the process's message bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BusState {
+    Connected,
+    Disconnected,
+}
+
+/// A message-bus connection, as `/health` reads it. The bus adapter
+/// implements it (`boss_nats::NatsEventBus` over its client's connection
+/// state) and [`hold_bus`]es it when it is constructed; boss-core cannot
+/// name the adapter, so the adapter names itself here.
+pub trait BusLink: Send + Sync {
+    fn connected(&self) -> bool;
+}
+
+/// Every bus this process holds, weakly: a bus that is dropped stops
+/// counting without anyone deregistering it.
+///
+/// A process-wide value on purpose, like `machine_token::shared`: the
+/// bus is a fact about the process, and the alternative is threading a
+/// handle into each binary's health handler — 16 copies of one field
+/// (CLAUDE.md 9a). The standard [`health_response`] reads it, so every
+/// binary that holds a bus reports it with no change of its own.
+static BUS_LINKS: std::sync::Mutex<Vec<std::sync::Weak<dyn BusLink>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Register a bus for [`bus_state`] to read. The caller keeps the strong
+/// handle; when the last one drops, the bus is forgotten.
+pub fn hold_bus(link: &std::sync::Arc<dyn BusLink>) {
+    // A poisoned lock still holds a usable list: a push never leaves it
+    // half-written.
+    let mut links = BUS_LINKS.lock().unwrap_or_else(|p| p.into_inner());
+    links.retain(|l| l.strong_count() > 0);
+    links.push(std::sync::Arc::downgrade(link));
+}
+
+/// The process's bus, read now: `None` when it holds none.
+pub fn bus_state() -> Option<BusState> {
+    let live: Vec<std::sync::Arc<dyn BusLink>> = {
+        let mut links = BUS_LINKS.lock().unwrap_or_else(|p| p.into_inner());
+        links.retain(|l| l.strong_count() > 0);
+        links.iter().filter_map(std::sync::Weak::upgrade).collect()
+    };
+    judge_bus(live.iter().map(|l| l.connected()))
+}
+
+/// PURE: no bus is `None`; any bus not connected is `Disconnected` — a
+/// process whose second connection is dark is degraded, and saying
+/// `connected` because the first one is up would hide it.
+pub fn judge_bus(connected: impl IntoIterator<Item = bool>) -> Option<BusState> {
+    connected
+        .into_iter()
+        .fold(None, |state, up| match (state, up) {
+            (Some(BusState::Disconnected), _) | (_, false) => Some(BusState::Disconnected),
+            _ => Some(BusState::Connected),
+        })
 }
 
 /// A service's own judgement of its database's migration level against
@@ -151,6 +221,7 @@ impl Capabilities {
             version,
             commit: build_commit(),
             schema: None,
+            bus: bus_state(),
         }
     }
 
@@ -294,6 +365,72 @@ mod schema_field_tests {
                 serde_json::from_str(Box::leak(text.into_boxed_str())).unwrap();
             assert_eq!(back.schema, original.schema);
         }
+    }
+}
+
+#[cfg(test)]
+mod bus_field_tests {
+    use super::{BusLink, BusState, Capabilities, bus_state, hold_bus, judge_bus};
+    use std::sync::Arc;
+
+    struct Fixed(bool);
+    impl BusLink for Fixed {
+        fn connected(&self) -> bool {
+            self.0
+        }
+    }
+
+    #[test]
+    fn a_process_with_no_bus_reports_none() {
+        assert_eq!(judge_bus([]), None);
+    }
+
+    #[test]
+    fn every_bus_connected_reads_connected() {
+        assert_eq!(judge_bus([true, true]), Some(BusState::Connected));
+    }
+
+    #[test]
+    fn one_dark_bus_reads_disconnected() {
+        assert_eq!(judge_bus([true, false]), Some(BusState::Disconnected));
+    }
+
+    #[test]
+    fn the_field_spells_the_two_states_and_is_absent_without_a_bus() {
+        let caps = Capabilities::new("boss-test-api", "0.1.0", "postgres");
+        let with = |bus| {
+            serde_json::to_value(Capabilities {
+                bus,
+                ..caps.clone()
+            })
+            .unwrap()
+        };
+        assert_eq!(with(Some(BusState::Connected))["bus"], "connected");
+        assert_eq!(with(Some(BusState::Disconnected))["bus"], "disconnected");
+        assert!(with(None).get("bus").is_none());
+    }
+
+    /// The ONLY test in this crate that holds a bus, so the registry it
+    /// reads is its own: a held link is read on every call, and a
+    /// dropped one stops counting (the bus that held it is gone).
+    #[test]
+    fn a_held_link_is_read_live_and_a_dropped_one_is_forgotten() {
+        assert_eq!(bus_state(), None, "nothing held yet");
+        let up: Arc<dyn BusLink> = Arc::new(Fixed(true));
+        hold_bus(&up);
+        assert_eq!(bus_state(), Some(BusState::Connected));
+        let dark: Arc<dyn BusLink> = Arc::new(Fixed(false));
+        hold_bus(&dark);
+        assert_eq!(bus_state(), Some(BusState::Disconnected));
+        assert_eq!(
+            Capabilities::new("boss-test-api", "0.1.0", "postgres").bus,
+            Some(BusState::Disconnected),
+            "every health answer reads the registry"
+        );
+        drop(dark);
+        assert_eq!(bus_state(), Some(BusState::Connected));
+        drop(up);
+        assert_eq!(bus_state(), None);
     }
 }
 

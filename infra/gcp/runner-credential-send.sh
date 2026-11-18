@@ -94,7 +94,16 @@ HDRS=(-H "x-boss-user: $(sor_reader_header automation:runner-credential-send)")
 [ -z "$MT_HDR" ] || HDRS+=(-H "$MT_HDR")
 API_CURL="$INFRA/boss-api-curl.sh"
 CODE="$("$API_CURL" -sS "${HDRS[@]}" -o "$WORK/enrollment" -w '%{http_code}' "$BOSS_JOBS_URL/api/jobs/$ENROLLMENT" 2>/dev/null)" || fail
-[ "$CODE" = 200 ] || refuse 'enrollment packet unreadable'
+# Only an answer about the PACKET refuses: the record says it is not
+# there (404) or gone (410). Any other non-200 is the system of record
+# failing (a 5xx, a timeout's 000), which the next tick may clear, so it
+# is a transient failed: line, never the refusal that files a RED item
+# (review bcd12a88 N1, backlog 0afa2351).
+case "$CODE" in
+    200) ;;
+    404 | 410) refuse "enrollment packet $ENROLLMENT not held by the system of record (HTTP $CODE)" ;;
+    *) fail "the enrollment read answered HTTP $CODE" ;;
+esac
 PUBLIC="$(ssh-keygen -y -f "$WORK/key" 2>/dev/null)" || refuse 'enrollment key unreadable'
 PUBLIC="$(printf '%s\n' "$PUBLIC" | awk 'NF >= 2 {print $1 " " $2}')" || refuse 'enrollment key unreadable'
 # WHAT WAS SIGNED IS THE LINE, AND THE KEY IS THE INSTALL STEP'S
@@ -287,6 +296,18 @@ if [ "$MODE" = verify ]; then
         || red receiver "boss-gcp's receiver greeted and was handed no byte, and did not refuse the empty envelope in its own words (ssh exit $src: $(why)) — the program behind the key is not the receiver this tree installs"
     EFFECT="Verified by effect at $NOW by the forge's runner credential sender (infra/gcp/runner-credential-send.sh, run by forge-converge through infra/forge/runner-credential-push.sh). With the transport key this packet prepared (its public half is the one on the completed install step), against boss-gcp's pinned host key, the account $ACCOUNT at $HOST answered first with the runner receiver's greeting '$GREETING', was handed no byte, and refused the empty envelope in the receiver's own words ('$EMPTY_REFUSAL', exit 65). Nothing was delivered: Secret boss/ops-runner-credential stages no boss-gcp.next."
 else
+    # GREETED, SENT, AND REFUSED IN ITS OWN WORDS (backlog 3f7d5f23, (c);
+    # review 34f8448c of car 2c628718). The receiver checked the envelope
+    # and refused it (exit 65, `refused (<check>)`): every pass sends the
+    # same envelope and meets the same refusal until a person reads which
+    # check refused, so it is RED on its own route — as a plain `fail` it
+    # redded every converge and filed nothing. The receiver names a fixed
+    # check word and never a byte of the envelope. Any other end (a
+    # transport that dropped, a receiver that failed after a refusal it
+    # did not name) stays a failure the next pass may clear.
+    if [ "$src" -eq 65 ] && grep -q '^runner-credential-recv: refused (' "$WORK/ssh-error"; then
+        red envelope-refused "boss-gcp's receiver greeted, was sent the envelope for rotation packet $JOB, and refused it in its own words ($(why)); boss-gcp holds the runner credential it held, and every pass sends the same envelope until a person reads that refusal"
+    fi
     [ "$src" -eq 0 ] || fail "the receiver greeted, was sent the envelope, and did not end cleanly (ssh exit $src): $(why)"
     # The greeting is the first line; the receipt is everything after it.
     jq_doc_file "$WORK/receipt" || fail 'the receiver answered with no single receipt'

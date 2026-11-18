@@ -3,9 +3,11 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import ts from 'typescript';
 
-// a4896fd2: pin only the two measured consumers. Other specs may need
+// a4896fd2: pin only the measured consumers. Other specs may need
 // real time; raw clock.install is not a tree-wide error by itself.
-const consumers = ['yard-refresh.mocked.spec.ts', 'it-map-live.mocked.spec.ts'];
+// it-map-live.mocked.spec.ts was the second; it retired with the transit
+// map (R3a, backlog 23a4b4d7), so yard-refresh is the one left.
+const consumers = ['yard-refresh.mocked.spec.ts'];
 function problems(source: string): string[] {
   const file = ts.createSourceFile('fixture.ts', source, ts.ScriptTarget.Latest, true);
   const found: string[] = [];
@@ -31,7 +33,7 @@ function problems(source: string): string[] {
 }
 
 test('the measured consumers use the shared held-clock boundary', () => {
-  expect(consumers.length).toBe(2);
+  expect(consumers.length).toBe(1);
   for (const name of consumers) {
     expect(problems(readFileSync(join(import.meta.dir, '../tests/mocked', name), 'utf8')), name).toEqual([]);
   }

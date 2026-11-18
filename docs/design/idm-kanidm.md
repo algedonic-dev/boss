@@ -1,6 +1,12 @@
 # Design: Kanidm IDM — the front door for real people (and agents)
 
-**Status**: decided — all 5 questions resolved 2026-08-16 via the in-app tracker; see Decisions.
+**Status**: living reference (re-statused 2026-11-18, backlog 924de432).
+All 5 questions were decided on 2026-08-16 (see Decisions), and
+`docs/architecture-decisions.md` §Policy & auth folds them and names
+this file the living contract for the front door. Where this file and
+the shipped runtime disagree (the group→role registry), the record's
+§Open findings says which one the code follows. New decisions go on
+design packets, not here.
 **Origin:** David's direction (2026-08-10): Kanidm provides IDM to
 the Playground; originally planned for the GCP box, deployed
 in-cluster (see Topology and the Q5 amendment). Item `98816e6a`.

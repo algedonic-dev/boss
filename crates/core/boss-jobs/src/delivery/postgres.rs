@@ -23,7 +23,7 @@ use crate::registry::WorkflowStatus;
 const COLUMNS: &str = "name, version, max_red_trains, stall_hours, \
                        consist_budget_secs, consist_output_budget, consist_files_named, \
                        skip_reason_file_budget, blip_cause_budget, ci_host_floor_gb, \
-                       gate_queue_owner, gate_max_concurrent, channels";
+                       gate_queue_owner, channels";
 
 pub struct PgDeliveryPolicy {
     pool: PgPool,
@@ -52,7 +52,6 @@ fn row_of(row: &sqlx::postgres::PgRow) -> Result<DeliveryPolicyRow, DeliveryPoli
         blip_cause_budget: row.try_get("blip_cause_budget").map_err(storage)?,
         ci_host_floor_gb: row.try_get("ci_host_floor_gb").map_err(storage)?,
         gate_queue_owner: row.try_get("gate_queue_owner").map_err(storage)?,
-        gate_max_concurrent: row.try_get("gate_max_concurrent").map_err(storage)?,
         channels: row.try_get("channels").map_err(storage)?,
     })
 }
@@ -167,7 +166,7 @@ impl DeliveryPolicyRegistry for PgDeliveryPolicy {
         let r = &spec.row;
         sqlx::query(&format!(
             "INSERT INTO delivery_policy (status, created_at, {COLUMNS}) \
-             VALUES ('active', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"
+             VALUES ('active', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"
         ))
         .bind(spec.created_at)
         .bind(&r.name)
@@ -181,7 +180,6 @@ impl DeliveryPolicyRegistry for PgDeliveryPolicy {
         .bind(r.blip_cause_budget)
         .bind(r.ci_host_floor_gb)
         .bind(&r.gate_queue_owner)
-        .bind(r.gate_max_concurrent)
         .bind(&r.channels)
         .execute(&mut *tx)
         .await

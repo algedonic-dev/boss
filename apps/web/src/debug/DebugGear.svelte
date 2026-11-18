@@ -322,7 +322,7 @@
     cursor: wait;
   }
   .debug-gear-log {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: var(--font-mono);
     font-size: 11px;
     line-height: 1.45;
     background: var(--ink-raised);

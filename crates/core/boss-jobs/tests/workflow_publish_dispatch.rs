@@ -62,7 +62,16 @@ fn build_app_with_publish(
     kinds: Arc<dyn WorkflowRegistry>,
     may_publish: bool,
 ) -> (Router, Arc<InMemoryJobs>, Arc<RecordingEventBus>) {
-    let jobs = Arc::new(InMemoryJobs::new());
+    build_app_over(kinds, Arc::new(InMemoryJobs::new()), may_publish)
+}
+
+/// The app over a jobs store the caller already holds — for a registry
+/// that counts pins in it (`InMemoryWorkflows::with_packets`).
+fn build_app_over(
+    kinds: Arc<dyn WorkflowRegistry>,
+    jobs: Arc<InMemoryJobs>,
+    may_publish: bool,
+) -> (Router, Arc<InMemoryJobs>, Arc<RecordingEventBus>) {
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let publisher = DomainPublisher::new(bus_dyn, "jobs");
@@ -587,6 +596,76 @@ async fn a_resend_after_another_packet_published_answers_its_own_row_and_keeps_t
     assert_eq!(
         jobs.get_step(&step_a).await.unwrap().unwrap().status,
         StepStatus::Completed
+    );
+}
+
+/// Backlog 50ded63d, the review of car e3c4a326 (B1). The re-send answer
+/// takes a row this packet authored that is NOT a draft to be its
+/// earlier publish. A REJECTED row is not a draft either, and it was
+/// never published: a draft created with this packet's
+/// `authoring_job_id` (the POST /api/workflows body carries it), an
+/// experiment's packets pinned to it, then rejected, was answered as
+/// "already published" — the step completed recording a publish, and
+/// no version went live. A rejected row answers as the draft it was
+/// (`WorkflowStatus::was_published`), so the step publishes the spec.
+#[tokio::test]
+async fn a_rejected_draft_this_packet_authored_is_not_its_publish() {
+    let jobs = Arc::new(InMemoryJobs::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture().with_packets(jobs.clone()));
+    let (app, jobs, _bus) = build_app_over(kinds.clone(), jobs, false);
+    let spec = valid_spec("morning-brew");
+    let metadata = json!({ "workflow_spec": serde_json::to_value(&spec).unwrap() });
+    let (job_id, step_id) = seed_publish_step(jobs.as_ref(), metadata).await;
+
+    let actor = boss_core::actor::ActorId::Human("emp-cto".into());
+    let mut authored = spec.clone();
+    authored.authoring_job_id = Some(*job_id.inner().as_uuid());
+    let candidate = kinds
+        .create_draft(authored, &actor, chrono::Utc::now())
+        .await
+        .expect("a draft carrying this packet as its author");
+    let mut admitted = boss_core::job::Job::new(
+        "morning-brew",
+        Subject::new("location", "loc-1"),
+        "admitted to the candidate",
+        "emp-cto",
+        Priority::Standard,
+        NaiveDate::from_ymd_opt(2026, 10, 22).unwrap(),
+    )
+    .with_workflow_version(candidate.version);
+    admitted.status = boss_core::job::JobStatus::Open;
+    jobs.create_job(&admitted).await.unwrap();
+    kinds
+        .reject_draft(
+            "morning-brew",
+            candidate.version,
+            &actor,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("the candidate met traffic and lost");
+
+    let resp = put_step_done(&app, job_id, step_id, &user_header(&cto())).await;
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let live = kinds
+        .get_active("morning-brew")
+        .await
+        .expect("the completed publish step left a live version");
+    assert_eq!(live.status, WorkflowStatus::Active);
+    assert_eq!(live.authoring_job_id, Some(*job_id.inner().as_uuid()));
+    assert_eq!(
+        live.version,
+        candidate.version + 1,
+        "published as its own version, not answered with the rejected row"
+    );
+    assert_eq!(
+        kinds
+            .get_version("morning-brew", candidate.version)
+            .await
+            .unwrap()
+            .status,
+        WorkflowStatus::Rejected,
+        "the rejected row stays what it was"
     );
 }
 

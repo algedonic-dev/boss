@@ -180,8 +180,44 @@ pub struct ManualSection {
     pub audience: Audience,
     pub current_version: i32,
     pub published: bool,
+    /// Declared authorship context, not a grant of write or read authority
+    /// (design 778de0c5 D2): the station-tree id of the owning station and
+    /// the packet writing the section. Older recorded sections, and the
+    /// manual facts already in the log, predate it and read as unknown.
+    #[serde(default)]
+    pub owner_station: Option<String>,
+    #[serde(default)]
+    pub authoring_job_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Navigation may name unfinished work, but must never carry its draft body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManualIndexEntry {
+    pub id: Uuid,
+    pub slug: String,
+    pub parent_slug: Option<String>,
+    pub title: String,
+    pub sort_order: i32,
+    pub published: bool,
+    pub owner_station: Option<String>,
+    pub authoring_job_id: Option<Uuid>,
+}
+
+impl ManualSection {
+    pub(crate) fn index_entry(&self) -> ManualIndexEntry {
+        ManualIndexEntry {
+            id: self.id,
+            slug: self.slug.clone(),
+            parent_slug: self.parent_slug.clone(),
+            title: self.title.clone(),
+            sort_order: self.sort_order,
+            published: self.published,
+            owner_station: self.owner_station.clone(),
+            authoring_job_id: self.authoring_job_id,
+        }
+    }
 }
 
 /// A frozen snapshot of a section at a specific version.
@@ -211,6 +247,10 @@ pub struct ManualSectionDraft {
     pub audience: Audience,
     #[serde(default = "default_published")]
     pub published: bool,
+    #[serde(default)]
+    pub owner_station: Option<String>,
+    #[serde(default)]
+    pub authoring_job_id: Option<Uuid>,
 }
 
 fn default_published() -> bool {
@@ -226,6 +266,8 @@ pub struct ManualPatch {
     pub audience: Option<Audience>,
     pub sort_order: Option<i32>,
     pub published: Option<bool>,
+    pub owner_station: Option<String>,
+    pub authoring_job_id: Option<Uuid>,
     /// Optional free-text "why this change" captured in history.
     pub reason: Option<String>,
 }

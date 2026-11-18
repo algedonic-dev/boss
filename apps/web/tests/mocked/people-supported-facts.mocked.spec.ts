@@ -50,7 +50,7 @@ test('HR keeps supported headcount without unsupported summaries', async ({ page
   await installSmokeMocks(page);
   await servePeopleRows(page, [row('emp-known', 'loc-known')]);
   await page.route(/\/api\/people$/, r => r.fulfill({ contentType: 'application/json', body: JSON.stringify([row('emp-known', 'loc-known')]) }));
-  await mountPage(page, '/hr');
+  await mountPage(page, '/people/hr');
   await expect(page.getByRole('tab')).toHaveText(['Overview', 'Workflows', 'Headcount']);
   await expect(page.getByText('Total headcount', { exact: true })).toBeVisible();
   await expect(page.locator('.catalog.theme-exec')).not.toContainText(/Avg tenure|Nothing urgent|certifications expiring/i);

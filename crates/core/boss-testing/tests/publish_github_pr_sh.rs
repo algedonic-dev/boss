@@ -1974,6 +1974,9 @@ fn a_measure_run_records_todays_drift_on_the_open_packet() {
     assert_eq!(d["newly_public_files"], serde_json::json!([]), "{body}");
     assert_eq!(d["commits_behind_foreign"], "1", "{body}");
     assert_eq!(d["blocking"], "mirror-has-unmerged-commits", "{body}");
+    // What stays behind is a number on the record, and zero is printed,
+    // not omitted (design f7087b8c D1): the fixture holds no internal/.
+    assert_eq!(d["internal_excluded"], "0", "internal_excluded: {body}");
     // The refresh time is the point: a held packet whose measurement
     // carries no instant is last week's number wearing today's date.
     assert!(
@@ -2161,6 +2164,127 @@ fn a_measure_over_our_own_mirror_names_the_tree_and_the_whole_review_list() {
     );
     assert_eq!(d["source_sha"], next.as_str(), "{body}");
     assert_eq!(d["scanned_sha"], next.as_str(), "{body}");
+}
+
+/// THE MEASURE COUNTS WHAT STAYS BEHIND, AND COMPARES ONLY WHAT LEAVES
+/// (design f7087b8c D1). Forge main gains `internal/` (two files) beside a
+/// change to `file`: the reading names the two as `internal_excluded`,
+/// and `files_changed` is the one public file — never the internal ones
+/// a publish would not carry.
+#[test]
+fn a_measure_counts_internal_as_excluded_and_never_as_changed() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the measure path needs a real jq");
+        return;
+    }
+    let run = Run::new("measure-internal-excluded");
+    run.forge_gains_internal("internal arrives", Some("a public change\n"));
+    let scan = run.planted_scan(0);
+    let (ok, out) = run.measure(&[("BOSS_SECRETS_SCAN", scan)]);
+    assert!(ok, "--measure refused a complete input set: {out}");
+    let body = run.patched();
+    let d = &body["drift_refresh"];
+    assert_eq!(d["internal_excluded"], "2", "internal_excluded: {body}");
+    assert_eq!(
+        d["files_changed"], "1",
+        "only the public file changed: {body}"
+    );
+    assert_eq!(
+        d["newly_public"], "0",
+        "internal/ is never newly public: {body}"
+    );
+    assert_eq!(d["has_drift"], "true", "{body}");
+}
+
+/// THE PREVIOUS FILTERED SNAPSHOT IS BOOKKEEPING, NOT FOREIGN WORK, and a
+/// train that touched only `internal/` is no drift (design f7087b8c D1).
+/// A snapshot of a commit holding `internal/` carries a tree NO source
+/// commit ever held, so the tree-identity rule that ended the 2026-09-10
+/// permanent block would read it as foreign — blocking every publish
+/// after the first — unless it accepts the PUBLIC tree of a source
+/// commit. Both ways the rule can find that commit are driven: the one
+/// the snapshot's body names, and the walk for a commit naming none.
+#[test]
+fn a_filtered_snapshot_on_the_mirror_is_bookkeeping_and_internal_only_is_no_drift() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the measure path needs a real jq");
+        return;
+    }
+    for names_its_source in [true, false] {
+        let case = if names_its_source {
+            "measure-filtered-named"
+        } else {
+            "measure-filtered-walk"
+        };
+        let run = Run::new(case);
+        let forge = run.forge.to_str().unwrap().to_string();
+        git_in(
+            &run.mirror,
+            &["fetch", "-q", &forge, "+refs/heads/main:refs/heads/main"],
+        );
+        // Published: a commit with internal/ AND a public change, so its
+        // public tree is one no forge commit holds.
+        let mirror_main = git_in(&run.mirror, &["rev-parse", "refs/heads/main"]);
+        let (published, public) =
+            run.forge_gains_internal("published with internal", Some("published\n"));
+        let body = if names_its_source {
+            format!("Snapshot of forge main at {published} onto the public mirror.")
+        } else {
+            "A commit carrying the same tree that names no source.".to_string()
+        };
+        // Built where the public tree object lives (the forge fixture),
+        // then carried to the mirror's main through a ref deleted after.
+        let snapshot = git_in(
+            &run.forge,
+            &[
+                "commit-tree",
+                &public,
+                "-p",
+                &mirror_main,
+                "-m",
+                "publish: 2026-01-01",
+                "-m",
+                &body,
+            ],
+        );
+        git_in(
+            &run.forge,
+            &["update-ref", "refs/fixture/snapshot", &snapshot],
+        );
+        git_in(
+            &run.mirror,
+            &[
+                "fetch",
+                "-q",
+                &forge,
+                "+refs/fixture/snapshot:refs/heads/main",
+            ],
+        );
+        git_in(&run.forge, &["update-ref", "-d", "refs/fixture/snapshot"]);
+        // Then a train that changed only internal/.
+        run.forge_gains_internal("only internal moved", None);
+
+        let scan = run.planted_scan(0);
+        let (ok, out) = run.measure(&[("BOSS_SECRETS_SCAN", scan)]);
+        assert!(ok, "{case}: --measure refused a complete input set: {out}");
+        let body = run.patched();
+        let d = &body["drift_refresh"];
+        assert_eq!(
+            d["commits_behind"], "1",
+            "{case}: the snapshot is mirror-only: {body}"
+        );
+        assert_eq!(
+            d["commits_behind_foreign"], "0",
+            "{case}: our own filtered snapshot is not foreign work: {body}"
+        );
+        assert_eq!(d["blocking"], "", "{case}: nothing blocks: {body}");
+        assert_eq!(
+            d["has_drift"], "false",
+            "{case}: an internal-only train leaves nothing to publish: {body}"
+        );
+        assert_eq!(d["files_changed"], "0", "{case}: {body}");
+        assert_eq!(d["internal_excluded"], "2", "{case}: {body}");
+    }
 }
 
 /// A scan that FINDS something is a finding ON the packet, not a
@@ -2607,6 +2731,64 @@ impl Run {
         commit
     }
 
+    /// Forge main gains a top-level `internal/` — `operating.md` and
+    /// `lint/a.sh`, its text carrying `marker` — in ONE commit, which with
+    /// `public` also gives the root's `file` that new content. Returns
+    /// the commit and the tree a publish of it must carry: the same root
+    /// built WITHOUT the `internal` entry, here, by hand — never by the
+    /// verb's own `public_tree`, so the two can disagree (design
+    /// f7087b8c D1). An `internal` entry already there is replaced.
+    fn forge_gains_internal(&self, marker: &str, public: Option<&str>) -> (String, String) {
+        let blob = |text: &str| {
+            git_stdin(
+                &self.forge,
+                &["hash-object", "-t", "blob", "-w", "--stdin"],
+                text,
+            )
+        };
+        let base = self.forge_main();
+        let mut entries: Vec<String> =
+            git_in(&self.forge, &["ls-tree", &format!("{base}^{{tree}}")])
+                .lines()
+                .filter(|l| !l.ends_with("\tinternal"))
+                .map(str::to_string)
+                .collect();
+        if let Some(text) = public {
+            let b = blob(text);
+            entries.retain(|l| !l.ends_with("\tfile"));
+            entries.push(format!("100644 blob {b}\tfile"));
+        }
+        let public_tree = git_stdin(
+            &self.forge,
+            &["mktree"],
+            &format!("{}\n", entries.join("\n")),
+        );
+        let op = blob(&format!("how Algedonic runs it — {marker}\n"));
+        let script = blob("#!/bin/sh\nexit 0\n");
+        let lint = git_stdin(
+            &self.forge,
+            &["mktree"],
+            &format!("100755 blob {script}\ta.sh\n"),
+        );
+        let internal = git_stdin(
+            &self.forge,
+            &["mktree"],
+            &format!("100644 blob {op}\toperating.md\n040000 tree {lint}\tlint\n"),
+        );
+        entries.push(format!("040000 tree {internal}\tinternal"));
+        let full = git_stdin(
+            &self.forge,
+            &["mktree"],
+            &format!("{}\n", entries.join("\n")),
+        );
+        let commit = git_in(
+            &self.forge,
+            &["commit-tree", &full, "-p", &base, "-m", marker],
+        );
+        git_in(&self.forge, &["update-ref", "refs/heads/main", &commit]);
+        (commit, public_tree)
+    }
+
     /// The tree of the snapshot the run pushed to the mirror, if any —
     /// found through `mirror_branch`, because the branch is named by the
     /// snapshot it holds (publish/<date>-<snapshot>, backlog 1f0aa60d).
@@ -2906,6 +3088,81 @@ fn the_snapshot_carries_the_signed_tree_even_after_forge_main_moves() {
         out.contains(&measured),
         "the run names the signed tree it published: {out}"
     );
+}
+
+/// WHAT LEAVES IS THE PUBLIC TREE (design f7087b8c D1, backlog e7f062d3).
+/// How Algedonic runs its estate lives in the forge under one top-level
+/// `internal/`, and the snapshot carries the signed commit's tree WITHOUT
+/// it — exactly the root built by hand without that entry — while the
+/// open-pr record still names the signed commit itself.
+#[test]
+fn the_snapshot_carries_the_signed_commits_public_tree_and_no_internal() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new("snapshot-public-tree");
+    run.echoing_curl();
+    let (signed, public) = run.forge_gains_internal("internal arrives", Some("a public change\n"));
+    run.packet(&Packet::signed(&signed));
+    let (ok, out) = run.go();
+    assert!(
+        ok,
+        "a signed publish of a tree holding internal/ must publish: {out}"
+    );
+    let (_, snapshot) = run
+        .mirror_branch()
+        .unwrap_or_else(|| panic!("nothing was pushed to the mirror: {out}"));
+    assert_eq!(
+        run.pushed_tree().as_deref(),
+        Some(public.as_str()),
+        "the snapshot must carry the signed commit's tree less internal/: {out}"
+    );
+    let root = git_in(&run.mirror, &["ls-tree", "--name-only", &snapshot]);
+    assert!(
+        !root.lines().any(|l| l == "internal"),
+        "the published root carries internal/: {root}"
+    );
+    assert!(
+        root.lines().any(|l| l == "file"),
+        "the public part of the tree must still leave: {root}"
+    );
+    let puts = run.puts();
+    let done = puts
+        .iter()
+        .find(|p| p["status"] == "completed")
+        .unwrap_or_else(|| panic!("open-pr was never completed: {puts:?}"));
+    assert_eq!(
+        done["metadata"]["source_sha"], signed,
+        "open-pr still records the commit the passkey signed: {done}"
+    );
+}
+
+/// The forge-only directory does not move the mirror: a signed commit
+/// whose public tree is ALREADY the mirror's main publishes nothing —
+/// the internal-only train is not a change to the public tree.
+#[test]
+fn a_signed_commit_whose_only_change_is_internal_publishes_nothing() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new("internal-only-publish");
+    let forge = run.forge.to_str().unwrap().to_string();
+    git_in(
+        &run.mirror,
+        &["fetch", "-q", &forge, "+refs/heads/main:refs/heads/main"],
+    );
+    run.echoing_curl();
+    let (signed, _) = run.forge_gains_internal("only internal moved", None);
+    run.packet(&Packet::signed(&signed));
+    let (ok, out) = run.go();
+    assert!(!ok, "nothing public changed, yet the verb published: {out}");
+    assert!(
+        out.contains("nothing to publish"),
+        "the refusal must say there is nothing to publish: {out}"
+    );
+    run.assert_nothing_published(&out);
 }
 
 /// One row of `gh pr list --json number,url,headRefName,headRepositoryOwner,
@@ -4283,7 +4540,14 @@ struct Merge {
 
 impl Merge {
     fn new(case: &str) -> Merge {
+        Merge::new_with(case, |_| {})
+    }
+
+    /// `new`, with `prepare` shaping the forge (and the signed packet)
+    /// before the publish that precedes the merge runs.
+    fn new_with(case: &str, prepare: impl FnOnce(&Run)) -> Merge {
         let run = Run::new(case);
+        prepare(&run);
         let (ok, out) = run.go();
         assert!(ok, "the publish that precedes the merge failed: {out}");
         let (branch, snapshot) = run
@@ -4617,6 +4881,98 @@ fn a_merge_fast_forwards_main_to_the_approved_snapshot_and_proves_it() {
     assert!(out.contains("already reads"), "{out}");
     assert_eq!(m.main(), m.snapshot);
     assert_eq!(m.run.puts()[0]["metadata"]["pushed"], false);
+}
+
+/// The merge's tree check reads the same public tree the snapshot was
+/// built from (design f7087b8c D1): a publish of a commit holding
+/// `internal/` merges, and the public main it leaves has no `internal`.
+/// Were the check still `the approved commit's tree`, every such PR
+/// would be refused.
+#[test]
+fn a_merge_of_a_filtered_snapshot_lands_a_main_with_no_internal() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the merge path needs a real jq");
+        return;
+    }
+    let m = Merge::new_with("merge-filtered", |run| {
+        let (signed, _) = run.forge_gains_internal("internal arrives", Some("a public change\n"));
+        run.packet(&Packet::signed(&signed));
+    });
+    let (ok, out) = m.go(&[]);
+    assert!(
+        ok,
+        "the merge refused a filtered snapshot of the signed commit: {out}"
+    );
+    assert_eq!(
+        m.main(),
+        m.snapshot,
+        "main is not the approved snapshot: {out}"
+    );
+    let root = git_in(
+        &m.run.mirror,
+        &["ls-tree", "--name-only", "refs/heads/main"],
+    );
+    assert!(
+        !root.lines().any(|l| l == "internal"),
+        "the public main carries internal/: {root}"
+    );
+}
+
+/// THE LEAK GUARD. A PR whose snapshot carries the signed commit's FULL
+/// tree — internal/ and all — is not of the tree a publish carries, and
+/// --merge refuses it before main moves, naming the public tree.
+#[test]
+fn a_merge_refuses_a_snapshot_carrying_internal() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the merge path needs a real jq");
+        return;
+    }
+    let m = Merge::new_with("merge-full-tree", |run| {
+        let (signed, _) = run.forge_gains_internal("internal arrives", Some("a public change\n"));
+        run.packet(&Packet::signed(&signed));
+    });
+    let signed = m.run.forge_main();
+    // The full tree's objects are the forge fixture's: build the leaking
+    // snapshot there and carry it onto the PR's branch on the mirror.
+    let full = git_in(&m.run.forge, &["rev-parse", &format!("{signed}^{{tree}}")]);
+    let leaking = git_in(
+        &m.run.forge,
+        &[
+            "commit-tree",
+            &full,
+            "-p",
+            &m.main_before,
+            "-m",
+            "publish: leaking",
+        ],
+    );
+    let forge = m.run.forge.to_str().unwrap().to_string();
+    git_in(
+        &m.run.forge,
+        &["update-ref", "refs/fixture/leaking", &leaking],
+    );
+    git_in(
+        &m.run.mirror,
+        &[
+            "fetch",
+            "-q",
+            &forge,
+            &format!("+refs/fixture/leaking:refs/heads/{}", m.branch),
+        ],
+    );
+    m.serve(&Packet::signed(&signed), |md| {
+        md["snapshot_commit"] = serde_json::json!(leaking);
+    });
+    let (code, out) = m.go_code(&[]);
+    assert_eq!(
+        code, 2,
+        "a snapshot carrying internal/ must be refused: {out}"
+    );
+    assert!(
+        out.contains("REFUSED") && out.contains("public tree"),
+        "the refusal must name the public tree it held the snapshot to: {out}"
+    );
+    m.assert_nothing_merged(&out);
 }
 
 /// One refusal: `change` reshapes what GitHub or the record says, and the

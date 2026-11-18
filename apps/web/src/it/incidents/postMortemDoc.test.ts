@@ -12,10 +12,12 @@
 
 import { describe, expect, test } from 'bun:test';
 import {
+  bodyParts,
   closedOutcome,
   humanizeKey,
   incidentAt,
   postMortemSections,
+  stepFindings,
 } from './postMortemDoc';
 import type { Step } from '../../jobs/types';
 
@@ -170,5 +172,99 @@ describe('closedOutcome', () => {
       'All mitigations shipped',
     );
     expect(closedOutcome({ metadata: {} })).toBeNull();
+  });
+});
+
+// Gap 1 of page-audit 9b9849f5 (backlog 434b6e0d). In incident v3 every
+// forcing-question answer is STEP metadata: the first closed v3 packet,
+// a65ba21e, carried 7 job keys and 23 step finding keys, and the archive
+// read only the 7. These pin the step half the archive now renders, the
+// way infra/step-plugins/incident-review.js renders it for the reviewer.
+describe('stepFindings — what each terminal step found, in workflow order', () => {
+  const step = (over: Partial<Step>): Step => ({
+    id: 's',
+    job_id: 'j',
+    kind: 'task',
+    title: 'a step',
+    assignee_id: null,
+    status: 'completed',
+    sort_order: 0,
+    blocked_by: [],
+    completed_on: '2026-09-26',
+    metadata: {},
+    ...over,
+  });
+
+  test('labels each finding by its field, steps in sort order, plumbing filtered', () => {
+    const found = stepFindings([
+      step({
+        id: 'cause',
+        title: 'What caused it',
+        sort_order: 4,
+        metadata: { authority_role: 'platform-admin', why_now: 'a token rotated', root_cause: 'a mirror force-synced' },
+      }),
+      step({
+        id: 'timeline',
+        title: 'Establish the timeline from evidence',
+        sort_order: 2,
+        metadata: { authority_role: 'platform-admin', detected_at: '2026-09-26T01:10Z', timeline: '01:00 push; 01:10 noticed' },
+      }),
+    ]);
+    expect(found.map((f) => f.step.id)).toEqual(['timeline', 'cause']);
+    // Known keys first, in the reading order postMortemSections keeps.
+    expect(found.map((f) => f.sections.map((s) => s.label))).toEqual([
+      ['Timeline', 'Detected at'],
+      ['Root cause', 'Why now'],
+    ]);
+    expect(found.flatMap((f) => f.sections.map((s) => s.key))).not.toContain('authority_role');
+  });
+
+  test('a step that recorded only plumbing, and a step not yet terminal, render nothing', () => {
+    const found = stepFindings([
+      step({ id: 'raised', kind: 'trigger', metadata: { trigger_kind: 'operator', trigger_name: 'raise' } }),
+      step({ id: 'review', kind: 'incident-review', sort_order: 8, metadata: { authority_role: 'platform-admin', human_only: true } }),
+      step({ id: 'closed', kind: 'outcome', sort_order: 9, metadata: { outcome_kind: 'completed' } }),
+      step({ id: 'later', status: 'ready', sort_order: 3, metadata: { timeline: 'not recorded yet' } }),
+    ]);
+    expect(found).toEqual([]);
+  });
+
+  test('a skipped step still shows what it recorded, as the review surface does', () => {
+    const found = stepFindings([step({ status: 'skipped', metadata: { prevention: 'none needed' } })]);
+    expect(found.map((f) => f.sections.map((s) => s.body))).toEqual([['none needed']]);
+  });
+
+  test('no steps on the read is no findings, not a throw', () => {
+    expect(stepFindings(undefined)).toEqual([]);
+  });
+});
+
+// "action_packets render as text" (434b6e0d): a packet ref in a field
+// that names packets becomes a link. Only such fields — a bare
+// 8-hex word elsewhere may be a commit, and a commit linked as a
+// packet is a click that dead-ends.
+describe('bodyParts — packet refs in a packet field become links', () => {
+  test('links the short id that leads each line, and a full uuid anywhere', () => {
+    const parts = bodyParts(
+      'action_packets',
+      '21d54f4a remove the push mirror\nan item to add: a rehearsal\ncarried by e6406701-a8cc-44da-a111-9670aff620db',
+    );
+    expect(parts.filter((p) => p.ref !== null).map((p) => p.ref)).toEqual([
+      '21d54f4a',
+      'e6406701-a8cc-44da-a111-9670aff620db',
+    ]);
+    // Nothing is dropped: the parts spell the body back exactly.
+    expect(parts.map((p) => p.text).join('')).toBe(
+      '21d54f4a remove the push mirror\nan item to add: a rehearsal\ncarried by e6406701-a8cc-44da-a111-9670aff620db',
+    );
+  });
+
+  test('a field that does not name packets links nothing', () => {
+    expect(bodyParts('shipped_in_this_incident', 'd812f1b7 the fix').map((p) => p.ref)).toEqual([null]);
+  });
+
+  test('a longer hex run (a commit sha) is not read as a short packet id', () => {
+    const sha = 'd812f1b7a0c94e2f8b1d3c5e7f9a0b2c4d6e8f01';
+    expect(bodyParts('follow_up_packets', sha).map((p) => p.ref)).toEqual([null]);
   });
 });

@@ -21,8 +21,13 @@
 //                        the list at the head of section 01, and the same
 //                        alarm beside the verdict of its own series — both
 //                        on the job detail surface too
-//   buttons   0         — no manual refresh
-//   forms     0, inputs 0
+//   buttons   0         — no manual refresh; sections 00–04 still hold
+//                        none. Since backlog 7aef2405 (2026-11-07)
+//                        section 05 is the page's one write, "File an
+//                        ops request": a verb, host and param fields and
+//                        one button, pinned in its own spec
+//                        (a-person-files-an-ops-request-from-the-verb-list)
+//   forms     0, inputs 0 outside section 05
 //   snippets  3         — the dev door's copyable command lines
 //   reads     4 estate reads (the fourth, the host comparisons scoped
 //             since gap 1 — 2d8d983b — and grouped per host since
@@ -35,7 +40,7 @@
 //             the newest closed ones, whole, and the open ones — whose
 //             zone line, open reading, zone alarm and tunnel-routes line
 //             each link to their packet.
-//   writes    0
+//   writes    0 on load — the only write is section 05's, on its button
 //   timer     1         — every read again each 60 s
 //
 // THIS STEP PINS WHAT THE PAGE DOES TODAY; it does not fix the gaps.
@@ -320,7 +325,31 @@ function route(path: string): ReturnType<typeof parseRoute> {
 }
 
 test.describe('/it/estate — the chrome, the loading line and the reads', () => {
-  test('the page is the catalogued Estate surface, with its header and five sections in order', async ({ page }) => {
+  test('every machine shows all declared disks and calls a missing byte reading not measured', async ({ page }) => {
+    await install(page);
+    await page.route(NODES_READ, (r) => json(r, NODES.map((n) => ({
+      ...n,
+      disks: n.id === 'forge'
+        ? [{ model: 'Fixture system disk', size_bytes: 250059350016 }, { model: 'Fixture forge data disk', size_bytes: 1000204886016 }]
+        : n.id === 'w-1'
+          ? [{ model: 'Fixture worker disk', size_bytes: 1000204886016 }, { model: 'Fixture worker disk' }]
+          : [],
+    }))));
+    await mountPage(page, PATH, TITLE);
+    const forge = machines(page).locator('tbody tr').filter({ has: page.locator('.estate-id', { hasText: /^forge$/ }) });
+    await expect(forge.getByText('Fixture system disk', { exact: true })).toBeVisible();
+    await expect(forge.getByText('Fixture forge data disk', { exact: true })).toBeVisible();
+    await expect(forge).toContainText('250059350016 bytes');
+    await expect(forge).toContainText('1000204886016 bytes');
+    const worker = machines(page).locator('tbody tr').filter({ has: page.locator('.estate-id', { hasText: /^w-1$/ }) });
+    await expect(worker.getByText('Fixture worker disk', { exact: true })).toHaveCount(2);
+    await expect(worker).toContainText('not measured');
+    const gcp = machines(page).locator('tbody tr').filter({ has: page.locator('.estate-id', { hasText: /^boss-gcp$/ }) });
+    await expect(gcp).toContainText('No disks declared');
+    await expect(forge).toContainText('500G');
+  });
+
+  test('the page is the catalogued Estate surface, with its header and six sections in order', async ({ page }) => {
     expect(route(PATH)).toEqual({ kind: 'systemEstate' });
     await install(page);
     await mountPage(page, PATH, TITLE);
@@ -334,6 +363,7 @@ test.describe('/it/estate — the chrome, the loading line and the reads', () =>
       '02 — THE LOOPS',
       '03 — THE EDGE',
       '04 — THE DEV WORKSPACE',
+      '05 — FILE AN OPS REQUEST',
     ]);
   });
 
@@ -396,10 +426,14 @@ test.describe('/it/estate — the chrome, the loading line and the reads', () =>
     ]);
     expect(sent.filter((s) => !s.startsWith('GET ')), 'the page wrote').toEqual([]);
 
+    // Every control on the page is section 05's (backlog 7aef2405): the
+    // read sections hold none, and the form wrote nothing on load.
     const root = page.locator('.estate-root');
-    await expect(root.locator('button')).toHaveCount(0);
+    await expect(page.getByTestId('file-an-ops-request')).toBeVisible();
+    const outside05 = ':not([data-testid="file-an-ops-request"] *)';
+    await expect(root.locator(`button${outside05}`)).toHaveCount(0);
     await expect(root.locator('form')).toHaveCount(0);
-    await expect(root.locator('input, select, textarea')).toHaveCount(0);
+    await expect(root.locator(`input${outside05}, select${outside05}, textarea${outside05}`)).toHaveCount(0);
   });
 
   test('every 60 s the page reads the estate again and paints the new answer', async ({ page }) => {
@@ -453,15 +487,15 @@ test.describe('/it/estate — 00 THE MACHINES', () => {
     await expect(rows).toHaveCount(3);
     await expect(rows.nth(0).locator('td')).toHaveText([
       'forge', 'forge · cluster-operator · ops-runner',
-      '192.0.2.15 seen 192.0.2.15', '16 seen 16', '30G seen 31G · drifted', '500G seen 480G',
+      '192.0.2.15 seen 192.0.2.15', '16 seen 16', '30G seen 31G · drifted', '500G seen 480G No disks declared',
     ]);
     await expect(rows.nth(1).locator('td')).toHaveText([
       'boss-gcp', 'gateway-host · ops-runner',
-      '192.0.2.20 seen 192.0.2.20', '4 seen 4', '15G seen 16G · drifted', '60G seen 60G',
+      '192.0.2.20 seen 192.0.2.20', '4 seen 4', '15G seen 16G · drifted', '60G seen 60G No disks declared',
     ]);
     // A machine that declares nothing reads a dash, never a zero — on
     // both sides: w-1's cluster reading carries no capacity.
-    await expect(rows.nth(2).locator('td')).toHaveText(['w-1', 'talos-worker', '— seen —', '— seen —', '— seen —', '— seen —']);
+    await expect(rows.nth(2).locator('td')).toHaveText(['w-1', 'talos-worker', '— seen —', '— seen —', '— seen —', '— seen — No disks declared']);
     // The notes ride as the row's tooltip; no notes, an empty one.
     await expect(rows.nth(0)).toHaveAttribute('title', 'the forge host');
     await expect(rows.nth(1)).toHaveAttribute('title', '');

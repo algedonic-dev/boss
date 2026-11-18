@@ -235,3 +235,28 @@ async fn a_step_promoted_by_a_completion_names_its_workflow_and_slug() {
     assert_eq!(ev.payload["workflow_kind"], "ship-a-change");
     assert_eq!(ev.payload["spec_slug"], "build");
 }
+
+/// The ready marker also names the PACKET by its title (backlog
+/// 77ac4f30, 2026-11-18). A rule that files work about the packet whose
+/// step became ready — the design-doc `fold` filing its fold build —
+/// has to say which packet in words a person reads, and the title lived
+/// only on the Job, one fetch away from a rule that cannot fetch.
+/// Hoisted for the reason `workflow_kind` is: the binder resolves the
+/// payload and nothing else, and an absent arg skips the rule.
+#[tokio::test]
+async fn a_ready_marker_names_its_packet_by_title() {
+    let (app, jobs) = app_with_bus();
+    let (_job_id, steps) = open_job(&app).await;
+    let scope_id = step_by_slug(&steps, "scope")["id"]
+        .as_str()
+        .expect("step id")
+        .to_string();
+
+    let recorded = jobs.recorded_events();
+    let ev = ready_for(&recorded, &scope_id);
+    assert_eq!(
+        ev.payload["job_title"], "t",
+        "the ready marker must carry its packet's title: {}",
+        ev.payload
+    );
+}

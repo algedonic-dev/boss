@@ -75,6 +75,55 @@ class ActivationContract(unittest.TestCase):
             self.assertEqual(os.readlink(store / "current"), "generations/" + "a" * 40)
             self.assertEqual(len(list(generation.glob("contract-check-*.json"))), 2)
 
+    def test_a_freshly_extracted_generation_is_validated_before_its_contract_runs(self):
+        # Backlog 7ed1251a (RELEASE review f6e0c3e5 of car 77f528cc): an
+        # existing generation was validated and a freshly extracted one
+        # was not. extract() holds bytes to the manifest, not the manifest
+        # to the published shape, so a manifest listing a third bin/ name
+        # was extracted, its bin/boss RUN for the contract and the result
+        # activated — and every door call then refused. Validated here, it
+        # refuses before any of its bytes run, and names why.
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, enabled, config = self.fixture(root)
+            (root / "binaries" / "git").write_bytes(b"published tool fixture")
+            with patch.object(self.artifact, "BINARIES", ("boss", "git", "kubectl")):
+                self.artifact.pack(Path(__file__).resolve().parents[2], root / "binaries", root / "bundle.tar", "a" * 40)
+            calls = []
+            def runner(argv, env):
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, CONTRACT, b"")
+            with self.assertRaisesRegex(ValueError, "bin/ 'boss', 'git', 'kubectl'"):
+                self.mod.activate(root / "bundle.tar", store, enabled, "a" * 40, config, runner)
+            self.assertEqual(calls, [], "a generation's binary ran before the generation was validated")
+            self.assertEqual(os.readlink(store / "current"), "old")
+            self.assertEqual(enabled.resolve(), store / "old")
+
+    def test_fresh_manifest_refusal_escapes_names_without_running_or_activating(self):
+        from unittest.mock import patch
+        hostile = "git\x1b]0;owned\x07\n\u202e"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, enabled, config = self.fixture(root)
+            (root / "binaries" / hostile).write_bytes(b"published tool fixture")
+            with patch.object(self.artifact, "BINARIES", ("boss", hostile, "kubectl")):
+                self.artifact.pack(Path(__file__).resolve().parents[2], root / "binaries", root / "bundle.tar", "a" * 40)
+            calls = []
+            def runner(argv, env):
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, CONTRACT, b"")
+            with self.assertRaises(ValueError) as refused:
+                self.mod.activate(root / "bundle.tar", store, enabled, "a" * 40, config, runner)
+            message = str(refused.exception)
+            self.assertTrue(message.startswith("controller manifest lists bin/ "), message)
+            self.assertIn(repr(hostile), message)
+            for control in ("\x1b", "\x07", "\n", "\u202e"):
+                self.assertNotIn(control, message)
+            self.assertEqual(calls, [], "the refused generation must not execute")
+            self.assertEqual(os.readlink(store / "current"), "old")
+            self.assertEqual(enabled.resolve(), store / "old")
+
     def test_interrupted_contract_check_retains_full_output_and_old_generation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -385,6 +434,35 @@ class ActivationFollowsMain(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(b"inert", result.stdout)
             self.assertFalse(enabled.is_symlink() or enabled.exists())
+
+    def test_an_explicit_activation_refuses_without_a_passing_preflight_receipt(self):
+        # Backlog b50b8953: two flips on 2026-10-19 each failed first at a
+        # step a rehearsal would have read. The operator's activation now
+        # reads the receipt `dev-control preflight` wrote, before anything.
+        preflight = module("preflight-control")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, enabled = self.store(root)
+            cli = root / "cli"
+            (cli / ("a" * 40)).mkdir(parents=True)
+            (cli / ("a" * 40) / "dev-control.tar").write_bytes(self.bundle(root, "a" * 40).read_bytes())
+            config = root / "config.json"
+            config.write_text(json.dumps(self.config))
+            argv = [sys.executable, "-I", str(Path(__file__).with_name("activate-control.py")), "a" * 40,
+                    "--cli-store", str(cli), "--store", str(store), "--config", str(config), "--main", "a" * 40]
+            checks = [{"check": n, "passed": n != "rehearsal-check-after-commit", "detail": "binding is stale"} for n in preflight.REQUIRED]
+            for receipt, named in ((None, b"dev-control preflight " + b"a" * 40),
+                                   ({"commit": "a" * 40, "main": "a" * 40, "checks": checks}, b"rehearsal-check-after-commit"),
+                                   ({"commit": "a" * 40, "main": "b" * 40, "checks": [dict(c, passed=True) for c in checks]}, b"main moved")):
+                if receipt is not None:
+                    preflight.write_receipt(store, receipt)
+                result = subprocess.run(argv, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(named, result.stderr)
+                self.assertFalse(enabled.is_symlink() or enabled.exists(), "a refused activation never writes the selector")
+                self.assertFalse((store / "generations").exists(), "nothing is extracted before the receipt is read")
+            result = subprocess.run(argv[:-2], capture_output=True)
+            self.assertNotEqual(result.returncode, 0, "an explicit activation names the main it was rehearsed at")
 
 
 if __name__ == "__main__":

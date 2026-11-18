@@ -21,6 +21,9 @@ use sqlx::{PgConnection, PgPool};
 /// One `audit_log` row handed to a projection's apply step.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReplayEvent {
+    /// Exact JSONB text retained before generic numeric decoding. It remains
+    /// part of the original-row conservation check, not a replacement fact.
+    pub raw_payload: Option<String>,
     /// `audit_log.id` — the monotonic sequence the replay walks in
     /// order. Carried so the apply step can log which event it skipped.
     pub audit_id: i64,
@@ -170,25 +173,27 @@ where
         crate::outbox::lock_and_assert_log_complete(&mut tx, &tables).await?;
     }
 
-    let rows: Vec<(i64, uuid::Uuid, String, DateTime<Utc>, serde_json::Value)> =
-        sqlx::query_as(&format!(
-            "SELECT id, event_id, kind, timestamp, payload FROM audit_log \
+    let rows: Vec<(i64, uuid::Uuid, String, DateTime<Utc>, String)> = sqlx::query_as(&format!(
+        "SELECT id, event_id, kind, timestamp, payload::text FROM audit_log \
              WHERE {kind_filter} ORDER BY id"
-        ))
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
+    ))
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
 
     let events: Vec<_> = rows
         .into_iter()
-        .map(|(audit_id, event_id, kind, ts, payload)| ReplayEvent {
-            audit_id,
-            event_id,
-            kind,
-            ts,
-            payload,
+        .map(|(audit_id, event_id, kind, ts, payload)| {
+            Ok::<_, String>(ReplayEvent {
+                audit_id,
+                event_id,
+                kind,
+                ts,
+                payload: serde_json::from_str(&payload).map_err(|e| e.to_string())?,
+                raw_payload: Some(payload),
+            })
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     let planned = prepare(&mut tx, &events).await?;
     conserve_plan(&events, &planned)?;
     let events = planned;
@@ -266,6 +271,7 @@ mod tests {
     #[test]
     fn a_plan_conserves_every_original_row_once_without_mutation() {
         let row = super::ReplayEvent {
+            raw_payload: None,
             audit_id: 1,
             event_id: uuid::Uuid::nil(),
             kind: "test".into(),
@@ -279,6 +285,9 @@ mod tests {
         assert!(
             super::conserve_plan(std::slice::from_ref(&row), &[row.clone(), row.clone()]).is_err()
         );
+        let mut changed = row.clone();
+        changed.raw_payload = Some("{\"fact\":1}".into());
+        assert!(super::conserve_plan(std::slice::from_ref(&row), &[changed]).is_err());
         let mut changed = row.clone();
         changed.payload = serde_json::json!({"fact":2});
         assert!(super::conserve_plan(&[row], &[changed]).is_err());

@@ -1,6 +1,6 @@
 # Design: the dev cluster — build and pipeline off the demo's machine
 
-**Status**: approved — in-review — open questions tracked at `/system/design` (2026-08-18).
+**Status**: decided, awaiting its fold (re-statused 2026-11-18, backlog 924de432). All four questions are resolved (see Decisions); the `/system/design` route this line used to name was deleted on 2026-09-10. Its decisions belong in `docs/architecture-decisions.md` §Deployment, the forge, and the cluster, which fold car 79d0040f is editing, so this file is folded and deleted after that car lands. The estate registry (`GET /api/estate…`) answers what the machines are today; this file does not.
 **Source**: backlog `ad2e28ab` (decisions recorded there 2026-08-07) and
 the operator's 2026-08-08 direction: the twice-daily train and its
 deployments should run against infrastructure BOSS models, on the five

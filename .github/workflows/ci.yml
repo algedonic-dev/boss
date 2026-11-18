@@ -95,6 +95,18 @@ jobs:
       # under `estate`. Nowhere else sets it — infra/lint/lib/no-estate.sh,
       # pinned by a_declared_no_estate_skips_only_the_live_half.rs.
       BOSS_ESTATE: none
+      # And there is no per-car trunk here (backlog 2d28df78, design
+      # e2710fbc). This checkout's only trunk is the previous publish, so a
+      # lint that judges what "this change" added against the trunk
+      # merge-base judged every forge car since then as one, and a rule
+      # that landed inside the window redded every publish spanning it
+      # (PR 258: factory-vocabulary, 711 files classed as added, 27 red
+      # that every forge car had passed). Each trunk-relative lint says it
+      # did not judge and passes; the receipt names them under `trunk`, and
+      # the forge's per-car receipts are the judgements. Nowhere else sets
+      # it — infra/lint/lib/trunk-ref.sh, pinned by
+      # a_declared_no_trunk_skips_every_trunk_relative_lint.rs.
+      BOSS_TRUNK: none
     services:
       postgres:
         image: postgres:16

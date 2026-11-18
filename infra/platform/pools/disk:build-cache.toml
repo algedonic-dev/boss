@@ -1,0 +1,15 @@
+# v2 (backlog 5ece507d): reclaimer_kind names the packet kind the
+# reclaimer's runs file, the key its last run is read by. The dev pod's
+# reclaim sidecar runs the script, which hands that kind to the wrap.
+# v3 (backlog 84f570a1): `capacity_from` says where the capacity number
+# comes from, for the console to show beside it (station-tree.md section 3).
+[[pool]]
+name = "disk:build-cache"
+version = 3
+status = "active"
+unit = "GiB"
+kind = "stock"
+reclaimer = "infra/cluster/dev-scratch-reclaim.sh"
+reclaimer_kind = "maintenance-dev-scratch-reclaim"
+capacity = { state = "unknown" }
+capacity_from = 'Unknown until an observer publishes it: the size of the build-cache volume of the dev pod; no observer writes it into this row yet. The stock is recovered by its reclaimer, infra/cluster/dev-scratch-reclaim.sh.'

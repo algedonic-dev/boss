@@ -39,7 +39,7 @@ const json = (r: Route, body: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
 
 /// The page's three reads, as ManualPage.svelte spells them.
-const TREE = /\/api\/content\/manual$/;
+const TREE = /\/api\/content\/manual-index$/;
 const SECTION = /\/api\/content\/manual\/(.+)$/;
 const PERSON = /\/api\/people\/([^/]+)$/;
 
@@ -99,6 +99,46 @@ const TREE_ORDER: ReadonlyArray<readonly [string, number]> = [
 const PARENTS = ['policies', 'benefits', 'benefits/time-off'];
 const LEAVES = ['welcome', 'policies/security', 'policies/conduct', 'benefits/time-off/sick'];
 
+test('unwritten sections name their owner and authoring packet without rendering draft prose', async ({ page }) => {
+  await installSmokeMocks(page);
+  const packet = '2c28833a-d0a3-499a-bcf9-2d3a264e26a3';
+  const header = {
+    id: 'ms-expenses', slug: 'expenses', parent_slug: null, title: 'Expenses',
+    sort_order: 1, published: false, owner_station: 'finance', authoring_job_id: packet,
+  };
+  // Both old and new read shapes return the same safe fixture. The failure
+  // must be the page's missing placeholder, not an unmocked endpoint.
+  await page.route(/\/api\/content\/manual$/, (r) => json(r, [header]));
+  await page.route(/\/api\/content\/manual-index$/, (r) => json(r, [header]));
+  await page.route(/\/api\/content\/manual\/expenses$/, (r) => json(r, { error: 'unpublished' }, 404));
+  await mountPage(page, '/ux/manual/expenses', { titleMatch: /Company manual/ });
+  await expect(page.getByText('Not yet written, owned by finance', { exact: true })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Open authoring packet' })).toHaveAttribute('href', `/ux/jobs/${packet}`);
+  await expect(page.locator('.manual-article-body')).toHaveCount(0);
+  await expect(page.getByText('PRIVATE unfinished work')).toHaveCount(0);
+});
+
+test('an old section with no recorded ownership says unknown instead of inventing a packet', async ({ page }) => {
+  await installSmokeMocks(page);
+  await page.route(TREE, (r) => json(r, [{
+    id: 'ms-legacy', slug: 'legacy', parent_slug: null, title: 'Legacy',
+    sort_order: 1, published: false, owner_station: null, authoring_job_id: null,
+  }]));
+  await page.route(/\/api\/content\/manual\/legacy$/, (r) => json(r, {}, 404));
+  await mountPage(page, '/ux/manual/legacy', { titleMatch: /Company manual/ });
+  await expect(page.getByText('Not yet written; owner not recorded.', { exact: true })).toBeVisible();
+  await expect(page.getByText('Authoring packet not recorded.', { exact: true })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Open authoring packet' })).toHaveCount(0);
+});
+
+test('an unreadable index is a read failure rather than an empty manual', async ({ page }) => {
+  await installSmokeMocks(page);
+  await page.route(TREE, (r) => json(r, { unavailable: true }));
+  await mountPage(page, '/ux/manual', { titleMatch: /Company manual/ });
+  await expect(page.getByRole('alert')).toContainText('Manual index response is unreadable');
+  await expect(page.getByText('No sections yet.', { exact: true })).toHaveCount(0);
+});
+
 async function installManualReads(page: Page): Promise<void> {
   await installSmokeMocks(page);
   await page.route(TREE, (r) => json(r, SECTIONS));
@@ -138,7 +178,7 @@ test.describe('/manual — the page chrome and its two spellings', () => {
 
       await expect(page.locator('.exec-eyebrow')).toHaveText('Know');
       await expect(page.locator('h1').first()).toHaveText('Company manual');
-      await expect(page.getByText('Authored by HR. Every change is versioned.')).toBeVisible();
+      await expect(page.getByText('Company guidance. Every change is versioned.')).toBeVisible();
       await expect(page.locator('.manual-content')).toHaveText(
         'Select a section from the tree to start reading.',
       );

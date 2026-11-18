@@ -1,0 +1,77 @@
+# ---------------------------------------------------------------------------
+# forge-ci — the forge's CI: every open pr-train whose `ci` step is ready
+# or being worked, i.e. a train whose PR is open and whose forge Actions
+# run (.forgejo/workflows/ci.yml: the image build, the locomotive, the
+# web suite) has not yet answered.
+#
+# An EQUIPMENT station (backlog c9b9bacc, conductor order 20261105_2217Z,
+# on pass item 3 of design ccfe87ff): shared process equipment, operated
+# by the forgejo-runner.service act runner on the forge host,
+# which polls Forgejo for tasks and runs each CI job as a container on the
+# host's system docker daemon (infra/forge/OPERATIONS.md, "CI runner").
+# Its automaton is that runner, automation:forge-actions-runner
+# (infra/platform/automations/forge-actions-runner.toml), which signs
+# nothing in the system of record: "NO JOB HERE WRITES TO THE SYSTEM OF
+# RECORD" (ci.yml, backlog 37742794).
+#
+# WHAT IT HOLDS is the stock disk:ci-workspaces names this station for:
+# each job's container and NAMED workspace volume on that daemon, which
+# the runner reclaims on a normal finish and which a crashed job leaves
+# behind for infra/forge/reap-dead-ci-jobs.sh (that script's header: a
+# 63 GB orphan volume, 2026-08-14, packet 1b63456b).
+#
+# ONE BAY, because the forge has one runner slot. Measured, not assumed:
+# .forgejo/workflows/ci.yml says the jobs "run serially on one runner
+# slot (~17 min a run)", counted off the forge's task list (backlog
+# 47fc2bc1; pinned by boss-testing's ci_runs_once_per_train), and again
+# where the Rust checks left for the cluster: "13 of the ~17 minutes
+# every train spent on the forge's one runner slot" (design 128b5496).
+# The workflow's own `concurrency` (group ci-<ref>, cancel-in-progress)
+# bounds one run per PR, not the runner; every job is `runs-on: docker`
+# and chained by `needs:` (delivery-plan, then build-image, locomotive,
+# web), so a train's run is one job at a time on that slot. The runner's
+# own config file is not in this tree (the unit's WorkingDirectory holds
+# its registration, infra/forge/recovery-kit.sh) — if its capacity is
+# raised, re-measure off the task list and bump this row.
+#
+# No step names this station yet: the `ci` step belongs to the train
+# conductor, who records the forge's verdict, and "everything else stays
+# undeclared until a constraint is real". To change this station, bump
+# `version`.
+#
+# Version 2 (T2 of design 4b27a65a, backlog 3f58c823; bumped from the
+# LIVE newest, v1): the station stands in the tree — its stable `id`, its
+# `parent` /algedonic/engineering/forge, its mode, and its seats, the
+# same number as its bays. Nothing else changed.
+#
+# Version 3 (backlog a1c0a0ff, design deba3000; bumped from the tree's
+# v2): the hand-typed `[station.upstream]` is gone. It named a /system
+# route the IT consolidation retired on 2026-08-31, so the walk upstream
+# led to a not-found page. A station's upstream is now DERIVED from the
+# tree, as its parent station's page (`upstreamOf` in
+# apps/web/src/it/tree/station-page.ts), and the seed refuses a declared
+# one. The retired department label is removed with its floor reader
+# (backlog aa82eb11); the station's parent places it in the tree.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "forge-ci"
+version = 4
+id = "210c9b9c-e485-4751-af65-5d8429a130e9"
+parent = "b8f8a23b-f8da-428f-8df2-731be4ae597a"
+mode = "standing"
+capacity = 1
+status = "active"
+title = "Forge CI — trains waiting on the forge runner"
+kind = "equipment"
+automaton = "automation:forge-actions-runner"
+bays = 1
+discipline = ["age"]
+
+[station.predicate]
+kind = "pr-train"
+status = "open"
+
+[station.predicate.step]
+slug = "ci"
+status_in = ["ready", "active"]

@@ -2,13 +2,45 @@
 
 One file per held kind, `<kind>.toml`, named for the workflow kind it
 holds (the row is `infra/platform/workflows/<kind>.toml`). **Holding a
-kind is dropping a file in. Lifting a hold is a car too, and which car
-depends on why the kind is held:** a kind held only by its file is
-lifted by deleting the file; a kind held BY DEFAULT (its row declares a
-`writer` or an `executor`, below) stays held when its file is deleted,
-and is lifted by a file that says `drift_publish = "released"`. Nothing
-is appended anywhere, so two cars holding two kinds touch no shared
-line.
+kind is dropping a file in, and lifting it is a car that deletes the
+file.** Nothing is appended anywhere, so two cars holding two kinds touch
+no shared line.
+
+## A hold is a timing hold; the passkey is the server's (backlog a4b57aca)
+
+Since 2026-11-08 a hold says only WHEN a row may go live — "after the
+stations it names read back", the deliberate publish with a positive
+control and a named rollback of design b08725c2 — and an agent may
+declare one for its own row. Whether a publish needs a PERSON is no longer
+this directory's question. `POST /api/workflows/{kind}/publish` answers it
+on the LIVE row: a row with a presence step, or one that admits or fulfils
+a packet of such a row through a dispatcher rule (closed transitively), is
+published only with a passkey-signed publish-a-protocol packet; every other
+row, a new kind and a candidate that adds presence among them, an agent
+publishes, and the drift publish may publish it unattended
+(`crates/core/boss-jobs/src/publish_passkey.rs`). So the default holds
+(any row declaring a `writer`, an `executor` or a `resources` bill) and the
+`released` state that answered them are retired.
+
+**Five files stay although the server now guards their rows' passkey**:
+`ops-request` and `publish-a-protocol`, and, since car db099d49 moved
+their owners (design c0ae096f; review 6254feec), `break-glass-enrolment`,
+`enroll-a-managed-agent` and `workflow-design`. A file here is still the
+only thing that makes `publish-drift --file-held` open the
+publish-a-protocol packet a person signs for an edit of the row;
+deleted, an edit of one would reach the drift publish, be refused by the
+server, leave a draft that blocks every later check, and reach no
+signer. The pin
+`every_moved_row_the_server_protects_waits_for_its_signed_publish`
+(crates/core/boss-jobs/tests/station_tree.rs) holds the three moved rows
+to the server's own `publish_passkey::protected_kinds`. Deriving
+`--file-held` from the server's protected set retires them (and so the
+rest of the approval half of this directory) in a later car. They also
+give `infra/platform/delivery-policy/train-conductor.toml` the names it
+reads here as `protected_names_from`: the first two keep delivery
+protection unchanged, and the three moved rows join it, so
+`infra/forge/delivery-plan.py` counts any edit of those rows protected,
+as a passkey row's edit should be.
 
 ## Why this exists (backlog 083d240e)
 
@@ -34,26 +66,13 @@ go live at a deliberate publish rather than on the next clean check.'''
 lifts = 'backlog 6c9183de: the car that follows the deliberate publish and its positive control deletes this file'
 ```
 
-- `drift_publish` is `"held"` or `"released"`. Required.
+- `drift_publish` is `"held"`. Required.
 - `why` is required, a sentence of at least 20 characters.
-- `lifts` is required on a held kind and names, by its 8-hex id, the item
+- `lifts` is required and names, by its 8-hex id, the item
   or design whose completion lifts the hold.
 - No other key is read, and the file carries no `kind =` line: the kind is
   the file name.
 
-## The default, and the override in both directions
-
-A row that declares a field `writer` or a step `executor` is a refusal row
-by construction, so it is **held by default, with no file here**:
-forgetting to declare a hold cannot publish a refusal unattended. A file
-overrides the default either way:
-
-- `drift_publish = "held"` holds any kind, and puts a `why` and a `lifts`
-  on a kind the default already holds.
-- `drift_publish = "released"` hands a default-held row back to the drift
-  publish, on the record, once its deliberate publish and control are
-  done. A `released` file for a row that declares no writer and no
-  executor releases nothing and is refused as residue.
 
 ## What a hold does, and what it does not
 
@@ -108,13 +127,13 @@ R1 of the signer car, run 7cee49b9). Both pass through
   names a publish for any kind, and the converge files one item saying
   so.
 - **What this does not guarantee.** It does not stop an actor who holds
-  `publish` on `workflow` from running that hand door, at any hour,
-  without David. Who may run it, and whether it should need a passkey, is
-  a policy question this directory does not answer.
+  `publish` on `workflow` from running that hand door at any hour. Whether
+  that publish needs a passkey is the server's answer (above), not this
+  directory's.
 - **Fail closed.** A file here that does not parse, lacks its `why`,
-  carries an unknown key or state, names a kind the bundle does not
-  author, or is neither `README.md` nor `<kind>.toml` — or this path
-  being anything but a directory, or a row file that does not parse — makes
+  carries an unknown key or a state other than `held`, names a kind the
+  bundle does not author, or is neither `README.md` nor `<kind>.toml` — or
+  this path being anything but a directory — makes
   `publish-workflow` refuse every mode and `publish-drift` refuse the
   whole run in both modes (exit 78: nothing published). The pin
   `crates/core/boss-testing/tests/publish_drift_sh.rs`

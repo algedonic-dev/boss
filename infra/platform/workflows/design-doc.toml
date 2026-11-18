@@ -52,7 +52,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "A design doc while it is still being decided. The prose and the open questions ride in the packet, so it is reviewable the moment it exists rather than after it ships; the markdown lands as a file only when the packet terminates. Replaces the index-and-flush round trip that made a review possible only after its doc reached deployed main."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { owner = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5", department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "drafted"
@@ -96,7 +96,7 @@ kind = "review-design"
 ready_when = "steps.drafted.done AND (NOT (job.metadata.no_open_questions = \"true\") OR job.metadata.questions.0.anchor = job.metadata.questions.0.anchor)"
 title_template = "Answer the open questions"
 authority_role = "platform-admin"
-metadata_defaults = { title = "{metadata.title}", markdown = "{metadata.markdown}", questions = "{metadata.questions}", resolutions = [] }
+metadata_defaults = { at = "202dc00d-c5a7-4cde-81f5-d6a6fcd26e6b", human_presentation = { ask = "Answer the open design questions", why_person = "These questions require the operator decision requested by this design.", action = "Read each question and record its resolution", after = "The design can be folded only after every question has a recorded answer.", evidence = "current-step" }, title = "{metadata.title}", markdown = "{metadata.markdown}", questions = "{metadata.questions}", doc_path = "", resolutions = [] }
 
 [[workflow.step.fields]]
 name = "title"
@@ -188,6 +188,7 @@ covers = "questions"
 name = "doc_path"
 field_type = "string"
 required = true
+filled_by = "filer"
 
 # The fold is where a settled doc pays into current truth. Published
 # live as design-doc v4 (2026-09-05) before it reached this bundle;
@@ -204,7 +205,7 @@ title_template = "Fold it into current truth"
 # at this step with no way to hand them out (the last fold car was
 # briefed by hand). The builder profile, because the output is a car.
 agent = { profile = "builder", model = "opus-5-5", budget_usd = 5, effort = "high" }
-metadata_defaults = { procedure = """State what CURRENT TRUTH gains from this doc now that its questions are answered, and where. 'Nothing' is a legitimate answer and still has to be written down with its reason — that is the whole point of the step existing.
+metadata_defaults = { at = "cc856b32-3667-4e70-b6cd-667f6fe89007", procedure = """State what CURRENT TRUTH gains from this doc now that its questions are answered, and where. 'Nothing' is a legitimate answer and still has to be written down with its reason — that is the whole point of the step existing.
 
 The fold is the current-truth reading, assembled per topic, with the decision history beside it rather than inlined (Q2). Today that is docs/architecture-decisions.md, maintained by hand because merging prose has nuance a generator cannot judge. This step does not automate that judgement; it makes skipping it visible.
 

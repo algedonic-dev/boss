@@ -89,7 +89,7 @@
 </script>
 
 <div class="detail-page theme-exec">
-  <Breadcrumb to={href('/ux/finance')}>
+  <Breadcrumb to={href('/finance')}>
     ← Finance
   </Breadcrumb>
 

@@ -20,7 +20,8 @@
   // NO NUMBER THIS SURFACE MAKES UP. Kinds come from the registry, not a
   // list here; a lane is the server's reading of what the filer
   // recorded, and `unclassified` where the filer named none (backlog
-  // 1eea4554); a kind whose page truncated is named; a failed read is a
+  // 1eea4554); a kind whose read came up short is named with the rows
+  // it kept of its total (backlog 3e96fe11); a failed read is a
   // failure, never a clear track.
   import { onMount } from 'svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
@@ -39,25 +40,26 @@
     lanesOf,
     loadEveryPage,
     loadWorkflows,
+    manifestSteps,
     provenance,
     readings,
+    shortReadSentence,
+    shortReads,
     SOURCED_KIND,
     waiting,
     type InboundRow,
+    type ShortRead,
     type WaitingRow,
   } from './receiving';
-  import { receivingPlatforms, type Deck } from '../yard/world-interior';
 
   // CAR 4 (design d2154293): this page is also mounted UNDER the world
   // zoomed into the receiving territory, at /it/yard/receiving.
   // `embedded` drops the page header, because the world above already
-  // carries one, and that is ALL it drops. `ondeck` hands the inbound
-  // rows up so the territory's platforms are drawn from the reads this
-  // page already makes — one read of a region, never two.
+  // carries one, and that is ALL it drops. The retired map no longer
+  // receives a second representation of the inbound rows (cfd67b9e).
   let {
     embedded = false,
-    ondeck = (_deck: Deck) => {},
-  }: Readonly<{ embedded?: boolean; ondeck?: (deck: Deck) => void }> = $props();
+  }: Readonly<{ embedded?: boolean }> = $props();
 
   /** The window: a week of days, today included. Departures are read
    *  from the same rows, so a packet that closed inside the window
@@ -72,7 +74,7 @@
   let today = $state<string>(new Date().toISOString().slice(0, 10));
   let registry = $state<Remote<ReadonlyArray<string>>>({ kind: 'loading' });
   let rows = $state<Remote<ReadonlyArray<InboundRow>>>({ kind: 'loading' });
-  let truncated = $state<ReadonlyArray<{ kind: string; total: number }>>([]);
+  let truncated = $state<ReadonlyArray<ShortRead>>([]);
 
   async function refresh(): Promise<void> {
     today = new Date().toISOString().slice(0, 10);
@@ -92,10 +94,7 @@
       return;
     }
     const ready = pages.flatMap((p) => (p.kind === 'ready' ? [p.data] : []));
-    truncated = kinds.flatMap((kind, i) => {
-      const p = ready[i];
-      return p && p.total > p.rows.length ? [{ kind, total: p.total }] : [];
-    });
+    truncated = shortReads(kinds, ready);
     rows = { kind: 'ready', data: ready.flatMap((p) => p.rows) };
   }
 
@@ -186,22 +185,6 @@
     return `${r.title} — ${r.age} d, on ${r.holder.label}${f ? ` — ${failedVerbPhrase(f)}` : ''}`;
   };
 
-  // What the zoomed territory draws: a platform per inbound lane,
-  // or the honest reason there is none. The registry read decides
-  // which kinds are inbound, so a registry that did not answer is an
-  // unavailable deck rather than an empty one.
-  const deck = $derived<Deck>(
-    registry.kind === 'failed'
-      ? { kind: 'unavailable', why: registry.error }
-      : rows.kind === 'failed'
-        ? { kind: 'unavailable', why: rows.error }
-        : registry.kind === 'loading' || rows.kind === 'loading'
-          ? { kind: 'reading' }
-          : { kind: 'ready', region: 'receiving', platforms: receivingPlatforms(all, today, days) },
-  );
-  $effect(() => {
-    ondeck(deck);
-  });
 </script>
 
 <div class="ry-root">
@@ -229,10 +212,8 @@
     {#if truncated.length > 0}
       <p class="ry-fail load-failed">
         {#each truncated as t (t.kind)}
-          <span class="mono">{t.kind}</span> has {t.total} packets in the window and only {PAGE}
-          were read;
+          <span class="mono">{t.kind}</span>: {shortReadSentence(t)}.
         {/each}
-        the counts below are floors for those kinds.
       </p>
     {/if}
 
@@ -466,7 +447,7 @@
                   <span class="id">{r.id.slice(0, 8)}{#if r.priority === 'urgent'} · urgent{/if}</span>
                 </td>
                 <td class="mono dim">
-                  {r.ready.map((s) => s.kind).join(', ') || '—'}
+                  {manifestSteps(r)}
                   {#if failed}
                     <!-- The verb's own line, in the error colour the
                          page already uses for a failed read, with the
@@ -586,7 +567,7 @@
   .car.h-nobody { background: transparent; color: var(--fog); outline: 1px dashed var(--static); outline-offset: -1px; }
   .car.h-nobody.aging { color: var(--warn); outline-color: var(--warn); }
   .car.h-nobody.stale { color: var(--err); outline-color: var(--err); }
-  .car:focus-visible { outline: 2px solid var(--signal); outline-offset: 1px; }
+  .car:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
   .ry-key { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 8px; font-family: var(--font-mono); font-size: 11px; color: var(--static); }
   .ry-key .fresh { color: var(--ok); }
   .ry-key .aging { color: var(--warn); }

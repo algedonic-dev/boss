@@ -46,19 +46,16 @@
     type StationFlowEnvelope,
     type StationLoadEnvelope,
   } from './marshalling';
-  import { marshallingPlatforms, type Deck } from '../yard/world-interior';
 
   // CAR 4 (design d2154293): this page is also mounted UNDER the world
   // zoomed into the marshalling territory, at /it/yard/marshalling.
   // `embedded` drops the page header, because the world above already
-  // carries one, and that is ALL it drops. `ondeck` hands the joined
-  // sidings up so the territory's platforms are drawn from the reads
-  // this page already makes — one read of a region, never two.
+  // carries one, and that is ALL it drops. The retired map no longer
+  // receives a second representation of the sidings (cfd67b9e).
   let {
     embedded = false,
     regionRead,
-    ondeck = (_deck: Deck) => {},
-  }: Readonly<{ embedded?: boolean; regionRead: Remote<Regions>; ondeck?: (deck: Deck) => void }> = $props();
+  }: Readonly<{ embedded?: boolean; regionRead: Remote<Regions> }> = $props();
 
   // Offered windows. A day is the default: the shortest span in which
   // every queue on this network has had a chance to be worked once, so
@@ -171,23 +168,6 @@
 
   const openPacket = (jobId: string) => navigate(`/jobs/${jobId}`);
 
-  // What the zoomed territory draws: a platform per station, or the
-  // honest reason there is none. A failed read is a FAILURE up there
-  // too — a region drawn empty would read as a quiet one.
-  const deck = $derived<Deck>(
-    membershipProblem !== null
-      ? { kind: 'unavailable', why: membershipProblem }
-      : load.kind === 'failed'
-      ? { kind: 'unavailable', why: load.error }
-      : flow.kind === 'failed'
-        ? { kind: 'unavailable', why: flow.error }
-        : load.kind === 'loading' || flow.kind === 'loading' || regionRead.kind === 'loading'
-          ? { kind: 'reading' }
-          : { kind: 'ready', region: 'marshalling', platforms: marshallingPlatforms(sidings, judgedHours) },
-  );
-  $effect(() => {
-    ondeck(deck);
-  });
 </script>
 
 <div class="my-root">
@@ -277,7 +257,7 @@
               <td class="mono">
                 <button type="button" class="my-station my-queue" onclick={() => selectedQueue = s.station}>{s.station}</button>
                 {#if s.flow.kind === 'counted'}
-                  <span class="dim">{s.flow.basis === 'packet-membership-v1' ? 'packet crossings' : 'legacy distinct Steps'}</span>
+                  <span class="dim">{s.flow.basis === 'step-window-v1' ? 'step stamps' : 'legacy distinct Steps'}</span>
                 {/if}
                 <!-- The per-kind drill-down, where the station's predicate
                      names one Workflow kind (c7c5c1de): which step of
@@ -296,7 +276,7 @@
                 {/if}
               </td>
               <td class="num">
-                {s.depth}{#if s.wipLimit !== null}<span class="dim"> / {s.wipLimit}</span>{/if}
+                {s.depth}
               </td>
               <td class="num dim">{s.oldestAgeDays === null ? '—' : `${s.oldestAgeDays} d`}</td>
               <td class="num">{s.flow.kind === 'counted' ? s.flow.arrived : '—'}</td>
@@ -385,10 +365,9 @@
     <p class="my-footnote">
       Depth and the oldest packet's age come from <span class="mono">/api/stations/load</span>;
       arrivals and departures from <span class="mono">/api/stations/flow</span>, counted over
-      the window from conserved original packet state and original transaction groups, on
-      the audit insertion clock. Retention uses the original business-clock mapping.
-      Departures include cancellation, reassignment and retention expiry; served counts
-      completed work. A legacy step-events answer counts distinct Steps and is labelled
+      the window from each step's own stamps: an arrival is a step that became ready at the
+      station, a departure a step completed there, and what departed is what it served.
+      A legacy step-events answer counts distinct Steps and is labelled
       per station; it is a different unit. "Oldest" is the oldest member packet's age
       since it opened, which over-reports time in this queue; the per-obligation wait below it
       is the step-level figure. Nothing on this page is estimated: a queue whose rate could not

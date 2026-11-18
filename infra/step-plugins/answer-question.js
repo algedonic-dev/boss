@@ -382,8 +382,13 @@
 
       const asker = meta('asked_by');
       const q = meta('question') || meta('message') || meta('body');
+      // `boss design --no-questions` stores the flag as the STRING
+      // "true" — design 195276f0 carried exactly that — so a boolean-only
+      // check read a recorded design as one with questions and sent the
+      // reader to a review that does not exist (backlog ac141c99).
+      const flag = linkedDesign && linkedDesign.metadata && linkedDesign.metadata.no_open_questions;
       const recorded = linkedDesign && linkedDesign.metadata &&
-        linkedDesign.metadata.no_open_questions === true &&
+        (flag === true || flag === 'true') &&
         Array.isArray(linkedDesign.metadata.questions) && linkedDesign.metadata.questions.length === 0;
       body.appendChild(
         h('div', { className: 'aq-head' },

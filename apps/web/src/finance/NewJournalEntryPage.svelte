@@ -119,7 +119,7 @@
           };
         }),
       });
-      navigate(href(`/ux/finance?entry=${encodeURIComponent(result.entry_id)}`));
+      navigate(href(`/finance?entry=${encodeURIComponent(result.entry_id)}`));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -129,7 +129,7 @@
 </script>
 
 <div class="theme-exec" style="padding:0 32px 32px">
-  <Breadcrumb to={href('/ux/finance')}>
+  <Breadcrumb to={href('/finance')}>
     ← Finance
   </Breadcrumb>
   <PageHeader
@@ -276,7 +276,7 @@
       >
         {saving ? 'Posting…' : 'Post entry'}
       </button>
-      <button type="button" onclick={() => navigate(href('/ux/finance'))} class="hr-done-btn">
+      <button type="button" onclick={() => navigate(href('/finance'))} class="hr-done-btn">
         Cancel
       </button>
     </div>

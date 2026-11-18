@@ -60,8 +60,7 @@ pub struct TenantConfig {
     /// annually). Action shape mirrors `PeriodicAction`.
     #[serde(default)]
     pub periodic: HashMap<String, PeriodicToml>,
-    // BatchEngine specs retired 2026-05-06 — see TODO.md
-    // "Strip BatchEngine". The four [batch.*] rows that lived
+    // BatchEngine specs retired 2026-05-06. The four [batch.*] rows that lived
     // here (payroll, sales-tax, payroll-941, income-tax) bypassed
     // the Workflow / Step / audit-trail by emitting canonical
     // events directly. Replaced by [periodic.*] specs that open
@@ -665,8 +664,8 @@ pub struct SubjectCadence {
     /// `None` defaults to midnight (`"00:00"`), matching the
     /// pre-Phase-B-2 behavior where cadence rows always fired
     /// on tick 0 of the matching weekday. Phase B-2 of the
-    /// sub-day-tick rollout — see TODO.md "Hourly tick
-    /// granularity" + `engines::tick::parse_hh_mm`.
+    /// sub-day-tick rollout; the parser is
+    /// `engines::tick::parse_hh_mm`.
     ///
     /// At day-tick (`tick_duration = "1d"`) this field has no
     /// observable effect: the day tick covers `[0, 24)` so
@@ -788,7 +787,7 @@ impl TenantConfig {
     }
 
     // batch_toml_specs() retired 2026-05-06 alongside the
-    // BatchEngine rip — see TODO.md "Strip BatchEngine".
+    // BatchEngine rip.
 
     /// Build a list of `PeriodicSpec`s from the parsed
     /// `[periodic.*]` blocks. Section keys become spec names.
@@ -1374,7 +1373,7 @@ delay_probability = 1.5
     }
 
     // parses_bakery_batch_section retired 2026-05-06 alongside
-    // the BatchEngine rip — see TODO.md "Strip BatchEngine".
+    // the BatchEngine rip.
 
     #[test]
     fn parses_bakery_periodic_section() {

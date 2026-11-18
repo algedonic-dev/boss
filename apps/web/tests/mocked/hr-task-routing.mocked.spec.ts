@@ -45,7 +45,7 @@ async function openTasks(page: Page, stepsStatus = 200, jobStatus = 200): Promis
     json(r, stepsStatus === 200 ? steps : { error: 'policy refuses this read' }, stepsStatus));
   await page.route(new RegExp(`/api/jobs/${JOB}$`), (r) =>
     json(r, jobStatus === 200 ? packet : { error: 'policy refuses this packet' }, jobStatus));
-  await mountPage(page, '/hr');
+  await mountPage(page, '/people/hr');
   await page.getByRole('tab', { name: 'Workflows', exact: true }).click();
   await page.getByRole('button', { name: 'View tasks', exact: true }).click();
   return writes;

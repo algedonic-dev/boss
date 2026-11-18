@@ -881,9 +881,24 @@ mod tests {
             "{}: {declared:?}",
             rule.name
         );
+        // NARROWED (backlog 9788e22d): no backlog-item declaration HERE,
+        // whole or narrowed to a step — every build of every priority
+        // would alarm on its wait, and an urgent build whose car waits on
+        // its train waits honestly. The urgent ones ARE watched, scoped
+        // by priority, by `jobs.urgent_item_watch`, whose own shipped-rule
+        // test holds that scope to urgent and emergency.
         assert!(
-            !declared.contains_key("backlog-item"),
-            "backlog builds are the flat list this alarm exists to stand apart from"
+            !declared
+                .keys()
+                .any(|k| declared_scope(k).0 == "backlog-item"),
+            "backlog builds are the flat list this alarm exists to stand apart from: {declared:?}"
+        );
+        assert!(
+            raw.rules.iter().any(|r| r
+                .do_steps
+                .iter()
+                .any(|d| d.handler == super::super::jobs_urgent_item_watch::HANDLER)),
+            "the only watch on backlog-item claims is the priority-scoped one"
         );
         // The owed landed review is watched, and ONLY that step of a car
         // — a whole-ship-a-change bound would alarm on every honest

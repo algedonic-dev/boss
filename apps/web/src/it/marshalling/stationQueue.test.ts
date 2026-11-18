@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { parseStationQueue } from './stationQueue';
 
 const packet = (id: string) => ({ id, kind: 'backlog-item', title: id, opened_on: '2026-09-23', metadata: {}, tags: [] });
-const envelope = { station: 'q.platform-admin.task', discipline: ['priority', 'age'], total: 3, data: [packet('urgent-new'), packet('standard-old')], over_limit: false, wip_limit: null };
+const envelope = { station: 'q.platform-admin.task', discipline: ['priority', 'age'], total: 3, data: [packet('urgent-new'), packet('standard-old')],  };
 
 describe('a selected station queue (fdc0ea0b)', () => {
   test('preserves server order, discipline and full total without claiming a truncated answer empty', () => {

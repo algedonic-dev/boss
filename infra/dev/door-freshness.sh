@@ -66,21 +66,39 @@
 # source this file (CLAUDE.md §9a: a comment asking the next person to
 # remember is not a mechanism).
 
+# THE SHARED CHECKOUT OFF MAIN is the same defect by another road
+# (backlog 88553fea, 2026-10-20). Measured from the /work/boss reflog:
+# reviewer runs detached it twice (17:40Z at 8a9fdecb, 19:03Z at
+# dcb010de) and run 2452d6ff switched it to its own branch and left it
+# there from 19:04 to 19:17Z — each a bare git whose `cd <worktree> &&`
+# the harness dropped — and every door ran that tree meanwhile. The
+# three questions above were silent throughout: a HEAD detached AT
+# origin/main is not behind it, and a branch with a commit of its own is
+# not an ancestor. So a fourth comes first: is this checkout THE shared
+# one — the PRIMARY worktree, with linked worktrees hanging off it — and
+# is its HEAD anything but `main`? Both halves keep the neighbours quiet:
+# a builder's LINKED worktree on its own branch is not primary, and the
+# gate's own clone (`git checkout -B <car branch>`, no linked worktree)
+# runs every door pin and must not warn on every car. It costs the
+# common case nothing: the symbolic name rides the same rev-parse.
+
 # door_is_stale "$0" — prints one sentence of facts and returns 0 when
-# the door's own copy is behind origin/main; returns 1, silently, in
+# the door's own copy is behind origin/main, or when it runs from the
+# shared checkout and that checkout is off main; returns 1, silently, in
 # every other case including every case it cannot judge.
 door_is_stale() {
-    local file dir top rel both head main ours theirs disk behind plural
+    local file dir top rel both head main sym ours theirs disk behind plural gitdir common where wt
     if [ "${BOSS_DOOR_FRESHNESS:-}" = off ]; then return 1; fi
     if ! command -v git >/dev/null 2>&1; then return 1; fi
     file=$(readlink -f "$1" 2>/dev/null) || return 1
     if [ -z "$file" ] || [ ! -e "$file" ]; then return 1; fi
     dir=$(dirname "$file")
 
-    # ONE git call decides the common case: both shas at once, and a
-    # checkout standing exactly on origin/main is answered by a string
-    # comparison with no second fork.
-    both=$(git -C "$dir" rev-parse HEAD refs/remotes/origin/main 2>/dev/null) || return 1
+    # ONE git call decides the common case: both shas and HEAD's
+    # symbolic name at once, and a checkout standing exactly on
+    # origin/main, on main, is answered by string comparisons with no
+    # second fork.
+    both=$(git -C "$dir" rev-parse HEAD refs/remotes/origin/main --symbolic-full-name HEAD 2>/dev/null) || return 1
     # Split on whitespace with the shell, not with $'\n' or a second
     # fork: this file is sourced, and a caller under dash reads a
     # bashism as a literal (the a-sh-script-parses-under-sh lesson).
@@ -90,6 +108,29 @@ door_is_stale() {
     set -- $both
     head=${1:-}
     main=${2:-}
+    sym=${3:-}
+    if [ -n "$head" ] && [ -n "$sym" ] && [ "$sym" != refs/heads/main ]; then
+        gitdir=$(git -C "$dir" rev-parse --path-format=absolute --git-dir --git-common-dir 2>/dev/null) || gitdir=
+        # shellcheck disable=SC2086
+        set -- $gitdir
+        common=${2:-}
+        if [ -n "$common" ] && [ "${1:-}" = "$common" ]; then
+            for wt in "$common"/worktrees/*; do
+                if [ -e "$wt" ]; then
+                    top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || top=$dir
+                    if [ "$sym" = HEAD ]; then
+                        where="HEAD is detached at"
+                    else
+                        where="it is on branch ${sym#refs/heads/} at"
+                    fi
+                    printf '%s ran from %s, in %s — the shared checkout every linked worktree hangs off — and that checkout is not on main: %s %.8s. Every door reached through it runs that tree'"'"'s copy, not main'"'"'s, and its answer can be well-formed and wrong (backlog 88553fea). Fix: git -C %s switch main (the dev pod'"'"'s reclaim pass returns a clean checkout to main hourly)' \
+                        "${file##*/}" "$file" "$top" "$where" "$head" "$top"
+                    return 0
+                fi
+                break
+            done
+        fi
+    fi
     if [ -z "$head" ] || [ -z "$main" ] || [ "$head" = "$main" ]; then return 1; fi
     # Behind means ANCESTOR OF: a diverged branch is a developer's, and
     # a checkout ahead of origin/main is nobody's problem.

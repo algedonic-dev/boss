@@ -1,0 +1,7 @@
+{
+  "about": "READ-ONLY: render the signed plan for set-longhorn-selector-policy, fixed to allow-empty-disk-selector-volume. Names the current and requested boolean, Longhorn's live definition, every node identity and full disk spec, affected tagged disks, the compare-and-set patch, read-back and inverse. False refuses while any default disk is tagged or no untagged disk remains. Any unread or disagreeing setting or disk inventory is CANNOT ANSWER. No replicas move; no setting is written. Backlog c84ab39b, design 3c475a19 interim scratch protection.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/longhorn-selector-policy.sh", "--plan", "{1}"],
+  "params": [{"name": "value", "one_of": ["true", "false"]}],
+  "timeout": 240
+}

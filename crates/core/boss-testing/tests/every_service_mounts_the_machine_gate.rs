@@ -57,6 +57,36 @@ const ROLE_SERVER_ADAPTER: &str = "crates/core/boss-policy-client/src/role_servi
 mod server_gate_scan;
 
 #[test]
+fn timed_machine_gate_keeps_the_served_value_provenance_requirement() {
+    let good = "fn main() { let app = boss_core::machine_gate::mount_with_request_latency(app, service, health, recorder, timing); axum::serve(listener, app); }";
+    let judged = server_gate_scan::scan(good).unwrap();
+    assert_eq!(judged.len(), 1);
+    assert!(judged[0].gated, "the canonical timed gate is a real gate");
+    for bad in [
+        "fn main() { let app = other::machine_gate::mount_with_request_latency(app); axum::serve(listener, app); }",
+        "fn main() { let app = boss_core::machine_gate::mount_with_request_latency(app); let app = other; axum::serve(listener, app); }",
+        "fn main() { let app = boss_core::machine_gate::mount_with_request_latency(app); axum::serve(listener, other); }",
+    ] {
+        assert!(
+            server_gate_scan::scan(bad)
+                .unwrap()
+                .iter()
+                .all(|server| !server.gated),
+            "{bad}"
+        );
+    }
+    assert!(mount_re().is_match("boss_core::machine_gate::mount_with_request_latency(app, \"jobs\", &[\"/api/jobs/health\"], Some(recorder), timing)"));
+    for name in ["mount", "mount_with_request_latency"] {
+        assert!(unrecorded_mount_re().is_match(&format!(
+            "machine_gate::{name}(app, \"jobs\", &[\"/api/jobs/health\"], None, timing)"
+        )));
+        assert!(!unrecorded_mount_re().is_match(&format!(
+            "machine_gate::{name}(app, \"jobs\", &[\"/api/jobs/health\"], Some(recorder), timing)"
+        )));
+    }
+}
+
+#[test]
 fn serving_an_app_requires_its_own_unshadowed_mount() {
     let good = "fn main() { let app = machine_gate::mount(app); axum::serve(listener, app); }";
     assert!(server_gate_scan::scan(good).unwrap()[0].gated);
@@ -757,7 +787,11 @@ fn is_test_file(tests: &[PathBuf], f: &Path) -> bool {
 }
 
 fn mount_re() -> Regex {
-    Regex::new(r#"machine_gate::mount\(\s*[^,"]+?\s*,\s*"([^"]+)"\s*,\s*&\[([^\]]*)\]"#).unwrap()
+    Regex::new(r#"machine_gate::mount(?:_with_request_latency)?\(\s*[^,"]+?\s*,\s*"([^"]+)"\s*,\s*&\[([^\]]*)\]"#).unwrap()
+}
+
+fn unrecorded_mount_re() -> Regex {
+    Regex::new(r#"machine_gate::mount(?:_with_request_latency)?\(\s*[^,"]+?\s*,\s*"([^"]+)"\s*,\s*&\[[^\]]*\]\s*,\s*None\s*(?:,|\))"#).unwrap()
 }
 
 /// Every mount in the tree: service name → (file, exempt paths).
@@ -956,10 +990,7 @@ const NO_RECORDER: [(&str, &str); 2] = [
 #[test]
 fn every_mount_states_its_facts_on_the_log_or_says_why_not() {
     let root = repo_root();
-    let none = Regex::new(
-        r#"machine_gate::mount\(\s*[^,"]+?\s*,\s*"([^"]+)"\s*,\s*&\[[^\]]*\]\s*,\s*None\s*,?\s*\)"#,
-    )
-    .unwrap();
+    let none = unrecorded_mount_re();
     let mut files = Vec::new();
     walk(&root.join("crates"), &mut files);
     let tests = test_only_modules(&files);

@@ -89,6 +89,20 @@ impl<S: ServiceLabel> std::error::Error for HttpClientError<S> {}
 /// }
 /// ```
 pub fn base(base_url: impl Into<String>) -> (String, crate::machine_token::Client) {
+    base_with_timeout(base_url, CLIENT_TIMEOUT)
+}
+
+/// [`base`] with a per-call timeout the CALLER owns. Production keeps
+/// [`CLIENT_TIMEOUT`] through [`base`]; this exists so a test reading an
+/// in-process double over loopback can hold a timeout of its own rather
+/// than the gate drive's: under a loaded drive a 5 s call to a double
+/// timed out and the test read the failure as a product answer (backlog
+/// ac3a347c, gate 1f46ec58 — a login refused 503, a coverage read
+/// "blinded").
+pub fn base_with_timeout(
+    base_url: impl Into<String>,
+    timeout: Duration,
+) -> (String, crate::machine_token::Client) {
     let base_url = base_url.into().trim_end_matches('/').to_string();
     // Every folded client carries the machine token when the process
     // has one mounted (machine_token.rs) — building it here is what
@@ -99,9 +113,8 @@ pub fn base(base_url: impl Into<String>) -> (String, crate::machine_token::Clien
     // Redirects off too, as every machine client is: a 3xx comes back
     // as a response rather than carrying the token to the host it
     // names (review of 6fbc7fc7, 2026-09-28, finding 1).
-    let http =
-        crate::machine_token::Client::build(reqwest::Client::builder().timeout(CLIENT_TIMEOUT))
-            .expect("building reqwest client");
+    let http = crate::machine_token::Client::build(reqwest::Client::builder().timeout(timeout))
+        .expect("building reqwest client");
     (base_url, http)
 }
 

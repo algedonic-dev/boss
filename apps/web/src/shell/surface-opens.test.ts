@@ -61,10 +61,10 @@ describe('routePattern', () => {
     // route never carries the id the parser extracted.
     for (const [path, expected] of [
       ['/ux/jobs/abc', '/ux/jobs/:jobId'],
-      ['/ux/vendors/acme%20co', '/ux/vendors/:vendorLookup'],
+      ['/finance/vendors/acme%20co', '/finance/vendors/:vendorLookup'],
       ['/ux/people/emp-032', '/ux/people/:empId'],
-      ['/ux/finance/inv-1', '/ux/finance/:invoiceId'],
-      ['/ux/purchase-orders/po-7', '/ux/purchase-orders/:poId'],
+      ['/finance/invoices/inv-1', '/finance/invoices/:invoiceId'],
+      ['/finance/purchase-orders/po-7', '/finance/purchase-orders/:poId'],
       ['/it/registry/rules/some-rule', '/it/registry/rules/:ruleName'],
       ['/it/registry/step-plugins/review-design', '/it/registry/step-plugins/:pluginSlug'],
       ['/ux/manual/intro', '/ux/manual/:slug'],

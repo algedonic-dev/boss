@@ -424,3 +424,32 @@ fn documents_split_on_separators_and_keys_read_at_their_level() {
     );
     assert_eq!(field(&docs[2], "spec", "backoffLimit"), None);
 }
+
+/// 8837710e / conductor decision 20261101T005013Z: the measured
+/// rewrites used more temporary I/O, so reduce full replays instead.
+#[test]
+fn search_reindex_is_hourly_without_overlapping_rebuilds() {
+    let manifest = std::fs::read_to_string(
+        repo_root().join("infra/cluster/manifests/boss-search-reindex.yaml"),
+    )
+    .unwrap();
+    assert_eq!(top_level(&manifest, "kind"), Some("CronJob"));
+    assert_eq!(name(&manifest), "boss-search-reindex");
+    assert_eq!(
+        field(&manifest, "spec", "schedule"),
+        Some("7 * * * *"),
+        "one full replay per hour, away from top-of-hour maintenance"
+    );
+    assert_eq!(
+        field(&manifest, "spec", "concurrencyPolicy"),
+        Some("Forbid")
+    );
+    let header = manifest.split_once("apiVersion:").unwrap().0;
+    assert!(
+        header.contains("hourly")
+            && header.contains("temp I/O")
+            && header.contains("staleness")
+            && header.contains("up to an hour"),
+        "the manifest must state the I/O versus freshness decision"
+    );
+}

@@ -184,6 +184,145 @@ pub(crate) async fn api_at_signed(
     payload: Option<Value>,
     signature: identity::Signature,
 ) -> Result<Option<Value>> {
+    api_at_signed_presenting(http, base, method, path, payload, signature, None).await
+}
+
+/// [`api`] presenting this host's ops-runner credential beside the
+/// machine token, in the header the jobs API's credential door resolves
+/// (`boss_jobs::runner_credential::HEADER`). ONE caller: the forge
+/// door's payment of an owed proof, the one write the server reserves
+/// to the credentialed runner (backlog 82946cd9). It rides the machine
+/// client, so it leaves only for a host the machine token may leave
+/// for, never through a proxy and never after a redirect.
+pub(crate) async fn api_presenting_runner(
+    http: &crate::machine_http::MachineClient,
+    method: reqwest::Method,
+    path: &str,
+    payload: Option<Value>,
+    credential: &reqwest::header::HeaderValue,
+) -> Result<Option<Value>> {
+    let signature = identity::signature_for(&method, path, identity::caller());
+    api_at_signed_presenting(
+        http,
+        &jobs_base()?,
+        method,
+        path,
+        payload,
+        signature,
+        Some(credential),
+    )
+    .await
+}
+
+/// [`api_at_signed`] with an optional runner credential — the seam the
+/// wire test reads the header through.
+pub(crate) async fn api_at_signed_presenting(
+    http: &crate::machine_http::MachineClient,
+    base: &str,
+    method: reqwest::Method,
+    path: &str,
+    payload: Option<Value>,
+    signature: identity::Signature,
+    runner: Option<&reqwest::header::HeaderValue>,
+) -> Result<Option<Value>> {
+    let extra: Vec<_> = runner
+        .map(|credential| (boss_jobs::runner_credential::HEADER, credential.clone()))
+        .into_iter()
+        .collect();
+    api_at_signed_with(http, base, method, path, payload, signature, &extra).await
+}
+
+/// The [`boss_jobs::step_metadata_write::EXPECT_HEADER`] value that
+/// carries the keys a step-metadata write judged (backlog cd1f68c6).
+pub(crate) fn expectation_value(
+    expect: &serde_json::Map<String, Value>,
+) -> Result<reqwest::header::HeaderValue> {
+    reqwest::header::HeaderValue::from_str(&boss_jobs::step_metadata_write::expectation_header(
+        expect,
+    ))
+    .context("the judged keys do not fit a header value")
+}
+
+/// [`api`] carrying the keys this write judged, in
+/// [`boss_jobs::step_metadata_write::EXPECT_HEADER`]: the merge door
+/// lands it only on a row that still reads so, and answers 409
+/// `step_changed` otherwise (backlog cd1f68c6).
+pub(crate) async fn api_expecting(
+    http: &crate::machine_http::MachineClient,
+    method: reqwest::Method,
+    path: &str,
+    payload: Option<Value>,
+    expect: &serde_json::Map<String, Value>,
+) -> Result<Option<Value>> {
+    let signature = identity::signature_for(&method, path, identity::caller());
+    let judged = expectation_value(expect)?;
+    api_at_signed_with(
+        http,
+        &jobs_base()?,
+        method,
+        path,
+        payload,
+        signature,
+        &[(boss_jobs::step_metadata_write::EXPECT_HEADER, judged)],
+    )
+    .await
+}
+
+/// [`api_at_signed`] with extra request headers — the runner credential,
+/// a write's judged keys — beside the signed caller. Every signed door
+/// sends through here.
+pub(crate) async fn api_at_signed_with(
+    http: &crate::machine_http::MachineClient,
+    base: &str,
+    method: reqwest::Method,
+    path: &str,
+    payload: Option<Value>,
+    signature: identity::Signature,
+    extra: &[(&'static str, reqwest::header::HeaderValue)],
+) -> Result<Option<Value>> {
+    let (status, body) =
+        api_raw_at_signed_with(http, base, method.clone(), path, payload, signature, extra).await?;
+    let body = std::str::from_utf8(&body).context("service response was not UTF-8")?;
+    success_answer(&service_at(base), &method, path, status, body)
+}
+
+/// The signed machine door before JSON parsing. Receipt consumers retain
+/// these bytes; ordinary API callers derive their parsed view above.
+pub(crate) async fn api_raw_at_signed_with(
+    http: &crate::machine_http::MachineClient,
+    base: &str,
+    method: reqwest::Method,
+    path: &str,
+    payload: Option<Value>,
+    signature: identity::Signature,
+    extra: &[(&'static str, reqwest::header::HeaderValue)],
+) -> Result<(reqwest::StatusCode, Vec<u8>)> {
+    let (status, body) =
+        api_response_at_signed_with(http, base, method.clone(), path, payload, signature, extra)
+            .await?;
+    if !status.is_success() {
+        let service = service_at(base);
+        let body = String::from_utf8_lossy(&body);
+        bail!(
+            "{service} {method} {path} -> {status}: {}{}",
+            body.trim(),
+            ways_out(&body)
+        );
+    }
+    Ok((status, body))
+}
+
+/// Original response status and bytes, including structured native refusals.
+/// Redirects remain refused at the same machine boundary.
+pub(crate) async fn api_response_at_signed_with(
+    http: &crate::machine_http::MachineClient,
+    base: &str,
+    method: reqwest::Method,
+    path: &str,
+    payload: Option<Value>,
+    signature: identity::Signature,
+    extra: &[(&'static str, reqwest::header::HeaderValue)],
+) -> Result<(reqwest::StatusCode, Vec<u8>)> {
     let signer = identity::apply(signature)?;
     let user = identity::header(&signer);
     let url = format!("{base}{path}");
@@ -196,6 +335,9 @@ pub(crate) async fn api_at_signed(
             .request(method.clone(), &url)
             .header("x-boss-user", user.as_str())
             .header("content-type", "application/json");
+        let req = extra
+            .iter()
+            .fold(req, |req, (name, value)| req.header(*name, value.clone()));
         match &payload {
             Some(p) => req.json(p),
             None => req,
@@ -220,15 +362,43 @@ pub(crate) async fn api_at_signed(
              instance?)"
         );
     }
-    let body = resp.text().await.unwrap_or_default();
+    let body = resp
+        .bytes()
+        .await
+        .with_context(|| format!("{service} {method} {path}: reading the response body"))?;
+    Ok((status, body.to_vec()))
+}
+
+/// A signed GET whose 2xx body is returned as the exact BYTES the service
+/// sent, before any parse — the shape a bounded START's packet snapshot is
+/// retained in (design e72dc7c9: parsed JSON is a derived view, and a
+/// reserialization is never the original response). Every refusal is the
+/// same as [`api_at_signed`]'s.
+pub(crate) async fn api_bytes_at_signed(
+    http: &crate::machine_http::MachineClient,
+    base: &str,
+    path: &str,
+    signature: identity::Signature,
+) -> Result<Vec<u8>> {
+    let signer = identity::apply(signature)?;
+    let user = identity::header(&signer);
+    let url = format!("{base}{path}");
+    let service = service_at(base);
+    let resp = crate::train::send_through_a_roll(&format!("{service} GET {path}"), || {
+        http.request(reqwest::Method::GET, &url)
+            .header("x-boss-user", user.as_str())
+    })
+    .await?;
+    let status = resp.status();
     if !status.is_success() {
-        bail!(
-            "{service} {method} {path} -> {status}: {}{}",
-            body.trim(),
-            ways_out(&body)
-        );
+        let body = resp.text().await.unwrap_or_default();
+        bail!("{service} GET {path} -> {status}: {}", body.trim());
     }
-    success_answer(&service, &method, path, status, &body)
+    Ok(resp
+        .bytes()
+        .await
+        .with_context(|| format!("{service} GET {path}: reading the body"))?
+        .to_vec())
 }
 
 /// The ways out a refusal names, one to a line under the body.
@@ -620,6 +790,38 @@ pub(crate) mod stub {
         (format!("http://{addr}"), handle)
     }
 
+    /// Answer each of `answers` — a status line and a body — to one
+    /// connection, in order: a record that changes between reads, the
+    /// way a gate-run's `withdrawn` terminal completes a second or two
+    /// after its verdict (backlog 7905cb5d). The counter is how many
+    /// requests were read, so a test can say a reader stopped early.
+    pub(crate) async fn answers_in_order(
+        answers: Vec<(&'static str, String)>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = served.clone();
+        tokio::spawn(async move {
+            for (status, body) in answers {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let _ = read_request(&mut sock).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), served)
+    }
+
     /// A one-shot `302` to `location`, its body echoing the whole target
     /// the way an HTML redirect page does — the shape Cloudflare Access
     /// answers `boss.algedonic.dev` with (backlog 2ee29275, F4).
@@ -907,6 +1109,54 @@ mod signing_tests {
         assert!(
             !head.contains(crate::identity::CONDUCTOR),
             "an operator's write must not be signed as the train automation; head was:\n{head}"
+        );
+    }
+
+    /// Backlog 82946cd9, at the wire: the runner credential rides in the
+    /// header the jobs API's credential door reads, beside the signed
+    /// caller, only on the write that asks for it — the plain signed
+    /// door never carries one.
+    #[tokio::test]
+    async fn the_runner_credential_rides_only_the_write_that_presents_it() {
+        let header = boss_jobs::runner_credential::HEADER;
+        let mut credential = reqwest::header::HeaderValue::from_static("fixture-credential");
+        credential.set_sensitive(true);
+        let http = crate::sor_client::machine_client().unwrap();
+
+        let (base, stub) = one_request("{}").await;
+        api_at_signed_presenting(
+            &http,
+            &base,
+            reqwest::Method::PATCH,
+            "/api/jobs/x/metadata",
+            Some(json!({"proof_owed": "paid"})),
+            Signature::As("automation:ops-runner".into()),
+            Some(&credential),
+        )
+        .await
+        .expect("the stub answers 200");
+        let head = stub.await.unwrap().expect("the stub read a request");
+        assert!(
+            head.contains(&format!("{header}: fixture-credential")),
+            "the payment presents the credential; head was:\n{head}"
+        );
+        assert!(head.contains(r#""id":"automation:ops-runner""#), "{head}");
+
+        let (base, stub) = one_request("{}").await;
+        api_at_signed(
+            &http,
+            &base,
+            reqwest::Method::PATCH,
+            "/api/jobs/x/metadata",
+            Some(json!({"proof_attempt": {}})),
+            Signature::As("automation:ops-runner".into()),
+        )
+        .await
+        .expect("the stub answers 200");
+        let head = stub.await.unwrap().expect("the stub read a request");
+        assert!(
+            !head.to_ascii_lowercase().contains(header),
+            "a plain write carries no runner credential; head was:\n{head}"
         );
     }
 

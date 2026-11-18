@@ -105,7 +105,6 @@ fn row(name: &str, version: i32) -> DeliveryPolicyRow {
         blip_cause_budget: 80,
         ci_host_floor_gb: 40,
         gate_queue_owner: boss_jobs::delivery::legacy_gate_queue_owner(),
-        gate_max_concurrent: 3,
         channels: serde_json::Value::Null,
     }
 }
@@ -124,7 +123,6 @@ fn ones(name: &str) -> DeliveryPolicyRow {
         blip_cause_budget: 1,
         ci_host_floor_gb: 1,
         gate_queue_owner: boss_jobs::delivery::legacy_gate_queue_owner(),
-        gate_max_concurrent: 1,
         channels: serde_json::Value::Null,
     }
 }
@@ -140,7 +138,6 @@ fn with(mut r: DeliveryPolicyRow, column: &str, value: i32) -> DeliveryPolicyRow
         "skip_reason_file_budget" => &mut r.skip_reason_file_budget,
         "blip_cause_budget" => &mut r.blip_cause_budget,
         "ci_host_floor_gb" => &mut r.ci_host_floor_gb,
-        "gate_max_concurrent" => &mut r.gate_max_concurrent,
         other => panic!("{other} is not a budget of DeliveryPolicyRow"),
     };
     *slot = value;
@@ -211,7 +208,7 @@ async fn a_fresh_registry_holds_no_suite_policy<P: Policies>(p: &P, adapter: &st
 async fn queue_owner_and_channels_survive_the_same_publication<P: Policies>(p: &P, adapter: &str) {
     let mut policy = row("suite-owner-channels", 1);
     policy.gate_queue_owner = "resident".into();
-    policy.gate_max_concurrent = 4;
+    policy.stall_hours = 4;
     policy.channels = serde_json::json!({"enabled": false, "marker": "both-fields-retained"});
     let want = written(policy.clone(), at(12, 0));
     assert_eq!(
@@ -542,8 +539,8 @@ async fn table_admits(pool: &sqlx::PgPool, r: &DeliveryPolicyRow) -> bool {
     let got = sqlx::query(
         "INSERT INTO delivery_policy (name, version, status, max_red_trains, stall_hours, \
          consist_budget_secs, consist_output_budget, consist_files_named, \
-         skip_reason_file_budget, blip_cause_budget, ci_host_floor_gb, gate_max_concurrent, gate_queue_owner) \
-         VALUES ($1, 1, 'active', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+         skip_reason_file_budget, blip_cause_budget, ci_host_floor_gb, gate_queue_owner) \
+         VALUES ($1, 1, 'active', $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(&r.name)
     .bind(r.max_red_trains)
@@ -554,7 +551,6 @@ async fn table_admits(pool: &sqlx::PgPool, r: &DeliveryPolicyRow) -> bool {
     .bind(r.skip_reason_file_budget)
     .bind(r.blip_cause_budget)
     .bind(r.ci_host_floor_gb)
-    .bind(r.gate_max_concurrent)
     .bind(&r.gate_queue_owner)
     .execute(&mut *tx)
     .await;

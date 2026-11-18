@@ -1,0 +1,42 @@
+# THE CALLER CAR 2b DID NOT SHIP (backlog 3aeaf08c, 2026-11-06). Design
+# a236103a D4 gave every reservation a lease (claimed_at + duration x 2)
+# and said the sweeper expires it: a lapsed FLOW reservation (slots,
+# vCPU, RAM) is released, a lapsed STOCK reservation becomes an
+# obligation the pool's reclaimer discharges. Car 2b (d37e17b7, #1524)
+# built that sweep, generation-fenced and capped at 64, and nothing
+# called it: measured on origin/main d6d422af, the only callers were
+# tests. A lapsed lease fenced its holder's completion and did nothing
+# else — its capacity stayed charged until a hand noticed. The conductor
+# deferred the caller until qualified physical return (car 2c) landed;
+# it landed in #1546.
+#
+# WHAT THIS RULE DECIDES: nothing. The door owns every judgement — it
+# reads the server's own clock (the clock the claim door stamped the
+# lease from), takes no instant from the caller, re-reads each claim
+# under its step's row lock so a fresher generation is never swept, and
+# writes one `jobs.step.resource_lease_expired` fact per lease in the
+# same transaction as the release. This rule only makes it happen on
+# time, as the actor each fact names.
+#
+# EVERY FIVE MINUTES, not hourly. Leases run for hours, but a lapsed
+# FLOW lease holds a slot someone is queued behind, and the query is one
+# index probe (`step_resource_claims_expiry`, active rows only) that
+# finds nothing on a healthy tick. An hourly sweep would hold a dead
+# run's slot up to an hour past its own bound, which is the leak D4 was
+# written to end.
+[[rule]]
+name = "resource-leases-are-swept-every-five-minutes"
+why = """
+A TIMER, the standing exemption: the condition is a lease whose
+lease_until has passed, and nothing emits an event when time passes.
+Measured 2026-11-06 on origin/main d6d422af (backlog 3aeaf08c): car 2b's
+sweep_resource_leases_at had no production caller, so no lapsed lease
+was released and no stock lease ever became an obligation. It adds no
+routing: the jobs API's sweep door releases FLOW and records STOCK as an
+obligation for the pool's declared reclaimer, the state design a236103a
+D4 names, and a fresher generation is never touched.
+"""
+version = 1
+schedule = { cadence = "every-5-minutes", anchor_date = "2026-11-06" }
+[[rule.do]]
+handler = "jobs.sweep-resource-leases"

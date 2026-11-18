@@ -51,14 +51,20 @@ export type RuleVersion = Readonly<{
  *  `name` keys the rule; the server assigns the version. Exactly one of
  *  `on_event` / `schedule` is present: the server's RawRule refuses both
  *  and neither (`Rule::from_raw`), and its `deny_unknown_fields` refuses
- *  any key it does not name. */
+ *  any key it does not name.
+ *
+ *  It carries no `delay`: `authoring::validate` refuses every rule that
+ *  declares one, because nothing executes a delay until design f1d66249's
+ *  durable delayed admission is built (car 4c706c5d, backlog 84a010cb).
+ *  The editor offered the field anyway and sent what was typed, so the
+ *  only thing it could earn was a refusal (backlog 677e332f). The car
+ *  that builds delayed admission puts the key back. */
 export type RuleSpec = Readonly<{
   name: string;
   on_event?: string;
   schedule?: DispatcherSchedule;
   when?: string | null;
   do: ReadonlyArray<DispatcherRuleDo>;
-  delay?: string | null;
 }>;
 
 /** Which trigger the form is editing. */
@@ -76,7 +82,6 @@ export type RuleForm = Readonly<{
   anchor_date: string;
   business_calendar: string;
   when: string;
-  delay: string;
   do: ReadonlyArray<{
     handler: string;
     args: ReadonlyArray<{ key: string; value: string }>;
@@ -97,7 +102,6 @@ export function formFromVersion(v: RuleVersion): RuleForm {
     anchor_date: s?.anchor_date ?? '',
     business_calendar: s?.business_calendar ?? '',
     when: v.when ?? '',
-    delay: v.delay ?? '',
     do: v.do.map((d) => ({
       handler: d.handler,
       args: Object.entries(d.args).map(([key, value]) => ({ key, value })),
@@ -107,7 +111,7 @@ export function formFromVersion(v: RuleVersion): RuleForm {
 
 /** Normalize an editor form into the API spec: trim everything, drop steps
  *  with an empty handler, drop args with an empty key, null out an empty
- *  `when`/`delay`, and send the chosen trigger ONLY — a topic typed while
+ *  `when`, send no `delay` (see RuleSpec), and send the chosen trigger ONLY — a topic typed while
  *  the trigger is the schedule is not sent, so a draft cannot silently
  *  turn a schedule rule into an event rule (backlog b38360ed). Pure — the
  *  editor's Validate + Save both go through it, so what you validate is
@@ -139,7 +143,6 @@ export function buildRuleSpec(form: RuleForm): RuleSpec {
     ...trigger,
     when: form.when.trim().length > 0 ? form.when.trim() : null,
     do: doSteps,
-    delay: form.delay.trim().length > 0 ? form.delay.trim() : null,
   };
 }
 

@@ -17,6 +17,11 @@
 //!    zero, which would read as "nothing is waiting".
 //! 4. **A countable station with no traffic reports zero** — absence is
 //!    a fact, and it is the reading that says a queue is not draining.
+//!
+//! Those four are the `?basis=step-events` cube's. The DEFAULT basis,
+//! `step-window-v1`, counts each station over the steps' own ready and
+//! completion stamps, as the IT map does (design 7b8ed079, car 1): it
+//! replays nothing, so the clause that blinds the cube does not blind it.
 
 use std::sync::Arc;
 
@@ -87,7 +92,7 @@ fn dock_station() -> StationSpec {
     let mut s = StationSpec::draft(
         "test-dock",
         "Test dock",
-        StationKind::Batch,
+        StationKind::Group,
         StationPredicate {
             kind: Some("car-kind".into()),
             metadata_present: vec!["branch".into()],
@@ -172,6 +177,10 @@ fn step_event(kind: &str, step_id: &str, at: DateTime<Utc>) -> Event {
 }
 
 async fn app() -> axum::Router {
+    app_and_jobs().await.0
+}
+
+async fn app_and_jobs() -> (axum::Router, Arc<InMemoryJobs>) {
     let jobs = Arc::new(InMemoryJobs::new());
     let stations = Arc::new(InMemoryStations::new());
     for spec in [constraint_station(), dock_station(), quiet_station()] {
@@ -214,7 +223,7 @@ async fn app() -> axum::Router {
     let state = JobsApiState {
         stations: Some(stations),
         ..JobsApiState::minimal(
-            jobs,
+            jobs.clone(),
             bus,
             DomainPublisher::new(bus_dyn, "jobs"),
             policy,
@@ -231,7 +240,7 @@ async fn app() -> axum::Router {
             )),
         )
     };
-    router(state)
+    (router(state), jobs)
 }
 
 async fn flow(app: &axum::Router, query: &str) -> serde_json::Value {
@@ -339,16 +348,98 @@ async fn the_envelope_names_its_own_window() {
     );
 }
 
-/// a4de1e72: the map must conserve the evaluator's original diagnosis,
-/// including an empty station. Missing flow is never a zero or idle.
-#[tokio::test]
-async fn the_map_retains_the_exact_clause_that_refused_a_station_flow() {
-    let app = app().await;
-    let original = flow(&app, "?window_hours=24").await;
-    let refused = row(&original, "test-dock");
-    let reason = refused["unavailable_reason"].as_str().unwrap();
-    assert!(refused["served"].is_null());
+/// The DEFAULT basis, read with no `basis` named.
+async fn counted(app: &axum::Router, query: &str) -> serde_json::Value {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/stations/flow{query}"))
+                .header("x-boss-user", user_header("emp-david", "operator"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&body).unwrap()
+}
 
+/// THE DEFAULT BASIS IS COUNTED OVER THE STEP RECORD (design 7b8ed079,
+/// car 1's remainder, backlog 95a9eca2). Until this car the door's
+/// default replayed the audit log into packet-membership spans — the
+/// projection stale since 2026-10-30, which read every station
+/// unavailable (b3572a26). It now counts what the IT map counts: an
+/// arrival is a step that became ready at the station inside the window,
+/// a departure (served) a step that completed there, and it reads no
+/// membership history to do it. The metadata clause that blinds the
+/// cube does not blind it, so the dock is counted rather than refused.
+#[tokio::test]
+async fn the_default_basis_counts_the_step_stamps_and_replays_nothing() {
+    let (app, jobs) = app_and_jobs().await;
+    // STEP_A became ready three hours ago; it is served an hour ago.
+    let now = Utc::now();
+    let served = Step {
+        status: StepStatus::Completed,
+        completed_at: Some(now - Duration::hours(1)),
+        ..step(STEP_A, StepStatus::Ready)
+    };
+    jobs.update_step_at(&served, now - Duration::hours(1), &[])
+        .await
+        .expect("the step is served");
+
+    let body = counted(&app, "?window_hours=24").await;
+    assert_eq!(body["basis"], "step-window-v1", "{body}");
+    assert_eq!(body["window_hours"], 24);
+    assert!(body["since"].as_str().is_some() && body["as_of"].as_str().is_some());
+    let busy = row(&body, "q.platform-admin.task");
+    assert_eq!(busy["basis"], "step-window-v1", "{busy}");
+    // STEP_A arrived and departed inside the day. STEP_B was born
+    // completed with no ready flip and no completion stamp, and STEP_OLD
+    // became ready two days ago: neither moved in this window.
+    assert_eq!(busy["arrived"], 1, "{busy}");
+    assert_eq!(busy["departed"], 1, "{busy}");
+    assert_eq!(busy["served"], 1, "what departed is what was served");
+    assert_eq!(busy["net"], 0);
+    assert!(busy["unavailable_reason"].is_null());
+    // The dock's Job-metadata clause blinds the cube; here it is read,
+    // and the packet (not a car) never stood there.
+    let dock = row(&body, "test-dock");
+    assert_eq!(dock["basis"], "step-window-v1", "{dock}");
+    assert_eq!(
+        (&dock["arrived"], &dock["departed"]),
+        (&0.into(), &0.into())
+    );
+    let quiet = row(&body, "q.cto.sign-off");
+    assert_eq!(
+        (&quiet["arrived"], &quiet["served"]),
+        (&0.into(), &0.into())
+    );
+
+    // The window is a filter: three days admits STEP_OLD's arrival.
+    let wide = counted(&app, "?window_hours=72").await;
+    let busy = row(&wide, "q.platform-admin.task");
+    assert_eq!(
+        (&busy["arrived"], &busy["departed"]),
+        (&2.into(), &1.into())
+    );
+
+    // The retired basis is refused by name, never answered as the default.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/stations/flow?basis=packet-membership-v1")
+                .header("x-boss-user", user_header("emp-david", "operator"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // The map judges the same station on its own count.
     let response = app
         .oneshot(
             Request::builder()
@@ -362,6 +453,7 @@ async fn the_map_retains_the_exact_clause_that_refused_a_station_flow() {
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let map: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(map["flow_as_of"], map["map_as_of"], "{map}");
     let machine = map["regions"]
         .as_array()
         .unwrap()
@@ -369,9 +461,5 @@ async fn the_map_retains_the_exact_clause_that_refused_a_station_flow() {
         .flat_map(|region| region["machines"].as_array().unwrap())
         .find(|machine| machine["id"] == "station:test-dock")
         .expect("the same evaluated station is on the map");
-    assert_eq!(machine["state"], "unknown");
-    assert!(
-        machine["why"].as_str().unwrap().contains(reason),
-        "the map discarded the original refusal: expected {reason:?}, got {machine}"
-    );
+    assert_ne!(machine["state"], "unknown", "judged: {machine}");
 }

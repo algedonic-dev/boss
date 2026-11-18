@@ -200,6 +200,18 @@ data:
   # back to CI after three failed launches, which was safe only while CI
   # still covered the tree.
   BOSS_TRAIN_GATE_REQUIRED: "1"
+  # A ONE-CAR TRAIN CARRIES ITS CAR'S GREEN when the assembled head is
+  # exactly main at departure merged with the gated head, under the same
+  # runner, digest-pinned images and launch request (backlog 2647cf38,
+  # David 2026-11-03; boss-cli train_gate_reuse.rs says what qualifies).
+  # Anything else gates as before. While infra/gate-runner/gate-runner.yaml
+  # names its images by TAG, nothing binds: a tag is not proof of the
+  # image the car's gate ran (review 93a363fa), so every train stamps
+  # `regate` until backlog 35a0de38 pins them. `shadow` stamps the
+  # assessment and binds nothing; `off` or unset is inert. Pinned to the
+  # bind word by
+  # train_gate_reuse::tests::the_conductor_ships_with_reuse_bound.
+  BOSS_TRAIN_GATE_REUSE: "exact"
   # Cadence knobs, set to their defaults explicitly so the contract is
   # visible here rather than implied (train.rs / cadence.rs defaults).
   BOSS_TRAIN_CADENCE_TICK_SECONDS: "60"

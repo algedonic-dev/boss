@@ -204,3 +204,50 @@ async fn permanent_is_not_retried() {
     assert!(report.blocked.is_none());
     assert_eq!(cursor_of(pool, "test-rules").await, bad);
 }
+
+#[tokio::test]
+async fn routing_holds_preserve_cursor_and_existing_handler_budget_until_recovery() {
+    let db = TestDb::new().await;
+    let mut tail = LogTail::new(db.pool.clone(), "held-routing");
+    tail.ensure_cursor().await.unwrap();
+    let before = cursor_of(&db.pool, "held-routing").await;
+    let id = seed_audit(&db.pool, "step.done.task", serde_json::json!({})).await;
+    for _ in 0..MAX_ATTEMPTS + 2 {
+        let report = tail
+            .drain_once(10, |_, _, _, _, _| async {
+                Settle::Hold("route unknown".into())
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.blocked.unwrap().attempts, 0);
+        assert_eq!(report.dead_lettered, 0);
+        assert_eq!(cursor_of(&db.pool, "held-routing").await, before);
+    }
+    let failed = tail
+        .drain_once(10, |_, _, _, _, _| async {
+            Settle::Retry("actual handler failure".into())
+        })
+        .await
+        .unwrap();
+    assert_eq!(failed.blocked.unwrap().attempts, 1);
+    for _ in 0..MAX_ATTEMPTS + 2 {
+        let report = tail
+            .drain_once(10, |_, _, _, _, _| async {
+                Settle::Hold("route unknown again".into())
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.blocked.unwrap().attempts, 1);
+        assert_eq!(report.dead_lettered, 0);
+        assert_eq!(cursor_of(&db.pool, "held-routing").await, before);
+    }
+    let recovered = tail
+        .drain_once(10, |_, _, _, attempt, _| async move {
+            assert_eq!(attempt, 2);
+            Settle::Ack
+        })
+        .await
+        .unwrap();
+    assert_eq!(recovered.processed, 1);
+    assert_eq!(cursor_of(&db.pool, "held-routing").await, id);
+}
