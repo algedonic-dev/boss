@@ -225,7 +225,11 @@ fn run_in(
         .env("PATH", curl.path())
         .env(url_var, ESTATE)
         .env("BOSS_SOR_WAIT_SECONDS", "0")
-        .env("GIT_CEILING_DIRECTORIES", root.parent().unwrap_or(root));
+        .env("GIT_CEILING_DIRECTORIES", root.parent().unwrap_or(root))
+        // The mirror also declares BOSS_TRUNK=none (backlog 2d28df78),
+        // under which the edit-level lint judges no path at all; these
+        // cases are about the estate declaration alone.
+        .env_remove("BOSS_TRUNK");
     match estate {
         Some(v) => cmd.env("BOSS_ESTATE", v),
         None => cmd.env_remove("BOSS_ESTATE"),
@@ -635,12 +639,16 @@ fn reads_or_prints(line: &str) -> bool {
     // A print is one plain echo/printf: no second command beside it.
     let chained = has(&["env ", "ENV ", "&&", "||", ";", "`", "|"]);
     let prints = t.starts_with("printf ") || t.starts_with("echo ");
+    // Naming the declaration to the runtime guard it shares with
+    // BOSS_TRUNK=none (lib/public-mirror.sh, backlog 2d28df78): a call
+    // that can only refuse, standing alone.
+    let guards = t.starts_with("refuse_off_the_public_mirror ");
     let reads =
         (t.contains("$BOSS_ESTATE") || t.contains("${BOSS_ESTATE")) && !t.contains("BOSS_ESTATE=");
     // A read inside a test (`[ -n "${BOSS_ESTATE:-}" ]; then`) carries a
     // `;` legitimately, and a read piped through `tr` a `|`; a print
     // needs neither.
-    !writes && ((prints && !chained) || reads)
+    !writes && (((prints || guards) && !chained) || reads)
 }
 
 /// Every line of `text` (the file at `rel`) that leaks the declaration,
@@ -737,6 +745,10 @@ fn the_leak_scan_catches_every_spelling_the_review_named() {
             "infra/lint/lib/no-estate.sh",
             "    declared=\"${BOSS_ESTATE}\" && printf '%s' x > \"$OUT\"",
         ),
+        (
+            "infra/lint/lib/no-estate.sh",
+            "refuse_off_the_public_mirror x \"BOSS_ESTATE=none\"; export BOSS_ESTATE=none",
+        ),
     ] {
         assert!(
             !estate_leaks(rel, text).is_empty(),
@@ -753,6 +765,10 @@ fn the_leak_scan_catches_every_spelling_the_review_named() {
             "    case \"${BOSS_ESTATE:-}\" in",
         ),
         ("infra/gate.sh", "    if [ -n \"${BOSS_ESTATE:-}\" ]; then"),
+        (
+            "infra/lint/lib/no-estate.sh",
+            "            refuse_off_the_public_mirror \"$lint\" \"BOSS_ESTATE=none\"",
+        ),
         (
             "infra/gate.sh",
             "        printf 'gate: NO ESTATE — BOSS_ESTATE=%s — the live half' \\",
@@ -884,7 +900,7 @@ impl Gate {
             &dir.join("df"),
             "#!/usr/bin/env bash\n\
              echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
-             echo '/dev/fake 1 1 943718400 1% /'\n",
+             for _ in \"$@\"; do echo '/dev/fake 1 1 943718400 1% /'; done\n",
         );
         Gate { dir, tree }
     }

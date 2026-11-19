@@ -1,0 +1,27 @@
+# robots:sol — the robots that run a sol model, a root pool of the
+# station tree (docs/design/station-tree.md section 3). T5 renamed it from
+# model-slot:sol (backlog 84f570a1, 2026-11-07). agent-codex runs
+# gpt-6.1-sol and records model_class sol (read live on GET /api/agents
+# 2026-11-07); the class is the model's tier, as `opus` is for opus-5-5
+# (design ccfe87ff pass item 1, backlog 446ab559: until the old file the
+# Codex robot had no class it could declare, 3317f4db).
+#
+# CONCURRENCY: a claim reserves 1 slot of it, against a SET limit of 4
+# (allocation item 5 of backlog 35e9babf set 2, which landed the limit and
+# the `models` list on model-slot:sol v2; T5 carries both onto this name).
+# What a run SPENDS draws on budget:robots. `models` is every run-model id
+# this pool meters, as item 5 read them.
+#
+# Version 2 (publish-a-protocol 322d7e96, live 2026-11-16 03:31Z; backlog
+# 5b103bfa carries the file): 2 -> 4, David asking for more sol slots.
+# The rows below equal the live v2 row, so the seed reads it as present.
+[[pool]]
+name = "robots:sol"
+version = 2
+status = "active"
+unit = "slot"
+kind = "flow"
+shape = "capacity"
+capacity = { state = "configured", amount = 4 }
+models = ["gpt-6.1-sol"]
+capacity_from = 'A SET concurrency limit, not a measurement: David approved the starting limit 2 in decided_plan_20261106_1457Z on design 012822ea (allocation item 5 of backlog 35e9babf), and Q1 of that design decided a set per-model limit, never derived from any robot max_concurrent_runs. This row is where it changes. Spend draws on budget:robots. David asked for more sol slots on 2026-11-16 (~03:30Z, in chat with the conductor); raised from 2 to 4. The shared dev-build worker-volume budget (6) and host:w-1 still bound the total of concurrent runs.'

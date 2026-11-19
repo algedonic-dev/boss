@@ -53,7 +53,9 @@
 //! from the state a REAL run of the move left in the fake, never from a
 //! state typed here, so the name it deletes is the one the move made.
 
+use boss_testing::signals::{DEFAULT_SIGNALS_ARGV, host_blocking, host_ignoring};
 use boss_testing::{repo_root, scratch_dir, write_exec, write_file};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -73,7 +75,7 @@ fn has(tool: &str) -> bool {
 /// jq and sha256sum are the gate image's; a test of a trust-boundary
 /// verb that cannot run must fail, never pass by returning early.
 fn needs_tools() {
-    for t in ["jq", "sha256sum", "cp", "du", "find", "stat"] {
+    for t in ["jq", "sha256sum", "cp", "du", "find", "stat", "python3"] {
         assert!(has(t), "move_forgejo_data_sh: no {t} on this box");
     }
 }
@@ -491,8 +493,24 @@ impl Case {
     }
 
     fn run(&self, args: &[&str]) -> Run {
-        let mut cmd = Command::new("bash");
-        cmd.arg(repo_root().join(SCRIPT)).args(args);
+        self.run_from(&[], args)
+    }
+
+    /// `run`, started by `parent` — an argv that sets up the signal
+    /// state of the host the script is run from and execs the rest.
+    /// Whatever that state, the script itself starts through
+    /// `boss_testing::signals`: like the environment `env_clear` empties,
+    /// the signal state is chosen here, never inherited from the runner
+    /// (backlog b43f68bb; the helper since 5f6a2cde).
+    fn run_from(&self, parent: &[&str], args: &[&str]) -> Run {
+        let script = repo_root().join(SCRIPT);
+        let mut argv: Vec<&OsStr> = parent.iter().map(OsStr::new).collect();
+        argv.extend(DEFAULT_SIGNALS_ARGV.map(OsStr::new));
+        argv.push(OsStr::new("bash"));
+        argv.push(script.as_os_str());
+        argv.extend(args.iter().map(OsStr::new));
+        let mut cmd = Command::new(argv[0]);
+        cmd.args(&argv[1..]);
         cmd.env_clear()
             .env(
                 "PATH",
@@ -1512,15 +1530,39 @@ fn restart_forgejo_never_stops_forgejo() {
 /// disk), the hold released, and the marker of a run that DID rename
 /// removed. The signal here is delivered by the `mv` that made the
 /// rename, so it lands in exactly that window.
+///
+/// THE HOST IS PART OF THE FIXTURE (backlog b43f68bb, 2026-11-17). On
+/// the public mirror's GitHub runner this case read exit 0 at the first
+/// assertion while the forge gates passed the same tree: the script had
+/// never seen the signal, finished the move and printed OK. A signal
+/// IGNORED when bash starts cannot be trapped at all, and one BLOCKED
+/// in the mask it inherits is never delivered, and `env_clear` resets
+/// neither, so the case measured its parent rather than the script.
+/// Each signal is now delivered three ways: from a parent that leaves
+/// it alone, one that ignores it, one that blocks it — and `run`
+/// starts the script with every signal at its default, so all three
+/// read the same.
 #[test]
 fn a_signal_after_the_rename_leaves_the_commit_point_standing() {
-    for sig in ["TERM", "INT", "HUP"] {
-        let c = Case::new(&format!("signal-after-rename-{}", sig.to_lowercase()));
+    for (sig, host) in ["TERM", "INT", "HUP"]
+        .into_iter()
+        .flat_map(|s| [(s, "default"), (s, "ignored"), (s, "blocked")])
+    {
+        let c = Case::new(&format!(
+            "signal-after-rename-{}-{host}",
+            sig.to_lowercase()
+        ));
         let hash = c.run(&["--plan"]).plan_sha();
         write_exec(&c.bin.join("mv"), STUB_MV_SIGNAL_AFTER_RENAME);
         let c = c.with("STUB_SIGNAL", sig);
-        let r = c.run(&[&hash]);
+        let parent: Vec<&str> = match host {
+            "default" => vec![],
+            "ignored" => host_ignoring(sig).to_vec(),
+            _ => host_blocking(sig).to_vec(),
+        };
+        let r = c.run_from(&parent, &[&hash]);
         let text = r.text();
+        let sig = format!("{sig} from a parent where it is {host}");
         assert_eq!(r.code, 1, "{sig}:\n{text}");
         assert!(
             c.pre().join("gitea/packages/ab/cd/blob").is_file(),

@@ -5,7 +5,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "Meta-kind: every Workflow in the registry is authored by a Job of this kind. The terminal `workflow-publish` step writes the spec into the registry and emits `jobs.kind.published` into audit_log. See docs/architecture-decisions.md (Jobs, Workflows, Steps)."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { owner = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5", department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "author"

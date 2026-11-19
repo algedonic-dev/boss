@@ -1,0 +1,8 @@
+[[invariant]]
+id = "a-legacy-station-key-names-its-live-reader"
+claim = "A station row keeps a v1 key beside the tree's words only while a live reader still needs it, and that reader is named with the condition that retires the key."
+source = "conductor order 20261108T0517Z (David: touched rows move to v2 words; an old key stays only for a named live reader); landed review of 90c51017, backlog 8172b40d"
+enforcement = "enforced"
+mechanism = "crates/core/boss-jobs/tests/a_legacy_station_key_names_its_live_reader.rs"
+last_verified = "2026-11-08"
+note = "One table names each legacy station key (department, automaton), the code line of every reader that keeps it, and when it retires. It fails both ways: a named reader whose line is gone means the key is retired from every row that still carries it, in the same car; a key no row carries means the entry is stale. department retires with the floor's move to tier-1 stations (c5f0a660); automaton retires once a station's operator is read from the automation rows (096a4354)."

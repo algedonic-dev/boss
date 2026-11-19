@@ -16,12 +16,11 @@
     // track), Receiving Yard and Marshalling Yard (those two stations),
     // and on Design, Feedback and Backlog (receiving; the backlog on
     // marshalling too). What stays is desk work, not a station.
+    // Incidents, Atlas, Bottlenecks, Policy and Experiments went with
+    // step 1 of design 01fa5bdf (David, 2026-11-17).
     operate: [
-      { label: 'Incidents', path: '/it/operate' },
       { label: 'Audit Log', path: '/it/operate/audit' },
       { label: 'Performance', path: '/it/operate/perf' },
-      { label: 'Atlas', path: '/it/operate/atlas' },
-      { label: 'Bottlenecks', path: '/it/operate/bottlenecks' },
     ],
     registry: [
       { label: 'Workflows', path: '/it/registry' },
@@ -31,7 +30,6 @@
       // rules →" link, and 0 of 784 surface-opens reached it (0a98d93f).
       { label: 'Rules', path: '/it/registry/rules' },
       { label: 'Step plugins', path: '/it/registry/step-plugins' },
-      { label: 'Policy', path: '/it/registry/policy' },
       { label: 'Subjects', path: '/it/registry/subjects' },
       { label: 'Drift', path: '/it/registry/drift' },
       // The agents registry as a directory (62988516) — who runs work
@@ -43,7 +41,6 @@
     ],
     design: [
       { label: 'Reviews', path: '/it/design' },
-      { label: 'Experiments', path: '/it/design/experiments' },
     ],
   };
 

@@ -152,11 +152,23 @@ SLUG=$(git remote get-url "$REMOTE" 2>/dev/null \
 # here is a real git error and must surface, not read as "current".
 AHEAD=$(git rev-list --count "$TARGET".."$SOURCE_SHA") || refuse "git rev-list $TARGET..$SOURCE failed"
 BEHIND=$(git rev-list --count "$SOURCE_SHA".."$TARGET") || refuse "git rev-list $SOURCE..$TARGET failed"
-FILES=$(git diff --name-only "$TARGET" "$SOURCE_SHA" | wc -l | tr -d ' ')
+# WHAT WOULD LEAVE is the source commit's PUBLIC tree — its tree without
+# the forge-only `internal/` (mirror-drift-lib.sh, design f7087b8c D1) —
+# so every file count and the drift verdict compare the mirror with
+# that, and what stays behind is counted rather than assumed. A commit
+# count cannot say whether anything would leave: a train that touched
+# only internal/ moves SOURCE ahead and leaves the public tree as it was.
+PUBLIC_TREE=$(public_tree "$SOURCE_SHA") || refuse "cannot compute the public tree of $SOURCE ($SOURCE_SHA)"
+EXCLUDED=$(public_tree_excluded "$SOURCE_SHA") || refuse "cannot list what $SOURCE ($SOURCE_SHA) holds under $PUBLIC_TREE_EXCLUDES/"
+EXCLUDED_COUNT=$(printf '%s' "$EXCLUDED" | grep -c . || true)
+MIRROR_TREE=$(git rev-parse --verify --quiet "$TARGET^{tree}") || refuse "cannot read the tree of $TARGET"
+FILES=$(git diff --no-renames --name-only "$TARGET" "$PUBLIC_TREE") || refuse "git diff $TARGET $PUBLIC_TREE failed"
+FILES=$(printf '%s' "$FILES" | grep -c . || true)
 
 say "  commits ahead : $AHEAD"
 say "  commits behind: $BEHIND"
 say "  files changed : $FILES"
+say "  not published : $EXCLUDED_COUNT file(s) under $PUBLIC_TREE_EXCLUDES/ (forge-only)"
 
 BLOCKING=""
 
@@ -184,14 +196,16 @@ elif [ "$BEHIND" -gt 0 ]; then
   say "  of the $BEHIND behind, 0 carry foreign content (our own publish bookkeeping)"
 fi
 
-if [ "$AHEAD" -eq 0 ] && [ -z "$BLOCKING" ]; then
+# Drift is judged on TREES (design f7087b8c D1): nothing to publish
+# exactly when the mirror already reads the public tree.
+if [ "$PUBLIC_TREE" = "$MIRROR_TREE" ] && [ -z "$BLOCKING" ]; then
   say "  nothing to publish — the mirror is current"
   # `scanned_sha` is the STRING "none", not null: publish-to-github's
   # measure step (registry v6 on) requires it as a string and copies it from this line
   # (backlog 0677a618), and no scan ran — so it says that, rather than
   # naming a sha that would claim one did. The publish verb refuses any
   # scanned_sha that is not a 40-hex sha, so "none" can never approve.
-  [ "$JSON" -eq 1 ] && printf '{"has_drift":false,"commits_ahead":0,"commits_behind":%s,"commits_behind_foreign":0,"files_changed":0,"secrets_scan":"skipped","source_sha":"%s","scanned_sha":"none","newly_public":0,"newly_public_files":[],"blocking":""}\n' "$BEHIND" "$SOURCE_SHA"
+  [ "$JSON" -eq 1 ] && printf '{"has_drift":false,"commits_ahead":%s,"commits_behind":%s,"commits_behind_foreign":0,"files_changed":0,"internal_excluded":%s,"secrets_scan":"skipped","source_sha":"%s","scanned_sha":"none","newly_public":0,"newly_public_files":[],"blocking":""}\n' "$AHEAD" "$BEHIND" "$EXCLUDED_COUNT" "$SOURCE_SHA"
   exit 0
 fi
 
@@ -214,6 +228,11 @@ fi
 # `export-ignore` committed in the tree it archives, so a file could be
 # published without being scanned, and "the scan read that tree" is a
 # fact to check, not to assume.
+#
+# It reads the commit's FULL tree, not $PUBLIC_TREE (design f7087b8c
+# D1): a superset of what leaves, so a secret placed under internal/
+# still blocks a publish, and the scanned-tree check below stays an
+# equality with the commit's own tree, as it was.
 SCAN_DIR=$(mktemp -d) || refuse "could not create a scratch dir for the tree of $SOURCE"
 trap 'rm -rf "$SCAN_DIR"' EXIT
 SCAN_TREE="$SCAN_DIR/tree"
@@ -268,7 +287,7 @@ say "  scanned       : $SCANNED_SHA (the tree of $SOURCE, from git, not the work
 # they describe how to reach and recover the live system, which is a
 # different kind of disclosure from source code.
 # ---------------------------------------------------------------------
-NEW_FILES=$(git diff --name-only --diff-filter=A "$TARGET" "$SOURCE_SHA" 2>/dev/null)
+NEW_FILES=$(git diff --no-renames --name-only --diff-filter=A "$TARGET" "$PUBLIC_TREE" 2>/dev/null)
 NEW_COUNT=$(printf '%s' "$NEW_FILES" | grep -c . || true)
 SENSITIVE=$(printf '%s\n' "$NEW_FILES" | grep -E '^(docs/runbooks/|infra/(cluster|caddy|forge)/)' || true)
 SENS_COUNT=$(printf '%s' "$SENSITIVE" | grep -c . || true)
@@ -284,8 +303,10 @@ fi
 
 if [ "$JSON" -eq 1 ]; then
   LIST=$(printf '%s\n' "$SENSITIVE" | grep . | sed 's/.*/"&"/' | paste -sd, - 2>/dev/null || true)
-  printf '{"has_drift":true,"commits_ahead":%s,"commits_behind":%s,"commits_behind_foreign":%s,"files_changed":%s,"secrets_scan":"%s","source_sha":"%s","scanned_sha":"%s","newly_public":%s,"newly_public_files":[%s],"blocking":"%s"}\n' \
-    "$AHEAD" "$BEHIND" "$FOREIGN_COUNT" "$FILES" "$SECRETS" "$SOURCE_SHA" "$SCANNED_SHA" "$SENS_COUNT" "${LIST:-}" "$(echo "$BLOCKING" | xargs)"
+  # has_drift stays true when the trees agree but something blocks: a
+  # blocking finding is never closed as nothing-to-publish.
+  printf '{"has_drift":true,"commits_ahead":%s,"commits_behind":%s,"commits_behind_foreign":%s,"files_changed":%s,"internal_excluded":%s,"secrets_scan":"%s","source_sha":"%s","scanned_sha":"%s","newly_public":%s,"newly_public_files":[%s],"blocking":"%s"}\n' \
+    "$AHEAD" "$BEHIND" "$FOREIGN_COUNT" "$FILES" "$EXCLUDED_COUNT" "$SECRETS" "$SOURCE_SHA" "$SCANNED_SHA" "$SENS_COUNT" "${LIST:-}" "$(echo "$BLOCKING" | xargs)"
 fi
 
 if [ -n "$BLOCKING" ]; then

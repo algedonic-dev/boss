@@ -16,7 +16,11 @@
 # --------------------
 # The SHAPE of the register, never the truth of a claim. Specifically:
 #
-#   * every entry carries all seven keys, and no others;
+#   * every entry carries all seven keys, and no others but an
+#     optional `owner`, which names a crate (design 089dc107 Q2): a
+#     workspace member at crates/<tier>/<owner> whose Cargo.toml
+#     declares that package — a path alone is not a crate (review
+#     7d4383b0);
 #   * `id` is a unique, citable slug (a conformance finding cites an
 #     id, so a duplicate silently merges two histories);
 #   * `claim`, `source` and `enforcement` are non-empty, and
@@ -68,6 +72,10 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 REGISTER_DIR="docs/invariants"
 REQUIRED_KEYS="id claim source enforcement mechanism last_verified note"
+# The tree an `owner` is resolved against: the workspace's Cargo.toml
+# and its crates/<tier>/ directories. The self-test points it at a
+# planted root; every real scan reads the repository itself.
+OWNER_ROOT="."
 
 ABSENT="<absent>"
 
@@ -97,6 +105,46 @@ finding() {
 # ---------------------------------------------------------------------
 ltrim() { printf '%s' "${1#"${1%%[![:space:]]*}"}"; }
 rtrim() { printf '%s' "${1%"${1##*[![:space:]]}"}"; }
+
+# ---------------------------------------------------------------------
+# Does an owner name a crate?
+# ---------------------------------------------------------------------
+# A crate is what cargo builds, not a path: a workspace member at
+# crates/<tier>/<owner> whose Cargo.toml's [package] declares that name.
+# The first version of this check only asked whether crates/*/<owner>
+# EXISTED, and review 7d4383b0 (2026-11-18) planted a plain file there
+# and watched every entry pass — a leftover directory or a stray file
+# would have let an owner rot exactly as a deleted lint rots a
+# mechanism. Prints the reason when <owner> is not a crate, nothing
+# when it is. The name is a validated slug, so it is safe in a pattern.
+owner_crate_problem() {
+    local owner="$1" member manifest name
+    member=$(awk '/^members[[:space:]]*=[[:space:]]*\[/ { inside = 1; next }
+                  inside && /^\]/ { exit }
+                  inside { print }' "$OWNER_ROOT/Cargo.toml" 2>/dev/null \
+        | sed -n 's|^[[:space:]]*"\(crates/[a-z0-9-]*/'"$owner"'\)".*|\1|p' \
+        | sed -n 1p)
+    if [ -z "$member" ]; then
+        if ls -d "$OWNER_ROOT"/crates/*/"$owner" >/dev/null 2>&1; then
+            echo "names '${owner}', which sits under crates/<tier>/ but is no member of the workspace in Cargo.toml"
+        else
+            echo "names '${owner}', which is no crate under crates/<tier>/"
+        fi
+        return
+    fi
+    manifest="$OWNER_ROOT/${member}/Cargo.toml"
+    if [ ! -f "$manifest" ]; then
+        echo "names '${owner}', but ${member}/Cargo.toml is not a file — a path with no manifest is not a crate"
+        return
+    fi
+    name=$(awk '/^\[/ { section = $0; next }
+                section == "[package]" && /^name[[:space:]]*=/ {
+                    sub(/^name[[:space:]]*=[[:space:]]*"/, ""); sub(/".*$/, ""); print; exit
+                }' "$manifest")
+    if [ "$name" != "$owner" ]; then
+        echo "names '${owner}', but ${member}/Cargo.toml declares package '${name:-<none>}'"
+    fi
+}
 
 # ---------------------------------------------------------------------
 # Per-entry validation
@@ -138,6 +186,27 @@ ${f_id}"
     if [ "$f_source" != "$ABSENT" ] && [ -z "$f_source" ]; then
         finding "$file" "$line" "$f_id" "source" \
             "must name the doc or file that states the claim"
+    fi
+
+    # --- the optional owner: a crate that exists ---------------------
+    # Design 089dc107 Q2 (David, 2026-11-18): an invariant may name the
+    # crate that owns it, so an unenforced one is that crate's debt
+    # with an address. Like an enforced mechanism, the address must
+    # exist, or a renamed crate leaves debt owned by nobody.
+    if [ "$f_owner" != "$ABSENT" ]; then
+        local owner_problem
+        if [ -z "$f_owner" ]; then
+            finding "$file" "$line" "$f_id" "owner" \
+                "must name a crate when present — leave the key out for no owner"
+        elif ! grep -qE '^[a-z0-9][a-z0-9-]*$' <<<"$f_owner"; then
+            finding "$file" "$line" "$f_id" "owner" \
+                "names '${f_owner}', which is not a crate name (a-z, 0-9, dashes)"
+        else
+            owner_problem=$(owner_crate_problem "$f_owner")
+            if [ -n "$owner_problem" ]; then
+                finding "$file" "$line" "$f_id" "owner" "$owner_problem"
+            fi
+        fi
     fi
 
     # --- the enforcement class dictates the rest ---------------------
@@ -187,7 +256,7 @@ reset_entry() {
     f_id="$ABSENT";        f_claim="$ABSENT"
     f_source="$ABSENT";    f_enforcement="$ABSENT"
     f_mechanism="$ABSENT"; f_last_verified="$ABSENT"
-    f_note="$ABSENT"
+    f_note="$ABSENT";      f_owner="$ABSENT"
 }
 
 # ---------------------------------------------------------------------
@@ -248,7 +317,7 @@ check_file() {
                 fi
 
                 case "$key" in
-                    id|claim|source|enforcement|mechanism|last_verified|note)
+                    id|claim|source|enforcement|mechanism|last_verified|note|owner)
                         # A key seen twice in one entry is invalid TOML,
                         # and it is the exact signature of an entry whose
                         # [[invariant]] header was lost in a merge: its
@@ -263,7 +332,7 @@ check_file() {
                         ;;
                     *)
                         finding "$file" "$lineno" "$f_id" "$key" \
-                            "unknown key — the register's fields are: ${REQUIRED_KEYS}"
+                            "unknown key — the register's fields are: ${REQUIRED_KEYS}, and optionally owner"
                         ;;
                 esac
                 ;;
@@ -584,7 +653,7 @@ last_verified = ""
 note = "why not"
 EOF
 
-    assert_caught "an unknown key inside an entry" fixture-one owner <<'EOF'
+    assert_caught "an unknown key inside an entry" fixture-one severity <<'EOF'
 [[invariant]]
 id = "fixture-one"
 claim = "A planted fixture."
@@ -593,8 +662,88 @@ enforcement = "unenforced"
 mechanism = ""
 last_verified = ""
 note = "why not"
-owner = "nobody"
+severity = "high"
 EOF
+
+    # The optional owner (design 089dc107 Q2): a crate that exists, so
+    # the debt an unenforced entry records has an address that cannot
+    # rot into a name nobody can find.
+    assert_clean "an entry naming an owner crate passes" <<'EOF'
+[[invariant]]
+id = "fixture-one"
+claim = "A planted fixture."
+source = "nowhere"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "why not"
+owner = "boss-events"
+EOF
+
+    assert_caught "an empty owner" fixture-one owner <<'EOF'
+[[invariant]]
+id = "fixture-one"
+claim = "A planted fixture."
+source = "nowhere"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "why not"
+owner = ""
+EOF
+
+    assert_caught "an owner naming no crate" fixture-one owner <<'EOF'
+[[invariant]]
+id = "fixture-one"
+claim = "A planted fixture."
+source = "nowhere"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "why not"
+owner = "boss-nowhere"
+EOF
+
+    # A path is not a crate (review 7d4383b0, 2026-11-18). The first
+    # owner check asked only whether crates/*/<owner> EXISTED, so a
+    # plain file planted at crates/core/review-owner-not-a-crate passed
+    # all 59 entries clean. These fixtures plant a whole crates root —
+    # one real crate as the positive control, then each thing that sits
+    # at a crate's path without being one — so every shape is asserted
+    # caught by id and field, not merely by exit code.
+    local st_root
+    st_root=$(mktemp -d)
+    mkdir -p "${st_root}/crates/core/fixture-crate" \
+        "${st_root}/crates/core/fixture-bare" \
+        "${st_root}/crates/core/fixture-misnamed" \
+        "${st_root}/crates/core/fixture-unlisted"
+    printf '[workspace]\nmembers = [\n    "crates/core/fixture-crate",\n    "crates/core/fixture-bare",\n    "crates/core/fixture-misnamed",\n    # "crates/core/fixture-unlisted",\n]\n' \
+        > "${st_root}/Cargo.toml"
+    printf '[package]\nname = "fixture-crate"\n' \
+        > "${st_root}/crates/core/fixture-crate/Cargo.toml"
+    printf 'a plain file at a crate path\n' > "${st_root}/crates/core/fixture-file"
+    printf '[package]\nname = "some-other-crate"\n' \
+        > "${st_root}/crates/core/fixture-misnamed/Cargo.toml"
+    printf '[package]\nname = "fixture-unlisted"\n' \
+        > "${st_root}/crates/core/fixture-unlisted/Cargo.toml"
+    OWNER_ROOT="$st_root"
+
+    owner_fixture() {
+        printf '[[invariant]]\nid = "fixture-one"\nclaim = "A planted fixture."\nsource = "nowhere"\nenforcement = "unenforced"\nmechanism = ""\nlast_verified = ""\nnote = "why not"\nowner = "%s"\n' "$1"
+    }
+    assert_clean "an owner that is a workspace crate with its manifest passes" \
+        < <(owner_fixture fixture-crate)
+    assert_caught "an owner that is a regular file" fixture-one owner \
+        < <(owner_fixture fixture-file)
+    assert_caught "an owner that is a directory with no Cargo.toml" fixture-one owner \
+        < <(owner_fixture fixture-bare)
+    assert_caught "an owner whose Cargo.toml declares another package" fixture-one owner \
+        < <(owner_fixture fixture-misnamed)
+    assert_caught "an owner that is no workspace member" fixture-one owner \
+        < <(owner_fixture fixture-unlisted)
+
+    OWNER_ROOT="."
+    rm -rf "$st_root"
 
     # An empty register is a register that checks nothing — the failure
     # mode where the file survives but its content is gone.

@@ -11,8 +11,9 @@
 //! each change in the outcome.
 //!
 //! And it refuses what the schema refuses, as Postgres does: a batch
-//! naming an id that is not `agent-<slug>` or a negative budget or run
-//! cap (the table's CHECKs, which run on every declared row, held or
+//! naming an id that is not `agent-<slug>`, a negative budget or run
+//! cap, or a blank model class (the table's CHECKs, which run on every
+//! declared row, held or
 //! not), and — given a rate card (`with_rate_card`) — a model the card
 //! does not price on a row the batch would WRITE (the foreign key, which
 //! fires only on a written row), each refusing the whole batch before
@@ -46,13 +47,16 @@ struct Rows {
 impl Rows {
     fn row(&self, a: &AgentInput) -> AgentRow {
         AgentRow {
+            factory_rotation: a.factory_rotation.unwrap_or(true),
             id: a.id.clone(),
             display_name: a.display_name.clone(),
             default_model: a.default_model.clone(),
+            model_class: a.model_class.clone(),
             role: a.role.clone(),
             department: a.department.clone(),
             hourly_budget_usd_micros: a.hourly_budget_usd_micros,
             max_concurrent_runs: a.max_concurrent_runs,
+            stations: a.stations.clone().unwrap_or_default(),
             aliases: self
                 .aliases
                 .iter()
@@ -106,7 +110,14 @@ impl InMemoryAgents {
         for a in declared {
             let negative = a.hourly_budget_usd_micros.is_some_and(|n| n < 0)
                 || a.max_concurrent_runs.is_some_and(|n| n < 0);
-            if !is_agent_id(&a.id) || negative {
+            // `agents_model_class_nonempty`: NULL, or not blank once
+            // `btrim` has taken the SPACES off — btrim's default trims ' '
+            // alone, so this trims exactly that (review 55a8acff R1).
+            let blank_class = a
+                .model_class
+                .as_deref()
+                .is_some_and(|c| c.trim_matches(' ').is_empty());
+            if !is_agent_id(&a.id) || negative || blank_class {
                 return Err(AgentsError::Storage(format!(
                     "agent {}: a CHECK on the agents table refuses the row",
                     a.id
@@ -147,14 +158,17 @@ impl InMemoryAgents {
             rows.agents
                 .entry(agent_id.to_string())
                 .or_insert_with(|| AgentInput {
+                    factory_rotation: Some(true),
                     id: agent_id.to_string(),
                     display_name: agent_id.to_string(),
                     default_model: "opus-5".to_string(),
+                    model_class: None,
                     aliases: Vec::new(),
                     role: None,
                     department: None,
                     hourly_budget_usd_micros: None,
                     max_concurrent_runs: None,
+                    stations: None,
                 });
             for login in logins {
                 rows.aliases.insert(login.to_string(), agent_id.to_string());
@@ -248,6 +262,18 @@ impl AgentsRegistry for InMemoryAgents {
         for a in declared {
             let before = rows.agents.get(&a.id).map(|held| rows.row(held));
             let mut stored = a.clone();
+            stored.factory_rotation = Some(
+                a.factory_rotation
+                    .unwrap_or_else(|| before.as_ref().is_none_or(|row| row.factory_rotation)),
+            );
+            // Seats the declaration does not name are kept (the Pg
+            // adapter's COALESCE), and a new row seats nobody.
+            stored.stations = Some(a.stations.clone().unwrap_or_else(|| {
+                before
+                    .as_ref()
+                    .map(|row| row.stations.clone())
+                    .unwrap_or_default()
+            }));
             stored.aliases.clear();
             // Insert-if-absent keeps a held row as it is; take replaces
             // it (the Pg adapter's DO NOTHING / DO UPDATE).
@@ -294,6 +320,8 @@ impl AgentsRegistry for InMemoryAgents {
             updated,
             kept,
             unchanged,
+            // The batch door names these from the registry read back.
+            no_model_class: Vec::new(),
         })
     }
 
@@ -337,6 +365,11 @@ impl AgentsRegistry for InMemoryAgents {
             events.push(automation_declared_event(stamp, d)?);
         }
         Ok(outcome)
+    }
+
+    async fn count_unresolved_login(&self, event: &Event) -> Result<(), AgentsError> {
+        self.events.lock().expect("events lock").push(event.clone());
+        Ok(())
     }
 }
 

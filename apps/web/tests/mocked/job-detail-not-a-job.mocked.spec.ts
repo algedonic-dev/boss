@@ -44,7 +44,10 @@ test.describe('/jobs/<id> says a body that is not a Job failed, rather than thro
   test('control: a whole Job renders its subject, with no failure line', async ({ page }) => {
     const errs = await openJob(page, JOB);
     await expect(page.locator('h1')).toContainText('A packet the inbox links to');
-    await expect(page.getByRole('link', { name: 'a1' })).toHaveAttribute('href', '/ux/accounts/a1');
+    // An account has no page since step 1 of design 01fa5bdf, and the
+    // jobs list its packets were on went with it: the id is text.
+    await expect(page.locator('[data-pageless="account"]')).toHaveText('a1');
+    await expect(page.getByRole('link', { name: 'a1' })).toHaveCount(0);
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
     expect(errs).toEqual([]);
   });

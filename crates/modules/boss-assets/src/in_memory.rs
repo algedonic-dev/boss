@@ -7,7 +7,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use boss_core::event::Event;
+use chrono::{DateTime, Utc};
 
+use crate::bridge::asset_event_to_core;
 use crate::port::{
     AssetsError, AssetsRepository, BatchAppendStats, model_named,
     refuse_an_actor_that_reads_back_as_another, refuse_negative_page, refuse_nul_in_event,
@@ -26,6 +29,10 @@ pub struct InMemoryAssets {
     /// declared catalog refuses a model it lacks `UnknownModel`, as
     /// Postgres's foreign key does (backlog be459ab9).
     models: Option<HashSet<String>>,
+    /// The facts `record` and `batch_record` staged, in order — the
+    /// double's analogue of the Postgres adapter's `event_outbox` rows
+    /// (backlog 2e45840a, design ad9519bc part d).
+    staged: Mutex<Vec<Event>>,
 }
 
 #[derive(Default)]
@@ -51,7 +58,20 @@ impl InMemoryAssets {
         Self {
             inner: Mutex::default(),
             models: Some(models.into_iter().map(Into::into).collect()),
+            staged: Mutex::default(),
         }
+    }
+
+    /// Every fact this store has staged, oldest first.
+    pub fn staged_facts(&self) -> Vec<Event> {
+        self.staged.lock().expect("poisoned lock").clone()
+    }
+
+    fn stage(&self, events: &[AssetEvent], recorded_at: DateTime<Utc>) {
+        self.staged
+            .lock()
+            .expect("poisoned lock")
+            .extend(events.iter().map(|e| asset_event_to_core(e, recorded_at)));
     }
 
     /// Seed from a prebuilt list of events (for demo data). Events are
@@ -122,11 +142,25 @@ impl AssetsRepository for InMemoryAssets {
         Ok(())
     }
 
+    async fn record(
+        &self,
+        event: AssetEvent,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<(), AssetsError> {
+        self.append(event.clone()).await?;
+        self.stage(std::slice::from_ref(&event), recorded_at);
+        Ok(())
+    }
+
     /// All or nothing, as the Postgres adapter's one transaction is: the
     /// whole batch is judged before any of it is stored. The port's
     /// default loop stored every event ahead of a refusal (backlog
     /// be459ab9).
-    async fn batch_append(&self, events: Vec<AssetEvent>) -> Result<BatchAppendStats, AssetsError> {
+    async fn batch_record(
+        &self,
+        events: Vec<AssetEvent>,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<BatchAppendStats, AssetsError> {
         for event in &events {
             refuse_nul_in_event(event)?;
             refuse_an_actor_that_reads_back_as_another(event)?;
@@ -144,6 +178,7 @@ impl AssetsRepository for InMemoryAssets {
             fresh.push(event);
         }
         stats.inserted = fresh.len() as u64;
+        self.stage(&fresh, recorded_at);
         for event in fresh {
             store(&mut state, event);
         }

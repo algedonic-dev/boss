@@ -5,3 +5,5 @@
 id = "automation:estate-observer"
 role = "platform-admin"
 description = 'The estate observer: records what the cluster and its nodes are (infra/cluster/manifests/boss-estate-observe.yaml).'
+# Host station: estate (backlog 6ecb5480, station-tree.md section 6).
+station = "134464a5-0b56-4386-86cb-d354c7448fdf"

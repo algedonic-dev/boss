@@ -58,6 +58,7 @@ pub mod in_memory;
 pub mod port;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod request_latency;
 pub mod seed;
 pub mod types;
 
@@ -67,6 +68,8 @@ pub use port::{Sensors, SensorsError, sweep_retention};
 pub use postgres::PgSensors;
 pub use seed::load_sensors_toml;
 pub use types::{
-    BatchOutcome, NewReading, PUSH_ONLY_SOURCES, PollStamp, RETENTION_DAYS, Reading,
-    ReadingsWindow, SensorInput, SensorRow, Sweep, is_push_only, sensor_actor, validate_sensor,
+    BatchOutcome, CursorWitness, MAX_POLL_REFUSALS, NewReading, PUSH_ONLY_SOURCES,
+    PollRefusalClasses, PollRefusals, PollStamp, READINGS_HTTP_BODY_LIMIT_BYTES, RETENTION_DAYS,
+    Reading, ReadingsWindow, RefusalLimit, RefusedMessage, SensorInput, SensorRow, Sweep,
+    is_push_only, sensor_actor, validate_sensor,
 };

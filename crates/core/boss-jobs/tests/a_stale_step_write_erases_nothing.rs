@@ -110,17 +110,29 @@ async fn briefed(jobs: &InMemoryJobs, job_id: &str) -> (Job, Step) {
 }
 
 async fn put_step(app: &Router, job: &Job, step: &Step, body: &str) -> (StatusCode, String) {
+    put_step_judged(app, job, step, body, None).await
+}
+
+/// [`put_step`] carrying the writer's judgement in
+/// [`boss_jobs::step_metadata_write::EXPECT_HEADER`].
+async fn put_step_judged(
+    app: &Router,
+    job: &Job,
+    step: &Step,
+    body: &str,
+    judged: Option<&str>,
+) -> (StatusCode, String) {
+    let mut request = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/jobs/{}/steps/{}", job.id, step.id))
+        .header("content-type", "application/json")
+        .header("x-boss-user", serde_json::to_string(&dispatcher()).unwrap());
+    if let Some(judged) = judged {
+        request = request.header(boss_jobs::step_metadata_write::EXPECT_HEADER, judged);
+    }
     let resp = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri(format!("/api/jobs/{}/steps/{}", job.id, step.id))
-                .header("content-type", "application/json")
-                .header("x-boss-user", serde_json::to_string(&dispatcher()).unwrap())
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
         .await
         .unwrap();
     let status = resp.status();
@@ -254,4 +266,76 @@ async fn the_port_refuses_a_stale_write_over_a_row_that_went_terminal() {
     );
     let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
     assert_eq!(stored.metadata["prompt_bytes"], "36128", "frozen");
+}
+
+/// A STEP PUT LANDS ONLY ON THE METADATA ITS WRITER JUDGED (review
+/// e296014b R2 on car c18bf126, backlog 0c55e31d). `boss dispatch
+/// --started` hands a claim back READY when the worker door refuses —
+/// unless a worker binding was recorded for that claim, and a concurrent
+/// `--started` can record one after every read the hand-back made. The
+/// binder writes the binding onto the claim's own step, and the hand-back
+/// PUT carries `{worker_session: null}` in the same header the merge door
+/// reads (cd1f68c6). The PUT judges it on the row it read, and its version
+/// compare freezes that row through the write, so the judgement holds AT
+/// the write, not at a read before it.
+#[tokio::test]
+async fn a_put_lands_only_on_the_metadata_its_writer_judged() {
+    let (app, jobs) = build_app();
+    let binding = serde_json::json!({
+        "worker_session": {"run": "r", "session": "dev-build-fedcba9876543210"}
+    });
+    let judged = boss_jobs::step_metadata_write::expectation_header(&map(
+        serde_json::json!({ "worker_session": null }),
+    ));
+    let body = r#"{"assignee_id":"agent-claude"}"#;
+
+    // 1. The row records the key the writer judged absent: refused by
+    //    code, and nothing is written or recorded.
+    let (job, step) = briefed(&jobs, "00000000-0000-0000-0000-00000000e385").await;
+    jobs.merge_step_metadata_at(
+        &step.id,
+        &map(binding.clone()),
+        &boss_core::publisher::EventStamp::new(
+            "jobs",
+            boss_core::actor::ActorId::Automation("test".into()),
+        ),
+    )
+    .await
+    .unwrap();
+    let events_before = jobs.recorded_events().len();
+    let (status, said) = put_step_judged(&app, &job, &step, body, Some(&judged)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{said}");
+    let said: serde_json::Value = serde_json::from_str(&said).expect("the 409 body is JSON");
+    assert_eq!(
+        said["code"],
+        boss_jobs::step_metadata_write::STEP_CHANGED_CODE
+    );
+    let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
+    assert_eq!(stored.assignee_id, None, "the refused write wrote nothing");
+    assert_eq!(jobs.recorded_events().len(), events_before);
+
+    // 2. The binding lands after the handler's read: the judgement passed
+    //    that read, and the version compare refuses the write.
+    let (job, step) = briefed(&jobs, "00000000-0000-0000-0000-00000000e386").await;
+    jobs.merge_after_next_read(&step.id, map(binding.clone()));
+    let (status, said) = put_step_judged(&app, &job, &step, body, Some(&judged)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{said}");
+    let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
+    assert_eq!(stored.assignee_id, None);
+    assert_eq!(stored.metadata["worker_session"], binding["worker_session"]);
+
+    // 3. The row still reads as judged: the write lands.
+    let (job, step) = briefed(&jobs, "00000000-0000-0000-0000-00000000e387").await;
+    let (status, said) = put_step_judged(&app, &job, &step, body, Some(&judged)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{said}");
+    let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
+    assert_eq!(stored.assignee_id.as_deref(), Some("agent-claude"));
+
+    // 4. A judgement that cannot be read is refused, never dropped into
+    //    the unjudged write it asked not to be.
+    let (job, step) = briefed(&jobs, "00000000-0000-0000-0000-00000000e388").await;
+    let (status, said) = put_step_judged(&app, &job, &step, body, Some("not json")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{said}");
+    let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
+    assert_eq!(stored.assignee_id, None);
 }

@@ -6,7 +6,9 @@
 // `StepEdge` anymore — the topological order emerges from the
 // predicates referencing sibling step slugs (`steps.<title>.done`).
 
-export type WorkflowStatus = 'draft' | 'active' | 'retired';
+// `rejected`: a draft that met traffic and lost an experiment — kept
+// for the packets pinned to it, never published (backlog 50ded63d).
+export type WorkflowStatus = 'draft' | 'active' | 'retired' | 'rejected';
 
 /// Terminal marker. When a step reaches Completed, the Job closes
 /// with this outcome. Absent for non-terminal steps.

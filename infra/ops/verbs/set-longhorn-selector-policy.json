@@ -1,0 +1,11 @@
+{
+  "about": "MUTATING — change ONE fixed Longhorn boolean, allow-empty-disk-selector-volume, under David's per-run passkey over plan-a-longhorn-selector-policy. Re-render the exact signed disk inventory, identities, definition and before/after value; refuse stale plans and no-op replays. False refuses any tagged default disk or absence of untagged disks. Atomically test the stored value before replacing it, then require the stored and manager API values to agree and applied true. Failure after patch says NOT proven; inspect with read-longhorn-setting. Existing replicas are not moved or deleted. Inverse is a fresh approved plan for the previous boolean. Cross-object reads are not a transaction; coordinate concurrent disk edits. This installs a door; it does not authorize running it. Backlog c84ab39b.",
+  "hosts": ["forge"],
+  "requires_approval": true,
+  "plan_verb": "plan-a-longhorn-selector-policy",
+  "approvers": ["emp-david"],
+  "argv": ["infra/forge/longhorn-selector-policy.sh", "{1}", "{2}"],
+  "params": [{"name": "value", "one_of": ["true", "false"]}, {"name": "plan_sha256", "pattern": "^[0-9a-f]{64}$"}],
+  "timeout": 360,
+  "effect": "^set-longhorn-selector-policy: allow-empty-disk-selector-volume reads back (true|false) — settings\\.longhorn\\.io and Longhorn API agree, applied true \\(was (true|false)\\)$"
+}

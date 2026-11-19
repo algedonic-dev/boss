@@ -54,8 +54,13 @@ ran its step at all. Measured 2026-09-19 on the first live analyst run
 true to go, and ~94 more such runs are queued behind the page march,
 each needing a hand at the end — the act the protocol exists to remove.
 """
-version = 1
+version = 2
 on_event = "step.done.*"
 [[rule.do]]
 handler = "jobs.complete_linked_step"
-args = { link = "\"agent_run\"", link_from = "\"step\"", steps = "\"building\"", evidence_key = "\"delivered\"", done_metadata = '"{\"result\": \"delivered\"}"' }
+# A conductor completing a boarding step did not execute its review
+# (f87641ae). Only the reviewer's own recorded verdict can evidence that
+# work. Only the reviewer profile's pre-boarding review records that
+# verdict on its run. Landed reviews, tenant reviewers and analysts
+# record completion on their executing packet and retain ordinary delivery.
+args = { link = "\"agent_run\"", link_from = "\"step\"", steps = "\"building\"", evidence_key = "\"delivered\"", done_metadata = '"{\"result\": \"delivered\"}"', target_when = '"metadata.profile != \"reviewer\" OR metadata.step != \"review\" OR ((metadata.review.verdict = \"release\" OR metadata.review.verdict = \"changes\") AND metadata.review.car = metadata.packet AND metadata.review.reviewed_sha > \"\" AND metadata.review.at > \"\")"' }

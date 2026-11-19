@@ -1173,7 +1173,7 @@ render_delete() {
 # Forgejo serves the moved bytes, not that the bytes exist somewhere.
 healthz_ok() {
     local code
-    code=$(curl -sS --max-time 10 -o "$WORK/healthz" -w '%{http_code}' "$HEALTHZ" 2> "$WORK/curl.err") || return 1
+    code=$(curl -q -sS --max-time 10 -o "$WORK/healthz" -w '%{http_code}' "$HEALTHZ" 2> "$WORK/curl.err") || return 1
     [ "$code" = 200 ] && jq_doc_file "$WORK/healthz" \
         && [ "$(jq -r '.status // empty' "$WORK/healthz" 2> /dev/null)" = pass ]
 }
@@ -1190,14 +1190,14 @@ main_sha() { # -> refs/heads/main's sha, as git inside the container reads it
 manifest_sha() {
     local code bearer
     : > "$WORK/manifest.why"
-    code=$(curl -sS --max-time 30 -K "$WORK/basic.cfg" -o "$WORK/token.json" -w '%{http_code}' \
+    code=$(curl -q -sS --max-time 30 -K "$WORK/basic.cfg" -o "$WORK/token.json" -w '%{http_code}' \
         "http://$REG_HOST/v2/token?service=container_registry" 2> "$WORK/curl.err") \
         || { echo "the token request failed: $(head -c 300 "$WORK/curl.err")" > "$WORK/manifest.why"; return 1; }
     bearer=$(jq -r '.token // empty' "$WORK/token.json" 2> /dev/null)
     [ "$code" = 200 ] && [ -n "$bearer" ] \
         || { echo "/v2/token answered HTTP $code with no token" > "$WORK/manifest.why"; return 1; }
     ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$bearer" > "$WORK/bearer.cfg" )
-    code=$(curl -sS --max-time 60 -K "$WORK/bearer.cfg" \
+    code=$(curl -q -sS --max-time 60 -K "$WORK/bearer.cfg" \
         -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
         -o "$WORK/manifest" -w '%{http_code}' \
         "http://$REG_HOST/v2/$REG_OWNER/$REG_NAME/manifests/$1" 2> "$WORK/curl.err") \

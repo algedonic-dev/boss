@@ -308,7 +308,7 @@ describe('reviewHref', () => {
   });
 
   test('falls back to the job page for a packet whose steps have not materialized', () => {
-    expect(reviewHref('job-1')).toBe('/service/job-1');
-    expect(reviewHref('job-1', null)).toBe('/service/job-1');
+    expect(reviewHref('job-1')).toBe('/jobs/job-1');
+    expect(reviewHref('job-1', null)).toBe('/jobs/job-1');
   });
 });

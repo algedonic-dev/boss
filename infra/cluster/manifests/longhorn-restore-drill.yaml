@@ -1,0 +1,33 @@
+# The restore drill's class (backlog 156eb6e5; design 3c475a19 car 4's
+# risk section: restore the newest dump into a scratch database ON W-3'S
+# POSTGRES DISK before the system of record moves there). The ops verb
+# drill-gcs-restore cuts its scratch claim from this class as a generic
+# ephemeral volume (infra/forge/restore-drill-job.yaml), so the claim is
+# made for the drill's pod and deleted with it.
+#
+# diskSelector "postgres": a replica is placed only on a disk the
+# disk-tag door has tagged `postgres` — w-3's u-postgres (tagged
+# `durable,postgres` by set-longhorn-disk-tags; infra/cluster/talos/
+# README.md). ONE replica, because the drill proves the disk the
+# database will live on, not Longhorn's redundancy, and its bytes are
+# disposable. WaitForFirstConsumer with best-effort locality, the
+# dev-build classes' shape (boss-dev.yaml): the volume is made once the
+# pod is placed on the data node, and Longhorn keeps its one replica
+# there. The verb does not take that on trust: it reads the claim's
+# Longhorn replicas and fails unless every one is on the data node at
+# /var/mnt/postgres. reclaimPolicy Delete: the claim's end is the
+# volume's.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: longhorn-restore-drill
+provisioner: driver.longhorn.io
+allowVolumeExpansion: false
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  numberOfReplicas: "1"
+  dataLocality: "best-effort"
+  diskSelector: "postgres"
+  staleReplicaTimeout: "30"
+  fsType: "ext4"

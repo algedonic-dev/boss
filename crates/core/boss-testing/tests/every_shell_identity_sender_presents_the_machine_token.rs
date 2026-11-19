@@ -65,10 +65,6 @@ const BY_DESIGN: &[(&str, &str)] = &[
         "the recorded probe's reader runs car-supplied shell on the forge and must not hold the estate token; its own reader door is backlog d26515c5",
     ),
     (
-        "infra/forge/recovery-kit-read.sh",
-        "installed root-owned outside the checkout and cannot source the reader (its own header says so)",
-    ),
-    (
         "infra/postgres/reset-to-baseline.sh",
         "an operator's tool against a local stack, not a caller of the estate",
     ),
@@ -199,7 +195,12 @@ fn every_shell_identity_sender_presents_the_machine_token() {
     );
     let missing: Vec<&str> = all
         .iter()
-        .filter(|(rel, signs, presents)| *signs && !*presents && !listed(rel))
+        .filter(|(rel, signs, presents)| {
+            *signs
+                && !*presents
+                && !listed(rel)
+                && !TOKENLESS_PROBES.iter().any(|site| site.file == rel)
+        })
         .map(|(rel, _, _)| rel.as_str())
         .collect();
     assert!(
@@ -384,6 +385,10 @@ fn no_unit_runs_a_hand_installed_copy() {
 /// Python files that open connections which are not to a gated service
 /// port. (file, where its requests go).
 const PYTHON_NOT_THE_ESTATE: &[(&str, &str)] = &[
+    (
+        "infra/gcp/proton_bridge.py",
+        "67e08c6a: fixed HTTPS official Proton Bridge release, detached signature and public signing-key downloads only; no estate service requests or account credentials, and the estate machine token must never be sent to the upstream package host",
+    ),
     (
         "infra/forge/isolation-receiver.py",
         "a21c491c R1 bounded synthetic receiver: controls connect only to its original-request-derived isolation-fixture Service in boss-dev; fake routes and fake credentials never address an estate service, and this fixture must not read or hold the estate machine token",
@@ -676,6 +681,16 @@ const fn site(file: &'static str, needle: &'static str, sends: usize, why: &'sta
     }
 }
 
+/// A negative probe must reach the estate without its credential; otherwise
+/// it measures an accepted request and cannot prove the refusal it claims.
+/// One declaration feeds the file scan and the bounded per-command roster.
+const TOKENLESS_PROBES: &[Site] = &[site(
+    "infra/ops/machine-gate-refuses-tokenless.sh",
+    "\"${BOSS_JOBS_URL%/}/api/jobs?limit=1\"",
+    1,
+    "2710c8fc: the enforcing car's negative probe must present no machine token and receive401; its own fixture pins the empty header, disabled curl config, valid synthetic identity and exact status",
+)];
+
 /// Sends that do not go to a gated service port: another party's API, a
 /// download, a registry, a local stack, or a path the gate exempts.
 const NOT_THE_ESTATE: &[Site] = &[
@@ -720,6 +735,12 @@ const NOT_THE_ESTATE: &[Site] = &[
         "-H \"Host: $site\" \"http://$addr/\"",
         1,
         "a tenant site asked through the cluster's ingress address, to see that it serves; not a service port",
+    ),
+    site(
+        "infra/forge/cluster-deploy-lib.sh",
+        "-H \"Host: $site\" \"http://$addr$path\"",
+        1,
+        "each staged page of a tenant site asked through the cluster's ingress address, to hash what it serves (backlog 96e171bf); not a service port",
     ),
     site(
         "infra/forge/cluster-watchdog.sh",
@@ -775,6 +796,12 @@ const NOT_THE_ESTATE: &[Site] = &[
         "the kubectl download",
     ),
     site(
+        "infra/forge/netboot.sh",
+        "-o \"$tmp\" -- \"$url\"",
+        1,
+        "the Talos Image Factory download of the declared netboot kernel and initramfs (backlog ee31ab73); the estate token must never leave the estate",
+    ),
+    site(
         "infra/forge/journal-read.sh",
         "\"${BASE}/machine\"",
         1,
@@ -817,6 +844,18 @@ const NOT_THE_ESTATE: &[Site] = &[
         "the forge's container registry: one manifest",
     ),
     site(
+        "infra/forge/upgrade-forgejo.sh",
+        "\"$BOSS_FORGE_URL/api/healthz\"",
+        1,
+        "Forgejo's own healthz, read before and after its upgrade (backlog cecf62b3); Forgejo is not a BOSS service port, and the estate machine token must not be sent to it",
+    ),
+    site(
+        "infra/forge/upgrade-forgejo.sh",
+        "\"$BOSS_FORGE_URL/api/v1/version\"",
+        1,
+        "Forgejo's own public version endpoint, the upgrade's version diff and read-back (backlog cecf62b3); Forgejo is not a BOSS service port, and the estate machine token must not be sent to it",
+    ),
+    site(
         "infra/forge/offsite-push.sh",
         "-H \"@$AUTH\"",
         1,
@@ -824,9 +863,15 @@ const NOT_THE_ESTATE: &[Site] = &[
     ),
     site(
         "infra/forge/protect-main.sh",
-        "\"$CURL\" \"${args[@]}\" \"$url\"",
+        "\"$CURL\" -q \"${args[@]}\" \"$url\"",
         1,
         "the forge's API: branch protection",
+    ),
+    site(
+        "infra/forge/forge-account.sh",
+        "\"$CURL\" -q \"${args[@]}\" \"$url\"",
+        1,
+        "the forge's API: a declared account's one collaborator grant and the read of every other repository (design 0af333ee); Forgejo is not a BOSS service port, and the estate machine token must not be sent to it",
     ),
     site(
         "infra/forge/prune-registry-versions.sh",
@@ -842,7 +887,7 @@ const NOT_THE_ESTATE: &[Site] = &[
     ),
     site(
         "infra/estate/install-cli-from-image.sh",
-        "curl \"${args[@]}\" \"$url\"",
+        "curl -q \"${args[@]}\" \"$url\"",
         1,
         "the container registry the CLI image is pulled from",
     ),
@@ -866,7 +911,7 @@ const NOT_THE_ESTATE: &[Site] = &[
     ),
     site(
         "infra/dev/dev-session.sh",
-        "claude) curl -fsSL https://claude.ai/install.sh | bash",
+        "claude) curl -q -fsSL https://claude.ai/install.sh | bash",
         1,
         "an agent CLI's installer",
     ),
@@ -894,7 +939,7 @@ const NOT_THE_ESTATE: &[Site] = &[
 const NOT_A_SEND: &[Site] = &[
     site(
         "infra/lib/curl-through-a-roll.sh",
-        "curl \"$@\" >&\"$write_fd\"",
+        "curl -q \"$@\" >&\"$write_fd\"",
         1,
         "the retry wrapper: it runs its caller's argv whole, and the header is judged on the caller's line",
     ),
@@ -906,7 +951,7 @@ const NOT_A_SEND: &[Site] = &[
     ),
     site(
         "infra/dev/dev-session.sh",
-        "echo \"curl -fsSL https://claude.ai/install.sh",
+        "echo \"curl -q -fsSL https://claude.ai/install.sh",
         1,
         "prose: the install command printed for a dry run",
     ),
@@ -1233,7 +1278,11 @@ fn stamps(reader: &Reader, command: &str) -> usize {
 }
 
 fn roster() -> impl Iterator<Item = &'static Site> {
-    NOT_THE_ESTATE.iter().chain(NOT_A_SEND).chain(OWED)
+    NOT_THE_ESTATE
+        .iter()
+        .chain(TOKENLESS_PROBES)
+        .chain(NOT_A_SEND)
+        .chain(OWED)
 }
 
 /// (refused lines, roster entries that excuse nothing now).
@@ -1265,10 +1314,11 @@ fn unstamped_sends(root: &Path) -> (Vec<String>, Vec<String>) {
             if stamped > 0
                 && let Some(out) = NOT_THE_ESTATE
                     .iter()
+                    .chain(TOKENLESS_PROBES)
                     .find(|s| s.file == rel && command.contains(s.needle))
             {
                 refused.push(format!(
-                    "{rel}:{n}: hands the estate token's header to a request NOT_THE_ESTATE names ({}): {shown}",
+                    "{rel}:{n}: hands the estate token's header to a request the tokenless roster names ({}): {shown}",
                     out.why
                 ));
                 continue;
@@ -1578,35 +1628,35 @@ fn an_unstamped_send_is_refused_however_it_is_spelled() {
     );
 }
 
-/// The token never rides a request the roster says leaves the estate: the
-/// header file is filled for one host, and nothing at the request checks
-/// where THIS request goes.
+/// A request the roster requires to be tokenless stays tokenless: an
+/// external request must not leak it and a negative probe must not carry it.
 #[test]
-fn a_rostered_request_out_of_the_estate_may_not_carry_the_header() {
-    let entry = &NOT_THE_ESTATE[0];
-    let root = boss_testing::scratch_dir("per-site-token-leaves");
-    std::fs::create_dir_all(root.join(entry.file).parent().unwrap()).unwrap();
-    let head = "#!/usr/bin/env bash\nmachine_token_header MT_HDR \"$BASE\" || MT_HDR=\"\"\n";
-    boss_testing::write_file(
-        &root.join(entry.file),
-        &format!(
-            "{head}curl -fsS ${{MT_HDR:+-H \"$MT_HDR\"}} \\\n    {} > \"$2\"\n",
-            entry.needle
-        ),
-    );
-    let (refused, _) = unstamped_sends(&root);
-    assert_eq!(refused.len(), 1, "{refused:#?}");
-    assert!(
-        refused[0].contains("hands the estate token's header")
-            && refused[0].starts_with(&format!("{}:3:", entry.file)),
-        "{refused:#?}"
-    );
-    // The same request without the header is the rostered one, and passes.
-    boss_testing::write_file(
-        &root.join(entry.file),
-        &format!("{head}curl -fsS {} > \"$2\"\n", entry.needle),
-    );
-    assert!(unstamped_sends(&root).0.is_empty());
+fn a_rostered_tokenless_request_may_not_carry_the_header() {
+    for entry in [&NOT_THE_ESTATE[0], &TOKENLESS_PROBES[0]] {
+        let root = boss_testing::scratch_dir("per-site-token-leaves");
+        std::fs::create_dir_all(root.join(entry.file).parent().unwrap()).unwrap();
+        let head = "#!/usr/bin/env bash\nmachine_token_header MT_HDR \"$BASE\" || MT_HDR=\"\"\n";
+        boss_testing::write_file(
+            &root.join(entry.file),
+            &format!(
+                "{head}curl -fsS ${{MT_HDR:+-H \"$MT_HDR\"}} \\\n    {} > \"$2\"\n",
+                entry.needle
+            ),
+        );
+        let (refused, _) = unstamped_sends(&root);
+        assert_eq!(refused.len(), 1, "{refused:#?}");
+        assert!(
+            refused[0].contains("hands the estate token's header")
+                && refused[0].starts_with(&format!("{}:3:", entry.file)),
+            "{refused:#?}"
+        );
+        // The same request without the header is the rostered one, and passes.
+        boss_testing::write_file(
+            &root.join(entry.file),
+            &format!("{head}curl -fsS {} > \"$2\"\n", entry.needle),
+        );
+        assert!(unstamped_sends(&root).0.is_empty());
+    }
 }
 
 /// A roster entry excuses the sends it counts and not one more, and only
@@ -2184,5 +2234,538 @@ fn an_unhanded_lint_run_is_refused_however_it_is_spelled() {
             .iter()
             .any(|l| l.starts_with("infra/forge/by-path.sh:3:")),
         "the refusal names the line the run is on: {refused:#?}"
+    );
+}
+
+// =====================================================================
+// A CREDENTIAL'S CURL READS NO CURLRC (backlog 4f300192, 2026-10-22)
+// =====================================================================
+//
+// THE DEFECT. curl reads `~/.curlrc` (and `$CURL_HOME/.curlrc`, and the
+// XDG one) before its own argv, with no ownership check, and a `proxy =`
+// or `header =` line there sends the request — header file and all —
+// where whoever wrote the file chose. Only `-q` (`--disable`) as curl's
+// FIRST argument stops the read; anywhere else it is a no-op. Backlog
+// 2b1bf9b4 found the shape on the dev pod, where root's HOME is
+// /work/home and group 1500 may create files in it, and fixed the doors
+// under infra/dev. Measured on origin/main ab273f9b7 (2026-10-22): the
+// same omission at every credential sender outside infra/dev — the
+// forge, gcp, estate and ops scripts and the estate observer's embedded
+// `api_curl` — none passing `-q` first. Whether a given host's HOME is
+// writable by anyone else today is a property of that host on that day;
+// a sender that reads no rc file does not depend on it.
+//
+// THE RULE. In every file under infra/ that hands curl a credential —
+// a shell file, or a manifest's embedded script (`.yaml`/`.yml`) — EVERY
+// curl it runs passes `-q` or `--disable` as its first argument. A
+// credential is the reader's header file (`stamps`, above), one
+// CREDENTIAL names on the command itself, or — judged over the whole
+// FILE (`holds_a_credential`) — a call to one of the header helpers or a
+// CREDENTIAL spelling on any live line. That file-level half exists
+// because review 3874e4a8 found two forge-token senders the per-command
+// test could not see: protect-main.sh puts `-H "@$AUTH"` into an argv
+// array on another line, and root-tree-token-recv.sh names its header
+// `$FORGE_HEADER`, which no part of a variable-name heuristic matched.
+// A header helper is the one way a header file is made
+// (a-secret-header-rides-in-a-file), so a file that calls one holds a
+// credential whatever it names the variable and however the argv is
+// assembled. The whole file, not only the
+// credential's own command: a file that holds a token is a file whose
+// other requests a planted rc can also redirect, and a rule per command
+// would leave the function a caller's token is handed to (`api_curl() {
+// … curl -m 60 "$@" }`) unjudged, because its body names no credential.
+// So a call through a function the same file defines is judged in that
+// function's body, and a call through the shared retry wrapper
+// (`curl_through_a_roll`, or `boss-api-curl.sh`, which is it) is judged
+// once, in infra/lib/curl-through-a-roll.sh, which EVERY_CURL_PASSES_Q
+// holds whatever it carries. A finding names file, line and command.
+//
+// WHAT IT DOES NOT SEE. A curl word this file's scanner does not see
+// (the PER CALL SITE section lists those); a credential spelled in none
+// of CREDENTIAL's ways and not by the reader; a Python sender (urllib
+// reads no curlrc); and `CURL_HOME` or `XDG_CONFIG_HOME` set by a caller
+// — `-q` refuses those reads too, so they need no rule of their own.
+
+/// Files every curl of which passes `-q` first, whatever it carries.
+/// (file, why).
+const EVERY_CURL_PASSES_Q: &[(&str, &str)] = &[
+    (
+        "infra/lib/curl-through-a-roll.sh",
+        "the retry wrapper: every chore through boss-api-curl.sh, the pod door and the live lints send through its one curl, so it is judged here rather than at each caller",
+    ),
+    (
+        "infra/cluster/manifests/boss-dev.yaml",
+        "the dev pod's boot script runs as root with HOME=/work/home, which group 1500 may write, and pipes what curl fetches into bash and into /usr/local/bin (backlog eb94c402)",
+    ),
+];
+
+/// Command words that run curl through the shared wrapper, which is
+/// judged in its own file.
+const WRAPPERS: &[&str] = &["curl_through_a_roll", "boss-api-curl"];
+
+/// A credential written on the command itself, besides the reader's
+/// header file: an Authorization or bearer header, a machine-token or
+/// runner-credential header spelled out, a forge token header, curl's own
+/// user / netrc / bearer / config-file flags, a header read from a file
+/// (`-H @f`), or a header handed in a variable whose name says what it
+/// holds (`-H "$hdr"`, `-H "$AUTH"`, `-H "$RC_HDR"`). `x-boss-user` ALONE
+/// is not one: it names an identity and proves none, so a sender that
+/// carries only it (infra/gate-runner/run.sh, the local seed scripts
+/// under infra/postgres/) holds nothing a planted proxy could take.
+static CREDENTIAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)authorization:|bearer|private-token|x-api-key|x-boss-machine-token|x-boss-runner-credential|--oauth2-bearer|--netrc|(?:^|\s)--user\s|(?:^|\s)-u\s|(?:^|\s)-K\s|--config\s|-H\s*"?@|-H\s*"?\$\{?[a-z_]*(?:hdr|token|auth|cred|secret)"#,
+    )
+    .unwrap()
+});
+
+/// A FILE holds a credential when any live line calls one of the header
+/// helpers in infra/lib/secret-header.sh — which every header file is
+/// made by — or spells a token header or a header file: an
+/// Authorization line, the machine-token or runner-credential header, a
+/// `-H @file`, or a `-H "$…HDR/TOKEN/AUTH…"` variable. Narrower than
+/// CREDENTIAL, which reads one curl command: its `-u`, `-K`, `--config`
+/// and `bearer` spellings, read across a whole file, match `date -u`,
+/// `journalctl -u`, `sudo -u` and prose, and measured on 2026-11-10 they
+/// pulled seven files that hold no credential (the local seed scripts,
+/// the gate runner, caddy and nats setup) into the rule.
+static FILE_CREDENTIAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)(?:^|[\s;&|({!])(?:secret_header|machine_token_header|machine_gate_value_header)\s|authorization:|x-boss-machine-token|x-boss-runner-credential|private-token|-H\s*"?@|-H\s*"?\$\{?[a-z_]*(?:hdr|token|auth|cred|secret)"#,
+    )
+    .unwrap()
+});
+
+/// Does any live line of `text` (heredocs already blanked) hold a
+/// credential (FILE_CREDENTIAL) — on a curl line or not: an argv array
+/// (`args=(… -H "@$AUTH")`, `args+=(-H "$TOKEN_HDR")`) is assembled lines
+/// away from the curl that sends it (review 3874e4a8 B3).
+fn holds_a_credential(text: &str) -> bool {
+    live(text).any(|l| FILE_CREDENTIAL.is_match(before_comment(l)))
+}
+
+/// A heredoc opener: `<<EOF`, `<<-'SH'`, `<< "X"`. Not `<<<`, and not an
+/// arithmetic shift (`$((1 << n))`), which `heredocs_blanked` refuses by
+/// the `((` in front of it.
+static HEREDOC: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?:^|[^<])<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?"#).unwrap());
+
+/// `text` with every heredoc BODY replaced by an empty line, so line
+/// numbers hold. A body is text a file writes — a lint's planted
+/// fixture, a unit file — not a command it runs, and the lints that
+/// test this very class plant credential curls in theirs. Measured
+/// 2026-10-22: outside infra/lint/ no heredoc body under infra/ held a
+/// credential curl.
+fn heredocs_blanked(text: &str) -> String {
+    let mut out = Vec::new();
+    let mut until: Option<String> = None;
+    for line in text.lines() {
+        if let Some(end) = &until {
+            if line.trim() == end {
+                until = None;
+            }
+            out.push("");
+            continue;
+        }
+        out.push(line);
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        if let Some(c) = HEREDOC.captures(line)
+            && !line[..c.get(0).map_or(0, |m| m.start())].contains("((")
+        {
+            until = Some(c[1].to_string());
+        }
+    }
+    out.join("\n")
+}
+
+/// Is `words[i]` inside a double-quoted string — an `echo "… (curl
+/// $rc)"` — rather than a command? An odd count of unescaped `"` in
+/// the words before it, and no `$(` or backtick opening a command in the
+/// word itself.
+fn in_prose(words: &[&str], i: usize) -> bool {
+    // A word that OPENS a single-quoted string handed to printf or echo —
+    // `printf '%s\n' 'api_curl -s "$u"'` — is text a file writes, not a
+    // command it runs (infra/lint/a-manifest-sender-presents-the-
+    // machine-token.sh appends one to a fixture). Only printf and echo:
+    // `bash -c 'curl …'`, `runuser … bash -c '…'` and `ssh h 'curl …'`
+    // RUN the string, so they are still judged.
+    let w = words[i];
+    if w.starts_with('\'')
+        && !(w.len() > 1 && w.ends_with('\''))
+        && words[..i]
+            .iter()
+            .any(|b| matches!(word_name(b), "printf" | "echo"))
+    {
+        return true;
+    }
+    let before = words[..i].join(" ");
+    let quotes = before
+        .char_indices()
+        .filter(|&(k, c)| c == '"' && !before[..k].ends_with('\\'))
+        .count();
+    quotes % 2 == 1 && !words[i].contains("$(") && !words[i].contains('`')
+}
+
+/// `name() {` / `function name {` — a function this file defines.
+static FUNCTION_DEF: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_-]*)\s*\(\)").unwrap());
+
+/// The name a command word runs: syntax stripped as `is_curl_word` does,
+/// and a `$VAR` / `${VAR…}` reduced to VAR.
+fn word_name(word: &str) -> &str {
+    let core = word.rsplit('(').next().unwrap_or(word);
+    let core = core.trim_start_matches(['|', ';', '&', '{', '!', '`']);
+    let core = core.trim_matches(['"', '\'', '`']);
+    let var = core.strip_prefix('$').unwrap_or(core);
+    let var = var.strip_prefix('{').unwrap_or(var);
+    let end = var
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/')))
+        .unwrap_or(var.len());
+    &var[..end]
+}
+
+fn passes_q(next: Option<&&str>) -> bool {
+    next.is_some_and(|w| matches!(w.trim_matches(['"', '\'']), "-q" | "--disable"))
+}
+
+/// Every curl, in a file that hands curl a credential, that does not
+/// pass `-q` first: "file:line: command".
+fn curlrc_reads(root: &Path) -> (Vec<String>, usize) {
+    let mut files = Vec::new();
+    walk(&root.join("infra"), &mut files);
+    files.sort();
+    let mut refused = Vec::new();
+    let mut judged = 0;
+    for f in files {
+        let Ok(raw) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        let manifest = f.extension().is_some_and(|x| x == "yaml" || x == "yml");
+        if !(manifest || is_shell(&f, &raw)) {
+            continue;
+        }
+        let text = heredocs_blanked(&raw);
+        let rel = f.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+        let reader = reader_of(&rel, &text);
+        let cmds = commands(&text);
+        let every = EVERY_CURL_PASSES_Q.iter().any(|(p, _)| *p == rel);
+        // The sibling scan's NOT_A_SEND names lines that run no request:
+        // prose, a curl's NAME handed as an argument. The wrapper's own
+        // line is there too, and is the one send this rule holds it to.
+        let not_a_send = |command: &str| {
+            !every
+                && NOT_A_SEND
+                    .iter()
+                    .any(|s| s.file == rel && command.contains(s.needle))
+        };
+        let carries = every
+            || holds_a_credential(&text)
+            || cmds.iter().any(|(_, c)| {
+                sends(&reader, c) > 0
+                    && (stamps(&reader, c) > 0 || CREDENTIAL.is_match(before_comment(c)))
+            });
+        if !carries {
+            continue;
+        }
+        judged += 1;
+        let functions: Vec<String> = text
+            .lines()
+            .filter_map(|l| FUNCTION_DEF.captures(l).map(|c| c[1].to_string()))
+            .collect();
+        // A name this file assigns the wrapper to (`api=…/boss-api-curl.sh`).
+        let wrapper_aliases: Vec<String> = live(&text)
+            .flat_map(|l| {
+                ASSIGNMENT
+                    .captures_iter(before_comment(l))
+                    .filter(|c| WRAPPERS.iter().any(|w| c[2].contains(w)))
+                    .map(|c| c[1].to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for (n, command) in cmds {
+            if not_a_send(&command) {
+                continue;
+            }
+            let words: Vec<&str> = command.split_whitespace().collect();
+            for i in 0..words.len() {
+                let runs = is_curl_word(words[i], &reader.aliases)
+                    && (words.get(i + 1).is_some_and(|next| {
+                        next.starts_with(['-', '"', '$', '@', '\'']) || next.starts_with("http")
+                    }) || xargs_runs(&words, i));
+                if !runs || in_prose(&words, i) {
+                    continue;
+                }
+                let name = word_name(words[i]);
+                let wrapped = functions.iter().any(|f| f == name)
+                    || WRAPPERS.iter().any(|w| name.contains(w))
+                    || wrapper_aliases.iter().any(|a| a == name);
+                if wrapped || passes_q(words.get(i + 1)) {
+                    continue;
+                }
+                let shown = words.join(" ");
+                refused.push(format!("{rel}:{n}: {shown}"));
+            }
+        }
+    }
+    (refused, judged)
+}
+
+#[test]
+fn every_curl_in_a_credential_sender_passes_q_first() {
+    let (refused, _) = curlrc_reads(&repo_root());
+    assert!(
+        refused.is_empty(),
+        "these files hand curl a credential (the estate machine token's header file, an \
+         Authorization or identity header, a user or netrc flag), and these curls in them read \
+         a curlrc first — a `proxy =` line planted in the HOME they run under sends the request, \
+         credential aboard, where its author chose (backlog 2b1bf9b4, 4f300192). Make `-q` \
+         curl's FIRST argument (`curl -q -fsS …`): anywhere else it is a no-op. A call through \
+         a function this file defines is judged in its body, and one through \
+         curl_through_a_roll in infra/lib/curl-through-a-roll.sh:\n  {}",
+        refused.join("\n  ")
+    );
+}
+
+/// A whole-file entry whose file has gone holds nothing (review 3874e4a8
+/// N2): a rename would silently drop the rule from it.
+#[test]
+fn every_whole_file_entry_exists() {
+    let root = repo_root();
+    let gone: Vec<&str> = EVERY_CURL_PASSES_Q
+        .iter()
+        .map(|(p, _)| *p)
+        .filter(|p| !root.join(p).is_file())
+        .collect();
+    assert!(
+        gone.is_empty(),
+        "EVERY_CURL_PASSES_Q names files that no longer exist — move each entry with its file: {gone:?}"
+    );
+}
+
+/// A scan that sees no sender passes everything.
+#[test]
+fn the_curlrc_scan_sees_the_senders() {
+    let (_, judged) = curlrc_reads(&repo_root());
+    assert!(
+        judged >= 40,
+        "the curlrc scan judged {judged} credential-sending files, fewer than forty — it has \
+         stopped seeing the tree (47 files called the reader on 2026-10-22)"
+    );
+}
+
+/// The scan, on a planted tree. Never executed.
+#[test]
+fn a_credential_curl_that_reads_a_curlrc_is_refused() {
+    let root = boss_testing::scratch_dir("curlrc-reads");
+    let dir = root.join("infra/forge");
+    std::fs::create_dir_all(&dir).unwrap();
+    let stamps = "#!/usr/bin/env bash\nmachine_token_header MT_HDR \"$BASE\" || MT_HDR=\"\"\n";
+    let cases: &[(&str, &str, &str, usize)] = &[
+        (
+            "stamped-without-q.sh",
+            stamps,
+            "curl -fsS ${MT_HDR:+-H \"$MT_HDR\"} \"$BASE/api/jobs\"\n",
+            1,
+        ),
+        (
+            "stamped-with-q.sh",
+            stamps,
+            "curl -q -fsS ${MT_HDR:+-H \"$MT_HDR\"} \"$BASE/api/jobs\"\n",
+            0,
+        ),
+        (
+            "disable-spelled-long.sh",
+            stamps,
+            "out=$(curl --disable -fsS ${MT_HDR:+-H \"$MT_HDR\"} \"$BASE/x\")\n",
+            0,
+        ),
+        (
+            "q-not-first-is-a-no-op.sh",
+            stamps,
+            "curl -fsS -q ${MT_HDR:+-H \"$MT_HDR\"} \"$BASE/api/jobs\"\n",
+            1,
+        ),
+        (
+            "the-other-curl-of-a-sender.sh",
+            stamps,
+            "curl -q -fsS ${MT_HDR:+-H \"$MT_HDR\"} \"$BASE/a\"\ncurl -fsS -o x https://example.com/y\n",
+            1,
+        ),
+        (
+            "a-continued-command.sh",
+            stamps,
+            "curl \\\n  -fsS ${MT_HDR:+-H \"$MT_HDR\"} \"$BASE/a\"\n",
+            1,
+        ),
+        (
+            "an-authorization-header.sh",
+            "#!/usr/bin/env bash\n",
+            "curl -fsS -H \"Authorization: token $FORGE_TOKEN\" \"$FORGE/api/v1/repos\"\n",
+            1,
+        ),
+        (
+            "a-header-variable.sh",
+            "#!/usr/bin/env bash\n",
+            "hdr=\"$MT\"; out=$(curl -m 60 ${hdr:+-H \"$hdr\"} \"$@\")\n",
+            1,
+        ),
+        (
+            "a-function-judged-in-its-body.sh",
+            "#!/usr/bin/env bash\n",
+            "api_curl() {\n  curl -q -m 60 \"$@\"\n}\napi_curl -sf -H \"Authorization: Bearer $T\" \"$JOBS/api/x\"\n",
+            0,
+        ),
+        (
+            "a-function-whose-body-reads-it.sh",
+            "#!/usr/bin/env bash\n",
+            "api_curl() {\n  curl -m 60 \"$@\"\n}\napi_curl -sf -H \"Authorization: Bearer $T\" \"$JOBS/api/x\"\n",
+            1,
+        ),
+        (
+            "through-the-wrapper.sh",
+            stamps,
+            "code=$(curl_through_a_roll \"$W\" me svc \"GET $U\" -fsS ${MT_HDR:+-H \"$MT_HDR\"} \"$U\")\n",
+            0,
+        ),
+        (
+            "through-boss-api-curl.sh",
+            stamps,
+            "api=\"$here/../boss-api-curl.sh\"\n\"$api\" -fsS ${MT_HDR:+-H \"$MT_HDR\"} \"$BASE/a\"\n",
+            0,
+        ),
+        (
+            "holds-no-credential.sh",
+            "#!/usr/bin/env bash\n",
+            "curl -fsSL -o /tmp/x https://example.com/x\n",
+            0,
+        ),
+        (
+            "prose-in-an-echo.sh",
+            stamps,
+            "curl -q -fsS ${MT_HDR:+-H \"$MT_HDR\"} \"$B\"\necho \"api: transport error (curl $rc), retrying\" >&2\n",
+            0,
+        ),
+        (
+            "a-heredoc-fixture.sh",
+            stamps,
+            "cat > \"$t/x.sh\" <<'SH'\ncurl -fsS ${MT_HDR:+-H \"$MT_HDR\"} \"$u\"\nSH\ncurl -q -fsS ${MT_HDR:+-H \"$MT_HDR\"} \"$u\"\n",
+            0,
+        ),
+        (
+            "an-arithmetic-shift-is-no-heredoc.sh",
+            stamps,
+            "n=$((1 << SHIFT))\ncurl -fsS ${MT_HDR:+-H \"$MT_HDR\"} \"$u\"\n",
+            1,
+        ),
+        (
+            "an-identity-header-alone.sh",
+            "#!/usr/bin/env bash\n",
+            "curl -fsS -H \"x-boss-user: $U\" \"$JOBS/api/x\"\n",
+            0,
+        ),
+        (
+            "a-config-file-of-credentials.sh",
+            "#!/usr/bin/env bash\n",
+            "code=$(curl -sS -K \"$WORK/basic.cfg\" \"http://$REG/v2/token\")\n",
+            1,
+        ),
+        // Review 3874e4a8 B2: a header made by the helper under a name
+        // the variable heuristic cannot read (root-tree-token-recv.sh).
+        (
+            "a-helper-made-header-under-any-name.sh",
+            "#!/usr/bin/env bash\nsecret_header FORGE_HEADER \"Authorization: token $VALUE\" || exit 1\n",
+            "CODE=\"$(curl --noproxy '*' -sS -H \"$FORGE_HEADER\" \"$F/api/v1/repos/x\")\"\n",
+            1,
+        ),
+        (
+            "a-helper-made-header-with-q.sh",
+            "#!/usr/bin/env bash\nsecret_header FORGE_HEADER \"Authorization: token $VALUE\" || exit 1\n",
+            "CODE=\"$(curl -q --noproxy '*' -sS -H \"$FORGE_HEADER\" \"$F/api/v1/repos/x\")\"\n",
+            0,
+        ),
+        // Review 3874e4a8 B1: the header file goes into an argv array on
+        // another line, and the curl names only the array
+        // (protect-main.sh's call()).
+        (
+            "a-header-in-an-args-array.sh",
+            "#!/usr/bin/env bash\nCURL=\"${X_CURL:-curl}\"\n",
+            "call() {\n  local args=(-sS -m 20 -H \"@$AUTH\" -X \"$1\")\n  CODE=\"$(\"$CURL\" \"${args[@]}\" \"$2\")\"\n}\n",
+            1,
+        ),
+        // And appended to one (install-cli-from-image.sh's http_get).
+        (
+            "a-header-appended-to-an-args-array.sh",
+            "#!/usr/bin/env bash\n",
+            "get() {\n  local -a args=(-sS -o \"$out\")\n  [ -n \"$TOKEN_HDR\" ] && args+=(-H \"$TOKEN_HDR\")\n  curl \"${args[@]}\" \"$url\"\n}\n",
+            1,
+        ),
+        // `-u` and its kin read across a whole file are no credential:
+        // `date -u`, `sudo -u` (the false holds measured 2026-11-10).
+        (
+            "date-u-is-no-credential.sh",
+            "#!/usr/bin/env bash\nat=$(date -u +%FT%TZ)\nsudo -u postgres dropdb x\n",
+            "curl -fsS -m 5 \"http://$H/health\"\n",
+            0,
+        ),
+        // Text a file writes is no send, even single-quoted.
+        (
+            "a-single-quoted-call-is-text.sh",
+            stamps,
+            "curl -q -fsS ${MT_HDR:+-H \"$MT_HDR\"} \"$B\"\nprintf '%s\\n' 'api_curl -s \"http://x.test/a\"' >> \"$t\"\n",
+            0,
+        ),
+        // A string bash RUNS is a command, quoted or not.
+        (
+            "a-single-quoted-string-bash-runs.sh",
+            stamps,
+            "bash -c 'curl -fsS ${MT_HDR:+-H \"$MT_HDR\"} \"$B\"'\n",
+            1,
+        ),
+        // Sourcing the helper library is not calling a helper.
+        (
+            "sources-the-helpers-and-sends-nothing-secret.sh",
+            "#!/usr/bin/env bash\n. \"$here/../lib/secret-header.sh\"\n",
+            "curl -fsSL -o /tmp/x https://example.com/x\n",
+            0,
+        ),
+        (
+            "a-comment-is-no-send.sh",
+            stamps,
+            "# curl -fsS ${MT_HDR:+-H \"$MT_HDR\"} \"$BASE/a\"\ncurl -q -fsS ${MT_HDR:+-H \"$MT_HDR\"} \"$BASE/a\"\n",
+            0,
+        ),
+    ];
+    for (name, head, body, _) in cases {
+        std::fs::write(dir.join(name), format!("{head}{body}")).unwrap();
+    }
+    // A manifest's embedded script is judged as a shell file is.
+    let manifests = root.join("infra/cluster/manifests");
+    std::fs::create_dir_all(&manifests).unwrap();
+    std::fs::write(
+        manifests.join("observer.yaml"),
+        "spec:\n  args:\n    - |\n      out=$(curl -m 60 ${hdr:+-H \"$hdr\"} \"$@\") || rc=$?\n",
+    )
+    .unwrap();
+    let (refused, _) = curlrc_reads(&root);
+    for (name, _, _, want) in cases {
+        let got = refused
+            .iter()
+            .filter(|l| l.starts_with(&format!("infra/forge/{name}:")))
+            .count();
+        assert_eq!(got, *want, "{name}: refused {got} time(s): {refused:#?}");
+    }
+    assert!(
+        refused
+            .iter()
+            .any(|l| l.starts_with("infra/cluster/manifests/observer.yaml:4:")),
+        "a manifest's embedded curl is judged, by line: {refused:#?}"
+    );
+    assert!(
+        refused
+            .iter()
+            .any(|l| l.starts_with("infra/forge/the-other-curl-of-a-sender.sh:4:")),
+        "the refusal names the line the curl is on: {refused:#?}"
     );
 }

@@ -504,14 +504,13 @@ test.describe('/ux/inbox — links and back', () => {
 
     // The producers write /jobs/{id} and /jobs/{id}/steps/{step}: the
     // router's job and step routes, reached through its unprefixed-path
-    // fallback. The catalog lists the jobs surface they sit under and
-    // no detail entry for either (the same shape as /ux/people/:id).
+    // fallback. The catalog lists no entry for either; the jobs list
+    // they once sat under went with step 1 of design 01fa5bdf.
     expect(ROUTE_CATALOG.inbox.path).toBe(PATH);
     expect(ROUTE_CATALOG.inbox.label).toBe('Inbox');
     expect(ROUTE_CATALOG.inbox.owner).toBe('home');
     expect(parseRoute('/jobs/job-1/steps/step-9')).toMatchObject({ kind: 'stepFocus', jobId: 'job-1', stepId: 'step-9' });
     expect(parseRoute('/jobs/job-2')).toMatchObject({ kind: 'jobDetail', jobId: 'job-2' });
-    expect(parseRoute(ROUTE_CATALOG.jobs.path)).toMatchObject({ kind: 'jobs' });
 
     const link = list(page).getByRole('link', { name: 'step: step-9' });
     await expect(link).toHaveAttribute('href', '/jobs/job-1/steps/step-9');

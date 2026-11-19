@@ -67,22 +67,19 @@ PATTERN="(${TERNARY})|(${EARLY_RETURN})"
 #     department list) and sets the registry's `error` arm.
 # AP aging and ledger render null as unavailable alerts; summary now
 # retains its cause. Design's missing fallback opens the real job page.
-# stationMap's nullable contracts, the machine/converge unknown arms
-# and yard cannot-see lane do not manufacture successful empty reads.
-# AccountsList/SupportPage retain a failed ReadState alongside each
-# narrowed page; their counts/cells/empty surfaces consume that state.
+# The machine/converge unknown arms and yard cannot-see lane do not
+# manufacture successful empty reads. (stationMap, AccountsList and
+# SupportPage carried entries until step 1 of design 01fa5bdf removed
+# them.)
 declare -A ALLOW=(
     ["libs/web-kit/src/session/classes.svelte.ts"]=1
     ["libs/web-kit/src/session/departments.svelte.ts"]=1
     ["apps/web/src/finance/api.ts"]=1
     ["apps/web/src/finance/ledger.ts"]=1
     ["apps/web/src/it/design/DesignReviewPage.svelte"]=1
-    ["apps/web/src/it/monitoring/stationMap.ts"]=2
     ["apps/web/src/it/yard/yard-machines.ts"]=1
     ["apps/web/src/it/yard/yard-converge.ts"]=1
     ["apps/web/src/it/yard/yard.ts"]=1
-    ["apps/web/src/accounts/AccountsList.svelte"]=3
-    ["apps/web/src/support/SupportPage.svelte"]=2
 )
 allowlist_paths_exist "$NAME" "${!ALLOW[@]}"
 

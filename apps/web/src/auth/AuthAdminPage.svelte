@@ -132,7 +132,7 @@
   .token-box {
     margin-top: 6px; padding: 8px 10px; background: var(--ink);
     border: 1px solid var(--clear); border-radius: 4px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: var(--font-mono);
     font-size: 13px; word-break: break-all; user-select: all;
   }
   .no-access {

@@ -246,7 +246,7 @@ impl Handler for JobsSpawn {
             .post(&url)
             .header("Content-Type", "application/json")
             .header("x-boss-user", user_header.as_str())
-            .header("x-sim-origin", crate::dispatcher::sim_origin_value())
+            .header("x-sim-origin", crate::next_hop::sim_origin_value())
             .json(&body)
             .send()
             .await
@@ -304,7 +304,7 @@ impl Handler for JobsSpawn {
                 .put(&step_url)
                 .header("Content-Type", "application/json")
                 .header("x-boss-user", user_header.as_str())
-                .header("x-sim-origin", crate::dispatcher::sim_origin_value())
+                .header("x-sim-origin", crate::next_hop::sim_origin_value())
                 .json(&put_body)
                 .send()
                 .await

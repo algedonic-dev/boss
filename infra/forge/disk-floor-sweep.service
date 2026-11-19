@@ -32,6 +32,7 @@ Type=oneshot
 # The script stops at the floor and touches only regenerable caches, so
 # a higher number costs nothing when the disk is already above it.
 Environment=BOSS_DISK_FLOOR_GB=100
+Environment=BOSS_ACTOR=automation:disk-floor-sweep
 # WHICH SYSTEM OF RECORD THE PRUNE ASKS. The routine pass collects a
 # per-train CI image whose `pr-train` packet is CLOSED, which it can only
 # know by reading the record; unset, it falls back to the age window that

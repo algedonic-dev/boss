@@ -46,18 +46,16 @@
   let loading = $state(true);
   let error = $state<string | null>(null);
 
-  function pathFor(kind: string, id: string): string {
+  function pathFor(kind: string, id: string): string | null {
+    // A subject with a page opens it; any other is a heading of text,
+    // with its work listed under it. Every other kind linked to its
+    // packets on the jobs list until that list went with step 1 of
+    // design 01fa5bdf (review df7aeb9c), after the account, employee,
+    // product and asset pages.
     const direct: Record<string, string> = {
-      account: `/ux/accounts/${id}`,
-      vendor: `/ux/vendors/${id}`,
-      employee: `/ux/people/${id}`,
-      product: `/ux/products/${id}`,
-      asset: `/ux/assets/${id}`,
+      vendor: `/finance/vendors/${encodeURIComponent(id)}`,
     };
-    return (
-      direct[kind] ??
-      `/ux/jobs?subject_kind=${encodeURIComponent(kind)}&subject_id=${encodeURIComponent(id)}`
-    );
+    return direct[kind] ?? null;
   }
 
   async function load(): Promise<void> {
@@ -103,12 +101,21 @@
   <p class="sr-msg">No matches for “{q}”.</p>
 {:else if results}
   {#each results.subjects as s (s.subject_kind + s.subject_id)}
+    {@const to = pathFor(s.subject_kind, s.subject_id)}
+    <!-- That {@const} sits directly under the {#each}, not inside the
+         section: svelte refuses it there (const_tag_invalid_placement). -->
+
     <section class="sr-subject">
-      <a class="sr-subject-head" href={safeLinkHref(pathFor(s.subject_kind, s.subject_id))}>
+      {#snippet head()}
         <span class="sr-kind">{s.subject_kind}</span>
         <span class="sr-title">{s.title}</span>
         <span class="sr-id">{s.subject_id}</span>
-      </a>
+      {/snippet}
+      {#if to !== null}
+        <a class="sr-subject-head" href={safeLinkHref(to)}>{@render head()}</a>
+      {:else}
+        <div class="sr-subject-head" data-pageless={s.subject_kind}>{@render head()}</div>
+      {/if}
 
       {#if s.jobs.length > 0 || s.event_count > 0}
         <div class="sr-panes">
@@ -195,7 +202,7 @@
     color: var(--text);
     border-bottom: 1px solid var(--border);
   }
-  .sr-subject-head:hover {
+  a.sr-subject-head:hover {
     background: var(--bg);
   }
   .sr-kind {

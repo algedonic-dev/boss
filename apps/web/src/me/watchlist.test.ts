@@ -124,8 +124,6 @@ describe('watchlistStateFromResponse', () => {
     station: 'my-watchlist',
     kind: 'actor',
     discipline: ['recency'],
-    wip_limit: null,
-    over_limit: false,
     terminal_window_days: 14,
     total: 1,
     data: [job()],

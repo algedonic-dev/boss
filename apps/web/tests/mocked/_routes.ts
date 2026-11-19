@@ -26,37 +26,25 @@ import { VENDOR_CRAWL_PATH } from '../fixtures/vendor';
 export const ROUTES: ReadonlyArray<string> = [
   // User Experiences perspective — bare / is the public home alias; the
   // operator surfaces are re-rooted under /ux/*.
-  '/', '/ux/me', '/ux/inbox', '/ux/jobs', '/ux/accounts', '/ux/vendors', '/ux/people', '/ux/parts',
+  // The /ux business pages (accounts, people, parts, products, shipping,
+  // assets, catalog, marketing-assets, support, service, qa, sales, shop,
+  // exec, warehouse) and the jobs list went with step 1 of design
+  // 01fa5bdf; RETIRED_ROUTES below holds each to not-found.
+  '/', '/ux/me', '/ux/inbox', '/finance/vendors',
   // e9c8e28d: focused specs already open VendorPage; shared crawls need
   // their own answered representative of the same native detail route.
   VENDOR_CRAWL_PATH,
   //6d6f88bd separates Finance detail availability from Vendors. These
   // concrete addresses open the catalog's native route-field patterns.
-  '/ux/purchase-orders/po-review', '/ux/vendor-invoices/bill-review',
-  // Approved company orientation (d4dada70, 2026-10-02): real registry
-  // regions, one connected IT example. All shared crawls exercise it.
-  '/map',
-  // An employee's page — the persona's own row, which _smokeMocks.ts
-  // seeds at EMPLOYEE_DETAIL (backlog 1a83fe98). Until then only
-  // employee-page-roster-read.mocked.spec.ts checked what it says when
-  // its reads fail, and no crawl opened it at all.
-  '/ux/people/emp-001',
-  '/ux/products', '/ux/shipping', '/ux/assets', '/ux/catalog',
-  '/ux/marketing-assets', '/ux/marketing-assets/ma-1', '/ux/calendar/me',
-  '/ux/support', '/ux/service', '/ux/qa', '/ux/hr', '/ux/sales',
-  '/ux/shop', '/ux/manual',
-  // The executive overview — DEFERRED until 2026-09-27 for `.find` /
-  // `.length` over object-shaped summaries. Page audit a1d62870 moved
-  // every read into src/exec/exec.ts behind a parser that answers a
-  // wrong shape as a failed read, so the `[]` floor paints a failure
-  // line rather than crashing the page (backlog 1495cf68).
-  '/ux/exec',
+  '/finance/purchase-orders/po-review', '/finance/vendor-invoices/bill-review',
+  '/ux/calendar/me',
+  '/ux/manual',
   // Finance — DEFERRED until 2026-09-25 for want of object-shaped
   // statement fixtures, which _smokeMocks.ts now carries (page audit
   // 3f964c57, backlog e0732f75). Under the empty leg every statement
   // answers its well-formed empty body; under the outage, Overview's
   // two failure lines wear the marker.
-  '/ux/finance',
+  '/finance',
   // The IT department — six surfaces, families as tabs (1f6d55e0).
   // /system is GONE (David's Q1/Q4: no legacy users, no redirects), so
   // this list crawls exactly what the catalog declares and nothing
@@ -71,47 +59,31 @@ export const ROUTES: ReadonlyArray<string> = [
   // `load-failed`.
   '/it/registry/rules/auto-park-on-gate-green',
   '/it/operate/perf',
-  '/it/operate/atlas', '/it/registry/step-plugins', '/it/kb', '/it/design',
-  '/it/design/experiments',
+  '/it/registry/step-plugins', '/it/kb', '/it/design',
   // Modeling + admin surfaces (System Model).
   '/it/registry', '/it/registry/new',
-  '/it/registry/seasonal-release', '/it/registry/policy', '/it/auth-admin',
+  '/it/registry/seasonal-release', '/it/auth-admin',
   // '/it/design/feedback' and '/it/design/backlog' were crawled here
-  // until car N3 of design e765b3fc (2026-09-25): each board is a
-  // station's panel on the Department Map now, crawled below with the
-  // station that carries it.
-  // Incidents (the Operate landing) renders both panels' empty states
-  // under the mock's `[]` catch-all — chrome + empty states, no crash.
-  '/it/operate',
-  // Bottlenecks (was Fleet) renders its no-Workflows empty state under
-  // the mock's empty /api/workflows — page chrome + picker. The map
-  // and flow pages died into the Atlas tab (already crawled above).
-  '/it/operate/bottlenecks',
+  // until car N3 of design e765b3fc (2026-09-25) made each a station's
+  // panel on the Department Map; both panels went with the map in step 1
+  // of design 01fa5bdf, as did Incidents, Atlas, Bottlenecks,
+  // Experiments and Policy.
   // The Audit Log. Deferred until 2026-09-23
   // for want of an object-shaped /api/events/stats fixture, which
   // _smokeMocks.ts now carries (EVENTS_STATS); its live stream answers
   // the floor's 204, so the page falls to its snapshot poll. Its own
   // controls are pinned in audit-log-page.mocked.spec.ts (65a273d5).
   '/it/operate/audit',
-  // THE DEPARTMENT MAP'S STATIONS (design e765b3fc, car N3). Each was a
-  // floor page at /it/yard/<region> — and the shop floor was the Crew
-  // Board at /it/crew — until car N3 made each one a SELECTION on the
-  // map, its floor, its board and the boards of the pages that retired
-  // into it (yard status, the conductor's feed, the feedback and backlog
-  // boards; panel.ts `STATION_BOARDS`) drawn in its panel under the map.
-  // So the crawl opens the selections, one per station the floors
-  // covered: the panel renders each board's empty states under the
-  // mocks and its `load-failed` line under the outage, exactly as the
-  // pages did. The old paths are not found (router.test.ts pins each).
+  // THE ALARMS BOARD AND THE STATIONS THAT KEEP A BOARD (design
+  // 01fa5bdf step 1): what stays at /it of the Department Map. Only the
+  // track, the dock and the garage still carry boards — the release and
+  // cancel controls (panel.ts `STATION_BOARDS`) — so the crawl opens
+  // those three selections: each board renders its empty states under
+  // the mocks and its `load-failed` line under the outage. The other
+  // stations' boards went with the map. '/it' itself is crawled above.
   '/it?at=dock',
-  '/it?at=gates',
   '/it?at=track',
-  '/it?at=shed',
-  '/it?at=arrivals',
   '/it?at=garage',
-  '/it?at=receiving',
-  '/it?at=marshalling',
-  '/it?at=shop-floor',
   // The codebase — its own sidebar row since feedback 9827c699
   // (2026-09-14; a Design tab before, backlog 06048ade). Its one read is
   // `/api/jobs?kind=maintenance-codebase-metrics`; under the mock's `[]`
@@ -140,12 +112,10 @@ export const ROUTES: ReadonlyArray<string> = [
   // drift test in route-smoke.mocked.spec.ts now enforces its presence
   // here instead of this line being the whole of its coverage.
   '/watchlist',
-  // HR and the operator manual joined the catalog with the watchlist
-  // (CAR-6): HR renders its empty-roster states under the mock's `[]`
-  // catch-all; the manual renders its docs chrome with the fetch
-  // failing honestly. Both pin chrome + no-crash, same bar as every
-  // other row.
-  '/hr',
+  // The operator manual joined the catalog with the watchlist (CAR-6):
+  // it renders its docs chrome with the fetch failing honestly — chrome
+  // + no-crash, same bar as every other row. HR, which joined with it,
+  // went with step 1 of design 01fa5bdf.
   '/manual',
   // The estate page under the mock's catch-all: every /api/estate/*
   // fetch fails or reads empty, and the page's whole design is that
@@ -201,6 +171,26 @@ export const RETIRED_ROUTES: ReadonlyArray<string> = [
   '/it/yard/receiving', '/it/yard/marshalling', '/it/crew',
   '/it/operate/receiving', '/it/operate/marshalling', '/it/operate/yard-status',
   '/it/operate/conductor', '/it/design/feedback', '/it/design/backlog', '/it/design/codebase',
+  // The department floor (backlog 858e62aa, 2026-11-08): the recursive
+  // station view at /it/tree is the surface it was a flat copy of.
+  '/it/floor/hosting',
+  // STEP 1 OF DESIGN 01fa5bdf (David, 2026-11-17: "IT disappears, the
+  // old map is pulled out, and the /ux business pages are removed").
+  // Each answered until then and is not found now; a page comes back as
+  // a station's page when a protocol runs there. (/it/registry/policy is
+  // not here: /it/registry/<kind> is a workflow's page, so it now asks
+  // the registry for a workflow named `policy`.)
+  '/it/operate', '/it/operate/atlas', '/it/operate/bottlenecks', '/it/design/experiments',
+  '/people/hr',
+  '/ux/accounts', '/ux/accounts/acct-1', '/ux/assets', '/ux/assets/ast-1',
+  '/ux/catalog', '/ux/catalog/FV-30', '/ux/exec', '/ux/marketing-assets', '/ux/marketing-assets/ma-1',
+  '/ux/parts', '/ux/parts/part-1', '/ux/people', '/ux/people/emp-001', '/ux/products', '/ux/products/sku-1',
+  '/ux/qa', '/ux/sales', '/ux/sales/job-1', '/ux/service', '/ux/service/job-1', '/ux/service/schedule',
+  '/ux/shipping', '/ux/shipments/ship-1', '/ux/shop', '/ux/shop/sku-1', '/ux/support', '/ux/warehouse',
+  // The jobs list, which the first build of that car kept (review
+  // df7aeb9c). A packet's own page, /ux/jobs/<id>, and its step pages
+  // stay: src/jobs/the-jobs-list-is-retired.test.ts holds both halves.
+  '/ux/jobs',
 ];
 
 /// Routes the crawls cannot cover yet, each with why. Shrinking this
@@ -220,7 +210,8 @@ export const DEFERRED: ReadonlyMap<string, string> = new Map([
   // e0732f75): its statements' object-shaped fixtures are in
   // _smokeMocks.ts (COMMERCE_SUMMARY, AP_AGING, LEDGER_STATEMENTS), and
   // finance-page.mocked.spec.ts pins the page's own controls.
-  ['/ux/warehouse', 'summary.below_reorder_count needs a faithful fixture'],
+  // '/ux/warehouse' was deferred here until its page went with step 1 of
+  // design 01fa5bdf.
   // '/ux/exec' left on 2026-09-27 (page audit a1d62870, backlog
   // 1495cf68): its reads parse their shapes, and exec-page.mocked.spec.ts
   // pins the page's own lines and links.

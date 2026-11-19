@@ -1,7 +1,8 @@
 //! Shared test scaffolding for the assets crate.
 //!
-//! Uses `RecordingEventBus` in place of NATS so tests are hermetic and
-//! can assert on published events directly.
+//! Uses `RecordingEventBus` in place of NATS so tests are hermetic; the
+//! facts a write stages are read off the double
+//! (`InMemoryAssets::staged_facts`), the analogue of `event_outbox`.
 //!
 //! `#[allow(dead_code)]` on the module: Rust sees each test binary as
 //! its own compilation, and some helpers are only used by a subset of
@@ -17,16 +18,10 @@ use boss_assets::http::{AssetsApiState, router};
 use boss_assets::in_memory::InMemoryAssets;
 use boss_assets::sse::SseHub;
 use boss_assets::types::{AssetEvent, AssetEventId, AssetEventKind, AssetId, IntakeSource};
-use boss_core::port::EventBus;
-use boss_core::publisher::DomainPublisher;
-#[cfg(feature = "postgres")]
-use boss_events::PgAuditWriter;
 use boss_people_client::{AlwaysExistsPeople, PeopleClient};
 use boss_policy_client::{PermissivePolicyClient, PolicyClient};
 use boss_testing::RecordingEventBus;
 use chrono::NaiveDate;
-#[cfg(feature = "postgres")]
-use sqlx::PgPool;
 
 /// Fully wired assets service for tests.
 pub struct AssetsTestApp {
@@ -61,42 +56,10 @@ impl AssetsTestApp {
             InMemoryAssets::with_events(events).expect("seed events should be non-duplicate"),
         );
         let bus = RecordingEventBus::new();
-        let publisher = DomainPublisher::new(bus.clone() as Arc<dyn EventBus>, "assets");
         let hub = SseHub::new();
         let state = AssetsApiState {
             assets: assets.clone(),
             bus: bus.clone(),
-            publisher,
-            people_client,
-            classes_client: None,
-            hub,
-            policy: Arc::new(PermissivePolicyClient) as Arc<dyn PolicyClient>,
-            insights_clients: None,
-            clock: Arc::new(boss_clock_client::WallClockClient),
-        };
-        let router = router(state);
-        Self {
-            router,
-            assets,
-            bus,
-        }
-    }
-
-    /// Build a test app whose publisher persists every emitted event
-    /// to the given Postgres pool's `audit_log` table. Used by the
-    /// audit_log E2E integration test.
-    #[cfg(feature = "postgres")]
-    pub async fn with_audit_pool(pool: PgPool) -> Self {
-        let assets = Arc::new(InMemoryAssets::new());
-        let bus = RecordingEventBus::new();
-        let publisher = DomainPublisher::new(bus.clone() as Arc<dyn EventBus>, "assets")
-            .with_audit(Arc::new(PgAuditWriter::new(pool)));
-        let people_client: Arc<dyn PeopleClient> = Arc::new(AlwaysExistsPeople);
-        let hub = SseHub::new();
-        let state = AssetsApiState {
-            assets: assets.clone(),
-            bus: bus.clone(),
-            publisher,
             people_client,
             classes_client: None,
             hub,

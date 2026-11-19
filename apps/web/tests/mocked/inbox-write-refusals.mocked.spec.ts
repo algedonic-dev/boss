@@ -33,7 +33,7 @@ const EMP = { id: 'emp-001', name: 'David', email: 'd@a', role: 'platform-admin'
 
 /// Where the message's entity link points. Any SPA route the floor
 /// can answer; the claim is only about whether the page goes there.
-const ENTITY_PATH = ROUTE_CATALOG.people.path;
+const ENTITY_PATH = ROUTE_CATALOG.schedule.path;
 
 const MSG = {
   id: 'msg-1', sender_id: 'system', recipient_id: EMP.id, kind: 'direct',

@@ -13,3 +13,5 @@
 id = "automation:machine-token-deposit"
 role = "audit-readonly"
 description = 'The estate machine-token deposit on the forge asking the jobs machine gate which slot its token matches (infra/forge/machine-token-deposit.sh). Reads only.'
+# Host station: vault (backlog 6ecb5480, station-tree.md section 6).
+station = "fa8b479f-1573-4153-9359-0ee123c3295c"

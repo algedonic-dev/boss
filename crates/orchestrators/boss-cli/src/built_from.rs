@@ -132,10 +132,7 @@ pub fn origin_main_head() -> Option<String> {
         );
         return None;
     }
-    String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .next()
-        .map(str::to_string)
+    crate::receipt::exact_ref_head(&String::from_utf8_lossy(&out.stdout), "refs/heads/main")
 }
 
 #[cfg(test)]

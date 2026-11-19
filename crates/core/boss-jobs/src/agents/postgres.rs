@@ -14,11 +14,14 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
+use boss_core::event::Event;
 use boss_core::publish::PublishMode;
 use boss_core::publisher::EventStamp;
 use sqlx::PgPool;
 
-use super::automations::{AutomationActor, AutomationsSeedOutcome, classify, validate_all};
+use super::automations::{
+    AutomationActor, AutomationsSeedOutcome, RecordedTier, classify, validate_all,
+};
 use super::port::{
     AgentsError, AgentsRegistry, automation_declared_event, declared_event, updated_event,
 };
@@ -58,7 +61,7 @@ impl PgAgents {
                 .map_err(storage)?;
         Ok((
             rows.into_iter().map(|row| to_row(row, &aliases)).collect(),
-            automations.into_iter().map(AutomationActor::from).collect(),
+            to_automations(automations)?,
         ))
     }
 }
@@ -83,13 +86,16 @@ fn insert_error(e: sqlx::Error, model: &str) -> AgentsError {
 
 #[derive(sqlx::FromRow)]
 struct AgentDbRow {
+    factory_rotation: bool,
     id: String,
     display_name: String,
     default_model: String,
+    model_class: Option<String>,
     role: Option<String>,
     department: Option<String>,
     hourly_budget_usd_micros: Option<i64>,
     max_concurrent_runs: Option<i32>,
+    stations: Vec<String>,
 }
 
 /// Every alias grouped under its actor, sorted in BYTE order.
@@ -118,19 +124,23 @@ where
 
 fn to_row(r: AgentDbRow, aliases: &BTreeMap<String, Vec<String>>) -> AgentRow {
     AgentRow {
+        factory_rotation: r.factory_rotation,
         aliases: aliases.get(&r.id).cloned().unwrap_or_default(),
         id: r.id,
         display_name: r.display_name,
         default_model: r.default_model,
+        model_class: r.model_class,
         role: r.role,
         department: r.department,
         hourly_budget_usd_micros: r.hourly_budget_usd_micros,
         max_concurrent_runs: r.max_concurrent_runs,
+        stations: r.stations,
     }
 }
 
-const SELECT: &str = "SELECT id, display_name, default_model, role, department, \
-                      hourly_budget_usd_micros, max_concurrent_runs FROM agents";
+const SELECT: &str = "SELECT factory_rotation, id, display_name, default_model, model_class, role, \
+                      department, hourly_budget_usd_micros, max_concurrent_runs, stations \
+                      FROM agents";
 
 /// One agent's row with its aliases (`None` when the registry does
 /// not hold the id), read inside the batch's transaction so the
@@ -205,23 +215,33 @@ impl AgentsRegistry for PgAgents {
                    default_model = EXCLUDED.default_model, \
                    role = EXCLUDED.role, \
                    department = EXCLUDED.department, \
+                   factory_rotation = COALESCE($8, agents.factory_rotation), \
                    hourly_budget_usd_micros = EXCLUDED.hourly_budget_usd_micros, \
-                   max_concurrent_runs = EXCLUDED.max_concurrent_runs \
+                   max_concurrent_runs = EXCLUDED.max_concurrent_runs, \
+                   model_class = EXCLUDED.model_class, \
+                   stations = COALESCE($10, agents.stations) \
                  WHERE (agents.display_name, agents.default_model, agents.role, \
                         agents.department, agents.hourly_budget_usd_micros, \
-                        agents.max_concurrent_runs) \
+                        agents.max_concurrent_runs, agents.factory_rotation, \
+                        agents.model_class, agents.stations) \
                        IS DISTINCT FROM \
                        (EXCLUDED.display_name, EXCLUDED.default_model, EXCLUDED.role, \
                         EXCLUDED.department, EXCLUDED.hourly_budget_usd_micros, \
-                        EXCLUDED.max_concurrent_runs)"
+                        EXCLUDED.max_concurrent_runs, COALESCE($8, agents.factory_rotation), \
+                        EXCLUDED.model_class, COALESCE($10, agents.stations))"
             } else {
                 "ON CONFLICT (id) DO NOTHING"
             };
+            // `stations` is COALESCEd like `factory_rotation`: a
+            // declaration that names no seats keeps the held ones, and a
+            // new row seats nobody (design 506e0a1c car 1).
             sqlx::query(&format!(
                 "INSERT INTO agents \
                  (id, display_name, default_model, role, department, \
-                  hourly_budget_usd_micros, max_concurrent_runs) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7) {on_conflict}"
+                  hourly_budget_usd_micros, max_concurrent_runs, factory_rotation, model_class, \
+                  stations) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, true), $9, \
+                         COALESCE($10::text[], '{{}}'::text[])) {on_conflict}"
             ))
             .bind(&a.id)
             .bind(&a.display_name)
@@ -230,6 +250,9 @@ impl AgentsRegistry for PgAgents {
             .bind(&a.department)
             .bind(a.hourly_budget_usd_micros)
             .bind(a.max_concurrent_runs)
+            .bind(a.factory_rotation)
+            .bind(&a.model_class)
+            .bind(&a.stations)
             .execute(&mut *tx)
             .await
             .map_err(|e| insert_error(e, &a.default_model))?;
@@ -302,6 +325,8 @@ impl AgentsRegistry for PgAgents {
             updated,
             kept,
             unchanged,
+            // The batch door names these from the registry read back.
+            no_model_class: Vec::new(),
         })
     }
 
@@ -311,7 +336,7 @@ impl AgentsRegistry for PgAgents {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(storage)?;
-        Ok(rows.into_iter().map(AutomationActor::from).collect())
+        to_automations(rows)
     }
 
     async fn declare_automations(
@@ -328,7 +353,7 @@ impl AgentsRegistry for PgAgents {
             .fetch_all(&mut *tx)
             .await
             .map_err(storage)?;
-        let held: Vec<AutomationActor> = held.into_iter().map(AutomationActor::from).collect();
+        let held = to_automations(held)?;
         let mut outcome = classify(&held, declared);
         let absent = std::mem::take(&mut outcome.inserted);
         for d in declared.iter().filter(|d| absent.contains(&d.id)) {
@@ -337,13 +362,15 @@ impl AgentsRegistry for PgAgents {
             // row once; only the run whose INSERT landed records it,
             // and the other counts the row as present.
             let landed = sqlx::query(
-                "INSERT INTO automation_actors (id, role, description, signs_for) \
-                 VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING",
+                "INSERT INTO automation_actors (id, role, description, signs_for, access_tier, station) \
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
             )
             .bind(&d.id)
             .bind(&d.role)
             .bind(&d.description)
             .bind(&d.signs_for)
+            .bind(d.access_tier.map(RecordedTier::as_str))
+            .bind(&d.station)
             .execute(&mut *tx)
             .await
             .map_err(storage)?
@@ -363,9 +390,22 @@ impl AgentsRegistry for PgAgents {
         tx.commit().await.map_err(storage)?;
         Ok(outcome)
     }
+
+    async fn count_unresolved_login(&self, event: &Event) -> Result<(), AgentsError> {
+        // The count is the fact and no row moves with it, so the
+        // transaction holds the outbox row alone (backlog 2e45840a,
+        // design ad9519bc part d): committed here, it is delivered by
+        // the relay whether or not the bus is up right now.
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        boss_events::outbox::record_event_in_tx(&mut tx, event)
+            .await
+            .map_err(AgentsError::Storage)?;
+        tx.commit().await.map_err(storage)
+    }
 }
 
-const SELECT_AUTOMATIONS: &str = "SELECT id, role, description, signs_for FROM automation_actors";
+const SELECT_AUTOMATIONS: &str =
+    "SELECT id, role, description, signs_for, access_tier, station FROM automation_actors";
 
 #[derive(sqlx::FromRow)]
 struct AutomationDbRow {
@@ -373,15 +413,38 @@ struct AutomationDbRow {
     role: String,
     description: String,
     signs_for: Option<String>,
+    access_tier: Option<String>,
+    station: Option<String>,
 }
 
-impl From<AutomationDbRow> for AutomationActor {
-    fn from(r: AutomationDbRow) -> Self {
-        AutomationActor {
+impl TryFrom<AutomationDbRow> for AutomationActor {
+    type Error = AgentsError;
+
+    /// A tier this build cannot name is refused, never read as no tier
+    /// (backlog f21804d8): the column's CHECK admits only `auditor`, so
+    /// another value is a schema this adapter does not know.
+    fn try_from(r: AutomationDbRow) -> Result<Self, AgentsError> {
+        let access_tier = match r.access_tier.as_deref() {
+            None => None,
+            Some(text) => Some(RecordedTier::parse(text).ok_or_else(|| {
+                AgentsError::Storage(format!(
+                    "automation_actors row {} records access_tier {text:?}, which this build \
+                     does not know; refusing the registry read rather than dropping it",
+                    r.id
+                ))
+            })?),
+        };
+        Ok(AutomationActor {
             id: r.id,
             role: r.role,
             description: r.description,
             signs_for: r.signs_for,
-        }
+            access_tier,
+            station: r.station,
+        })
     }
+}
+
+fn to_automations(rows: Vec<AutomationDbRow>) -> Result<Vec<AutomationActor>, AgentsError> {
+    rows.into_iter().map(AutomationActor::try_from).collect()
 }

@@ -10,8 +10,10 @@ const source = readFileSync(new URL('../it/ItTabs.svelte', import.meta.url), 'ut
 const tabs = [...source.matchAll(/path: '(\/it\/operate(?:\/[^']*)?)'/g)].map((m) => m[1]!);
 const catalog = Object.values(ROUTE_CATALOG);
 
-test('the fixture reads the actual five Operate tabs', () => {
-  expect(tabs).toHaveLength(5);
+// Five until step 1 of design 01fa5bdf took Incidents, Atlas and
+// Bottlenecks off the strip (2026-11-17).
+test('the fixture reads the actual two Operate tabs', () => {
+  expect(tabs).toEqual(['/it/operate/audit', '/it/operate/perf']);
 });
 
 for (const path of tabs) {
@@ -24,17 +26,21 @@ for (const path of tabs) {
   });
 }
 
-test('retired Yard status and Conductor stay retired', () => {
-  for (const path of ['/it/operate/yard-status', '/it/operate/conductor']) {
-    expect(RETIRED_ROUTES).toContain(path);
-    expect(ROUTES).not.toContain(path);
-    expect(catalog.some((row) => row.path === path)).toBe(false);
-    expect(parseRoute(path).kind).toBe('notFound');
+test('retired Yard status, Conductor, Incidents, Atlas and Bottlenecks stay retired', () => {
+  for (const path of [
+    '/it/operate/yard-status', '/it/operate/conductor',
+    // design 01fa5bdf step 1
+    '/it/operate', '/it/operate/atlas', '/it/operate/bottlenecks',
+  ]) {
+    expect({ path, retired: RETIRED_ROUTES.includes(path) }).toEqual({ path, retired: true });
+    expect({ path, crawled: ROUTES.includes(path) }).toEqual({ path, crawled: false });
+    expect({ path, catalogued: catalog.some((row) => row.path === path) }).toEqual({ path, catalogued: false });
+    expect({ path, route: parseRoute(path).kind }).toEqual({ path, route: 'notFound' });
   }
 });
 
-test('Performance and Atlas remain tabs rather than additional sidebar rows', () => {
+test('the Audit Log is the Operate row and Performance stays a tab behind it', () => {
   const paths = departmentRows('it').map((row) => row.path);
+  expect(paths).toContain('/it/operate/audit');
   expect(paths).not.toContain('/it/operate/perf');
-  expect(paths).not.toContain('/it/operate/atlas');
 });

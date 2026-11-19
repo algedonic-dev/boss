@@ -10,3 +10,5 @@
 id = "automation:sweep-archive-branches-reader"
 role = "audit-readonly"
 description = 'The archive-branch sweep reading the open cars, the open trains and its decision packet before it deletes a branch on the forge (infra/forge/sweep-archive-branches.sh). Reads only.'
+# Host station: forge (backlog 6ecb5480, station-tree.md section 6).
+station = "b8f8a23b-f8da-428f-8df2-731be4ae597a"

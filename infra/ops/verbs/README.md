@@ -350,6 +350,17 @@ only when the step's `decision` — saved before the stamp, so inside the
 signed shape — is exactly `approved`; ops-request routes any other
 decision to `refused` (adversarial re-review of fd7090cc, 2026-09-25).
 
+Before it claims an approved execute, the runner renders the plan again
+and runs nothing unless the signed plan is exactly those bytes. A
+re-render that exits non-zero WITHOUT naming a `plan-sha256` rendered
+nothing, so it is tried again — three attempts in all, the approval
+judged again (window included) after each wait — rather than spending a
+single-use approval on a transient read (backlog 05d7c0b9). A render
+that names a hash is judged on it at once, and a different hash is never
+retried. Every attempt rides the execute step as `rerender_attempts`:
+its exit, the hash it rendered, its time and its whole stderr as a byte
+record.
+
 ## Review verbs — an independent release before the passkey
 
 An approval verb may also declare `"requires_review": true` (backlog

@@ -76,7 +76,8 @@ pub(crate) fn recorded_review_wait(
             ));
         }
     };
-    if protocol.status == crate::registry::WorkflowStatus::Draft {
+    // A rejected row was never published either (backlog 50ded63d).
+    if !protocol.status.was_published() {
         return Err("pinned review protocol was not published".into());
     }
     let hours = protocol
@@ -134,8 +135,22 @@ pub(crate) fn recorded_review_wait(
         })
         .ok_or("review worker has no matching active registered claim")?;
     let receipt = &run.metadata["worker_started"];
+    let expected = &building.metadata[crate::agent_budget::WORKER_START_EXPECTATION];
     let receipt_matches = match receipt.get("schema").and_then(Value::as_u64) {
-        Some(1) => receipt.as_object().is_some_and(|fields| fields.len() == 3),
+        // A whole-START receipt never stands for a bounded START's
+        // (design e72dc7c9): that run asked for the schema-3 statement.
+        Some(1) => {
+            receipt.as_object().is_some_and(|fields| fields.len() == 3)
+                && expected["schema"] != crate::execution_inputs::START_SCHEMA
+        }
+        Some(crate::execution_inputs::START_SCHEMA) => {
+            crate::execution_inputs::start_receipt_matches(
+                expected,
+                receipt,
+                &run.id.to_string(),
+                owner,
+            )
+        }
         Some(2) => crate::agent_budget::observer_start_receipt_matches(
             &building.metadata[crate::agent_budget::WORKER_START_EXPECTATION],
             receipt,
@@ -417,6 +432,7 @@ mod tests {
             reason: "independent review".into(),
             kind: crate::yard::CarHoldKind::Operator,
             release: None,
+            auto_release: None,
         });
         let cars = vec![(car, steps)];
         let runs = vec![(run, vec![building])];

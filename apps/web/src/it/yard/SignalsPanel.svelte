@@ -43,27 +43,27 @@
     font-size: 11px;
     letter-spacing: var(--ls-label);
     text-transform: uppercase;
-    color: var(--static);
+    color: var(--map-ink);
     font-weight: 600;
     display: flex;
     justify-content: space-between;
     gap: var(--s3);
   }
-  .head small { font-weight: 500; letter-spacing: var(--ls-label); color: var(--text-faint); }
+  .head small { font-weight: 500; letter-spacing: var(--ls-label); color: var(--map-muted); }
   .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
   .list { margin-top: var(--s2); display: grid; }
   .sig {
     display: grid; grid-template-columns: 68px 1fr; gap: var(--s3); align-items: baseline;
     font: inherit; font-size: 12.5px; color: inherit; text-align: left; padding: 4px 0;
-    border: 0; border-top: 1px solid var(--hairline); background: transparent; cursor: pointer; border-radius: 0;
+    border: 0; border-top: 1px solid var(--map-rule); background: transparent; cursor: pointer; border-radius: 0;
     min-width: 0;
   }
   .sig span { overflow-wrap: anywhere; }
-  .sig:hover, .sig:focus-visible { background: var(--wash); }
-  .sig time { color: var(--static); }
-  .sig .who { color: var(--signal); }
-  .sig.hand .who { color: var(--warn); }
-  .sig.warn .who { color: var(--warn); }
-  .sig.err .who { color: var(--err); }
-  .empty { color: var(--text-faint); font-size: 12px; padding: 6px 0; }
+  .sig:hover, .sig:focus-visible { background: var(--map-bg); }
+  .sig time { color: var(--map-muted); }
+  .sig .who { color: var(--map-accent); }
+  .sig.hand .who { color: var(--map-warn-ink); }
+  .sig.warn .who { color: var(--map-warn-ink); }
+  .sig.err .who { color: var(--map-bad-ink); }
+  .empty { color: var(--map-muted); font-size: 12px; padding: 6px 0; }
 </style>

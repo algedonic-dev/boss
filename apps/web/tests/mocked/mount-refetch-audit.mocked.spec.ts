@@ -45,17 +45,8 @@ async function failAndCount(page: Page, pattern: RegExp): Promise<() => number> 
 // (backlog 28a60028).
 
 test.describe('a failed mount-time read is not retried without bound', () => {
-  test('bottlenecks reads the Workflow registry once', async ({ page }) => {
-    await installSmokeMocks(page);
-    const reads = await failAndCount(page, /\/api\/workflows$/);
-
-    await mountPage(page, '/it/operate/bottlenecks');
-
-    // onMount, once. The page's 10s poll re-reads the fleet view, not
-    // the registry, so nothing here should climb.
-    expect(await settledReads(page, reads, 1)).toBe(1);
-  });
-
+  // Bottlenecks was pinned here until it went with step 1 of design
+  // 01fa5bdf.
   test('subjects and classes reads the SubjectKind taxonomy once', async ({ page }) => {
     await installSmokeMocks(page);
     const reads = await failAndCount(page, /\/api\/subject-kinds$/);

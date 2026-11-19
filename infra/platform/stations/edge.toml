@@ -1,0 +1,25 @@
+# ---------------------------------------------------------------------------
+# edge — the public edge on boss-gcp (T2 of design 4b27a65a, backlog
+# 3f58c823; handoff section 1, the publish region): the gateway and the
+# public site.
+#
+# A CONTAINER, NOT A QUEUE: the tagged predicate holds no packet (see
+# algedonic.toml). Handoff section 5 gives it all of host:boss-gcp; that
+# is left to the car that measures the box's other tenants, so it
+# allocates nothing yet. To change this station, bump `version`.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "edge"
+version = 1
+status = "active"
+title = "Edge — the gateway and the public site"
+kind = "group"
+discipline = ["priority", "age"]
+id = "20f2b366-553c-4e60-8a21-c532e784f3a2"
+parent = "9660c60f-eb47-4405-ae08-fcbb30c71e5f"
+mode = "standing"
+machines = ["automation:gateway"]
+
+[station.predicate]
+tags_any = ["station:edge"]

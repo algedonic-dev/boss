@@ -61,7 +61,14 @@ pub fn router(state: SensorsApiState) -> Router {
         .route("/api/sensors", get(list))
         .route("/api/sensors/batch", post(publish))
         .route("/api/sensors/sweep", post(sweep))
-        .route("/api/sensors/{id}/readings", get(readings).post(record))
+        .route(
+            "/api/sensors/{id}/readings",
+            get(readings)
+                .post(record)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    super::types::READINGS_HTTP_BODY_LIMIT_BYTES,
+                )),
+        )
         .route(
             "/api/sensors/{id}/readings/{external_id}/packet",
             put(stamp),

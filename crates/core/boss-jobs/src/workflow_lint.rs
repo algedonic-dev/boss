@@ -56,7 +56,10 @@
 //!   completion. Refused naming the field and the resolvable principals
 //!   (backlog 6c9183de, review S4). And a step never defaults a key it
 //!   reserves: the default is the protocol writing it, at admission and
-//!   into a step a re-pin inserts (review S1).
+//!   into a step a re-pin inserts (review S1). A step `executor` naming a
+//!   KIND (`role:`, `model:`, `equipment:` — factory taxonomy M3) is no
+//!   principal: only its shape is judged here, and whether a registry
+//!   declares it is `pools::validate_step_declarations`'.
 //!
 //! Runs at author time (`POST /api/workflows/_validate`), publish
 //! time (every registry path that can set a row ACTIVE — see
@@ -101,9 +104,20 @@ pub fn validate_workflow(spec: &WorkflowSpec, registry: &StepRegistry) -> Vec<Wo
     // Phase 0 — metadata default value shapes.
     for step in &spec.steps {
         check_field_types_are_known(spec, step, &mut errs);
+        if let Some(bill) = &step.resources
+            && let Err(why) = bill.validate()
+        {
+            errs.push(err(spec, &step.title, why));
+        }
         check_metadata_defaults_values(spec, step, registry, &mut errs);
         check_item_keys_name_an_array(spec, step, &mut errs);
         check_covers_names_an_array_on_the_same_step(spec, step, &mut errs);
+        if crate::human_only::declared(&step.metadata_defaults)
+            && let Err(why) =
+                crate::human_presentation::HumanPresentation::read(&step.metadata_defaults)
+        {
+            errs.push(err(spec, &step.title, why));
+        }
     }
     // Phases 1–3 — viability of the predicate graph.
     check_viability(spec, registry, &mut errs);
@@ -1240,13 +1254,27 @@ fn check_writers_are_resolvable(
                 .into(),
         });
     }
-    if let Some(executor) = step.executor.as_deref()
-        && !resolvable.contains(&executor)
+    // An executor KIND (factory taxonomy M3, item 0a78f8f8) is not a
+    // principal: whether a registry declares it is the declaration lint's
+    // (`pools::validate_step_declarations`), and only its SHAPE is judged
+    // here, at every publish — a kind prefix naming nothing is refused.
+    match step
+        .executor
+        .as_deref()
+        .map(|e| (e, crate::step_executor::ExecutorDemand::parse(e)))
     {
-        errs.push(WorkflowLintError {
-            workflow: spec.kind.clone(), step: step.title.clone(),
-            reason: format!("executor `{executor}` is not a principal a deployed credential door resolves; refusing a step no caller could execute"),
-        });
+        Some((_, Err(malformed))) => errs.push(WorkflowLintError {
+            workflow: spec.kind.clone(),
+            step: step.title.clone(),
+            reason: malformed,
+        }),
+        Some((executor, Ok(None))) if !resolvable.contains(&executor) => {
+            errs.push(WorkflowLintError {
+                workflow: spec.kind.clone(), step: step.title.clone(),
+                reason: format!("executor `{executor}` is not a principal a deployed credential door resolves; refusing a step no caller could execute"),
+            });
+        }
+        _ => {}
     }
     for field in &step.fields {
         let Some(writer) = field.writer.as_deref() else {
@@ -1706,6 +1734,36 @@ mod tests {
         assert!(errs[0].reason.contains("f5ebd2e1"), "{}", errs[0].reason);
     }
 
+    #[test]
+    fn human_presentation_is_required_by_the_canonical_declaration() {
+        for flag in [json!(true), json!(" TRUE ")] {
+            let mut spec = viable_spec("human-presentation");
+            spec.steps[1].metadata_defaults = json!({"human_only": flag});
+            let errors = validate_workflow(&spec, &StepRegistry::v1());
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.reason.contains("human_presentation")),
+                "{errors:?}"
+            );
+            let presentation = json!({"ask":"Approve this change", "why_person":"Your authorization is required", "action":"Review and sign", "after":"The change can proceed", "evidence":"current-step"});
+            spec.steps[1].metadata_defaults["human_presentation"] = presentation.clone();
+            assert!(gate_active(&spec).is_ok());
+            for field in ["ask", "why_person", "action", "after", "evidence"] {
+                for invalid in [json!(null), json!("  "), json!(27)] {
+                    spec.steps[1].metadata_defaults["human_presentation"] = presentation.clone();
+                    spec.steps[1].metadata_defaults["human_presentation"][field] = invalid;
+                    assert!(gate_active(&spec).is_err(), "{field}");
+                }
+            }
+            spec.steps[1].metadata_defaults["human_presentation"] = presentation;
+            spec.steps[1].metadata_defaults["human_presentation"]["evidence"] =
+                json!("javascript:alert(1)");
+            assert!(gate_active(&spec).is_err());
+        }
+        assert!(gate_active(&viable_spec("not-declared-human")).is_ok());
+    }
+
     // Phase 8 — an agent block names a priced model and a positive
     // budget (c87fb59b car 1, 028891cf).
     fn with_agent(agent: crate::agent_spec::AgentSpec) -> WorkflowSpec {
@@ -1775,7 +1833,11 @@ mod tests {
     fn an_agent_block_on_a_human_only_step_is_refused() {
         let reg = StepRegistry::v1();
         let mut spec = with_agent(builder());
-        spec.steps[1].metadata_defaults = json!({ "human_only": true });
+        let human = json!({ "human_only": true, "human_presentation": {
+            "ask":"Review this request", "why_person":"Independent authorization",
+            "action":"Review and sign", "after":"Work may proceed", "evidence":"current-step"
+        }});
+        spec.steps[1].metadata_defaults = human.clone();
         let errs = validate_workflow(&spec, &reg);
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].reason.contains("human_only"), "{}", errs[0].reason);
@@ -1785,7 +1847,8 @@ mod tests {
         spec.steps[1].metadata_defaults = json!({ "human_only": false });
         assert!(validate_workflow(&spec, &reg).is_empty());
         // Both spellings the live registry carries.
-        spec.steps[1].metadata_defaults = json!({ "human_only": "true" });
+        spec.steps[1].metadata_defaults = human;
+        spec.steps[1].metadata_defaults["human_only"] = json!("true");
         assert_eq!(validate_workflow(&spec, &reg).len(), 1);
     }
 
@@ -2017,6 +2080,38 @@ mod tests {
                 .any(|e| e.reason.contains("never a metadata default")),
             "{errs:?}"
         );
+    }
+
+    /// Factory taxonomy M3 (item 0a78f8f8): `executor` also names an
+    /// executor KIND — `role:`, `model:` or `equipment:` — and such a
+    /// declaration is not a credential principal, so the resolvable
+    /// list does not judge it (the declaration lint in `pools` does,
+    /// against the registries that declare each). A kind prefix with
+    /// nothing after it is refused here, at every publish, because no
+    /// registry could ever declare it.
+    #[test]
+    fn an_executor_kind_is_not_judged_as_a_credential_principal() {
+        let reg = StepRegistry::v1();
+        for declared in ["role:platform-admin", "model:opus", "equipment:gates"] {
+            let mut spec = viable_spec("execute");
+            spec.steps[1].executor = Some(declared.into());
+            let errs = validate_workflow(&spec, &reg);
+            assert!(errs.is_empty(), "{declared}: {errs:?}");
+        }
+        for malformed in ["role:", "model: opus", "equipment:"] {
+            let mut spec = viable_spec("execute");
+            spec.steps[1].executor = Some(malformed.into());
+            let errs = validate_workflow(&spec, &reg);
+            assert!(
+                errs.iter()
+                    .any(|e| e.step == "finish" && e.reason.contains(malformed)),
+                "{malformed:?}: {errs:?}"
+            );
+        }
+        // A principal is still a principal: a typo of one stays refused.
+        let mut spec = viable_spec("execute");
+        spec.steps[1].executor = Some("runner:osp".into());
+        assert!(!validate_workflow(&spec, &reg).is_empty());
     }
 
     /// `covers` must relate two array fields on the same step; each way

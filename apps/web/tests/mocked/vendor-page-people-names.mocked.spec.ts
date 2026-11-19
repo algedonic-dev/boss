@@ -1,4 +1,4 @@
-// /ux/vendors/{id} — naming the employees on a vendor's page.
+// /finance/vendors/{id} — naming the employees on a vendor's page.
 //
 // Backlog 1e73bd93 (the last car). The vendor page read the WHOLE
 // employee roster beside its vendor, orders and invoices reads to name
@@ -15,7 +15,7 @@ import { installSmokeMocks } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
 
 const VID = 'vnd-hops-001';
-const PATH = `/ux/vendors/${VID}`;
+const PATH = `/finance/vendors/${VID}`;
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
@@ -82,13 +82,13 @@ async function install(page: Page, signer: (r: Route) => Promise<void>): Promise
 const section = (page: Page, title: RegExp) =>
   page.locator('section', { has: page.getByRole('heading', { name: title }) });
 
-test.describe('/ux/vendors/{id} — naming the employees shown', () => {
+test.describe('/finance/vendors/{id} — naming the employees shown', () => {
   test('answered, each employee is named from their own row, a rule is never looked up, and nothing says a read failed', async ({ page }) => {
     const asked = await install(page, (r) => json(r, { id: 'emp-cfo-2', name: 'Iris Vale' }));
     await mountPage(page, PATH);
 
-    await expect(section(page, /^Account team/).getByRole('link', { name: 'Ben Lusk' })).toBeVisible();
-    await expect(section(page, /^Active contracts/).getByRole('link', { name: 'Iris Vale' })).toBeVisible();
+    await expect(section(page, /^Account team/).locator('[data-pageless="employee"]', { hasText: 'Ben Lusk' })).toBeVisible();
+    await expect(section(page, /^Active contracts/).locator('[data-pageless="employee"]', { hasText: 'Iris Vale' })).toBeVisible();
     await expect(section(page, /^Interactions/)).toContainText('by Ben Lusk');
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
     expect([...new Set(asked)].sort()).toEqual(['/api/people/emp-buyer-1', '/api/people/emp-cfo-2']);
@@ -98,8 +98,8 @@ test.describe('/ux/vendors/{id} — naming the employees shown', () => {
     await install(page, (r) => json(r, { error: 'people down' }, 503));
     await mountPage(page, PATH);
 
-    await expect(section(page, /^Active contracts/).getByRole('link', { name: 'emp-cfo-2' })).toBeVisible();
-    await expect(section(page, /^Account team/).getByRole('link', { name: 'Ben Lusk' })).toBeVisible();
+    await expect(section(page, /^Active contracts/).locator('[data-pageless="employee"]', { hasText: 'emp-cfo-2' })).toBeVisible();
+    await expect(section(page, /^Account team/).locator('[data-pageless="employee"]', { hasText: 'Ben Lusk' })).toBeVisible();
     await expect(page.locator(`${FAILURE_MARKER}[role=alert]`)).toHaveText(
       "Couldn't load people — /api/people/emp-cfo-2: HTTP 503. Employees below show as ids rather than names.",
     );

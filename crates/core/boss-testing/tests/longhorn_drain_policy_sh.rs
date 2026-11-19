@@ -411,20 +411,37 @@ fn the_plan_names_the_value_the_options_and_the_volumes_the_policy_decides_for()
         "test that value is still block-if-contains-last-replica, replace it with allow-if-replica-is-stopped",
         "is NOT Longhorn's default",
         "check-longhorn-drain-policy",
-        "== longhorn volumes whose only healthy replica is on a worker (2) ==",
-        &format!(
-            "volume {WORK_VOL} (pvc boss-dev/boss-dev-work): only healthy replica on worker w-1"
-        ),
-        &format!(
-            "volume {GATE_VOL} (pvc boss-gate/gate-runner-disk): only healthy replica on worker w-1"
-        ),
+        "volumes: the volumes whose only healthy replica is on a worker are listed beside this plan, live and not signed; the write reads them again and lists them before it patches",
     ] {
         assert!(plan.contains(want), "the plan says {want:?}:\n{plan}");
     }
+    // The volumes the policy decides for ride stderr, live and NOT signed
+    // (backlog 6fa13f0f): every builder's dev-build volume is one of them,
+    // so a list in the signed bytes moved with every builder that started
+    // or ended, and two signed restores were refused at run on 2026-11-11.
+    let o = l.run(&["--plan", RELAXED], &[]);
+    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+    for want in [
+        "live, not signed: 2 longhorn volume(s) whose only healthy replica is on a worker",
+        &format!(
+            "volume {WORK_VOL} (pvc boss-dev/boss-dev-work, live state attached): only healthy replica on worker w-1"
+        ),
+        &format!(
+            "volume {GATE_VOL} (pvc boss-gate/gate-runner-disk, live state detached): only healthy replica on worker w-1"
+        ),
+    ] {
+        assert!(stderr.contains(want), "stderr says {want:?}:\n{stderr}");
+    }
+    for v in [WORK_VOL, GATE_VOL, BOTH_VOL, CP_VOL] {
+        assert!(
+            !plan.contains(v),
+            "no volume is in the signed bytes — {v}:\n{plan}"
+        );
+    }
     for not in [BOTH_VOL, CP_VOL] {
         assert!(
-            !plan.contains(not),
-            "a volume with a healthy replica off the worker is not one the policy decides for: {plan}"
+            !stderr.contains(not),
+            "a volume with a healthy replica off the worker is not one the policy decides for: {stderr}"
         );
     }
     assert_eq!(hash.len(), 64, "{hash}");
@@ -584,27 +601,130 @@ fn the_write_runs_only_the_signed_plan_there_and_back() {
 }
 
 #[test]
-fn the_write_refuses_a_hash_that_is_not_todays_plan() {
-    let l = Longhorn::new("ldp-drift");
-    let (_, hash) = l.plan(RELAXED);
-    // A volume's last replica moved to the worker after the plan was
-    // signed: the plan the passkey saw no longer describes the cluster.
+fn a_replica_that_moves_while_the_plan_waits_for_its_passkey_does_not_refuse_the_run() {
+    // Backlog 6fa13f0f, measured 2026-11-11: the restore to the default
+    // was signed twice and refused at run twice, because w-2 rejoined,
+    // replicas rebuilt and builders' dev-build volumes came and went from
+    // the list the plan hashed. The act is a test-and-replace of ONE
+    // setting; which volumes have their last replica on a worker is read
+    // again when the write runs and listed there, never frozen into the
+    // signature.
+    let l = Longhorn::new("ldp-replica-moves");
+    let (plan, hash) = l.plan(RELAXED);
+    // After the signing: the gate disk's replica rebuilt onto a control
+    // plane, the shared volume lost its copy off the worker, and a new
+    // dev-build volume appeared with its only replica on w-1.
+    const DEV_BUILD_VOL: &str = "pvc-0d0d0d0d-4444-4555-8666-977788889999";
     l.state(
         "replicas.json",
         &json!([
             replica(WORK_VOL, "work-r-1", "w-1", true, false),
-            replica(GATE_VOL, "gate-r-1", "w-1", true, false),
+            replica(GATE_VOL, "gate-r-2", "cp-3", true, false),
             replica(BOTH_VOL, "both-r-1", "w-1", true, false),
+            replica(DEV_BUILD_VOL, "dev-build-r-1", "w-1", true, false),
         ]),
+    );
+    let mut vols: Vec<Value> = serde_json::from_str(
+        &std::fs::read_to_string(l.dir.join("state/volumes.json")).expect("volumes"),
+    )
+    .expect("json");
+    vols.push(volume(
+        DEV_BUILD_VOL,
+        Some(("boss-dev", "dev-build-agent-x")),
+        "attached",
+    ));
+    l.state("volumes.json", &json!(vols));
+    assert_eq!(
+        l.plan(RELAXED),
+        (plan, hash.clone()),
+        "a replica move is not a change to what the write acts on"
+    );
+
+    let o = l.run(&[RELAXED, &hash], &[]);
+    let out = text(&o);
+    assert!(o.status.success(), "the signed plan still runs: {out}");
+    assert_eq!(l.value_now(), RELAXED);
+    assert_eq!(effect_lines(&out).len(), 1, "{out}");
+    // The run reads the volumes again and lists what it found AT THE RUN,
+    // before the patch, in the record the execute step keeps.
+    let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+    let listed = stdout
+        .find("read at this run, not signed: 3 longhorn volume(s) whose only healthy replica is on a worker")
+        .unwrap_or_else(|| panic!("the run lists the live volumes: {out}"));
+    let patched = stdout
+        .find("Longhorn accepted")
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(listed < patched, "listed before it patches: {stdout}");
+    for want in [
+        format!(
+            "volume {DEV_BUILD_VOL} (pvc boss-dev/dev-build-agent-x, live state attached): only healthy replica on worker w-1"
+        ),
+        format!(
+            "volume {WORK_VOL} (pvc boss-dev/boss-dev-work, live state attached): only healthy replica on worker w-1"
+        ),
+        format!(
+            "volume {BOTH_VOL} (pvc boss/postgres, live state attached): only healthy replica on worker w-1"
+        ),
+    ] {
+        assert!(stdout.contains(&want), "{want:?}:\n{stdout}");
+    }
+    assert!(
+        !stdout.contains(GATE_VOL),
+        "its last replica left the worker after the signing: {stdout}"
+    );
+}
+
+#[test]
+fn the_write_refuses_when_what_it_acts_on_moved_since_the_signing() {
+    let l = Longhorn::new("ldp-drift");
+    let (_, hash) = l.plan(RELAXED);
+
+    // Another hand: a hash that is no plan, and a value the plan did not
+    // sign (the target is in the bytes).
+    let o = l.run(&[RELAXED, &"0".repeat(64)], &[]);
+    assert_eq!(o.status.code(), Some(78), "{}", text(&o));
+    let o = l.run(&["always-allow", &hash], &[]);
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(78), "the target is signed: {out}");
+    assert!(out.contains(&hash), "names the approved hash: {out}");
+
+    // Longhorn's definition moved: an option dropped, so the options the
+    // passkey saw are not the ones that stand.
+    let mut def = definition(false);
+    def["definition"]["options"] = json!([DEFAULT, RELAXED]);
+    l.state("def.json", &def);
+    let o = l.run(&[RELAXED, &hash], &[]);
+    assert_eq!(o.status.code(), Some(78), "{}", text(&o));
+    l.state("def.json", &definition(false));
+
+    // The value that stands moved under the plan: what it was is signed,
+    // and the compare-and-set would test the wrong one.
+    l.state(
+        "setting.json",
+        &setting("always-allow", Some("2026-11-11T20:00:00Z")),
     );
     let o = l.run(&[RELAXED, &hash], &[]);
     let out = text(&o);
-    assert_eq!(o.status.code(), Some(78), "{out}");
-    assert!(out.contains(&hash), "names the approved hash: {out}");
-    let o = l.run(&[RELAXED, &"0".repeat(64)], &[]);
-    assert_eq!(o.status.code(), Some(78), "{}", text(&o));
+    assert_eq!(
+        o.status.code(),
+        Some(78),
+        "the value before is signed: {out}"
+    );
+    assert!(
+        out.contains("value: always-allow -> allow-if-replica-is-stopped"),
+        "{out}"
+    );
     assert!(l.patches().is_empty(), "{:?}", l.calls());
-    assert_eq!(l.value_now(), DEFAULT);
+    assert_eq!(l.value_now(), "always-allow");
+
+    // The verb's identity is the plan's first signed line.
+    l.state(
+        "setting.json",
+        &setting(DEFAULT, Some("2026-08-01T00:00:00Z")),
+    );
+    let (plan, again) = l.plan(RELAXED);
+    assert_eq!(again, hash);
+    assert_eq!(plan.lines().next(), Some("plan: set-longhorn-drain-policy"));
 }
 
 #[test]

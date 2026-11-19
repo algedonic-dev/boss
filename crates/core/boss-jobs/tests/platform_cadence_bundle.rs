@@ -227,6 +227,8 @@ regate_hold_minutes = 15
 /// THE DOCK'S REFRESH RULE (design 42279fb2, backlog 4890165b): the dock
 /// refreshes on a wall clock of its own, short enough to relaunch
 /// re-gates between departures rather than once per departure window.
+/// Five minutes is the ceiling since v3 (2026-11-13): at two, a ten-car
+/// dock pass ran 123-133 s and starved the board of the train lock.
 #[test]
 fn the_dock_refreshes_on_its_own_clock() {
     let rules = bundle();
@@ -244,7 +246,7 @@ fn the_dock_refreshes_on_its_own_clock() {
         refresh
             .row
             .every_minutes
-            .is_some_and(|m| (1..5).contains(&m)),
+            .is_some_and(|m| (1..=5).contains(&m)),
         "the refresh re-asks within a few minutes, not once per departure window: {:?}",
         refresh.row.every_minutes
     );

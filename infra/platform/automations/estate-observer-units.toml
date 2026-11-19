@@ -5,3 +5,5 @@
 id = "automation:estate-observer-units"
 role = "platform-admin"
 description = 'Observes the systemd units on each estate host and records them (infra/estate/observe-units.sh).'
+# Host station: estate (backlog 6ecb5480, station-tree.md section 6).
+station = "134464a5-0b56-4386-86cb-d354c7448fdf"

@@ -54,6 +54,22 @@ use crate::session::{self, Session};
 const STATE_COOKIE: &str = "boss_oidc_state";
 const STATE_TTL_SECONDS: u64 = 300;
 
+/// The page the visitor was sent to sign in FROM, carried through the
+/// IdP round trip beside the state cookie (backlog 7d70cad6, David
+/// 2026-11-16). Without it the callback landed every sign-in on `/`,
+/// so the `?next=` a dead session put on /login was lost at the one
+/// button David signs in with. The value is percent-encoded here and
+/// only ever re-emitted inside `/login?next=`, where LoginPage's
+/// `safeSitePath` judges it — the gateway never redirects to it.
+///
+/// The value is `<attempt's csrf state>.<percent-encoded page>`, and the
+/// callback applies it only when that prefix is the state its own signed
+/// cookie carries (Codex's review B1, run ae9c6cf3): an unbound
+/// breadcrumb outlived an abandoned sign-in, and a fresh attempt from
+/// /login with no page returned to the abandoned one. A start with no
+/// page also expires the cookie, so none is left lying in the jar.
+const NEXT_COOKIE: &str = "boss_oidc_next";
+
 pub struct OidcConfig {
     pub issuer: String,
     pub client_id: String,
@@ -138,11 +154,20 @@ fn pkce_pair() -> (String, String) {
     (verifier, challenge)
 }
 
-/// `state.verifier.mac` — the MAC (keyed with the session key) binds
-/// the pair so a tampered cookie fails closed rather than letting a
-/// caller supply their own verifier.
-fn encode_state_cookie(key: &[u8], state: &str, verifier: &str) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac accepts any key length");
+/// `state.verifier.mac` — the MAC binds the pair so a tampered cookie
+/// fails closed rather than letting a caller supply their own verifier.
+/// It is keyed with the state cookie's OWN key, derived from the session
+/// key under `boss_core::presence::OIDC_STATE_KEY_LABEL`, never the
+/// session key itself (backlog 19f00800, design c22f36c6 item 2): that
+/// key also signs session cookies, and a MAC under it is one no other
+/// purpose may share. A sign-in in flight at the deploy restarts.
+fn state_key(session_key: &[u8]) -> Option<Vec<u8>> {
+    boss_core::presence::derived_key(session_key, boss_core::presence::OIDC_STATE_KEY_LABEL)
+}
+
+fn encode_state_cookie(session_key: &[u8], state: &str, verifier: &str) -> String {
+    let key = state_key(session_key).expect("HKDF-SHA256 yields a 32-byte key");
+    let mut mac = Hmac::<Sha256>::new_from_slice(&key).expect("hmac accepts any key length");
     mac.update(state.as_bytes());
     mac.update(b".");
     mac.update(verifier.as_bytes());
@@ -150,12 +175,12 @@ fn encode_state_cookie(key: &[u8], state: &str, verifier: &str) -> String {
     format!("{state}.{verifier}.{tag}")
 }
 
-fn decode_state_cookie(key: &[u8], value: &str) -> Option<(String, String)> {
+fn decode_state_cookie(session_key: &[u8], value: &str) -> Option<(String, String)> {
     let mut parts = value.splitn(3, '.');
     let state = parts.next()?;
     let verifier = parts.next()?;
     let tag = parts.next()?;
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).ok()?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&state_key(session_key)?).ok()?;
     mac.update(state.as_bytes());
     mac.update(b".");
     mac.update(verifier.as_bytes());
@@ -183,9 +208,46 @@ pub async fn available(State(state): State<Arc<LocalAuthState>>) -> Response {
     Json(serde_json::json!({ "enabled": state.oidc.is_some() })).into_response()
 }
 
+#[derive(Deserialize)]
+pub struct LoginQuery {
+    /// The page to return to after sign-in, as LoginPage read it off
+    /// its own `?next=`.
+    pub next: Option<String>,
+}
+
+/// Where the callback sends a browser that has just signed in: back
+/// through `/login?next=<page>` when the login carried a page, else
+/// `/`. The page is used only if the cookie is bound to `attempt` — the
+/// csrf state of the sign-in this callback completes — and only if it is
+/// wholly the percent-encoded alphabet `urlencode` writes, so a cookie
+/// the gateway did not write can neither add a parameter nor leave the
+/// query, and one another attempt wrote never applies.
+fn landing_after_sign_in(headers: &HeaderMap, attempt: &str) -> String {
+    let raw = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| session::find_cookie(c, NEXT_COOKIE))
+        .and_then(|c| c.split_once('.'))
+        .and_then(|(bound, page)| (bound == attempt).then_some(page));
+    match raw {
+        Some(v)
+            if !v.is_empty()
+                && v.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'%')
+                }) =>
+        {
+            format!("/login?next={v}")
+        }
+        _ => "/".to_string(),
+    }
+}
+
 /// `GET /api/auth/oidc/login` — mint state + PKCE, set the signed
-/// cookie, redirect to the IdP.
-pub async fn login(State(state): State<Arc<LocalAuthState>>) -> Response {
+/// cookie, redirect to the IdP. A `?next=` rides its own cookie.
+pub async fn login(
+    State(state): State<Arc<LocalAuthState>>,
+    Query(q): Query<LoginQuery>,
+) -> Response {
     let Some(oidc) = &state.oidc else {
         return (StatusCode::NOT_FOUND, "OIDC is not configured").into_response();
     };
@@ -223,7 +285,22 @@ pub async fn login(State(state): State<Arc<LocalAuthState>>) -> Response {
     );
     let mut headers = HeaderMap::new();
     if let Ok(v) = HeaderValue::from_str(&cookie) {
-        headers.insert(header::SET_COOKIE, v);
+        headers.append(header::SET_COOKIE, v);
+    }
+    // Every start writes the breadcrumb: bound to THIS attempt's state
+    // when it carries a page, expired when it does not (review B1). The
+    // csrf is URL-safe base64, which has no `.`, so the first `.` ends it.
+    let carried = match q.next.as_deref().filter(|n| !n.is_empty()) {
+        Some(next) => session::set_cookie(
+            NEXT_COOKIE,
+            &format!("{csrf}.{}", urlencode(next)),
+            STATE_TTL_SECONDS,
+            "/api/auth/oidc",
+        ),
+        None => session::set_cookie(NEXT_COOKIE, "", 0, "/api/auth/oidc"),
+    };
+    if let Ok(v) = HeaderValue::from_str(&carried) {
+        headers.append(header::SET_COOKIE, v);
     }
     if let Ok(v) = HeaderValue::from_str(&authorize) {
         headers.insert(header::LOCATION, v);
@@ -402,6 +479,7 @@ pub async fn callback(
     // hardware key mints that role (backlog 8f45e0b4).
     let role = match crate::local_auth::session_role(
         &state.audit,
+        state.classes_timeout,
         crate::audit::AuthMethod::Oidc,
         Some(&oidc.config.issuer),
         &email,
@@ -432,16 +510,20 @@ pub async fn callback(
         session::DEFAULT_TTL_SECONDS,
         "/",
     );
-    // Expire the state cookie — it did its one job.
+    // Expire the state cookie — it did its one job — and the page it
+    // carried, which is spent once read.
+    let landing = landing_after_sign_in(&headers, &cookie_state);
     let clear_state = session::set_cookie(STATE_COOKIE, "", 0, "/api/auth/oidc");
+    let clear_next = session::set_cookie(NEXT_COOKIE, "", 0, "/api/auth/oidc");
     let mut out = HeaderMap::new();
-    if let Ok(v) = HeaderValue::from_str(&session_cookie) {
-        out.append(header::SET_COOKIE, v);
+    for cookie in [&session_cookie, &clear_state, &clear_next] {
+        if let Ok(v) = HeaderValue::from_str(cookie) {
+            out.append(header::SET_COOKIE, v);
+        }
     }
-    if let Ok(v) = HeaderValue::from_str(&clear_state) {
-        out.append(header::SET_COOKIE, v);
-    }
-    out.insert(header::LOCATION, HeaderValue::from_static("/"));
+    let location =
+        HeaderValue::from_str(&landing).unwrap_or_else(|_| HeaderValue::from_static("/"));
+    out.insert(header::LOCATION, location);
     (StatusCode::FOUND, out).into_response()
 }
 
@@ -486,6 +568,23 @@ mod tests {
         assert_eq!(decode_state_cookie(key, &forged), None);
         // Wrong key: also refused.
         assert_eq!(decode_state_cookie(b"other-key", &cookie), None);
+    }
+
+    /// The third format the session key signed (backlog 19f00800, design
+    /// c22f36c6 item 2): the state cookie's tag is NOT an HMAC under the
+    /// session key itself, and a pair MAC'd with the bare session key —
+    /// what the old codec wrote, and what anything else signing
+    /// `state.verifier` under that key would produce — is refused.
+    #[test]
+    fn a_state_cookie_is_not_signed_with_the_bare_session_key() {
+        let key = [9u8; 32];
+        let bare = {
+            let mut mac = Hmac::<Sha256>::new_from_slice(&key).unwrap();
+            mac.update(b"st-1.ver-1");
+            format!("st-1.ver-1.{}", B64.encode(mac.finalize().into_bytes()))
+        };
+        assert_ne!(encode_state_cookie(&key, "st-1", "ver-1"), bare);
+        assert_eq!(decode_state_cookie(&key, &bare), None);
     }
 
     // ----------------------------------------------------------------
@@ -725,6 +824,7 @@ mod tests {
             http: reqwest::Client::new(),
             machine: crate::machine_client::MachineClient::unstamped(reqwest::Client::builder())
                 .unwrap(),
+            classes_timeout: crate::login_doubles::UPSTREAM_TIMEOUT,
             audit,
             guest_access: crate::local_auth::GuestAccess::Off,
             oidc: Some(OidcRuntime::new(OidcConfig {
@@ -955,5 +1055,303 @@ mod tests {
         };
         // from_env applies the same emptiness rule; pin the intent.
         assert!(missing.issuer.is_empty());
+    }
+
+    // ----------------------------------------------------------------
+    // The page survives the IdP round trip (backlog 7d70cad6, David
+    // 2026-11-16). A dead session sent him to /login?next=<page>, and
+    // the passkey button — his sign-in — went to the IdP without it and
+    // came back to `/`. So every redirect that carried the breadcrumb
+    // ended at the root page anyway.
+    // ----------------------------------------------------------------
+
+    fn set_cookies(resp: &Response) -> Vec<String> {
+        resp.headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_sign_in_carries_next_through_the_idp() {
+        let idp = mock_idp().await;
+        let st = oidc_state(&idp);
+        let resp = login(
+            State(st.clone()),
+            Query(LoginQuery {
+                next: Some("/ux/jobs/abc?tab=steps".into()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let cookies = set_cookies(&resp);
+        let next = cookies
+            .iter()
+            .find(|c| c.starts_with(&format!("{NEXT_COOKIE}=")))
+            .unwrap_or_else(|| panic!("the page rides a cookie: {cookies:?}"));
+        // Bound to this attempt's signed csrf state (review B1).
+        let signed = cookies
+            .iter()
+            .find_map(|c| c.strip_prefix(&format!("{STATE_COOKIE}=")))
+            .and_then(|c| c.split(';').next())
+            .expect("the state cookie");
+        let (csrf, _) = decode_state_cookie(&st.session_key, signed).expect("signed state");
+        assert!(
+            next.starts_with(&format!(
+                "{NEXT_COOKIE}={csrf}.%2Fux%2Fjobs%2Fabc%3Ftab%3Dsteps;"
+            )),
+            "{next}"
+        );
+        // Scoped to the callback, like the state it travels beside.
+        assert!(next.contains("Path=/api/auth/oidc"), "{next}");
+    }
+
+    /// A start with no page leaves no breadcrumb in the jar: it expires
+    /// whatever an earlier, abandoned attempt set (review B1). An empty
+    /// `next` is no page too.
+    #[tokio::test]
+    async fn a_sign_in_without_next_expires_any_next_cookie() {
+        let idp = mock_idp().await;
+        for next in [None, Some(String::new())] {
+            let resp = login(State(oidc_state(&idp)), Query(LoginQuery { next })).await;
+            assert_eq!(resp.status(), StatusCode::FOUND);
+            let cookies = set_cookies(&resp);
+            assert!(
+                cookies
+                    .iter()
+                    .any(|c| c.starts_with(&format!("{NEXT_COOKIE}=;")) && c.contains("Max-Age=0")),
+                "{cookies:?}"
+            );
+        }
+    }
+
+    /// Where the callback sends a browser that has just signed in. The
+    /// page goes back through `/login?next=`, so LoginPage's
+    /// `safeSitePath` — the ONE judge of what `next` may name — judges
+    /// it; the gateway never redirects off its own sign-in page.
+    #[test]
+    fn the_callback_lands_on_sign_in_with_the_page_or_on_root() {
+        let with = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(
+                header::COOKIE,
+                HeaderValue::from_str(&format!("{STATE_COOKIE}=s.v.t; {NEXT_COOKIE}={v}")).unwrap(),
+            );
+            h
+        };
+        assert_eq!(
+            landing_after_sign_in(&with("st.%2Fux%2Fjobs%2Fabc%3Ftab%3Dsteps"), "st"),
+            "/login?next=%2Fux%2Fjobs%2Fabc%3Ftab%3Dsteps"
+        );
+        // A page with a dot in it survives: only the first `.` binds.
+        assert_eq!(
+            landing_after_sign_in(&with("st.%2Fdocs%2Fa.b"), "st"),
+            "/login?next=%2Fdocs%2Fa.b"
+        );
+        // No breadcrumb: home, as before.
+        assert_eq!(landing_after_sign_in(&HeaderMap::new(), "st"), "/");
+        // A breadcrumb another attempt wrote, or one bound to nothing,
+        // never applies (review B1).
+        for unbound in ["other.%2Fux%2Fjobs%2Fabc", "%2Fux%2Fjobs%2Fabc", ".%2Fux"] {
+            assert_eq!(
+                landing_after_sign_in(&with(unbound), "st"),
+                "/",
+                "{unbound:?}"
+            );
+        }
+        // A cookie the gateway did not write — anything outside the
+        // percent-encoded alphabet — is ignored, never echoed into the
+        // Location: it cannot add a parameter or break out of the query.
+        for forged in ["/evil", "a&b=c", "x#y", "", "%2F%2Fevil.example\""] {
+            assert_eq!(
+                landing_after_sign_in(&with(&format!("st.{forged}")), "st"),
+                "/",
+                "{forged:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_callback_returns_to_the_page_and_clears_the_breadcrumb() {
+        let mut env = UpstreamEnv::lock().await;
+        let idp = mock_idp().await;
+        let people = mock_people().await;
+        env.set(PEOPLE_VAR, &people);
+        let st = oidc_state(&idp);
+        let cookie = encode_state_cookie(&st.session_key, "st-n", "ver-n");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{STATE_COOKIE}={cookie}; {NEXT_COOKIE}=st-n.%2Fux%2Fjobs%2Fabc"
+            ))
+            .unwrap(),
+        );
+        let resp = callback(
+            State(st.clone()),
+            Query(CallbackQuery {
+                code: Some("code-n".into()),
+                state: Some("st-n".into()),
+                error: None,
+            }),
+            headers,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(
+            resp.headers()[header::LOCATION],
+            "/login?next=%2Fux%2Fjobs%2Fabc"
+        );
+        let cookies = set_cookies(&resp);
+        assert!(
+            cookies
+                .iter()
+                .any(|c| c.starts_with(&format!("{NEXT_COOKIE}=;")) && c.contains("Max-Age=0")),
+            "the breadcrumb is spent: {cookies:?}"
+        );
+    }
+
+    /// A browser's cookie jar, as far as these two cookies go: both
+    /// share `Path=/api/auth/oidc`, so name alone keys them, and a
+    /// `Max-Age=0` Set-Cookie removes the name.
+    fn apply_set_cookies(jar: &mut std::collections::BTreeMap<String, String>, resp: &Response) {
+        for c in set_cookies(resp) {
+            let pair = c.split(';').next().unwrap_or_default();
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+            if c.contains("Max-Age=0") {
+                jar.remove(name);
+            } else {
+                jar.insert(name.to_string(), value.to_string());
+            }
+        }
+    }
+
+    fn jar_header(jar: &std::collections::BTreeMap<String, String>) -> HeaderMap {
+        let line = jar
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut h = HeaderMap::new();
+        h.insert(header::COOKIE, HeaderValue::from_str(&line).unwrap());
+        h
+    }
+
+    /// Codex's review B1 on car 2916e54c (run ae9c6cf3): a sign-in
+    /// started from a page and abandoned at the IdP left its breadcrumb
+    /// behind, and a FRESH sign-in started from /login with no page
+    /// inherited it — the second attempt's valid callback sent the
+    /// person to the abandoned page instead of home. Two real login
+    /// calls through a browser-shaped jar, then the real callback for
+    /// the second attempt's own signed state.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fresh_sign_in_without_next_does_not_inherit_an_abandoned_page() {
+        let mut env = UpstreamEnv::lock().await;
+        let idp = mock_idp().await;
+        let people = mock_people().await;
+        env.set(PEOPLE_VAR, &people);
+        let st = oidc_state(&idp);
+        let mut jar = std::collections::BTreeMap::new();
+
+        // Attempt one: from a page, abandoned at the IdP.
+        let first = login(
+            State(st.clone()),
+            Query(LoginQuery {
+                next: Some("/ux/jobs/abandoned?tab=steps".into()),
+            }),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::FOUND);
+        apply_set_cookies(&mut jar, &first);
+        // Attempt two: from /login with no page, inside the TTL.
+        let second = login(State(st.clone()), Query(LoginQuery { next: None })).await;
+        assert_eq!(second.status(), StatusCode::FOUND);
+        apply_set_cookies(&mut jar, &second);
+
+        let (csrf, _) = decode_state_cookie(&st.session_key, &jar[STATE_COOKIE])
+            .expect("the second attempt's signed state");
+        let resp = callback(
+            State(st.clone()),
+            Query(CallbackQuery {
+                code: Some("code-2".into()),
+                state: Some(csrf),
+                error: None,
+            }),
+            jar_header(&jar),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(resp.headers()[header::LOCATION], "/");
+    }
+
+    /// The second lock on B1, independent of the expiry: a jar that
+    /// still holds the abandoned attempt's breadcrumb (its expiry never
+    /// arrived) completes the fresh attempt at home, because the
+    /// breadcrumb is bound to the other attempt's state.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_breadcrumb_bound_to_another_attempt_is_never_applied() {
+        let mut env = UpstreamEnv::lock().await;
+        let idp = mock_idp().await;
+        let people = mock_people().await;
+        env.set(PEOPLE_VAR, &people);
+        let st = oidc_state(&idp);
+        let mut jar = std::collections::BTreeMap::new();
+
+        let first = login(
+            State(st.clone()),
+            Query(LoginQuery {
+                next: Some("/ux/jobs/abandoned".into()),
+            }),
+        )
+        .await;
+        apply_set_cookies(&mut jar, &first);
+        let stale = jar[NEXT_COOKIE].clone();
+        let second = login(State(st.clone()), Query(LoginQuery { next: None })).await;
+        apply_set_cookies(&mut jar, &second);
+        jar.insert(NEXT_COOKIE.to_string(), stale);
+
+        let (csrf, _) = decode_state_cookie(&st.session_key, &jar[STATE_COOKIE])
+            .expect("the second attempt's signed state");
+        let resp = callback(
+            State(st.clone()),
+            Query(CallbackQuery {
+                code: Some("code-3".into()),
+                state: Some(csrf),
+                error: None,
+            }),
+            jar_header(&jar),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(resp.headers()[header::LOCATION], "/");
+
+        // And the fresh attempt that DOES carry a page returns to it.
+        let third = login(
+            State(st.clone()),
+            Query(LoginQuery {
+                next: Some("/ux/jobs/fresh".into()),
+            }),
+        )
+        .await;
+        apply_set_cookies(&mut jar, &third);
+        let (csrf, _) = decode_state_cookie(&st.session_key, &jar[STATE_COOKIE])
+            .expect("the third attempt's signed state");
+        let resp = callback(
+            State(st),
+            Query(CallbackQuery {
+                code: Some("code-4".into()),
+                state: Some(csrf),
+                error: None,
+            }),
+            jar_header(&jar),
+        )
+        .await;
+        assert_eq!(
+            resp.headers()[header::LOCATION],
+            "/login?next=%2Fux%2Fjobs%2Ffresh"
+        );
     }
 }

@@ -84,21 +84,17 @@
     debounce = setTimeout(() => void run(q), 180);
   }
 
-  function pathFor(kind: string, id: string): string {
-    // Subject kinds the SPA has a detail route for. Anything else
-    // falls back to a jobs-filtered view, which is always meaningful:
-    // every Subject can at least answer "what work is about me".
+  function pathFor(kind: string, id: string): string | null {
+    // Subject kinds the SPA has a page for; any other is a row of text.
+    // Every other kind fell back to its packets on the jobs list until
+    // that list went with step 1 of design 01fa5bdf (review df7aeb9c),
+    // as the account, employee, product and asset pages had; the job
+    // rows below still open each packet, and Enter opens the full
+    // results, which list a subject's work.
     const direct: Record<string, string> = {
-      account: `/ux/accounts/${id}`,
-      vendor: `/ux/vendors/${id}`,
-      employee: `/ux/people/${id}`,
-      product: `/ux/products/${id}`,
-      asset: `/ux/assets/${id}`,
+      vendor: `/finance/vendors/${encodeURIComponent(id)}`,
     };
-    return (
-      direct[kind] ??
-      `/ux/jobs?subject_kind=${encodeURIComponent(kind)}&subject_id=${encodeURIComponent(id)}`
-    );
+    return direct[kind] ?? null;
   }
 
   function close(): void {
@@ -146,7 +142,8 @@
         <div class="gs-msg">No matches for “{q}”.</div>
       {:else if results}
         {#each results.subjects.slice(0, 5) as s (s.subject_kind + s.subject_id)}
-          <a class="gs-row" href={safeLinkHref(href(pathFor(s.subject_kind, s.subject_id)))} onclick={close}>
+          {@const to = pathFor(s.subject_kind, s.subject_id)}
+          {#snippet subjectRow()}
             <span class="gs-kind">{s.subject_kind}</span>
             <span class="gs-title">{s.title}</span>
             <!-- The unified layer, shown rather than claimed: this is
@@ -156,7 +153,12 @@
               {s.jobs.length}
               {s.jobs.length === 1 ? 'job' : 'jobs'} · {s.event_count} events
             </span>
-          </a>
+          {/snippet}
+          {#if to !== null}
+            <a class="gs-row" href={safeLinkHref(href(to))} onclick={close}>{@render subjectRow()}</a>
+          {:else}
+            <div class="gs-row gs-row-static" data-pageless={s.subject_kind}>{@render subjectRow()}</div>
+          {/if}
         {/each}
 
         {#each results.jobs.slice(0, 3) as j (j.ref_id)}

@@ -343,7 +343,7 @@ async function open(page: Page, route: string): Promise<boolean> {
 const pathOf = (page: Page): string => new URL(page.url()).pathname;
 
 /// Where a crawled ROW is — its path, and its query when the row names
-/// one. `/it?at=gates` is the Department Map with the gates selected
+/// one. `/it?at=dock` is the alarms board with the dock selected
 /// (design e765b3fc, car N3, whose station panels are the crawl rows of
 /// the pages they replaced): a selection is a place, so a click that
 /// selects another station has left it and back must return to it. A
@@ -396,7 +396,7 @@ const EMPTIED: ReadonlyArray<readonly [RegExp, unknown]> = [
 /// window.print() opens the browser's print dialog — a native dialog the
 /// user sees, so a response under THE JUDGING RULE — but Playwright's
 /// `dialog` event covers alert, confirm, prompt and beforeunload only,
-/// and headless Chromium shows nothing, so /ux/finance's Print / PDF
+/// and headless Chromium shows nothing, so /finance's Print / PDF
 /// read "no observable response" the day the route left DEFERRED (page
 /// audit 3f964c57, 2026-09-25). The call is counted instead, and not
 /// made: a headed debugging run would block on the real dialog.
@@ -471,21 +471,6 @@ async function clickLeg(
   // (a) every in-app href is served — and one that lands on / says
   // Home (HOME_LINK above).
   if (leg === 'main' && scope === 'page') {
-    // 50ab513c: a green link crawl must actually have product rows to
-    // judge. Dedicated page specs cannot prove the shared mock paints them.
-    if (route === '/ux/products') {
-      const rows = page.locator('.prod-table tbody tr');
-      await expect(rows).toHaveCount(2);
-      const active = rows.filter({ hasText: 'CRAWL-ACTIVE' });
-      const retired = rows.filter({ hasText: 'CRAWL-RETIRED' });
-      await expect(active.locator('td').nth(4)).toHaveText('23');
-      await expect(retired.locator('td').nth(4)).toHaveText('7');
-      await expect(active).not.toHaveClass(/retired/);
-      await expect(retired).toHaveClass(/retired/);
-      await expect(retired).toHaveCSS('opacity', '0.5');
-      await expect(active.locator('a')).toHaveAttribute('href', '/ux/products/CRAWL-ACTIVE');
-      await expect(retired.locator('a')).toHaveAttribute('href', '/ux/products/CRAWL-RETIRED');
-    }
     const anchors = await page.locator('a[href]').evaluateAll((els) =>
       els.map((a) => ({
         href: a.getAttribute('href') ?? '',
@@ -808,18 +793,8 @@ test.describe('the interaction crawl — every rendered link lands, every contro
     expect((await controls(page, 'page')).map(control => control.label)).toEqual(['Available', 'Hidden until opened', 'Legend exception', 'SVG control']);
   });
 
-  test('the policy control census does not try to click a closed prepared-input button', async ({ page }) => {
-    await installLegs(page, { refuse: false, empty: false });
-    await page.goto('/it/registry/policy');
-    await expect(page.getByRole('heading', { name: 'Named-person permissions' })).toBeVisible();
-    const measured = await page.locator('button').evaluateAll(buttons => buttons.map((button, index) => ({
-      index, text: button.textContent?.trim(), innerText: (button as HTMLButtonElement).innerText,
-      visible: button.checkVisibility(), disabled: button.matches(':disabled'),
-      ownDisabled: (button as HTMLButtonElement).disabled, closedDetails: !!button.closest('details:not([open])'),
-    })));
-    console.log('policy native button observations', JSON.stringify(measured));
-    expect((await controls(page, 'page')).some(control => control.label.startsWith('<button #'))).toBe(false);
-  });
+  // The policy page's control census ran here until the page went with
+  // step 1 of design 01fa5bdf; the closed-details case is the test above.
 
   for (let shard = 0; shard < SHARDS; shard++) {
     test(`shard ${shard + 1}/${SHARDS}: links, clicks, back, empty backend, refused writes`, async ({ page }) => {
@@ -840,16 +815,6 @@ test.describe('the interaction crawl — every rendered link lands, every contro
         mode.refuse = false;
         mode.empty = false;
         found.push(...(await clickLeg(page, route, 'main', 'page', tally, errors)));
-        if (route === '/ux/products') {
-          for (const [sku, name] of [['CRAWL-ACTIVE', 'Crawl output'], ['CRAWL-RETIRED', 'Retired crawl output']] as const) {
-            await page.locator('.prod-table').getByRole('link', { name: sku, exact: true }).click();
-            await expect(page).toHaveURL(new RegExp(`/ux/products/${sku}$`));
-            await expect(page.locator('h1')).toContainText(name);
-            await page.goBack();
-            await expect(page).toHaveURL(/\/ux\/products$/);
-            await expect(page.locator('.prod-table tbody tr')).toHaveCount(2);
-          }
-        }
         mode.refuse = true;
         found.push(...(await clickLeg(page, route, 'refused', 'page', tally, errors)));
         mode.refuse = false;

@@ -13,7 +13,7 @@
 // schema. Schemas declare nullable / optional fields explicitly;
 // the parse() call enforces them at runtime. Each domain owns
 // its schemas in a sibling `schemas.ts` file (e.g.
-// `apps/web/src/catalog/schemas.ts`).
+// `apps/web/src/accounts/schemas.ts`).
 //
 // Adoption is incremental — old casts coexist with new
 // parse-based helpers. Convert at the call sites that have

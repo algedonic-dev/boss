@@ -47,7 +47,7 @@ import { FAILURE_MARKER } from './_routes';
 import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
 import { parseRoute } from '../../src/router';
 
-const PATH = ROUTE_CATALOG.watchlist.path;
+const PATH = ROUTE_CATALOG.accounts.path;
 const ACCOUNTS_PATH = ROUTE_CATALOG.accounts.path;
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
@@ -461,33 +461,25 @@ async function installDetail(page: Page, row: ReturnType<typeof account>): Promi
   }
 }
 
-test.describe('/watchlist — the account link, and back', () => {
-  test('every row links its account under the catalogued accounts path; one Back returns', async ({ page }) => {
+// The account was a link to its /ux/accounts page until that page went
+// with step 1 of design 01fa5bdf; a link would land on not-found, so the
+// account is named, as text, and the page carries no link at all.
+test.describe('/watchlist — the account named, not linked', () => {
+  test('every row names its account; no row links to the removed account page', async ({ page }) => {
     await install(page);
     await installDetail(page, ZED);
     await mountScored(page);
 
-    const links = page.locator('table.risk-table tbody a');
-    await expect(links).toHaveCount(SCORES.length);
+    const names = page.locator('table.risk-table tbody [data-pageless="account"]');
+    await expect(names).toHaveCount(SCORES.length);
     for (const [i, row] of TABLE.entries()) {
       const id = DIRECTORY_ROWS.find((a) => a.name === row[0])!.id;
-      await expect(links.nth(i)).toHaveText(row[0]!);
-      await expect(links.nth(i)).toHaveAttribute('href', `${ACCOUNTS_PATH}/${encodeURIComponent(id)}`);
+      await expect(names.nth(i)).toHaveText(row[0]!);
+      await expect(names.nth(i)).toHaveAttribute('title', id);
     }
-    // The one link kind on the page, and where the router sends it: the
-    // account detail under the catalogued Accounts route.
-    await expect(page.locator('section.list-section a')).toHaveCount(SCORES.length);
-    expect(parseRoute(`${ACCOUNTS_PATH}/acct-zed`)).toMatchObject({ kind: 'account' });
-
-    const depth = await page.evaluate(() => window.history.length);
-    await links.first().click();
-    await expect.poll(() => new URL(page.url()).pathname).toBe(`${ACCOUNTS_PATH}/acct-zed`);
-    await expect(page.locator('h1.exec-title')).toHaveText('Zed Taproom');
-    expect(await page.evaluate(() => window.history.length)).toBe(depth + 1);
-
-    await page.goBack();
-    await expect.poll(() => new URL(page.url()).pathname).toBe(PATH);
-    await expect(page.locator('h1.exec-title')).toHaveText('Churn watchlist');
+    await expect(page.locator('section.list-section a')).toHaveCount(0);
+    expect(parseRoute(`/ux/accounts/acct-zed`)).toMatchObject({ kind: 'notFound' });
+    expect(ACCOUNTS_PATH).toBe(PATH);
     expect(await table(page)).toEqual(TABLE);
   });
 });

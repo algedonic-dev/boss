@@ -5,8 +5,8 @@ import { ROUTES } from './_routes';
 import { CRAWL_VENDOR, VENDOR_CRAWL_PATH } from '../fixtures/vendor';
 
 test('the shared crawls have a seeded native VendorPage representative', () => {
-  expect(ROUTES).toContain('/ux/vendors');
-  expect(ROUTES.some((path) => /^\/ux\/vendors\/[^/]+$/.test(path))).toBe(true);
+  expect(ROUTES).toContain('/finance/vendors');
+  expect(ROUTES.some((path) => /^\/finance\/vendors\/[^/]+$/.test(path))).toBe(true);
 });
 
 test('the shared smoke fixture mounts a real vendor detail, not Vendor not found', async ({ page }) => {

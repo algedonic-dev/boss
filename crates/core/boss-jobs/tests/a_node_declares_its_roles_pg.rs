@@ -186,6 +186,7 @@ async fn a_role_that_is_not_a_class_of_node_is_refused_and_nothing_lands() {
         memory_gb: None,
         disk_gb: None,
         notes: None,
+        disks: None,
     }];
     assert!(repo.declare_estate_nodes(&bad, &stamp).await.is_err());
     assert!(repo.list_estate_nodes().await.unwrap().is_empty());

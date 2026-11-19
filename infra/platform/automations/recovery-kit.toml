@@ -5,3 +5,5 @@
 id = "automation:recovery-kit"
 role = "platform-admin"
 description = 'The workstation door to a recovery kit the forge has cut (infra/forge/recovery-kit-read.sh).'
+# Host station: vault (backlog 6ecb5480, station-tree.md section 6).
+station = "fa8b479f-1573-4153-9359-0ee123c3295c"

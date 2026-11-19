@@ -115,8 +115,8 @@ fn receiving_stuck(inputs: &RegionInputs<'_>) -> StuckPart {
     }
 }
 
-/// THE STATIONS: packets standing at a station over its WIP limit, or at
-/// one nothing left in the window — [`marshalling`]'s own two troubles.
+/// THE STATIONS: packets standing at a station nothing left in the
+/// window — [`marshalling`]'s own not-draining reading.
 /// A station whose flow the cube is blind to, with work standing, is a
 /// question mark and never a zero (design cf820810 Q5); one with nothing
 /// standing holds nothing that could be stuck.
@@ -128,20 +128,26 @@ fn stations_stuck(inputs: &RegionInputs<'_>) -> StuckPart {
         Ok(view) => view,
         Err(why) => return StuckPart::unread("marshalling", &format!("marshalling: {why}")),
     };
-    let stuck = stations
-        .iter()
-        .filter(|s| s.over_limit || (!s.members.is_empty() && s.served == Some(0)))
-        .flat_map(|s| s.members.iter().map(|m| (m.clone(), None)))
-        .collect();
-    let unknown = stations
+    // A packet at a station that served nothing is WAITING when every
+    // step that put it there waits on its named owner inside its declared
+    // bound — the region's own attention arm, read per packet — and stuck
+    // otherwise (backlog 6254e602).
+    let mut part = StuckPart::new("marshalling");
+    for s in &stations {
+        for m in &s.members {
+            if super::marshalling::not_draining(s) {
+                match super::marshalling::member_wait(s, m, inputs.internal_protocols, inputs.now) {
+                    Ok(_) => part.waiting.push(m.clone()),
+                    Err(_) => part.stuck.push((m.clone(), None)),
+                }
+            }
+        }
+    }
+    part.unknown = stations
         .iter()
         .filter_map(super::marshalling::unread_station_flow)
         .collect();
-    StuckPart {
-        stuck,
-        unknown,
-        ..StuckPart::new("marshalling")
-    }
+    part
 }
 
 /// THE GARAGE: cars held on the dock by hand and greens held before
@@ -616,8 +622,8 @@ mod tests {
     }
 
     /// QUEUE MANAGEMENT: intake past the three-day triage band, and the
-    /// packets standing at a station that is not draining or is over its
-    /// WIP limit — each packet ONCE, though it stands in receiving and at
+    /// packets standing at a station that is not draining — each packet
+    /// ONCE, though it stands in receiving and at
     /// a station both. A station whose flow the cube cannot count is a
     /// question mark, never a zero (design cf820810 Q5): the third names
     /// it in `unknown`, so its stuck figure reads as a floor. A blind
@@ -630,22 +636,23 @@ mod tests {
         fresh.opened_on = chrono::NaiveDate::from_ymd_opt(2026, 9, 18).unwrap();
         let aging_id = aging.id.to_string();
         let inbound = untaken(vec![aging, fresh]);
-        let station =
-            |name: &str, members: &[&str], served: Option<i64>, over: bool| StationReading {
-                name: name.into(),
-                over_limit: over,
-                members: members.iter().map(|m| (*m).to_string()).collect(),
-                served,
-                flow_blind: None,
-                previous_served: served,
-                opened: Default::default(),
-            };
+        let station = |name: &str, members: &[&str], served: Option<i64>| StationReading {
+            name: name.into(),
+            members: members.iter().map(|m| (*m).to_string()).collect(),
+            served,
+            flow_unread: None,
+            flow_stale_since: None,
+            previous_served: served,
+            flow_folded: false,
+            opened: Default::default(),
+            standing: Vec::new(),
+        };
         let stations = vec![
-            station("design-review", &["px", aging_id.as_str()], Some(0), false),
-            station("q.platform-admin.task", &["p1"], Some(3), false),
-            station("over", &["p9"], Some(5), true),
-            station("a.platform-admin.opus-5-1m", &["b1", "b2"], None, false),
-            station("my-watchlist", &[], None, false),
+            station("design-review", &["px", aging_id.as_str()], Some(0)),
+            station("q.platform-admin.task", &["p1"], Some(3)),
+            station("over", &["p9"], Some(5)),
+            station("a.platform-admin.opus-5-1m", &["b1", "b2"], None),
+            station("my-watchlist", &[], None),
         ];
         let status = empty_status();
         let out = regions(&inputs(
@@ -658,10 +665,7 @@ mod tests {
             Some(&stations),
         ));
         let q = third(&out, "queue-management");
-        assert_eq!(
-            q.stuck, 3,
-            "aging (once), px not draining, p9 over the limit: {q:?}"
-        );
+        assert_eq!(q.stuck, 2, "aging (once), px not draining: {q:?}");
         assert_eq!(q.waiting, 0);
         assert_eq!(
             q.oldest_hours,
@@ -711,6 +715,7 @@ mod tests {
             reason: "wait for the migration".into(),
             kind: crate::yard::CarHoldKind::Operator,
             release: None,
+            auto_release: None,
         }];
         status.held = vec![crate::yard::HeldGreen {
             branch: "feat/held-green".into(),

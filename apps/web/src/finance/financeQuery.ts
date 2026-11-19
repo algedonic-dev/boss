@@ -1,4 +1,4 @@
-// The /ux/finance view, read off and written back to the URL (backlog
+// The /finance view, read off and written back to the URL (backlog
 // 2ab44d55, page audit 3f964c57 gap 7).
 //
 // The active tab lived in component state only, so back from an
@@ -8,8 +8,8 @@
 // kinds link there — so the operator who had just posted an entry was
 // shown the Overview instead of it. parseRoute reads this view off the
 // query and App mounts FinancePage with it; the page writes it back
-// with replaceState, the /ux/jobs mechanism (../jobs/filterQuery.ts,
-// f8027805). The write is the read's inverse, so a mount rewrites
+// with replaceState, the mechanism the jobs list's filters used
+// (f8027805; that list went with design 01fa5bdf). The write is the read's inverse, so a mount rewrites
 // nothing.
 //
 // An entry or a fact is a drill-down OF the Trial Balance, so either

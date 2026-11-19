@@ -31,8 +31,11 @@
 # enforced across all 55 crates. Layer answers "which layer of the
 # network is this?" and is defined only for the network machinery
 # inside crates/core — about a third of that tier. The two axes are
-# orthogonal and both are load-bearing; see
-# docs/design/crates-and-layers.md.
+# orthogonal and both are load-bearing; the analysis was
+# docs/design/crates-and-layers.md, re-filed with its open questions as
+# the design packet "Crates and layers: when boss-jobs splits, and
+# whether BossMemory owns the correctness properties" (089dc107,
+# 2026-11-18).
 #
 # Crates with no layer are not violations. Most of core is shared
 # services (calendar, search, docs, locations) or Subject kinds, and
@@ -130,7 +133,7 @@ rank_of() {
 # Deleting a line is how a fix is recorded. Adding one requires a
 # reviewer to agree the layer boundary genuinely does not apply.
 read -r -d '' SHAPE_ALLOW <<'ALLOW' || true
-boss-events/tail_http.rs memory-no-http-server Apps concern in the memory crate; eviction proposed in docs/design/crates-and-layers.md
+boss-events/tail_http.rs memory-no-http-server Apps concern in the memory crate; eviction proposed in the crates-and-layers design (packet 089dc107)
 boss-events/outbox_http.rs memory-no-http-server the dead-letter door, mounted on boss-events-api beside tail_http at the adversarial review's direction (backlog e22b692e, H1: the service that owns event_outbox acts on it, not a CLI with a database URL); evicts with tail_http
 ALLOW
 

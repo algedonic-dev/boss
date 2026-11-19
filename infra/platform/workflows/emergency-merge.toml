@@ -56,7 +56,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "The sanctioned lane for a fix the pipeline cannot carry because the system of record is down. Rollback to a NAMED last-good revision is tried first and ends the packet if it restores service; otherwise the fix is gated locally for a real receipt, a platform-admin signs the train bypass, the branch fast-forwards onto main, the system of record is read answering on the fix, and the retro is filed. Each step carries the evidence the next needs to become ready, so the lane cannot be improvised twice the same way."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { owner = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5", department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "declared"
@@ -135,7 +135,7 @@ ready_when = "steps.gate-locally.done AND steps.gate-locally.metadata.receipt_ve
 title_template = "Approve the train bypass — the operator's call"
 authority_role = "platform-admin"
 sign_offs_required = ["platform-admin"]
-metadata_defaults = { authority_role = "platform-admin" }
+metadata_defaults = { authority_role = "platform-admin", human_only = true, human_presentation = { ask = "Approve or refuse the emergency train bypass", why_person = "Bypassing the train requires the operator decision, not an agent receipt.", action = "Read the green receipt and record the bypass decision", after = "Only an approved decision permits the emergency merge.", evidence = "current-step" } }
 
 [[workflow.step.fields]]
 name = "decision"

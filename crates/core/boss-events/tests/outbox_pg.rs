@@ -21,7 +21,7 @@ use boss_core::port::{EventBus, EventBusError, EventStream};
 use boss_events::outbox::{
     MAX_STAGED_EVENT_BYTES, REDELIVERED_KIND, RESOLVED_KIND, dead_lettered_count,
     drain_outbox_once, pending_count, read_back, record_event_in_tx, redeliver_dead_letter,
-    relay_lag, resolve_dead_letter, undrained,
+    relay_lag, resolve_dead_letter, undelivered, undrained,
 };
 use boss_testing::{RecordingEventBus, TestDb};
 use chrono::{TimeZone, Utc};
@@ -327,6 +327,68 @@ async fn relay_lag_over_an_empty_window_has_no_percentiles() {
     assert_eq!(lag.p95_seconds, None);
     assert_eq!(lag.max_seconds, None);
     assert_eq!(lag.covered_hours, None);
+}
+
+/// Design ad9519bc part (c), backlog 2e45840a: a dark bus must show as a
+/// growing, ageing outbox, not as silence. The relay's audit-then-publish
+/// order means a dark bus leaves every row in audit_log and none
+/// delivered, so `undrained` reads EMPTY through an outage (the test
+/// above pins that) and nothing else dated the owed rows. `undelivered`
+/// is the relay's report: every row the bus still owes, and how long
+/// the oldest has waited by the database's own clock — the clock that
+/// stamped `created_at`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dark_bus_shows_as_a_growing_ageing_outbox() {
+    let db = TestDb::new().await;
+    let empty = undelivered(&db.pool).await.unwrap();
+    assert_eq!(empty.count, 0);
+    assert_eq!(
+        (empty.oldest_created_at, empty.oldest_age_seconds),
+        (None, None),
+        "nothing owed has no age — never a zero"
+    );
+
+    let first = event("outbox.test.held.first");
+    stage(&db, &first).await;
+    stage(&db, &event("outbox.test.held.second")).await;
+    // The first write committed 90 s ago.
+    sqlx::query(
+        "UPDATE event_outbox SET created_at = created_at - INTERVAL '90 seconds' \
+         WHERE event_id = $1",
+    )
+    .bind(first.id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let dark = Arc::new(FailingBus {
+        attempts: AtomicUsize::new(0),
+    });
+    drain_outbox_once(&db.pool, &(dark as Arc<dyn EventBus>), 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        undrained(&db.pool).await.unwrap().count,
+        0,
+        "audit_log holds both: the existing read sees no lag at all"
+    );
+    let held = undelivered(&db.pool).await.unwrap();
+    assert_eq!(held.count, 2, "both rows are owed to the bus");
+    let age = held.oldest_age_seconds.expect("held rows have an age");
+    assert!(
+        (90.0..150.0).contains(&age),
+        "the oldest has waited about 90 s: {age}"
+    );
+
+    // The bus returns: the outbox drains and the age goes with it.
+    drain_outbox_once(
+        &db.pool,
+        &(RecordingEventBus::new() as Arc<dyn EventBus>),
+        100,
+    )
+    .await
+    .unwrap();
+    assert_eq!(undelivered(&db.pool).await.unwrap(), empty);
 }
 
 /// A bus that refuses what NATS refuses: an encoded event larger than

@@ -1,0 +1,12 @@
+-- d2cb38af, car 2: the readers and writers retired in car 526b65b9,
+-- converged and proven on 2026-11-11. The previous converged image
+-- therefore also reads stations without this column on a rollback.
+-- Historical published specs remain in the immutable audit log.
+--
+-- This is ordinary boot-path schema: migrate.sh wraps it and its ledger
+-- row in one transaction with a 5s LOCAL lock_timeout. DROP COLUMN takes
+-- ACCESS EXCLUSIVE, but neither rewrites rows nor builds an index.
+-- Recreate stops the jobs API before boss-init runs it. A lock refusal
+-- rolls back, records nothing and fails boot loudly; retry uses the same
+-- ledger and never replays the older INSERT ... SELECT upstream files.
+ALTER TABLE stations DROP COLUMN IF EXISTS upstream;

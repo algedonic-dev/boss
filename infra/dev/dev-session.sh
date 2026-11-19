@@ -4,7 +4,7 @@
 #
 # An interactive ssh login used to exec straight into the one durable
 # tmux session, `dev` — the Remote Control / drain session the boot
-# starts running /work/dev-claude.sh. It now offers five sessions:
+# starts running /work/dev-claude.sh. It now offers six sessions:
 #
 #   1) Claude + Claude Code   tmux `dev`     /work/dev-claude.sh
 #   2) GPT + Codex            tmux `codex`   codex
@@ -12,6 +12,12 @@
 #   4) Shell                  tmux `shell`   bash -l
 #   5) Claude B + Claude Code tmux `claude-b` claude, own login home
 #      ($HOME/.claude-b), signing as claude-b@algedonic.dev
+#   6) GPT + Codex, factory   tmux `codex-factory`
+#      infra/dev/factory-loop.sh: the same codex identity, the CLI's
+#      non-interactive mode run one turn at a time and relaunched on a
+#      model limit (backlog 628dc540). Option 2 stays the interactive
+#      TUI; the two never start beside each other, because two CLIs
+#      signing as one agent would race for one queue.
 #
 # Each JOINS its session when it runs and CREATES it when it does not
 # (`tmux new-session -A`). Enter, or no answer within the timeout, is 1,
@@ -52,9 +58,80 @@
 # BOSS_DEV_ROOT stands in for /work, BOSS_DEV_SESSION_TIMEOUT for the
 # 10 s, and BOSS_DEV_SESSION_ASSUME_TTY=1 for a terminal: the test
 # harness's seams, unset on the pod.
+#
+# `--detached 6` (backlog ccd985ef, decided 2026-10-29) starts option 6
+# — the factory loop, with its session name, identity and command
+# exactly as the menu's 6 has them, through the one `start_factory`
+# below — in a DETACHED session, prints `<session> <pane pid>`, and
+# exits. It shows no menu, needs no terminal, never joins (a running
+# loop or TUI is refused), and never offers an install. Its caller is
+# infra/dev/agent-pane.sh, for `boss factory
+# restart`: the conductor starting a factory that is not running at all,
+# so a stall is not left waiting for David at the console.
+#
+# `--detached 2` and `--detached 5` (backlog 2a2d11b2, David
+# 2026-11-10) start the interactive Codex and Claude B the same way, and
+# for the same reason: after the pod rolled at ~01:40Z that night both
+# waited for an interactive login, and seven of Claude B's packets and
+# one of Codex's sat stranded behind them until David typed. Each goes
+# through the menu's own definition (`start_codex`, `start_claude_b`
+# below) and so through join()'s identity check, config placing and
+# Claude B's login-home preparation; detached, a running session is
+# refused, never joined, and the codex TUI is never started beside the
+# factory loop. Its caller is `boss session start <codex|claude-b>`,
+# which records what it saw and did on that agent's work-session.
+# Option 1 (`dev`, the drain the boot owns), 3 and 4 stay menu-only.
+#
+# `--boot` (backlog b513514c, David's morning plan 2026-11-17, item 3)
+# starts EVERY seat of infra/dev/seats.tsv — each executor CLI the pod
+# runs supervised by factory-loop.sh — that is not running, detached,
+# and prints one `seat <name>:` line for each: started, with its
+# `<session> <pane pid>`, or not started and why. The boot runs it
+# (boss-dev.yaml's /work/dev-factory.sh, behind the drain switch), so a
+# pod roll brings back the conductor's loop and Claude B's as well as
+# Codex's; on 2026-11-17 the factory stood idle 7.5 h (item 5627a4e1)
+# with only Codex supervised. A seat starts exactly as `--detached`
+# starts an option: through join(), so its identity, config and login
+# home are the menu's, a running seat is never joined, and a seat whose
+# `twin` (the interactive session on the same agent) is running is
+# refused. Before it starts, the seat's CLI must be installed and say it
+# is logged in — its own answer (`codex login status`, `claude auth
+# status`, measured exiting 1 with no login on Claude Code 2.1.326) — so
+# a seat that cannot run a turn is named in the log rather than looping
+# on a refusal. It exits 0 whatever each seat did: the boot reads the
+# lines, and no seat's refusal stops another's start. Option 6 is the
+# list's first seat, started by the same start_seat. Review ce8970ce
+# added three lines: a seat with a file under
+# $HOME/.config/boss/seat-off/ is `off` (N3: a seat stopped on purpose
+# otherwise comes back on every roll); `--boot --except <seat>` skips
+# that seat (N2: the boot decides once whether the drain is in tmux
+# `dev` or the conductor's seat); and a seat started with its identity
+# unconfirmed says `started UNSIGNED` (N4).
 
 root=${BOSS_DEV_ROOT:-/work}
 timeout=${BOSS_DEV_SESSION_TIMEOUT:-10}
+
+detached=''
+if [ "${1:-}" = --detached ]; then
+  case ${2:-} in
+    2 | 5 | 6) detached=$2 ;;
+    *)
+      echo "dev-session: --detached takes only 2, 5 or 6 (the codex TUI, Claude B, the factory loop), not '${2:-}' - nothing started" >&2
+      exit 64
+      ;;
+  esac
+fi
+boot_except=''
+if [ "${1:-}" = --boot ]; then
+  detached=boot
+  # `--boot --except <seat>`: the boot's ONE decision about the drain
+  # (review ce8970ce N2). When the boot left the drain in tmux `dev`,
+  # the conductor's seat must not start beside it, even if the checkout
+  # was fast-forwarded between the two reads (boss-dev.yaml).
+  if [ "${2:-}" = --except ]; then
+    boot_except=${3:-}
+  fi
+fi
 
 # The session environment, as the pod's .bashrc and dev-claude.sh set it.
 export HOME=$root/home
@@ -67,7 +144,7 @@ cd "$root/boss" || true
 # dev-session.sh exactly — the .profile execs this only for interactive
 # tty logins outside tmux, and a shell inside any session (the `shell`
 # session's own login bash included) must never be offered it again.
-if [ -n "${TMUX:-}" ] || { [ ! -t 0 ] && [ "${BOSS_DEV_SESSION_ASSUME_TTY:-}" != 1 ]; }; then
+if [ -z "$detached" ] && { [ -n "${TMUX:-}" ] || { [ ! -t 0 ] && [ "${BOSS_DEV_SESSION_ASSUME_TTY:-}" != 1 ]; }; }; then
   exec tmux new-session -A -s dev
 fi
 
@@ -94,18 +171,69 @@ running() { tmux has-session -t "=$1" 2>/dev/null; }
 
 status() { if running "$1"; then echo running; else echo 'not running'; fi; }
 
+# The seats (infra/dev/seats.tsv, beside this file): `seat_field <seat>
+# <n>` prints column n of the seat's row, and fails when no row names it.
+# Plain bash: a login runs this with nothing else assumed on PATH.
+seats=$here/seats.tsv
+# A seat stopped on purpose stays stopped across rolls only with its
+# own switch (review ce8970ce N3): a file here named after the seat,
+# on the PVC beside drain-on-boot, touched and removed by hand, no
+# deploy. Every other stop lasts only until the next boot.
+seat_off=$HOME/.config/boss/seat-off
+seat_rows() {
+  local line
+  local -a f
+  [ -r "$seats" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    read -r -a f <<<"$line"
+    [ "${#f[@]}" -gt 0 ] || continue
+    case ${f[0]} in '#'*) continue ;; esac
+    echo "${f[*]}"
+  done <"$seats"
+}
+seat_field() {
+  local row
+  local -a f
+  while IFS= read -r row; do
+    read -r -a f <<<"$row"
+    if [ "${f[0]}" = "$1" ]; then
+      echo "${f[$2 - 1]:-}"
+      return 0
+    fi
+  done < <(seat_rows)
+  return 1
+}
+seat_names() {
+  local row
+  while IFS= read -r row; do echo "${row%% *}"; done < <(seat_rows)
+}
+
+# The interactive session a seat stands for — its identity, config and
+# login home are that session's — or the name itself.
+twin_of() {
+  local twin
+  twin=$(seat_field "$1" 6) || twin=-
+  if [ "$twin" = - ]; then echo "$1"; else echo "$twin"; fi
+}
+
 # The CLI an option's session needs to START (joining needs only tmux).
 cli_of() {
   case $1 in
     dev | claude-b) echo claude ;;
     codex) echo codex ;;
     gemini) echo gemini ;;
+    *) seat_field "$1" 2 ;;
   esac
 }
 
+# -q FIRST on the installer's curl (backlog 2b1bf9b4): this menu runs as
+# root with HOME=/work/home, which group 1500 may create a .curlrc in,
+# and what that curl fetches is piped into bash as root. Only as curl's
+# first argument does -q skip the curlrc; the_doors_read_no_curlrc.rs
+# holds every curl under infra/dev to it.
 install_hint() {
   case $1 in
-    claude) echo "curl -fsSL https://claude.ai/install.sh | HOME=$HOME bash" ;;
+    claude) echo "curl -q -fsSL https://claude.ai/install.sh | HOME=$HOME bash" ;;
     codex) echo "npm i -g --prefix $HOME/.local @openai/codex" ;;
     gemini) echo "npm i -g --prefix $HOME/.local @google/gemini-cli" ;;
   esac
@@ -113,7 +241,7 @@ install_hint() {
 
 run_install() {
   case $1 in
-    claude) curl -fsSL https://claude.ai/install.sh | bash ;;
+    claude) curl -q -fsSL https://claude.ai/install.sh | bash ;;
     codex) npm i -g --prefix "$HOME/.local" @openai/codex ;;
     gemini) npm i -g --prefix "$HOME/.local" @google/gemini-cli ;;
   esac
@@ -245,14 +373,22 @@ join() {
   shift
   local -a flags=() cmd=("$@")
   if running "$name"; then
+    if [ -n "$detached" ]; then
+      echo "dev-session: tmux \`$name\` is already running - --detached never joins, nothing started"
+      return 1
+    fi
     mode=unsigned
   else
     cli=$(cli_of "$name")
     if [ -n "$cli" ] && ! command -v "$cli" >/dev/null 2>&1; then
+      if [ -n "$detached" ]; then
+        echo "dev-session: $cli is not installed on this pod - nothing started. Install it with: $(install_hint "$cli")"
+        return 1
+      fi
       offer_install "$cli" || return 1
     fi
   fi
-  case $name in
+  case $(twin_of "$name") in
     codex)
       agent_identity codex@algedonic.dev 'Codex (engineering)' "$mode"
       [ "$mode" = check ] && place_config infra/dev/cli/codex-config.toml .codex/config.toml
@@ -267,8 +403,151 @@ join() {
       [ "$mode" = check ] && place_config infra/dev/cli/gemini-settings.json .gemini/settings.json
       ;;
   esac
+  if [ -n "$detached" ]; then
+    exec tmux new-session -d -P -F '#{session_name} #{pane_pid}' -s "$name" -c "$root/boss" "${flags[@]}" "${cmd[@]}"
+  fi
   exec tmux new-session -A -s "$name" -c "$root/boss" "${flags[@]}" "${cmd[@]}"
 }
+
+# An interactive session and its seat sign as ONE agent — the codex TUI
+# and the factory loop (backlog 628dc540), Claude B and its loop
+# (b513514c) — so neither is CREATED while the other runs: two CLIs on
+# one identity race for one queue. Joining a running one is unchanged.
+# Returns 1, back to the menu, when the other holds the identity.
+join_twin() {
+  local name=$1 other=$2
+  shift 2
+  if ! running "$name" && running "$other"; then
+    echo "tmux \`$other\` is running and signs as the same agent - quit it before starting \`$name\`."
+    # A seat comes back on every roll (review ce8970ce N3): name the
+    # switch that keeps it off.
+    if seat_field "$other" 1 >/dev/null; then
+      echo "\`$other\` is a supervised seat: stop it (tmux kill-session -t $other) and touch $seat_off/$other so the next pod roll does not start it again."
+    fi
+    return 1
+  fi
+  join "$name" "$@"
+}
+
+# A seat of seats.tsv: its loop, never beside its twin. The list's first
+# seat is the loop's default, so its command is the bare path option 6
+# has always had (agent-pane.sh proves a factory by it); every other
+# seat names itself.
+start_seat() {
+  local seat=$1 twin first
+  twin=$(seat_field "$seat" 6) || {
+    echo "dev-session: no seat '$seat' in $seats - nothing started"
+    return 1
+  }
+  first=$(seat_names)
+  first=${first%%$'\n'*}
+  local -a cmd=("$root/boss/infra/dev/factory-loop.sh")
+  [ "$seat" = "$first" ] || cmd+=("$seat")
+  if [ "$twin" = - ]; then
+    join "$seat" "${cmd[@]}"
+  else
+    join_twin "$seat" "$twin" "${cmd[@]}"
+  fi
+}
+
+# Option 6, the factory loop: defined ONCE, read by the menu and by
+# `--detached 6` (backlog ccd985ef), so the conductor's restart and
+# David's login start the same thing — and by `--boot`, as the seat it
+# is (b513514c).
+start_factory() {
+  start_seat codex-factory
+}
+
+# Options 2 and 5, likewise defined once for the menu and `--detached`
+# (backlog 2a2d11b2). Claude B's interactive session is refused beside
+# its seat, as the codex TUI is beside the factory: one identity, one
+# queue.
+start_codex() {
+  join_twin codex codex-factory codex
+}
+
+start_claude_b() {
+  join_twin claude-b claude-b-factory claude
+}
+
+# Whether a CLI says it is logged in, in the seat's own login home.
+logged_in() {
+  local seat=$1 cli=$2
+  case $cli in
+    codex) timeout -k 5 30 codex login status >/dev/null 2>&1 ;;
+    claude)
+      if [ "$(twin_of "$seat")" = claude-b ]; then
+        CLAUDE_CONFIG_DIR=$HOME/.claude-b timeout -k 5 30 claude auth status >/dev/null 2>&1
+      else
+        timeout -k 5 30 claude auth status >/dev/null 2>&1
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# --boot: every seat, each in a subshell (a start execs tmux), each
+# outcome one line.
+boot_seats() {
+  local seat cli out rc
+  if ! [ -r "$seats" ]; then
+    echo "seats: no seat list at $seats - nothing started"
+    return 0
+  fi
+  for seat in $(seat_names); do
+    cli=$(cli_of "$seat")
+    if [ "$seat" = "$boot_except" ]; then
+      echo "seat $seat: not started - the boot left the drain in tmux dev (--except $seat), and two drains on one agent race for one queue"
+      continue
+    fi
+    if [ -e "$seat_off/$seat" ]; then
+      echo "seat $seat: off - $seat_off/$seat exists; remove it and the next boot starts this seat"
+      continue
+    fi
+    if running "$seat"; then
+      echo "seat $seat: already running - nothing started"
+      continue
+    fi
+    if ! command -v "$cli" >/dev/null 2>&1; then
+      echo "seat $seat: not started - $cli is not installed on this pod. Install it with: $(install_hint "$cli")"
+      continue
+    fi
+    if ! logged_in "$seat" "$cli"; then
+      echo "seat $seat: not started - $cli is not logged in for this seat; log in once in its interactive session ($(twin_of "$seat")) and the next boot starts it"
+      continue
+    fi
+    out=$( (start_seat "$seat") </dev/null 2>&1)
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      # A seat whose identity the registry did not confirm runs with
+      # BOSS_ACTOR blank (agent_identity: it fails closed, never signs as
+      # another), so every write it makes is refused until it is
+      # restarted. Said on the seat's own line, not only in the lines
+      # join() printed beside it (review ce8970ce N4).
+      case $out in
+        *'starts with BOSS_ACTOR blank'*)
+          echo "seat $seat: started UNSIGNED - its identity could not be confirmed, so every write it makes is refused until it is restarted (tmux kill-session -t $seat, then dev-session.sh --boot): ${out//$'\n'/ | }"
+          ;;
+        *) echo "seat $seat: started ${out:-(tmux printed no pane)}" ;;
+      esac
+    else
+      echo "seat $seat: not started (exit $rc): $out"
+    fi
+  done
+  return 0
+}
+
+# Each start execs tmux on success, so a return is a refusal.
+case $detached in
+  2) start_codex ;;
+  5) start_claude_b ;;
+  6) start_factory ;;
+  boot)
+    boot_seats
+    exit 0
+    ;;
+esac
+[ -z "$detached" ] || exit 1
 
 join_dev() {
   if [ -x "$root/dev-claude.sh" ]; then
@@ -287,6 +566,7 @@ while :; do
   printf '  3) %-22s %-8s %s\n' 'Gemini + Code Assist' gemini "$(status gemini)"
   printf '  4) %-22s %-8s %s\n' 'Shell' shell "$(status shell)"
   printf '  5) %-22s %-8s %s\n' 'Claude B + Claude Code' claude-b "$(status claude-b)"
+  printf '  6) %-22s %-8s %s\n' 'GPT + Codex, factory' codex-factory "$(status codex-factory)"
   printf '> '
   choice=''
   if ! read -r -t "$timeout" choice && [ -z "$choice" ]; then
@@ -294,10 +574,11 @@ while :; do
   fi
   case $choice in
     '' | 1) join_dev ;;
-    2) join codex codex ;;
+    2) start_codex ;;
     3) join gemini gemini ;;
     4) join shell bash -l ;;
-    5) join claude-b claude ;;
+    5) start_claude_b ;;
+    6) start_factory ;;
     *) echo "no option '$choice'" ;;
   esac
 done

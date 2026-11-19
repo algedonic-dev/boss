@@ -51,6 +51,10 @@ not-a-fact file crates/core/boss-content/src/rebuild.rs -- projection rebuilder:
 not-a-fact file crates/core/boss-jobs/src/agent_runs/rebuild.rs -- projection rebuilder: replays agents.run.recorded from audit_log into agent_runs
 not-a-fact fn crates/core/boss-jobs/src/credentials/rebuild.rs::rebuild_credentials -- projection rebuilder: restores credential declarations, original phase receipts and Installed timestamps from complete audit_log history; emitting a new fact would duplicate the original event
 not-a-fact file crates/core/boss-jobs/src/rebuild.rs -- projection rebuilder: replays jobs.* events from audit_log into jobs and steps
+not-a-fact fn crates/core/boss-jobs/src/claims_console/postgres.rs::PgClaimsHistory::apply_batch -- derived resource console history: atomically materializes bounded immutable audit prefixes and their sequence witnesses; replay must not emit new facts
+not-a-fact fn crates/core/boss-jobs/src/claims_console/postgres.rs::PgClaimsHistory::prune -- derived history retention: removes only reproducible projection rows and advances the retained horizon; original audit facts remain untouched
+not-a-fact fn crates/core/boss-jobs/src/claims_console/postgres.rs::PgClaimsHistory::begin_rebuild -- derived projection generation reset: rebuilds resource console history from immutable audit facts without creating new business facts
+not-a-fact fn crates/core/boss-jobs/src/claims_console/postgres.rs::PgClaimsHistory::source_failed -- projection observation bookkeeping: records a failed source read on the derived history header, not an original business fact
 not-a-fact file crates/core/boss-jobs/src/scheduling/rebuild.rs -- projection rebuilder: replays scheduling events from audit_log into the scheduling tables
 not-a-fact file crates/core/boss-search/src/rebuild.rs -- projection rebuilder: search_index is rebuilt from the identity projections, themselves rebuilt from audit_log
 not-a-fact file crates/core/boss-subject-kinds/src/rebuild.rs -- projection rebuilder: replays subject_kind.updated from audit_log onto the migration-seeded subject_kinds rows
@@ -75,7 +79,8 @@ not-a-fact file crates/modules/boss-shipping/src/rebuild.rs -- projection rebuil
 not-a-fact file crates/modules/boss-ledger/src/live_facts.rs -- projection consumer: runs the rebuild's own project_event over events already delivered from the log, so the facts it writes are projections of facts already recorded
 not-a-fact fn crates/modules/boss-ledger/src/supersede.rs::replay_supersede_events_in_tx -- projection rebuilder: replays ledger.fact.superseded events from audit_log onto financial_facts
 not-a-fact file crates/modules/boss-ledger/src/replay_check.rs -- verifier: re-projects the GL inside a transaction it always rolls back, so nothing it writes survives
-not-a-fact fn crates/modules/boss-assets/src/postgres.rs::PgAssets::rebuild_projection -- projection rebuilder: re-projects the assets tables from asset_events (whose own gap is recorded below)
+not-a-fact fn crates/modules/boss-assets/src/postgres.rs::PgAssets::rebuild_projection -- projection rebuilder: re-projects the assets tables from asset_events, whose new rows stage their facts (PgAssets::record, PgAssets::batch_record)
+not-a-fact fn crates/modules/boss-assets/src/postgres.rs::PgAssets::append -- projection consumer: the bus ingress re-applies an asset.* fact PgAssets::record already staged (redelivery dedups on the event id); staging it again would mint a second fact for one event
 
 # ---------------------------------------------------------------------
 # not-a-fact: the log itself and its bookkeeping.
@@ -142,7 +147,7 @@ not-a-fact fn crates/core/boss-testing/src/test_db.rs::TestDb::declare_revenue_c
 # Registries written with no fact, where workflows, stations and step
 # plugins stage a *.published event for the same kind of write:
 gap fn crates/core/boss-dispatcher/src/rules/authoring.rs::create_draft -- a dispatcher rule draft is authored with no event
-gap fn crates/core/boss-dispatcher/src/rules/authoring.rs::publish -- a dispatcher rule is published, retiring the prior version, with no event
+gap fn crates/core/boss-dispatcher/src/rules/authoring.rs::publish_with_lane_policy -- a dispatcher rule is published, retiring the prior version, with no event
 gap fn crates/core/boss-dispatcher/src/rules/authoring.rs::retire -- a dispatcher rule is retired with no event
 gap fn crates/core/boss-dispatcher/src/rules/seed.rs::seed_authored_rules -- the boot seed retires and replaces dispatcher rules with no event
 gap fn crates/core/boss-dispatcher/src/rules/seed.rs::insert_active -- the boot seed inserts an active dispatcher rule with no event
@@ -158,9 +163,9 @@ gap fn crates/core/boss-jobs/src/scheduling/postgres.rs::PgScheduling::materiali
 gap fn crates/core/boss-views/src/postgres.rs::PgViewsRepo::create -- an operator's saved View is created with no event
 gap fn crates/core/boss-views/src/postgres.rs::PgViewsRepo::replace -- an operator's saved View is replaced with no event
 gap fn crates/core/boss-views/src/postgres.rs::PgViewsRepo::delete -- an operator's saved View is deleted with no event
-gap fn crates/modules/boss-assets/src/postgres.rs::PgAssets::append -- asset history is appended to its own asset_events table, never staged on the outbox, so audit_log does not hold it
-gap fn crates/modules/boss-assets/src/postgres.rs::PgAssets::batch_append -- the batch form of the asset_events append, likewise never reaching audit_log
 gap fn crates/modules/boss-catalog/src/marketing_assets/postgres.rs::PgMarketingAssets::create -- a marketing asset (and each edit, which re-creates it) mints a subject and a row with no event
 gap fn crates/modules/boss-catalog/src/marketing_assets/postgres.rs::PgMarketingAssets::retire -- a marketing asset is retired with no event
 gap fn crates/modules/boss-people/src/webauthn.rs::register_credential -- a break-glass passkey is registered with no event
 gap fn crates/modules/boss-people/src/webauthn.rs::remove_credential -- a break-glass passkey is removed with no event
+
+not-a-fact fn crates/core/boss-jobs/src/sensors/request_latency/pg.rs::PgLatency::record -- operational telemetry: A1906 latency distributions and recorder coverage, separate from command/refusal transactions; bounded retention is not an audit fact

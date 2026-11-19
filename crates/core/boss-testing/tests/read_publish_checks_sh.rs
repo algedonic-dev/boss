@@ -138,12 +138,15 @@ impl Run {
             &format!(
                 r#"#!/bin/sh
 echo "$*" >> '{log}'
-url=""; data=""; method=GET; prev=""
+url=""; data=""; method=GET; hdr=""; out=""; wfmt=""; prev=""
 for a in "$@"; do
-    case "$prev" in --data-binary) data="$a" ;; -X) method="$a" ;; esac
+    case "$prev" in --data-binary) data="$a" ;; -X) method="$a" ;; -D) hdr="$a" ;; -o) out="$a" ;; -w) wfmt="$a" ;; esac
     case "$a" in http://*|https://*) url="$a" ;; esac
     prev="$a"
 done
+# A `-D <file>` gets the case's answer headers, when it wrote any (the
+# anonymous rate limit GitHub states on every answer, backlog 1b32c950).
+if [ -n "$hdr" ] && [ -f '{headers}' ]; then cp '{headers}' "$hdr"; fi
 # Every request, with whether a `-H @file` it was handed holds the
 # machine token's header (backlog 44b2087e).
 tok=no; prev=""
@@ -155,8 +158,31 @@ for a in "$@"; do
 done
 printf '%s %s token=%s\n' "$method" "$url" "$tok" >> '{log}.calls'
 if [ "$method" != GET ]; then
+    # A write the case refuses ONCE (review 75bb4029 B1): `refuse.once`
+    # holds the answer's status on its first line and its body after. It
+    # refuses only a body carrying failing_annotations, is not recorded
+    # as a write (the call log above still has it), and is removed, so
+    # the next write lands. A `-w` caller is told the status and `-o`
+    # gets the body; a caller without `-w` gets what `curl -f` gives on
+    # a 4xx, exit 22 and the status in its words.
+    refused=no
+    if [ -f '{refuse}' ]; then
+        case "$data" in @*) if grep -q failing_annotations "${{data#@}}"; then refused=yes; fi ;; esac
+    fi
+    if [ "$refused" = yes ]; then
+        code=$(head -n 1 '{refuse}')
+        if [ -n "$out" ]; then tail -n +2 '{refuse}' > "$out"; fi
+        rm -f '{refuse}'
+        if [ -z "$wfmt" ]; then
+            echo "curl: (22) The requested URL returned error: $code" >&2
+            exit 22
+        fi
+        printf '%s' "$code"
+        exit 0
+    fi
     printf '%s %s\n' "$method" "$url" >> '{writes}'
     case "$data" in @*) cat "${{data#@}}" >> '{writes}'; echo >> '{writes}' ;; esac
+    if [ -n "$wfmt" ]; then printf '200'; fi
     exit 0
 fi
 # First route whose file still exists wins; a `*.once.json` file is
@@ -176,6 +202,8 @@ exit 22
                 log = log.display(),
                 writes = writes.display(),
                 routes = routes.display(),
+                headers = root.join("headers").display(),
+                refuse = root.join("refuse.once").display(),
             ),
         );
         let run = Run {
@@ -275,6 +303,23 @@ exit 22
             .unwrap_or_else(|| panic!("no metadata PATCH on the packet; writes:\n{writes}"));
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
         v["code_scanning"].clone()
+    }
+
+    /// The `failing_annotations` the verb PATCHed onto the packet beside
+    /// that reading, in the same body (backlog 1b32c950).
+    fn failing_annotations(&self) -> serde_json::Value {
+        let writes = self.writes();
+        let body = writes
+            .lines()
+            .skip_while(|l| {
+                !l.starts_with(&format!(
+                    "PATCH http://jobs.invalid/api/jobs/{JOB}/metadata"
+                ))
+            })
+            .nth(1)
+            .unwrap_or_else(|| panic!("no metadata PATCH on the packet; writes:\n{writes}"));
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        v["failing_annotations"].clone()
     }
 
     /// The read-checks step's completion, as the two writes that make
@@ -1060,6 +1105,357 @@ fn unreadable_gate_annotations_are_named_unread_and_the_read_completes() {
     assert_eq!(
         run.step_put()["metadata"]["failing"],
         format!("{MIRROR_GATE}: failure (its annotations could not be read)")
+    );
+    // The whole record says the same, by the check's id (1b32c950).
+    let fa = run.failing_annotations();
+    assert_eq!(fa[0]["check"], MIRROR_GATE, "{fa}");
+    assert_eq!(fa[0]["id"].to_string(), GATE_RUN_245, "{fa}");
+    assert!(
+        fa[0]["error"].as_str().is_some_and(|e| e.contains("404")),
+        "a failed read records why, never silence: {fa}"
+    );
+    assert!(
+        fa[0].get("annotations").is_none(),
+        "nothing is invented: {fa}"
+    );
+}
+
+// ---- every failing check's annotations, whole (backlog 1b32c950) ----
+
+/// THE WHOLE RECORD, NOT ONLY WHAT A FILTER KEPT (design 62f27539 C2).
+/// `failing` keeps only the gate's `GATE FAIL` / `GATE REFUSED` titles;
+/// everything else a failing check annotated — a browser error at
+/// `plugins/incident-review.js:12`, the exit-code line, a check that is
+/// not this gate at all and prints no `GATE FAIL` — was read and then
+/// thrown away, and the job log that would say it answers 403 to an
+/// anonymous reader. So each failing check's annotations land on the
+/// packet as `failing_annotations`: the check's name and id, what the
+/// check-run declares beside what was read, and every annotation in the
+/// API's order with its path, line, level, title and message, the
+/// message never cut. One read per failing check, at `per_page=50` —
+/// an Actions job keeps at most fifty — and none for a check that
+/// passed or for the scan, whose annotations are its alerts.
+#[test]
+fn every_failing_checks_annotations_are_recorded_whole_on_the_packet() {
+    let run = Run::new("annotations-whole", open_pr_245());
+    let long = format!(
+        "test a_long_named_case ... FAILED\n{} (exit 101, after 3779s)",
+        "panicked at a line the job log holds; ".repeat(60)
+    );
+    route_pr245(&run, vec![gate_annotation(28507, "GATE FAIL: test", &long)]);
+
+    let (code, text) = run.go(&[], &[]);
+    assert_eq!(code, 0, "{text}");
+    let served: Vec<serde_json::Value> = serde_json::from_str(
+        &std::fs::read_to_string(run.root.join("gate-annotations.json")).unwrap(),
+    )
+    .unwrap();
+    let whole: Vec<serde_json::Value> = served
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "path": a["path"], "start_line": a["start_line"],
+                "end_line": a["end_line"],
+                "level": a["annotation_level"], "title": a["title"],
+                "message": a["message"],
+            })
+        })
+        .collect();
+    let fa = run.failing_annotations();
+    assert_eq!(
+        fa,
+        serde_json::json!([{
+            "check": MIRROR_GATE,
+            "id": GATE_RUN_245.parse::<u64>().unwrap(),
+            "conclusion": "failure",
+            "declared": 7,
+            "read": 8,
+            "annotations": whole,
+        }]),
+        "every annotation of the failing check, in the API's order, whole"
+    );
+    assert!(
+        fa.to_string().contains("plugins/incident-review.js"),
+        "what the GATE FAIL filter drops is on the record: {fa}"
+    );
+    let calls = run.calls();
+    let reads = |id: &str| {
+        calls
+            .iter()
+            .filter(|c| c.contains(&format!("/check-runs/{id}/annotations")))
+            .count()
+    };
+    assert_eq!(
+        reads(GATE_RUN_245),
+        1,
+        "one read per failing check:\n{calls:?}"
+    );
+    assert!(
+        calls.iter().any(|c| c.contains(&format!(
+            "/check-runs/{GATE_RUN_245}/annotations?per_page=50 "
+        ))),
+        "one page of fifty, the most an Actions job keeps:\n{calls:?}"
+    );
+    assert_eq!(
+        reads("108632199660") + reads("108632199583"),
+        0,
+        "a check that passed is not read:\n{calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .filter(|c| c.contains("api.github.invalid"))
+            .all(|c| c.ends_with("token=no")),
+        "no credential rides to GitHub:\n{calls:?}"
+    );
+}
+
+/// ONE FACT, TWO FILES (CLAUDE.md §9a). The verb writes the key and the
+/// publish-to-github row's `judge-checks` procedure tells the agent where
+/// to start from; a rename on either side would leave the judge opening
+/// a job log it cannot read. Both are read here, from their files.
+#[test]
+fn the_judge_step_is_told_the_key_the_verb_writes() {
+    let script = std::fs::read_to_string(repo_root().join(SCRIPT)).unwrap();
+    assert!(
+        script.contains("{failing_annotations: $failing_annotations,"),
+        "the verb writes failing_annotations onto the packet"
+    );
+    let path = repo_root().join("infra/platform/workflows/publish-to-github.toml");
+    let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let judge = doc["workflow"][0]["step"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["title"].as_str() == Some("judge-checks"))
+        .expect("publish-to-github has a judge-checks step");
+    let procedure = judge["metadata_defaults"]["procedure"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        procedure.contains("`metadata.failing_annotations`"),
+        "judge-checks starts from the annotations on the packet: {procedure}"
+    );
+}
+
+/// THE ANONYMOUS RATE LIMIT IS RESPECTED, AND SAID (backlog 1b32c950).
+/// GitHub answers an unauthenticated reader sixty requests an hour per
+/// address and states what is left on every answer. When the last answer
+/// said none is left, the verb makes no annotation read it knows will be
+/// refused: it records each failing check as not read, naming the limit
+/// and when it resets, and the reading still completes — the check's
+/// failure never depended on its annotations.
+#[test]
+fn a_spent_anonymous_rate_limit_reads_no_annotations_and_records_why() {
+    let run = Run::new("rate-spent", open_pr_245());
+    route_pr245(&run, vec![]);
+    write_file(
+        &run.root.join("headers"),
+        "HTTP/2 200\r\nx-ratelimit-limit: 60\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: 1794860276\r\n\r\n",
+    );
+
+    let (code, text) = run.go(&[], &[]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        !run.calls()
+            .iter()
+            .any(|c| c.contains(&format!("/check-runs/{GATE_RUN_245}/annotations"))),
+        "no read is made against a spent limit:\n{:?}",
+        run.calls()
+    );
+    let fa = run.failing_annotations();
+    let why = fa[0]["error"].as_str().unwrap_or_default();
+    assert!(
+        why.contains("rate limit") && why.contains("2026-11-16T20:17:56Z"),
+        "the record names the limit and when it resets: {fa}"
+    );
+    assert!(
+        fa[0].get("annotations").is_none(),
+        "nothing is invented: {fa}"
+    );
+    assert_eq!(
+        run.reading()["failing"][0]["annotations_unread"],
+        fa[0]["error"],
+        "the reading's failing entry says the same why"
+    );
+    assert_eq!(run.step_put()["metadata"]["conclusion"], "failure");
+}
+
+// ---- the record is bounded, and a refused write still lands the scan (review 75bb4029 B1) ----
+
+/// The verb's allowance on `failing_annotations`, off its own line.
+fn allowance() -> usize {
+    let script = std::fs::read_to_string(repo_root().join(SCRIPT)).unwrap();
+    let line = script
+        .lines()
+        .find_map(|l| l.strip_prefix("FAILING_ANNOTATIONS_ALLOWANCE="))
+        .expect("the verb states FAILING_ANNOTATIONS_ALLOWANCE=<bytes> on a line of its own");
+    line.trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("FAILING_ANNOTATIONS_ALLOWANCE={line}: {e}"))
+}
+
+/// ONE FACT, TWO FILES (CLAUDE.md §9a). The jobs API refuses a write that
+/// grows a packet at `boss_jobs::packet_budget::BUDGET`, and the reading
+/// rides one PATCH with `code_scanning`; the verb holds its annotations
+/// to a quarter of that, read here from both files, so a budget that
+/// moves cannot leave the verb's allowance above it.
+#[test]
+fn the_annotation_allowance_is_a_quarter_of_the_packet_budget() {
+    assert_eq!(allowance(), boss_jobs::packet_budget::BUDGET / 4);
+}
+
+/// The second failing check the allowance case adds to #245: a check that
+/// is not the gate, with one browser error — small, and recorded whole.
+const WEB_RUN: &str = "108632200999";
+const WEB_CHECK: &str = "Web (bun, mocked)";
+
+/// THE ALLOWANCE. One failing check annotated more than a quarter of the
+/// packet budget — four browser errors of 60,000 bytes, which GitHub
+/// takes (a message may hold 64 KB) and no gate caps — and a second
+/// failing check annotated one line. The large one is NOT RECORDED and
+/// says so with its byte count, the allowance and where GitHub holds it;
+/// the small one is recorded whole; nothing is cut; and the scan's
+/// reading lands beside them and the step completes. Before this, the
+/// one PATCH carried all of it and the jobs API's 413 lost the scan's
+/// reading with it (review 75bb4029 B1).
+#[test]
+fn annotations_over_the_allowance_are_stated_not_recorded_and_the_reading_lands() {
+    let run = Run::new("annotations-allowance", open_pr_245());
+    // #245's check list with a second failing check, routed before the
+    // fixture's so it is the one served.
+    let mut checks = fixture_json("check-runs-pr245.json");
+    let mut web = checks["check_runs"][1].clone();
+    assert_eq!(web["name"], MIRROR_GATE, "the fixture's [1] is the Gate");
+    web["id"] = serde_json::json!(WEB_RUN.parse::<u64>().unwrap());
+    web["name"] = serde_json::json!(WEB_CHECK);
+    web["output"]["annotations_count"] = serde_json::json!(1);
+    checks["check_runs"].as_array_mut().unwrap().push(web);
+    let total = checks["total_count"].as_u64().unwrap_or(0);
+    checks["total_count"] = serde_json::json!(total + 1);
+    let list = run.root.join("check-runs-with-web.json");
+    write_file(&list, &checks.to_string());
+    run.route(&format!("/commits/{HEAD_245}/check-runs"), &list);
+    let small = gate_annotation(
+        12,
+        "Error",
+        "plugins/incident-review.js:12:36 TypeError: x is undefined",
+    );
+    let web_file = run.root.join("web-annotations.json");
+    write_file(&web_file, &serde_json::json!([small]).to_string());
+    run.route(&format!("/check-runs/{WEB_RUN}/annotations"), &web_file);
+    let big = |line: u64| gate_annotation(line, "Error", &"x".repeat(60_000));
+    route_pr245(&run, vec![big(30001), big(30002), big(30003), big(30004)]);
+
+    let (code, text) = run.go(&[], &[]);
+    assert_eq!(code, 0, "{text}");
+
+    let fa = run.failing_annotations();
+    assert_eq!(fa.as_array().map(Vec::len), Some(2), "{fa}");
+    let gate = &fa[0];
+    assert_eq!(gate["check"], MIRROR_GATE, "{gate}");
+    assert_eq!(gate["read"], 11, "seven measured and four large: {gate}");
+    assert!(
+        gate.get("annotations").is_none(),
+        "over the allowance, not recorded — never a cut list: {gate}"
+    );
+    let why = gate["error"].as_str().unwrap_or_default();
+    assert!(
+        why.starts_with("not recorded: ")
+            && why.contains(&format!("over the allowance of {}", allowance()))
+            && why.contains(&format!("/check-runs/{GATE_RUN_245}/annotations")),
+        "the entry says it was not recorded, against what, and where it is: {why}"
+    );
+    let bytes: usize = why
+        .trim_start_matches("not recorded: ")
+        .split(' ')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("the entry names its byte count: {why}"));
+    assert!(bytes > 240_000, "the byte count is the check's own: {why}");
+
+    let web = &fa[1];
+    assert_eq!(web["check"], WEB_CHECK, "{web}");
+    assert_eq!(
+        web["annotations"][0]["message"], small["message"],
+        "a check under the allowance is recorded whole: {web}"
+    );
+    assert!(
+        !fa.to_string().contains(&"x".repeat(1_000)),
+        "no part of a large message is recorded — nothing is cut"
+    );
+    assert!(
+        fa.to_string().len() <= allowance(),
+        "the record is under the allowance"
+    );
+
+    // The scan's reading landed beside it, and the step completed.
+    let reading = run.reading();
+    assert_eq!(reading["conclusion"], "failure", "{reading}");
+    assert_eq!(reading["alerts"]["check"], "CodeQL", "{reading}");
+    assert_eq!(run.step_put()["status"], "completed");
+    assert!(
+        text.contains(&format!("not recorded for: {MIRROR_GATE}")),
+        "the run says which check went unrecorded:\n{text}"
+    );
+}
+
+/// A REFUSED WRITE STILL COMPLETES THE STEP. The allowance keeps the
+/// annotations under the budget, but a packet whose OTHER metadata has
+/// grown can still be refused: the jobs API answers 413 with its packet
+/// event budget's words. The verb re-sends the reading with each check's
+/// annotations replaced by why they are not recorded — the 413 and the
+/// server's words — so `code_scanning` lands and read-checks completes,
+/// rather than a verb dead on that packet re-filing the same refusal
+/// every fifteen minutes (review 75bb4029 B1).
+#[test]
+fn a_reading_refused_413_is_re_sent_without_the_annotations_and_the_step_completes() {
+    let run = Run::new("annotations-413", open_pr_245());
+    route_pr245(&run, vec![]);
+    write_file(
+        &run.root.join("refuse.once"),
+        "413\n{\"error\":\"packet event budget refused: the packet's events would encode to 740001 bytes\"}\n",
+    );
+
+    let (code, text) = run.go(&[], &[]);
+    assert_eq!(code, 0, "{text}");
+    let patches = run
+        .calls()
+        .iter()
+        .filter(|c| {
+            c.starts_with(&format!(
+                "PATCH http://jobs.invalid/api/jobs/{JOB}/metadata "
+            ))
+        })
+        .count();
+    assert_eq!(patches, 2, "refused once, re-sent once:\n{:?}", run.calls());
+
+    let fa = run.failing_annotations();
+    let gate = &fa[0];
+    assert_eq!(gate["check"], MIRROR_GATE, "{fa}");
+    assert_eq!(gate["read"], 7, "what was read is still said: {gate}");
+    assert!(
+        gate.get("annotations").is_none(),
+        "the re-send carries no annotations: {gate}"
+    );
+    let why = gate["error"].as_str().unwrap_or_default();
+    assert!(
+        why.starts_with("not recorded: ")
+            && why.contains("413")
+            && why.contains("packet event budget refused")
+            && why.contains(&format!("/check-runs/{GATE_RUN_245}/annotations")),
+        "the entry says why, in the server's words, and where they are: {why}"
+    );
+    let reading = run.reading();
+    assert_eq!(reading["conclusion"], "failure", "{reading}");
+    assert_eq!(
+        reading["failing"][0]["name"], MIRROR_GATE,
+        "the scan's reading landed: {reading}"
+    );
+    assert_eq!(run.step_put()["status"], "completed");
+    assert!(
+        text.contains("refused the reading with failing_annotations (413)"),
+        "the run says it re-sent:\n{text}"
     );
 }
 

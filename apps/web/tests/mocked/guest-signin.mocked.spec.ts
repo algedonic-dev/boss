@@ -21,21 +21,32 @@ const MANIFEST = { display_name: 'Algedonic Ales', modules: {}, labels: {} };
 /// so waiting for `.app-shell` would fail on a page that is working.
 const LOGIN_ROOT = '.login-card';
 
+/// The guest identity is the deployment's, read off GET /api/auth/guest
+/// (approved design c6f08b60 D2, item 26f5080a). A reserved RFC 2606
+/// address, with a local part that is not `guest`, so a page still
+/// spelling a constant cannot pass by coincidence.
+const GUEST_EMAIL = 'visitor@example.test';
+
+/// The address the page hardcoded until this car: one instance's guest,
+/// shown to every adopter's visitors.
+const INSTANCE_GUEST_EMAIL = 'guest@algedonic.dev';
+
 async function stubAuth(
   page: import('@playwright/test').Page,
-  opts: { guestEnabled: boolean },
+  opts: { guestEnabled: boolean; email?: string | null },
 ): Promise<void> {
   await installApiFloor(page);
   await page.route(/\/api\/tenant\/manifest$/, (r) => r.fulfill({ json: MANIFEST }));
   // Not signed in — otherwise the page redirects to home instead of
   // rendering the form we are testing.
   await page.route('**/api/auth/me', (r) => r.fulfill({ status: 401, body: '' }));
+  const email = opts.email === undefined ? GUEST_EMAIL : opts.email;
   await page.route('**/api/auth/guest', async (route) => {
     if (route.request().method() !== 'GET') return route.fallback();
     return route.fulfill({
       json: {
         enabled: opts.guestEnabled,
-        email: 'guest@algedonic.dev',
+        ...(email === null ? {} : { email }),
         role: 'audit-readonly',
       },
     });
@@ -52,9 +63,23 @@ test.describe('guest sign-in', () => {
 
     await expect(guestButton(page)).toBeVisible();
     // The identity is named on the button's own note rather than left
-    // for the visitor to discover in a menu after the fact.
-    await expect(page.getByText('guest@algedonic.dev')).toBeVisible();
+    // for the visitor to discover in a menu after the fact — and it is
+    // the identity this deployment answered, not one instance's.
+    await expect(page.locator('.guest-note code')).toHaveText(GUEST_EMAIL);
+    await expect(page.getByText(INSTANCE_GUEST_EMAIL)).toHaveCount(0);
     await expect(page.getByText(/read-only/i)).toBeVisible();
+  });
+
+  // A gateway that names no guest address still offers the button; the
+  // note then names no address rather than inventing one.
+  test('names no address when the deployment answers none', async ({ page }) => {
+    await stubAuth(page, { guestEnabled: true, email: null });
+    await mountPage(page, '/login', { root: LOGIN_ROOT });
+
+    await expect(guestButton(page)).toBeVisible();
+    await expect(page.getByText(/read-only/i)).toBeVisible();
+    await expect(page.locator('.guest-note code')).toHaveCount(0);
+    await expect(page.getByText(INSTANCE_GUEST_EMAIL)).toHaveCount(0);
   });
 
   // A tenant running BOSS on their own company's data does not hand
@@ -79,7 +104,7 @@ test.describe('guest sign-in', () => {
       mintCalls += 1;
       return route.fulfill({
         json: {
-          email: 'guest@algedonic.dev',
+          email: GUEST_EMAIL,
           employee_id: null,
           role: 'audit-readonly',
           access_tier: null,

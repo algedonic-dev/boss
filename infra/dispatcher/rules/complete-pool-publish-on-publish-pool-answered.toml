@@ -1,0 +1,46 @@
+# The publish-pool verb's answer reaches the publish-a-protocol step it
+# was filed for — on success AND on failure (backlog f399458f ask 2).
+#
+# publish-a-protocol-files-its-pool-publish spawns the request with
+# `for_protocol_publish` = the packet. This rule follows that edge with
+# `jobs.complete_linked_step`, the twin of
+# complete-protocol-publish-on-publish-workflow-answered:
+#
+# - exit 0 and the verb's confirmed line
+#
+#     publish-pool: <name> vA -> vB live at <url> — confirmed by reading
+#     the lineage back and comparing it to the signed row (equal);
+#     packet <request>
+#
+#   completes `publish-pool` with `version` = B, `from_version` = A and
+#   `read_back` = `equal`, each COPIED from that line;
+# - a non-zero exit (a refused signature, a moved lineage, a lint that
+#   failed, an unconfirmed publish): `annotate-and-alert` — the verb's
+#   last FAILED or REFUSED line lands on the still-open step as
+#   `failed`, and an urgent backlog-item names the verb, the request and
+#   the line. The step stays open, because the row is not live.
+#
+# The pattern carries no backslash (two string lexers, TOML then
+# boss-expr's); `.` stands for the em dash. The line it reads is
+# publish-pool.sh's own last line, pinned by
+# crates/core/boss-dispatcher/tests/publish_a_protocol_rules.rs and the
+# script's own test.
+[[rule]]
+name = "complete-pool-publish-on-publish-pool-answered"
+why = """
+A CROSS-PROTOCOL REACTOR closing the loop
+publish-a-protocol-files-its-pool-publish opened: ops-request ->
+publish-a-protocol, which no single Workflow consequence can express —
+the request's protocol cannot know which packet asked, and the
+packet's cannot read another packet's execute step. Without it the
+publish-pool step would sit ready behind an `answered` request whatever
+the verb said. No authority widened: on success the only writes are the
+step's three required fields, copied from the verb's read-back line; on
+failure the step is annotated, never completed. Self-filters to this
+one verb and this one edge.
+"""
+on_event = "jobs.job.closed"
+when = 'kind = "ops-request" AND outcome = "answered"'
+[[rule.do]]
+handler = "jobs.complete_linked_step"
+args = { verb = '"publish-pool"', verdict_pattern = '"^publish-pool: (?P<pool>[a-z][a-z0-9_:.-]+) v(?P<from_version>[0-9]+) -> v(?P<version>[0-9]+) live at [^ ]+ . confirmed by reading the lineage back and comparing it to the signed row [(](?P<read_back>equal)[)]"', link = '"for_protocol_publish"', steps = '"publish-pool"', done_metadata = '"{\"version\": \"{version}\", \"from_version\": \"{from_version}\", \"read_back\": \"{read_back}\"}"', evidence_key = '"published_by"', on_failure = '"annotate-and-alert"' }

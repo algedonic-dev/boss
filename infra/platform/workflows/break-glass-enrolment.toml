@@ -65,7 +65,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "Authorise enrolling ONE break-glass hardware key, with a passkey (design 03451237). The filer names the key's label (primary or backup), the relying party it is for and the deployment's origin; an authoriser on the gateway's named list approves `authorise` with a presence stamp over exactly that; the gateway, asked from that authoriser's own session at /break-glass, re-judges the stamp against the step's current content, verifies the key's attestation, records the credential it enrolled on `enrol` BEFORE it hands the record out, and refuses any second use naming the credential it was spent on. The record is then committed to the in-tree credential manifest. `declined` is an authorisation the approver did not approve."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { owner = "9660c60f-eb47-4405-ae08-fcbb30c71e5f", department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "filed"
@@ -82,7 +82,7 @@ assurance_required = "presence"
 sign_offs_required = ["platform-admin"]
 title_template = "Authorise enrolling the {metadata.label} break-glass key for {metadata.rp_id}"
 authority_role = "platform-admin"
-metadata_defaults = { label = "{metadata.label}", rp_id = "{metadata.rp_id}", origin = "{metadata.origin}", procedure = "YOUR PASSKEY SIGNS THIS STEP'S CONTENT, and the gateway enrols exactly what it names: the `label` (which physical key: primary or backup), the `rp_id` (the relying party the key will be bound to - it must be the host of the deployment you will enrol on, or the key will never open that door) and the `origin`. Approve only a request you made, for a key you hold. After approving, open `<origin>/break-glass` SIGNED IN AS YOURSELF, expand Enrollment, paste this packet's id, and touch the key: the enrolment is refused from anyone else's session. The page prints the record to commit to infra/cluster/manifests/boss-break-glass-credentials.yaml." }
+metadata_defaults = { human_only = true, human_presentation = { ask = "Authorize this exact break-glass key enrollment", why_person = "Your passkey authorizes the physical key and relying party.", action = "Read the request and approve or reject", after = "Approval permits the gateway enrollment ceremony; it does not enroll the key.", evidence = "current-step" }, label = "{metadata.label}", rp_id = "{metadata.rp_id}", origin = "{metadata.origin}", procedure = "YOUR PASSKEY SIGNS THIS STEP'S CONTENT, and the gateway enrols exactly what it names: the `label` (which physical key: primary or backup), the `rp_id` (the relying party the key will be bound to - it must be the host of the deployment you will enrol on, or the key will never open that door) and the `origin`. Approve only a request you made, for a key you hold. After approving, open `<origin>/break-glass` SIGNED IN AS YOURSELF, expand Enrollment, paste this packet's id, and touch the key: the enrolment is refused from anyone else's session. The page prints the record to commit to infra/cluster/manifests/boss-break-glass-credentials.yaml." }
 
 [[workflow.step.fields]]
 name = "label"

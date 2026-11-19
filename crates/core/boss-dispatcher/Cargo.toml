@@ -8,7 +8,9 @@ edition.workspace = true
 boss-core = { path = "../boss-core" }
 boss-ports = { path = "../boss-ports" }
 boss-nats = { path = "../boss-nats" }
-boss-jobs = { path = "../boss-jobs" }
+# `postgres`: the rule doors read the workflow rows the passkey edges are
+# judged over through boss-jobs' own reader (backlog a4b57aca, review R1).
+boss-jobs = { path = "../boss-jobs", features = ["postgres"] }
 boss-expr = { path = "../boss-expr" }
 boss-clock-client = { path = "../boss-clock-client" }
 boss-calendar-client = { path = "../boss-calendar-client" }
@@ -39,6 +41,9 @@ regex = "1"
 tempfile = "3"
 tower = { workspace = true }
 http-body-util = "0.1"
+# `start_paused`: the assignment consumer's reopen ladder walked on a
+# paused clock (backlog 2e45840a, design ad9519bc).
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

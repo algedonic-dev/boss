@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub(crate) const ROWS: &str = "infra/platform/agent-controllers";
+const GENERATION_KUBECONFIG: &str = "infra/dev/kubeconfig";
 
 fn replay_patch(record: &Value, receipt: Option<&Value>, ending: &Value) -> Result<Value, String> {
     if ending["backend"] != "cluster"
@@ -36,6 +37,117 @@ fn replay_patch(record: &Value, receipt: Option<&Value>, ending: &Value) -> Resu
 #[cfg(test)]
 mod replay_tests {
     use super::*;
+    async fn refused_observation_config(shape: &str) {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = boss_testing::scratch_dir("launch-observation-refusal");
+        let generation = root.join("generation");
+        std::fs::create_dir_all(generation.join("bin")).unwrap();
+        std::fs::create_dir_all(generation.join("infra/dev")).unwrap();
+        let config = generation.join("infra/dev/kubeconfig");
+        match shape {
+            "missing" => {}
+            "directory" => std::fs::create_dir(&config).unwrap(),
+            "symlink" => {
+                let other = root.join("other-config");
+                std::fs::write(&other, b"fixture; no credential").unwrap();
+                symlink(other, &config).unwrap();
+            }
+            "writable" => {
+                std::fs::write(&config, b"fixture; no credential").unwrap();
+                std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o664)).unwrap();
+            }
+            _ => panic!("unknown fixture shape"),
+        }
+        let called = root.join("client-called");
+        let executable = generation.join("bin/kubectl");
+        boss_testing::write_exec(
+            &executable,
+            &format!(
+                "#!/usr/bin/python3 -I\nfrom pathlib import Path\nPath({}).write_text('called')\n",
+                serde_json::to_string(called.to_str().unwrap()).unwrap()
+            ),
+        );
+        let captures = root.join("captures");
+        std::fs::create_dir(&captures).unwrap();
+        let mut native = KubeTransport::new(executable, captures).unwrap();
+        let why = native
+            .observe_client(&["auth", "whoami", "-o=json"], Duration::from_secs(120))
+            .await
+            .expect_err("an unsafe generation config must refuse before launching the client");
+        assert!(why.contains("kubeconfig"), "{why}");
+        assert!(!called.exists(), "the refused client was launched: {shape}");
+    }
+    #[tokio::test]
+    async fn connection_observation_refuses_a_missing_config_before_launch() {
+        refused_observation_config("missing").await;
+    }
+    #[tokio::test]
+    async fn connection_observation_refuses_a_config_directory_before_launch() {
+        refused_observation_config("directory").await;
+    }
+    #[tokio::test]
+    async fn connection_observation_refuses_a_config_symlink_before_launch() {
+        refused_observation_config("symlink").await;
+    }
+    #[tokio::test]
+    async fn connection_observation_refuses_a_writable_config_before_launch() {
+        refused_observation_config("writable").await;
+    }
+    #[tokio::test]
+    async fn every_connection_observation_uses_the_generation_config_and_private_home() {
+        let door = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../infra/dev/control-tools.py"
+        ));
+        assert!(
+            door.lines()
+                .any(|line| line == format!("KUBECONFIG = {GENERATION_KUBECONFIG:?}")),
+            "the CLI and published door must select the same generation config"
+        );
+        let root = boss_testing::scratch_dir("launch-observation-config");
+        let generation = root.join("generation");
+        std::fs::create_dir_all(generation.join("bin")).unwrap();
+        std::fs::create_dir_all(generation.join("infra/dev")).unwrap();
+        let config = generation.join(GENERATION_KUBECONFIG);
+        std::fs::write(&config, b"fixture config; no credential").unwrap();
+        let executable = generation.join("bin/kubectl");
+        boss_testing::write_exec(
+            &executable,
+            "#!/usr/bin/python3 -I\nimport json,os,sys\nprint(json.dumps({'config':os.environ.get('KUBECONFIG'),'home':os.environ.get('HOME'),'argv':sys.argv[1:]}))\nsys.stderr.buffer.write(b'original-observation-error\\x00\\xff')\n",
+        );
+        let captures = root.join("captures");
+        std::fs::create_dir(&captures).unwrap();
+        let mut native = KubeTransport::new(executable, captures.clone()).unwrap();
+        for args in [
+            vec!["config", "current-context"],
+            vec!["config", "view", "--minify"],
+            vec!["auth", "whoami", "-o=json"],
+        ] {
+            let result = native
+                .observe_client(&args, Duration::from_secs(120))
+                .await
+                .unwrap();
+            assert_eq!(result.exit, Some(0));
+            let response: Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert_eq!(
+                response["config"],
+                config.to_str().unwrap(),
+                "connection observation must never fall back to HOME's kubeconfig"
+            );
+            assert_eq!(response["home"], captures.to_str().unwrap());
+            assert_eq!(response["argv"], json!(args));
+            assert_eq!(result.stderr, b"original-observation-error\x00\xff");
+            let prefix = captures.join(format!("connection-{:08}", native.sequence));
+            assert_eq!(
+                std::fs::read(prefix.with_extension("stdout")).unwrap(),
+                result.stdout
+            );
+            assert_eq!(
+                std::fs::read(prefix.with_extension("stderr")).unwrap(),
+                result.stderr
+            );
+        }
+    }
     #[tokio::test]
     async fn every_native_effect_uses_the_private_pinned_config_and_conserves_uid_delete_input() {
         let root = boss_testing::scratch_dir("launch-native-config");
@@ -55,7 +167,14 @@ mod replay_tests {
                     name: "agent-original".into(),
                     options: options.clone(),
                 },
-                Duration::from_secs(5),
+                // What the client was handed is this test's subject, not
+                // the deadline. Five seconds raced a python3 stub's start
+                // against the gate's load: gate-run 624df717 (2026-10-19, a
+                // brief.rs car) went red here on "native client deadline;
+                // partial streams retained" (f10419f9), and a stub held six
+                // seconds reproduces it. A deadline that fires is judged by
+                // a client hung on purpose, never by a race.
+                Duration::from_secs(120),
             )
             .await
             .unwrap();
@@ -523,6 +642,21 @@ pub(crate) async fn launch_at(
         || building["status"] != "ready"
     {
         bail!("observer requires this newly dispatched run's exact ready actor nomination");
+    }
+    // A bounded START's run (design e72dc7c9) asks for a receipt this
+    // observer cannot record, and its schema-2 expectation would replace
+    // the one that names the START: refused by name, nothing written.
+    if before["metadata"]
+        .get(crate::start_inputs::RUN_KEY)
+        .is_some()
+        || building["metadata"][crate::dispatch_started::EXPECTATION_KEY]["schema"]
+            == boss_jobs::execution_inputs::START_SCHEMA
+    {
+        bail!(
+            "the cluster observer does not implement the {} contract this run was admitted \
+             under; refused before any expectation, claim or Job",
+            boss_jobs::execution_inputs::CONTRACT
+        );
     }
     let step = building["id"].as_str().context("building has no id")?;
     let expectation = json!({"schema":2,"minutes":15,"observer":observer,"actor":prepared.actor,
@@ -1454,6 +1588,30 @@ impl KubeTransport {
         args: &[&str],
         remaining: Duration,
     ) -> Result<Native, String> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // 62895f2d / review6d7b418b: the initial whoami already sends
+        // the selected credential, before initialize pins its own copy.
+        // Its first read must use the verified generation, never HOME.
+        let generation = self
+            .executable
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("published kubectl has no generation for its kubeconfig")?;
+        let config = generation.join(GENERATION_KUBECONFIG);
+        let metadata = std::fs::symlink_metadata(&config)
+            .map_err(|e| format!("trusted kubeconfig {} is unreadable: {e}", config.display()))?;
+        let owner = rustix::process::getuid().as_raw();
+        if !metadata.is_file()
+            || metadata.uid() != owner
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(format!(
+                "trusted kubeconfig {} must be a regular file owned by uid {owner} without group or other write permission (mode {:04o}, uid {})",
+                config.display(),
+                metadata.permissions().mode() & 0o7777,
+                metadata.uid()
+            ));
+        }
         self.sequence += 1;
         let prefix = self
             .captures
@@ -1462,7 +1620,8 @@ impl KubeTransport {
         command
             .args(args)
             .env_clear()
-            .env("HOME", "/work/home")
+            .env("HOME", &self.captures)
+            .env("KUBECONFIG", config)
             .env("PATH", "/usr/bin:/bin")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())

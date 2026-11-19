@@ -1,0 +1,11 @@
+{
+  "about": "READ-ONLY: renders what retire-access-object WOULD delete, and deletes nothing (infra/forge/retire-access-object.sh --plan <kind> <namespace> <name>; backlog 526bedf2). One ServiceAccount, Role or RoleBinding, named in full; any other kind is refused before anything is read. Every bound of the write is applied, each refusing by name (exit 78): the name is not protected (ServiceAccount default, break-glass*); the manifest directories are clean in git, read as the checkout's owner; infra/cluster/undeclared-objects.sh --check names <kind>/<namespace>/<name> undeclared, which refuses a namespace the tree does not own, a declared object, an exempt object, a controller-owned one and one that is not live; the object is not being deleted and has no owner; and nothing consumes it — for a ServiceAccount no Pod in any phase runs as it, no workload would, no Secret is a long-lived token issued from it, and no RoleBinding in any namespace nor ClusterRoleBinding grants it; for a Role no RoleBinding grants it; for a RoleBinding every subject is a ServiceAccount no Pod or workload runs as (a User or Group subject is refused, because no read names its holders). A list that cannot be read is a failure (exit 1), never an empty one. The plan names the object (uid, labels, annotation keys, finalizers, creation), what it carries (a Role's rules, a binding's roleRef and subjects, an account's secrets), the consumer verdict and the one DELETE it authorises, with no clock, resourceVersion or tree sha, so two renders of one state are byte-identical; its sha256 rides stderr as plan-sha256 and David's passkey signs those bytes. Reads go through the forge ops_kubectl door (the derivation's --kubectl); Secrets are read as name, type and account annotation only, never their bytes. Timeout 300 covers the derivation's manifest parse, as delete-orphan-object's does.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/retire-access-object.sh", "--plan", "{1}", "{2}", "{3}"],
+  "params": [
+    {"name": "kind", "one_of": ["ServiceAccount", "Role", "RoleBinding"]},
+    {"name": "namespace", "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"},
+    {"name": "name", "pattern": "^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$"}
+  ],
+  "timeout": 300
+}

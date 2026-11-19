@@ -26,7 +26,9 @@
 //! defect; running NOTHING was the next one — four ops-requests were
 //! left open on 2026-10-09 because the write each re-send repeated had
 //! landed without its packet being settled, and the re-send was the
-//! only write left that could do it.
+//! only write left that could do it. A re-sent SKIP settles the same way
+//! (backlog 657c9200): it is the other finished status, and a skipped
+//! last step owes its packet the all-steps-terminal close.
 //!
 //! The first test reproduces the measured interleaving deterministically:
 //! it stops the first writer between its step write and its job close
@@ -503,4 +505,145 @@ async fn a_resend_after_the_close_records_nothing_and_keeps_the_outcome() {
     let after = h.jobs.get_job(&job_id).await.unwrap().expect("job");
     assert_eq!(after.metadata["outcome"], "disproved");
     assert_eq!(after, closed, "the packet row is untouched");
+}
+
+/// A status-only PUT, as the dispatcher and the verbs send it.
+async fn put_status(
+    app: &axum::Router,
+    job_id: &JobId,
+    step: &boss_core::job::Step,
+    status: &str,
+) -> (StatusCode, serde_json::Value) {
+    send(
+        app,
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/api/jobs/{job_id}/steps/{}", step.id))
+            .header("content-type", "application/json")
+            .header("x-boss-user", admin_header())
+            .body(Body::from(
+                serde_json::json!({ "status": status }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
+}
+
+/// A SKIP IS TOLD TO RETRY, SO ITS RETRY MUST SETTLE (backlog 657c9200,
+/// from landed-review fc7b75f6 of car f705c864). A step write whose
+/// settle fails answers 500 — the readiness pass's says "send the same
+/// request again — a re-send re-runs it" — but the re-send settled only
+/// a step stored `completed`. A skip is the other finished status, and
+/// it can owe its packet the all-steps-terminal catch-all close: here
+/// the skipped step is the packet's last open one, a step added beside
+/// its protocol (a protocol step is skipped by its protocol, never by
+/// hand). Its close fails, the caller retries, and the retry answered
+/// 204 and ran nothing — a silent success over a packet left open with
+/// every step terminal.
+#[tokio::test]
+async fn a_resent_skip_whose_settle_failed_closes_the_packet() {
+    let h = harness();
+    let job_id = open_job(&h.app).await;
+
+    let work = step(&h.jobs, &job_id, "work").await;
+    let (status, body) = put_completed(&h.app, &job_id, &work).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "work completes: {body}");
+    // A step no protocol describes, still open.
+    let mut added = step(&h.jobs, &job_id, "nothing-to-do").await;
+    added.id = boss_core::job::StepId::from_uuid(Uuid::new_v4());
+    added.spec_slug = None;
+    added.title = "A step added beside the protocol".into();
+    added.sort_order = 3;
+    added.status = StepStatus::Ready;
+    h.jobs.add_step(&added).await.expect("add the step");
+    // Every protocol step finished, and no declared terminal completed:
+    // only the catch-all can close this packet once `added` is done.
+    for slug in ["disproved", "nothing-to-do"] {
+        let mut ruled_out = step(&h.jobs, &job_id, slug).await;
+        ruled_out.status = StepStatus::Skipped;
+        h.jobs.update_step(&ruled_out).await.expect("rule it out");
+    }
+
+    h.jobs.fail_job_close(&job_id);
+    let (status, body) = put_status(&h.app, &job_id, &added, "skipped").await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a skip whose close failed is not a 204: {body}"
+    );
+    h.jobs.restore_job_close(&job_id);
+    let stored = h
+        .jobs
+        .get_step(&added.id)
+        .await
+        .unwrap()
+        .expect("the added step");
+    assert_eq!(
+        stored.status,
+        StepStatus::Skipped,
+        "precondition: the skip itself was written"
+    );
+    assert_eq!(
+        h.jobs.get_job(&job_id).await.unwrap().expect("job").status,
+        boss_core::job::JobStatus::Open,
+        "precondition: the close the skip owed did not land"
+    );
+
+    let (status, body) = put_status(&h.app, &job_id, &added, "skipped").await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the retry answers 204: {body}"
+    );
+    assert_eq!(
+        h.jobs.get_job(&job_id).await.unwrap().expect("job").status,
+        boss_core::job::JobStatus::Closed,
+        "the retry of a skip settles its packet: every step is terminal"
+    );
+    assert_eq!(
+        h.jobs.get_step(&added.id).await.unwrap(),
+        Some(stored),
+        "the re-sent step itself is not rewritten"
+    );
+}
+
+/// The promise is made for EVERY step write, so every re-send keeps it.
+/// An unchanged re-send of a step that is not finished never reaches the
+/// terminal re-send branch at all: it is written again and settled like
+/// any write (the freeze, and the branch with it, cover only completed
+/// and skipped steps). Pinned so that holds: here the packet was left
+/// unsettled by an earlier write (`work` completed, no pass after it)
+/// and the re-send lands on a step still `pending`.
+#[tokio::test]
+async fn a_resend_of_an_unfinished_step_on_an_open_packet_settles_it_too() {
+    let h = harness();
+    let job_id = open_job(&h.app).await;
+
+    let work = step(&h.jobs, &job_id, "work").await;
+    let mut first = work.clone();
+    first.status = StepStatus::Completed;
+    first.completed_on = Some(chrono::Utc::now().date_naive());
+    h.jobs
+        .update_step(&first)
+        .await
+        .expect("first writer's step write");
+    let waiting = step(&h.jobs, &job_id, "nothing-to-do").await;
+    assert_eq!(waiting.status, StepStatus::Pending, "precondition");
+
+    let (status, body) = put_status(&h.app, &job_id, &waiting, "pending").await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the re-send answers 204: {body}"
+    );
+    assert_eq!(
+        step(&h.jobs, &job_id, "disproved").await.status,
+        StepStatus::Ready,
+        "the re-send of an unfinished step ran the readiness pass"
+    );
+    assert_eq!(
+        step(&h.jobs, &job_id, "nothing-to-do").await,
+        waiting,
+        "the re-sent step itself is not rewritten"
+    );
 }

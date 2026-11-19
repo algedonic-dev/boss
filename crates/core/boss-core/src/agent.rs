@@ -494,24 +494,27 @@ pub enum BudgetDecision {
     },
 }
 
-/// The caps an agent's registry row declares — `agents.hourly_budget_
-/// usd_micros` and `agents.max_concurrent_runs` (20260915212644), both
-/// nullable there and both optional here. `None` is "no cap declared"
-/// and admits every run: a missing number must not stop the stack (the
-/// boot-guard lesson of 2026-09-07), so unbudgeted is never a refusal.
+/// The cap an agent's registry row declares — `agents.hourly_budget_
+/// usd_micros` (20260915212644), nullable there and optional here. `None`
+/// is "no cap declared" and admits every run: a missing number must not
+/// stop the stack (the boot-guard lesson of 2026-09-07), so unbudgeted is
+/// never a refusal.
+///
+/// NO CONCURRENCY CAP (backlog 3e927996; David, design a3c5e58a Q3). The
+/// row's `max_concurrent_runs` was judged here too, and at the claim door;
+/// the station tree retired it — a robot's runs are bounded by its
+/// `robots:<model>` pool alone — so the column is a stored declaration
+/// nothing reads into a decision.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCaps {
     pub hourly_budget_usd_micros: Option<u64>,
-    pub max_concurrent_runs: Option<u32>,
 }
 
 /// What the ledger measured for an agent at the admission instant: the
-/// micro-USD its priced runs spent in the window, and how many of its
-/// runs were in flight.
+/// micro-USD its priced runs spent in the window.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AgentLoad {
     pub spent_usd_micros: u64,
-    pub in_flight: u32,
 }
 
 impl BudgetDecision {
@@ -522,10 +525,8 @@ impl BudgetDecision {
     /// testable and a recorded decision replays without recomputing.
     ///
     /// Spend at or over the cap denies (a cap of zero denies every run:
-    /// declared, not absent); in-flight at or over the concurrency cap
-    /// denies; a budget denial is reported before a concurrency one,
-    /// because the money is what the desk can act on. Otherwise allow,
-    /// with the remainder when there is a cap to count down from.
+    /// declared, not absent). Otherwise allow, with the remainder when
+    /// there is a cap to count down from.
     pub fn decide(caps: AgentCaps, load: AgentLoad) -> BudgetDecision {
         if let Some(cap) = caps.hourly_budget_usd_micros
             && load.spent_usd_micros >= cap
@@ -534,16 +535,6 @@ impl BudgetDecision {
                 reason: format!(
                     "hourly budget exhausted: spent {} of {} usd_micros in the last hour",
                     load.spent_usd_micros, cap
-                ),
-            };
-        }
-        if let Some(max) = caps.max_concurrent_runs
-            && load.in_flight >= max
-        {
-            return BudgetDecision::Deny {
-                reason: format!(
-                    "concurrency cap reached: {} of {} runs in flight",
-                    load.in_flight, max
                 ),
             };
         }
@@ -862,14 +853,12 @@ mod tests {
     fn capped(cap: u64) -> AgentCaps {
         AgentCaps {
             hourly_budget_usd_micros: Some(cap),
-            max_concurrent_runs: None,
         }
     }
 
     fn spent(usd: u64) -> AgentLoad {
         AgentLoad {
             spent_usd_micros: usd,
-            in_flight: 0,
         }
     }
 
@@ -928,63 +917,6 @@ mod tests {
                 remaining_usd_micros: None
             }
         );
-    }
-
-    #[test]
-    fn under_the_concurrency_cap_allows() {
-        let caps = AgentCaps {
-            hourly_budget_usd_micros: None,
-            max_concurrent_runs: Some(2),
-        };
-        let d = BudgetDecision::decide(
-            caps,
-            AgentLoad {
-                spent_usd_micros: 0,
-                in_flight: 1,
-            },
-        );
-        assert!(d.is_allowed(), "{d:?}");
-    }
-
-    #[test]
-    fn at_the_concurrency_cap_denies_naming_the_count() {
-        let caps = AgentCaps {
-            hourly_budget_usd_micros: None,
-            max_concurrent_runs: Some(2),
-        };
-        let d = BudgetDecision::decide(
-            caps,
-            AgentLoad {
-                spent_usd_micros: 0,
-                in_flight: 2,
-            },
-        );
-        let BudgetDecision::Deny { reason } = d else {
-            panic!("two in flight of two is full: {d:?}");
-        };
-        assert!(reason.contains("2 of 2"), "{reason}");
-        assert!(reason.contains("in flight"), "{reason}");
-    }
-
-    #[test]
-    fn a_budget_denial_is_reported_before_a_concurrency_one() {
-        // Both exhausted: the reason names the money, because the
-        // money is what the desk can do something about.
-        let caps = AgentCaps {
-            hourly_budget_usd_micros: Some(10),
-            max_concurrent_runs: Some(1),
-        };
-        let d = BudgetDecision::decide(
-            caps,
-            AgentLoad {
-                spent_usd_micros: 10,
-                in_flight: 1,
-            },
-        );
-        let BudgetDecision::Deny { reason } = d else {
-            panic!("{d:?}");
-        };
-        assert!(reason.contains("hourly"), "{reason}");
     }
 
     #[test]

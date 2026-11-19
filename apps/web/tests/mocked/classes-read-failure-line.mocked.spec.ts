@@ -30,22 +30,6 @@ const ACCOUNT_ID = 'acct-tiers';
 const ACCOUNT_ROW = { id: ACCOUNT_ID, name: 'Tier Taproom', director: null, city: null, state: null, tier: 'gold', customer_since: null, territory_rep_id: null };
 const ACCOUNTS_LIST = /\/api\/people\/accounts\?limit=1000$/;
 
-/// The account page's reads, answered, so its Account section renders
-/// (account-notes-author-names does the same).
-async function accountPage(page: Page): Promise<void> {
-  await page.route(new RegExp(`/api/people/accounts/${ACCOUNT_ID}$`), (r) =>
-    json(r, ACCOUNT_ROW),
-  );
-  for (const re of [
-    new RegExp(`/api/assets\\?account_id=${ACCOUNT_ID}&`),
-    new RegExp(`/api/commerce/invoices\\?account_id=${ACCOUNT_ID}&`),
-    new RegExp(`/api/jobs\\?subject_id=${ACCOUNT_ID}&`),
-    new RegExp(`/api/shipping/shipments\\?account_id=${ACCOUNT_ID}&`),
-  ]) {
-    await page.route(re, (r) => json(r, paged([])));
-  }
-}
-
 /// One invoice on the account above, for the invoice page's Account
 /// section (finance-page's fixture shape).
 async function invoicePage(page: Page): Promise<void> {
@@ -75,30 +59,12 @@ const CASES: ReadonlyArray<Case> = [
   { reader: 'AppShell (the sidebar)', path: ROUTE_CATALOG.inbox.path, subjectKind: 'employee', what: 'roles',
     fallback: 'The sidebar shows every surface, not the ones your role declares.' },
   { reader: 'InboxPage', path: ROUTE_CATALOG.inbox.path, subjectKind: 'employee', what: 'roles', fallback: ROLES },
-  { reader: 'QaPage', path: ROUTE_CATALOG.qa.path, subjectKind: 'employee', what: 'roles', fallback: ROLES },
-  { reader: 'HrPage', path: ROUTE_CATALOG.hr.path, subjectKind: 'employee', what: 'roles',
-    fallback: 'Roles show by code, and the counts include every role.' },
-  { reader: 'PeopleList and its OrgTreeNode', path: ROUTE_CATALOG.people.path, subjectKind: 'employee',
-    what: 'roles and statuses',
-    fallback: 'Roles and statuses show by code, and the headcount includes every role.' },
-  { reader: 'EmployeePage', path: `${ROUTE_CATALOG.people.path}/emp-001`, subjectKind: 'employee', what: 'roles', fallback: ROLES },
-  { reader: 'PolicyPage (the roles EditPolicyFlyout is opened on)', path: ROUTE_CATALOG.policy.path,
-    subjectKind: 'employee', what: 'roles', fallback: 'Roles holding no rules are not listed.' },
-  { reader: 'AccountsList and its TierChip', path: ROUTE_CATALOG.accounts.path, subjectKind: 'account',
-    what: 'account tiers', fallback: TIERS },
-  { reader: "AccountPage's TierChip", path: `${ROUTE_CATALOG.accounts.path}/${ACCOUNT_ID}`, subjectKind: 'account',
-    what: 'account tiers', fallback: TIERS, setup: accountPage },
-  { reader: "InvoicePage's TierChip", path: '/ux/finance/inv-tiers', subjectKind: 'account',
+  // QaPage, HrPage, PeopleList, EmployeePage, PolicyPage, AccountsList,
+  // AccountPage, SupportPage and AssetsList were readers here until
+  // their pages went with step 1 of design 01fa5bdf.
+  { reader: "InvoicePage's TierChip", path: '/finance/invoices/inv-tiers', subjectKind: 'account',
     what: 'account tiers', fallback: TIERS, setup: invoicePage },
-  { reader: "SupportPage's TierChip (Account Health)", path: ROUTE_CATALOG.support.path, subjectKind: 'account',
-    what: 'account tiers', fallback: TIERS,
-    setup: async (page) => {
-      await page.route(ACCOUNTS_LIST, (r) => json(r, paged([ACCOUNT_ROW])));
-    },
-    open: (page) => page.getByRole('tab', { name: 'Account Health' }).click() },
-  { reader: 'WatchlistPage', path: ROUTE_CATALOG.watchlist.path, subjectKind: 'account', what: 'account tiers', fallback: TIERS },
-  { reader: 'AssetsList', path: ROUTE_CATALOG.assets.path, subjectKind: 'asset', what: 'asset phases',
-    fallback: 'Phases show by code, not by their registry names.' },
+  { reader: 'WatchlistPage', path: ROUTE_CATALOG.accounts.path, subjectKind: 'account', what: 'account tiers', fallback: TIERS },
 ];
 
 const classesOf = (kind: string): RegExp => new RegExp(`/api/classes\\?subject_kind=${kind}$`);

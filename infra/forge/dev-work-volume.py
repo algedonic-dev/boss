@@ -91,8 +91,90 @@ def qualified_longhorn_image(value, component):
     return value in (familiar, 'docker.io/' + familiar)
 
 
+def dev_build_scheduling(pods, claims, volumes, reads, deadline=None):
+    """Observed existing reservations, never worker admission or resize authority."""
+    result = {'state': 'OBSERVED', 'basis': 'existing reservations; zero additional growth; not placement admission',
+              'workers': []}
+    try:
+        workers = [p for p in whole(pods, 'Pod', TARGET[0])
+                   if p['metadata']['name'].startswith('dev-build-')]
+        need(len(workers) <= 16, 'dev-build roster exceeds bounded diagnostic')
+        claim_rows = whole(claims, 'PersistentVolumeClaim', TARGET[0])
+        volume_rows = whole(volumes, 'Volume', 'longhorn-system')
+        replicas = whole(reads['replicas'], 'Replica', 'longhorn-system')
+        nodes = whole(reads['nodes'], 'Node', 'longhorn-system')
+        op, minimum = reads['overprovisioning'], reads['minimal_available']
+        identity(op, 'Setting', 'storage-over-provisioning-percentage', 'longhorn-system')
+        identity(minimum, 'Setting', 'storage-minimal-available-percentage', 'longhorn-system')
+        for pod in workers:
+            row = {'pod': identity(pod, 'Pod', namespace=TARGET[0]), 'state': 'UNKNOWN'}
+            result['workers'].append(row)
+            try:
+                labels = pod['metadata'].get('labels', {})
+                session = labels.get('boss.dev/session', '')
+                need(labels.get('boss.dev/purpose') == 'isolated-build'
+                     and re.fullmatch(r'dev-build-[0-9a-f]{16}', session) is not None
+                     and pod['metadata']['name'].startswith(session+'-'), 'dev-build selector identity disagrees')
+                names = [v['persistentVolumeClaim']['claimName'] for v in pod['spec'].get('volumes', [])
+                         if 'persistentVolumeClaim' in v]
+                need(names == [session], 'dev-build workspace claim identity disagrees')
+                matches = [c for c in claim_rows if c['metadata']['name'] == session]
+                need(len(matches) == 1, 'dev-build claim missing or ambiguous')
+                claim = matches[0]
+                row['claim_uid'] = claim['metadata']['uid']
+                need(claim['status']['phase'] == 'Bound', 'dev-build claim is not Bound')
+                name = claim['spec']['volumeName']
+                found = [v for v in volume_rows if v['metadata']['name'] == name]
+                need(len(found) == 1, 'dev-build Longhorn volume missing or ambiguous')
+                volume = found[0]
+                binding = volume['status']['kubernetesStatus']
+                need((binding['namespace'], binding['pvcName'], binding['pvName']) ==
+                     (TARGET[0], session, name), 'dev-build Longhorn claim binding disagrees')
+                row.update(volume=name, volume_uid=volume['metadata']['uid'])
+                roster = [r for r in replicas if r['spec']['volumeName'] == name]
+                need(roster and len(roster) == uint(volume['spec']['numberOfReplicas']),
+                     'dev-build replica roster missing or incomplete')
+                remaining = 10 if deadline is None else min(10, deadline-time.monotonic())
+                need(remaining > 0, 'native diagnostic deadline exhausted')
+                checked = subprocess.run(['bash', str(ROOT / 'infra/lib/check-longhorn-expansion.sh')],
+                    input=json.dumps({'volume': volume, 'replicas': roster, 'nodes': nodes,
+                                      'opct': uint(op['value']), 'mpct': uint(minimum['value']), 'growth': 0}),
+                    text=True, capture_output=True, timeout=remaining, check=False)
+                row.update(ledger_exit=checked.returncode, ledger_stdout=checked.stdout, ledger_stderr=checked.stderr)
+                need(checked.returncode == 0, 'existing reservation ledger cannot answer or refuses')
+                row.update(state='OBSERVED', ledger=decode_native(checked.stdout))
+            except (ValueError, KeyError, TypeError, subprocess.SubprocessError, OSError) as error:
+                row['cause'] = str(error)
+        if any(row['state'] == 'UNKNOWN' for row in result['workers']):
+            result.update(state='UNKNOWN', cause='one or more worker observations cannot answer')
+    except (ValueError, KeyError, TypeError) as error:
+        result.update(state='UNKNOWN', cause=str(error))
+    return result
+
+
+# 4f60b5b2: what each disk's signed verdict was judged by. The figures it
+# was judged on ride beside the plan, never in it (planned()).
+ADMISSION_RULE = ('Longhorn v1.11.3 ValidateDiskAvailableForExpansion, then IsSchedulableToDisk '
+                  'with requiredStorage 0, over the live disk ledger (infra/lib/check-longhorn-expansion.sh); '
+                  're-judged on a fresh read immediately before the one patch')
+
+
 def plan(reads, requested):
     """Return stable signed facts only after live physical admission succeeds."""
+    return planned(reads, requested)[0]
+
+
+def planned(reads, requested):
+    """(signed proposal, live figures it was admitted on).
+
+    4f60b5b2: requests 06873bac and 20c62983 were refused minutes after
+    David approved them, because their signed plans carried each disk's
+    scheduled bytes, which move whenever a dev-build worker volume comes or
+    goes, and the session process list, which grows at every ssh login. The
+    signed bytes carry identities, the growth and the admission VERDICT (the
+    856f070e precedent, verdicts not reasons); the live figures are printed
+    and recorded but never hashed, and execute re-judges them before writing.
+    """
     try:
         return _plan(reads, requested)
     except (KeyError, TypeError, IndexError) as error:
@@ -100,10 +182,10 @@ def plan(reads, requested):
 
 
 def _plan(r, requested):
-    need(type(requested) is str and re.fullmatch(r'[1-9][0-9]?Gi', requested) is not None,
+    need(type(requested) is str and re.fullmatch(r'[1-9][0-9]{0,2}Gi', requested) is not None,
          'explicit whole GiB target required')
     wanted = size(requested)
-    need(wanted <= 64 * GIB, 'target exceeds approved 64 GiB ceiling')
+    need(65 * GIB <= wanted <= 128 * GIB, 'target outside approved 65..128 GiB range')
     pvc = r['pvc']
     claim = identity(pvc, 'PersistentVolumeClaim', TARGET[1], TARGET[0])
     need(pvc['status']['phase'] == 'Bound', 'claim is not Bound')
@@ -155,7 +237,10 @@ def _plan(r, requested):
     checked = subprocess.run(['bash', str(ROOT / 'infra/lib/check-longhorn-expansion.sh')],
                              input=json.dumps(ledger), text=True, capture_output=True, timeout=10, check=False)
     need(checked.returncode == 0, 'Longhorn admission cannot answer or refuses: ' + checked.stderr)
-    disks = json.loads(checked.stdout)
+    ledger_rows = json.loads(checked.stdout)
+    disks = [{'node': d['node'], 'uuid': d['uuid'], 'name': d['name'], 'count': d['count'],
+              'required_bytes': d['required_bytes'], 'verdict': 'admitted', 'rule': ADMISSION_RULE}
+             for d in ledger_rows]
     pods = [p for p in whole(r['pods'], 'Pod', TARGET[0]) if any(
         v.get('persistentVolumeClaim', {}).get('claimName') == TARGET[1] for v in p['spec'].get('volumes', []))]
     need(len(pods) == 1, 'claim must have exactly one current consumer')
@@ -209,8 +294,13 @@ def _plan(r, requested):
          'actual mounted filesystem capacity unavailable or disagrees')
     need(mount['available_bytes'] + wanted - before > 18*GIB,
          'requested growth does not project mounted headroom above the unchanged18GiB floor')
+    # The session's processes are a continuity witness execute takes from its
+    # own read before the write, not an identity to sign: an ssh login or a
+    # tmux client between render and approval voided 06873bac (4f60b5b2).
     binding = {k: mount[k] for k in ('filesystem', 'source', 'mountpoint', 'device', 'boot_id')}
-    binding['processes'] = processes
+    live = {'basis': 'live figures admission was judged on; printed and recorded, never signed (4f60b5b2)',
+            'disks': ledger_rows,
+            'mount': {'available_bytes': mount['available_bytes'], 'processes': processes}}
     proposal = {'purpose': 'dev-work-volume', 'claim': dict(claim, namespace=TARGET[0]), 'pv': pv_id,
             'summary': f'Grow boss-dev/boss-dev-work from {before//GIB}Gi to {wanted//GIB}Gi; '
                        f'+{(wanted-before)//GIB}Gi per existing replica, '
@@ -230,7 +320,7 @@ def _plan(r, requested):
     # decided_2026-10-17_emp-david: no cost gate. The volume is Longhorn on
     # our own hardware, so there is no bill to evidence; the resource plan
     # alone is what David's passkey signs.
-    return proposal
+    return proposal, live
 
 
 def digest(value):
@@ -255,7 +345,7 @@ def render_manifest(template, claim):
     identity(claim,'PersistentVolumeClaim',TARGET[1],TARGET[0])
     need(claim['spec']['storageClassName'] == 'longhorn-dev-disposable', 'live dev work class changed')
     current = claim['spec']['resources']['requests']['storage']
-    need(40*GIB <= size(current) <= 64*GIB, 'live request outside approved dev work range; never shrink')
+    need(40*GIB <= size(current) <= 128*GIB, 'live request outside approved dev work range; never shrink')
     documents[index] = re.sub(r'^      storage: 40Gi$', '      storage: '+current, documents[index], flags=re.M)
     return '\n---\n'.join(documents)
 
@@ -270,7 +360,9 @@ def execute(read, patch, requested, approved, wait_seconds=0, room=None):
     before = plan(read(), requested)
     need(digest(before) == approved, 'approved plan drift; nothing patched')
     # Re-read every physical admission and stable binding immediately before CAS.
-    current = plan(read(), requested)
+    # A disk that has really lost room refuses here, its figures in the
+    # refusal; the figures that admitted the write ride its receipt (4f60b5b2).
+    current, admitted = planned(read(), requested)
     need(digest(current) == approved, 'plan drift before write; nothing patched')
     patch(current['write']['patch'])
     deadline = time.monotonic() + wait_seconds
@@ -298,7 +390,7 @@ def execute(read, patch, requested, approved, wait_seconds=0, room=None):
         mount = after['mount']
         baseline = before['mount_binding']
         need(all(mount[k] == baseline[k] for k in ('filesystem','source','mountpoint','device','boot_id'))
-             and all(p in mount['processes'] for p in baseline['processes']),
+             and all(p in mount['processes'] for p in admitted['mount']['processes']),
              'request stands; mount/session continuity changed, effect unproven')
         wanted = before['target_bytes']
         ready = (size(pvc['spec']['resources']['requests']['storage']) == wanted
@@ -312,6 +404,7 @@ def execute(read, patch, requested, approved, wait_seconds=0, room=None):
             return {'plan_sha256': approved, 'claim_uid': before['claim']['uid'], 'pod_uid': before['pod']['uid'],
                     'mounted_available_bytes': available, 'capacity_bytes': wanted,
                     'mounted_capacity_bytes': uint(mount['capacity_bytes']),
+                    'admitted_live': admitted,
                     'record_conservation': 'unproven; independent evidence required'}
         left = deadline - time.monotonic()
         need(left > 0, 'request stands; capacity/filesystem expansion is not proven; no growth retry')
@@ -472,6 +565,26 @@ class Native:
         self.call(['patch','pvc','boss-dev-work','-n','boss-dev','--type=json','-p',json.dumps(value),
                    '-o','json','--request-timeout=20s'])
 
+    def worker_scheduling(self, reads):
+        # Constant two complete list reads, no per-worker requests or new rights.
+        # Originals share the existing deadline and lossless evidence carrier.
+        start = len(self.records)
+        try:
+            need(self.room() >= 2, 'native evidence has no room for worker diagnostics')
+            claims = self.get('pvc', namespace=TARGET[0])
+            volumes = self.get('volumes.longhorn.io', namespace='longhorn-system')
+            return dev_build_scheduling(reads['pods'], claims, volumes, reads, self.deadline)
+        except Exception as error:
+            # Review 2814c3c5: any error, not only the expected ones; this runs
+            # in main's finally, and an escape would replace the plan's result.
+            return {'state': 'UNKNOWN', 'cause': str(error), 'workers': [],
+                    'basis': 'diagnostic only; no worker placement or resize authority'}
+        finally:
+            # Review 2814c3c5: these originals stay in the carrier, marked, so a
+            # failed or timed-out diagnostic read is kept but never counted as
+            # a failed observation of the plan (--decode-evidence).
+            self.records[start:] = [dict(record, diagnostic=True) for record in self.records[start:]]
+
     def patch_issued(self):
         """Whether the write was sent: from then on, no refusal may deny its effect."""
         return any(record['argv'][:1] == ['patch'] for record in self.records)
@@ -521,8 +634,11 @@ def main(args):
         directory=Path(args[2])
         decoded=carrier.restore(reference,args[3],lambda file_id:carrier.read_part(directory,file_id),include_failure=True)
         if transport['plan_success']:
-            need(decoded['failure'] is None and decoded['records']
-                 and all(record['exit']==0 for record in decoded['records']),
+            # A marked worker diagnostic read is retained, not judged: it is
+            # not admission (review 2814c3c5). Every plan observation still is.
+            observed=[record for record in decoded['records'] if record.get('diagnostic') is not True]
+            need(decoded['failure'] is None and observed
+                 and all(record['exit']==0 for record in observed),
                  'successful ops carrier contains failed native observations')
         decoded['carrier']=transport
         print(render(decoded),end='')
@@ -536,7 +652,7 @@ def main(args):
     planning = len(args) == 2 and args[0] == '--plan'
     need(planning or len(args) == 2, 'usage: --plan <size> OR <size> <approved-plan-sha256>')
     requested = args[1] if planning else args[0]
-    need(re.fullmatch(r'(4[1-9]|5[0-9]|6[0-4])Gi', requested) is not None, 'fixed41..64Gi purpose only')
+    need(re.fullmatch(r'(6[5-9]|[7-9][0-9]|1[01][0-9]|12[0-8])Gi', requested) is not None, 'fixed65..128Gi purpose only')
     need(planning or re.fullmatch(r'[0-9a-f]{64}',args[1]) is not None, 'exact approved-plan hash required')
     # Parse the door from the trusted wrapper, never from a request parameter.
     door = shlex.split(os.environ.get('BOSS_DEV_WORK_KUBECTL', ''))
@@ -545,7 +661,18 @@ def main(args):
     failure=None
     try:
         if planning:
-            proposal = plan(native.read(), requested)
+            reads = native.read()
+            try:
+                proposal, live = planned(reads, requested)
+                # 4f60b5b2: printed beside the signed bytes, never in them;
+                # one prefixed line, so from_packet never reads it as evidence.
+                print('dev-work-live: '+json.dumps(live, sort_keys=True), file=sys.stderr)
+            finally:
+                # ONE compact line (review 2814c3c5): from_packet reads every
+                # stderr line starting with '{' as the evidence document, and
+                # an indented render put one there for every worker row.
+                print('dev-build-scheduling: '+json.dumps(native.worker_scheduling(reads), sort_keys=True),
+                      file=sys.stderr)
         else:
             receipt = execute(native.read,native.patch,requested,args[1],wait_seconds=600,room=native.room)
     except Exception as error:

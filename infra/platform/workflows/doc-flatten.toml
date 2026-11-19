@@ -33,7 +33,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "Periodic curation: fold settled decisions into the one current-truth record, retire what they supersede, and prove the corpus still resolves. Born from David's ruling that the corpus is a working surface rather than an archive - history is kept, but edited - and from the audit finding that the declared flatten process had never actually run."
-metadata = { department = "it", surfaces = ["system-design"] }
+metadata = { owner = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5", department = "it", surfaces = ["system-design"] }
 
 [[workflow.step]]
 title = "opened"
@@ -59,6 +59,7 @@ fields = [
   { name = "source_docs", field_type = "string", required = true },
   { name = "already_folded", field_type = "string" },
 ]
+metadata_defaults = { at = "cc856b32-3667-4e70-b6cd-667f6fe89007" }
 
 [[workflow.step]]
 title = "fold"
@@ -72,6 +73,7 @@ fields = [
   { name = "decisions_folded", field_type = "string", required = true },
   { name = "target_sections", field_type = "string", required = true },
 ]
+metadata_defaults = { at = "cc856b32-3667-4e70-b6cd-667f6fe89007" }
 
 [[workflow.step]]
 title = "curate"
@@ -86,6 +88,7 @@ fields = [
   { name = "retired", field_type = "string", required = true },
   { name = "kept", field_type = "string", required = true },
 ]
+metadata_defaults = { at = "cc856b32-3667-4e70-b6cd-667f6fe89007" }
 
 [[workflow.step]]
 title = "verify"
@@ -99,6 +102,7 @@ fields = [
   { name = "lint", field_type = "string", required = true },
   { name = "references", field_type = "string", required = true },
 ]
+metadata_defaults = { at = "cc856b32-3667-4e70-b6cd-667f6fe89007" }
 
 [[workflow.step]]
 title = "review"
@@ -107,6 +111,7 @@ ready_when = "steps.verify.done"
 title_template = "Ratify the fold"
 authority_role = "platform-admin"
 fields = [{ name = "decision", field_type = "pending|approved|rejected|changes-requested", required = true }]
+metadata_defaults = { at = "cc856b32-3667-4e70-b6cd-667f6fe89007" }
 
 [[workflow.step]]
 title = "recorded"

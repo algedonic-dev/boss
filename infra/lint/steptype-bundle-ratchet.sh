@@ -84,6 +84,16 @@ BUNDLE="crates/core/boss-jobs/seeds/step_types.toml"
 # the trunk" at it is a wrong remediation: measured on 2026-09-11 in a
 # gate workspace where the trunk was present and every git command was
 # exiting 128 (backlog 6b2f4a1a).
+#
+# A declared absence is neither: the public mirror says it has no per-car
+# trunk (BOSS_TRUNK=none, lib/trunk-ref.sh; backlog 2d28df78), and the
+# forge ratcheted each car. The bundle is still read and its kinds
+# counted, so the line says what went unjudged.
+if lint_no_trunk "$LINT" "whether this change tightened the step-kind bundle"; then
+    head_kinds=$(grep -c '^kind = ' "$BUNDLE" || true)
+    lint_scanned "$LINT" "$head_kinds" "step kind(s) in $BUNDLE; this run declares no per-car trunk, so none was compared with one — not judged"
+    exit 0
+fi
 trunk=$(resolve_trunk_ref "$LINT"); rc=$?
 if [ "$rc" -eq "$LINT_CANNOT_ANSWER" ]; then
     exit "$LINT_CANNOT_ANSWER"

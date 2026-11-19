@@ -30,7 +30,7 @@ owning_team = "platform"
 # Existing packets keep their pin; this declares no native activation.
 metadata_schema = { type = "object", immutable_fields = ["gate_launch_intent", "gate_launch_observation", "gate_orphan_claim", "gate_submission"], guarded_fields = ["gate_launch_attempt"] }
 description = "A full-gate execution as a tracked unit of work. The runner registers the packet at launch, heartbeats while running, and closes it with the receipt - green, failed, or lost (lost is an honest verdict). An OVERDUE open gate-run packet is the alarm: it means the runner died (pod replacement, OOM, node bounce). RELAUNCH PROTOCOL, learned 2026-08-22/23: the chain script lives on the PVC at /work/gate-out-launcher.sh and is resumable (each gate skips itself if its receipt exists in /work/gate-out/); on any overdue packet, re-exec it in a fresh tmux session, PATCH a relaunch_note onto the packet, and bump due_on. Receipts on the PVC, never /scratch. Throttle: CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=2 nice 10 under the container's 8/16Gi bounds."
-metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
+metadata = { owner = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5", department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
 
 [[workflow.step]]
 title = "launched"
@@ -49,10 +49,37 @@ kind = "gate-verdict"
 duration_hours = 3.0
 ready_when = "steps.launched.done"
 title_template = "Record the receipt"
-metadata_defaults = { heartbeat_at = "" }
+metadata_defaults = { at = "a426acd5-4c77-4ec9-9686-c96cd59b53d7", heartbeat_at = "" }
+# EXECUTED BY EQUIPMENT: THE GATES (design ccfe87ff, question
+# first-executors, decided by David 2026-11-05; backlog 364b27a3). This
+# is the one step of a gate-run that stands open for the whole run, so
+# its holds ARE the occupancy the `gates` row's `bays` bound, and the
+# gates row is the right equipment rather than a station of its own,
+# which would be a second home for the gate capacity (CLAUDE.md §9a). A
+# claim clears only for the station's automaton, automation:gate-runner,
+# with a free bay. Measured 2026-11-05: 30 of the 30 newest closed runs
+# completed this step from READY with no holder (the conductor records
+# the receipt the runner leaves), so no live completion passes the claim
+# door and nothing strands. A row declaring an `executor` is held from
+# the unattended drift publish; infra/platform/workflow-holds/gate-run.toml
+# says why and what lifts it.
+executor = "equipment:gates"
+# AN EQUIPMENT FAULT IS NOT A PRODUCT DEFECT (item c02fc3b3; factory
+# taxonomy M4). Two optional facts beside `verdict`, which is unchanged:
+# the conductor's verdict recorder writes each from the receipt it holds
+# (boss_jobs::failure_facts) — equipment_fault = {kind: refused|lost|
+# stall-deadline|unjudged, checks, io_full_s, wall_s, why}, product_defect =
+# {checks, entries, why} — and a red holding both records both. A red
+# with no readable verdict is `unjudged` and never a product_defect. Readers
+# (the dock's strike count, the alert, auto-cancel, the merge) are car
+# T3b. Declared in the `gate-verdict` StepType bundle too, which is the
+# validator the live lineage already runs; this row reaches the live
+# registry through `boss workflow publish gate-run`.
 fields = [
   { name = "verdict", field_type = "green|failed|lost|refused|withdrawn", required = true },
   { name = "receipt", field_type = "string" },
+  { name = "equipment_fault", field_type = "object" },
+  { name = "product_defect", field_type = "object" },
 ]
 
 [[workflow.step]]

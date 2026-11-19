@@ -20,6 +20,7 @@ import type { AppId, Department } from '@boss/web-kit/nav';
 import {
   APP_SUBJECT_KINDS,
   ROUTE_CATALOG,
+  STATION,
   appForSection,
   appsFor,
   departmentJobsPath,
@@ -28,11 +29,12 @@ import {
   departmentRows,
   departmentsWithoutSurfaces,
   inPerspective,
+  unhostedPages,
   type NavItem,
 } from './nav-catalog';
 import { appForRoute, withRoster } from './sections';
 import { parseRoute, type Route } from '../router';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 
 /// The departments registry's rows, read from the files that seed them
 /// rather than restated here — restating is the drift this test exists
@@ -92,11 +94,12 @@ const APPS = appsFor(SEEDED, { simulator: true });
 /// is still pinned verbatim: the app they belong to changed, which
 /// surfaces belong together did not. If a future change moves a
 /// surface into or out of the set, this list is the thing to update,
-/// deliberately.
+/// deliberately. 'system-experiments' and 'policy' left with their
+/// pages in step 1 of design 01fa5bdf (2026-11-17).
 const LEGACY_MODEL_ROUTES: ReadonlyArray<string> = [
   'system-monitoring', 'system-step-plugins', 'system-dispatcher',
   'system-subjects', 'system-dispatcher-rules', 'system-dispatcher-rule',
-  'system-kb', 'system-design', 'system-experiments', 'policy',
+  'system-kb', 'system-design',
   // One entry, not two. `workflows` (the authoring row, already
   // dropped from the sidebar) and `workflows` (the catalog) were
   // separate keys pointing at the same path; the rename collapsed
@@ -146,10 +149,8 @@ describe('nav catalog — app assignment', () => {
     // Flow — the team's own throughput, in wall-clock time. Distinct
     // from System Monitoring on purpose: monitoring answers what the
     // machine is doing, Flow answers what the people got through.
-    // Fleet — every in-flight Job of a kind on its Workflow's DAG.
-    // Beside Flow deliberately: Flow is throughput, Fleet is where
-    // the work is piling up (queue-visibility Q4's depth signal).
-    'system-fleet',
+    // Fleet (Bottlenecks), Incidents and Atlas were rows here until
+    // step 1 of design 01fa5bdf (2026-11-17) took them with the map.
     // The Crew Board, the Receiving Yard and the Marshalling Yard were
     // rows here (04c5bbc0, 92921c2f) and LEFT the catalog with car N1
     // of design e765b3fc (2026-09-25): each is a station on the
@@ -158,18 +159,10 @@ describe('nav catalog — app assignment', () => {
     // only to be a sidebar row.
     // The train yard — the departure board over the pipeline's queues
     // and the IT app's guest-visible landing (departure-board.md Q1).
-    // Its car landed without this line; added when the map arrived.
+    // Its car landed without this line; added when the map arrived. The
+    // alarms board since design 01fa5bdf step 1.
     'system-yard',
-    // The network map — every registry station as a node
-    // (stations.md: priority queues, stations, and network nodes are
-    // one concept). No edges until motion is evented.
-    // Incidents — active incident packets to respond to,
-    // plus the closed ones rendered as a durable archive (David:
-    // "both where we respond to active incidents and document post
-    // mortems for posterity").
-    'system-incidents',
     'system-performance',
-    'system-atlas',
     // The hardware registry page — declared beside observed, plus the
     // dev-workspace ssh door (59ef456a).
     'system-estate',
@@ -214,8 +207,8 @@ describe('nav catalog — app assignment', () => {
     // is also the executable "17 pages became 6, plus one decided since"
     // claim.
     const SIDEBAR_ROWS: ReadonlyArray<string> = [
-      'system-yard',        // /it — the Department Map, the landing
-      'system-incidents',   // Operate
+      'system-yard',        // /it — the alarms board, the landing
+      'system-monitoring',  // Operate — the audit log since design 01fa5bdf
       'workflows',          // Registry
       'system-design',      // Design
       'system-codebase',    // Codebase — see below
@@ -249,7 +242,6 @@ describe('nav catalog — app assignment', () => {
       'system-dispatcher-rules', // reached from the cascade
       'system-dispatcher-rule',
       'auth-admin',              // unlisted by design (1f6d55e0)
-      'system-monitoring',       // the permKey behind Operate's gated tabs
     ];
     const unreachable = entries
       .filter(([, v]) => v.owner === 'it')
@@ -268,17 +260,17 @@ describe('nav catalog — app assignment', () => {
     expect(listed).toEqual([]);
   });
 
-  it('the IT sidebar leads with the Department Map, which is also where the IT tab lands', () => {
-    // Design e765b3fc, car N1 (David, 2026-09-25): the map at the top of
-    // the page, and ONE sidebar row for it — "Department Map" — where
-    // Receiving Yard, Marshalling Yard, Train Yard and Crew Board stood
-    // (design 55417146's flow-ordered four). The landing is the entry
-    // flagged `landing` (design 8c3e9599 §5), so it no longer rests on
-    // the map happening to come first in catalog order.
+  it('the IT sidebar leads with the alarms board, which is also where the IT tab lands', () => {
+    // Design e765b3fc, car N1 (David, 2026-09-25): ONE sidebar row for
+    // the map where Receiving Yard, Marshalling Yard, Train Yard and Crew
+    // Board stood (design 55417146's flow-ordered four). Step 1 of design
+    // 01fa5bdf pulled the map out and kept the row for what it left: the
+    // alarms board. The landing is the entry flagged `landing` (design
+    // 8c3e9599 §5), so it does not rest on coming first in catalog order.
     expect(departmentRows('it')[0]?.id).toBe('system-yard');
     expect(departmentLanding('it')?.id).toBe('system-yard');
     expect(ROUTE_CATALOG['system-yard'].landing).toBe(true);
-    expect(ROUTE_CATALOG['system-yard'].label).toBe('Department Map');
+    expect(ROUTE_CATALOG['system-yard'].label).toBe('Alarms');
     expect(ROUTE_CATALOG['system-yard'].path).toBe('/it');
     expect(APPS.find((a) => a.id === 'it')?.href).toBe('/it');
     expect(parseRoute('/it')).toEqual({ kind: 'systemYard' });
@@ -288,9 +280,29 @@ describe('nav catalog — app assignment', () => {
     // The four rows the map replaced are gone from the catalog too — no
     // row is left pointing at a floor page (no shims before 1.0.0).
     const catalog = ROUTE_CATALOG as Readonly<Record<string, NavItem | undefined>>;
-    for (const gone of ['system-receiving', 'system-marshalling', 'system-crew']) {
+    for (const gone of [
+      'system-receiving', 'system-marshalling', 'system-crew',
+      // design 01fa5bdf step 1
+      'system-incidents', 'system-atlas', 'system-fleet', 'system-experiments', 'policy',
+    ]) {
       expect(catalog[gone], gone).toBeUndefined();
     }
+  });
+
+  it('the /ux business pages and HR are gone from the catalog (design 01fa5bdf step 1)', () => {
+    const catalog = ROUTE_CATALOG as Readonly<Record<string, NavItem | undefined>>;
+    for (const gone of [
+      'sales', 'service', 'qa', 'warehouse', 'shipping', 'support', 'exec', 'catalog', 'parts',
+      'products', 'people', 'assets', 'shop', 'marketing-assets', 'hr', 'watchlist',
+    ]) {
+      expect({ gone, entry: catalog[gone] }).toEqual({ gone, entry: undefined });
+    }
+    // And no entry left points under a removed /ux address.
+    const removed = /^\/ux\/(accounts|assets|catalog|exec|marketing-assets|parts|people|products|qa|sales|service|shipping|shipments|shop|support|warehouse)(\/|$)|^\/people\/hr$/;
+    expect(entries.filter(([, v]) => removed.test(v.path)).map(([k]) => k)).toEqual([]);
+    // The watchlist kept its gate: the `accounts` entry is it now.
+    expect(ROUTE_CATALOG.accounts.path).toBe('/watchlist');
+    expect(ROUTE_CATALOG.accounts.permKey).toBe('accounts');
   });
 
   it('the shell keeps no list of its own: APP_SURFACES and IT_GROUPS are gone', () => {
@@ -337,7 +349,7 @@ describe('nav catalog — app assignment', () => {
       [...src.matchAll(/ROUTE_CATALOG(?:\.(\w[\w-]*)|\['([^']+)'\])/g)].map((m) => (m[1] ?? m[2])!);
     const catalog = ROUTE_CATALOG as Readonly<Record<string, NavItem | undefined>>;
     const homeGroups: ReadonlyArray<readonly [AppId, ReadonlyArray<NavItem | undefined>]> = [
-      ['home', rowsOf(between('const WORK', 'const HOME_GROUPS')).map((k) => catalog[k])],
+      // Home's Work group (All jobs) went with the jobs list, design 01fa5bdf.
       ['home', rowsOf(between('const HOME_GROUPS', 'let MAIN')).map((k) => catalog[k])],
     ];
     const departmentGroups = SEEDED.map((d) => [d.code, departmentRows(d.code)] as const);
@@ -363,11 +375,12 @@ describe('nav catalog — app assignment', () => {
     // then its child units (none nest yet), then Jobs. Sales lists its
     // pipeline first now — its landing, and first in the catalog — where
     // the deleted APP_SURFACES listed Accounts first against the tab that
-    // opened on the pipeline. The churn watchlist is a door reached from
-    // Accounts, not a row, as it was.
-    expect(departmentRows('sales').map((r) => r.id)).toEqual(['sales', 'accounts', 'shop', 'department-jobs']);
+    // opened on the pipeline. Since step 1 of design 01fa5bdf took the
+    // pipeline, Accounts and the Shop, Sales owns only the churn
+    // watchlist — a door, not a row, as it was — so its sidebar is Jobs.
+    expect(departmentRows('sales').map((r) => r.id)).toEqual(['department-jobs']);
     expect(departmentRows('finance').map((r) => r.id)).toEqual(['finance', 'vendors', 'department-jobs']);
-    expect(departmentRows('people').map((r) => r.id)).toEqual(['people', 'department-jobs']);
+    expect(departmentRows('people').map((r) => r.id)).toEqual(['department-jobs']);
     const jobs = departmentRows('sales').at(-1)!;
     expect(jobs).toEqual({ id: 'department-jobs', label: 'Jobs', path: '/sales/jobs' });
     // No owner of its own: it belongs to the group it sits in.
@@ -449,15 +462,12 @@ describe('appForSection — the App.svelte tab derivation', () => {
     expect(appForSection('system-yard')).toBe('it');
     expect(appForSection('accounts')).toBe('sales');
     expect(appForSection('finance')).toBe('finance');
-    // 'All jobs' stays on Home deliberately. It is the cross-cutting
-    // queue, and pinning it to one department would be the thing
-    // feedback 4b454768 objected to: "I shouldn't be jerked around
-    // through apps as I work."
-    expect(appForSection('jobs')).toBe('home');
-    expect(appForSection('warehouse')).toBe('warehouse');
-    expect(appForSection('shipping')).toBe('distribution');
-    expect(appForSection('marketing-assets')).toBe('marketing');
-    expect(appForSection('people')).toBe('people');
+    // 'All jobs' sat on Home deliberately until the list went with step
+    // 1 of design 01fa5bdf; a packet's own page takes Home's fallback
+    // section for the same reason (feedback 4b454768: "I shouldn't be
+    // jerked around through apps as I work").
+    expect(appForSection('vendors')).toBe('finance');
+    expect(appForSection('system-monitoring')).toBe('it');
     expect(appForSection('inbox')).toBe('home');
   });
 
@@ -560,8 +570,14 @@ describe('departments map to apps', () => {
     // Since c87e3d6d the roster is the departments registry, not the
     // employee Classes: `refurb` and `audit` were Classes and never
     // departments rows, and packaging and taproom are the brewery's
-    // declared departments with no screen yet.
-    expect(bare).toEqual(['packaging', 'taproom']);
+    // declared departments with no screen yet. Step 1 of design 01fa5bdf
+    // (2026-11-17) removed the /ux business pages, so every department
+    // but Finance, Sales (its watchlist) and IT has none now: each tab
+    // lands on its jobs view until a station's page is built for it.
+    expect(bare).toEqual([
+      'distribution', 'executive', 'maintenance', 'marketing', 'packaging', 'people',
+      'production', 'qa', 'service', 'support', 'taproom', 'warehouse',
+    ]);
   });
 
   // THE PIN the packet names (backlog 64656a46, car 2 of design
@@ -712,18 +728,9 @@ describe('a surface that lists a department names it by its owner', () => {
     }
   });
 
-  it('the two jobs-queue surfaces are owned, so neither needs a kind literal', () => {
-    expect(ROUTE_CATALOG.sales.owner).toBe('sales');
-    expect(ROUTE_CATALOG.service.owner).toBe('service');
-  });
-
-  // Backlog 044dffa1 (2026-09-23, page audit 63d810aa): /ux/parts made
-  // four reads and none was a jobs read, so a warehouse packet — once a
-  // protocol declares the department — could never appear on the
-  // warehouse's own page. The department it lists is its owner.
-  it('the parts surface lists the warehouse department it sits under', () => {
-    expect(ROUTE_CATALOG.parts.owner).toBe('warehouse');
-  });
+  // The two jobs-queue surfaces (Service queue, Sales pipeline) and the
+  // parts surface (backlog 044dffa1) were pinned here until they went
+  // with step 1 of design 01fa5bdf.
 
   // Backlog 4d4dc204 (2026-09-23, page audit 3f964c57 gap 2): /ux/finance
   // made no jobs read and linked nowhere that did, so a receive-a-payout
@@ -741,8 +748,106 @@ describe('standalone Views retirement', () => {
     }
     const rows = Object.values(ROUTE_CATALOG);
     expect(rows.some((row) => row.path === '/ux/views' || row.label === 'Views')).toBe(false);
-    for (const id of ['inbox', 'jobs', 'schedule']) {
+    // 'jobs' (All jobs) went with step 1 of design 01fa5bdf.
+    for (const id of ['inbox', 'schedule']) {
       expect(rows.some((row) => row.id === id)).toBe(true);
     }
+  });
+});
+
+describe('every page names the station that hosts it', () => {
+  // Car 1 of design deba3000 (backlog 03fb75c8, David 2026-11-10): a
+  // page has one host station, declared beside its registration here,
+  // by the station's ID — the one field of a station row that never
+  // changes (its name, and with it its address, can). These tests read
+  // the rows from infra/platform/stations/, the files the platform seed
+  // publishes, so the ids the catalog spells are held to the rows they
+  // name (CLAUDE.md §9a) rather than restated.
+  type StationRow = Readonly<{ id: string; name: string; status: string; parent?: string }>;
+  const STATIONS_DIR = new URL('../../../../infra/platform/stations/', import.meta.url);
+  const rows: ReadonlyArray<StationRow> = readdirSync(STATIONS_DIR)
+    .filter((f) => f.endsWith('.toml'))
+    .flatMap((f) => {
+      const parsed = Bun.TOML.parse(readFileSync(new URL(f, STATIONS_DIR), 'utf8')) as {
+        station?: ReadonlyArray<StationRow>;
+      };
+      return parsed.station ?? [];
+    });
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  // A reader that silently matched nothing would make every assertion
+  // below vacuous.
+  expect(rows.length).toBeGreaterThan(10);
+
+  /// The root: the one row naming no parent (validate_station_tree
+  /// refuses a tree with any other number of roots).
+  const roots = rows.filter((r) => r.parent === undefined);
+  expect(roots.length).toBe(1);
+  const ROOT = roots[0]!;
+
+  /// The station and every station above it, nearest first.
+  function lineage(id: string): ReadonlyArray<StationRow> {
+    const row = byId.get(id);
+    return row === undefined ? [] : [row, ...(row.parent ? lineage(row.parent) : [])];
+  }
+
+  it('every station the catalog names is an active row, under the name it is given here', () => {
+    for (const [name, id] of Object.entries(STATION)) {
+      const row = byId.get(id);
+      expect([name, row?.name, row?.status]).toEqual([name, name, 'active']);
+    }
+  });
+
+  it('every host is one of those stations, spelled by id', () => {
+    const named = new Set<string>(Object.values(STATION));
+    for (const [key, e] of entries) {
+      if (e.host === undefined) continue;
+      expect([key, named.has(e.host)]).toEqual([key, true]);
+    }
+  });
+
+  // Design deba3000 §1: company-level pages sit at the root. Since step
+  // 1 of design 01fa5bdf the /it landing is only the alarms board (and
+  // the train yard's release and cancel board under `at`): every
+  // station's alarms, which is the company's view, not one station's.
+  it('the company-level pages are hosted at the root', () => {
+    expect<string | undefined>(ROUTE_CATALOG['system-yard'].host).toBe(ROOT.id);
+  });
+
+  // Design 01fa5bdf (David 2026-11-17): Executive dissolves — its
+  // personal parts go to /me, the rest to the root (878fd1e7). A page
+  // hosted there would be one more thing that retirement has to move.
+  it('no page is hosted at Executive or beneath it', () => {
+    for (const [key, e] of entries) {
+      if (e.host === undefined) continue;
+      expect([key, lineage(e.host).some((s) => s.name === 'executive')]).toEqual([key, false]);
+    }
+  });
+
+  // The host is placement; the owner is the tab and the packets the
+  // page lists (design 8c3e9599). Where the owner is itself a station of
+  // the tree (Finance), the host must not take the page somewhere else.
+  it('a page whose owner is a station is hosted at that station or beneath it', () => {
+    const stationNames = new Set(rows.map((r) => r.name));
+    for (const [key, e] of entries) {
+      if (e.owner === undefined || !stationNames.has(e.owner)) continue;
+      const above = e.host === undefined ? [] : lineage(e.host).map((s) => s.name);
+      expect([key, above.includes(e.owner)]).toEqual([key, true]);
+    }
+  });
+
+  // The report (design deba3000 §Shape): the pages with no host yet.
+  // It fails nothing — the migration is incremental, a few pages a car —
+  // and prints `unhosted-pages:<n>`, a number that falls, the way
+  // infra/lint/rows-still-in-v1-words.sh prints `v1-rows:<n>`. When it
+  // reaches zero, car 3 of the design makes `host` required and this
+  // becomes a pin.
+  it('the unhosted report lists exactly the catalog entries with no host', () => {
+    const report = unhostedPages();
+    expect(report.map((e) => e.id)).toEqual(
+      Object.values(ROUTE_CATALOG)
+        .filter((e) => e.host === undefined)
+        .map((e) => e.id),
+    );
+    console.info(`unhosted-pages:${report.length} ${report.map((e) => e.id).join(' ')}`);
   });
 });

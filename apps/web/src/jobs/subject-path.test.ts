@@ -1,21 +1,15 @@
-// Where clicking a Subject lands. Every branch of `subjectPath` goes to
-// the Subject's OWN page or the Subject's OWN packets; none of them may
-// go to a workflow kind, because a kind is tenant data and this file is
-// shared by every instance (backlog 423a531d).
+// Where clicking a Subject lands. A kind with a page of its own (a
+// purchase order, a vendor) opens that page; every other kind is drawn
+// as text (null), because the jobs list its packets used to open went
+// with step 1 of design 01fa5bdf (review df7aeb9c).
 //
-// The campaign branch did: it returned `/jobs?kind=marketing-motion`, a
-// workflow one tenant's seed bundle authors, so clicking a campaign on
-// an instance running another tenant landed on an empty list. The honest
-// destination is the campaign's packets, whatever kind they are — the
-// same `subject_id` filter the router already parses on /jobs.
-//
-// And none may go to `'#'` (backlog 4af37dd8, page audit 473f4f92 GAP 2):
-// custom and every kind the switch did not name returned it, `href('#')`
-// is `/#`, which parses as `/`, so a Subject click landed on Home — for
-// every open packet (286 of 286 `custom` at the audit, 322 of 322 when
-// this was built, 2026-09-24). Subject
-// kinds are registry data (boss-subject-kinds); a kind with no page of
-// its own lands on its own packets without a branch naming it.
+// None may go to a workflow kind, because a kind is tenant data and
+// this file is shared by every instance (backlog 423a531d: the campaign
+// branch returned `/jobs?kind=marketing-motion`). And none may go to
+// `'#'` (backlog 4af37dd8, page audit 473f4f92 GAP 2): `href('#')` is
+// `/#`, which parses as `/`, so a Subject click landed on Home — for
+// every open packet, all of them `custom`. Null is the honest answer
+// for a kind with no page.
 import { describe, expect, it } from 'bun:test';
 import { subjectPath } from './types';
 import { parseRoute, type Route } from '../router';
@@ -25,63 +19,30 @@ const subject = (subject_kind: string, id: string): Subject =>
   ({ subject_kind, id }) as unknown as Subject;
 
 describe('subjectPath', () => {
-  it('sends a campaign to its own packets, not to a workflow kind', () => {
-    expect(subjectPath(subject('campaign', 'camp-2026-spring'))).toBe(
-      '/ux/jobs?subject_id=camp-2026-spring',
-    );
-  });
-
-  it('url-encodes a campaign id', () => {
-    expect(subjectPath(subject('campaign', 'camp a/b'))).toBe('/ux/jobs?subject_id=camp%20a%2Fb');
-  });
-
-  it('sends a custom subject to its own packets, not to Home', () => {
-    expect(subjectPath(subject('custom', '/ux/jobs'))).toBe('/ux/jobs?subject_id=%2Fux%2Fjobs');
-  });
-
-  it('sends a registry kind this file never names to its own packets', () => {
-    // `recipe` is a brewery-tenant row, `department` a platform one
-    // added after this switch was written; neither has a case here.
-    expect(subjectPath(subject('recipe', 'west-coast-ipa'))).toBe(
-      '/ux/jobs?subject_id=west-coast-ipa',
-    );
-    expect(subjectPath(subject('department', 'it'))).toBe('/ux/jobs?subject_id=it');
-  });
-
-  it('names no workflow kind on any branch', () => {
-    const kinds = ['asset', 'account', 'purchase_order', 'campaign', 'employee', 'vendor', 'custom'];
-    for (const k of kinds) {
-      expect(subjectPath(subject(k, 'x'))).not.toContain('kind=');
-    }
-  });
-
-  // The branches spelled the router's unprefixed legacy paths — /jobs,
-  // /accounts, /assets — which parse only because the router strips
-  // `/ux` "defensively"; every other link in the app is the canonical
-  // /ux/… (backlog d0b93b80, found by the /ux/jobs page audit's spec).
-  it('spells every branch under /ux, the way entityHref does, to a route the router serves', () => {
+  it('opens a page only for a kind that has one, to a route the router serves', () => {
     const cases: ReadonlyArray<[string, string, Route['kind']]> = [
-      ['asset', '/ux/assets/x', 'asset'],
-      ['account', '/ux/accounts/x', 'account'],
-      ['purchase_order', '/ux/purchase-orders/x', 'po'],
-      ['employee', '/ux/people/x', 'employee'],
-      ['vendor', '/ux/vendors/x', 'vendor'],
-      ['custom', '/ux/jobs?subject_id=x', 'jobs'],
+      // Finance's pages live at Finance's address (backlog c7ef4728).
+      ['purchase_order', '/finance/purchase-orders/x', 'po'],
+      ['vendor', '/finance/vendors/x', 'vendor'],
     ];
     for (const [k, want, route] of cases) {
       const p = subjectPath(subject(k, 'x'));
       expect(p).toBe(want);
-      const [path, query = ''] = p.split('?');
-      expect(parseRoute(path!, query ? `?${query}` : '').kind).toBe(route);
+      expect(parseRoute(p!).kind).toBe(route);
     }
   });
 
-  it('answers a real path for every kind, never #', () => {
-    const kinds = ['asset', 'account', 'purchase_order', 'campaign', 'employee', 'vendor', 'custom', 'recipe'];
-    for (const k of kinds) {
-      const p = subjectPath(subject(k, 'x'));
-      expect(p.startsWith('/')).toBe(true);
-      expect(p).not.toContain('#');
+  it('url-encodes the id', () => {
+    expect(subjectPath(subject('vendor', 'v a/b'))).toBe('/finance/vendors/v%20a%2Fb');
+  });
+
+  it('answers null for every kind with no page, never a path to the retired list or to Home', () => {
+    // An asset's, an account's and an employee's /ux pages went with
+    // step 1 of design 01fa5bdf, and so did the list a pageless kind
+    // landed on. `recipe` is a brewery-tenant row and `department` a
+    // platform one, neither named in the switch.
+    for (const k of ['asset', 'account', 'employee', 'campaign', 'custom', 'recipe', 'department']) {
+      expect({ kind: k, path: subjectPath(subject(k, 'x')) }).toEqual({ kind: k, path: null });
     }
   });
 });

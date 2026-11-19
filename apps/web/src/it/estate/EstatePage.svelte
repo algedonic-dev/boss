@@ -46,6 +46,9 @@
     type DevDoorDeclaration,
   } from './estate';
   import type { Remote } from '../../data/remote';
+  // 05: the one write on this page — a person files an ops request to a
+  // host from the verb list (backlog 7aef2405).
+  import FileAnOpsRequest from './FileAnOpsRequest.svelte';
 
   let estate = $state<EstateState | null>(null);
   let door = $state<Remote<DevDoorDeclaration>>({ kind: 'loading' });
@@ -142,6 +145,15 @@
                   title={seen.drift ? `drift: declared ${machineValue(f, seen.drift.declared)}, observed ${machineValue(f, seen.drift.observed)}` : undefined}
                 >
                   {machineValue(f, n[f])} <span class={seen.drift ? 'estate-seen estate-drift' : 'estate-seen'}>{seen.text}</span>
+                  {#if f === 'disk_gb'}
+                    <div class="estate-disks" aria-label="Declared physical disks">
+                      {#each n.disks as disk}
+                        <div><span>{disk.model}</span> · {disk.size_bytes === null ? 'not measured' : `${disk.size_bytes} bytes`}</div>
+                      {:else}
+                        <span>No disks declared</span>
+                      {/each}
+                    </div>
+                  {/if}
                 </td>
               {/each}
             </tr>
@@ -182,7 +194,7 @@
                       <a class="estate-alarm-link" href={`/ux/jobs/${a.id}`} title={a.title}>alarm</a>
                     {/each}
                   </td>
-                  <td class={v.capacity_intent.verdict === 'match' ? 'estate-ok' : 'estate-drift'} data-capacity-intent={v.capacity_intent.verdict}>
+                  <td class={v.capacity_intent.verdict === 'match' && (!v.standalone_declaration || v.standalone_declaration.verdict === 'covered') ? 'estate-ok' : 'estate-drift'} data-capacity-intent={v.capacity_intent.verdict} data-standalone-declaration={v.standalone_declaration?.verdict ?? 'not-recorded'}>
                     {capacityIntentLine(v)}
                     {#if v.capacity_intent.assignment}
                       <a class="estate-alarm-link" href={`/ux/jobs/${v.capacity_intent.assignment.packet}`} title={`Assigned by ${v.capacity_intent.assignment.decided_by} at ${v.capacity_intent.assignment.decided_at}; step ${v.capacity_intent.assignment.step}`}>
@@ -537,6 +549,9 @@
       </p>
       {/if}
     </div>
+
+    <div class="estate-section">05 — FILE AN OPS REQUEST</div>
+    <FileAnOpsRequest />
   {/if}
 </div>
 
@@ -565,6 +580,7 @@
   .estate-table td { padding: 6px 12px 6px 0; border-bottom: 1px solid var(--hairline); }
   .estate-id { font-family: var(--font-mono); }
   .estate-addr, .estate-num { font-family: var(--font-mono); color: var(--static); }
+  .estate-disks { margin-top: 0.4rem; font-size: 0.85em; white-space: normal; }
   .estate-roles { font-family: var(--font-mono); font-size: 11px; color: var(--static); }
   .estate-obs { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
   .estate-obs-row { display: flex; gap: 16px; align-items: baseline; }

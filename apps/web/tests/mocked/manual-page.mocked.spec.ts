@@ -39,7 +39,7 @@ const json = (r: Route, body: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
 
 /// The page's three reads, as ManualPage.svelte spells them.
-const TREE = /\/api\/content\/manual$/;
+const TREE = /\/api\/content\/manual-index$/;
 const SECTION = /\/api\/content\/manual\/(.+)$/;
 const PERSON = /\/api\/people\/([^/]+)$/;
 
@@ -99,6 +99,46 @@ const TREE_ORDER: ReadonlyArray<readonly [string, number]> = [
 const PARENTS = ['policies', 'benefits', 'benefits/time-off'];
 const LEAVES = ['welcome', 'policies/security', 'policies/conduct', 'benefits/time-off/sick'];
 
+test('unwritten sections name their owner and authoring packet without rendering draft prose', async ({ page }) => {
+  await installSmokeMocks(page);
+  const packet = '2c28833a-d0a3-499a-bcf9-2d3a264e26a3';
+  const header = {
+    id: 'ms-expenses', slug: 'expenses', parent_slug: null, title: 'Expenses',
+    sort_order: 1, published: false, owner_station: 'finance', authoring_job_id: packet,
+  };
+  // Both old and new read shapes return the same safe fixture. The failure
+  // must be the page's missing placeholder, not an unmocked endpoint.
+  await page.route(/\/api\/content\/manual$/, (r) => json(r, [header]));
+  await page.route(/\/api\/content\/manual-index$/, (r) => json(r, [header]));
+  await page.route(/\/api\/content\/manual\/expenses$/, (r) => json(r, { error: 'unpublished' }, 404));
+  await mountPage(page, '/ux/manual/expenses', { titleMatch: /Company manual/ });
+  await expect(page.getByText('Not yet written, owned by finance', { exact: true })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Open authoring packet' })).toHaveAttribute('href', `/ux/jobs/${packet}`);
+  await expect(page.locator('.manual-article-body')).toHaveCount(0);
+  await expect(page.getByText('PRIVATE unfinished work')).toHaveCount(0);
+});
+
+test('an old section with no recorded ownership says unknown instead of inventing a packet', async ({ page }) => {
+  await installSmokeMocks(page);
+  await page.route(TREE, (r) => json(r, [{
+    id: 'ms-legacy', slug: 'legacy', parent_slug: null, title: 'Legacy',
+    sort_order: 1, published: false, owner_station: null, authoring_job_id: null,
+  }]));
+  await page.route(/\/api\/content\/manual\/legacy$/, (r) => json(r, {}, 404));
+  await mountPage(page, '/ux/manual/legacy', { titleMatch: /Company manual/ });
+  await expect(page.getByText('Not yet written; owner not recorded.', { exact: true })).toBeVisible();
+  await expect(page.getByText('Authoring packet not recorded.', { exact: true })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Open authoring packet' })).toHaveCount(0);
+});
+
+test('an unreadable index is a read failure rather than an empty manual', async ({ page }) => {
+  await installSmokeMocks(page);
+  await page.route(TREE, (r) => json(r, { unavailable: true }));
+  await mountPage(page, '/ux/manual', { titleMatch: /Company manual/ });
+  await expect(page.getByRole('alert')).toContainText('Manual index response is unreadable');
+  await expect(page.getByText('No sections yet.', { exact: true })).toHaveCount(0);
+});
+
 async function installManualReads(page: Page): Promise<void> {
   await installSmokeMocks(page);
   await page.route(TREE, (r) => json(r, SECTIONS));
@@ -138,7 +178,7 @@ test.describe('/manual — the page chrome and its two spellings', () => {
 
       await expect(page.locator('.exec-eyebrow')).toHaveText('Know');
       await expect(page.locator('h1').first()).toHaveText('Company manual');
-      await expect(page.getByText('Authored by HR. Every change is versioned.')).toBeVisible();
+      await expect(page.getByText('Company guidance. Every change is versioned.')).toBeVisible();
       await expect(page.locator('.manual-content')).toHaveText(
         'Select a section from the tree to start reading.',
       );
@@ -358,21 +398,17 @@ test.describe('/manual — tree toggles', () => {
 });
 
 test.describe('/manual — the section body', () => {
-  test('an employee shortcode is a link to that employee, labelled by name, and back returns', async ({ page }) => {
+  // A link to the employee until the people page went with step 1 of
+  // design 01fa5bdf: its address is not found now, so the name is text.
+  test('an employee shortcode names that employee, as text — the people page is gone', async ({ page }) => {
     await installManualReads(page);
     await mountPage(page, '/ux/manual/welcome', { titleMatch: /Company manual/ });
 
-    const link = page.locator('.manual-article-body a');
-    await expect(link).toHaveCount(1);
-    await expect(link).toHaveText(EMP_001.name);
-    await expect(link).toHaveAttribute('href', '/ux/people/emp-001');
-    expect(route('/ux/people/emp-001')).toEqual({ kind: 'employee', empId: 'emp-001' });
-
-    await link.click();
-    await expect(page).toHaveURL(/\/ux\/people\/emp-001$/);
-    await page.goBack();
-    await expect(page).toHaveURL(/\/ux\/manual\/welcome$/);
-    await expect(page.locator('article.manual-article h2')).toHaveText('Welcome');
+    await expect(page.locator('.manual-article-body a')).toHaveCount(0);
+    const name = page.locator('.manual-article-body span.entity-link');
+    await expect(name).toHaveText(EMP_001.name);
+    await expect(name).toHaveAttribute('title', 'emp-001');
+    expect(route('/ux/people/emp-001').kind).toBe('notFound');
   });
 
   // Authored seed markdown is rendered, not shown as literal delimiters (d1b6cfef).
@@ -528,7 +564,7 @@ test.describe('/manual — empty and failed reads are never the same paint', () 
     await mountPage(page, '/ux/manual/welcome', { titleMatch: /Company manual/ });
 
     await expect(page.locator('article.manual-article h2')).toHaveText('Welcome');
-    await expect(page.locator('.manual-article-body a')).toHaveText('emp-001');
+    await expect(page.locator('.manual-article-body span.entity-link')).toHaveText('emp-001');
     const failed = page.locator(`article.manual-article ${FAILURE_MARKER}`);
     await expect(failed).toHaveAttribute('role', 'alert');
     await expect(failed).toHaveText(
@@ -554,7 +590,7 @@ test.describe('/manual — empty and failed reads are never the same paint', () 
     expect(personReads).toEqual([]);
 
     await page.getByRole('link', { name: 'Welcome', exact: true }).click();
-    await expect(page.locator('.manual-article-body a')).toHaveText(EMP_001.name);
+    await expect(page.locator('.manual-article-body span.entity-link')).toHaveText(EMP_001.name);
     expect([...new Set(personReads)]).toEqual(['/api/people/emp-001']);
   });
 });

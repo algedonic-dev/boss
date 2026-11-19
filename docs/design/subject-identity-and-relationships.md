@@ -4,8 +4,10 @@
 R1–R4 + Q1–Q7, approved 2026-07-15 — completed 2026-07-29; decision
 history folded into
 [docs/architecture-decisions.md](../architecture-decisions.md)
-§Primitives; the audit's residual defect worklist moved to
-TODO.md). Every new subject kind and every new cross-kind reference
+§Primitives; the audit's residual defect worklist moved to the
+roadmap's "Subject-model audit residuals" section, readable at
+`git show dab00c7bb6f3:TODO.md`; open work is a backlog-item packet
+now). Every new subject kind and every new cross-kind reference
 follows this contract.
 
 ## The two invariants

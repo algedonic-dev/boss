@@ -42,9 +42,14 @@
 # proof on a CLOSED car was the second car (`boss prove --from-car
 # --unattended` admits the skipped `proven` of a car carrying the
 # marker, and a green writes `proof_owed = "paid"` beside the proof
-# under `owed_proof`). Still owed by the plan: the exit, and filing
-# loudly when an owed proof is judged false. The plan rides on the
-# backlog item.
+# under `owed_proof`). Since backlog 82946cd9 the jobs API admits that
+# write only from the credentialed runner (`runner:ops`) on a host the
+# run-car-probe verb runs on, and the forge door presents the runner's
+# own credential on that write alone. Filing loudly when an owed proof
+# does not prove is the third car: file-a-backlog-item-when-an-owed-
+# proof-fails opens a backlog-item from the failing attempt the forge
+# door writes on the closed car. Still owed by the plan: the exit. The
+# plan rides on the backlog item.
 [[rule]]
 name = "rerun-owed-proofs-on-job-closed"
 why = """

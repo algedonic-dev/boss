@@ -1,0 +1,27 @@
+# ---------------------------------------------------------------------------
+# claude-code-b — the second Claude account's Agent tool (agent-claude-b).
+#
+# Same host tool as claude-code.toml, signing as the second registered
+# Claude account the dev pod runs since 2026-10-17 (session A coordinates
+# as agent-claude; session B builds as agent-claude-b). It exists because
+# `--report` finds a run's transcript only through the file that signs as
+# the run's agent, so every agent-claude-b run landed unmetered — "no file
+# under infra/platform/harnesses signs as agent-claude-b" — unless the
+# operator passed --transcript by hand (runs 93784166 and d0651edc, the
+# night the account went live). One actor names one harness, so the twin
+# is a second file, not a second actor on the first.
+#
+# What differs is only the home: each account's login sets its own
+# `$CLAUDE_CONFIG_DIR` (`/work/home/.claude-b` on the pod), and the
+# default under `$HOME` is `.claude-b` for the same reason.
+# ---------------------------------------------------------------------------
+id = "claude-code-b"
+actor = "agent-claude-b"
+launch = "host-tool"
+
+# `$CLAUDE_CONFIG_DIR`, else `$HOME/.claude-b`.
+[transcript]
+adapter = "claude-subagent"
+home_env = "CLAUDE_CONFIG_DIR"
+home_default = ".claude-b"
+glob = "projects/*/*/subagents/agent-*.jsonl"

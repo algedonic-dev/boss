@@ -51,7 +51,7 @@ impl InventoryHelpers {
             .client
             .get(url)
             .header("x-boss-user", SYSTEM_USER_HEADER)
-            .header("x-sim-origin", crate::dispatcher::sim_origin_value())
+            .header("x-sim-origin", crate::next_hop::sim_origin_value())
             .send();
         let resp = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(req))
             .map_err(|e| EvalError::HelperFailed {
@@ -102,6 +102,13 @@ impl HelperResolver for InventoryHelpers {
             // a car is skipped. It lives here because this is the one
             // resolver the runners bind.
             "starts_with" => starts_with(args),
+            // Pure string builders, no request (backlog 77ac4f30): the
+            // DSL has no string operator, so a spawned packet's title
+            // could be a literal or one payload field and nothing that
+            // names WHICH packet it is about in words — "Fold design
+            // <id8> (<title>) into the decision record".
+            "concat" => concat(args),
+            "left" => left(args),
             other => Err(EvalError::UnknownHelper(other.to_string())),
         }
     }
@@ -265,6 +272,65 @@ fn starts_with(args: &[Value]) -> Result<Value, EvalError> {
     }))
 }
 
+/// `concat(a, b, ...)`: the strings joined, in order.
+///
+/// An ABSENT operand answers `Absent`, never a string with a hole in it:
+/// a spawn arg that resolved to nothing is refused by the absent-arg
+/// guard in `match_event`, which names the rule and leaves its
+/// neighbours on the topic firing (the 2026-08-24 incident). Folding the
+/// hole into a string would hand the handler a title reading "Fold
+/// design  () into ..." and the guard could not see it. Any other
+/// non-string is the rule author's mistake and says so.
+fn concat(args: &[Value]) -> Result<Value, EvalError> {
+    if args.iter().any(|a| matches!(a, Value::Absent)) {
+        return Ok(Value::Absent);
+    }
+    args.iter()
+        .map(|a| match a {
+            Value::String(s) => Ok(s.as_str()),
+            other => Err(EvalError::TypeError {
+                expected: "string",
+                got: other.kind(),
+            }),
+        })
+        .collect::<Result<String, _>>()
+        .map(Value::String)
+}
+
+/// `left(subject, n)`: the first `n` characters of `subject` — the
+/// eight-character id a person reads a packet by. Absent in, absent out,
+/// for the reason `concat` gives; `n` is the author's and must be a
+/// non-negative integer.
+fn left(args: &[Value]) -> Result<Value, EvalError> {
+    let n = match args.get(1) {
+        Some(Value::Int(n)) if *n >= 0 => *n as usize,
+        Some(other) => {
+            return Err(EvalError::TypeError {
+                expected: "non-negative int",
+                got: other.kind(),
+            });
+        }
+        None => {
+            return Err(EvalError::HelperFailed {
+                name: "left".into(),
+                msg: "missing required arg".into(),
+            });
+        }
+    };
+    match args.first() {
+        Some(Value::String(s)) => Ok(Value::String(s.chars().take(n).collect())),
+        Some(Value::Absent) => Ok(Value::Absent),
+        Some(other) => Err(EvalError::TypeError {
+            expected: "string",
+            got: other.kind(),
+        }),
+        None => Err(EvalError::HelperFailed {
+            name: "left".into(),
+            msg: "missing required arg".into(),
+        }),
+    }
+}
+
 /// True if an `ingredient-restock` Job for `part_sku` is already open.
 ///
 /// The reorder rule dedups on this — per-SKU, on the in-flight restock Job
@@ -331,6 +397,48 @@ mod tests {
         assert!(starts_with(&[s("conflict: a.rs")]).is_err());
         assert!(starts_with(&[s("conflict: a.rs"), Value::Int(1)]).is_err());
         assert!(starts_with(&[]).is_err());
+    }
+
+    /// A title built from the payload (backlog 77ac4f30): strings join in
+    /// order, and an id is read by its first eight characters.
+    #[test]
+    fn concat_and_left_build_a_title_a_person_reads() {
+        let h = InventoryHelpers::new("http://unused.invalid", "http://unused.invalid");
+        let id8 = h
+            .call(
+                "left",
+                &[s("02894662-99a0-4c1d-b194-933e0077e803"), Value::Int(8)],
+            )
+            .expect("left");
+        assert_eq!(id8, s("02894662"));
+        assert_eq!(
+            h.call("concat", &[s("Fold design "), id8, s(" (A title)")]),
+            Ok(s("Fold design 02894662 (A title)"))
+        );
+        assert_eq!(
+            left(&[s("ab"), Value::Int(8)]),
+            Ok(s("ab")),
+            "short is whole"
+        );
+    }
+
+    /// A hole stays a hole: an absent operand answers Absent, so the
+    /// absent-arg guard refuses the spawn by name instead of a title with
+    /// a gap in it reaching a person's queue.
+    #[test]
+    fn concat_and_left_keep_an_absent_operand_absent() {
+        assert_eq!(concat(&[s("Fold "), Value::Absent]), Ok(Value::Absent));
+        assert_eq!(left(&[Value::Absent, Value::Int(8)]), Ok(Value::Absent));
+    }
+
+    /// Anything else that is not a string is the author's mistake.
+    #[test]
+    fn concat_and_left_refuse_what_the_author_got_wrong() {
+        assert!(concat(&[s("a"), Value::Int(1)]).is_err());
+        assert!(concat(&[Value::Null]).is_err());
+        assert!(left(&[s("abc")]).is_err());
+        assert!(left(&[s("abc"), Value::Int(-1)]).is_err());
+        assert!(left(&[Value::Int(3), Value::Int(1)]).is_err());
     }
 
     /// It dispatches by name through the one resolver the runner binds,

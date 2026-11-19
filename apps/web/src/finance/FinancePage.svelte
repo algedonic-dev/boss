@@ -9,7 +9,7 @@
 
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Link from '@boss/web-kit/ui/Link.svelte';
-  import { formatMoney } from '@boss/web-kit/ui/money';
+  import { appToday } from '@boss/web-kit/sim-clock';
   import IncomeStatementTab from './IncomeStatementTab.svelte';
   import BalanceSheetTab from './BalanceSheetTab.svelte';
   import CashFlowTab from './CashFlowTab.svelte';
@@ -25,6 +25,9 @@
     loadCommerceSummary,
     type CommerceSummary,
   } from './api';
+  import { headlineText, loadHeadline, type Headline } from './ledger';
+  import { trailingYear } from './window';
+  import type { Remote } from '../data/remote';
   import type { PagedResult } from '../data/paginated';
   import { loadingRead, readStateOf, type ReadState } from '../data/readState';
   import { href } from '../router';
@@ -122,29 +125,22 @@
     };
   });
 
-  function glance(cents: number): string {
-    return formatMoney({ amount_cents: cents, currency: 'USD' }, { precision: 'compact' });
-  }
-
-  let headline = $derived.by(() => {
-    if (!summary) {
-      return {
-        title: 'Finance',
-        subtitle: summaryLoading ? 'Loading…' : 'Summary unavailable',
-      };
-    }
-    const marginPct =
-      summary.total_revenue_ttm_cents > 0
-        ? (summary.total_gross_margin_ttm_cents / summary.total_revenue_ttm_cents) * 100
-        : 0;
-    return {
-      title: `${glance(summary.total_revenue_ttm_cents)} trailing revenue`,
-      subtitle:
-        `${glance(summary.total_gross_margin_ttm_cents)} gross margin ` +
-        `(${marginPct.toFixed(1)}%) · ` +
-        `${glance(summary.total_outstanding_cents)} receivables outstanding`,
+  // The headline is the ledger's income statement over the trailing
+  // year — the window /exec's revenue card reads — not boss-commerce's
+  // summary, which no Algedonic protocol writes (backlog 801b6a7a,
+  // design c2820008 D1). Read once on mount: the ledger moves when a
+  // packet posts, and the Income statement tab does not poll either.
+  let headlineRead = $state<Remote<Headline>>({ kind: 'loading' });
+  $effect(() => {
+    let cancelled = false;
+    void loadHeadline(trailingYear(appToday())).then((r) => {
+      if (!cancelled) headlineRead = r;
+    });
+    return () => {
+      cancelled = true;
     };
   });
+  let headline = $derived(headlineText(headlineRead));
 </script>
 
 <div class="catalog theme-exec">
@@ -156,12 +152,12 @@
 
   <div class="finance-actions" style="display:flex; gap:8px; align-items:flex-start; flex-wrap:wrap">
     {#if offerInvoice}
-      <Link to={href('/ux/finance/new')} className="fin-new-invoice">
+      <Link to={href('/finance/invoices/new')} className="fin-new-invoice">
         + New invoice
       </Link>
     {/if}
     {#if offerEntry}
-      <Link to={href('/ux/finance/journal-entries/new')} className="fin-new-invoice">
+      <Link to={href('/finance/journal-entries/new')} className="fin-new-invoice">
         + New journal entry
       </Link>
     {/if}

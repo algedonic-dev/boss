@@ -94,6 +94,27 @@ fn the_claim_is_declared_in_the_manifest_not_made_by_hand() {
 }
 
 #[test]
+fn the_backup_claim_does_not_shrink_its_approved_capacity() {
+    // Approved expansion 691d8369 grew this standalone claim to 40Gi,
+    // and a6bb0366 (2026-11-06, alarm cddc5a07) grew it to 80Gi.
+    // Converge reapplies it, unlike a StatefulSet claim template: a
+    // smaller request stops every deploy (outage 43b4b5d2), and one
+    // below the live claim is declaration drift on every comparison.
+    let pvc = doc(BACKUP, "PersistentVolumeClaim", "boss-backups");
+    let declared_gib = pvc
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("storage:"))
+        .and_then(|size| size.trim().strip_suffix("Gi"))
+        .and_then(|size| size.parse::<u64>().ok())
+        .expect("boss-backups must declare its storage request in Gi");
+    assert!(
+        declared_gib >= 80,
+        "{BACKUP}: boss-backups declares {declared_gib}Gi, below its approved 80Gi capacity; \
+         Kubernetes refuses that shrink and stops the converge"
+    );
+}
+
+#[test]
 fn the_content_service_runs_on_the_store() {
     let dep = doc(DEPLOYMENT, "Deployment", "boss");
     assert!(

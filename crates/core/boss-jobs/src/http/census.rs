@@ -199,11 +199,29 @@ pub(super) async fn record_estate_comparison<R: JobsRepository + 'static, B: Eve
     let actor = user
         .ambient_actor()
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-    let event = events::estate_compared_event(&actor, comparison);
-    match state.jobs.record_events(std::slice::from_ref(&event)).await {
-        Ok(()) => (
+    let mut event = events::estate_compared_event(&actor, comparison);
+    let recorded = match event.payload.get("observation_id") {
+        None => state
+            .jobs
+            .record_events(std::slice::from_ref(&event))
+            .await
+            .map(|()| true),
+        Some(value) => {
+            let Some(id) = value.as_str().and_then(|v| uuid::Uuid::parse_str(v).ok()) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "observation_id must be a UUID when supplied",
+                )
+                    .into_response();
+            };
+            event.payload["observation_id"] = serde_json::json!(id);
+            state.jobs.record_estate_comparison_once(id, &event).await
+        }
+    };
+    match recorded {
+        Ok(recorded) => (
             StatusCode::ACCEPTED,
-            Json(serde_json::json!({ "recorded": true })),
+            Json(serde_json::json!({ "recorded": recorded })),
         )
             .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),

@@ -11,6 +11,7 @@ import errno
 import gzip
 import hashlib
 import json
+import os
 import re
 import signal
 import subprocess
@@ -85,7 +86,10 @@ class CompletionTrailer:
         return bool(self.tail) and self.tail[-1] == trailer
 
 
-def verify(bucket, token, work, receipt=None):
+def verify(bucket, token, work, receipt=None, sink=None):
+    # sink: the restore drill's (drill-gcs-restore, backlog 156eb6e5) file
+    # for the pinned bytes, written as each block is digested and checked, so
+    # what it restores is exactly what this verified — never a second fetch.
     if receipt is None:
         receipt = {}
     receipt.update(claim='remote-archive-integrity', bucket=bucket, result='failed', stage='complete-list')
@@ -172,6 +176,8 @@ def verify(bucket, token, work, receipt=None):
                     if downloaded > receipt['object_bytes']:
                         raise ValueError('download: more bytes than selected metadata')
                     digest.update(block)
+                    if sink is not None:
+                        sink.write(block)
                     try:
                         remaining = memoryview(block)
                         while remaining:
@@ -242,8 +248,18 @@ def main():
         access = subprocess.run(['gcloud', 'auth', 'print-access-token'], capture_output=True, timeout=60, check=False)
         if access.returncode or not access.stdout.strip():
             raise ValueError('authentication: access token unavailable')
+        # One optional argument, the restore drill's path for the kept dump
+        # (the Job's own scratch claim); check-gcs-backup passes none and
+        # spools nothing. 'xb' refuses a path that already holds a file.
+        save = sys.argv[1] if len(sys.argv) > 1 else None
         with tempfile.TemporaryDirectory(dir='/work') as work:
-            verify(bucket, access.stdout.decode().strip(), work, receipt)
+            if save is None:
+                verify(bucket, access.stdout.decode().strip(), work, receipt)
+            else:
+                with open(save, 'xb') as sink:
+                    verify(bucket, access.stdout.decode().strip(), work, receipt, sink)
+                os.chmod(save, 0o644)
+                receipt['saved'] = True
         print('receipt: ' + json.dumps(receipt, sort_keys=True), flush=True)
         return 0
     except Exception as error:

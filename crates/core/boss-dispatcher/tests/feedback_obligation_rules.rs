@@ -431,10 +431,15 @@ async fn every_branch_the_rule_names_is_a_live_non_terminal_feedback_branch() {
     let downstream: Vec<(String, bool)> = feedback
         .steps
         .iter()
+        // Opened BY the branch: its done is the predicate, or the
+        // predicate's leading conjunct — since ac141c99 the review reads
+        // `steps.draft-design.done AND NOT (… = "recorded")`, still the
+        // one hop on from a filed design.
         .filter(|s| {
-            all_branches
-                .iter()
-                .any(|(b, _)| s.ready_when == format!("steps.{b}.done"))
+            all_branches.iter().any(|(b, _)| {
+                let done = format!("steps.{b}.done");
+                s.ready_when == done || s.ready_when.starts_with(&format!("{done} AND "))
+            })
         })
         .map(|s| (s.title.clone(), s.terminal.is_some()))
         .collect();

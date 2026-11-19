@@ -26,7 +26,7 @@
 // PRODUCTION text (`boss_testing::production_source`) see none of it —
 // they read each file by itself and cannot see `main.rs` gate the module.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use boss_dispatcher::rules::expr::Value as Arg;
@@ -104,6 +104,8 @@ mod tests {
                     registry: agents,
                     classes: None,
                     departments: None,
+                    pools: None,
+                    stations: None,
                 },
             ))
             .layer(axum::middleware::from_fn_with_state(
@@ -284,7 +286,7 @@ mod tests {
     /// A rule's args as its file under `infra/dispatcher/rules/` authors
     /// them — each an expression, a quoted string literal — so these tests
     /// run the rules that run (CLAUDE.md §9a).
-    fn rule_args(name: &str) -> Vec<(String, Arg)> {
+    pub(crate) fn rule_args(name: &str) -> Vec<(String, Arg)> {
         let path = boss_testing::repo_root()
             .join("infra/dispatcher/rules")
             .join(format!("{name}.toml"));

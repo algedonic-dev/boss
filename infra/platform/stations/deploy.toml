@@ -1,0 +1,64 @@
+# ---------------------------------------------------------------------------
+# deploy — the cluster deploy: forge main built into the image every pod
+# runs, pushed, and the cluster rolled onto it. Its membership is every
+# open maintenance-cluster-converge packet, one per run of the unit.
+#
+# An EQUIPMENT station (design ccfe87ff, decided by David 2026-11-05,
+# question converge-stations: "Three, each with its own bays, since they
+# are operated by different automata and hold different resources";
+# pass item 2, backlog 364b27a3). This is the first of the three: the
+# equipment that takes a merge to a running build. Its automaton is the
+# cluster deploy runner (infra/platform/automations/cluster-deploy-
+# runner.toml), the unit infra/forge/cluster-deploy-runner.service on the
+# forge host, and what it holds is the forge's system docker build, the
+# registry push and the cluster rollout — none of which the converge or
+# the probe shed touch.
+#
+# ONE BAY, because one run is all the unit has. The unit is
+# `Type=oneshot` (infra/forge/cluster-deploy-runner.service), and systemd
+# runs one invocation of a unit at a time: a start while it runs joins
+# that invocation. The converge verb's read-back says so in its own
+# words (infra/ops/verbs/converge.json, backlog 1058e686): "the same
+# invocation as before is a converge already running that took the
+# start into itself — exit 75". Ten-minute timer, merge-started fast
+# path and hand `converge` all queue on that one bay.
+#
+# No step names this station yet: the run step of its packet belongs to
+# automation:boss-step (maintenance-cluster-converge.toml), and the
+# decision keeps every step but record-verdict and the probe undeclared
+# "until a constraint is real". To change this station, bump `version`.
+#
+# Version 2 (T2 of design 4b27a65a, backlog 3f58c823; bumped from the
+# LIVE newest, v1): the station stands in the tree — its stable `id`, its
+# `parent` /algedonic/operations, its mode, its seats (the same number as
+# its bays) and the converges that run beside its runner as machines
+# (proposal section 2). Nothing else changed.
+#
+# Version 3 (backlog a1c0a0ff, design deba3000; bumped from the tree's
+# v2): the hand-typed `[station.upstream]` is gone. It named a /system
+# route the IT consolidation retired on 2026-08-31, so the walk upstream
+# led to a not-found page. A station's upstream is now DERIVED from the
+# tree, as its parent station's page (`upstreamOf` in
+# apps/web/src/it/tree/station-page.ts), and the seed refuses a declared
+# one. The retired department label is removed with its floor reader
+# (backlog aa82eb11); the station's parent places it in the tree.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "deploy"
+version = 4
+id = "57b72e1f-490e-443a-9a9f-870a9977c9fb"
+parent = "9660c60f-eb47-4405-ae08-fcbb30c71e5f"
+mode = "standing"
+capacity = 1
+machines = ["automation:forge-converge", "automation:boss-gcp-converge"]
+status = "active"
+title = "Deploy — forge main built and rolled onto the cluster"
+kind = "equipment"
+automaton = "automation:cluster-deploy-runner"
+bays = 1
+discipline = ["age"]
+
+[station.predicate]
+kind = "maintenance-cluster-converge"
+status = "open"

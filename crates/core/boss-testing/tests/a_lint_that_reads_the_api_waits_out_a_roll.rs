@@ -127,7 +127,10 @@ fn run_lint(s: &Stubs, rel: &str, url_var: &str, env: &[(&str, &str)]) -> Run {
         .env_remove("BOSS_SOR_WAIT_SECONDS")
         // The public mirror declares BOSS_ESTATE=none (backlog 3e63662c),
         // under which these lints never read; every case here reads.
-        .env_remove("BOSS_ESTATE");
+        .env_remove("BOSS_ESTATE")
+        // And BOSS_TRUNK=none (backlog 2d28df78), under which the
+        // edit-level lint judges no path and never reads.
+        .env_remove("BOSS_TRUNK");
     for (k, v) in env {
         cmd.env(k, v);
     }

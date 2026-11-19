@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------------------
+# engineering — makes the change (T2 of design 4b27a65a, backlog
+# 3f58c823; handoff section 1): from scope to a merged, green,
+# image-built train. Its standing children are the build station where
+# robots build (since v4), the forge, the gates and the loading dock,
+# and the probe shed where landed cars prove.
+#
+# ALLOCATION, read off the manifests that decide it, never estimated:
+# 28 vCPU of host:w-1, the build node — the gates' 12 (gates.toml) and
+# the 16 CPU the dev pod, where every builder's workspace runs, is limited
+# to (infra/cluster/manifests/boss-dev.yaml, `limits: {cpu: "16"}`; it
+# prefers w-1 by node affinity). w-1 has 32 (host:w-1); the 4 left are
+# the root's slack.
+#
+# A CONTAINER, NOT A QUEUE: the tagged predicate holds no packet (see
+# algedonic.toml). To change this station, bump `version`.
+#
+# Version 2 (backlog a082371d; bumped from the LIVE newest, v1): 24 -> 28,
+# because the gates moved from two seats to three (gates.toml v4). Held to
+# the manifests by the_engineering_allocations_are_the_manifests_numbers.
+# Nothing else changed.
+#
+# Version 3 (backlog 85cb2103, design c4854fd4; bumped from the LIVE
+# newest, v2): `line = "it"`, so its card rail and every station under it
+# keep IT's line (#0F6E9F). Nothing else changed.
+#
+# Version 4 (backlog b5c815e4, design 52613d21 row 1; bumped from the
+# LIVE newest, v3): Engineering holds the robot slots, robots:opus and
+# robots:sol whole, from the root, so that its `build` station (build.toml)
+# can hold them. The dev pod's 16 of host:w-1 still floats here, where
+# the claim door places a builder's vCPU (agent-run is Engineering's
+# protocol; see build.toml). Nothing else changed.
+#
+# Version 5 (backlog 950ad972, design 08d1530e Q2; bumped from the LIVE
+# newest, v4): `line = "engineering"`. It borrowed IT's line and IT is
+# retiring (df0ecd8b), so it names its own token, --map-line-engineering,
+# set to today's IT blue (#0F6E9F): nothing on screen changes. Nothing
+# else changed.
+#
+# Version 6 (backlog 5b103bfa; bumped from the LIVE newest, v5):
+# robots:sol 2 -> 4, to hold the pool whole again after robots:sol v2
+# (capacity 4, published 2026-11-16 03:31Z; David: "Could we have more
+# sol robot slots"). host:w-1 stays 28: 6 opus plus 4 sol builder claims
+# at 2.5 vCPU each is 25. The shared dev-build worker-volume budget (6)
+# still bounds the total of concurrent runs. Nothing else changed.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "engineering"
+version = 6
+status = "active"
+title = "Engineering — makes the change"
+kind = "group"
+discipline = ["priority", "age"]
+id = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5"
+parent = "00b04483-90c6-46b9-b911-8e19d2a0b410"
+mode = "standing"
+allocation = { "host:w-1" = 28, "robots:opus" = 6, "robots:sol" = 4 }
+line = "engineering"
+
+[station.predicate]
+tags_any = ["station:engineering"]

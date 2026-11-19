@@ -95,6 +95,7 @@ infra/cluster/manifests/boss-machine-token-push.yaml	CronJob image
 infra/cluster/manifests/boss-messages-events-purge.yaml	CronJob image
 infra/cluster/manifests/boss-node-maintenance.yaml	CronJob image, pinned by digest: the one pod with a node capability pulls exactly the mirrored image that was read (17f6170c)
 infra/cluster/manifests/boss-playground-crawl.yaml	CronJob images and the clone-by-IP a Job needs before it has a checkout or a host file (gate-runner.yaml + run.sh's shape)
+infra/cluster/manifests/boss-post-start-schema.yaml	CronJob image, pinned to this instance's converged build; the kubelet reads no estate file
 infra/cluster/manifests/boss-recovery-sheet.yaml	CronJob images and the clone-by-IP, as the crawl above
 infra/cluster/manifests/boss-search-reindex.yaml	CronJob image
 infra/cluster/manifests/boss-views-catchup.yaml	CronJob image
@@ -104,9 +105,10 @@ infra/cluster/talos/patches/cp-1.yaml	machine.registries.mirrors — Talos node 
 infra/cluster/talos/patches/cp-2.yaml	machine.registries.mirrors, as above
 infra/cluster/talos/patches/cp-3.yaml	machine.registries.mirrors, as above
 infra/cluster/talos/patches/w-1.yaml	machine.registries.mirrors, as above
+infra/cluster/talos/patches/w-3.yaml	machine.registries.mirrors, as above
 infra/forge/boss-ci/Dockerfile	FROM lines pull mirrored bases by registry tag; a Dockerfile reads no env
-infra/gate-runner/bootstrap.sh	run.sh's fetch, one step earlier: it runs in the gate Job before any checkout and fetches run.sh itself (e3100bc8)
 infra/gate-runner/gate-runner.yaml	the gate Job's images (a manifest rendered by gate.rs)
+infra/gate-runner/gate-volume-proof.yaml	the gate-volume proof Job's image, the gate container's own (held equal to gate-runner.yaml's by prove_gate_volume_sh.rs; ae59464b)
 infra/gate-runner/run.sh	runs in a cluster Job before it has a checkout or a host file; gate.rs rendering both addresses from the source is the follow-up
 infra/lint/ci-checks-out-from-the-forge.sh	the expected checkout line it holds ci.yml to
 infra/lint/ci-images-are-pruned-by-age.sh	self-test fixtures for the sweep's image repo

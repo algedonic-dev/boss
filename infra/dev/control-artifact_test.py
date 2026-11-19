@@ -114,6 +114,10 @@ class ArtifactContract(unittest.TestCase):
             self.assertEqual(set(record["files"]), declared | {"bin/boss", "bin/kubectl"})
             self.assertNotIn("target", set(record["files"]))
             self.assertIn("infra/consist-worker/declaration.py", record["files"])
+            # Activation reads the preflight receipt through the SAME
+            # generation's reader (b50b8953); a closure without it cannot
+            # activate at all.
+            self.assertIn("infra/dev/preflight-control.py", record["files"])
             loader = importlib.util.spec_from_file_location("packed_dev_build", root / "generation/infra/dev/dev-build.py")
             controller = importlib.util.module_from_spec(loader)
             sys.modules[loader.name] = controller
@@ -137,12 +141,94 @@ class ArtifactContract(unittest.TestCase):
             with self.assertRaises((ValueError, OSError)):
                 self.mod.validate_generation(generation, "a" * 40)
 
+    def published_generation(self, root, binaries=("boss", "kubectl")):
+        """An extracted generation whose manifest lists exactly `binaries`."""
+        data = b"published inert bytes"
+        record = {"commit": "a" * 40, "files": {"bin/" + name: {"sha256": hashlib.sha256(data).hexdigest(), "mode": 0o755} for name in binaries}}
+        with tarfile.open(root / "bundle.tar", "w") as archive:
+            for name, value, mode in [("artifact.json", json.dumps(record).encode(), 0o644), *(("bin/" + name, data, 0o755) for name in binaries)]:
+                item = tarfile.TarInfo(name)
+                item.size = len(value)
+                item.mode = mode
+                archive.addfile(item, io.BytesIO(value))
+        generation = root / "generation"
+        self.mod.extract(root / "bundle.tar", generation, "a" * 40)
+        generation.chmod(0o700)
+        return generation
+
+    def test_manifest_binary_refusal_escapes_every_name_before_reading_bin(self):
+        hostile = "git\x1b]0;owned\x07\n\u202e"
+        record = {"files": {"bin/" + name: {} for name in ("boss", hostile, "kubectl")}}
+        with self.assertRaises(ValueError) as refused:
+            self.mod.validate_bin(Path("absent-generation"), record)
+        message = str(refused.exception)
+        self.assertTrue(message.startswith("controller manifest lists bin/ "), message)
+        self.assertIn(repr(hostile), message)
+        self.assertIn("publishes exactly bin/ 'boss', 'kubectl'", message)
+        for control in ("\x1b", "\x07", "\n", "\u202e"):
+            self.assertNotIn(control, message)
+
+    def test_a_generation_bin_holding_anything_but_the_listed_binaries_is_refused(self):
+        # Backlog e17b0135 (RELEASE review 7b6bc631 of car eb28f2c0): the
+        # trusted boss door puts <generation>/bin first on PATH, and this
+        # check hash-read only the files the manifest lists — so a bin/git
+        # planted beside them passed and resolved as `git` under that PATH.
+        # bin/ now holds exactly the manifest's binaries, which are exactly
+        # the published pair: an extra file, a link (to anything, even a
+        # listed binary), a directory, a missing binary, or a manifest
+        # naming a third or fewer, each refuses the whole generation.
+        with tempfile.TemporaryDirectory() as tmp:
+            self.mod.validate_generation(self.published_generation(Path(tmp)), "a" * 40)
+        plants = {
+            "an extra regular file": lambda b: (b / "git").write_bytes(b"#!/bin/sh\n"),
+            "a hidden extra file": lambda b: (b / ".git").write_bytes(b"#!/bin/sh\n"),
+            "a link to a listed binary": lambda b: (b / "git").symlink_to(b / "boss"),
+            "a dangling link": lambda b: (b / "git").symlink_to(b / "absent"),
+            "a directory": lambda b: (b / "git").mkdir(),
+            "a missing listed binary": lambda b: (b / "kubectl").unlink(),
+        }
+        for label, plant in plants.items():
+            with self.subTest(plant=label), tempfile.TemporaryDirectory() as tmp:
+                generation = self.published_generation(Path(tmp))
+                plant(generation / "bin")
+                with self.assertRaisesRegex(ValueError, "bin/"):
+                    self.mod.validate_generation(generation, "a" * 40)
+        for binaries in [("boss",), ("boss", "kubectl", "git")]:
+            with self.subTest(manifest=binaries), tempfile.TemporaryDirectory() as tmp:
+                generation = self.published_generation(Path(tmp), binaries)
+                with self.assertRaisesRegex(ValueError, "bin/"):
+                    self.mod.validate_generation(generation, "a" * 40)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            generation = self.published_generation(root)
+            (generation / "bin").rename(root / "foreign-bin")
+            (generation / "bin").symlink_to(root / "foreign-bin", target_is_directory=True)
+            with self.assertRaises(ValueError):
+                self.mod.validate_generation(generation, "a" * 40)
+
+    def test_the_bin_refusal_escapes_every_name_it_prints(self):
+        # Backlog 7ed1251a (RELEASE review f6e0c3e5 of car 77f528cc): the
+        # refusal escaped the 'unlisted' names and printed the 'holds'
+        # listing raw, so a planted name carrying control characters
+        # reached the operator's terminal as-is through the second list.
+        hostile = "git\x1b]0;owned\x07\n‮"
+        with tempfile.TemporaryDirectory() as tmp:
+            generation = self.published_generation(Path(tmp))
+            (generation / "bin" / hostile).write_bytes(b"#!/bin/sh\n")
+            with self.assertRaisesRegex(ValueError, "bin/") as refused:
+                self.mod.validate_generation(generation, "a" * 40)
+        said = str(refused.exception)
+        for raw in ("\x1b", "\x07", "\n", "‮"):
+            self.assertNotIn(raw, said, "the refusal printed a planted name's control character raw")
+        self.assertIn(repr(hostile), said)
+
     def test_published_bootstrap_validates_before_running_any_activation_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = root / "cli"
             generation = store / ("a" * 40)
             generation.mkdir(parents=True)
+            (store / "current").symlink_to("a" * 40)
             marker = root / "activated"
             code = ("import pathlib,sys,tarfile\n"
                     "private=pathlib.Path(sys.argv[sys.argv.index('--cli-store')+1])\n"
@@ -216,6 +302,72 @@ class ArtifactContract(unittest.TestCase):
                     self.assertEqual(argv[argv.index("--prepared-config") + 1], str(generation / "config.json"))
             result = subprocess.run([sys.executable, "-I", str(Path(__file__).with_name("control-artifact.py")), "activate", "a" * 40, "--cli-store", str(store)], capture_output=True)
             self.assertNotEqual(result.returncode, 0, "an activation names its config or follows main; never neither")
+
+    def published(self, root, members):
+        store = root / "cli"
+        generation = store / ("a" * 40)
+        generation.mkdir(parents=True)
+        members = dict(members, **{"infra/dev/control-artifact.py": Path(__file__).with_name("control-artifact.py").read_bytes()})
+        record = {"commit": "a" * 40, "files": {n: {"sha256": hashlib.sha256(v).hexdigest(), "mode": 0o644} for n, v in members.items()}}
+        with tarfile.open(generation / "dev-control.tar", "w") as archive:
+            for name, raw in [("artifact.json", json.dumps(record).encode()), *members.items()]:
+                item = tarfile.TarInfo(name)
+                item.mode = 0o644
+                item.size = len(raw)
+                archive.addfile(item, io.BytesIO(raw))
+        (generation / "config.json").write_text('{"prepared": true}')
+        return store, generation
+
+    def test_an_explicit_activation_names_the_main_the_image_store_holds(self):
+        # b50b8953: the receipt is judged against the main the installer
+        # last published; the bootstrap is what knows the real store.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            seen = root / "argv.json"
+            code = "import json,sys\nopen(" + repr(str(seen)) + ",'w').write(json.dumps(sys.argv[1:]))\n"
+            store, _ = self.published(root, {"infra/dev/activate-control.py": code.encode()})
+            argv = [sys.executable, "-I", str(Path(__file__).with_name("control-artifact.py")), "activate", "a" * 40,
+                    "--cli-store", str(store), "--config", str(root / "config.json")]
+            result = subprocess.run(argv, capture_output=True)
+            self.assertNotEqual(result.returncode, 0, "no current main, no activation")
+            self.assertFalse(seen.exists(), "refused before the published activation runs")
+            (store / "current").symlink_to("b" * 40)
+            result = subprocess.run(argv, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            passed = json.loads(seen.read_text())
+            self.assertEqual(passed[passed.index("--main") + 1], "b" * 40)
+            self.assertEqual(passed[-2:], ["--config", str((root / "config.json").resolve())])
+
+    def test_the_preflight_verb_runs_the_published_rehearsal_with_the_prepared_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            seen = root / "seen.json"
+            code = ("import json,os,pathlib,sys\n"
+                    "here=pathlib.Path(__file__).resolve().parents[2]\n"
+                    "open(" + repr(str(seen)) + ",'w').write(json.dumps({'argv': sys.argv[1:], 'config': (here/'config.json').read_text(),"
+                    " 'env': sorted(os.environ)}))\n"
+                    "sys.exit(int(os.environ.get('BOSS_ACTOR') == 'refuse'))\n")
+            store, _ = self.published(root, {"infra/dev/preflight-control.py": code.encode()})
+            (store / "current").symlink_to("b" * 40)
+            control = root / "dev-control"
+            argv = [sys.executable, "-I", str(Path(__file__).with_name("control-artifact.py")), "preflight", "a" * 40,
+                    "--cli-store", str(store), "--store", str(control), "--workers", "3",
+                    "--record-on", "b3071bf4-5996-4cf8-96db-e4b23b2f67a1"]
+            env = {"PATH": "/usr/bin:/bin", "BOSS_ACTOR": "agent-test", "KUBERNETES_SERVICE_HOST": "10.0.0.1", "OPENAI_API_KEY": "never"}
+            result = subprocess.run(argv, capture_output=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            observed = json.loads(seen.read_text())
+            passed = observed["argv"]
+            self.assertEqual(passed[0], "a" * 40)
+            for flag, value in (("--main", "b" * 40), ("--cli-store", str(store.resolve())), ("--store", str(control.resolve())),
+                                ("--workers", "3"), ("--record-on", "b3071bf4-5996-4cf8-96db-e4b23b2f67a1")):
+                self.assertEqual(passed[passed.index(flag) + 1], value, flag)
+            self.assertEqual(observed["config"], '{"prepared": true}', "the rehearsal starts workers from the prepared config")
+            self.assertIn("BOSS_ACTOR", observed["env"])
+            self.assertIn("KUBERNETES_SERVICE_HOST", observed["env"])
+            self.assertNotIn("OPENAI_API_KEY", observed["env"])
+            result = subprocess.run(argv, capture_output=True, env=dict(env, BOSS_ACTOR="refuse"))
+            self.assertNotEqual(result.returncode, 0, "a failed preflight is a failed verb")
 
     def test_bootstrap_rejects_a_linked_installed_archive_without_running_it(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -6,8 +6,6 @@ pub mod events_api_config;
 #[cfg(feature = "postgres")]
 pub mod gate_evidence_pg;
 #[cfg(feature = "postgres")]
-pub mod history_snapshot;
-#[cfg(feature = "postgres")]
 pub mod integrity;
 #[cfg(feature = "postgres")]
 pub mod messages_events_pg;
@@ -18,6 +16,8 @@ pub mod original_groups;
 pub mod outbox;
 #[cfg(feature = "postgres")]
 pub mod outbox_http;
+#[cfg(feature = "postgres")]
+pub mod projection_tail;
 #[cfg(feature = "postgres")]
 pub mod replay;
 #[cfg(feature = "postgres")]

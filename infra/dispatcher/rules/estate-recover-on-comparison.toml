@@ -30,6 +30,12 @@
 # against the readings from before it went quiet
 # (handlers/estate_recover.rs).
 #
+# THE HOLD, v2 (backlog f4b0ad41, decided by David 2026-11-17):
+# `hold_days` is how long a recovered alarm is held OPEN with a
+# RECOVERED note before it closes. A finding back inside the window is
+# appended to the alarm as a relapse instead of re-raised as a new item;
+# a window with none closes it through the step the Workflow names.
+#
 # NO `when`, for the raiser's reason: the decision is not a predicate
 # over one event. Whether an open alarm belongs to the series that just
 # ticked, and whether its finding has been absent N consecutive times,
@@ -59,6 +65,8 @@ one firing closes at most the alarms of the one series that ticked,
 each through the step the Workflow already names — and it is what lets
 the algedonic channel go quiet by itself when the pain stops.
 """
+version = 2
 on_event = "jobs.estate.compared"
 [[rule.do]]
 handler = "estate.recover"
+args = { hold_days = "7" }

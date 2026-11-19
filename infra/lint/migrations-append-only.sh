@@ -94,7 +94,7 @@ check_against() {
     local base="$1" head="${2:-HEAD}" violations=0 status file
     local mb diff_out
     mb=$(resolve_merge_base "$LINT" "$base" "$head") || exit $?
-    diff_out=$(git_answer "$LINT" 0 diff --name-status "$mb" "$head" -- "$SCHEMA_DIR") || exit $?
+    diff_out=$(git_answer "$LINT" 0 diff --no-renames --name-status "$mb" "$head" -- "$SCHEMA_DIR") || exit $?
 
     while read -r status file; do
         [ -z "${file:-}" ] && continue
@@ -263,6 +263,11 @@ fi
 # trunk" there sent an operator after a ref that was already present
 # (backlog 6b2f4a1a). resolve_trunk_ref returns 1 for the first and 3 for
 # the second, having already printed git's own words.
+#
+# A THIRD answer is the run's own: the public mirror declares it has no
+# per-car trunk (BOSS_TRUNK=none, lib/trunk-ref.sh; backlog 2d28df78). The
+# self-test above still ran; the forge judged each car's migrations.
+lint_no_trunk "$LINT" "which applied migrations this change edited" && exit 0
 BASE=$(resolve_trunk_ref "$LINT"); rc=$?
 if [ "$rc" -eq "$LINT_CANNOT_ANSWER" ]; then
     exit "$LINT_CANNOT_ANSWER"

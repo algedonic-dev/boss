@@ -18,9 +18,8 @@
 // design-review/queue` makes the registry row the single definition.
 //
 // The page's own identity (header, which panels it carries) comes from
-// the same envelope, off `stations.lens` — the shape `upstream` proved
-// in 119: the row declares it, the queue echoes it, the lens renders
-// whatever the row says.
+// the same envelope, off `stations.lens`: the row declares it, the
+// queue echoes it, the lens renders whatever the row says.
 
 import { readEnvelope } from '../../data/shape';
 
@@ -405,5 +404,7 @@ export const BACK_HERE = `from=${encodeURIComponent('/it/design')}&from_label=${
  *  job page is the fallback for a packet caught before its steps
  *  materialized. */
 export function reviewHref(jobId: string, stepId?: string | null): string {
-  return stepId ? `/jobs/${jobId}/steps/${stepId}?${BACK_HERE}` : `/service/${jobId}`;
+  // The job page's own spelling: `/service/<id>` answered it until
+  // design 01fa5bdf removed the Service queue's paths.
+  return stepId ? `/jobs/${jobId}/steps/${stepId}?${BACK_HERE}` : `/jobs/${jobId}`;
 }

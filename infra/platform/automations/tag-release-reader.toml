@@ -9,3 +9,5 @@
 id = "automation:tag-release-reader"
 role = "audit-readonly"
 description = 'The release tagger reading the closed trains to find the merge it tags (infra/forge/tag-release.sh). Reads only.'
+# Host station: forge (backlog 6ecb5480, station-tree.md section 6).
+station = "b8f8a23b-f8da-428f-8df2-731be4ae597a"

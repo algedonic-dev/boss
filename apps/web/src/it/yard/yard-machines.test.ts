@@ -136,17 +136,20 @@ describe('runnerMachine — the deploy-runner shed, from the converge packets', 
     for (const code of ['1', '2', '74', '76', '124']) expect(exitFailed(code)).toBe(true);
   });
 
+  // The server spells it once, in the ops-execution classifier that
+  // verb_failure, `boss ops --wait` and the machinery glyphs all read
+  // (design b7bb1625); it moved there from jobs_complete_linked_step.rs.
   test('NOT_YET_EXIT equals the Rust NOT_YET_EXIT that verb_failure reads (CLAUDE.md §9a)', () => {
     const src = readFileSync(
       join(
         import.meta.dir,
         '..', '..', '..', '..', '..',
-        'crates', 'orchestrators', 'boss-dispatcher-handlers', 'src', 'handlers', 'jobs_complete_linked_step.rs',
+        'crates', 'core', 'boss-jobs', 'src', 'ops_execution.rs',
       ),
       'utf8',
     );
-    const rust = src.match(/pub\(crate\) const NOT_YET_EXIT: &str = "(\d+)";/);
-    expect(rust, 'jobs_complete_linked_step.rs is where the server spells NOT_YET_EXIT').not.toBeNull();
+    const rust = src.match(/pub const NOT_YET_EXIT: &str = "(\d+)";/);
+    expect(rust, 'ops_execution.rs is where the server spells NOT_YET_EXIT').not.toBeNull();
     expect(String(NOT_YET_EXIT)).toBe(rust![1]!);
   });
 

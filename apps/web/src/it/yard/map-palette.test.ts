@@ -20,23 +20,15 @@ import { join } from 'node:path';
  *  is an edit to the `--map-*` block rather than to these files. */
 const MAP_FILES = [
   'MapPage.svelte',
-  'WorldMap.svelte',
-  // 'RegionMap.svelte' and 'RegionFloor.svelte' retired with the floor
-  // pages (design e765b3fc, car N3).
-  // The HUD frame above the map (design 00774ca8): the same palette.
-  'HudFrame.svelte',
-  // The motion layer over the world (design 31bade8f, car M2): its canvas
-  // reads the same tokens rather than naming a colour of its own.
-  'MotionLayer.svelte',
-  // The transit monitor (design 16091dfb, flight it-map-transit): its
-  // lines are --map-line-* tokens, its rings the map's own states.
-  'TransitMap.svelte',
-  // The route layer it mounts (design e765b3fc, car R3): the served
-  // routes' strokes, the same tokens.
-  'RouteLayer.svelte',
-  // The real moves on the transit map (design e765b3fc car M2, flight
-  // it-map-live): its dots and pings wear the lines' own tokens.
-  'LiveMotion.svelte',
+  'SignalsPanel.svelte',
+  // NeedsYou.svelte, the needs-you board /it kept through R3 of the
+  // transit-map retirement (backlog 23a4b4d7), went with the map in step
+  // 1 of design 01fa5bdf.
+  // ConsolePage, ReviewScrubber, EstateBand, DeliveryBelt, FiringsPanel,
+  // HudFrame, TransitMap, RouteLayer and LiveMotion retired with the
+  // transit map (R3, backlog 23a4b4d7); CompanyMap, the department floor,
+  // FloorWire, BindingPlate and the claim lamps with the flat company
+  // map (backlogs 858e62aa and 759da6bc).
 ] as const;
 
 /** The grammar round 2 swaps: grounds, text, rules, the accent, and
@@ -103,38 +95,6 @@ describe('the map names every colour through its own tokens', () => {
     const read = MAP_FILES.flatMap((f) => [...here(f).matchAll(/var\(\s*(--map-[a-z0-9-]+)/g)].map((m) => m[1]));
     expect(read.length).toBeGreaterThan(0);
     expect(read.filter((t) => !defined.has(t))).toEqual([]);
-  });
-
-  // Design e765b3fc Q2, decided by David 2026-09-25: full is a SOLID disk
-  // in the state green with a heavier ring, clear stays a hollow ring —
-  // readable by fill alone, with no text and no hue to tell apart.
-  it('TransitMap fills a full station solid with --map-full, rings it heavier than clear, and leaves clear hollow', () => {
-    const rule = (sel: string): string =>
-      here('TransitMap.svelte').match(new RegExp(`^\\s*${sel.replaceAll('.', '\\.')}\\s*\\{([^}]*)\\}`, 'm'))?.[1] ?? '';
-    const width = (css: string): number => Number(css.match(/stroke-width:\s*([\d.]+)/)?.[1] ?? NaN);
-    const full = rule('.ring.full');
-    expect(full).toMatch(/fill:\s*var\(--map-full\)/);
-    expect(full).toMatch(/stroke:\s*var\(--map-full\)/);
-    expect(width(full)).toBeGreaterThan(width(rule('.ring.clear')));
-    expect(rule('.ring.clear')).not.toMatch(/fill:/);
-    expect(rule('.ring')).toMatch(/fill:\s*var\(--map-surface\)/);
-  });
-
-  // Backlog b9c88c61 (David 2026-09-26, watching the live map): a dash of
-  // 2 6 on an 8-unit round-capped stroke drew a section with no reading
-  // as a string of beads. It is a hollow TUBE now — the line's own colour
-  // as the casing, a pale centre on top — and no dash at all, so dashed
-  // stays the undeclared route's alone.
-  it('RouteLayer draws a section with no reading as a hollow tube, never dashed', () => {
-    const rule = (sel: string): string =>
-      uncommented(here('RouteLayer.svelte')).match(new RegExp(`^\\s*${sel.replaceAll('.', '\\.')}\\s*\\{([^}]*)\\}`, 'm'))?.[1] ?? '';
-    const width = (css: string): number => Number(css.match(/stroke-width:\s*([\d.]+)/)?.[1] ?? NaN);
-    const core = rule('.tube-core');
-    expect(core).toMatch(/stroke:\s*var\(--map-line-unconfirmed-core\)/);
-    expect(core).not.toMatch(/dasharray/);
-    expect(width(core)).toBeLessThan(width(rule('.section')));
-    expect(rule('.section.unknown')).not.toMatch(/dasharray/);
-    expect(uncommented(here('RouteLayer.svelte'))).toMatch(/\.section\.undeclared[^{]*\{[^}]*stroke-dasharray:\s*9 6/);
   });
 
   it('styles.css declares the whole Transit grammar, so round 2 is one block', () => {

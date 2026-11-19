@@ -10,6 +10,8 @@ use serde::Serialize;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JobsError {
+    #[error("resource claim refused: {0}")]
+    ResourceRefused(crate::flow_resources::Refusal),
     #[error("immutable metadata refused: {0}")]
     ImmutableMetadata(String),
     #[error("job not found: {0}")]
@@ -25,6 +27,19 @@ pub enum JobsError {
     ClaimConflict {
         holder: Option<String>,
         status: String,
+    },
+    /// A claim by an equipment station's automaton found every bay of
+    /// that station occupied, counted inside the claim's own write
+    /// (backlog 5a571b1a): under the station's lineage lock in the Pg
+    /// adapter, under the state lock in the in-memory one. The claim
+    /// door's read before the CAS could not hold its count still, so
+    /// two claims both read the last bay free and both took it. Nothing
+    /// is written.
+    #[error("equipment station {station} has no free bay: {occupied} of {bays} occupied")]
+    NoFreeBay {
+        station: String,
+        occupied: u32,
+        bays: i32,
     },
     #[error("station selection refused: {0}")]
     SelectionConflict(String),
@@ -60,8 +75,11 @@ pub enum JobsError {
     /// the row as the patch would leave it; merged into a row another
     /// writer changed since, the decision would be about a row that
     /// never existed. Refused atomically with the row lock; nothing is
-    /// written or recorded, and the caller re-reads and re-sends.
-    #[error("job {id} changed since this merge was judged — nothing was written")]
+    /// written or recorded, and the caller re-reads and re-sends. The
+    /// same refusal answers a write whose `expect` precondition no longer
+    /// holds under the lock — a merge's or a whole-row save's (backlog
+    /// 87fe090d).
+    #[error("job {id} changed since this write was judged — nothing was written")]
     JobChanged { id: JobId },
     /// A whole-row step write was computed from a read of a version the
     /// row no longer is: another writer (the merge door, a claim, a
@@ -118,6 +136,14 @@ pub enum JobsError {
         "{kind} v{version} was discarded — a packet is never admitted onto a version no protocol answers to"
     )]
     VersionDiscarded { kind: String, version: i32 },
+    /// The state event a write would stage is past its packet's budget
+    /// and the write grows the packet, or is over the event bound
+    /// itself (backlog 4f8783fb, design 6ab85352). Judged under the row
+    /// lock, before anything is staged; nothing is written, and the
+    /// door answers 413 naming the size, the budget, the bound and the
+    /// repair door.
+    #[error("{0}")]
+    OverBudget(crate::packet_budget::Refusal),
 }
 
 /// The nonce `stamp` would spend, if a stamp already on the step spent
@@ -223,6 +249,91 @@ pub enum Admission {
     AlreadyAdmitted,
 }
 
+/// Metadata keys that describe the DELIVERY a create body arrived on,
+/// not the packet it describes: which event a rule reacted to, on which
+/// topic. Stamped at the first admission and never compared against a
+/// re-send (backlog 4bdb8150, the round-3 review of car 983696b5).
+///
+/// `jobs.spawn` keys a delegate-subjob's child on its parent STEP, so a
+/// step that becomes Ready a second time emits a new `step.ready` — a
+/// new event id — and re-sends the same child id. Compared, the event id
+/// refused that re-send 409 `metadata`; the handler maps any non-2xx to
+/// a downstream error, so the rule erred on every delivery of the event
+/// while the one child it owns stood. The packet keeps the provenance
+/// of the delivery that admitted it; a later one is answered, not
+/// recorded.
+pub const DELIVERY_SCOPED_KEYS: [&str; 2] = ["triggered_by_event_id", "triggered_by_topic"];
+
+/// Every field of `sent` — a create body under an id `existing` already
+/// holds — that does not read the same on that packet (backlog
+/// 558396ff; the round-2 review of car 983696b5, SF2). Empty means the
+/// body describes the packet that exists, and a re-send of it is
+/// answered rather than admitted twice.
+///
+/// Two admission doors ask it, so it lives beside [`Admission`] rather
+/// than in either: the jobs API's create, for a re-sent body, and the
+/// guarded admission port, for a packet already under a delayed rule's
+/// child id ([`crate::guarded_admission::reconciles`]; review d6774dfd
+/// of car 2b7ff3ca found that port comparing kind, version and
+/// partition and nothing else — the shape round 2 of car 983696b5 found
+/// here).
+///
+/// What is compared is what the CALLER decides at admission. Left out,
+/// each because the server writes it and a re-send cannot be expected
+/// to match it: `workflow_version` (the pin), `opened_at`, an `owner_id`
+/// admission would not keep as sent (`owner_kept_as_sent` false: an
+/// automation-shaped id, or a person not on the active roster, both
+/// resolved to a role holder — [`crate::owner_resolution::kept_as_sent`];
+/// a kept owner is compared), `opened_on` when the clock supplied it,
+/// the metadata keys the server stamps beside the caller's (only the
+/// keys SENT are compared), and `status`, which the packet's protocol
+/// moves after admission. A field an edit has moved since then differs
+/// too, and is refused: the packet under that id no longer reads as the
+/// body.
+///
+/// The owner is judged by the keep rule, not by re-running the
+/// resolution (backlog dc7c91cc, SF-B): the role holder a replaced owner
+/// resolves to is a hash over the role's CURRENT holders, so a holder
+/// joining or leaving between the two sends would move it and refuse
+/// the re-send again.
+///
+/// The keys in [`DELIVERY_SCOPED_KEYS`] are not compared either
+/// (backlog 4bdb8150): they name the delivery that sent the body, and
+/// the first admission's value is the one the packet keeps.
+pub fn admission_differences(
+    sent: &Job,
+    dated_by_caller: bool,
+    owner_kept_as_sent: bool,
+    existing: &Job,
+) -> Vec<&'static str> {
+    let metadata_differs = match sent.metadata.as_object() {
+        Some(keys) => keys
+            .iter()
+            .filter(|(k, _)| !DELIVERY_SCOPED_KEYS.contains(&k.as_str()))
+            .any(|(k, v)| existing.metadata.get(k) != Some(v)),
+        None => !sent.metadata.is_null() && sent.metadata != existing.metadata,
+    };
+    let owner_differs = owner_kept_as_sent && sent.owner_id != existing.owner_id;
+    [
+        ("kind", sent.kind != existing.kind),
+        ("subject", sent.subject != existing.subject),
+        ("partition", sent.partition != existing.partition),
+        ("title", sent.title != existing.title),
+        ("owner_id", owner_differs),
+        ("priority", sent.priority != existing.priority),
+        (
+            "opened_on",
+            dated_by_caller && sent.opened_on != existing.opened_on,
+        ),
+        ("due_on", sent.due_on != existing.due_on),
+        ("tags", sent.tags != existing.tags),
+        ("metadata", metadata_differs),
+    ]
+    .into_iter()
+    .filter_map(|(field, differs)| differs.then_some(field))
+    .collect()
+}
+
 /// Optional filters for listing jobs.
 #[derive(Debug, Clone, Default)]
 pub struct JobFilter {
@@ -267,7 +378,7 @@ pub struct JobFilter {
     /// `limit=200`. Filtering after the fetch does not fix that; the
     /// window has to be in the query.
     ///
-    /// Same idea as `stations.md`'s `terminal_window_days`, which
+    /// Same idea as the station row's `terminal_window_days` (station-tree.md), which
     /// `my-watchlist` sets to 14 so a filer can still see an outcome.
     /// Combines with `status` as OR, not AND: `status = open` plus a
     /// window means "live OR recently closed", which is the useful
@@ -482,6 +593,29 @@ impl JobScope {
             }
         }
     }
+
+    /// Whether every binding `other` admits, this scope admits too —
+    /// decided from the two scopes alone, never from rows. A selection
+    /// receipt digests its competitors rather than copying them (backlog
+    /// a8e91ac5), so a replay cannot check each competitor's binding; it
+    /// checks that the reader's scope covers the one every competitor was
+    /// admitted under. Anything not provably covered answers false.
+    pub(crate) fn covers(&self, other: &JobScope) -> bool {
+        let within = |narrow: &[String], wide: &[String]| narrow.iter().all(|n| wide.contains(n));
+        match (self, other) {
+            (JobScope::All, _) | (_, JobScope::None) => true,
+            (JobScope::OwnerIs(own), JobScope::OwnerIs(other)) => own == other,
+            (JobScope::OwnerIn(owners), JobScope::OwnerIs(other)) => owners.contains(other),
+            (JobScope::OwnerIs(own), JobScope::OwnerIn(others)) => {
+                within(others, std::slice::from_ref(own))
+            }
+            (JobScope::OwnerIn(owners), JobScope::OwnerIn(others)) => within(others, owners),
+            (JobScope::AccountIn(accounts), JobScope::AccountIn(others)) => {
+                within(others, accounts)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Every packet pinned to one Workflow row, `(kind, version)`, in ANY
@@ -512,8 +646,31 @@ impl PinnedJobs {
         };
         format!(
             "{kind} v{version} cannot be discarded: {} {noun} pinned to it{named}, \
-             and a pinned packet runs the text it was admitted under",
+             and a pinned packet runs the text it was admitted under. A candidate \
+             that met traffic and lost is REJECTED instead — kept for those packets, \
+             never published: `boss workflow reject {kind} {version}`",
             self.count
+        )
+    }
+
+    /// The sentence a reject of a draft NO packet is pinned to refuses
+    /// with (backlog 50ded63d): it admitted nothing, so it is
+    /// pre-history and the discard removes it. One wording for both
+    /// adapters.
+    pub fn reject_needs_traffic(kind: &str, version: i32) -> String {
+        format!(
+            "{kind} v{version} cannot be rejected: no packet is pinned to it, so it met \
+             no traffic and is not history — discard it instead: `boss workflow discard \
+             {kind} {version}`"
+        )
+    }
+
+    /// The sentence a reject of a row that is not a draft refuses with.
+    /// A rejected row is not refused: rejecting it again is a no-op.
+    pub fn reject_history(kind: &str, version: i32, status: &str) -> String {
+        format!(
+            "{kind} v{version} is {status}, not a draft — an active or retired version \
+             is history; only a draft that met traffic can be rejected"
         )
     }
 }
@@ -864,6 +1021,30 @@ pub struct EstateNode {
     /// Retired machines stay readable so history resolves, exactly as
     /// retired subject kinds do.
     pub retired: bool,
+    /// The physical drives the node DECLARES (backlog ba0b7308), empty
+    /// when it declares none.
+    #[serde(default)]
+    pub disks: Vec<EstateDisk>,
+}
+
+/// One physical drive of a node, as the tree declares it (backlog
+/// ba0b7308; design f29798c0 §7). On 2026-10-29 the drive CLASS was the
+/// whole diagnosis of the WAL stalls — DRAM-less OEM client NVMe under
+/// etcd and the database — and the registry knew each node's disk size
+/// and nothing about what the disk was, so the models were read five
+/// times through `talos-get <node> disks` and copied into a packet.
+///
+/// `model` is the Talos `disks` resource's `spec.model`, `size_bytes`
+/// its `spec.size`, copied from that reading rather than rounded. Never
+/// a kernel name: the forge's devices renumbered when a disk was added
+/// (2026-09-21). No serial: the tree is published to the public mirror.
+/// Latency is a measurement and rides the log (`talos-read-diskstats`),
+/// so a key the shape does not name is refused.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EstateDisk {
+    pub model: String,
+    pub size_bytes: i64,
 }
 
 /// A machine as the tree DECLARES it (`[[node]]` in
@@ -894,11 +1075,16 @@ pub struct EstateNodeInput {
     pub disk_gb: Option<i32>,
     #[serde(default)]
     pub notes: Option<String>,
+    /// The node's physical drives. `None` keeps what a kept node has;
+    /// an explicit list refreshes it, as `disk_gb` does. Left out of the
+    /// serialized form when `None`, so a declaration that names no disks
+    /// writes the same fact it did before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disks: Option<Vec<EstateDisk>>,
 }
 
-/// Why a node declaration is refused, named so the refusal says which
-/// check failed; the same check runs at the file, the door and both
-/// adapters.
+/// Shape validation for the estate file and HTTP declaration door.
+/// The disk-capacity guard also runs at both adapters before any write.
 pub fn validate_estate_node(n: &EstateNodeInput) -> Result<(), String> {
     let slug = |field: &str, v: &str| -> Result<(), String> {
         if v.is_empty() {
@@ -920,6 +1106,7 @@ pub fn validate_estate_node(n: &EstateNodeInput) -> Result<(), String> {
     }
     slug("id", &n.id)?;
     slug("role", &n.role)?;
+    validate_estate_disk_capacity(n)?;
     for r in &n.roles {
         slug("roles entry", r)?;
     }
@@ -931,20 +1118,101 @@ pub fn validate_estate_node(n: &EstateNodeInput) -> Result<(), String> {
     Ok(())
 }
 
+/// The disk guard both adapters run before any write: declared capacity,
+/// and each declared drive (backlog ba0b7308), so a bad entry refuses the
+/// whole batch rather than landing half of it.
+pub(crate) fn validate_estate_disk_capacity(n: &EstateNodeInput) -> Result<(), String> {
+    if n.disk_gb.is_some_and(|disk| disk <= 0) {
+        return Err(format!(
+            "node {}: disk_gb must be positive when supplied",
+            n.id
+        ));
+    }
+    for d in n.disks.iter().flatten() {
+        if d.model.trim().is_empty() {
+            return Err(format!(
+                "node {}: a declared disk needs its model (spec.model of the Talos disks resource)",
+                n.id
+            ));
+        }
+        if d.size_bytes <= 0 {
+            return Err(format!(
+                "node {}: disk {} must declare a positive size_bytes, got {}",
+                n.id, d.model, d.size_bytes
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// What `POST /api/estate/nodes/batch` takes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EstateNodeBatch {
     pub nodes: Vec<EstateNodeInput>,
 }
 
-/// What a declaration did: nodes received, nodes inserted, and roles
+/// The file and every batch path share one identity rule. Conflicting
+/// duplicates would otherwise change capacity back and forth on retry.
+pub fn validate_estate_node_ids(nodes: &[EstateNodeInput]) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for node in nodes {
+        if !seen.insert(&node.id) {
+            return Err(format!("node {} is declared twice", node.id));
+        }
+    }
+    Ok(())
+}
+
+/// What a declaration did: nodes received, nodes inserted, distinct
+/// kept nodes whose explicit disk capacity or declared disks changed
+/// (a node counts once whichever changed), and roles
 /// inserted (a role landed on a node already there counts here — the
 /// forge gained `cluster-operator` after its row existed).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EstateBatchOutcome {
     pub received: usize,
     pub inserted: usize,
+    #[serde(default)]
+    pub updated: usize,
     pub roles_inserted: usize,
+}
+
+/// Only an explicit disk declaration refreshes a kept node. Other
+/// fields retain their existing ownership; omission never clears one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct EstateDiskChange {
+    pub before: Option<i32>,
+    pub after: i32,
+}
+
+pub(crate) fn estate_disk_change(
+    before: Option<i32>,
+    declared: Option<i32>,
+) -> Option<EstateDiskChange> {
+    declared
+        .filter(|after| Some(*after) != before)
+        .map(|after| EstateDiskChange { before, after })
+}
+
+/// A declared disk list that differs from the kept one, with both sides
+/// (backlog ba0b7308). As with `disk_gb`, only an explicit list refreshes
+/// a kept node; an omitted one never clears it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct EstateDisksChange {
+    pub before: Vec<EstateDisk>,
+    pub after: Vec<EstateDisk>,
+}
+
+pub(crate) fn estate_disks_change(
+    before: &[EstateDisk],
+    declared: Option<&Vec<EstateDisk>>,
+) -> Option<EstateDisksChange> {
+    declared
+        .filter(|after| after.as_slice() != before)
+        .map(|after| EstateDisksChange {
+            before: before.to_vec(),
+            after: after.clone(),
+        })
 }
 
 /// Which rows of one event kind [`JobsRepository::recent_events_by_kind`]
@@ -987,8 +1255,10 @@ pub struct EventPage {
 }
 
 /// The fact one declaration leaves: `node.declared`, once per node the
-/// batch changed (its row inserted, or a role landed on it), carrying
-/// the declaration, what landed, and `declared_by` from the stamp.
+/// batch changed (its row inserted, a role landed, its disk capacity or
+/// its declared disks changed), carrying the request, explicit `landed`
+/// fields and `declared_by`. Older role-only facts carry requested fields
+/// that did NOT land; never infer an update from those request fields.
 pub const NODE_DECLARED: &str = "node.declared";
 
 pub fn node_declared_event(
@@ -997,16 +1267,33 @@ pub fn node_declared_event(
     inserted: bool,
     roles_inserted: &[String],
 ) -> Result<boss_core::event::Event, JobsError> {
+    node_declared_event_with_disk(stamp, node, inserted, roles_inserted, None, None)
+}
+
+pub(crate) fn node_declared_event_with_disk(
+    stamp: &boss_core::publisher::EventStamp,
+    node: &EstateNodeInput,
+    inserted: bool,
+    roles_inserted: &[String],
+    disk: Option<&EstateDiskChange>,
+    disks: Option<&EstateDisksChange>,
+) -> Result<boss_core::event::Event, JobsError> {
     let mut payload = serde_json::to_value(node).map_err(|e| JobsError::Storage(e.to_string()))?;
     if let serde_json::Value::Object(map) = &mut payload {
         map.insert(
             "declared_by".to_string(),
             serde_json::Value::String(stamp.actor().to_string()),
         );
-        map.insert(
-            "landed".to_string(),
-            serde_json::json!({ "node": inserted, "roles": roles_inserted }),
-        );
+        let mut landed = serde_json::json!({ "node": inserted, "roles": roles_inserted });
+        if let Some(disk) = disk {
+            landed["disk_gb"] =
+                serde_json::to_value(disk).map_err(|e| JobsError::Storage(e.to_string()))?;
+        }
+        if let Some(disks) = disks {
+            landed["disks"] =
+                serde_json::to_value(disks).map_err(|e| JobsError::Storage(e.to_string()))?;
+        }
+        map.insert("landed".to_string(), landed);
     }
     Ok(stamp.event(NODE_DECLARED, payload))
 }
@@ -1038,6 +1325,93 @@ pub fn node_declared_event(
 /// overloads pass no events (test-path ergonomics).
 #[async_trait]
 pub trait JobsRepository: Send + Sync {
+    async fn bind_resource_identity_at(
+        &self,
+        _step: &StepId,
+        _actor: &str,
+        _binding: &crate::resource_leases::IdentityBinding,
+        _stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), JobsError> {
+        Err(JobsError::Storage(
+            "resource identity binding unsupported".into(),
+        ))
+    }
+    /// Expire up to `limit` (1..=`MAX_SWEEP`) active claims whose lease
+    /// lapsed at `stamp.timestamp`: FLOW is released, STOCK becomes an
+    /// obligation its reclaimer discharges. Called by
+    /// `POST /api/jobs/resource-leases/sweep`, which the dispatcher's
+    /// `resource-leases-are-swept-every-five-minutes` rule fires (backlog
+    /// 3aeaf08c, once qualified physical return landed in car 2c, #1546).
+    /// The stamp signs every expiry, but each expiry is recorded under
+    /// its own packet's admission partition, never the stamp's.
+    async fn sweep_resource_leases_at(
+        &self,
+        _stamp: &boss_core::publisher::EventStamp,
+        _limit: usize,
+    ) -> Result<crate::resource_leases::SweepResult, JobsError> {
+        Err(JobsError::Storage(
+            "resource lease sweep unsupported".into(),
+        ))
+    }
+    async fn stock_obligations(
+        &self,
+        _acquisition: uuid::Uuid,
+    ) -> Result<Vec<crate::resource_leases::StockObligation>, JobsError> {
+        Err(JobsError::Storage("stock obligations unsupported".into()))
+    }
+    /// The READY steps of live (not closed or cancelled) packets whose
+    /// `metadata.waiting_on` names `pool` — the claim door's own reading
+    /// of a live packet — as the pool's line, unordered; one pure function
+    /// orders it for every adapter (`flow_resources::line`, backlog
+    /// 587f395a). An adapter that cannot read it says so, never an empty
+    /// line.
+    async fn resource_waiting_rows(
+        &self,
+        _pool: &str,
+    ) -> Result<Vec<crate::flow_resources::WaitingRow>, JobsError> {
+        Err(JobsError::Storage(
+            "resource waiting line unsupported".into(),
+        ))
+    }
+    /// Exact historical declaration for an obligation, never the newest pool.
+    async fn resource_pool_version(
+        &self,
+        _name: &str,
+        _version: i32,
+    ) -> Result<Option<crate::pools::PoolSpec>, JobsError> {
+        Err(JobsError::Storage(
+            "pinned resource pool read unsupported".into(),
+        ))
+    }
+    /// Every ACTIVE pool row, name-ordered — what the station tree read
+    /// serves beside the stations that hold from them (T5 of design
+    /// 4b27a65a, backlog 3f58c823). An adapter that cannot say is an
+    /// error, which the read names, never an empty list.
+    async fn active_resource_pools(&self) -> Result<Vec<crate::pools::PoolSpec>, JobsError> {
+        Err(JobsError::Storage(
+            "active resource pool list unsupported".into(),
+        ))
+    }
+    /// Whether a pool named `name` has an ACTIVE version now — the claim
+    /// door's evidence that a robot's recorded model class is a declared
+    /// one (`robots:<class>`; T2d, backlog 06d8988b). An adapter that
+    /// cannot say is an error, never a `false` and never a `true`.
+    async fn resource_pool_is_active(&self, _name: &str) -> Result<bool, JobsError> {
+        Err(JobsError::Storage(
+            "active resource pool read unsupported".into(),
+        ))
+    }
+    async fn discharge_stock_at(
+        &self,
+        _acquisition: uuid::Uuid,
+        _pool: &str,
+        _actor: &str,
+        _evidence: uuid::Uuid,
+        _verifier: &dyn crate::resource_leases::ResourceReturnVerifier,
+        _stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), JobsError> {
+        Err(JobsError::Storage("stock discharge unsupported".into()))
+    }
     // ----- Jobs -----
 
     async fn create_job(&self, job: &Job) -> Result<(), JobsError> {
@@ -1236,6 +1610,95 @@ pub trait JobsRepository: Send + Sync {
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Job, JobsError>;
 
+    /// [`Self::update_job_at`] with `expect`, a precondition on the row's
+    /// metadata judged under the same lock as the write
+    /// ([`crate::step_metadata_write::metadata_still_reads`]): a row that
+    /// no longer reads so is refused with [`JobsError::JobChanged`] and
+    /// nothing is written or recorded. The job PUT sends the owed-proof
+    /// payment it judged ([`crate::car::payment_as_read`]), so a payment,
+    /// debt or erasure committed after its read is not undone by a
+    /// whole-row save judged on the row before it (backlog 87fe090d). An
+    /// adapter that cannot judge it refuses it, as the step door's
+    /// guarded merge does.
+    async fn update_job_expecting_at(
+        &self,
+        job: &Job,
+        read: JobStatus,
+        expect: Option<&serde_json::Map<String, serde_json::Value>>,
+        now: DateTime<Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<(), JobsError> {
+        if expect.is_some() {
+            return Err(JobsError::Storage(
+                "adapter cannot judge a metadata precondition under its write".into(),
+            ));
+        }
+        self.update_job_at(job, read, now, events).await
+    }
+
+    /// [`Self::merge_job_metadata_at`] with `expect`, judged as
+    /// [`Self::update_job_expecting_at`] judges it: narrower than
+    /// `judged_on` on purpose, because a key it does not name may move
+    /// freely under the merge (backlog 87fe090d).
+    async fn merge_job_metadata_expecting_at(
+        &self,
+        id: &JobId,
+        patch: &serde_json::Map<String, serde_json::Value>,
+        judged_on: Option<&Job>,
+        expect: Option<&serde_json::Map<String, serde_json::Value>>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<Job, JobsError> {
+        if expect.is_some() {
+            return Err(JobsError::Storage(
+                "adapter cannot judge a metadata precondition under its write".into(),
+            ));
+        }
+        self.merge_job_metadata_at(id, patch, judged_on, stamp)
+            .await
+    }
+
+    /// Set the Job's `priority` to `to` and append the move to its
+    /// reserved `priority_changes` list ([`crate::priority`], backlog
+    /// eb26059d), in ONE write under the row's lock, recording the
+    /// JOB_UPDATED state event built from the post-write row. The
+    /// record's `from` is the stored priority at write time and its
+    /// `by` is the stamp's actor. A Closed or Cancelled row is refused
+    /// with [`JobsError::TerminalJob`]; a row already at `to` writes and
+    /// records nothing (`changed: false`). Touches no other envelope
+    /// field and no other metadata key.
+    async fn set_priority_at(
+        &self,
+        id: &JobId,
+        to: boss_core::job::Priority,
+        why: &str,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<crate::priority::PriorityMove, JobsError> {
+        let _ = (id, to, why, stamp);
+        Err(JobsError::Storage(
+            "the priority door is unsupported by this adapter".into(),
+        ))
+    }
+
+    /// Judge `expected` under the same lock as the priority column and
+    /// history append. A stale observation writes and records nothing,
+    /// even when `to` is already stored. An adapter without this contract
+    /// refuses a guarded move; it never downgrades it to the legacy write.
+    async fn set_priority_expecting_at(
+        &self,
+        id: &JobId,
+        to: boss_core::job::Priority,
+        why: &str,
+        expected: Option<&crate::priority::PriorityExpectation>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<crate::priority::PriorityMove, JobsError> {
+        if expected.is_some() {
+            return Err(JobsError::Storage(
+                "adapter cannot judge a priority precondition under its write".into(),
+            ));
+        }
+        self.set_priority_at(id, to, why, stamp).await
+    }
+
     /// Atomically test exact key presence/value, apply and retain the
     /// actor-bound idempotency receipt and full state event. A replay
     /// returns its ORIGINAL receipt even after the row moves.
@@ -1260,6 +1723,19 @@ pub trait JobsRepository: Send + Sync {
         let _ = (id, actor, command_id);
         Err(JobsError::Storage(
             "conditional metadata receipt lookup is unsupported by this adapter".into(),
+        ))
+    }
+
+    /// Every conditional receipt this packet retains, every actor's, in no
+    /// order: the history a gate attempt id is judged fresh against
+    /// (backlog 0471152b).
+    async fn conditional_job_metadata_receipts(
+        &self,
+        id: &JobId,
+    ) -> Result<Vec<crate::conditional_metadata::Receipt>, JobsError> {
+        let _ = id;
+        Err(JobsError::Storage(
+            "conditional metadata receipt history is unsupported by this adapter".into(),
         ))
     }
 
@@ -1311,6 +1787,51 @@ pub trait JobsRepository: Send + Sync {
         markers: &(dyn for<'j> Fn(&'j Job) -> Vec<boss_core::event::Event> + Send + Sync),
     ) -> Result<Option<Job>, JobsError>;
 
+    /// Admit a delayed rule's child under its intent's guard, in ONE
+    /// transaction (backlog 84a010cb, car 3; design f1d66249): the
+    /// intent's `due` step is decided and, when the guard holds, the
+    /// child graph is created — the job row, every step row, their
+    /// events and the decided `due` step with its events all commit
+    /// together, or none of them do.
+    ///
+    /// The binding is the intent's immutable `envelope`, read under the
+    /// intent's lock; the request's child must be the envelope's
+    /// ([`crate::guarded_admission::preflight`]). Before the due
+    /// instant, or once decided, nothing is written. The guard is judged
+    /// ([`crate::guarded_admission::judge`]) on rows FENCED against their
+    /// real writers until commit: the source job's row (the close and
+    /// cancel doors lock it `FOR UPDATE`) and each named guard step's row
+    /// (the step write door locks it `FOR UPDATE`). LOCK ORDER, shared
+    /// with those writers: job rows first — the intent `FOR UPDATE`, the
+    /// source and an existing child `FOR SHARE` — then the step-write
+    /// reservation, then step rows: the intent's `due` step `FOR UPDATE`,
+    /// the source's named steps `FOR SHARE`, then an existing child's
+    /// steps `FOR SHARE`, each by id. A writer that committed first is
+    /// SEEN (a locking read re-reads the newest row version); one that
+    /// comes after waits for this commit.
+    ///
+    /// The exact requested child already under the envelope's id — its
+    /// job row and its step graph, closed included — is reconciled, not
+    /// admitted twice; a packet under that id that differs from it in
+    /// any field admission compares, or in its step graph, is refused
+    /// ([`crate::guarded_admission::reconciles`]) whatever the guard
+    /// says, as is a child step carrying another job's id, and so is the
+    /// exact child when the guard suppresses
+    /// ([`crate::guarded_admission::decide`]). `due_events` builds the decided step's events from
+    /// the row as written. The outcome steps and the intent's close
+    /// follow through the ordinary step advance; this port does not
+    /// write them, and it does not recheck policy — its caller does.
+    async fn guarded_admission_at(
+        &self,
+        request: &crate::guarded_admission::Request,
+        due_events: &(dyn for<'s> Fn(&'s Step) -> Vec<boss_core::event::Event> + Send + Sync),
+    ) -> Result<crate::guarded_admission::Outcome, JobsError> {
+        let _ = (request, due_events);
+        Err(JobsError::Storage(
+            "guarded admission is unsupported by this adapter".into(),
+        ))
+    }
+
     /// Append one entry to the Job's reserved `corrections` list
     /// (`crate::corrections`, design 4105b020), atomically against the
     /// row as it stands, and return the post-append Job with the index
@@ -1330,6 +1851,20 @@ pub trait JobsRepository: Send + Sync {
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(Job, usize), JobsError>;
 
+    /// Append one entry to the Job's reserved `input_classifications`
+    /// list (`crate::execution_inputs`, design e72dc7c9), atomically
+    /// against the row as it stands, exactly as
+    /// [`JobsRepository::append_step_correction_at`] appends a correction:
+    /// two classifications landing at once both survive. Records, in the
+    /// same transaction, JOB_UPDATED from the post-append row and
+    /// JOB_INPUT_CLASSIFIED naming the index.
+    async fn append_input_classification_at(
+        &self,
+        id: &JobId,
+        entry: &serde_json::Value,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(Job, usize), JobsError>;
+
     /// Every machine the estate declares.
     ///
     /// Declaring a machine is a change to the TREE that converges
@@ -1337,7 +1872,7 @@ pub trait JobsRepository: Send + Sync {
     /// ee368d0c (2026-09-18) the tree's copy was a schema migration, so
     /// every fresh database — every OSS install — carried this LAN's
     /// nodes; now the launcher publishes the tree's declaration through
-    /// `declare_estate_nodes` on every start, insert-if-absent. What was
+    /// `declare_estate_nodes` on every start. What was
     /// missing before either existed was any way to READ it: the tables
     /// had existed since 144-estate-subjects.sql and no service served
     /// them, so "what hardware is running" was unanswerable from inside
@@ -1349,13 +1884,17 @@ pub trait JobsRepository: Send + Sync {
     /// what the `node` subject kind's own description says.
     async fn list_estate_nodes(&self) -> Result<Vec<EstateNode>, JobsError>;
 
-    /// Land the tree's declaration, insert-if-absent: a `nodes` row and
-    /// its `subjects` identity for each id not already there (a row
-    /// already there is KEPT — its notes and capacity as the last
-    /// declaration or migration left them, never overwritten), and a
+    /// Land the tree's declaration: insert a `nodes` row and its
+    /// `subjects` identity for each new id. On kept nodes, an explicit
+    /// disk_gb refreshes declared disk capacity, and an explicit `disks`
+    /// list the declared drives; None keeps either. Notes,
+    /// cpu/memory, identity, address, primary role and retirement stay
+    /// unchanged. There is no revision ordering: the last accepted
+    /// explicit disk declaration wins. Also insert a
     /// `node_roles` row for each (node, role) pair not already there,
     /// on kept nodes too. One `node.declared` fact per node the batch
-    /// changed, staged in the write's own transaction; none for a node
+    /// changed, with an explicit before/after for a landed disk change,
+    /// staged in the write's own transaction; none for a node
     /// it left alone. A role that is not a Class of `node` is refused
     /// by the schema's FK — the vocabulary stays registry data
     /// (202609120300).
@@ -1445,18 +1984,21 @@ pub trait JobsRepository: Send + Sync {
             "bounded historical events unavailable".into(),
         ))
     }
-    /// Original packet/registry/clock histories and current safe policy
-    /// identity census at one native audit cut. No projection fallback.
-    async fn membership_snapshot(
+    /// THE SET OF PACKET IDS A NARROWED SCOPE ADMITS RIGHT NOW, the map
+    /// cache's authorization binding (review run 94784c1a of car
+    /// dc7a2a00, F1). `None` for `All`, whose set is everything; an error
+    /// for `None`, for a bound outside 1..=1,000,000, or for a set larger
+    /// than `limit` — never a truncated set, which would let two different
+    /// sets share a key. An adapter that cannot answer refuses, and the
+    /// map answers 503: the guard fails closed. Until design 7b8ed079
+    /// car 2 this was the membership replay's `membership_census`; the
+    /// replay is retired and the read stays, as a plain scoped read.
+    async fn scope_census(
         &self,
-        _since: DateTime<Utc>,
-        _actor: Option<String>,
         _scope: &JobScope,
         _limit: i64,
-    ) -> Result<crate::membership_replay::ReplayInput, JobsError> {
-        Err(JobsError::Storage(
-            "native membership history unavailable".into(),
-        ))
+    ) -> Result<Option<std::collections::BTreeSet<String>>, JobsError> {
+        Err(JobsError::Storage("scope census unavailable".into()))
     }
     /// One consistent native audit snapshot, identities resolved from an immutable diagnosis.
     async fn move_admission_snapshot(
@@ -1690,19 +2232,58 @@ pub trait JobsRepository: Send + Sync {
 
     /// A signer guard is checked under the actual row/event writers, and again
     /// before Pg COMMIT dispatch. An adapter with no such owner refuses it.
+    ///
+    /// `expect` is a precondition on the row's metadata, judged under the
+    /// same lock as the write ([`crate::step_metadata_write::metadata_still_reads`]):
+    /// a row that no longer reads so is refused with
+    /// [`JobsError::StepChanged`] and nothing is written. The release door
+    /// sends the `hold` and `hold_sha` it judged, so a hold written between
+    /// its read and its write is not lifted (review 792b871a N1). An
+    /// adapter that cannot judge it refuses it, as it refuses a guard.
     async fn merge_step_metadata_guarded_at(
         &self,
         id: &StepId,
         patch: &serde_json::Map<String, serde_json::Value>,
         stamp: &boss_core::publisher::EventStamp,
         guard: Option<&crate::signer_write::SignerWriteGuard>,
+        expect: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> Result<Step, JobsError> {
         if guard.is_some() {
             return Err(JobsError::Storage(
                 "adapter has no owning signer metadata guard".into(),
             ));
         }
+        if expect.is_some() {
+            return Err(JobsError::Storage(
+                "adapter cannot judge a metadata precondition under its write".into(),
+            ));
+        }
         self.merge_step_metadata_at(id, patch, stamp).await
+    }
+
+    /// A context writer may have been admitted only before a person's
+    /// decision. Carry the opaque whole-row version into the SAME merge
+    /// lock: metadata-only expectations cannot detect a competing stamp.
+    /// Existing callers retain their ordinary merge semantics with None.
+    /// An adapter without this owning comparison must refuse, never
+    /// silently fall back to an unchecked write.
+    async fn merge_step_metadata_checked_at(
+        &self,
+        id: &StepId,
+        patch: &serde_json::Map<String, serde_json::Value>,
+        stamp: &boss_core::publisher::EventStamp,
+        guard: Option<&crate::signer_write::SignerWriteGuard>,
+        expect: Option<&serde_json::Map<String, serde_json::Value>>,
+        read: Option<StepVersion>,
+    ) -> Result<Step, JobsError> {
+        if read.is_some() {
+            return Err(JobsError::Storage(
+                "adapter cannot enforce the expected step version under its metadata merge lock"
+                    .into(),
+            ));
+        }
+        self.merge_step_metadata_guarded_at(id, patch, stamp, guard, expect)
+            .await
     }
 
     /// Read the original receipt without a caller value or replay write.
@@ -1769,7 +2350,7 @@ pub trait JobsRepository: Send + Sync {
     }
 
     /// Claim a ready step for an actor — the Ready→Active
-    /// compare-and-set (queue-visibility Q2). Succeeds only while
+    /// compare-and-set (queue-visibility Q2, in the decision record). Succeeds only while
     /// the step is `ready` and unassigned; a re-claim by the current
     /// holder (ready or active) is an idempotent success. Everything
     /// else is `ClaimConflict` naming the holder. Like
@@ -1940,6 +2521,18 @@ pub trait JobsRepository: Send + Sync {
     /// small transaction.
     async fn record_events(&self, events: &[boss_core::event::Event]) -> Result<(), JobsError>;
 
+    /// Atomically retain the first comparison of one immutable observation.
+    /// A repeated delivery is not another persistence sample.
+    async fn record_estate_comparison_once(
+        &self,
+        _observation: uuid::Uuid,
+        _event: &boss_core::event::Event,
+    ) -> Result<bool, JobsError> {
+        Err(JobsError::Storage(
+            "idempotent estate comparisons are unsupported by this adapter".into(),
+        ))
+    }
+
     /// The plugin version a step of `kind` written now is stamped with:
     /// the version of the step plugin active for the kind in THIS
     /// adapter's registry, 0 when none serves it — the same lookup a
@@ -1979,6 +2572,22 @@ pub trait JobsRepository: Send + Sync {
     }
 
     async fn list_steps(&self, job_id: &JobId) -> Result<Vec<Step>, JobsError>;
+
+    /// All steps belonging to the distinct requested packets, ordered by
+    /// packet id then step order. Missing packets contribute no rows; a
+    /// failed read remains an error. Adapters can replace the compatible
+    /// per-packet default with one storage read.
+    async fn list_steps_for_jobs(&self, job_ids: &[JobId]) -> Result<Vec<Step>, JobsError> {
+        let mut ids = job_ids.to_vec();
+        ids.sort_by_key(|id| *id.inner().as_uuid());
+        ids.dedup();
+        let mut steps = Vec::new();
+        for id in ids {
+            steps.extend(self.list_steps(&id).await?);
+        }
+        steps.sort_by_key(|step| (*step.job_id.inner().as_uuid(), step.sort_order));
+        Ok(steps)
+    }
 
     /// Open, workable steps for an executor — the pull side of the
     /// "human-powered state machine" dispatcher. Returns steps whose
@@ -2155,6 +2764,26 @@ pub trait JobsRepository: Send + Sync {
     /// so there is no honest way to derive it from `list_jobs` +
     /// `list_steps`, and a default would have to invent one.
     async fn queue_age(&self, scope: &JobScope) -> Result<Vec<QueueAgeRow>, JobsError>;
+
+    /// THE PACKETS A STATION WINDOW READS (design 7b8ed079, car 1): every
+    /// packet in `scope` one of whose steps became ready or completed at
+    /// or after `since`, with EVERY one of its steps and each step's
+    /// recorded ready flip — what [`crate::station_window`] counts a
+    /// station's arrivals and departures from, with nothing replayed.
+    ///
+    /// The default refuses, for [`Self::queue_age`]'s reason: the ready
+    /// flip is adapter storage, invisible to `Step`, so a default would
+    /// have to invent it. A refusal is drawn as an unread flow, never as
+    /// a station that moved nothing.
+    async fn station_window_packets(
+        &self,
+        _since: DateTime<Utc>,
+        _scope: &JobScope,
+    ) -> Result<Vec<crate::station_window::WindowPacket>, JobsError> {
+        Err(JobsError::Storage(
+            "this store records no step stamps to count a station window from".into(),
+        ))
+    }
 
     /// Count steps whose kind matches `step_kind` and whose status is
     /// still non-terminal (pending, ready, active). Used by the Step

@@ -192,6 +192,33 @@ impl StepType {
     pub fn is_marker(&self) -> bool {
         self.required_roles.is_empty() && self.typical_duration_hours.is_some_and(|h| h <= 0.0)
     }
+
+    /// A GATE — an `outcome` enum the Workflow forks on. It may carry the
+    /// marker shape, but `gate.resolve` must compute its outcome from real
+    /// stock first, so nothing completes one on readiness alone.
+    pub fn is_gate(&self) -> bool {
+        self.fields.iter().any(|f| f.name == "outcome")
+    }
+
+    /// A marker the SYSTEM completes the moment it is ready: the marker
+    /// shape, not a gate, and not a trigger (`auto-on-materialize`: the
+    /// firing one is born completed, so materialization owns it). ONE
+    /// definition, read by `jobs.complete_step` on `step.ready.*` and by
+    /// the readiness sweep that completes a ready marker whose event was
+    /// lost (backlog ee399c2c), so the event and its recovery cannot
+    /// disagree about which steps are a person's.
+    pub fn completes_itself_when_ready(&self) -> bool {
+        self.is_marker() && !self.is_gate() && self.completion != Completion::AutoOnMaterialize
+    }
+}
+
+/// A completion refused 400 for a missing required field is a marker that
+/// owes a value only a person can supply — not a fault to retry. Read by
+/// both writers that complete a ready marker (`jobs.complete_step` and the
+/// readiness sweep, backlog ee399c2c), beside the validator that writes
+/// the message it reads, so the two cannot drift apart from it.
+pub fn needs_a_person(status: u16, text: &str) -> bool {
+    status == 400 && text.contains("required field") && text.contains("is missing")
 }
 
 /// Validation error for step metadata.

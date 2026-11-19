@@ -7,11 +7,6 @@
     "sort_order": 20,
     "metadata": {
       "surfaces": [
-        "exec",
-        "shipping",
-        "jobs",
-        "people",
-        "policy",
         "workflows"
       ]
     }
@@ -24,11 +19,6 @@
     "sort_order": 21,
     "metadata": {
       "surfaces": [
-        "exec",
-        "marketing-assets",
-        "jobs",
-        "people",
-        "policy",
         "workflows"
       ]
     }
@@ -41,10 +31,6 @@
     "sort_order": 22,
     "metadata": {
       "surfaces": [
-        "exec",
-        "people",
-        "jobs",
-        "policy",
         "workflows"
       ]
     }
@@ -57,12 +43,7 @@
     "sort_order": 23,
     "metadata": {
       "surfaces": [
-        "exec",
-        "sales",
         "accounts",
-        "jobs",
-        "people",
-        "policy",
         "workflows"
       ]
     }
@@ -75,12 +56,6 @@
     "sort_order": 30,
     "metadata": {
       "surfaces": [
-        "exec",
-        "jobs",
-        "parts",
-        "products",
-        "qa",
-        "people",
         "schedule"
       ]
     }
@@ -93,10 +68,6 @@
     "sort_order": 31,
     "metadata": {
       "surfaces": [
-        "jobs",
-        "parts",
-        "products",
-        "qa",
         "schedule"
       ]
     }
@@ -109,9 +80,6 @@
     "sort_order": 32,
     "metadata": {
       "surfaces": [
-        "jobs",
-        "parts",
-        "products",
         "schedule"
       ]
     }
@@ -124,9 +92,6 @@
     "sort_order": 33,
     "metadata": {
       "surfaces": [
-        "jobs",
-        "parts",
-        "products",
         "schedule"
       ]
     }
@@ -139,11 +104,7 @@
     "sort_order": 34,
     "metadata": {
       "surfaces": [
-        "jobs",
-        "parts",
-        "products",
-        "schedule",
-        "people"
+        "schedule"
       ]
     }
   },
@@ -155,10 +116,6 @@
     "sort_order": 40,
     "metadata": {
       "surfaces": [
-        "jobs",
-        "warehouse",
-        "shipping",
-        "people",
         "schedule"
       ]
     }
@@ -178,8 +135,6 @@
     "sort_order": 41,
     "metadata": {
       "surfaces": [
-        "jobs",
-        "warehouse",
         "schedule"
       ]
     }
@@ -192,8 +147,6 @@
     "sort_order": 42,
     "metadata": {
       "surfaces": [
-        "jobs",
-        "warehouse"
       ]
     }
   },
@@ -205,11 +158,6 @@
     "sort_order": 50,
     "metadata": {
       "surfaces": [
-        "jobs",
-        "qa",
-        "parts",
-        "products",
-        "people"
       ]
     }
   },
@@ -220,13 +168,7 @@
     "member_attribute": "role",
     "sort_order": 51,
     "metadata": {
-      "surfaces": [
-        "catalog",
-        "assets",
-        "parts",
-        "products",
-        "qa"
-      ]
+      "surfaces": []
     }
   },
   {
@@ -237,10 +179,6 @@
     "sort_order": 52,
     "metadata": {
       "surfaces": [
-        "jobs",
-        "qa",
-        "parts",
-        "products"
       ]
     }
   },
@@ -258,12 +196,7 @@
     "member_attribute": "role",
     "sort_order": 60,
     "metadata": {
-      "surfaces": [
-        "warehouse",
-        "parts",
-        "products",
-        "shipping"
-      ]
+      "surfaces": []
     }
   },
   {
@@ -273,11 +206,7 @@
     "member_attribute": "role",
     "sort_order": 61,
     "metadata": {
-      "surfaces": [
-        "warehouse",
-        "parts",
-        "products"
-      ]
+      "surfaces": []
     }
   },
   {
@@ -287,10 +216,7 @@
     "member_attribute": "role",
     "sort_order": 62,
     "metadata": {
-      "surfaces": [
-        "warehouse",
-        "shipping"
-      ]
+      "surfaces": []
     }
   },
   {
@@ -308,8 +234,6 @@
     "sort_order": 70,
     "metadata": {
       "surfaces": [
-        "shipping",
-        "jobs",
         "schedule"
       ]
     }
@@ -322,10 +246,6 @@
     "sort_order": 80,
     "metadata": {
       "surfaces": [
-        "jobs",
-        "parts",
-        "products",
-        "people",
         "schedule"
       ]
     }
@@ -338,9 +258,6 @@
     "sort_order": 81,
     "metadata": {
       "surfaces": [
-        "jobs",
-        "parts",
-        "products",
         "schedule"
       ]
     }
@@ -353,9 +270,6 @@
     "sort_order": 82,
     "metadata": {
       "surfaces": [
-        "jobs",
-        "parts",
-        "products",
         "schedule"
       ]
     }
@@ -368,9 +282,7 @@
     "sort_order": 90,
     "metadata": {
       "surfaces": [
-        "sales",
-        "accounts",
-        "jobs"
+        "accounts"
       ]
     }
   },
@@ -389,9 +301,6 @@
     "sort_order": 100,
     "metadata": {
       "surfaces": [
-        "exec",
-        "marketing-assets",
-        "jobs"
       ]
     }
   },
@@ -403,8 +312,6 @@
     "sort_order": 101,
     "metadata": {
       "surfaces": [
-        "jobs",
-        "marketing-assets"
       ]
     }
   },
@@ -415,9 +322,7 @@
     "member_attribute": "role",
     "sort_order": 102,
     "metadata": {
-      "surfaces": [
-        "marketing-assets"
-      ]
+      "surfaces": []
     }
   },
   {
@@ -461,8 +366,7 @@
       "surfaces": [
         "finance",
         "accounts",
-        "vendors",
-        "jobs"
+        "vendors"
       ]
     }
   },
@@ -475,8 +379,7 @@
     "metadata": {
       "surfaces": [
         "finance",
-        "accounts",
-        "jobs"
+        "accounts"
       ]
     }
   },
@@ -489,10 +392,7 @@
     "metadata": {
       "surfaces": [
         "finance",
-        "vendors",
-        "parts",
-        "products",
-        "jobs"
+        "vendors"
       ]
     }
   },
@@ -504,9 +404,7 @@
     "sort_order": 123,
     "metadata": {
       "surfaces": [
-        "finance",
-        "exec",
-        "jobs"
+        "finance"
       ]
     }
   },
@@ -518,9 +416,7 @@
     "sort_order": 124,
     "metadata": {
       "surfaces": [
-        "finance",
-        "people",
-        "jobs"
+        "finance"
       ]
     }
   },
@@ -532,8 +428,6 @@
     "sort_order": 130,
     "metadata": {
       "surfaces": [
-        "people",
-        "jobs"
       ]
     }
   },
@@ -545,7 +439,6 @@
     "sort_order": 140,
     "metadata": {
       "surfaces": [
-        "exec",
         "system-monitoring",
         "system-kb",
         "system-step-plugins",
@@ -553,8 +446,7 @@
         "system-dispatcher-rules",
         "system-dispatcher-rule",
         "system-subjects",
-        "system-design",
-        "jobs"
+        "system-design"
       ]
     }
   },
@@ -573,8 +465,7 @@
         "system-dispatcher-rules",
         "system-dispatcher-rule",
         "system-subjects",
-        "system-design",
-        "jobs"
+        "system-design"
       ]
     }
   },
@@ -587,8 +478,7 @@
     "metadata": {
       "surfaces": [
         "system-monitoring",
-        "system-kb",
-        "jobs"
+        "system-kb"
       ]
     }
   },
@@ -642,14 +532,8 @@
     "sort_order": 320,
     "metadata": {
       "surfaces": [
-        "exec",
         "accounts",
-        "assets",
-        "sales",
         "finance",
-        "people",
-        "parts",
-        "products",
         "vendors"
       ]
     }
@@ -676,12 +560,8 @@
     "sort_order": 350,
     "metadata": {
       "surfaces": [
-        "exec",
         "accounts",
-        "sales",
         "finance",
-        "parts",
-        "products",
         "vendors"
       ]
     }
@@ -693,9 +573,7 @@
     "member_attribute": "role",
     "sort_order": 360,
     "metadata": {
-      "surfaces": [
-        "people"
-      ]
+      "surfaces": []
     }
   },
   {
@@ -705,9 +583,7 @@
     "member_attribute": "role",
     "sort_order": 370,
     "metadata": {
-      "surfaces": [
-        "people"
-      ]
+      "surfaces": []
     }
   },
   {
@@ -718,9 +594,7 @@
     "sort_order": 380,
     "metadata": {
       "surfaces": [
-        "catalog",
-        "accounts",
-        "sales"
+        "accounts"
       ]
     }
   },
@@ -732,12 +606,7 @@
     "sort_order": 390,
     "metadata": {
       "surfaces": [
-        "parts",
-        "products",
-        "people",
-        "warehouse",
-        "vendors",
-        "shipping"
+        "vendors"
       ]
     }
   },

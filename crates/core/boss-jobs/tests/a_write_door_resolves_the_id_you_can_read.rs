@@ -263,3 +263,45 @@ async fn a_full_uuid_still_takes_the_fast_path() {
     assert!(status.is_success(), "{status} {body}");
     assert_eq!(metadata_of(&jobs, UNIQUE).await["note"], "by full id");
 }
+
+/// A BODY WRAPPED IN `metadata` IS REFUSED, naming the mistake (backlog
+/// 0727a117). This door merges TOP-LEVEL keys, so `{"metadata": {...}}`
+/// stored one key named `metadata` that each later wrapped write replaced,
+/// every call answering 204: on 2026-11-05/06 nine builder reports to one
+/// conductor session landed that way and were read as two and a half
+/// hours of silence, and on 2026-11-07 a report landed the same way
+/// again. A wrong shape that answers is the silent failure; it is refused
+/// 422, and nothing is written.
+#[tokio::test]
+async fn a_body_wrapped_in_metadata_is_refused_and_writes_nothing() {
+    let (app, jobs) = seed().await;
+    let (status, body) =
+        patch_metadata(&app, UNIQUE, r#"{"metadata":{"report_1":"swallowed"}}"#).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a wrapped body must be refused, not stored as one nested key: {body}"
+    );
+    let text = body.to_string();
+    assert!(
+        text.contains("metadata") && text.contains("top-level"),
+        "the refusal names the wrapper and the shape that works: {text}"
+    );
+    let md = metadata_of(&jobs, UNIQUE).await;
+    assert!(md.get("metadata").is_none(), "nothing was written: {md}");
+
+    // Beside an ordinary key it is the same mistake, and still nothing lands.
+    let (status, _) = patch_metadata(
+        &app,
+        UNIQUE,
+        r#"{"note":"kept out","metadata":{"report_2":"swallowed"}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(metadata_of(&jobs, UNIQUE).await.get("note").is_none());
+
+    // The unwrapped body is the door's contract, and lands.
+    let (status, body) = patch_metadata(&app, UNIQUE, r#"{"report_1":"read"}"#).await;
+    assert!(status.is_success(), "{status} {body}");
+    assert_eq!(metadata_of(&jobs, UNIQUE).await["report_1"], "read");
+}

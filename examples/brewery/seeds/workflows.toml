@@ -494,9 +494,12 @@ metadata_defaults = { line_items = [
 # Pull + stage the kegs from the cooler — the physical pick a warehouse hand
 # performs (human labor), gated on the stock-check deciding "fulfill". This is
 # the fulfillment step the old flow was missing (it jumped straight from
-# acknowledge to ship). Finished goods are relieved here against the kegs
-# actually pulled — see the FG-drawdown-on-pick rule in rules.toml. Wholesale
-# ships from the stock morning-brew builds; there is no per-order brew.
+# acknowledge to ship). The kegs leave the shelf here, but this step moves no
+# stock on the record: finished goods are drawn down when the invoice issues,
+# by the products-consume-on-invoice-created rule in rules.toml (car 0e0549dc's
+# review found this comment citing an FG-drawdown-on-pick rule that never
+# existed). Wholesale ships from the stock morning-brew builds; there is no
+# per-order brew.
 [[workflow.step]]
 title = "pull-and-stage"
 kind = "handoff"
@@ -534,11 +537,12 @@ authority_role = "distribution-driver"
 # `line_items` drives shipping_line_items (the shipment
 # projection's per-SKU rows) via the `shipping.create` side
 # effect. Pre-#105 a sibling `consumes_products` array drove
-# `products.consume` for the COGS draw. Post-#105 the billing
-# step's line_items carry sku + qty and the `invoice_issued`
-# posting rule emits the COGS pair in the same JE as revenue;
-# the shipment becomes purely physical (ship-out date + scan
-# chain), with no GL movement.
+# `products.consume` for the COGS draw. Now the billing step's
+# line_items carry sku + qty, and the issued invoice drains the
+# finished goods and posts COGS through the
+# products-consume-on-invoice-created rule (rules.toml); the
+# shipment is purely physical (ship-out date + scan chain), with
+# no GL movement.
 metadata_defaults = { direction = "outbound", origin = "loc-brewery-brewhouse", destination = "{subject.id}", carrier = "local-pickup", line_items = [
     { sku = "FP-IPA-1-2-BBL", qty = 2, unit_price_cents = 14500, description = "IPA 1/2 BBL keg" },
     { sku = "FP-IPA-1-6-BBL", qty = 3, unit_price_cents = 8500, description = "IPA 1/6 BBL keg" },
@@ -565,10 +569,16 @@ authority_role = "bookkeeper"
 # StepType lists account_id / amount_cents / currency as
 # required for the UI/admin path. Per-Job derivation is the
 # faker hook (#33).
-# #105 — billing line_items now carry sku + qty so the
-# `invoice_issued` posting rule emits matching COGS lines in the
-# same JE. Commerce HTTP handler decrements FG on_hand + stamps
-# the cost basis in the same tx as the invoice insert. The
+# #105 — billing line_items carry sku + qty so the issued
+# invoice can drain finished goods. The drain is not commerce's:
+# the products-consume-on-invoice-created rule (rules.toml) reacts
+# to `commerce.invoice.created` and runs
+# `products.consume_from_invoice`, which consumes each FG line and
+# posts `finance.cogs.recognized` at the drained cost. Commerce
+# used to decrement FG inside the invoice tx and `invoice_issued`
+# carried a COGS leg; both retired when the consume took COGS
+# (docs/architecture-decisions.md §Finance & ledger: "the consume
+# owns COGS"). The
 # shipment step's `consumes_products` array is no longer
 # load-bearing for COGS — billing is the single source of truth.
 # Wholesale price list — brewery → distributor, the lowest-price
@@ -796,9 +806,9 @@ ready_when = "steps.allocate-cases.done"
 title_template = "Final invoice"
 authority_role = "bookkeeper"
 # Default line items so commerce.invoice.issue emits a real
-# Invoice on step.done. Billing line carries sku + qty so
-# the `invoice_issued` posting rule (post-#105) draws matching
-# COGS in the same JE — revenue + FG drawdown are siamese.
+# Invoice on step.done. Billing line carries sku + qty so the
+# products-consume-on-invoice-created rule drains the FG cases and
+# posts their COGS once the invoice is created.
 metadata_defaults = { account_id = "{subject.id}", amount_cents = 850000, currency = "USD", line_items = [
     { sku = "FP-SEASONAL-12OZ-CS", qty = 50, amount_cents = 850000, revenue_category = "event-package", description = "Seasonal release allocation" },
 ] }
@@ -1400,8 +1410,8 @@ employees server-side, computes per-employee gross/withheld/net
 + aggregate employer_tax, and posts the compound journal entry
 (DR 6100 Payroll Expense + DR 6400 Payroll Taxes & Benefits /
 CR 2150 Payroll Liability + CR 1000 Cash). Replaces the legacy
-BatchEngine `[batch.payroll]` path (retired 2026-05-06; see
-TODO.md "Strip BatchEngine").
+BatchEngine `[batch.payroll]` path (retired 2026-05-06), which
+emitted the payroll entries directly, past any Workflow or step.
 """
 
 [[workflow.step]]
@@ -1758,9 +1768,9 @@ authority_role = "shipping-clerk"
 # orders ship same-day or via local delivery, no scan chain.
 #
 # Physical pickup/ship step — tracks the moment goods leave the
-# brewery. Post-#105 the COGS draw moved to the billing step
-# (where revenue + cost are siamese in one JE), so the shipment
-# step is purely operational here.
+# brewery. Post-#105 the COGS draw follows the billing step (the
+# issued invoice drives products-consume-on-invoice-created), so
+# the shipment step is purely operational here.
 metadata_defaults = { direction = "outbound", origin = "loc-brewery-brewhouse", destination = "customer-pickup", line_items = [
     { sku = "FP-PALE-1-6-BBL", qty = 1, unit_price_cents = 18000, description = "Direct shop order — Pale Ale sixtel ($180 retail)" },
 ] }
@@ -2787,7 +2797,8 @@ metadata_defaults = { total_paid_cents = 0, bill_count = 0, run_notes = "" }
 # half-BBLs the brewery over-produces. Wholesale buys PALE-1/2 + IPA-1/6, so
 # PALE-1/6 + IPA-1/2 accumulate; the taproom monetizes that surplus at retail
 # pour value and posts to Revenue — Taproom (4120). The billing line_items
-# drive both the FG decrement and the revenue+COGS JE (post-#105).
+# drive the revenue JE, and the issued invoice drives the FG decrement and
+# its COGS through products-consume-on-invoice-created (post-#105).
 # ---------------------------------------------------------------------------
 [[workflow]]
 kind = "taproom-shift-close"

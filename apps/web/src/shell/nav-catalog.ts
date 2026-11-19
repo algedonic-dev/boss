@@ -24,9 +24,10 @@
 //     plain module the test imports the real thing, so the mirror —
 //     and the drift it was there to catch — is gone.
 //
-// Adding a surface: add one entry here with its `owner` (and
-// `unlisted` if it is a tab or a door rather than a sidebar row), and
-// add a matching branch to router.ts. The consistency test enforces the
+// Adding a surface: add one entry here with its `owner` and the
+// station that hosts it (`host`, design deba3000), plus `unlisted` if
+// it is a tab or a door rather than a sidebar row, and add a matching
+// branch to router.ts. The consistency test enforces the
 // second half. Adding a DEPARTMENT touches neither: it is a registry
 // row, and its tab, landing, sidebar and jobs view follow from it.
 
@@ -39,7 +40,28 @@ export type { AppId, AppTab };
 // `AppId` and the tab list live in @boss/web-kit/nav (the bar is
 // rendered by apps/web AND apps/simulator). THIS file answers the
 // other half — which surface belongs to which app — because web-kit
-// has no business knowing about /ux/warehouse.
+// has no business knowing about /finance/vendors.
+
+/// The stations that host a catalog page, each by the `id` of its row
+/// under infra/platform/stations/ (car 1 of design deba3000, backlog
+/// 03fb75c8). The id is the one field of a station row that never
+/// changes: its name can, and its address is derived from the name
+/// (station-tree.md: code never names an address). The key is only a
+/// label for the reader here. Both are held to the rows by
+/// nav-catalog.test.ts, which reads the files the platform seed
+/// publishes, so neither can drift from the tree (CLAUDE.md §9a).
+export const STATION = {
+  algedonic: '00b04483-90c6-46b9-b911-8e19d2a0b410',
+  engineering: '4c5ddf6c-b8ed-4776-98d9-2f99553317c5',
+  design: 'cc856b32-3667-4e70-b6cd-667f6fe89007',
+  operations: '9660c60f-eb47-4405-ae08-fcbb30c71e5f',
+  estate: '134464a5-0b56-4386-86cb-d354c7448fdf',
+  vault: 'fa8b479f-1573-4153-9359-0ee123c3295c',
+  finance: '9b024f00-a8d4-43da-b2de-b648772c062b',
+} as const;
+
+/// A host: one of the stations above, by id.
+export type HostStation = (typeof STATION)[keyof typeof STATION];
 
 export type NavItem = Readonly<{
   id: string;
@@ -74,6 +96,15 @@ export type NavItem = Readonly<{
   /// owners, which mount one surface under several departments, arrive
   /// with car 9.
   owner?: AppId;
+  /// The one station in the tree that hosts this page, by station id
+  /// (design deba3000, David 2026-11-10): the station whose executors
+  /// the page serves, and whose queue its maintenance is. Placement
+  /// only — the owner above still decides the tab and the packets the
+  /// page lists, and the URL is not derived from it yet (backlog
+  /// 0bc2eb68). Optional while pages move a few at a time;
+  /// `unhostedPages()` counts the rest, and when that reaches zero the
+  /// field becomes required (car 3 of the design).
+  host?: HostStation;
   /// The department's landing: what /<code> renders (design 8c3e9599
   /// §5). Absent everywhere, the landing is the department's first
   /// sidebar entry in catalog order, else its jobs view. At most one per
@@ -91,27 +122,21 @@ export type NavGroup = Readonly<{ label: string; items: ReadonlyArray<NavItem> }
 /// Catalog keys that are surfaces without a permission key of their
 /// own. `RouteName` (libs/web-kit) is the role-gating vocabulary;
 /// these entries are visible to every role by construction (like the
-/// permKey-less Audit Log / Atlas rows), so they extend the CATALOG
-/// without widening the PERMISSION vocabulary — the catalog still
-/// answers "which app owns this surface" and "which sidebar row
-/// highlights" for them.
-// 'system-fleet' left the permission vocabulary with the 2026-08-31
-// consolidation (its tab gates under system-monitoring), but the
-// catalog still answers "which app / which row" for its route kind.
-// 'hr', 'watchlist', 'manual' (CAR-6, 6edb1b77): routable since their
-// pages shipped but never listed here, so a 574-line HR page and the
-// app's best list were typed-URL-only. Like system-fleet they borrow
-// gate parity from the surface they sit beside (hr → 'people',
-// watchlist → 'accounts') rather than widening the vocabulary; the
-// manual is permKey-less like the docs it renders.
+/// permKey-less Codebase row), so they extend the CATALOG without
+/// widening the PERMISSION vocabulary — the catalog still answers
+/// "which app owns this surface" and "which sidebar row highlights" for
+/// them.
+// 'manual' (CAR-6, 6edb1b77) is permKey-less like the docs it renders.
 // 'system-crew', 'system-receiving' and 'system-marshalling' were ids
 // here until car N1 of design e765b3fc (2026-09-25): each was a sidebar
 // row onto a station of the map, and the map's one row replaced them.
+// 'system-incidents' (/it/operate), 'system-atlas', 'system-fleet'
+// (Bottlenecks) and 'hr' (/people/hr) went with their pages in step 1
+// of design 01fa5bdf (2026-11-17). 'watchlist' went with them as an id:
+// the Churn watchlist is the `accounts` entry now, the gate it always
+// borrowed, since the Accounts page it sat beside is gone.
 export type UngatedSurfaceId =
-  | 'company-map'
-  | 'system-incidents'
   | 'system-performance'
-  | 'system-atlas'
   // 'system-codebase' (the Codebase row): the department's own numbers,
   // readable by any operator — permKey-less like the Operate row above,
   // because a permKey would widen the RouteName vocabulary in
@@ -133,107 +158,109 @@ export type UngatedSurfaceId =
   // 851259b9). It borrows the `workflows` gate of the family it sits in,
   // as Agents does; the registry read itself is operator-tier upstream.
   | 'system-credentials'
-  | 'system-fleet'
-  | 'hr'
-  | 'watchlist'
   | 'purchase-order'
   | 'vendor-invoice'
   | 'manual';
 
 export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavItem>> = {
-  jobs:      { id: 'jobs',      label: 'All jobs',         path: '/ux/jobs',      permKey: 'jobs',      owner: 'home' },
-  sales:     { id: 'sales',     label: 'Sales pipeline',   path: '/ux/sales',     permKey: 'sales',     owner: 'sales' },
-  service:   { id: 'service',   label: 'Service queue',    path: '/ux/service',   permKey: 'service',   module: 'support', owner: 'service' },
-  qa:        { id: 'qa',        label: 'QA',               path: '/ux/qa',        permKey: 'qa',        module: 'qa',      owner: 'qa' },
-  finance:   { id: 'finance',   label: 'Finance',          path: '/ux/finance',   permKey: 'finance',   module: 'finance', owner: 'finance' },
-  warehouse: { id: 'warehouse', label: 'Inventory',        path: '/ux/warehouse', permKey: 'warehouse', module: 'warehouse', owner: 'warehouse' },
-  shipping:  { id: 'shipping',  label: 'Shipments',        path: '/ux/shipping',  permKey: 'shipping',  module: 'shipping', owner: 'distribution' },
-  support:   { id: 'support',   label: 'Support',          path: '/ux/support',   permKey: 'support',   module: 'support', owner: 'support' },
-  exec:      { id: 'exec',      label: 'Exec',             path: '/ux/exec',      permKey: 'exec',      module: 'exec',    owner: 'executive' },
+  // The /ux business pages (sales, service, qa, warehouse, shipping,
+  // support, exec, catalog, parts, products, accounts, people, assets,
+  // shop, marketing-assets) and their entries went with step 1 of design
+  // 01fa5bdf (David, 2026-11-17); a page comes back as a station's page
+  // when a protocol runs there. All jobs (/ux/jobs) went with them
+  // (review df7aeb9c); a packet's own page has no row, as it never had.
+  //
+  // HOSTS (car 1 of design deba3000, backlog 03fb75c8) follow the
+  // placement table of design 01fa5bdf (David, 2026-11-17). Not hosted
+  // yet: the personal pages that table sends to /me — My schedule, the
+  // Inbox and the watchlist — because the person's station does not
+  // exist until 5cb56bb3, and Executive, which holds those queues today,
+  // dissolves (878fd1e7). `unhostedPages()` names them.
+  finance:   { id: 'finance',   label: 'Finance',          path: '/finance',      permKey: 'finance',   module: 'finance', owner: 'finance', host: STATION.finance },
   schedule:  { id: 'schedule',  label: 'My schedule',      path: '/ux/calendar/me', permKey: 'schedule', owner: 'home' },
-  catalog:   { id: 'catalog',   label: 'Equipment',        path: '/ux/catalog',   permKey: 'catalog',   module: 'equipment', owner: 'maintenance' },
-  parts:     { id: 'parts',     label: 'Ingredients & parts', path: '/ux/parts',  permKey: 'parts',     module: 'parts',   owner: 'warehouse' },
-  products:  { id: 'products',  label: 'Products',         path: '/ux/products',  permKey: 'parts',     module: 'parts',   owner: 'production' },
-  accounts:  { id: 'accounts',  label: 'Accounts',         path: '/ux/accounts',  permKey: 'accounts',  owner: 'sales' },
-  vendors:   { id: 'vendors',   label: 'Vendors',          path: '/ux/vendors',   permKey: 'vendors',   owner: 'finance', module: 'warehouse', whenDisabled: 'absent' },
+  // The Churn watchlist, under the `accounts` gate it always borrowed
+  // (6edb1b77); it was the `watchlist` entry beside an Accounts page
+  // until that page went (design 01fa5bdf). Unlisted, as it was.
+  accounts:  { id: 'accounts',  label: 'Churn watchlist',  path: '/watchlist',    permKey: 'accounts',  owner: 'sales', unlisted: true },
+  vendors:   { id: 'vendors',   label: 'Vendors',          path: '/finance/vendors', permKey: 'vendors',   owner: 'finance', module: 'warehouse', whenDisabled: 'absent', host: STATION.finance },
   // Design45fad3bb preserves financial details when the vendor register
   // is absent. Separate unlisted declarations keep their existing gate
   // and Finance ownership without adding sidebar rows (6d6f88bd).
-  'purchase-order': { id: 'purchase-order', label: 'Purchase order', path: '/ux/purchase-orders/:poId', permKey: 'vendors', owner: 'finance', unlisted: true },
-  'vendor-invoice': { id: 'vendor-invoice', label: 'Vendor invoice', path: '/ux/vendor-invoices/:vendorInvoiceId', permKey: 'vendors', owner: 'finance', unlisted: true },
-  people:    { id: 'people',    label: 'Employees',        path: '/ux/people',    permKey: 'people',    owner: 'people' },
-  assets:    { id: 'assets',    label: 'Assets',           path: '/ux/assets',    permKey: 'assets',    module: 'equipment', owner: 'maintenance' },
-  shop:      { id: 'shop',      label: 'Shop',             path: '/ux/shop',      permKey: 'shop',      module: 'shop',    owner: 'sales' },
+  'purchase-order': { id: 'purchase-order', label: 'Purchase order', path: '/finance/purchase-orders/:poId', permKey: 'vendors', owner: 'finance', unlisted: true, host: STATION.finance },
+  'vendor-invoice': { id: 'vendor-invoice', label: 'Vendor invoice', path: '/finance/vendor-invoices/:vendorInvoiceId', permKey: 'vendors', owner: 'finance', unlisted: true, host: STATION.finance },
   inbox:     { id: 'inbox',     label: 'Inbox',            path: '/ux/inbox',     permKey: 'inbox',     owner: 'home' },
-  'marketing-assets': { id: 'marketing-assets', label: 'Marketing assets', path: '/ux/marketing-assets', permKey: 'marketing-assets', module: 'marketing-assets', owner: 'marketing' },
-  hr:        { id: 'hr',        label: 'HR',               path: '/hr',           permKey: 'people',    owner: 'people', unlisted: true },
-  watchlist: { id: 'watchlist', label: 'Churn watchlist',  path: '/watchlist',    permKey: 'accounts',  owner: 'sales', unlisted: true },
-  manual:    { id: 'manual',    label: 'Manual',           path: '/manual',       owner: 'home' },
-  'company-map': { id: 'company-map', label: 'System Network Map', path: '/map', owner: 'home' },
+  manual:    { id: 'manual',    label: 'Manual',           path: '/manual',       owner: 'home', host: STATION.engineering },
 
-  // The IT department — SIX surfaces (the 2026-08-31 consolidation,
-  // packet 1f6d55e0; was 17 pages, four of them dual-routed). The
-  // catalog keeps non-sidebar entries only where a RouteName still
+  // The IT department (the 2026-08-31 consolidation, packet 1f6d55e0).
+  // The catalog keeps non-sidebar entries only where a RouteName still
   // exists (tab pages, unlisted doors) so appForSection() can answer
-  // for them; map/flow/model died outright and fleet became Operate's
-  // Bottlenecks tab.
-  // The IT app's landing (departure-board.md Q1), AT /it itself, and
-  // flagged `landing` since car 2 of design 8c3e9599 rather than resting
-  // on coming first in catalog order. Since car N1 of design
-  // e765b3fc (David, 2026-09-25) it is the DEPARTMENT MAP: the map on
-  // top, the selection's detail below it, and the one sidebar row where
-  // Receiving Yard, Marshalling Yard, Train Yard and Crew Board stood —
-  // each of those is a station on the map, selected there.
-  'system-yard':              { id: 'system-yard',              label: 'Department Map',      path: '/it',              permKey: 'system-yard',             owner: 'it', landing: true },
-  // The Operate row is permKey-less like the incidents surface it
-  // leads with — readable by any operator; the tabs behind it keep
-  // their own gates.
-  'system-incidents':        { id: 'system-incidents',        label: 'Operate',             path: '/it/operate',      owner: 'it' },
-  'system-monitoring':       { id: 'system-monitoring',       label: 'Audit Log',          path: '/it/operate/audit', permKey: 'system-monitoring',      owner: 'it', unlisted: true },
-  // These served Operate tabs must reach the page-audit march too
+  // for them. Its pages move into stations in steps 2-4 of design
+  // 01fa5bdf; step 1 removed the map, /it/operate (incidents), Atlas,
+  // Bottlenecks, Experiments and Policy.
+  // The IT app's landing, AT /it itself, flagged `landing` since car 2
+  // of design 8c3e9599. It was the DEPARTMENT MAP (design e765b3fc);
+  // since step 1 of design 01fa5bdf it is only what the map held that
+  // nothing else does yet: the alarms board, and the board with the
+  // release and cancel controls, until the station page takes them.
+  // Hosted at the ROOT: every station's alarms on one board is the
+  // company's view, not any one station's (design deba3000 §1:
+  // company-level pages sit at the root).
+  'system-yard':              { id: 'system-yard',              label: 'Alarms',              path: '/it',              permKey: 'system-yard',             owner: 'it', landing: true, host: STATION.algedonic },
+  // The Operate row: the audit log leads, its performance tab behind it.
+  // It was the incidents surface's (/it/operate) until design 01fa5bdf.
+  'system-monitoring':       { id: 'system-monitoring',       label: 'Audit Log',          path: '/it/operate/audit', permKey: 'system-monitoring',      owner: 'it', host: STATION.operations },
+  // This served Operate tab must reach the page-audit march too
   // (e52e3017). Catalog membership adds no permission or sidebar row.
-  'system-performance':     { id: 'system-performance',      label: 'Performance',         path: '/it/operate/perf', owner: 'it', unlisted: true },
-  'system-atlas':           { id: 'system-atlas',            label: 'Atlas',               path: '/it/operate/atlas', owner: 'it', unlisted: true },
-  'system-fleet':            { id: 'system-fleet',            label: 'Bottlenecks',         path: '/it/operate/bottlenecks', permKey: 'system-monitoring', owner: 'it', unlisted: true },
-  workflows:                 { id: 'workflows',               label: 'Registry',            path: '/it/registry',     permKey: 'workflows',               owner: 'it' },
-  policy:                    { id: 'policy',                  label: 'Policy',              path: '/it/registry/policy', permKey: 'policy',               owner: 'it', unlisted: true },
-  'system-step-plugins':     { id: 'system-step-plugins',     label: 'Step plugins',        path: '/it/registry/step-plugins', permKey: 'system-step-plugins', owner: 'it', unlisted: true },
-  'system-dispatcher':       { id: 'system-dispatcher',       label: 'Dispatcher rules',    path: '/it/registry/dispatcher', permKey: 'system-dispatcher', owner: 'it', unlisted: true },
-  'system-subjects':         { id: 'system-subjects',         label: 'Subjects & Classes',  path: '/it/registry/subjects', permKey: 'system-subjects',    owner: 'it', unlisted: true },
-  'system-registry-drift':   { id: 'system-registry-drift',   label: 'Protocol drift',      path: '/it/registry/drift', permKey: 'workflows',             owner: 'it', unlisted: true },
+  'system-performance':     { id: 'system-performance',      label: 'Performance',         path: '/it/operate/perf', owner: 'it', unlisted: true, host: STATION.operations },
+  workflows:                 { id: 'workflows',               label: 'Registry',            path: '/it/registry',     permKey: 'workflows',               owner: 'it', host: STATION.engineering },
+  'system-step-plugins':     { id: 'system-step-plugins',     label: 'Step plugins',        path: '/it/registry/step-plugins', permKey: 'system-step-plugins', owner: 'it', unlisted: true, host: STATION.engineering },
+  'system-dispatcher':       { id: 'system-dispatcher',       label: 'Dispatcher rules',    path: '/it/registry/dispatcher', permKey: 'system-dispatcher', owner: 'it', unlisted: true, host: STATION.engineering },
+  'system-subjects':         { id: 'system-subjects',         label: 'Subjects & Classes',  path: '/it/registry/subjects', permKey: 'system-subjects',    owner: 'it', unlisted: true, host: STATION.engineering },
+  'system-registry-drift':   { id: 'system-registry-drift',   label: 'Protocol drift',      path: '/it/registry/drift', permKey: 'workflows',             owner: 'it', unlisted: true, host: STATION.engineering },
   // Agents live here and never on the People roster (David, 2026-09-26,
   // answering 6a123f1f; backlog 62988516).
-  'system-agents':           { id: 'system-agents',           label: 'Agents',              path: '/it/registry/agents', permKey: 'workflows',            owner: 'it', unlisted: true },
+  'system-agents':           { id: 'system-agents',           label: 'Agents',              path: '/it/registry/agents', permKey: 'workflows',            owner: 'it', unlisted: true, host: STATION.engineering },
   // What the estate holds access with — declared, rotated and retired as
   // packets, never a value on the page (David 2026-09-27, design
-  // 76155676 step 3; backlog 851259b9).
-  'system-credentials':      { id: 'system-credentials',      label: 'Credentials',         path: '/it/registry/credentials', permKey: 'workflows',       owner: 'it', unlisted: true },
-  'system-dispatcher-rules': { id: 'system-dispatcher-rules', label: 'Rule authoring', path: '/it/registry/rules', permKey: 'system-dispatcher-rules', owner: 'it', unlisted: true },
+  // 76155676 step 3; backlog 851259b9). Hosted at the vault, the
+  // station whose machines are the credential automations.
+  'system-credentials':      { id: 'system-credentials',      label: 'Credentials',         path: '/it/registry/credentials', permKey: 'workflows',       owner: 'it', unlisted: true, host: STATION.vault },
+  'system-dispatcher-rules': { id: 'system-dispatcher-rules', label: 'Rule authoring', path: '/it/registry/rules', permKey: 'system-dispatcher-rules', owner: 'it', unlisted: true, host: STATION.engineering },
   // The editor's path is a PATTERN, spelled the way surface-opens records
   // every open of it (routePattern). It shared the list's path until
   // backlog 3071e235 (2026-09-24), so the page march — one audit per
   // catalog path — never reached the page carrying all four rule writes.
-  'system-dispatcher-rule':  { id: 'system-dispatcher-rule',  label: 'Dispatcher rule — editor',     path: '/it/registry/rules/:ruleName', permKey: 'system-dispatcher-rule',  owner: 'it', unlisted: true },
-  'system-design':           { id: 'system-design',           label: 'Design',              path: '/it/design',       permKey: 'system-design',           owner: 'it' },
-  'system-experiments':      { id: 'system-experiments',      label: 'Experiments',         path: '/it/design/experiments', permKey: 'system-experiments', owner: 'it', unlisted: true },
+  'system-dispatcher-rule':  { id: 'system-dispatcher-rule',  label: 'Dispatcher rule — editor',     path: '/it/registry/rules/:ruleName', permKey: 'system-dispatcher-rule',  owner: 'it', unlisted: true, host: STATION.engineering },
+  'system-design':           { id: 'system-design',           label: 'Design',              path: '/it/design',       permKey: 'system-design',           owner: 'it', host: STATION.design },
   // 'system-feedback' (Feedback triage, /it/design/feedback) and
   // 'system-backlog' (IT backlog, /it/design/backlog) were Design tabs
-  // until car N3 of design e765b3fc (2026-09-25): the feedback board is
-  // the receiving station's panel on the Department Map, and the backlog
-  // board the receiving and marshalling stations' — a packet of either
-  // kind is inbound until triaged, then stands at a station.
+  // until car N3 of design e765b3fc (2026-09-25) made each a station's
+  // panel on the Department Map; both panels went with the map in step 1
+  // of design 01fa5bdf.
   // The Codebase — a SIDEBAR ROW, not the Design tab it was: David's
   // feedback 9827c699 (2026-09-14) asked for "a page to the IT department
   // showing the Code base stats" while the trend sat one tab in. permKey-
   // less: the department's own numbers, readable by any operator.
-  'system-codebase':         { id: 'system-codebase',         label: 'Codebase',            path: '/it/codebase',     owner: 'it' },
+  'system-codebase':         { id: 'system-codebase',         label: 'Codebase',            path: '/it/codebase',     owner: 'it', host: STATION.engineering },
   // The hardware registry — declared beside observed beside the
   // difference, plus the dev-workspace door (59ef456a).
-  'system-estate':          { id: 'system-estate',           label: 'Estate',              path: '/it/estate',       permKey: 'system-estate',           owner: 'it' },
-  'system-kb':               { id: 'system-kb',               label: 'Knowledge Base',      path: '/it/kb',           permKey: 'system-kb',               owner: 'it' },
-  // Unlisted door: reachable, never a sidebar row.
-  'auth-admin':              { id: 'auth-admin',              label: 'Auth admin',          path: '/it/auth-admin',   permKey: 'auth-admin',              owner: 'it', unlisted: true },
+  'system-estate':          { id: 'system-estate',           label: 'Estate',              path: '/it/estate',       permKey: 'system-estate',           owner: 'it', host: STATION.estate },
+  'system-kb':               { id: 'system-kb',               label: 'Knowledge Base',      path: '/it/kb',           permKey: 'system-kb',               owner: 'it', host: STATION.engineering },
+  // Unlisted door: reachable, never a sidebar row. It onboards users and
+  // issues reset tokens on the credential store, so it is hosted at the
+  // vault beside Credentials.
+  'auth-admin':              { id: 'auth-admin',              label: 'Auth admin',          path: '/it/auth-admin',   permKey: 'auth-admin',              owner: 'it', unlisted: true, host: STATION.vault },
 };
+
+/// The migration's progress report (design deba3000 §Shape): every
+/// catalog entry that names no host station yet, in catalog order. It
+/// fails nothing — pages move a few at a time, usually when a car
+/// touches them — and nav-catalog.test.ts prints its count as
+/// `unhosted-pages:<n>`, a number that falls. When it reaches zero the
+/// `host` field becomes required and the report becomes a pin (car 3).
+export function unhostedPages(): ReadonlyArray<NavItem> {
+  return Object.values(ROUTE_CATALOG).filter((e) => e.host === undefined);
+}
 
 /// The apps this host offers: Home, Simulator when the tenant has one,
 /// and one per department the tenant's registry declares.
@@ -288,8 +315,8 @@ function ownedBy(code: string): ReadonlyArray<NavItem> {
 /// department flags `landing`, else its first sidebar entry in catalog
 /// order — so the tab opens on the row the sidebar shows first — else
 /// nothing, and the caller renders the jobs view. IT is the flagged
-/// one: its landing is the Department Map, which until car 2 rested on
-/// the map happening to come first in the catalog, beside a sidebar
+/// one: its landing is the alarms board at /it, which until car 2 rested
+/// on happening to come first in the catalog, beside a sidebar
 /// order that was AppShell's own IT_GROUPS list.
 export function departmentLanding(code: string): NavItem | undefined {
   const owned = ownedBy(code);

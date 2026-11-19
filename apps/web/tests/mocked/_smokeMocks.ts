@@ -12,33 +12,21 @@
 // mounts.
 
 import type { Page, Route } from '@playwright/test';
-import type { Product, ProductDetail, ProductInventory } from '../../src/products/types';
 import { CRAWL_VENDOR } from '../fixtures/vendor';
 
-// 50ab513c: shared crawls need rows, not only the dedicated Products
-// spec's private fixtures. Synthetic catalog and coherent multi-location
-// stock, shaped by boss-products' list/detail serializers.
-const CRAWL_PRODUCTS: ReadonlyArray<Product & { total_on_hand: number }> = [
-  { sku: 'CRAWL-ACTIVE', name: 'Crawl output', product_kind: 'finished-good', package_unit: 'each', description: null, metadata: {}, active: true, total_on_hand: 23 },
-  { sku: 'CRAWL-RETIRED', name: 'Retired crawl output', product_kind: 'finished-good', package_unit: 'each', description: null, metadata: {}, active: false, total_on_hand: 7 },
-];
-
-function crawlProductDetail(product: (typeof CRAWL_PRODUCTS)[number]): ProductDetail {
-  const stock = (location_id: string, on_hand: number): ProductInventory & {
-    value_cents: number; production_cost_cents: number;
-  } => ({ product_sku: product.sku, location_id, on_hand, reserved: 0,
-    value_cents: 0, production_cost_cents: 0, updated_at: null });
-  return { ...product, inventory: [stock('crawl-store', product.total_on_hand - 2), stock('crawl-dock', 2)] };
-}
-// The world's own layout, so the empty leg below cannot list a region
-// the map does not draw (backlog 94c6ffd0: the list was typed out here
-// and went stale the day a ninth region landed). world.ts is pinned to
-// the server's REGIONS by world.test.ts, so this is one definition deep.
+// The crawl's product rows (50ab513c) went with /ux/products in step 1
+// of design 01fa5bdf.
+// The declared regions, so the empty leg below cannot list a region the
+// alarms board does not expect (backlog 94c6ffd0: the list was typed out
+// here and went stale the day a ninth region landed). REGION_NAMES is
+// pinned to the server's REGIONS by regions.test.ts, so this is one
+// definition deep.
 // The map draws no edge list of its own since car R3 of design e765b3fc,
 // so the borders and routes the empty leg answers are the shared test
 // fixture's — the borders pinned equal to the server's by borders.test.ts.
-import { TERRITORIES } from '../../src/it/yard/world';
+import { REGION_NAMES } from '../../src/it/yard/regions';
 import { BORDERS, routesPayload } from '../fixtures/yard';
+import { claimsRead, stationList, treeRead } from '../fixtures/station-tree';
 import LIVE_RECORDING from './live-tenant-manifest.json' with { type: 'json' };
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
@@ -261,10 +249,16 @@ export const JOBS_ASSIGNMENTS = /\/api\/jobs\/assignments(\?|$)/;
 /// The per-kind ledger (`{ kinds }`, backlog 112c0535): /it/registry
 /// reads a bare `[]` as a failed read, not as no packets ever.
 export const JOBS_KINDS = /\/api\/jobs\/kinds$/;
+/// The ops allowlist (`{ verbs }`, backlog 7aef2405): the Estate page's
+/// "File an ops request" form reads a bare `[]` as a list it cannot read.
+export const OPS_VERBS = /\/api\/jobs\/ops-verbs$/;
 export const YARD_STATUS = /\/api\/yard\/status$/;
 export const YARD_REGIONS = /\/api\/yard\/regions(\?|$)/;
+export const YARD_FLOW = /\/api\/yard\/flow(\?|$)/;
 export const YARD_BORDERS = /\/api\/yard\/borders(\?|$)/;
 export const YARD_ROUTES = /\/api\/yard\/routes(\?|$)/;
+export const YARD_MOVES = /\/api\/yard\/moves(\?|$)/;
+export const YARD_MOVES_STREAM = /\/api\/yard\/moves\/stream(\?|$)/;
 export const WORKFLOW_DETAIL = /\/api\/workflows\/[^/]+$/;
 export const DISPATCHER_RULES = /\/api\/dispatcher\/rules$/;
 export const GATEWAY_PERF = /\/api\/gateway\/perf$/;
@@ -388,7 +382,7 @@ export const RISK_SCORES = /\/api\/people\/accounts\/risk-scores(\?|$)/;
 /// JSON `[]` is not an event stream, so the EventSource fails and the
 /// page says the stream is down, on the failure marker (sweep c3e4edcc).
 export const EVENTS_STREAM = /\/api\/events\/stream(\?|$)/;
-/// The /ux/finance statements (page audit 3f964c57, backlog e0732f75):
+/// The /finance statements (page audit 3f964c57, backlog e0732f75):
 /// the fixtures the route sat in DEFERRED waiting for ("statements
 /// .reduce needs object-shaped fixtures"). Each is a single object the
 /// page reads fields off — under the `[]` catch-all the commerce
@@ -402,8 +396,16 @@ export const AP_AGING = /\/api\/inventory\/ap-aging$/;
 /// paints as its failure line, which is right for a broken backend and
 /// wrong for the empty leg.
 export const STATIONS_LOAD = /\/api\/stations\/load$/;
+/// The station rows and the tree read under one (GET /api/stations[?under=]).
+export const STATIONS_TREE = /\/api\/stations(\?|$)/;
+/// The open claims (GET /api/claims), an object read.
+export const CLAIMS_READ = /\/api\/claims(\?|$)/;
 export const STATIONS_FLOW = /\/api\/stations\/flow(\?|$)/;
 export const QUEUE_AGE = /\/api\/jobs\/queue-age$/;
+/// Any one station's queue — the company station's page on /it reads
+/// its root's (R3b, backlog 23a4b4d7). The design pair below is more
+/// specific and is routed after it, so it wins for those two.
+export const STATION_QUEUE = /\/api\/stations\/[^/]+\/queue$/;
 export const DESIGN_STATION_QUEUES = /\/api\/stations\/design-(review|decided)\/queue$/;
 export const LEDGER_STATEMENTS =
   /\/api\/ledger\/(income-statement|balance-sheet|cash-flow|trial-balance|deferred-revenue-runoff|tax-liability)(\?|$)/;
@@ -525,10 +527,13 @@ export const AUDIT_STATS = {
   ],
 } as const;
 export const OBJECT_ENDPOINTS: ReadonlyArray<RegExp> = [
-  JOBS_LIVE, JOBS_SUMMARY, JOBS_ASSIGNMENTS, YARD_STATUS, YARD_REGIONS, YARD_BORDERS, YARD_ROUTES, WORKFLOW_DETAIL, DISPATCHER_RULES, GATEWAY_PERF,
+  JOBS_LIVE, JOBS_SUMMARY, JOBS_ASSIGNMENTS, YARD_STATUS, YARD_REGIONS, YARD_FLOW, YARD_BORDERS, YARD_ROUTES, YARD_MOVES, YARD_MOVES_STREAM, WORKFLOW_DETAIL, DISPATCHER_RULES, GATEWAY_PERF,
   MARKETING_ASSET_DETAIL, VIEW_RESULTS, VIEW_SOURCES, SHIPMENT_DETAIL, EMPLOYEE_DETAIL, EVENTS_STATS, RISK_SCORES, EVENTS_STREAM,
   COMMERCE_SUMMARY, AP_AGING, LEDGER_STATEMENTS, ASSETS_SUMMARY,
   STATIONS_LOAD, STATIONS_FLOW, QUEUE_AGE, DESIGN_STATION_QUEUES,
+  // The tree floor /it draws (R3, backlog 23a4b4d7): `{ data }` and the
+  // claims object, never a bare list.
+  STATIONS_TREE, CLAIMS_READ, STATION_QUEUE,
   // `{data, total}`, not a list: a bare `[]` here is the shape a wrong
   // endpoint answers, and the bar reads it as a failed roster rather
   // than an empty one — deliberately, so the org chart cannot go
@@ -536,6 +541,8 @@ export const OBJECT_ENDPOINTS: ReadonlyArray<RegExp> = [
   DEPARTMENTS_ENDPOINT,
   // `{ kinds }`, the per-kind ledger /it/registry reads (112c0535).
   JOBS_KINDS,
+  // `{ verbs }`, the ops allowlist the Estate page's form reads (7aef2405).
+  OPS_VERBS,
 ];
 
 /// The floor under every mocked spec's backend (backlog f88e7908,
@@ -611,6 +618,10 @@ export async function installApiFloor(page: Page): Promise<void> {
   // The per-kind ledger (112c0535): `{ kinds }`, because the registry
   // reads a bare `[]` as a failed read rather than as no packets ever.
   await page.route(JOBS_KINDS, (r) => json(r, { kinds: [] }));
+  // The ops allowlist the Estate page's "File an ops request" form reads
+  // (backlog 7aef2405): `{ verbs }`, because the form reads a bare `[]`
+  // as a list it cannot read and says so on the failure marker.
+  await page.route(OPS_VERBS, (r) => json(r, { verbs: [] }));
   // The churn watchlist's scores: `{ accounts }` (RiskScoreListSchema).
   // Under the `[]` catch-all the page parses a wrong shape and says so on
   // the failure marker (sweep c3e4edcc) — right for a broken backend,
@@ -630,6 +641,15 @@ export async function installApiFloor(page: Page): Promise<void> {
     }),
   );
 
+  // The station tree floor /it draws since R3 of the transit-map
+  // retirement (backlog 23a4b4d7): the station rows, the tree read under
+  // the root, and the open claims — the shared fixture's, so the empty
+  // leg draws every card rather than a failed read.
+  await page.route(STATIONS_TREE, (r) => {
+    const under = new URL(r.request().url()).searchParams.get('under');
+    return json(r, under === null ? stationList() : treeRead(under.startsWith('id-') ? under.slice(3) : under));
+  });
+  await page.route(CLAIMS_READ, (r) => json(r, claimsRead([])));
   // The IT system map's regions (design 0524fc95, car 2): the /it
   // landing reads this ONE endpoint. An empty-but-well-formed map —
   // one region per declared territory, each clear with a count of 0 and
@@ -637,11 +657,12 @@ export async function installApiFloor(page: Page): Promise<void> {
   // crawl walks every door. Under the `[]` catch-all the page would
   // render a failure line (a list where the map is due is a malformed
   // read), which is right for an outage and wrong for the empty leg.
+  await page.route(YARD_FLOW, (r) => json(r, { state: 'ready', as_of: '2026-09-03T12:00:00Z', window_hours: 24, why: null }));
   await page.route(YARD_REGIONS, (r) =>
     json(r, {
       window_hours: 24,
       now: '2026-09-03T12:00:00Z',
-      regions: TERRITORIES.map(({ name }) => ({
+      regions: REGION_NAMES.map((name) => ({
         name, count: 0, state: 'clear', why: 'nothing here',
         trend: { metric: 'nothing measured', unit: 'per day', current: null, previous: null, samples: 0, previous_samples: 0 },
       })),
@@ -668,6 +689,13 @@ export async function installApiFloor(page: Page): Promise<void> {
   // exactly what this read serves, so the empty leg answers the shared
   // fixture's — the live shape of 2026-09-26 — rather than a failed read.
   await page.route(YARD_ROUTES, (r) => json(r, routesPayload()));
+  // Live motion is the default after graduation. Its empty leg has a
+  // real baseline, not the catch-all's malformed bare array.
+  await page.route(YARD_MOVES, (r) => json(r, { moves: [], latest_seq: 0 }));
+  await page.route(YARD_MOVES_STREAM, (r) => r.fulfill({
+    contentType: 'text/event-stream',
+    body: 'retry: 3600000\nevent: resync\ndata: {"frame":"resync","seq":0,"reason":"empty fixture baseline"}\n\n',
+  }));
 
   // The other object reads, empty; the detail reads, absent.
   await page.route(DISPATCHER_RULES, (r) => json(r, { rules: [], handler_emits: {}, system_edges: [] }));
@@ -694,9 +722,13 @@ export async function installApiFloor(page: Page): Promise<void> {
   await page.route(STATIONS_LOAD, (r) => json(r, { data: [], total: 0, distinct_packets: 0 }));
   await page.route(STATIONS_FLOW, (r) => json(r, { window_hours: 24, as_of: '2026-09-03T12:00:00Z', data: [] }));
   await page.route(QUEUE_AGE, (r) => json(r, { data: [], total: 0, now: '2026-09-03T12:00:00Z' }));
+  await page.route(STATION_QUEUE, (r) => {
+    const station = decodeURIComponent(/\/api\/stations\/([^/]+)\/queue$/.exec(new URL(r.request().url()).pathname)?.[1] ?? '');
+    return json(r, { station, kind: 'group', discipline: [], total: 0, data: [], steps: {} });
+  });
   await page.route(DESIGN_STATION_QUEUES, (r) => {
     const station = /design-(review|decided)/.exec(r.request().url())?.[0] ?? 'design-review';
-    return json(r, { station, kind: 'batch', discipline: [], total: 0, data: [], steps: {} });
+    return json(r, { station, kind: 'group', discipline: [], total: 0, data: [], steps: {} });
   });
   for (const detail of [WORKFLOW_DETAIL, MARKETING_ASSET_DETAIL, SHIPMENT_DETAIL, VIEW_RESULTS, PERSON_DETAIL]) {
     await page.route(detail, (r) => json(r, 'not found', 404));
@@ -719,17 +751,6 @@ export async function installSmokeMocks(page: Page): Promise<void> {
 
   await page.route(/\/api\/inventory\/vendors(\?|$)/, (r) =>
     r.request().method() === 'GET' ? json(r, [CRAWL_VENDOR]) : r.fallback());
-
-  // Include an inactive row as an adversarial catalog response, just
-  // as the dedicated spec does; this does not enable or retire anything.
-  await page.route(/\/api\/products(\?|$)/, (r) =>
-    r.request().method() === 'GET' ? json(r, CRAWL_PRODUCTS) : r.fallback());
-  await page.route(/\/api\/products\/[^/?]+(\?|$)/, (r) => {
-    if (r.request().method() !== 'GET') return r.fallback();
-    const sku = decodeURIComponent(new URL(r.request().url()).pathname.split('/').pop()!);
-    const product = CRAWL_PRODUCTS.find((p) => p.sku === sku);
-    return product ? json(r, crawlProductDetail(product)) : json(r, 'product not found', 404);
-  });
 
   // Identity / session: a persona, so `/api/auth/me` is someone.
   await page.route(/\/api\/people$/, (r) => json(r, [EMP]));

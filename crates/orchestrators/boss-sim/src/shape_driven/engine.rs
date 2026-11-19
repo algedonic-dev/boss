@@ -75,8 +75,8 @@ pub fn simulate_day(
     )
 }
 
-/// Tick-aware day loop — Phase A of the sub-day-tick rollout
-/// (TODO.md "Hourly tick granularity for the live sim").
+/// Tick-aware day loop — Phase A of the sub-day-tick rollout, which
+/// landed: the example tenant's seed sets `tick_duration = "1m"`.
 ///
 /// Per-tick math scales by `tick.day_fraction()`:
 /// - **Poisson draws** scale lambda → per-day expected volume invariant

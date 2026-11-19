@@ -47,12 +47,20 @@
 # THE PLAN (stdout; sha256 on stderr as `plan-sha256:`) names the
 # setting, the value before and after, Longhorn's default, the options
 # its definition allows, Longhorn's own words for the requested option,
-# the one patch, and every Longhorn volume whose only healthy replica is
-# on a worker node — the volumes the policy decides for. A non-default
-# value carries a note naming the daily check that alarms on it. No clock
-# and no volume state in the bytes (a gate's disk attaches and detaches
-# many times an hour, and a plan that signed it could never be run); the
-# states ride stderr.
+# and the one patch: what the write acts on, and nothing else. A
+# non-default value carries a note naming the daily check that alarms on
+# it. No clock and no volume in the bytes. Every Longhorn volume whose
+# only healthy replica is on a worker node — the volumes the policy
+# decides for — rides stderr beside the plan, live and NOT signed, with
+# its state; the write reads them again and lists them on stdout before
+# it patches, so the execute record says what the setting decided for at
+# the moment it changed. They were signed once, and no signature survived
+# to run (backlog 6fa13f0f, 2026-11-11): every builder's dev-build volume
+# is one of them, and a replica rebuilds whenever a node rejoins — which
+# is exactly when the default is put back — so two restores David signed
+# were refused at run. The list gated nothing; it informs the signer and
+# the record, and the write still refuses (CANNOT ANSWER) when it cannot
+# read it.
 #
 # THE WRITE is one `kubectl patch settings.longhorn.io --type=json` that
 # TESTS `value` is still the planned one and replaces it — a
@@ -234,8 +242,9 @@ read_list() {
         || unread "$1 did not read back as a list (its first 200 bytes: '$(head -c 200 "$WORK/$2" | tr '\n' ' ')')"
 }
 
-# render — the bounds, then the plan into $WORK/plan and the volumes'
-# live states into $WORK/states.
+# render — the bounds, then the plan into $WORK/plan and the volumes the
+# policy decides for, with their live states, into $WORK/states (never
+# into the plan: 6fa13f0f).
 render() {
     local opt
     opt="$(jq -r --arg w "$WANT" '.definition.options | index($w) // "none"' "$WORK/def.json")"
@@ -268,8 +277,10 @@ render() {
         unread "the replicas, volumes and nodes would not parse together: $(tr '\n' ' ' < "$WORK/last.err")"
     fi
     sort -o "$WORK/last" "$WORK/last"
+    LAST_N="$(wc -l < "$WORK/last" | tr -d ' ')"
     awk -F'\t' '{ printf "volume %s (%s, live state %s): only healthy replica on worker %s\n", $1, $2, $4, $3 }' \
         "$WORK/last" > "$WORK/states"
+    [ -s "$WORK/states" ] || echo "none" > "$WORK/states"
     {
         echo "plan: set-longhorn-drain-policy"
         echo "setting: settings.longhorn.io/$SETTING in $LH"
@@ -286,19 +297,14 @@ render() {
         else
             echo "note: $WANT is NOT Longhorn's default ($DEF). check-longhorn-drain-policy reads it every day and files an urgent alarm once it has stood non-default for 24 hours; the way back is this verb with $CUR."
         fi
-        echo
-        echo "== longhorn volumes whose only healthy replica is on a worker ($(wc -l < "$WORK/last" | tr -d ' ')) =="
-        if [ -s "$WORK/last" ]; then
-            awk -F'\t' '{ printf "volume %s (%s): only healthy replica on worker %s\n", $1, $2, $3 }' "$WORK/last"
-        else
-            echo "none"
-        fi
+        echo "volumes: the volumes whose only healthy replica is on a worker are listed beside this plan, live and not signed; the write reads them again and lists them before it patches."
     } > "$WORK/plan"
 }
 
 render
 HASH="$(sha256sum "$WORK/plan" | cut -d' ' -f1)"
-sed "s/^/$ME: not signed (a volume's state moves with every attach): /" "$WORK/states" >&2
+echo "$ME: live, not signed: $LAST_N longhorn volume(s) whose only healthy replica is on a worker (a replica moves with every rebuild, a state with every attach; the write reads them again)" >&2
+sed "s/^/$ME: live, not signed: /" "$WORK/states" >&2
 
 if [ "$MODE" = plan ]; then
     cat "$WORK/plan"
@@ -309,11 +315,15 @@ fi
 # --- the write -----------------------------------------------------------------
 if [ "$HASH" != "$APPROVED" ]; then
     cat "$WORK/plan" >&2
-    refuse "today's plan for $SETTING (above) hashes to $HASH, not the approved plan $APPROVED — its value, Longhorn's definition or the volumes it decides for moved since the plan was signed (or this plan already ran). Nothing was patched; render and approve it again"
+    refuse "today's plan for $SETTING (above) hashes to $HASH, not the approved plan $APPROVED — its value, its target or Longhorn's definition moved since the plan was signed (or this plan already ran). Nothing was patched; render and approve it again"
 fi
 cat "$WORK/plan"
 echo
 echo "$ME: plan $APPROVED still holds — setting $SETTING from $CUR to $WANT"
+# The volumes this setting decides for, read at this run rather than at
+# the signing (6fa13f0f), into the execute record before the patch.
+echo "$ME: read at this run, not signed: $LAST_N longhorn volume(s) whose only healthy replica is on a worker — the volumes $SETTING decides for once it is $WANT:"
+sed 's/^/    /' "$WORK/states"
 
 PATCH="[{\"op\":\"test\",\"path\":\"/value\",\"value\":\"$CUR\"},{\"op\":\"replace\",\"path\":\"/value\",\"value\":\"$WANT\"}]"
 # shellcheck disable=SC2086 # K is one line the door prints to be word-split

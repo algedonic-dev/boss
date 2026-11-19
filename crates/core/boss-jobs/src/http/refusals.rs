@@ -27,8 +27,11 @@ use crate::refusals::{StepWriteRefusal, classify, is_refusal, is_step_write};
 const DETAIL_LIMIT: usize = 2000;
 
 /// The atomic first-record and conditional completion doors promise no persisted writes on rejection,
-/// including refusal telemetry. Its route owns this declaration; ordinary
-/// step-write routes retain their existing attempt counters.
+/// including refusal rows. Operational request timing is the one separate
+/// store outside this command-state promise (A1906, D9): after the response
+/// is decided it queues a sensor sample, never inside the command transaction.
+/// Its failure cannot change the response. This guard still suppresses the
+/// original refusal row; ordinary step-write routes retain their counters.
 #[derive(Clone)]
 struct NoPersistedRefusal;
 

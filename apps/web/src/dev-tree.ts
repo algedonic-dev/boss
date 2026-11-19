@@ -23,6 +23,22 @@
 // starts its own. Under CI there is no reuse at all, matching tree or
 // not: a gate must exercise the tree it was handed and nothing else.
 //
+// SAME TREE IS NOT SAME LIFETIME (backlog 14ab6f08). The runner stops
+// the server it started the moment its own Playwright exits, so a
+// second run in the same tree that borrowed that server lost it
+// mid-suite: measured 2026-10-11 by agent-run b9e9795a, the owner's 8 s
+// spec went green and the borrower's 12 s follow-up navigation died
+// ERR_CONNECTION_REFUSED. So the server also says whether it is in
+// mocked mode, and a mocked server is never reused: every starter of
+// one (tests/run-mocked.ts, playwright.mocked.config.ts,
+// scripts/serve-static-plugins.ts) owns its lifetime and stops it when
+// its run ends. The warm server reuse exists for is a standing
+// `bun run dev`, which is not mocked and which no run stops. A
+// same-tree server that does not say is not reused either — no answer
+// is not a pass. Counting borrowers was the other shape the packet
+// named; it would make an owner wait on processes it cannot see die,
+// for a saving (one ~30 s bundle) a second server buys back anyway.
+//
 // ONE DEFINITION, NOT TWO (CLAUDE.md §9a). Both sides of the handshake —
 // the dev-server that answers and the runner that asks — import TREE_ID
 // from this file, and TREE_ID is derived from this file's own location.
@@ -61,6 +77,7 @@ export const DEFAULT_PORT = 5174;
 // This tree's identity: the resolved absolute path of the web app root
 // (the parent of src/, where this module lives). Resolved through
 // symlinks so two spellings of one directory are one identity.
+// web-suite-reads: none — names apps/web itself, to tell this tree's server from another's
 export const TREE_ID: string = realpathSync(
   dirname(dirname(fileURLToPath(import.meta.url))),
 );
@@ -76,10 +93,18 @@ export function isCi(env: Record<string, string | undefined>): boolean {
   });
 }
 
-// The dev-server's half of the handshake.
-export function treeResponse(): Response {
-  return Response.json({ tree: TREE_ID });
+// The dev-server's half of the handshake: which tree, and whether it
+// runs in mocked mode (a run's server, stopped when that run ends).
+export function treeResponse(mocked: boolean): Response {
+  return Response.json({ tree: TREE_ID, mocked });
 }
+
+// What a server says about itself. `mocked` is null when it does not
+// say — a dev-server from before backlog 14ab6f08.
+export type TreeAnswer = {
+  readonly tree: string;
+  readonly mocked: boolean | null;
+};
 
 // The runner's half: what tree is the server on this origin serving?
 // null covers every not-mine answer — nothing listening, a connection
@@ -88,7 +113,7 @@ export function treeResponse(): Response {
 export async function probeTree(
   origin: string,
   timeoutMs: number,
-): Promise<string | null> {
+): Promise<TreeAnswer | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -97,9 +122,11 @@ export async function probeTree(
       await res.body?.cancel();
       return null;
     }
-    const body: unknown = await res.json();
-    const tree = (body as { tree?: unknown } | null)?.tree;
-    return typeof tree === 'string' ? tree : null;
+    const body = (await res.json()) as { tree?: unknown; mocked?: unknown } | null;
+    const tree = body?.tree;
+    if (typeof tree !== 'string') return null;
+    const mocked = body?.mocked;
+    return { tree, mocked: typeof mocked === 'boolean' ? mocked : null };
   } catch {
     return null;
   } finally {
@@ -163,7 +190,8 @@ export type ChooseOptions = {
 export type Target = {
   // Where the suite will point: the preferred port, or a free one.
   readonly port: number;
-  // True only for a server already serving THIS tree, off CI.
+  // True only for a standing (not mocked) server already serving THIS
+  // tree, off CI.
   readonly reuse: boolean;
   // Human-readable justification, logged by the runner so a run says
   // out loud which server it tested.
@@ -191,15 +219,25 @@ export async function chooseTarget(
         };
   }
 
-  const tree = await probeTree(origin, probeTimeoutMs);
-  if (tree === TREE_ID) {
-    return { port: preferredPort, reuse: true, reason: `reusing the server serving ${TREE_ID}` };
-  }
-  if (tree !== null) {
+  const answer = await probeTree(origin, probeTimeoutMs);
+  if (answer !== null && answer.tree === TREE_ID) {
+    if (answer.mocked === false) {
+      return { port: preferredPort, reuse: true, reason: `reusing the server serving ${TREE_ID} (standing: not mocked, no run stops it)` };
+    }
     return {
       port: await freePort(),
       reuse: false,
-      reason: `:${preferredPort} is serving a DIFFERENT tree (${tree}) — not reusing it`,
+      reason:
+        answer.mocked === true
+          ? `:${preferredPort} is serving this tree for another run, which stops it when that run ends — not borrowing it`
+          : `:${preferredPort} is serving this tree but does not say whether a run owns it — not borrowing it`,
+    };
+  }
+  if (answer !== null) {
+    return {
+      port: await freePort(),
+      reuse: false,
+      reason: `:${preferredPort} is serving a DIFFERENT tree (${answer.tree}) — not reusing it`,
     };
   }
   if (await portIsFree(preferredPort, whileBound)) {

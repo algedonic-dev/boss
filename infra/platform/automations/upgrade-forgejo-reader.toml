@@ -1,0 +1,8 @@
+# The upgrade's pipeline checks use the existing GET-only SoR reader.
+# No command or mutation is signed as this identity.
+[[automation]]
+id = "automation:upgrade-forgejo-reader"
+role = "audit-readonly"
+description = 'Read open trains and gates before a signed Forgejo upgrade takes its dump or swaps the compose file (infra/forge/upgrade-forgejo.sh). Reads only.'
+# Host station: estate.
+station = "134464a5-0b56-4386-86cb-d354c7448fdf"

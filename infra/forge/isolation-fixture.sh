@@ -14,7 +14,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PHASE="$1"
 shift
 # Pure syntax validation precedes host authority and all private readers.
-python3 -I "$HERE/isolation-fixture-host.py" validate "$PHASE" "${OPS_REQUEST_ID:-}" "$@"
+python3 -I -B "$HERE/isolation-fixture-host.py" validate "$PHASE" "${OPS_REQUEST_ID:-}" "$@"
 # These operations have no production-authority test override. Owning tests
 # construct explicit native ports and temporary journals instead.
 for name in BOSS_FIXTURE_STATE BOSS_FIXTURE_CLI BOSS_FIXTURE_INVOCATIONS; do
@@ -44,7 +44,7 @@ SOURCE="$(cd "$HERE/../.." && pwd -P)"
 # invocation, never a token value or caller-supplied command.
 K="$(ops_kubectl)"
 KI="$(ops_kubectl --stdin)"
-python3 -I "$HERE/isolation-fixture-host.py" "$PHASE" "$SOURCE" "$K" "$KI" \
+python3 -I -B "$HERE/isolation-fixture-host.py" "$PHASE" "$SOURCE" "$K" "$KI" \
     "$FIXTURE_MT_HDR" "$BOSS_JOBS_URL" "$REGISTRY" "$OPS_REQUEST_ID" "$@"
 # set -e prevents any effect line when the complete engine readback refuses.
 fixture_effect "$PHASE" "$OPS_REQUEST_ID" "${1:-}"

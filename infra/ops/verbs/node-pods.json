@@ -1,0 +1,17 @@
+{
+  "about": "READ-ONLY: every pod the cluster has placed on one node, in every phase (infra/forge/node-pods.sh <node>; backlog 01927489, filed from join-a-node aca68557, whose prove step asks for the `workload` a new node ran — w-2's join 829f75a8 named the DaemonSet pods placed on it, read by hand, and no verb listed the pods on a node). Through the forge's ops_kubectl door, kubectl get only: the Node first — a node the cluster does not hold FAILS (exit 1), because a field selector on a wrong target answers an empty list — then the API server's own filter, kubectl get pods -A --field-selector spec.nodeName=<node>, one sorted line per pod: `pod <namespace>/<name> <phase> image <image>[,…] [init <image>[,…]] owner <kind name>`, and a closing line counting them by phase. A list that could not be read prints CANNOT ANSWER and exits 1: an unread node is not an empty one. The node must be one the estate registry declares, not retired, with a talos-* role (a control plane may be read). Nothing is written; exit 78 is a refusal. Timeout 180: the registry read (15 s), two kubectl reads (50 s together) and, the first time, the door image's pull bounded at 120 s.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/node-pods.sh",
+    "{1}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    }
+  ],
+  "timeout": 180
+}

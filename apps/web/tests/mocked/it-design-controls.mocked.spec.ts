@@ -136,8 +136,8 @@ const HIGH = 'rev-high';
 const BARE = 'rev-bare';
 const FRESH = 'rev-fresh';
 const queue = () => ({
-  station: 'design-review', kind: 'batch', discipline: ['priority', 'age'],
-  wip_limit: null, over_limit: false, terminal_window_days: null,
+  station: 'design-review', kind: 'group', discipline: ['priority', 'age'],
+  terminal_window_days: null,
   lens: LENS,
   total: 3,
   data: [
@@ -159,8 +159,8 @@ const W_READY = 'w-ready';
 const W_ACTIVE = 'w-active';
 const O_DONE = 'o-done';
 const decided = () => ({
-  station: 'design-decided', kind: 'batch', discipline: ['recency'],
-  wip_limit: null, over_limit: false, terminal_window_days: 7,
+  station: 'design-decided', kind: 'group', discipline: ['recency'],
+  terminal_window_days: 7,
   lens: { eyebrow: 'System Model · Design review', title: 'Decided designs', panels: [], with_steps: true },
   total: 3,
   data: [
@@ -393,24 +393,22 @@ test.describe('/it/design — the route and the words it says', () => {
 // ---------------------------------------------------------------------
 
 test.describe('/it/design — every control', () => {
-  test('the two tabs are catalogued routes, Reviews is this page, and each lands where it says and comes back', async ({ page }) => {
+  test('the one tab is a catalogued route, Reviews, this page', async ({ page }) => {
     await install(page);
     await mountPage(page, PATH, TITLE);
     const tabs = page.locator('nav.it-tabs a');
     // Feedback and Backlog left with car N3 of design e765b3fc: the
     // feedback board is the Receiving station's panel on the Department
-    // Map, the backlog board Receiving's and Marshalling's.
-    await expect(tabs).toHaveText(['Reviews', 'Experiments']);
+    // Map, the backlog board Receiving's and Marshalling's. Experiments
+    // left with step 1 of design 01fa5bdf.
+    await expect(tabs).toHaveText(['Reviews']);
     await expect(tabs.nth(0)).toHaveAttribute('aria-current', 'page');
     await expect(page.locator('nav.it-tabs a[aria-current]')).toHaveCount(1);
 
     // Each tab's target is read from the one catalogue, never a second list.
     const catalogued = new Set(Object.values(ROUTE_CATALOG).map((n) => n.path));
     const hrefs = await tabs.evaluateAll((as) => as.map((a) => a.getAttribute('href') ?? ''));
-    expect(hrefs).toEqual([
-      ROUTE_CATALOG['system-design'].path,
-      ROUTE_CATALOG['system-experiments'].path,
-    ]);
+    expect(hrefs).toEqual([ROUTE_CATALOG['system-design'].path]);
     for (const h of hrefs) {
       expect(catalogued.has(h)).toBe(true);
       expect(parseRoute(h).kind).not.toBe('notFound');
@@ -430,7 +428,7 @@ test.describe('/it/design — every control', () => {
 
   test('Review opens the review step the envelope carried, reads nothing to find it, and its Back returns here', async ({ page }) => {
     // The fallback read is REFUSED for this packet. Had the page made
-    // it, the button would have landed on /service/…, so landing on the
+    // it, the button would have landed on /jobs/…, so landing on the
     // step surface proves the envelope's step was used. (The step
     // surface reads the job itself after the navigation, so a count of
     // that read could not tell the two apart.)
@@ -486,8 +484,8 @@ test.describe('/it/design — every control', () => {
     page.on('dialog', (d) => { alerts.push(d.message()); void d.dismiss(); });
 
     await queueRow(page, 'A design whose steps').getByRole('button', { name: 'Review' }).click();
-    await expect(page).toHaveURL(new RegExp(`/service/${BARE}$`));
-    expect(parseRoute(`/service/${BARE}`)).toEqual({ kind: 'jobDetail', jobId: BARE });
+    await expect(page).toHaveURL(new RegExp(`/jobs/${BARE}$`));
+    expect(parseRoute(`/jobs/${BARE}`)).toEqual({ kind: 'jobDetail', jobId: BARE });
     expect(alerts).toEqual([]);
   });
 
@@ -497,7 +495,7 @@ test.describe('/it/design — every control', () => {
     });
     await mountPage(page, PATH, TITLE);
     await queueRow(page, 'A design whose steps').getByRole('button', { name: 'Review' }).click();
-    await expect(page).toHaveURL(new RegExp(`/service/${BARE}$`));
+    await expect(page).toHaveURL(new RegExp(`/jobs/${BARE}$`));
   });
 
   test('each decided row is a link to its packet\'s job detail, and back returns here', async ({ page }) => {

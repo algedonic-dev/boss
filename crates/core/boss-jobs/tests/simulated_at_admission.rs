@@ -1,5 +1,5 @@
 //! A Job is created as real or simulated — fixed at admission, and
-//! all event/data/state lives within the Job (stations.md lineage;
+//! all event/data/state lives within the Job (station-tree.md lineage;
 //! the epoch-trim invariant in 03-jobs.sql).
 //!
 //! Three contracts pinned here:

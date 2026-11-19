@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 /** The look is Enamel, and its values live in ONE place (design a4df741a,
@@ -37,6 +37,31 @@ const tokens: ReadonlyMap<string, string> = new Map(
     ),
   ),
 );
+
+describe('the decided department line palette (design 88b7e424 Q1)', () => {
+  const departments = {
+    it: '#0F6E9F', support: '#1F7F8A', hosting: '#3B5BB5', product: '#5B4BD6',
+    design: '#7B3FBF', marketing: '#A43A9E', people: '#B8407A', executive: '#0E1B2E',
+    finance: '#5C7A2A', sales: '#C2651C',
+  } as const;
+
+  it('states every approved department colour under its public token name', () => {
+    expect(Object.fromEntries(Object.keys(departments).map((department) => [
+      department, tokens.get(`--map-line-${department}`),
+    ]))).toEqual(departments);
+  });
+
+  it('declares each department once in the existing map palette block', () => {
+    const blocks = [...uncommented.matchAll(ROOT_BLOCK)].map((match) => match[0]);
+    const mapBlock = blocks.find((block) => /--map-bg\s*:/.test(block));
+    expect(mapBlock).toBeDefined();
+    for (const department of Object.keys(departments)) {
+      const declaration = new RegExp(`--map-line-${department}\\s*:`, 'g');
+      expect([...uncommented.matchAll(declaration)]).toHaveLength(1);
+      expect([...(mapBlock ?? '').matchAll(declaration)]).toHaveLength(1);
+    }
+  });
+});
 
 /** A token's value with every var() followed to its definition. */
 const resolve = (name: string, seen: readonly string[] = []): string => {
@@ -566,15 +591,12 @@ describe('the field is Enamel’s', () => {
   it('the components still drawing their own field frame are only these', () => {
     // A ratchet, not a destination: each is a page's scoped rule, left for
     // the next car so this one migrates the shared field and stays small.
-    // Two web-kit controls keep their own: GlobalSearch is a white field let
-    // into the band (7eb59678 car 2), and FeedbackControl also renders in
-    // the simulator, which does not load this stylesheet until it wears
-    // Enamel itself (c6db2cfb) — without its own rule it would fall to the
-    // browser's field there.
-    const LEFT = [
-      'web-kit/FeedbackControl.svelte',
-      'web-kit/GlobalSearch.svelte',
-    ];
+    // One web-kit control keeps its own: GlobalSearch is a white field let
+    // into the band (7eb59678 car 2). FeedbackControl kept one only because
+    // the simulator did not load this stylesheet; it has imported it since
+    // car 4 (apps/simulator/src/styles.css), so the feedback panel's fields
+    // are the shared field in both apps (backlog 6f471ff6, 2026-11-15).
+    const LEFT = ['web-kit/GlobalSearch.svelte'];
     const drawing = svelteFiles
       .filter(([, src]) => {
         const css = (src.match(/<style[^>]*>([\s\S]*?)<\/style>/)?.[1] ?? '').replace(
@@ -690,8 +712,20 @@ describe('the failed read is a red rail', () => {
     expect(decl(RAIL, 'font-style')).toBe('normal');
   });
 
-  it('is the only rule that draws the marker', () => {
-    expect([...rules.keys()].filter((s) => /\.load-failed\b/.test(s))).toEqual([RAIL]);
+  // A component's <style> is a rule too (backlog dfca9fd3). Svelte
+  // scopes `.a.load-failed` to `.a.load-failed.svelte-x`, three classes,
+  // which outranks the rail's `:root body` pair and takes its ink back —
+  // TransitMap set the motion line's failure in the map's red and
+  // FleetPage its notes in amber, a failure dressed as a warning, while
+  // this check read styles.css alone and passed. So every component's
+  // own rules are read too, named by file, and the rail stays the one.
+  it('is the only rule that draws the marker, in styles.css or any component', () => {
+    const scoped = svelteFiles.flatMap(([file]) =>
+      [...componentRules(file).keys()]
+        .filter((s) => /\.load-failed\b/.test(s))
+        .map((s) => `${file}: ${s}`),
+    );
+    expect([...[...rules.keys()].filter((s) => /\.load-failed\b/.test(s)), ...scoped]).toEqual([RAIL]);
   });
 
   it('no failure repaints its words inline', () => {
@@ -855,5 +889,53 @@ describe('the Simulator wears this stylesheet, not a copy of it', () => {
       expect(`${cls}: ${new RegExp(`\\b${cls}\\b`).test(shell)}`).toBe(`${cls}: true`);
       expect(`${cls}: ${new RegExp(`\\.${cls}\\s*\\{`).test(uncommented)}`).toBe(`${cls}: true`);
     }
+  });
+});
+
+/** One focus, one face (backlog 6f471ff6, car 1). Keyboard focus is
+ *  Enamel's amber ring and nothing else, and type is set only through the
+ *  two Enamel faces. Measured on origin/main e3483fcb: two :focus-visible
+ *  rings drew --accent and --signal, and 36 font-family declarations named
+ *  a stack of their own (14 bare monospace, 13 ui-monospace stacks, 5
+ *  system sans, 2 Overpass, 2 Overpass Mono). A selection mark
+ *  (.jd-step.focused, StepDag's .node.selected) is not focus and is not
+ *  read here. */
+describe('one focus, one face', () => {
+  const WEB = import.meta.dir;
+  const KIT = join(import.meta.dir, '..', '..', '..', 'libs', 'web-kit', 'src');
+  const walk = (dir: string): string[] =>
+    readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+      e.isDirectory() ? walk(join(dir, e.name)) : /\.(svelte|css)$/.test(e.name) ? [join(dir, e.name)] : [],
+    );
+  const sources = [...walk(WEB), ...walk(KIT)].map((f) => {
+    const raw = readFileSync(f, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+    // The faces are DEFINED at :root (the tokens) and in @font-face (which
+    // must name the family it loads); everything else reads them.
+    return [f.slice(f.indexOf('/src/') + 1), raw.replace(ROOT_BLOCK, '').replace(/@font-face\s*\{[^}]*\}/g, '')] as const;
+  });
+  /** Left for the brand call on 9230dfe4, by name: the landing page's
+   *  reading serif is a decision Enamel has not made. */
+  const SERIF_LEFT = 'src/landing/SystemModelLiveView.svelte';
+
+  it('every font-family is an Enamel face', () => {
+    const escaping = sources.flatMap(([f, src]) =>
+      [...src.matchAll(/font-family\s*:\s*([^;`"}]+)/g)]
+        .map((m) => (m[1] ?? '').trim())
+        .filter((v) => !/^var\(--font-(?:body|mono|display)\)$|^var\(--mono\)$|^inherit$/.test(v))
+        .filter((v) => !(f === SERIF_LEFT && /serif$/.test(v)))
+        .map((v) => `${f}: ${v}`),
+    );
+    expect(escaping).toEqual([]);
+  });
+
+  it('every keyboard focus ring is the amber --focus', () => {
+    const off = sources.flatMap(([f, src]) =>
+      [...src.matchAll(/:focus-visible[^{]*\{([^}]*)\}/g)]
+        .flatMap((m) => [...(m[1] ?? '').matchAll(/outline(?:-color)?\s*:[^;]*var\(--([a-z0-9-]+)\)/g)])
+        .map((o) => o[1] ?? '')
+        .filter((token) => token !== 'focus')
+        .map((token) => `${f}: --${token}`),
+    );
+    expect(off).toEqual([]);
   });
 });

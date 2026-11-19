@@ -89,7 +89,7 @@
         {#if reverseState.kind === 'posted'}
           <span class="tb-reverse-result">
             Reversal posted: <Link
-              to={href(`/ux/finance${entrySearch(reverseState.reversalId)}`)}
+              to={href(`/finance${entrySearch(reverseState.reversalId)}`)}
               className="mono">{shortId(reverseState.reversalId)}</Link>
           </span>
         {:else}

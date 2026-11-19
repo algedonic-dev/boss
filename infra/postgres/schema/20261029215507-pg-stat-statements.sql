@@ -1,0 +1,11 @@
+-- 891e48c9 / d9b39685, 2026-10-29: temp-file spills may outweigh the WAL
+-- write load on the same etcd disks, and naming the statements that spill
+-- needs pg_stat_statements. The server preloads it
+-- (shared_preload_libraries in infra/cluster/manifests/boss.yaml); this
+-- creates its view in the database, without which the loaded library has
+-- nothing to read. Ships with PostgreSQL 16's contrib in the image every
+-- instance runs. It is not a trusted extension, so this needs a superuser:
+-- every migrate.sh caller is one (POSTGRES_USER, or sudo -u postgres).
+-- Created on a server that has not loaded the library yet, the extension
+-- exists and its view errors until the next start; nothing reads it then.
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;

@@ -198,7 +198,12 @@ spec:
       # A refusal does not change on a retry: the grant, the key and the
       # receiver are what they are until someone changes them.
       backoffLimit: 0
-      activeDeadlineSeconds: 300
+      # The packet open's worst case at three attempts (about 278 s,
+      # review 0aced427) plus the container's BOSS_ACT_BOUND_S, held by
+      # every_maintenance_wrap_caller_retries_its_open.rs. It was 300,
+      # which left the deposit about 20 s after a stalled open; it runs
+      # once a day.
+      activeDeadlineSeconds: 600
       template:
         spec:
           serviceAccountName: break-glass-deposit
@@ -235,6 +240,28 @@ spec:
                   value: "1"
                 - name: BOSS_JOBS_URL
                   value: http://boss-jobs-internal.boss.svc.cluster.local:7900
+                # The packet open tries 3 times, not the wrap's default 1
+                # (backlog a2ae9f39: one failed read lost the backup's
+                # packet on 10-26 and 10-27). Pinned by
+                # every_maintenance_wrap_caller_retries_its_open.rs.
+                - name: BOSS_WRAP_OPEN_RETRY
+                  value: "3"
+                # THE ACT'S OWN BOUND, in seconds: how long this container
+                # still runs once the wrap's open returns. A declaration,
+                # read by every_maintenance_wrap_caller_retries_its_open.rs
+                # and by no process: that pin refuses an
+                # activeDeadlineSeconds below the wrap's worst-case open at
+                # three attempts plus this (review 0aced427). The bounded
+                # calls in infra/cluster/break-glass-deposit.sh: nine
+                # kubectl requests at --request-timeout=20s (four can-i,
+                # must_accept's get and patch, three must_refuse patches),
+                # 180 s, then the ship, SHIP_TIMEOUT_S (60 s) under
+                # `timeout -k 5`, its greeting wait inside it: 245 s. Its
+                # four in-cluster kubectl calls (the key and token Secret
+                # reads, the key patch, the binding read) set no request
+                # timeout and are not in it.
+                - name: BOSS_ACT_BOUND_S
+                  value: "245"
                 # The hosts its packet writes may carry the estate machine
                 # token to, besides loopback: this namespace's Services, by
                 # suffix (backlog 2ee29275; the car-4 checklist on 2710c8fc).

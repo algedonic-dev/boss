@@ -140,10 +140,8 @@ itself, the
 covers `BOSS_REGEN_DAYS=14` for a ~5 min run that checks a clean
 rebuild.
 
-Dev loop once installed: the bare-metal Rust services run as
-plain background processes (logs in `~/.boss-logs/`, PIDs in
-`~/.boss-pids`); systemd is the production-deploy path only. The
-SPA reloads via `cd apps/web && bun run dev`. Type-check with
+Dev loop once installed: the SPA reloads via
+`cd apps/web && bun run dev`. Type-check with
 `cd apps/web && bun run typecheck`; Rust suites with
 `cargo test -p <crate>`.
 

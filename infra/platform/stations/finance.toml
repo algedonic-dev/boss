@@ -1,0 +1,49 @@
+# ---------------------------------------------------------------------------
+# finance — the company's money as data (design c0ae096f section 3, car 1,
+# backlog 599fec3e; David, 2026-11-10: "I am fine bringing Finance back as
+# a station right now given we have collected real sponsorship money and I
+# want to have BOSS be tracking our budget even if actual spending can
+# only happen outside").
+#
+# A DEPARTMENT: a tier-1 station, a direct child of the root, a sibling of
+# engineering and operations (station-tree.md section 2: "Future
+# producing departments (finance, ...) are siblings of engineering and
+# operations"). What it owns is the money as data: sponsorship revenue
+# in, the Stripe balance (ledger account 1010, crates/modules/boss-ledger
+# chart.rs), every purchase recorded back by a human step, and the budget
+# each review reads. It does NOT spend: purchases happen outside BOSS, by
+# David, and BOSS has no payment mechanism.
+#
+# ITS EXECUTORS: people:platform-admin (David) decides and records;
+# robots reconcile and report. Neither is ALLOCATED here, and that is
+# measured, not deferred by taste: people:platform-admin is a roster read
+# whose bundle capacity is unknown, and an unknown capacity cannot be
+# allocated from (validate_station_tree), exactly as at executive; and
+# engineering holds robots:opus and robots:sol whole from the root
+# (engineering.toml v4), so a slot reserved here would exceed the pool.
+# A reconciliation robot's claim floats, as every claim under a station
+# that reserves nothing does.
+#
+# A CONTAINER, NOT A QUEUE: the tagged predicate holds no packet (see
+# algedonic.toml). Its first protocols, the two ledger maintenance rows,
+# name it as their owner in car 2 of the design, not here.
+#
+# `line = "finance"` draws --map-line-finance (apps/web/src/styles.css),
+# held by every_top_level_station_names_a_line_the_stylesheet_declares.
+# To change this station, bump `version`; `id` never changes.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "finance"
+version = 1
+status = "active"
+title = "Finance — the company's money as data"
+kind = "group"
+discipline = ["priority", "age"]
+id = "9b024f00-a8d4-43da-b2de-b648772c062b"
+parent = "00b04483-90c6-46b9-b911-8e19d2a0b410"
+mode = "standing"
+line = "finance"
+
+[station.predicate]
+tags_any = ["station:finance"]

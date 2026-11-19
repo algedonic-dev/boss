@@ -1,0 +1,8 @@
+[[invariant]]
+id = "a-protocol-names-only-its-owners-subtree"
+claim = "A protocol names only stations in its owner's subtree; work that crosses a boundary is a fulfilled_by step that creates packets under the other station's protocol, never a reference."
+source = "docs/design/station-tree.md §1 and §8.3; handoff rule 6 on design 4b27a65a; car T6"
+enforcement = "enforced"
+mechanism = "crates/core/boss-jobs/src/station_tree.rs"
+last_verified = "2026-11-12"
+note = "Filed unenforced by T0 (backlog ac434bd4); flipped by T6 (backlog baac0b65) in two cars. Car A: every platform workflow names its owner station by id under metadata.owner (station_tree::validate_protocol_owners). Car B: a step stands at a station by id under its metadata_defaults.at, or hands off under metadata_defaults.fulfilled_by; station_tree::validate_protocol_subtree refuses a station outside the owner's subtree, an id that is no station, a hand-off to no protocol of the bundle, and a step naming both. Both are pinned on the bundle by every_platform_protocol_names_a_standing_owner_station and every_platform_step_stands_in_its_owners_subtree in crates/core/boss-jobs/tests/station_tree.rs. Not covered: the publish door does not yet run either check on a live row (only the bundle is judged), and only engineering's protocols place their steps so far: sweep 2 of design c0ae096f placed every engineering work step at its station or named it unplaced with its reason (every_engineering_work_step_names_where_it_runs_or_why_not); the other owners' rows place none yet. The tree queues read at (station_queue::addressed_here), and resolution at claim (T6's next car) is the next reader."

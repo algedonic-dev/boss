@@ -470,6 +470,22 @@ async fn readyz_answers_anyone_and_names_no_rule() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn health_reports_unknown_lag_without_asking_policy_or_the_database() {
+    let app = router(state(unreachable_pool(), Arc::new(UnreachablePolicy)));
+    let (status, body) = get_at(&app, "/api/dispatcher/health", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["capabilities"]["service"], "boss-dispatcher");
+    assert_eq!(
+        value["dispatcher"]["rules_consumer_lag"]["status"],
+        "unobserved"
+    );
+    assert!(value["dispatcher"]["rules_consumer_lag"]["pending"].is_null());
+    assert_eq!(value["dispatcher"]["rules_phase_costs"]["events"], 0);
+}
+
 /// A policy service that cannot answer is refused, never read as an
 /// allow (fail closed, D9) — and says it was the policy check.
 #[tokio::test(flavor = "multi_thread")]

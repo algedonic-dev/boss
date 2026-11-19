@@ -299,6 +299,12 @@ fn the_door_reads_metadata_only_through_a_readonly_mount() {
         .iter()
         .position(|a| *a == "alpine/k8s:1.33.3")
         .unwrap_or_else(|| panic!("the image ops_kubectl pulls, not a second one: {docker:?}"));
+    // It mounts the whole credential directory, so it keeps no container
+    // log — docker's option, before the image (backlog ff957587).
+    assert!(
+        docker[..image_at].contains(&"--log-driver=none"),
+        "no daemon log of what the door prints: {docker:?}"
+    );
     // `timeout 10` INSIDE the container: killing the host-side client
     // leaves a container running (review of 058b1ef1, M1).
     assert_eq!(
@@ -440,10 +446,42 @@ fn a_door_that_ignores_term_is_killed_and_the_reading_goes_on() {
     // stand-in here ignores TERM outright, so only the host-side
     // `timeout -k` KILL ends it (review of 058b1ef1, M1). Without the
     // bound, or without its -k, this takes the stand-in's full 30s.
-    let Some(dir) = sealed("ops-creds-hang") else {
+    a_hung_door_costs_seconds("ops-creds-hang", false);
+}
+
+#[test]
+fn a_door_whose_command_leaves_the_timeouts_group_cannot_hold_the_reading() {
+    // THE SAME BOUND, WITH THE HOLDER OUT OF timeout's REACH (backlog
+    // c44ba179, 2026-11-16). The test above passed on every forge gate
+    // and held the full 30s on the public mirror's ubuntu-latest, which
+    // moved to Ubuntu 26 on 2026-10-19: a door that ignores TERM keeps a
+    // child, and that child still had the command substitution's pipe
+    // open after timeout had gone. `$(…)` waits for EOF from EVERY
+    // holder of its pipe, not for timeout, so the bound held only as far
+    // as the host's timeout happens to KILL its whole process group —
+    // and a real door leaves that group anyway: sudo runs its command in
+    // a new session on a pty (use_pty, the default on current sudo, and
+    // sudo-rs), where timeout's group KILL never arrives and docker's
+    // sig-proxy catches the hangup. So the stand-in sudo here puts the
+    // command in a new session itself, which makes the escape this
+    // test's own fixture rather than a property of whichever timeout and
+    // sudo the host carries.
+    a_hung_door_costs_seconds("ops-creds-hang-session", true);
+}
+
+/// A sealed directory read through a door that ignores TERM and keeps a
+/// child holding its output for 30s; the reading must still end inside
+/// the 1s bound plus `-k 5`, say `unmeasured`, and let the caller go on.
+/// `new_session` makes the stand-in sudo run the door the way a real
+/// sudo on a pty does, outside timeout's process group.
+fn a_hung_door_costs_seconds(name: &str, new_session: bool) {
+    let Some(dir) = sealed(name) else {
         return;
     };
-    let d = stand_in("ops-creds-hang-bin", false, "trap '' TERM\nsleep 30\n");
+    let d = stand_in(&format!("{name}-bin"), false, "trap '' TERM\nsleep 30\n");
+    if new_session {
+        sudo_in_a_new_session(&d);
+    }
     let started = std::time::Instant::now();
     let (rc, out) = observe_shaped(&dir, Some(&d.bin), Some("1"));
     let took = started.elapsed();
@@ -453,6 +491,237 @@ fn a_door_that_ignores_term_is_killed_and_the_reading_goes_on() {
     assert!(
         took < std::time::Duration::from_secs(20),
         "the door held the reading {took:?}: {out}"
+    );
+}
+
+/// Replaces a stand-in's `sudo` with one that runs its command in a new
+/// session, as a real sudo on a pty does (use_pty, sudo-rs): outside
+/// timeout's process group, where only a KILL sent to the command's own
+/// pid arrives and anything it forked lives on (backlog c44ba179).
+fn sudo_in_a_new_session(d: &Door) {
+    let record = format!(
+        "for a in \"$0\" \"$@\"; do printf '%s\\n' \"$a\" >> '{}'; done\n",
+        d.log.display()
+    );
+    boss_testing::write_exec(
+        &d.bin.join("sudo"),
+        &format!("#!/bin/sh\n{record}[ \"$1\" = -n ] && shift\nexec setsid \"$@\"\n"),
+    );
+}
+
+// ── A DOOR CUT OFF MID-ANSWER (review e4325ecd of car d92554d9, L1) ──────
+//
+// timeout's status was discarded with `|| :`, so a door cut off after it
+// had printed only its `/ops/.` line read as a door that had looked and
+// found nothing: `not ready: talosconfig:absent kubeconfig:absent`, a
+// confident guess about two files nobody had stat'ed. Cut off is
+// `unmeasured`, naming the timeout, at either of timeout's two answers:
+// 124 when TERM ended the door, 137 when only the `-k` KILL did.
+
+/// A sealed directory read through a door that prints the directory's
+/// own line and then hangs past the 1s bound — `ignore_term` decides
+/// whether TERM ends it or only the KILL does.
+fn a_door_cut_off_after_its_first_line(name: &str, ignore_term: bool) {
+    let Some(dir) = sealed(name) else {
+        return;
+    };
+    let trap = if ignore_term { "trap '' TERM\n" } else { "" };
+    let d = stand_in(
+        &format!("{name}-bin"),
+        false,
+        &format!("{trap}echo '/ops/. root:root 700 0:0'\nsleep 30\n"),
+    );
+    let (rc, out) = observe_shaped(&dir, Some(&d.bin), Some("1"));
+    unseal(&dir);
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.starts_with("unmeasured: "), "{out}");
+    assert!(
+        out.contains("cut off by its timeout") && out.contains("bound 1s"),
+        "the reading names the timeout: {out}"
+    );
+}
+
+#[test]
+fn a_door_terminated_mid_answer_is_unmeasured_not_absent() {
+    a_door_cut_off_after_its_first_line("ops-creds-cut-term", false);
+}
+
+#[test]
+fn a_door_killed_mid_answer_is_unmeasured_not_absent() {
+    a_door_cut_off_after_its_first_line("ops-creds-cut-kill", true);
+}
+
+// ── THE PULL, BOUNDED THE SAME WAY (backlog 4b1b1ff5) ────────────────────
+//
+// ops_image_ready's first-time pull was the door's shape before car
+// d92554d9: `$(timeout … sudo -n docker pull …)`, and with no `-k` at
+// all. Every acting loop runs it first — the watchdog, rollback-to,
+// every node verb — so a pull whose command left timeout's group held
+// the loop for as long as the survivor kept the pipe.
+
+/// ops_image_ready run the way its callers run it: `set -eu`, the lib
+/// sourced, `ready="$(ops_image_ready 2> err)"`. Returns what the caller
+/// printed after: `ready: …` or `refused: <the stderr>`, then CONTINUED.
+fn ready_shaped(d: &Door, tmpdir: Option<&std::path::Path>) -> std::process::Child {
+    let lib = repo_root().join(LIB);
+    let err = d.log.with_file_name("ready.err");
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(format!(
+            "set -eu\n. '{}'\nif ready=\"$(ops_image_ready 2> '{}')\"; then printf 'ready: %s\\n' \"$ready\"; else printf 'refused: %s\\n' \"$(cat '{}')\"; fi\necho '{CONTINUED}'\n",
+            lib.display(),
+            err.display(),
+            err.display()
+        ))
+        .env("BOSS_FORGE_REGISTRY_HOST", "reg.test")
+        .env("BOSS_OPS_PULL_TIMEOUT_S", "1")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                d.bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(t) = tmpdir {
+        cmd.env("TMPDIR", t);
+    }
+    // Its own process group, so a test can kill the caller the way
+    // systemd stops a unit: everything in it at once.
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    cmd.spawn().expect("sh runs")
+}
+
+/// A docker stand-in with no image on the daemon, whose pull ignores
+/// TERM and keeps a child for 30s.
+const A_PULL_THAT_HANGS: &str = "case \"$1\" in\n\
+     image) exit 1 ;;\n\
+     pull) trap '' TERM; sleep 30 ;;\n\
+     *) exit 0 ;;\n\
+     esac\n";
+
+#[test]
+fn a_pull_whose_command_leaves_the_timeouts_group_cannot_hold_the_caller() {
+    let d = stand_in("ops-pull-session-bin", false, A_PULL_THAT_HANGS);
+    sudo_in_a_new_session(&d);
+    let started = std::time::Instant::now();
+    let out = ready_shaped(&d, None).wait_with_output().expect("sh runs");
+    let took = started.elapsed();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        took < std::time::Duration::from_secs(20),
+        "the pull held its caller {took:?}: {text}"
+    );
+    assert!(text.trim_end().ends_with(CONTINUED), "{text}");
+    assert!(
+        text.starts_with("refused: ") && text.contains("timed out after 1s"),
+        "a pull cut off is a named refusal: {text}"
+    );
+    assert!(
+        argv(&d).windows(2).any(|w| w == ["-n", "docker"]),
+        "the pull went through sudo -n: {:?}",
+        argv(&d)
+    );
+}
+
+// ── NO SCRATCH FILE OUTLIVES A KILLED CALLER (review e4325ecd, L2) ───────
+//
+// The door's answer file was removed after timeout returned, so a caller
+// killed while it waited — systemd's stop of the unit, its start timeout
+// — never reached the rm, and every such kill left a file in the
+// caller's TMPDIR. The file is now unlinked before the door runs.
+
+/// Kills `caller`'s whole process group once the stand-in door has been
+/// handed `word` (so the scratch file, where one is made, exists by
+/// then), and returns what was left in `tmpdir`.
+fn left_behind_after_a_kill(
+    caller: std::process::Child,
+    d: &Door,
+    word: &str,
+    tmpdir: &std::path::Path,
+) -> Vec<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !argv(d).iter().any(|a| a == word) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stand-in door was never handed `{word}`: {:?}",
+            argv(d)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // The negated pid is the group; dash's kill reads a `--` as a pid.
+    let killed = Command::new("sh")
+        .arg("-c")
+        .arg("kill -9 \"-$1\"")
+        .arg("sh")
+        .arg(caller.id().to_string())
+        .status()
+        .expect("kill runs");
+    assert!(killed.success(), "the caller's group was killed");
+    let _ = caller.wait_with_output();
+    std::fs::read_dir(tmpdir)
+        .expect("read tmpdir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect()
+}
+
+#[test]
+fn a_caller_killed_while_the_door_runs_leaves_no_scratch_file() {
+    let Some(dir) = sealed("ops-creds-killed") else {
+        return;
+    };
+    let tmp = scratch_dir("ops-creds-killed-tmp");
+    let d = stand_in("ops-creds-killed-bin", false, "sleep 30\n");
+    let lib = repo_root().join(LIB);
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(format!(
+            "set -eu\n. '{}'\nops_state=$(ops_credentials_state forge)\nprintf '%s\\n' \"$ops_state\"\n",
+            lib.display()
+        ))
+        .env(
+            "BOSS_ESTATE_SOURCE",
+            repo_root().join("infra/estate/estate.toml"),
+        )
+        .env("BOSS_OPS_DIR", &dir)
+        .env("BOSS_OPS_DOOR_TIMEOUT_S", "3")
+        .env("TMPDIR", &tmp)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                d.bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let caller = cmd.spawn().expect("sh runs");
+    let left = left_behind_after_a_kill(caller, &d, "stat", &tmp);
+    unseal(&dir);
+    assert!(
+        left.is_empty(),
+        "a killed caller leaked {left:?} in {tmp:?}"
+    );
+}
+
+#[test]
+fn a_caller_killed_while_the_pull_runs_leaves_no_scratch_file() {
+    let tmp = scratch_dir("ops-pull-killed-tmp");
+    let d = stand_in(
+        "ops-pull-killed-bin",
+        false,
+        "case \"$1\" in image) exit 1 ;; pull) sleep 30 ;; esac\n",
+    );
+    let caller = ready_shaped(&d, Some(&tmp));
+    let left = left_behind_after_a_kill(caller, &d, "pull", &tmp);
+    assert!(
+        left.is_empty(),
+        "a killed caller leaked {left:?} in {tmp:?}"
     );
 }
 

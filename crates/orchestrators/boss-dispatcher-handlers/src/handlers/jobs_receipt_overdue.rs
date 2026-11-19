@@ -85,9 +85,14 @@ pub fn judge(job: &Json, d: &Declared, now: DateTime<Utc>) -> Result<Option<Over
     };
     if !matches!(
         expectation.get("schema").and_then(Json::as_u64),
-        Some(1 | 2)
+        Some(1..=3)
     ) {
         return Err("receipt expectation has an unsupported schema".into());
+    }
+    // A bounded START's expectation (design e72dc7c9) is judged whole.
+    let bounded = expectation["schema"] == boss_jobs::execution_inputs::START_SCHEMA;
+    if bounded && !boss_jobs::execution_inputs::start_expectation_valid(expectation) {
+        return Err("bounded START expectation is incomplete".into());
     }
     if expectation["schema"] == 2
         && !boss_jobs::agent_budget::observer_start_expectation_valid(
@@ -128,6 +133,21 @@ pub fn judge(job: &Json, d: &Declared, now: DateTime<Utc>) -> Result<Option<Over
             ) {
                 return Err(
                     "launcher observation, input digests or native incarnation cannot be verified"
+                        .into(),
+                );
+            }
+            return Ok(None);
+        }
+        if bounded {
+            let assigned = step.get("assignee_id").and_then(Json::as_str).unwrap_or("");
+            if !boss_jobs::execution_inputs::start_receipt_matches(
+                expectation,
+                receipt,
+                packet,
+                assigned,
+            ) {
+                return Err(
+                    "bounded START receipt does not bind this run, actor, START and manifest"
                         .into(),
                 );
             }
@@ -613,6 +633,29 @@ mod tests {
         }
         job["steps"][1]["metadata"]["start_expected"] = json!({"schema":1,"minutes":15});
         assert!(judge(&job, &declaration(), at("2026-10-03T12:20:00Z")).is_err());
+    }
+
+    /// A bounded START's run (design e72dc7c9) is overdue on the same
+    /// clock, spared only by the schema-3 receipt naming its START and
+    /// manifest — never by a whole-START receipt it did not ask for.
+    #[test]
+    fn a_bounded_start_is_spared_only_by_the_receipt_naming_its_start() {
+        let expected = boss_jobs::execution_inputs::start_expectation("the START", &json!([]), 15);
+        let mut job = printed_prompt();
+        job["steps"][1]["metadata"]["start_expected"] = expected.clone();
+        let late = judge(&job, &declaration(), at("2026-10-03T12:20:00Z"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(late.bound_minutes, 15);
+        job["metadata"]["worker_started"] = json!({"schema":1,"run":"run-1","actor":"agent-codex"});
+        assert!(judge(&job, &declaration(), at("2026-10-03T12:20:00Z")).is_err());
+        job["metadata"]["worker_started"] =
+            boss_jobs::execution_inputs::start_receipt(&expected, "run-1", "agent-codex").unwrap();
+        assert!(
+            judge(&job, &declaration(), at("2026-10-03T12:20:00Z"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

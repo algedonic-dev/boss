@@ -57,7 +57,7 @@ pub const MAX_ATTEMPTS: u32 = boss_nats::durable::MAX_DELIVER as u32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blocked {
     pub audit_id: i64,
-    /// Presentations so far (1-based: the first failure is attempt 1).
+    /// Handler failures so far (first failure is 1; routing holds spend none).
     pub attempts: u32,
     pub reason: String,
 }
@@ -199,6 +199,24 @@ impl LogTail {
                     self.advance(id).await?;
                     self.blocked = None;
                     report.processed += 1;
+                }
+                Settle::Hold(reason) => {
+                    // Unknown routing is not an attempt at the handler. Preserve
+                    // the cursor and prior failure count until authority returns.
+                    let prior = self
+                        .blocked
+                        .as_ref()
+                        .filter(|b| b.audit_id == id)
+                        .map(|b| b.attempts)
+                        .unwrap_or(0);
+                    let blocked = Blocked {
+                        audit_id: id,
+                        attempts: prior,
+                        reason,
+                    };
+                    self.blocked = Some(blocked.clone());
+                    report.blocked = Some(blocked);
+                    return Ok(report);
                 }
                 Settle::Retry(reason) => {
                     if attempts >= MAX_ATTEMPTS {

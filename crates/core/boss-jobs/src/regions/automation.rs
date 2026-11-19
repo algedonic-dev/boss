@@ -27,6 +27,20 @@
 //! byte-identical, and the exit step is read off the crossing's own
 //! `step` and `via` ([`completed_step`]), in the shapes the walk writes.
 //!
+//! WHO MOVED A PACKET A TERMINAL CLOSED is read off the packet, not the
+//! walk (backlog 8bc32104). The walk names ONE step behind a terminal —
+//! the one whose completion it tried last on its own path, `closed, after
+//! proven completed` for ship-a-change's `merged` — while `merged` is
+//! ready when `proven` AND a `landed-review` are done, so the step that
+//! closed a real car is whichever of them completed LAST. Crediting the
+//! walk's step read 13 of the last 60 closed cars on 2026-11-13 as moved
+//! by `automation:ops-runner` when an agent's landed-review had closed
+//! them. So a closing exit credits the latest-completed of the steps the
+//! terminal's `ready_when` names — the terminal row's own `blocked_by`,
+//! written at materialisation — and counts at the terminal's completion,
+//! the moment the packet left. `routes.rs` stays byte-identical, for the
+//! reason above.
+//!
 //! NO TARGET RATIO, by decision: the reading has a direction (hand-moved
 //! downstream goes down) and no goal number, so it is a measure beside
 //! the state and never a band that judges it.
@@ -111,12 +125,43 @@ pub fn completed_step<'a>(step: &'a str, via: &'a str) -> Option<&'a str> {
     }
 }
 
-/// THE STEPS WHOSE COMPLETION MOVES A PACKET OUT OF `region`, as
-/// `(workflow, step slug)`: every protocol crossing on a route leaving
-/// it that a step completion made. Read off the walks that draw the
-/// rails, so the reading and the rails cannot disagree about which
-/// steps leave a region. A declared hand-off names no step.
-pub fn completion_exits(map: &crate::routes::RouteMap, region: &str) -> BTreeSet<(String, String)> {
+/// One way a step completion moves a packet out of a region, read off a
+/// crossing the walk recorded.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Exit {
+    pub workflow: String,
+    /// The step whose completion the walk saw make the crossing.
+    pub step: String,
+    /// The terminal that completion readied and closed the packet on,
+    /// when it is not `step` itself. Such an exit is credited to the
+    /// step the terminal names that completed last on the packet, which
+    /// need not be `step` (backlog 8bc32104).
+    pub closes: Option<String>,
+}
+
+impl Exit {
+    /// A step whose own completion moves the packet out.
+    pub fn by(workflow: &str, step: &str) -> Self {
+        Exit {
+            workflow: workflow.into(),
+            step: step.into(),
+            closes: None,
+        }
+    }
+
+    /// The slug of the step row whose completion IS the exit: the
+    /// terminal for a closing exit, else the step.
+    fn leaves_on(&self) -> &str {
+        self.closes.as_deref().unwrap_or(&self.step)
+    }
+}
+
+/// THE STEP COMPLETIONS THAT MOVE A PACKET OUT OF `region`: every
+/// protocol crossing on a route leaving it that a step completion made.
+/// Read off the walks that draw the rails, so the reading and the rails
+/// cannot disagree about which crossings leave a region. A declared
+/// hand-off names no step.
+pub fn completion_exits(map: &crate::routes::RouteMap, region: &str) -> BTreeSet<Exit> {
     map.routes
         .iter()
         .filter(|r| r.from.as_deref() == Some(region) && r.to.as_deref() != Some(region))
@@ -127,46 +172,82 @@ pub fn completion_exits(map: &crate::routes::RouteMap, region: &str) -> BTreeSet
                 step,
                 via,
                 ..
-            } => completed_step(step, via).map(|done| (workflow.clone(), done.to_string())),
+            } => completed_step(step, via).map(|done| Exit {
+                closes: (done != step).then(|| step.clone()),
+                ..Exit::by(workflow, done)
+            }),
             _ => None,
         })
         .collect()
 }
 
-/// The completions in the CURRENT window of the steps named in `exits`
-/// (`(workflow, step slug)`), by who completed them. A step read twice
-/// — the same packet carried by two of the handler's reads — counts
-/// once.
-pub fn moved_by(
-    exits: &BTreeSet<(String, String)>,
-    rows: &[&(Job, Vec<Step>)],
-    w: &Windows,
-) -> MovedBy {
+/// The exits in the CURRENT window, by who made each: a step's own
+/// completion by its completer, a terminal's by the completer of the
+/// step behind it that completed last ([`mover`]). A step read twice —
+/// the same packet carried by two of the handler's reads — counts once.
+pub fn moved_by(exits: &BTreeSet<Exit>, rows: &[&(Job, Vec<Step>)], w: &Windows) -> MovedBy {
     let mut seen = HashSet::new();
     rows.iter()
-        .flat_map(|(job, steps)| steps.iter().map(move |s| (job, s)))
-        .filter(|(job, s)| {
-            s.status == StepStatus::Completed
-                && s.spec_slug
-                    .as_ref()
-                    .is_some_and(|slug| exits.contains(&(job.kind.clone(), slug.clone())))
-                && s.completed_at.is_some_and(|at| w.current(at))
+        .flat_map(|(job, steps)| {
+            steps
+                .iter()
+                .filter_map(move |s| mover(exits, job, steps, s, w))
         })
-        .filter(|(_, s)| seen.insert(s.id))
-        .fold(MovedBy::default(), |m, (_, s)| {
-            m.with(s.completed_by.as_ref())
+        .filter(|s| seen.insert(s.id))
+        .fold(MovedBy::default(), |m, s| m.with(s.completed_by.as_ref()))
+}
+
+/// The step whose completion moved `job` out where `s` is an exit
+/// completed in the current window, else `None`. For a terminal that
+/// closed it, that is the latest-completed, no later than the terminal,
+/// of the steps its `ready_when` names (the row's `blocked_by`) and the
+/// step the walk named, which stands in for a row with no `blocked_by`.
+/// A terminal with none of them completed is credited to itself.
+fn mover<'a>(
+    exits: &BTreeSet<Exit>,
+    job: &Job,
+    steps: &'a [Step],
+    s: &'a Step,
+    w: &Windows,
+) -> Option<&'a Step> {
+    let at = s
+        .completed_at
+        .filter(|at| s.status == StepStatus::Completed && w.current(*at))?;
+    let slug = s.spec_slug.as_deref()?;
+    let hits: Vec<&Exit> = exits
+        .iter()
+        .filter(|e| e.workflow == job.kind && e.leaves_on() == slug)
+        .collect();
+    if hits.is_empty() {
+        return None;
+    }
+    if hits.iter().all(|e| e.closes.is_none()) {
+        return Some(s);
+    }
+    let named = |x: &Step| {
+        s.blocked_by.contains(&x.id)
+            || x.spec_slug
+                .as_deref()
+                .is_some_and(|name| hits.iter().any(|e| e.closes.is_some() && e.step == name))
+    };
+    steps
+        .iter()
+        .filter(|x| x.id != s.id && x.status == StepStatus::Completed && named(x))
+        .filter_map(|x| {
+            x.completed_at
+                .filter(|done| *done <= at)
+                .map(|done| (done, x))
         })
+        .max_by_key(|(done, _)| *done)
+        .map(|(_, x)| x)
+        .or(Some(s))
 }
 
 /// The reading as the region's KPI carries it: `machine-moved 80% · 2
 /// hand-moved/day`. The value is the machine share of the ATTRIBUTED
 /// completions, `None` where there were none — a share of nothing is
 /// not zero — and the sentence says which of the reasons it is.
-pub fn automation_measure(
-    exits: Option<&BTreeSet<(String, String)>>,
-    moved: MovedBy,
-    w: &Windows,
-) -> Measure {
+pub fn automation_measure(exits: Option<&BTreeSet<Exit>>, moved: MovedBy, w: &Windows) -> Measure {
     let none =
         |why: &str| measure_said(MACHINE_MOVED, None, "%", format!("{MACHINE_MOVED}: {why}"));
     let Some(exits) = exits else {
@@ -236,10 +317,10 @@ mod tests {
         s
     }
 
-    fn exits() -> BTreeSet<(String, String)> {
+    fn exits() -> BTreeSet<Exit> {
         [("pr-train", "merged"), ("gate-run", "record-verdict")]
             .into_iter()
-            .map(|(k, s)| (k.to_string(), s.to_string()))
+            .map(|(k, s)| Exit::by(k, s))
             .collect()
     }
 
@@ -300,29 +381,40 @@ mod tests {
 
     /// THE STEPS WHOSE COMPLETION LEAVES A REGION, on the tree's own
     /// walks: a completion counts, and so does one that closed the
-    /// packet (named by the step that closed it, not by the terminal); a
-    /// marker, a job key and an aged-out window name no one.
+    /// packet (named by the step that closed it, with the terminal it
+    /// closed on); a marker, a job key and an aged-out window name no one.
     #[test]
     fn a_regions_completion_exits_are_the_steps_its_crossings_complete() {
         let map = tree_routes();
-        let pair = |k: &str, s: &str| (k.to_string(), s.to_string());
+        let closes = |k: &str, s: &str, t: &str| Exit {
+            closes: Some(t.into()),
+            ..Exit::by(k, s)
+        };
         let gates = completion_exits(&map, "gates");
         assert!(
-            gates.contains(&pair("gate-run", "record-verdict")),
+            gates.contains(&closes("gate-run", "record-verdict", "green")),
             "{gates:?}"
         );
-        assert!(gates.contains(&pair("pr-train", "merged")), "{gates:?}");
+        assert!(gates.contains(&Exit::by("pr-train", "merged")), "{gates:?}");
         assert!(
-            !gates.contains(&pair("gate-run", "green")),
+            !gates
+                .iter()
+                .any(|e| e.workflow == "gate-run" && e.step == "green"),
             "a terminal is not the step: {gates:?}"
         );
         let dock = completion_exits(&map, "dock");
-        assert!(dock.contains(&pair("pr-train", "pr")), "{dock:?}");
+        assert!(dock.contains(&Exit::by("pr-train", "pr")), "{dock:?}");
         assert!(
-            !dock.contains(&pair("ship-a-change", "review")),
+            !dock
+                .iter()
+                .any(|e| e.workflow == "ship-a-change" && e.step == "review"),
             "a marker moves nobody: {dock:?}"
         );
-        assert!(completion_exits(&map, "shed").contains(&pair("ship-a-change", "proven")));
+        assert!(completion_exits(&map, "shed").contains(&closes(
+            "ship-a-change",
+            "proven",
+            "merged"
+        )));
         assert!(
             completion_exits(&map, "garage").is_empty(),
             "the garage is left by markers only"
@@ -413,6 +505,110 @@ mod tests {
         assert_eq!(
             m.text,
             "machine-moved 40% · 1.5 hand-moved/day · 1 unattributed"
+        );
+    }
+
+    /// A ship-a-change car as the record holds it: `done` steps as
+    /// `(slug, completed_at, completed_by)`, the rest at their status, and
+    /// `merged`'s `blocked_by` the steps its ready_when names, as
+    /// materialisation writes it (`registry::predicate_step_refs`).
+    fn car(done: &[(&str, &str, &str)], rest: &[(&str, StepStatus)]) -> (Job, Vec<Step>) {
+        let status = if rest.is_empty() {
+            JobStatus::Closed
+        } else {
+            JobStatus::Open
+        };
+        let car = job("ship-a-change", "car", status, json!({}));
+        let mut steps: Vec<Step> = done
+            .iter()
+            .map(|(slug, at, by)| done_by(&car, slug, at, Some(by)))
+            .chain(rest.iter().map(|(slug, st)| step(&car, slug, *st, None)))
+            .collect();
+        let named: Vec<StepId> = steps
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.spec_slug.as_deref(),
+                    Some("landed-review" | "proven" | "review")
+                )
+            })
+            .map(|s| s.id)
+            .collect();
+        if let Some(m) = steps
+            .iter_mut()
+            .find(|s| s.spec_slug.as_deref() == Some("merged"))
+        {
+            m.blocked_by = named;
+        }
+        (car, steps)
+    }
+
+    /// A CONJUNCTIVE TERMINAL'S EXIT IS THE ACT OF WHICHEVER STEP IT
+    /// CONJOINS COMPLETED LAST (backlog 8bc32104). ship-a-change's
+    /// `merged` is ready when `steps.proven.done AND
+    /// (steps.landed-review.done OR …)`, and the tree's walk names the
+    /// shed's crossing `closed, after proven completed` — one order the
+    /// walk tried, not the order the packet lived. Measured 2026-11-13 on
+    /// the last 60 closed cars: 13 had `proven` completed by
+    /// automation:ops-runner hours before an agent's `landed-review`, and
+    /// `merged` closed in that second (d1e01362: proven 03:02:02 by
+    /// ops-runner, landed-review 11:06:51 by agent-codex, merged 11:06:52
+    /// by the marker rule), while the live shed read `machine-moved 100% ·
+    /// 0 hand-moved/day`. Where `proven` IS last the machine moved it; a
+    /// car whose `merged` has not closed has not left the shed at all.
+    #[test]
+    fn a_conjunctive_terminal_is_credited_to_the_step_that_completed_last() {
+        let shed = completion_exits(&tree_routes(), "shed");
+        // The measured case: the agent's landed-review closed it.
+        let reviewed_last = car(
+            &[
+                ("review", "2026-09-19T00:30:00Z", "agent-claude"),
+                ("proven", "2026-09-19T03:02:02Z", "automation:ops-runner"),
+                ("landed-review", "2026-09-19T11:06:51Z", "agent-codex"),
+                (
+                    "merged",
+                    "2026-09-19T11:06:52Z",
+                    "automation:rule:complete-marker-on-step-ready",
+                ),
+            ],
+            &[],
+        );
+        // The control: the landed-review came first, the proof closed it.
+        let proven_last = car(
+            &[
+                ("review", "2026-09-19T01:00:00Z", "agent-claude"),
+                ("landed-review", "2026-09-19T02:00:00Z", "agent-claude"),
+                ("proven", "2026-09-19T05:00:00Z", "automation:ops-runner"),
+                (
+                    "merged",
+                    "2026-09-19T05:00:00Z",
+                    "automation:rule:complete-marker-on-step-ready",
+                ),
+            ],
+            &[],
+        );
+        // Proven, still waiting on its landed-review: still in the shed.
+        let still_in_the_shed = car(
+            &[
+                ("review", "2026-09-19T01:00:00Z", "agent-claude"),
+                ("proven", "2026-09-19T06:00:00Z", "automation:ops-runner"),
+            ],
+            &[
+                ("landed-review", StepStatus::Ready),
+                ("merged", StepStatus::Pending),
+            ],
+        );
+        let w = Windows::of(t(NOW), 24);
+        let rows = [&reviewed_last, &proven_last, &still_in_the_shed];
+        assert_eq!(
+            moved_by(&shed, &rows, &w),
+            MovedBy {
+                machine: 1,
+                agent: 1,
+                human: 0,
+                unknown: 0
+            },
+            "exits read: {shed:?}"
         );
     }
 

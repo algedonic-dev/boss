@@ -155,7 +155,8 @@ BUILD_URL="postgres://$DB_USER:$DB_USER@127.0.0.1/$DB_NAME"
 # truth and `crates/modules/boss-people/src/bin/boss_operator_baseline_seed.rs`
 # for the loader.
 # Platform Workflow rows that live as DATA rather than as Rust
-# literals (docs/design/protocols-as-data.md). INSERT-ONLY: a kind
+# literals (protocols-as-data, in docs/architecture-decisions.md §Jobs,
+# Workflows, Steps). INSERT-ONLY: a kind
 # already present is left exactly as it is, including an operator's
 # edits to it. Deliberately NOT bootstrap_reconcile, which republishes
 # the code default over a drifted row and is how two protocol edits

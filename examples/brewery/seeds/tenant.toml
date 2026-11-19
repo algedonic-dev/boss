@@ -184,6 +184,7 @@ qa          = true   # QA & Compliance hub — already brewery-themed
 exec        = true
 hr          = true
 parts       = true   # Brewery uses parts as ingredients + packaging
+products    = true   # Its finished-goods catalog is independent of parts
 warehouse   = true   # Inventory tracking
 shop        = true   # Direct-to-consumer brewery storefront at /shop
 
@@ -787,13 +788,14 @@ post_offer_decline_probability = 0.10
 #   target `subject_kinds = ["account"]` directly, no more
 #   "Account is close-but-not-quite" framing.
 #
-#   What remains (deferred): an `account_type` Class registry
-#   under (subject_kind='account', member_attribute='type') so
-#   tenants distinguish their Account flavors — the
-#   used-device-shop tenant gets account_type='service-account',
-#   brewery gets account_type='wholesale-customer'. That lift comes
-#   when the AccountType + boss-accounts crate work lands per
-#   TODO.md.
+#   The `account_type` Class registry under
+#   (subject_kind='account', member_attribute='type') has landed
+#   too: the account Class rows are seeded in
+#   infra/postgres/schema/01-registries.sql (the brewery's
+#   wholesale / wholesale-distributor / bar-restaurant / … beside
+#   the used-device shop's service-account), and boss-accounts
+#   validates every write against them (`check_account_type` in
+#   accounts.rs).
 #
 # GAP 4: StepType registry doesn't carry sim-affordance fields.
 #   RESOLVED — `crates/core/boss-jobs/src/step_registry.rs` StepType
@@ -1195,8 +1197,7 @@ action.subject_kind = "company"
 action.subject_id = "brewery"
 
 # ---------------------------------------------------------------------------
-# Batch [batch.*] specs retired 2026-05-06 — see TODO.md
-# "Strip BatchEngine" for the why. The four batch rows that lived
+# Batch [batch.*] specs retired 2026-05-06. The four batch rows that lived
 # here (payroll, sales-tax, payroll-941, income-tax) bypassed the
 # Workflow / Step / audit-trail by emitting canonical events
 # directly — a developer-convenience back door that produced

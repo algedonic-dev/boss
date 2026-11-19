@@ -10,7 +10,6 @@
   import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
   import { formatDate } from '@boss/web-kit/ui/date';
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
-  import Link from '@boss/web-kit/ui/Link.svelte';
   import Meta from '@boss/web-kit/ui/Meta.svelte';
   import ProvenanceBadge from '@boss/web-kit/ui/ProvenanceBadge.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
@@ -278,16 +277,16 @@
   </div>
 {:else if !vendor}
   <div class="catalog theme-exec">
-    <Breadcrumb to={href('/ux/warehouse')}>
-      ← Warehouse
+    <Breadcrumb to={href('/finance/vendors')}>
+      ← Vendors
     </Breadcrumb>
     <div class="exec-header"><h1 class="exec-title">Vendor not found</h1></div>
     <p class="empty">No vendor record for <code>{lookup}</code>.</p>
   </div>
 {:else}
   <div class="detail-page theme-exec">
-    <Breadcrumb to={href('/ux/warehouse')}>
-      ← Warehouse
+    <Breadcrumb to={href('/finance/vendors')}>
+      ← Vendors
     </Breadcrumb>
 
     <header class="detail-hero">
@@ -323,14 +322,9 @@
       </p>
     {/each}
 
-    <div class="subject-actions">
-      <a
-        class="action-btn"
-        href={href(`/ux/jobs?new=1&subject_kind=vendor&subject_id=${encodeURIComponent(vendor.id)}`)}
-      >
-        + Create a Job for this vendor
-      </a>
-    </div>
+    <!-- "+ Create a Job for this vendor" opened the jobs list's new-job
+         form, which went with that list in step 1 of design 01fa5bdf
+         (review df7aeb9c). -->
 
     <!-- Section 1 — Profile -->
     <div class="tab-grid">
@@ -423,10 +417,10 @@
                     <td>{c.auto_renew ? 'Yes' : 'No'}</td>
                     <td>
                       {#if c.signed_by_employee_id}
+                        <!-- Named, not linked: /ux/hr/<id> answered nothing, and
+                             the people pages went with design 01fa5bdf step 1. -->
                         {@const signer = c.signed_by_employee_id}
-                        <Link to={href(`/ux/hr/${signer}`)}>
-                            {empNames.get(signer) ?? signer}
-                        </Link>
+                        <EntityLink kind="employee" id={signer} label={empNames.get(signer)} mono={false} />
                       {:else}
                         —
                       {/if}

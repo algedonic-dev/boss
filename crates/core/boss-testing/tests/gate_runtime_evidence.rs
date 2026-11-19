@@ -363,6 +363,8 @@ fn shape_diagnostics_are_bounded_and_do_not_bridge_an_invalid_sample() {
         *value = serde_json::json!({"state":"measured","raw":"0\n"});
     }
     row["files"]["cpu.stat"]["raw"] = serde_json::json!("usage_usec 100\nnr_throttled 1\n");
+    // "0" is no io.stat line; a measured receipt needs a measured byte table.
+    row["files"]["io.stat"]["raw"] = serde_json::json!("8:0 rbytes=0 wbytes=0\n");
     let before = row.clone();
     row["label"] = serde_json::json!("after");
     row["monotonic_ns"] = serde_json::json!(before["monotonic_ns"].as_u64().unwrap() + 1000);
@@ -1024,4 +1026,342 @@ fn malformed_journal_diagnostics_are_bounded_not_healthy() {
     let value: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(value["state"], "unavailable");
     assert!(value["omitted_rows"].as_u64().unwrap() > 0);
+}
+
+/// Run the real collector's `report` over a journal, from `cwd`, with extra env.
+fn report_from(journal: &std::path::Path, cwd: &std::path::Path, env: &[(&str, &str)]) -> Value {
+    let out = Command::new("python3")
+        .arg(repo_root().join("infra/gate-runner/runtime-evidence.py"))
+        .args(["report", journal.to_str().unwrap()])
+        .current_dir(cwd)
+        .envs(env.iter().copied())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.len() <= 65536,
+        "receipt evidence escaped its bound"
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// WHY (backlog f42bd52f, car 2 of design 121f44a1, D4). The gate drive's
+/// byte budget needs bytes per device per PHASE, and the receipt already
+/// cannot carry them per interval: on 2026-11-12 two green receipts kept 115
+/// of ~225 intervals and the last one kept was a pre-flight lint, so build
+/// and test — the phases that write the drive — never reach the record. The
+/// first attempt at this car (bb4eeee6) put io on every interval and kept 79
+/// of 229. So the bytes are a SUMMARY over every sample, computed before the
+/// reductions, like pgdata and memory: the heaviest phases named, the rest
+/// folded into one count, the gaps between phases beside them, and the three
+/// summing exactly to the endpoint total (conservation).
+#[test]
+fn a_receipt_carries_io_bytes_per_device_per_phase_over_every_sample() {
+    let dir = scratch_dir("runtime-io-phases");
+    let cg = dir.join("cgroup");
+    std::fs::create_dir(&cg).unwrap();
+    let journal = dir.join("samples.jsonl");
+    let mut labels = vec!["runner-start".to_string(), "gate-start".to_string()];
+    for n in 0..40 {
+        labels.push(format!("check-start:c{n}"));
+        labels.push(format!("check-finish:c{n}"));
+    }
+    labels.push("receipt:green".to_string());
+    // Each gap reads 7 bytes off 259:0; phase cN writes (N+1)*1000 bytes to
+    // 259:6 and reads N+1. Counters are cumulative, as the kernel's are.
+    let (mut r0, w0, mut r6, mut w6) = (100u64, 50u64, 10u64, 20u64);
+    for (index, label) in labels.iter().enumerate() {
+        if index > 0 {
+            match label.strip_prefix("check-finish:c") {
+                Some(n) => {
+                    let n: u64 = n.parse().unwrap();
+                    r6 += n + 1;
+                    w6 += (n + 1) * 1000;
+                }
+                None => r0 += 7,
+            }
+        }
+        // The kernel's own line shape, in either device order.
+        let a = format!("259:0 rbytes={r0} wbytes={w0} rios=1 wios=1 dbytes=0 dios=0");
+        let b = format!("259:6 rbytes={r6} wbytes={w6} rios=1 wios=1 dbytes=0 dios=0");
+        let io = if index % 2 == 0 {
+            format!("{a}\n{b}\n")
+        } else {
+            format!("{b}\n{a}\n")
+        };
+        sample_pressure(
+            &cg,
+            &journal,
+            label,
+            &[("cpu.stat", "usage_usec 100\n"), ("io.stat", &io)],
+        );
+    }
+    let value = report_from(&journal, &dir, &[]);
+    assert!(
+        value["omitted_samples"].as_u64().unwrap() > 0,
+        "the fixture must exercise the receipt's reductions"
+    );
+    let io = &value["io"];
+    assert_eq!(io["state"], "measured", "{io}");
+    assert_eq!(io["from"], "runner-start");
+    assert_eq!(io["to"], "receipt:green");
+    assert_eq!(io["devices"]["259:0"]["rbytes"], 42 * 7);
+    assert_eq!(io["devices"]["259:0"]["wbytes"], w0 - 50, "a measured zero");
+    assert_eq!(
+        io["devices"]["259:6"]["wbytes"],
+        1000 * (1..=40).sum::<u64>()
+    );
+    assert_eq!(io["devices"]["259:6"]["rbytes"], (1..=40).sum::<u64>());
+    assert_eq!(value["bounds"]["io_phases"], 16);
+    // The sixteen heaviest phases, named, in the order they ran.
+    let phases = io["phases"].as_array().unwrap();
+    let names: Vec<&str> = phases
+        .iter()
+        .map(|p| p["phase"].as_str().unwrap())
+        .collect();
+    let expected: Vec<String> = (24..40).map(|n| format!("c{n}")).collect();
+    assert_eq!(names, expected, "{io}");
+    assert_eq!(phases[0]["devices"]["259:6"]["wbytes"], 25_000);
+    assert_eq!(phases[0]["devices"]["259:6"]["rbytes"], 25);
+    assert_eq!(
+        phases[0]["devices"]["259:0"]["rbytes"], 0,
+        "a measured zero is a zero"
+    );
+    assert_eq!(io["other_phases"]["count"], 24);
+    assert_eq!(
+        io["other_phases"]["devices"]["259:6"]["wbytes"],
+        1000 * (1..=24).sum::<u64>()
+    );
+    assert_eq!(io["between_phases"]["devices"]["259:0"]["rbytes"], 42 * 7);
+    assert_eq!(io["between_phases"]["devices"]["259:6"]["wbytes"], 0);
+    // Conservation: named + other + between is the endpoint total, per key.
+    for device in ["259:0", "259:6"] {
+        for key in ["rbytes", "wbytes"] {
+            let named: u64 = phases
+                .iter()
+                .map(|p| p["devices"][device][key].as_u64().unwrap())
+                .sum();
+            let other = io["other_phases"]["devices"][device][key].as_u64().unwrap();
+            let gaps = io["between_phases"]["devices"][device][key]
+                .as_u64()
+                .unwrap();
+            assert_eq!(
+                named + other + gaps,
+                io["devices"][device][key].as_u64().unwrap(),
+                "{device} {key} does not conserve: {io}"
+            );
+        }
+    }
+    // Not per interval: that costs the intervals the receipt already drops.
+    for interval in value["intervals"].as_array().unwrap() {
+        assert!(interval.get("io").is_none(), "{interval}");
+    }
+    // The raw reading is retained whole in the journal.
+    let first: Value = serde_json::from_str(
+        std::fs::read_to_string(&journal)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        first["files"]["io.stat"]["raw"]
+            .as_str()
+            .unwrap()
+            .contains("dios=0")
+    );
+}
+
+/// An unread, truncated, malformed, reset or re-identified io.stat is never a
+/// zero, never a prefix, and never takes the CPU evidence beside it down.
+#[test]
+fn io_unknowns_never_become_zero_or_erase_the_cpu_sibling() {
+    let dir = scratch_dir("runtime-io-unknowns");
+    let cg = dir.join("cgroup");
+    std::fs::create_dir(&cg).unwrap();
+    let journal = dir.join("samples.jsonl");
+    sample_pressure(
+        &cg,
+        &journal,
+        "check-start:test",
+        &[
+            ("cpu.stat", "usage_usec 100\n"),
+            ("io.stat", "8:0 rbytes=10 wbytes=20\n"),
+        ],
+    );
+    let first: Value =
+        serde_json::from_str(std::fs::read_to_string(&journal).unwrap().trim()).unwrap();
+    let mut last = first.clone();
+    last["label"] = serde_json::json!("check-finish:test");
+    last["monotonic_ns"] = serde_json::json!(first["monotonic_ns"].as_u64().unwrap() + 1000);
+    last["files"]["cpu.stat"]["raw"] = serde_json::json!("usage_usec 150\n");
+    last["files"]["io.stat"]["raw"] = serde_json::json!("8:0 wbytes=40 rbytes=30\n");
+    let run = |rows: &[Value]| -> Value {
+        let raw = rows
+            .iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>();
+        std::fs::write(&journal, &raw).unwrap();
+        let value = report_from(&journal, &dir, &[]);
+        assert_eq!(std::fs::read_to_string(&journal).unwrap(), raw);
+        value
+    };
+    let good = run(&[first.clone(), last.clone()]);
+    assert_eq!(good["io"]["state"], "measured", "{good}");
+    assert_eq!(good["io"]["devices"]["8:0"]["rbytes"], 20);
+    assert_eq!(good["io"]["phases"][0]["phase"], "test");
+    for observation in [
+        serde_json::json!({"state":"unavailable","reason":"fixture read refused"}),
+        serde_json::json!({"state":"truncated","raw":"8:0 rbytes=30 wbytes=40"}),
+        serde_json::json!({"state":"measured","raw":"8:0 rbytes=9 wbytes=40"}),
+        serde_json::json!({"state":"measured","raw":"8:0 rbytes=30"}),
+        serde_json::json!({"state":"measured","raw":"8:0 rbytes=30 wbytes=-1"}),
+        serde_json::json!({"state":"measured","raw":"8:0 rbytes=30 rbytes=31 wbytes=40"}),
+        serde_json::json!({"state":"measured","raw":"8:0 rbytes=30 wbytes=40\n8:0 rbytes=30 wbytes=40"}),
+        serde_json::json!({"state":"measured","raw":"253:0 rbytes=30 wbytes=40"}),
+    ] {
+        let mut bad = last.clone();
+        bad["files"]["io.stat"] = observation.clone();
+        let value = run(&[first.clone(), bad]);
+        assert_eq!(value["io"]["state"], "unavailable", "{observation}");
+        assert!(
+            value["io"]["reason"]
+                .as_str()
+                .is_some_and(|r| !r.is_empty()),
+            "an unavailable io must say why: {observation}"
+        );
+        assert!(value["io"].get("devices").is_none(), "{observation}");
+        assert!(value["io"].get("phases").is_none(), "{observation}");
+        assert_eq!(value["state"], "partial");
+        assert_eq!(value["intervals"][0]["cpu_usage_usec"], 50);
+    }
+    // A journal from before io.stat was read stays readable; its bytes are unknown.
+    let mut legacy = first.clone();
+    legacy["files"].as_object_mut().unwrap().remove("io.stat");
+    let value = run(&[legacy, last.clone()]);
+    assert_eq!(value["sample_count"], 2);
+    assert_eq!(value["io"]["state"], "unavailable");
+    // A CPU reset spoils the CPU interval and nothing of the bytes.
+    let mut cpu_reset = last.clone();
+    cpu_reset["files"]["cpu.stat"]["raw"] = serde_json::json!("usage_usec 1\n");
+    let value = run(&[first.clone(), cpu_reset]);
+    assert_eq!(value["intervals"][0]["state"], "invalid");
+    assert_eq!(value["io"]["devices"]["8:0"]["rbytes"], 20);
+    // Monotonic endpoints cannot conceal an intervening reset.
+    let mut middle = last.clone();
+    middle["label"] = serde_json::json!("middle");
+    middle["monotonic_ns"] = serde_json::json!(first["monotonic_ns"].as_u64().unwrap() + 500);
+    middle["files"]["io.stat"]["raw"] = serde_json::json!("8:0 rbytes=5 wbytes=5\n");
+    assert_eq!(
+        run(&[first.clone(), middle, last.clone()])["io"]["state"],
+        "unavailable"
+    );
+    for field in ["identity", "lifetime"] {
+        let mut changed = last.clone();
+        if field == "identity" {
+            changed[field]["POD_UID"] = serde_json::json!("another-pod");
+        } else {
+            changed[field][1] = serde_json::json!(0);
+        }
+        assert_eq!(run(&[first.clone(), changed])["io"]["state"], "unavailable");
+    }
+    // A real over-bound file is retained as truncated, never parsed as a prefix.
+    std::fs::write(&journal, "").unwrap();
+    let huge = "8:0 rbytes=30 wbytes=40\n".repeat(200);
+    sample_pressure(&cg, &journal, "bounded", &[("io.stat", &huge)]);
+    let bounded: Value =
+        serde_json::from_str(std::fs::read_to_string(&journal).unwrap().trim()).unwrap();
+    assert_eq!(bounded["files"]["io.stat"]["state"], "truncated");
+    assert_eq!(
+        bounded["files"]["io.stat"]["raw"].as_str().unwrap().len(),
+        2048
+    );
+}
+
+/// WHY (2026-11-12). io.stat keys a WHOLE DISK (blk-cgroup counts per
+/// request queue), while the gate volume's st_dev is its PARTITION: tonight
+/// it moved to w-1's nvme1n1p1, 259:7 (66311, proof 690b7fa7), and io.stat
+/// counts it under nvme1n1, 259:6. A reader looking the volume's own device
+/// up in the byte table finds nothing. So the receipt names the disk under
+/// the gate's working directory, read from that directory's stat and sysfs
+/// at report time — never typed: the last layout's numbers went stale the
+/// night the volume moved.
+#[test]
+fn the_receipt_names_the_disk_under_the_gate_workspace_from_its_own_stat() {
+    let dir = scratch_dir("runtime-io-workspace");
+    let workspace = dir.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    // The oracle is GNU stat, not the collector's own arithmetic.
+    let stat = Command::new("stat")
+        .args(["-c", "%Hd:%Ld"])
+        .arg(&workspace)
+        .output()
+        .unwrap();
+    assert!(stat.status.success());
+    let device = String::from_utf8(stat.stdout).unwrap().trim().to_string();
+    let sys = dir.join("sys");
+    let part = sys.join("devices/disk/part");
+    std::fs::create_dir_all(&part).unwrap();
+    std::fs::create_dir_all(sys.join("block")).unwrap();
+    std::fs::write(sys.join("devices/disk/dev"), "259:42\n").unwrap();
+    std::fs::write(part.join("dev"), format!("{device}\n")).unwrap();
+    std::fs::write(part.join("partition"), "1\n").unwrap();
+    std::os::unix::fs::symlink("../devices/disk/part", sys.join("block").join(&device)).unwrap();
+    let cg = dir.join("cgroup");
+    std::fs::create_dir(&cg).unwrap();
+    let journal = dir.join("samples.jsonl");
+    for (label, bytes) in [("check-start:test", 1), ("check-finish:test", 9)] {
+        sample_pressure(
+            &cg,
+            &journal,
+            label,
+            &[
+                ("cpu.stat", "usage_usec 100\n"),
+                (
+                    "io.stat",
+                    &format!("259:42 rbytes={bytes} wbytes={bytes}\n"),
+                ),
+            ],
+        );
+    }
+    let block = sys.join("block");
+    let env = [("BOSS_RUNTIME_SYS_BLOCK", block.to_str().unwrap())];
+    let value = report_from(&journal, &workspace, &env);
+    let named = &value["io"]["workspace"];
+    assert_eq!(named["state"], "measured", "{named}");
+    assert_eq!(named["device"], device.as_str());
+    assert_eq!(
+        named["disk"], "259:42",
+        "a partition is counted under its disk"
+    );
+    assert_eq!(
+        named["path"],
+        workspace.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        value["io"]["devices"][named["disk"].as_str().unwrap()]["wbytes"],
+        8
+    );
+    // A whole disk is its own key.
+    std::fs::remove_file(part.join("partition")).unwrap();
+    let value = report_from(&journal, &workspace, &env);
+    assert_eq!(value["io"]["workspace"]["disk"], device.as_str());
+    // No sysfs entry: the device is still said, the disk is not guessed.
+    let empty = dir.join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let value = report_from(
+        &journal,
+        &workspace,
+        &[("BOSS_RUNTIME_SYS_BLOCK", empty.to_str().unwrap())],
+    );
+    let named = &value["io"]["workspace"];
+    assert_eq!(named["state"], "partial", "{named}");
+    assert_eq!(named["device"], device.as_str());
+    assert!(named.get("disk").is_none(), "{named}");
+    assert!(named["reason"].as_str().is_some_and(|r| !r.is_empty()));
 }

@@ -65,6 +65,153 @@ The two brewery kinds (`recipe`, `equipment`) are rows in
 `seeds/subject_kinds.toml` — adding a tenant Subject kind is registry
 data, never a core code change.
 
+## How the work gets done: one keg order, start to finish
+
+The table above says what the brewery's work is *about*. This section
+says how the work gets *done*. The brewery has only so much of
+everything — fermenters, trucks, kegs in the cooler, hours of people's
+time — and a workforce to use it. BOSS breaks each complex job into
+simple steps, and does each step at a **station**: a place where, for as
+long as the step takes, the right resources and the right executor are
+reserved together to do that step the way the protocol says.
+
+Eight primitives make up that model: resource pool, job packet, job
+step, station, executor, machine, protocol and audit record
+([factory-taxonomy-v2.md](../../docs/design/factory-taxonomy-v2.md)
+defines them). Here is one wholesale keg order walked through all eight.
+
+**The job packet.** A bar on the Mission route orders kegs: two
+half-barrels and three sixtels of IPA, plus pale ale, lager, stout and
+hazy. That order becomes one **job packet**, a `wholesale-keg-order` Job
+about the bar's account. The packet is created under one version of the
+protocol and stays on that version for its whole life, so changing how
+orders work tomorrow never rewrites an order already on the floor.
+
+**The protocol and its steps.** The **protocol** is the
+`wholesale-keg-order` Workflow row in `seeds/workflows.toml`. It names
+each **step**, the condition that makes it ready, and the test that says
+it is done:
+
+| Step | Ready when | Done when |
+|---|---|---|
+| confirm-order | the order arrives | the order is confirmed (no field is required: the lines default from the protocol row, and the delivery window may be left empty) |
+| stock-check | the order is confirmed | it has recorded `fulfill` or `backorder` against the kegs actually in the cooler |
+| pull-and-stage | stock-check said `fulfill` | the ordered kegs are off the shelves and staged at the dock |
+| deliver | the kegs are staged | the driver has confirmed the delivery |
+| invoice | the kegs are delivered | an invoice for the delivered kegs is issued |
+
+If stock-check says `backorder`, the packet goes straight to its
+`backordered` ending: nothing is pulled, loaded or billed against kegs
+that are not there. No step starts until the one before it has passed
+its test, so no step depends on anyone remembering what the last one
+did.
+
+**The resource pools.** A **pool** is a constraint, something the
+brewery has a limited amount of. A pool takes one of three shapes:
+
+- **Capacity** is held while a step runs and handed back when it ends:
+  the brewhouse's 40 fermenters and 20 brite tanks, the trucks, the
+  forklifts, and the people, counted by role from the roster (24
+  distribution drivers, 6 warehouse leads) rather than set by hand.
+- **Stock** is used up and comes back only through another protocol:
+  finished kegs in the cooler (refilled by `morning-brew`), grain and
+  hops (refilled by `ingredient-restock`), and empty keg shells (brought
+  home by `keg-return`).
+- **Rate** is spent and never handed back, like a monthly fuel or
+  overtime budget.
+
+**The stations.** A **station** is defined by what it holds: the pools
+its parent station hands it and the executors it can seat. Stations form
+one tree, and the company at the root holds every constraint there is:
+
+```
+Algedonic Ales           the company: every pool starts here
+  production             brewhouse, fermenters, brite tanks, brewers, cellar techs
+  packaging              the kegging line, packaging techs
+  warehouse              the cooler and its keg stock, forklifts, warehouse leads
+    cooler
+    loading dock
+  distribution           trucks, drivers, the three routes
+    a delivery run       made for one truckload, released when the truck is back
+  finance                billing
+```
+
+Some stations are **standing**, set up once and kept, like the cooler
+and the loading dock. Others are made for one piece of work and released
+after it, like a delivery run. The model's rule is that a station is
+never booked past what it holds: when nothing is free (no truck, or no
+driver) the step waits, and the record names what it is waiting for.
+The brewery's seeds do not enforce that rule yet, because they declare
+no station or pool (see *What the seeds hold today* below).
+
+**The executors.** An **executor** is whatever does a step, and there
+are exactly three kinds:
+
+- **Humans** do the steps that need hands: the warehouse lead pulls and
+  stages the kegs, and the driver delivers them.
+- **Automata** are deterministic software. Confirm-order, stock-check
+  and invoice are done this way, at computer speed with no person in the
+  loop: stock-check is a rule reading real stock, not a judgment call.
+  The step-type registry still marks these steps `completion = "agent"`,
+  the older word; v2 calls them automaton steps because the dispatcher
+  does them itself.
+- **Robots** are AI agents, for steps that need judgment but no hands.
+  The keg order has none today. If bars emailed their orders as free
+  text, a robot could read each email and fill in the order lines before
+  confirm-order runs, and adding that step would be a change to the
+  protocol row, not new code.
+
+**The machines.** A **machine** is software placed in a station to serve
+the work done there. BOSS's dispatcher is the company station's machine:
+it watches the steps that finish and reacts to them, and when this order
+closes as delivered it opens a `keg-return` packet so the empty kegs come
+home. For stock-check the same dispatcher is the *automaton*, because
+there the step is its own to do: the step decides which role a piece of
+software plays. Tanks, trucks and forklifts are not machines in this
+sense. They are pool capacity, which a step reserves.
+
+**The walk.** Put together, the order moves like this:
+
+| Step | Station | Executor | Reserves while it runs | Uses up |
+|---|---|---|---|---|
+| confirm-order | sales | automaton | nothing | nothing |
+| stock-check | cooler | automaton | nothing (it reads the keg stock) | nothing |
+| pull-and-stage | cooler, then loading dock | human: a warehouse lead | the lead, a forklift, a dock door | nothing on the record (the kegs leave the shelf here) |
+| deliver | a delivery run on the Mission route | human: a driver | the driver, a truck | nothing |
+| invoice | finance | automaton | nothing | the ordered kegs, drawn from finished stock as the invoice issues |
+
+The kegs physically leave the shelf at the pick, but the stock record
+drops at the invoice: the dispatcher rule
+`products-consume-on-invoice-created` in `seeds/rules.toml` drains
+finished goods, and books their cost, when the invoice is issued.
+
+Each reservation lasts only as long as its step. When the driver
+confirms the delivery, the driver and the truck go back to their pools
+and the next order can have them.
+
+The kegs on the shelf came from an earlier packet, a `morning-brew`. It
+holds a fermenter for about a week and then time on the kegging line,
+and it turns grain and hops into finished kegs. The two
+packets never refer to each other: they meet only in the cooler's stock,
+which is what lets production and distribution each change how they work
+without asking the other.
+
+**The audit record.** Every change is written down once and never
+edited: the packet opening, each step claimed and completed and by whom,
+the invoice and, with it, the kegs leaving finished stock, the return
+packet opening.
+Every screen in BOSS — the order's page, the cooler's stock, the books —
+is a reading of that record. "Did this order really ship, and who handled
+it?" is answered by the record, not by anyone's memory.
+
+**What the seeds hold today.** The protocol, its steps, the roles, the
+stock and the dispatcher's rules are live in this directory's seeds. The
+stations and pools are not rows here yet: `seeds/` declares no station
+tree and no pool, so a step is assigned by role rather than to a named
+truck or fermenter, and the fermenter count recorded on the brewhouse
+Location does not yet hold back a brew. This section is the picture
+those rows will encode.
+
 ## What's in this directory
 
 ```

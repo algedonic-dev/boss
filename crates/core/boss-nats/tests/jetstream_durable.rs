@@ -269,3 +269,54 @@ async fn purge_drops_undelivered_messages_but_keeps_the_durable_consumer() {
 
     ctx.delete_stream(&stream_name).await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires nats-server with JetStream at 127.0.0.1:4222"]
+async fn a_stream_whose_consumer_vanished_unheard_ends_and_reopening_recreates_it() {
+    // Backlog 2e45840a (design ad9519bc part b): a consumer removed while
+    // no pull request of its stream was waiting — as when it goes while
+    // the client is disconnected — sends no `Consumer Deleted` status, so
+    // the client never ended the stream: every later pull answered
+    // NoResponders, and `keep_bound` never reopened it. The client sends
+    // its first pull only on the stream's first poll, so removing the
+    // consumer between the open and that poll is the same unheard shape.
+    let ctx = context().await;
+    let (stream_name, root) = throwaway_stream(&ctx, "vanished").await;
+    let mut msgs = durable::open_durable(&ctx, &stream_name, "d", vec![format!("{root}.>")])
+        .await
+        .unwrap();
+    ctx.get_stream(&stream_name)
+        .await
+        .unwrap()
+        .delete_consumer("d")
+        .await
+        .unwrap();
+
+    let ended = tokio::time::timeout(Duration::from_secs(10), async {
+        while msgs.next().await.is_some() {}
+    })
+    .await;
+    assert!(
+        ended.is_ok(),
+        "a stream whose consumer vanished must end, so its keeper reopens it"
+    );
+
+    // The reopen's create-or-update brings the consumer back.
+    ctx.publish(format!("{root}.evt"), b"{\"id\":\"back\"}".to_vec().into())
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    let mut msgs = durable::open_durable(&ctx, &stream_name, "d", vec![format!("{root}.>")])
+        .await
+        .unwrap();
+    let m = tokio::time::timeout(Duration::from_secs(5), msgs.next())
+        .await
+        .expect("the recreated consumer delivers")
+        .expect("stream open")
+        .unwrap();
+    assert_eq!(m.payload.as_ref(), b"{\"id\":\"back\"}");
+    durable::settle::<&str>(&m, Ok(())).await;
+
+    ctx.delete_stream(&stream_name).await.unwrap();
+}

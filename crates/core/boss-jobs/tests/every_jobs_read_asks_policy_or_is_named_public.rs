@@ -499,7 +499,7 @@ fn assembled(asked: Arc<AtomicUsize>) -> Router {
     let mut station = boss_jobs::StationSpec::draft(
         STATION,
         "The pin's station",
-        boss_jobs::StationKind::Batch,
+        boss_jobs::StationKind::Group,
         boss_jobs::station_queue::StationPredicate::default(),
         Utc::now(),
     );
@@ -510,6 +510,7 @@ fn assembled(asked: Arc<AtomicUsize>) -> Router {
         plugin_registry: Some(Arc::new(boss_jobs::step_plugins::InMemoryStepPlugins::new())),
         job_edges: Some(Arc::new(boss_jobs::job_edges::InMemoryJobEdges)),
         stations: Some(Arc::new(stations)),
+        pools: Some(Arc::new(boss_jobs::pools::InMemoryPools::default())),
         cadence: Some(cadence.clone()),
         dispatcher_firings: Some(Arc::new(
             boss_jobs::dispatcher_firings::InMemoryDispatcherFirings::new(Vec::new()),
@@ -566,6 +567,8 @@ fn assembled(asked: Arc<AtomicUsize>) -> Router {
                 registry: Arc::new(boss_jobs::agents::InMemoryAgents::new()),
                 classes: None,
                 departments: None,
+                pools: None,
+                stations: None,
             },
         ))
         .merge(boss_jobs::department::http::router(

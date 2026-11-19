@@ -35,7 +35,9 @@ test.describe('feedback control', () => {
   // reports the first failure without saying which navigation was
   // slow, and re-navigating three times in a single test made this
   // the flakiest thing in the suite.
-  for (const path of ['/ux/jobs', '/it', '/ux/inbox']) {
+  // /ux/calendar/me stands where /ux/jobs did until the jobs list went
+  // with step 1 of design 01fa5bdf.
+  for (const path of ['/ux/calendar/me', '/it', '/ux/inbox']) {
     test(`is in the chrome on ${path}`, async ({ page }) => {
       await mountPage(page, path);
       await expect(chromeFeedback(page)).toBeVisible();
@@ -76,7 +78,7 @@ test.describe('feedback control', () => {
   });
 
   test('will not send an empty message', async ({ page }) => {
-    await mountPage(page, '/ux/jobs');
+    await mountPage(page, '/ux/inbox');
     await chromeFeedback(page).click();
     await expect(page.getByRole('button', { name: /^send$/i })).toBeDisabled();
   });
@@ -86,7 +88,7 @@ test.describe('feedback control', () => {
       if (route.request().method() !== 'POST') return route.fallback();
       return route.fulfill({ status: 422, body: 'invalid job body' });
     });
-    await mountPage(page, '/ux/jobs');
+    await mountPage(page, '/ux/inbox');
     await chromeFeedback(page).click();
     await page.getByRole('radio', { name: /^feature$/i }).click();
     await page.getByPlaceholder(/idea, a gap/i).fill('something');

@@ -225,7 +225,7 @@
                 >{departmentCount === null
                   ? 'department count unknown — the departments registry has not answered'
                   : `${departmentCount} department${departmentCount === 1 ? '' : 's'} in the departments registry`}
-                · <a href={href('/it')}>Department Map</a></span
+                · <a href={href('/it/tree')}>Station tree</a></span
               >
             {/if}
           </div>

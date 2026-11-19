@@ -200,6 +200,115 @@ pub fn patch_is_noop(stored: &Value, patch: &Map<String, Value>) -> bool {
         })
 }
 
+/// PURE: does `stored` still read as `expect` on every key `expect`
+/// names? A `null` expected value is "absent, or null". The precondition
+/// a write computed from a read of a few keys carries into the adapter,
+/// which judges it under the row's lock in the write's own transaction
+/// ([`crate::port::JobsRepository::merge_step_metadata_guarded_at`]): the
+/// release door lifts the hold it judged or nothing (review 792b871a N1).
+/// Narrower than the row version on purpose — an unrelated key written
+/// since the read changes nothing the write rests on.
+pub fn metadata_still_reads(stored: &Value, expect: &Map<String, Value>) -> bool {
+    let stored = stored.as_object();
+    expect.iter().all(|(k, v)| {
+        let held = stored.and_then(|s| s.get(k)).unwrap_or(&Value::Null);
+        held == v
+    })
+}
+
+/// The header a step-metadata merge carries its WRITER'S judgement in
+/// (backlog cd1f68c6): a JSON object of the keys the writer read and
+/// decided on, each as it read them (`null` = absent), which the merge
+/// door joins to its own precondition ([`join_expectations`]) and the
+/// adapter judges under the write's row lock ([`metadata_still_reads`]).
+/// A row that no longer reads so is the step race — 409
+/// [`STEP_CHANGED_CODE`] — and nothing is written. A merge without it is
+/// judged exactly as before.
+///
+/// WHY A HEADER AND NOT A BODY KEY. The body is the patch, every
+/// top-level key of it a metadata key, so a reserved key there would be
+/// a key no writer could ever set — and a jobs API that predates this
+/// rule would STORE it on the step. An unknown header is ignored by an
+/// old server, which leaves the write exactly as unjudged as it was.
+///
+/// Measured on origin/main a2fa9b091 (Codex review 5d605949 R1, and the
+/// strike-release repair run c76fff92): the wire PATCH passed no
+/// precondition at all, so every client that judged a review hold on
+/// one read and wrote it many calls later — `boss rerail --finish` and
+/// the auto-park refresh carrying a hold to the new head, the strike
+/// release lifting a red-train hold — could erase or rebind a hold
+/// written in between. Only the release door, in-process, could ask.
+pub const EXPECT_HEADER: &str = "x-boss-expect-metadata";
+
+/// PURE: `expect` as the [`EXPECT_HEADER`] value — its JSON, with every
+/// character a header may not carry escaped as `\uXXXX`. A hold reason
+/// is prose and carries em-dashes; a header value is visible ASCII, and
+/// a proxy is free to mangle anything else. JSON's own escape is the
+/// one both ends already read, so the value parses back to the same
+/// object ([`expectation_from_header`]).
+pub fn expectation_header(expect: &Map<String, Value>) -> String {
+    use std::fmt::Write as _;
+    let json = Value::Object(expect.clone()).to_string();
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        if c.is_ascii() && c != '\u{7f}' {
+            out.push(c);
+        } else {
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                let _ = write!(out, "\\u{unit:04x}");
+            }
+        }
+    }
+    out
+}
+
+/// PURE: the judged keys an [`EXPECT_HEADER`] carries, or why it cannot
+/// be read. A malformed precondition is refused, never dropped: a
+/// writer that asked to be judged and was not is the race this header
+/// exists to close.
+pub fn expectation_from_header(raw: &[u8]) -> Result<Map<String, Value>, String> {
+    let text = std::str::from_utf8(raw).map_err(|_| {
+        format!("{EXPECT_HEADER} is not UTF-8, so the judgement it carries cannot be read")
+    })?;
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Object(expect)) => Ok(expect),
+        Ok(_) => Err(format!(
+            "{EXPECT_HEADER} must be a JSON object of the metadata keys the write judged, each \
+             as it was read (null = absent)"
+        )),
+        Err(e) => Err(format!("{EXPECT_HEADER} is not JSON: {e}")),
+    }
+}
+
+/// PURE: the ONE precondition a merge carries when two parties judged
+/// the row — the door's own (the release door's, or the server's read
+/// of a hold-clearing write's reservation) and the writer's, from
+/// [`EXPECT_HEADER`]. Their union; or, when they name one key with two
+/// values, `Err` with that key: no row reads both ways, so the row has
+/// already moved since the writer judged it, which is the step race
+/// before the write reaches the lock. The writer's judgement never
+/// REPLACES the door's — it can only narrow which rows the write lands
+/// on, so no caller can talk its way past a check the door makes.
+pub fn join_expectations(
+    door: Option<Map<String, Value>>,
+    judged: Option<Map<String, Value>>,
+) -> Result<Option<Map<String, Value>>, String> {
+    let Some(judged) = judged else {
+        return Ok(door);
+    };
+    let mut joined = door.unwrap_or_default();
+    for (key, value) in judged {
+        match joined.get(&key) {
+            Some(held) if held != &value => return Err(key),
+            _ => {
+                joined.insert(key, value);
+            }
+        }
+    }
+    Ok(Some(joined))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +316,73 @@ mod tests {
 
     fn obj(v: Value) -> Map<String, Value> {
         v.as_object().cloned().unwrap_or_default()
+    }
+
+    /// The header round-trips a hold reason's prose as visible ASCII
+    /// (backlog cd1f68c6): every value `http` will put on a header, and
+    /// the same object on the far side.
+    #[test]
+    fn a_judgement_rides_a_header_as_ascii_and_reads_back_whole() {
+        let expect = obj(json!({
+            "hold": "conductor re-judge at 29943365 — waits for a review 🚦 of this head\u{7f}",
+            "hold_sha": "29943365",
+            "releaser": null,
+        }));
+        let header = expectation_header(&expect);
+        assert!(
+            header.bytes().all(|b| (0x20..0x7f).contains(&b)),
+            "visible ASCII only: {header}"
+        );
+        assert_eq!(expectation_from_header(header.as_bytes()), Ok(expect));
+        assert!(expectation_from_header(b"[1]").is_err(), "an array");
+        assert!(expectation_from_header(b"{not json").is_err());
+        assert!(expectation_from_header(&[0xff, 0xfe]).is_err(), "not UTF-8");
+    }
+
+    /// The writer's judgement narrows the door's and never replaces it:
+    /// a key both name with two values is the race, already lost.
+    #[test]
+    fn a_writers_judgement_joins_the_doors_and_cannot_replace_it() {
+        let door = obj(json!({"hold": "x", "releaser": null}));
+        let judged = obj(json!({"hold": "x", "hold_sha": "h1"}));
+        assert_eq!(
+            join_expectations(Some(door.clone()), Some(judged)),
+            Ok(Some(obj(
+                json!({"hold": "x", "releaser": null, "hold_sha": "h1"})
+            )))
+        );
+        assert_eq!(
+            join_expectations(Some(door.clone()), Some(obj(json!({"hold": "y"})))),
+            Err("hold".to_string())
+        );
+        assert_eq!(join_expectations(Some(door.clone()), None), Ok(Some(door)));
+        assert_eq!(join_expectations(None, None), Ok(None));
+        assert_eq!(
+            join_expectations(None, Some(obj(json!({"hold_sha": "h1"})))),
+            Ok(Some(obj(json!({"hold_sha": "h1"}))))
+        );
+    }
+
+    #[test]
+    fn a_precondition_reads_only_the_keys_it_names_and_null_as_absent() {
+        let stored = json!({"hold": "x", "hold_sha": "h1", "note": "anything", "gone": null});
+        let as_read = obj(json!({"hold": "x", "hold_sha": "h1", "never": null, "gone": null}));
+        assert!(metadata_still_reads(&stored, &as_read));
+        for moved in [
+            json!({"hold": "y"}),
+            json!({"hold_sha": "h2"}),
+            json!({"hold": null}),
+            json!({"never": "now"}),
+        ] {
+            assert!(
+                !metadata_still_reads(&stored, &obj(moved.clone())),
+                "{moved}"
+            );
+        }
+        assert!(metadata_still_reads(
+            &json!(null),
+            &obj(json!({"hold": null}))
+        ));
     }
 
     #[test]

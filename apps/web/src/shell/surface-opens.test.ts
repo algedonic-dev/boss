@@ -22,8 +22,8 @@ describe('routePattern', () => {
   test('a detail page carries the field name, never the id', () => {
     const uuid = '0123abcd-4567-89ef-0123-456789abcdef';
     expect(routePattern({ kind: 'jobDetail', jobId: uuid }, `/ux/jobs/${uuid}`)).toBe('/ux/jobs/:jobId');
-    expect(routePattern({ kind: 'account', accountId: 'account-00001' }, '/ux/accounts/account-00001')).toBe(
-      '/ux/accounts/:accountId',
+    expect(routePattern({ kind: 'invoice', invoiceId: 'inv-00001' }, '/finance/invoices/inv-00001')).toBe(
+      '/finance/invoices/:invoiceId',
     );
     expect(
       routePattern({ kind: 'workflowDetail', kindSlug: 'seasonal-release' }, '/it/registry/seasonal-release'),
@@ -37,7 +37,9 @@ describe('routePattern', () => {
   });
 
   test('an encoded id in the pathname still matches its decoded field', () => {
-    expect(routePattern({ kind: 'part', partSku: 'HOP 01' }, '/ux/parts/HOP%2001')).toBe('/ux/parts/:partSku');
+    expect(routePattern({ kind: 'vendor', vendorLookup: 'HOP 01' }, '/finance/vendors/HOP%2001')).toBe(
+      '/finance/vendors/:vendorLookup',
+    );
   });
 
   test('a query-string field never rewrites a static segment', () => {
@@ -48,12 +50,12 @@ describe('routePattern', () => {
         '/ux/jobs/j/steps/s',
       ),
     ).toBe('/ux/jobs/:jobId/steps/:stepId');
-    expect(routePattern({ kind: 'search', q: 'search' }, '/ux/search')).toBe('/ux/search');
-    expect(routePattern({ kind: 'jobs', workflow: 'jobs' }, '/ux/jobs')).toBe('/ux/jobs');
-  });
+    expect(routePattern({ kind: 'search', q: 'search' }, '/ux/search')).toBe('/ux/search');  });
 
   test('an id that is a substring of a static segment is left alone', () => {
-    expect(routePattern({ kind: 'asset', assetId: 'asset' }, '/ux/assets/asset')).toBe('/ux/assets/:assetId');
+    expect(routePattern({ kind: 'invoice', invoiceId: 'invoice' }, '/finance/invoices/invoice')).toBe(
+      '/finance/invoices/:invoiceId',
+    );
   });
 
   test('the router and the pattern agree on every parsed route (CLAUDE.md 9a)', () => {
@@ -61,10 +63,9 @@ describe('routePattern', () => {
     // route never carries the id the parser extracted.
     for (const [path, expected] of [
       ['/ux/jobs/abc', '/ux/jobs/:jobId'],
-      ['/ux/vendors/acme%20co', '/ux/vendors/:vendorLookup'],
-      ['/ux/people/emp-032', '/ux/people/:empId'],
-      ['/ux/finance/inv-1', '/ux/finance/:invoiceId'],
-      ['/ux/purchase-orders/po-7', '/ux/purchase-orders/:poId'],
+      ['/finance/vendors/acme%20co', '/finance/vendors/:vendorLookup'],
+      ['/finance/invoices/inv-1', '/finance/invoices/:invoiceId'],
+      ['/finance/purchase-orders/po-7', '/finance/purchase-orders/:poId'],
       ['/it/registry/rules/some-rule', '/it/registry/rules/:ruleName'],
       ['/it/registry/step-plugins/review-design', '/it/registry/step-plugins/:pluginSlug'],
       ['/ux/manual/intro', '/ux/manual/:slug'],

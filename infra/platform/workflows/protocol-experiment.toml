@@ -46,7 +46,7 @@ label = "Experiment"
 category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
-metadata = { department = "it" }
+metadata = { owner = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5", department = "it" }
 description = """
 An A/B between two things, with the hypothesis stated BEFORE the result is known.
 

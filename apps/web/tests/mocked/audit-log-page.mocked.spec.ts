@@ -142,13 +142,11 @@ const CATALOGUED = new Set(Object.values(ROUTE_CATALOG).map((i) => i.path));
 /// (e52e3017). Car N3 of design e765b3fc
 /// (2026-09-25) took four tabs off the strip — Yard status, Conductor,
 /// Receiving Yard and Marshalling Yard — each a station's panel on the
-/// Department Map now, its page not found.
+/// Department Map now, its page not found. Step 1 of design 01fa5bdf
+/// (2026-11-17) took three more — Incidents, Atlas and Bottlenecks.
 const TABS: ReadonlyArray<{ label: string; path: string; catalogued: boolean }> = [
-  { label: 'Incidents', path: '/it/operate', catalogued: true },
   { label: 'Audit Log', path: '/it/operate/audit', catalogued: true },
   { label: 'Performance', path: '/it/operate/perf', catalogued: true },
-  { label: 'Atlas', path: '/it/operate/atlas', catalogued: true },
-  { label: 'Bottlenecks', path: '/it/operate/bottlenecks', catalogued: true },
 ];
 
 const stream = (page: Page) => page.locator('.events-table tbody tr.events-row');
@@ -172,7 +170,7 @@ test.describe('/it/operate/audit — the page and its names', () => {
 });
 
 test.describe('/it/operate/audit — the tab links', () => {
-  test('five tabs, each served by the router and catalogued', async ({ page }) => {
+  test('two tabs, each served by the router and catalogued', async ({ page }) => {
     await installAuditReads(page);
     await mountPage(page, PATH, { titleMatch: /Audit Log/ });
     const tabs = page.locator('nav.it-tabs a');

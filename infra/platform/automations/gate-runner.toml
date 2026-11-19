@@ -5,3 +5,5 @@
 id = "automation:gate-runner"
 role = "platform-admin"
 description = 'The cluster gate Job: judges a branch and leaves its receipt in its pod log for the conductor to record on the gate-run packet; a runner whose manifest hands it no verdict carrier still records it itself (infra/gate-runner/run.sh).'
+# Host station: gates (backlog 6ecb5480, station-tree.md section 6).
+station = "a426acd5-4c77-4ec9-9686-c96cd59b53d7"

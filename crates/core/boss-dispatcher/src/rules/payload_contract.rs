@@ -107,6 +107,7 @@ mod tests {
 
     fn rule(when: Option<&str>, args: &[(&str, &str)]) -> Rule {
         let raw = RawRule {
+            delivery_lane: None,
             name: "r".into(),
             on_event: Some("jobs.job.closed".into()),
             schedule: None,

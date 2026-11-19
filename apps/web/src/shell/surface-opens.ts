@@ -40,15 +40,9 @@ import type { Route } from '../router';
 /// free text, so `fromLabel: 'jobs'` must not turn `/ux/jobs/…` into
 /// `/ux/:fromLabel/…`. Pinned against router.ts by surface-opens.test.ts:
 /// a new `sp.get(…)` field that is not listed here fails the test.
+// The jobs list's filter and new-job fields left with that list (step 1
+// of design 01fa5bdf).
 export const QUERY_FIELDS: ReadonlySet<string> = new Set([
-  'workflow',
-  'workflowPrefix',
-  'jobStatus',
-  'jobOwnerId',
-  'jobSubjectId',
-  'newJobKind',
-  'newJobSubjectKind',
-  'newJobSubjectId',
   'q',
   'from',
   'fromLabel',
@@ -91,8 +85,9 @@ export function routePattern(route: Route, pathname: string): string {
 
 /// `path` with the LAST segment-bounded occurrence of `/value` replaced
 /// by `/:field`. Segment-bounded: `/` + value followed by `/` or the
-/// end, so `assetId: 'asset'` rewrites `/ux/assets/asset` to
-/// `/ux/assets/:assetId` and leaves the `assets` segment alone; last,
+/// end, so `invoiceId: 'invoice'` rewrites `/finance/invoices/invoice`
+/// to `/finance/invoices/:invoiceId` and leaves the `invoices` segment
+/// alone; last,
 /// because the router puts ids at the tail and a static segment that
 /// merely starts with the id (`/jobs` for `jobId: 'j'`) sits earlier.
 function replaceSegment(path: string, value: string, field: string): string {

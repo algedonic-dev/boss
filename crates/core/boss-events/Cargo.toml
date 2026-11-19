@@ -15,9 +15,18 @@ default = ["bin"]
 postgres = ["dep:sqlx", "dep:axum", "dep:async-stream", "dep:futures", "dep:tokio-stream"]
 bin = ["postgres", "dep:anyhow", "dep:clap", "dep:tracing-subscriber", "dep:hex", "dep:boss-nats"]
 events-api = ["bin"]
+# The fold fixtures' measured stall and budget in `statement_budget`,
+# spelled once for this crate's tests and boss-jobs' (backlog 03a5dbdc).
+# Turned on by this crate's own dev-dependency below and by boss-jobs'
+# `test-support`; nothing built for production enables it.
+test-support = []
 
 [[test]]
 name = "stream_order_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "projection_tail_pg"
 required-features = ["postgres"]
 
 [dependencies]
@@ -54,6 +63,9 @@ path = "src/bin/boss_event_relay.rs"
 required-features = ["bin"]
 
 [dev-dependencies]
+# The integration tests read the fold fixtures' stall and budget
+# (`test-support`, backlog 03a5dbdc).
+boss-events = { path = ".", features = ["test-support"] }
 boss-testing = { path = "../boss-testing", features = ["postgres"] }
 sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
@@ -86,6 +98,12 @@ required-features = ["postgres"]
 [[test]]
 name = "outbox_http"
 required-features = ["postgres"]
+
+# The real relay pass over the real NATS adapter (`boss-nats`, which
+# only `bin` brings in) against a loopback NATS stub (backlog 2e45840a).
+[[test]]
+name = "the_relay_stamps_only_an_acked_publish_pg"
+required-features = ["postgres", "bin"]
 
 [[test]]
 name = "rebuild_log_complete_pg"

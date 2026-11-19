@@ -1,0 +1,72 @@
+# ---------------------------------------------------------------------------
+# converge — merged trains waiting for the cluster to serve their merge:
+# every open pr-train whose `converged` step is ready or being worked.
+#
+# An EQUIPMENT station (design ccfe87ff, decided by David 2026-11-05,
+# question converge-stations; pass item 2, backlog 364b27a3). The second
+# of the three: the equipment that judges a merge DELIVERED. Its automaton
+# is the train conductor, which completes `converged` on one of two
+# bases — the running jobs API self-reporting the merge commit (image),
+# or the train's frozen data delivery plan read back live (data) — in
+# `Conductor::verify_convergence` (crates/orchestrators/boss-cli/src/
+# train/conductor.rs), and through the rule complete-train-converged-on-
+# runner-rolled, which is the conductor's own image-basis completion
+# fired on the deploy runner's `rolled` report (infra/dispatcher/rules/).
+# Measured 2026-11-05: 15 of the 20 newest closed trains completed the
+# step that way and 5 skipped it. What it holds is that judgement, not
+# the build: the deploy can roll and the train still not arrive, which is
+# why these are two stations and not one.
+#
+# The conductor also operates the loading dock. One automaton may operate
+# two stations; the claim door counts each station's bays separately
+# (`step_executor::occupied_bays` counts only holds demanding THIS
+# station).
+#
+# ONE BAY, because the conductor judges one train at a time: it runs as
+# one replica (infra/cluster/manifests/boss-conductor.yaml, `replicas:
+# 1`), and its reconcile walks the open trains in a serial `for` loop,
+# one `reconcile_train` scope each. Several merged trains may stand here
+# at once — a merged train does not hold the track, and the next consist
+# converges it by ancestry — but they are judged in turn.
+#
+# Membership reads the step, not the job's status: a train waits here
+# only between its deploy and its arrival. To change this station, bump
+# `version`.
+#
+# Version 2 (T2 of design 4b27a65a, backlog 3f58c823; bumped from the
+# LIVE newest, v1): the station stands in the tree — its stable `id`, its
+# `parent` /algedonic/operations (judging a merge delivered is the back
+# half of pr-train, Operations' by handoff section 4), its mode, and its
+# seats, the same number as its bays. Nothing else changed.
+#
+# Version 3 (backlog a1c0a0ff, design deba3000; bumped from the tree's
+# v2): the hand-typed `[station.upstream]` is gone. It named a /system
+# route the IT consolidation retired on 2026-08-31, so the walk upstream
+# led to a not-found page. A station's upstream is now DERIVED from the
+# tree, as its parent station's page (`upstreamOf` in
+# apps/web/src/it/tree/station-page.ts), and the seed refuses a declared
+# one. The retired department label is removed with its floor reader
+# (backlog aa82eb11); the station's parent places it in the tree.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "converge"
+version = 4
+id = "9f95281d-40eb-4f97-9ba6-8e8f239bbe87"
+parent = "9660c60f-eb47-4405-ae08-fcbb30c71e5f"
+mode = "standing"
+capacity = 1
+status = "active"
+title = "Converge — merged trains waiting for the cluster to serve them"
+kind = "equipment"
+automaton = "automation:train-conductor"
+bays = 1
+discipline = ["age"]
+
+[station.predicate]
+kind = "pr-train"
+status = "open"
+
+[station.predicate.step]
+slug = "converged"
+status_in = ["ready", "active"]

@@ -2,7 +2,7 @@
   // Approval / sign-off surface — port of
   // apps/web-legacy/src/steps/ApprovalSurface.tsx.
 
-  import { onDestroy, tick } from 'svelte';
+  import { onDestroy, tick, untrack } from 'svelte';
   import { session } from '@boss/web-kit/session/session.svelte';
   import { appNow, appToday } from '@boss/web-kit/sim-clock';
   import {
@@ -45,7 +45,7 @@
   let userRole = $derived(
     session.value.kind === 'ready' ? session.value.user.role : '',
   );
-  let signError = $state('');
+  let signError = $state<{ stepId: string; message: string } | null>(null);
   // The id as a VALUE: a derived notifies only when it changes, where
   // reading `step.id` in the effect re-ran it on every refresh of the
   // same step — so the onUpdate() after a refused completion wiped the
@@ -127,9 +127,11 @@
     // ceremony refuses rather than sign what is no longer shown, and a
     // passkey prompt it already has up is taken down (7c53b1bf).
     void stepId;
+    // Reset on a rail switch, not on a refresh of this step's metadata.
+    comment = untrack(() => String(step.metadata.comment ?? ''));
     gesture?.abort();
     gesture = null;
-    signError = '';
+    signError = null;
     pending = null;
     scrolling = {};
   });
@@ -153,7 +155,7 @@
     const controller = new AbortController();
     gesture = controller;
     saving = true;
-    signError = '';
+    signError = null;
     try {
       // v2: both approve and reject COMPLETE the step. The reject
       // decision lives in metadata.decision; downstream routing is
@@ -180,7 +182,7 @@
       // rejected is how phantom approvals happen (packet cc9d7fc6).
       const decided = await saveStep(job, target.id, body);
       if (decided.kind === 'failed') {
-        signError = decided.error;
+        signError = { stepId: target.id, message: decided.error };
         return;
       }
       const required = target.signOffsRequired;
@@ -219,7 +221,7 @@
               body: JSON.stringify({ role }),
             });
           } catch (e) {
-            signError = e instanceof Error ? e.message : String(e);
+            signError = { stepId: target.id, message: e instanceof Error ? e.message : String(e) };
             // The decision DID land — refresh so the surface renders
             // the recorded state, with the refusal beside it.
             onUpdate();
@@ -227,10 +229,10 @@
           }
         }
         if (!stamp.ok) {
-          signError = describeWriteFailure(
-            stamp.status,
-            await stamp.text().catch(() => ''),
-          );
+          signError = {
+            stepId: target.id,
+            message: describeWriteFailure(stamp.status, await stamp.text().catch(() => '')),
+          };
           onUpdate();
           return;
         }
@@ -251,7 +253,7 @@
         // presence step whose stamps do not carry it) render as the same
         // "sign-offs outstanding: …" line — describeWriteFailure names
         // the roles from the refusal body, with the server's reason.
-        if (done.kind === 'failed') signError = done.error;
+        if (done.kind === 'failed') signError = { stepId: target.id, message: done.error };
       }
       onUpdate();
     } finally {
@@ -268,8 +270,8 @@
     <span class="step-status step-status-{step.status}">{step.status}</span>
   </div>
 
-  {#if signError}
-    <p class="step-write-error" role="alert">{signError}</p>
+  {#if signError?.stepId === step.id}
+    <p class="step-write-error" role="alert">{signError.message}</p>
   {/if}
   {#if signedVisible}
     <section class="step-signed-keys" aria-label="What your passkey signs">

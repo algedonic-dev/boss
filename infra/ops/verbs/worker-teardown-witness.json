@@ -1,0 +1,19 @@
+{
+  "about": "READ-ONLY: qualify only a frozen CI-workspace Job/PVC identity, never delete or reclaim it. Through existing forge ops_kubectl, read namespace/default ServiceAccount positive controls on the same connection and complete bounded paginated inventories, refusing unread/overflow/changed identities or a target UID still present. Full original native observations are attached through the existing evidence door before the bounded summary. This inactive verifier capability grants no return-posting rule, sweep, credential or capacity; the server compares the protected executed envelope, pinned pool version, exact acquisition/generation/amount/reclaimer/UIDs and consumes a witness once. The held ops-request version needs David website publication after LAND; older envelope-less records refuse.",
+  "hosts": ["forge"],
+  "argv": ["bash", "infra/forge/worker-teardown-witness.sh", "{1}", "{2}", "{3}", "{4}", "{5}", "{6}", "{7}", "{8}", "{9}", "{10}"],
+  "params": [
+    {"name":"namespace", "pattern":"^[a-z0-9][a-z0-9-]{0,62}$"},
+    {"name":"job_uid", "pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    {"name":"pvc_uid", "pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    {"name":"run_id", "pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    {"name":"acquisition", "pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    {"name":"generation", "pattern":"^[1-9][0-9]{0,18}$"},
+    {"name":"pool", "pattern":"^[a-z0-9][a-z0-9:_-]{0,127}$"},
+    {"name":"pool_version", "pattern":"^[1-9][0-9]{0,8}$"},
+    {"name":"amount", "pattern":"^(0|[1-9][0-9]*)(\\.[0-9]+)?$"},
+    {"name":"reclaimer", "pattern":"^[a-zA-Z0-9][a-zA-Z0-9:_./-]{0,255}$"}
+  ],
+  "capture": "separate-streams",
+  "timeout": 310
+}

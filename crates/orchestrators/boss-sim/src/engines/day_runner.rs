@@ -84,8 +84,9 @@ pub fn run_days(
     )
 }
 
-/// Tick-aware day loop — Phase A of the sub-day-tick rollout
-/// (TODO.md "Hourly tick granularity for the live sim").
+/// Tick-aware day loop — Phase A of the sub-day-tick rollout, which
+/// landed: `engines::tick` holds the math, and the example tenant's
+/// seed sets `tick_duration = "1m"`.
 ///
 /// Splits each sim-day into `ticks_per_day` equal ticks. Each
 /// tick advances the shape-driven engine (Poisson + birth +

@@ -234,7 +234,7 @@ test.describe('/it/registry/subjects names each kind by its module and the workf
 // "this company has four departments", nor send anyone looking for
 // department Classes that retired.
 test.describe('/it/registry/subjects points the department kind at its registry', () => {
-  test("the department kind counts the registry's rows and links the Department Map", async ({ page }) => {
+  test("the department kind counts the registry's rows and links the station tree", async ({ page }) => {
     await openSubjects(page);
     await pick(page, 'department').click();
 
@@ -242,9 +242,11 @@ test.describe('/it/registry/subjects points the department kind at its registry'
     await expect(meta(page)).toContainText(
       `${DEPARTMENTS.length} departments in the departments registry`,
     );
-    await expect(meta(page).getByRole('link', { name: 'Department Map' })).toHaveAttribute(
+    // The Department Map at /it drew the departments until design
+    // 01fa5bdf pulled it out; the station tree draws them now.
+    await expect(meta(page).getByRole('link', { name: 'Station tree' })).toHaveAttribute(
       'href',
-      '/it',
+      '/it/tree',
     );
   });
 
@@ -256,7 +258,7 @@ test.describe('/it/registry/subjects points the department kind at its registry'
 
     await expect(meta(page)).toContainText('department count unknown');
     await expect(meta(page)).not.toContainText('0 departments');
-    await expect(meta(page).getByRole('link', { name: 'Department Map' })).toBeVisible();
+    await expect(meta(page).getByRole('link', { name: 'Station tree' })).toBeVisible();
   });
 
   test('another kind carries no departments line', async ({ page }) => {

@@ -1,0 +1,6 @@
+[[automation]]
+id = "automation:read-jobs-database"
+role = "audit-readonly"
+description = 'The fixed read-jobs-database observation reading the protected serving pool target (infra/forge/read-jobs-database.sh). Reads only.'
+# Host station: estate (backlog 6ecb5480, station-tree.md section 6).
+station = "134464a5-0b56-4386-86cb-d354c7448fdf"

@@ -18,9 +18,11 @@
 # REGULAR FILE under the shared checkout (not in .claude/worktrees/), that
 # differs from HEAD, last modified within BOSS_RESTORE_WINDOW seconds
 # (default 3600). An older change is the operator's, and is refused by
-# name. A directory, a symlink, a missing file and a pathspec are refused
-# too (review 0dc61dd6, finding 1): a stray write INSIDE a directory
-# freshens the directory's mtime, so a directory passed the window and
+# name. A directory, a symlink, a missing file, a pathspec and a path the
+# filesystem cannot resolve are refused too; a path THROUGH a symlinked
+# directory is the file the write reached (backlog c5088c05). A
+# directory is refused (review 0dc61dd6, finding 1): a stray write
+# INSIDE a directory freshens its mtime, so a directory passed the window and
 # `git checkout HEAD -- <dir>` reverted every tracked change under it —
 # an operator's two-hour-old edit included, measured. The window is a
 # file's, so the argument is one file. Before it touches anything it
@@ -70,8 +72,39 @@ for arg in "$@"; do
     /*) full="$arg" ;;
     *) full="$shared/$arg" ;;
   esac
-  full=$(realpath -m -- "$full")
+  # Resolve the path as the kernel did when the write landed, but keep
+  # its LAST component unresolved, so the -L test below sees the argument
+  # itself. A whole-path realpath resolved a tracked symlink to its TARGET
+  # and restored the target while the refusal said symlinks are refused
+  # (backlog c5088c05, re-review ea76e79f). A lexical one (-s) dropped
+  # `link/..` before following the link, so a/link/../file restored
+  # a/file while the write had reached b/file (review e039117a, B1). So
+  # the parent is resolved physically and in full: a path the
+  # filesystem cannot resolve names no file a write could have reached,
+  # and is refused, never guessed at. A last component of `.` or `..`, or
+  # a trailing slash, names a directory and never a link to refuse, so
+  # that path is resolved whole and refused below as a directory.
+  #
+  # The KERNEL resolves it — `cd -P` hands the path to chdir(2) as
+  # written, and `pwd -P` reads back where it landed — never `realpath`
+  # (backlog 920f4fd5). GNU coreutils' `realpath -e` refuses missing/..
+  # and a.rs/.. as the kernel does; a realpath that collapses `..` by
+  # text first resolves both, and on GitHub's runner the door restored
+  # a file nobody's write reached while the cluster gate stayed green.
+  # Which coreutils a host ships is not this door's to depend on.
   case "$full" in
+    */ | */. | */..) resolved=$(CDPATH='' cd -P -- "$full" 2>/dev/null && pwd -P) ;;
+    *) resolved=$(CDPATH='' cd -P -- "$(dirname -- "$full")" 2>/dev/null && pwd -P) \
+         && resolved="${resolved%/}/$(basename -- "$full")" ;;
+  esac || {
+    echo "restore-shared: $arg does not resolve (a missing directory, or a file used as one, in its path) — refused, nothing touched" >&2
+    status=1; continue
+  }
+  full="$resolved"
+  case "$full" in
+    # The checkout itself is a directory, refused below as one — not as
+    # outside the checkout, which `restore-shared .` was (c5088c05).
+    "$shared") rel=. ;;
     "$shared"/*) rel="${full#"$shared"/}" ;;
     *) echo "restore-shared: $arg is outside the shared checkout $shared — refused" >&2; status=1; continue ;;
   esac

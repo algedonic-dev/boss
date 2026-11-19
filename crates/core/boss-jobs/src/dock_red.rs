@@ -51,6 +51,13 @@ pub struct RegateRed {
     /// re-gates the car only when main moves again. Likely the car's own,
     /// but not proven so — a regression on main reddens every car.
     pub garaged: bool,
+    /// Two dock re-gates in a row went red on the same check (backlog
+    /// 8f3d731a): the dock stops re-gating the car at ANY head, a main
+    /// move included, and its item's build goes back to the build station
+    /// as the car's repair (`a-dock-red-returns-the-build-to-its-station`).
+    /// Always beside `garaged`, so every reader of a garaged red — the
+    /// repair door, the yard, `boss orient` — reads a returned one too.
+    pub returned: bool,
 }
 
 fn short(s: &str) -> &str {
@@ -66,6 +73,7 @@ impl RegateRed {
             "verdict": self.verdict,
             "checks": self.checks,
             "garaged": self.garaged,
+            "returned": self.returned,
         })
     }
 
@@ -90,7 +98,18 @@ impl RegateRed {
             short(&self.head),
             short(&self.main),
         );
-        if self.garaged {
+        if self.returned {
+            // The same check twice in a row (backlog 8f3d731a): the dock
+            // has stopped for good, and the repair is a build's, not a
+            // main move's.
+            format!(
+                "NOT boardable, garaged and returned for repair: {what}, its second dock \
+                 re-gate in a row to fail that check. The dock does not re-gate it again, on \
+                 this head or on a main move; its item's build is back at the build station as \
+                 this car's repair, which re-gates it with boss gate --rebase --park-* and so \
+                 refreshes this car (backlog 8f3d731a)"
+            )
+        } else if self.garaged {
             // Two reds in a row do not prove the red is the car's: a
             // regression on main reddens every car it touches, across a
             // main move too (the adversarial review of car 5eb1967e). So
@@ -144,6 +163,10 @@ pub fn regate_red(metadata: &Value) -> Option<RegateRed> {
             })
             .unwrap_or_default(),
         garaged: red.get("garaged").and_then(Value::as_bool).unwrap_or(false),
+        returned: red
+            .get("returned")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -159,7 +182,48 @@ mod tests {
             verdict: "failed".into(),
             checks: vec!["test".into(), "web-suite (unit+build+mocked)".into()],
             garaged: false,
+            returned: false,
         }
+    }
+
+    /// Car aab5f34e as the dock should have left it on 2026-11-18 at
+    /// 00:43Z (backlog 8f3d731a): its second dock re-gate in a row went
+    /// red on `test`, the check the first had named. The red says the
+    /// dock has RETURNED it — no further re-gate, on this head or on a
+    /// main move — round-trips through the stamp, and its sentence sends
+    /// the reader to the build station rather than to the next main.
+    #[test]
+    fn a_returned_red_round_trips_and_says_the_repair_is_at_the_build_station() {
+        let returned = RegateRed {
+            garaged: true,
+            returned: true,
+            checks: vec!["test".into()],
+            ..red()
+        };
+        let md = json!({ BASE_REGATE: { "main": "m", RED: returned.to_value() } });
+        assert_eq!(regate_red(&md), Some(returned.clone()));
+        let old = json!({ BASE_REGATE: { "main": "m", RED: {
+            "gate_run": "e77c4e30", "verdict": "failed", "garaged": true } } });
+        assert!(
+            regate_red(&old).is_some_and(|r| r.garaged && !r.returned),
+            "a red written before the return existed is garaged, not returned"
+        );
+        let line = returned.reason();
+        for want in [
+            "NOT boardable",
+            "returned",
+            "e77c4e30",
+            "test",
+            "build station",
+            "--park-",
+            "8f3d731a",
+        ] {
+            assert!(line.contains(want), "{want}: {line}");
+        }
+        assert!(
+            !line.contains("each time main moves"),
+            "a returned car is not re-gated on a main move: {line}"
+        );
     }
 
     /// Car 51ad323d as it stood at 15:10Z on 2026-09-27: its stamp's red

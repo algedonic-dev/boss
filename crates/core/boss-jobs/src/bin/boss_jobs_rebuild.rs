@@ -89,5 +89,11 @@ async fn main() -> Result<()> {
             "the rebuilt steps lack sign-off stamps the log records only as markers; see the per-marker warnings above"
         );
     }
+    if report.bounded_closes_unreproduced > 0 {
+        warn!(
+            bounded_closes_unreproduced = report.bounded_closes_unreproduced,
+            "rebuilt jobs closed over the event bound do not hash to the rows their closes recorded; see the per-close warnings above"
+        );
+    }
     Ok(())
 }

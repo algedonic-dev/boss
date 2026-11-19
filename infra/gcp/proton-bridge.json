@@ -1,0 +1,25 @@
+{
+  "version": "3.27.1",
+  "source_commit": "43b9237786204a0215abfd4dcc51ee7bb92f52d4",
+  "artifacts": {
+    "package.deb": {
+      "url": "https://github.com/ProtonMail/proton-bridge/releases/download/v3.27.1/protonmail-bridge_3.27.1-1_amd64.deb",
+      "sha256": "d69eab5674335a41428bf77bde6a9f85667867e2083205625a710f6948e54d86",
+      "max_bytes": 90000000
+    },
+    "package.sig": {
+      "url": "https://github.com/ProtonMail/proton-bridge/releases/download/v3.27.1/protonmail-bridge_3.27.1-1_amd64.deb.sig",
+      "sha256": "7ae3370693212c0dde69377322c13f0fe8a52b4f4ea2aec984e8fdf853cbb43e",
+      "max_bytes": 4096
+    },
+    "key.asc": {
+      "url": "https://github.com/ProtonMail/proton-bridge/releases/download/v3.27.1/bridge_pubkey.gpg",
+      "sha256": "d5279ed2dc52ffad8875569df0bcca45bd7448bf737fe79722762337e204c221",
+      "max_bytes": 16384
+    }
+  },
+  "executables": {
+    "proton-bridge": "5615a944d30f69a0f1caf0c2bba6f9266bc64cffdf01a036dfd5edbe1e5d83f2",
+    "bridge": "f60bb6b31578e2387e25cd33960769a8420cf0ef23c82d8672707461898963a4"
+  }
+}

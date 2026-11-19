@@ -1,0 +1,8 @@
+[[invariant]]
+id = "child-allocation-never-exceeds-parent"
+claim = "A child's reserved allocation is subtracted from its parent's floating capacity, and no set of children ever reserves more of a pool than their parent holds: an unsatisfiable draw waits, naming its constraint, and never over-allocates."
+source = "docs/design/factory-taxonomy-v2.md (R2); docs/design/station-tree.md §8.4; design 4b27a65a, cars T2 and T5"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "DOES NOT HOLD TODAY. Filed by T0 (backlog ac434bd4). Stations carry no allocation and pools carry no owner station, so there is nothing to sum. T2+T5 (backlog 3f58c823) add the allocation and the pool owner; this entry flips when the seed refuses a tree whose children over-draw a parent, as section 8.4 of station-tree.md requires."

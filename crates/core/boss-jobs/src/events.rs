@@ -7,7 +7,10 @@
 //!   Step mutation emits exactly one: `JOB_CREATED`, `JOB_UPDATED`,
 //!   `STEP_CREATED`, `STEP_UPDATED`. The payload is a serialized
 //!   `Job` / `Step` — the rebuilder reproduces the projection by
-//!   replaying these in audit_log id order.
+//!   replaying these in audit_log id order. One exception carries a
+//!   delta instead of a row: `JOB_CLOSED_OVER_BOUND`, the close of a
+//!   packet too large for one event, which names the digest of the row
+//!   it leaves.
 //! - **Marker events** are informational signals for downstream
 //!   consumers (dispatcher rule registry, UI badges, integrations).
 //!   They duplicate state already in the sibling state event but
@@ -19,6 +22,43 @@ pub const JOB_CREATED: &str = "jobs.job.created";
 pub const JOB_UPDATED: &str = "jobs.job.updated";
 pub const STEP_CREATED: &str = "jobs.step.created";
 pub const STEP_UPDATED: &str = "jobs.step.updated";
+/// The close of a packet whose whole row cannot ride one event (backlog
+/// b96df4f8). A state event, but a DELTA, not a row: the close's own
+/// fields — `status`, `closed_on`, and `merged`, the metadata keys the
+/// close owns — beside `row_sha256` / `row_bytes`, the digest and size
+/// of the whole post-close row the [`JOB_UPDATED`] would have carried.
+/// The rebuild applies the delta to the row the log already built and
+/// refuses to go on unless the result hashes to `row_sha256`, so the
+/// log still proves the row the close left. Staged only when that
+/// [`JOB_UPDATED`] would encode over the outbox bound
+/// (`crate::packet_budget::close_event`): 044b189b, ~984 KB, stood open
+/// with every step terminal because its close re-emitted the whole row.
+pub const JOB_CLOSED_OVER_BOUND: &str = "jobs.job.closed_over_bound";
+/// The executor kind a claim's `STEP_UPDATED` fact records for the
+/// step's new HOLDER — `person`, `robot` or `automaton` (factory
+/// taxonomy M1, backlog 3ff2ef60). Beside `_actor` in the `_` family
+/// rather than in the step's metadata: it is a fact about the claim, the
+/// row is unchanged by it (so replay rebuilds exactly what the CAS
+/// wrote), and the resource rewrite of a claim's fact keeps `_` keys.
+/// The holder, not the signer: a claim made FOR someone records the
+/// kind of the one it was made for, while `_actor` names who made it.
+pub const EXECUTOR_KIND_KEY: &str = "_executor_kind";
+/// The station a claim made through the per-step door
+/// (`POST /api/jobs/{id}/steps/{sid}/claim`) took its step from, on that
+/// claim's own `STEP_UPDATED` fact (backlog 2682c418) — the station the
+/// claim named and the gate admitted, else the one its step is queued
+/// at. Beside [`EXECUTOR_KIND_KEY`] for the same reasons: a fact about
+/// the claim, not a change to the row. The claims fold reads it into the
+/// same `station-claim` row a [`STATION_CLAIMED`] receipt makes, so a
+/// robot's claim no longer reads `not-recorded`. Absent when the step is
+/// queued at no station; `claim-next` does not write it, because its own
+/// selection receipt already names the station.
+pub const CLAIM_STATION_KEY: &str = "_station";
+/// Stable row identity and the recorded resolution, shared by both claim doors.
+pub const CLAIM_STATION_ID_KEY: &str = "_station_id";
+pub const STATION_RESOLUTION_KEY: &str = "station_resolution";
+pub const STATION_RESOLUTION_REASON_KEY: &str = "station_resolution_reason";
+pub const STATION_RESOURCE_REFUSED: &str = "jobs.station.resource_refused";
 pub const STATION_CLAIMED: &str = "jobs.station.claimed";
 pub const STATION_SELECTION_EVIDENCE: &str = "jobs.station.selection_evidence";
 /// Full step state plus the immutable first record and server receipt.
@@ -54,6 +94,10 @@ pub const WORKFLOW_RETIRED: &str = "jobs.kind.retired";
 /// A draft row deleted before it ever went live (ebd7bb70): the
 /// armed-draft hazard removed, with the discard on the record.
 pub const WORKFLOW_DRAFT_DISCARDED: &str = "jobs.kind.draft_discarded";
+/// A draft that met traffic and lost was set `rejected` (backlog
+/// 50ded63d): kept for the packets pinned to it, never promotable.
+/// Payload is the rejected `WorkflowSpec`.
+pub const WORKFLOW_DRAFT_REJECTED: &str = "jobs.kind.draft_rejected";
 /// A draft StepPlugin row was appended to the registry (author
 /// saved, not live). Recorded by the registry adapter atomically
 /// with the step_plugins row; payload is the full `StepPluginSpec`.
@@ -100,6 +144,11 @@ pub const STEP_SIGNED_OFF: &str = "jobs.step.signed_off";
 /// the sibling JOB_UPDATED in the same transaction, which is what the
 /// rebuild replays, so the rebuild ignores this marker.
 pub const STEP_CORRECTED: &str = "jobs.step.corrected";
+/// An operator classified one frozen value of a packet for its executors'
+/// START (`execution_inputs`, design e72dc7c9): payload `{job_id, index,
+/// classification}`. The fact of the classification; the job's row state
+/// rides the sibling JOB_UPDATED, which the rebuild replays.
+pub const JOB_INPUT_CLASSIFIED: &str = "jobs.job.input_classified";
 /// A packet was moved to another version of its protocol through the
 /// re-pin door (`POST /api/jobs/{id}/convert`, design 7cf202a9 Q3):
 /// payload `{job_id, from, to, by, at, reprojected: [{step, step_id,

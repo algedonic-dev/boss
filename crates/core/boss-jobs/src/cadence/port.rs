@@ -98,6 +98,16 @@ pub trait CadenceRegistry: Send + Sync {
     /// lineage. Empty when the registry has never held the name.
     async fn live_versions(&self, name: &str) -> Result<Vec<CadenceRuleSpec>, CadenceError>;
 
+    /// Every rule name this registry has ever held a row of, any
+    /// status, sorted byte for byte — the recovery export's walk
+    /// (`crate::registry_export`, backlog c26aacaa). Refuses rather
+    /// than answering a short list when the adapter cannot enumerate.
+    async fn lineage_names(&self) -> Result<Vec<String>, CadenceError> {
+        Err(CadenceError::Storage(
+            "cadence adapter cannot enumerate its lineages".into(),
+        ))
+    }
+
     /// Retire any active row of the same name, then insert `spec` at
     /// its declared version, active, stamped `now` — in that order,
     /// because `cadence_rules_one_active_per_name` is a plain partial

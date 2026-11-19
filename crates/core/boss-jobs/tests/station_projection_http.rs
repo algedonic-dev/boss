@@ -93,7 +93,7 @@ fn authored_dock() -> StationSpec {
     let mut s = StationSpec::draft(
         "loading-dock",
         "Loading dock",
-        StationKind::Batch,
+        StationKind::Group,
         StationPredicate {
             kind: Some("vendor-bill".into()),
             ..Default::default()
@@ -248,7 +248,6 @@ async fn an_authored_row_of_the_same_name_wins_and_appears_once() {
         chrono::Utc::now(),
     );
     authored.status = boss_jobs::registry::WorkflowStatus::Active;
-    authored.wip_limit = Some(5);
 
     let app = app(Some(authored));
     let (status, v) = get_json(&app, "/api/stations").await;
@@ -264,10 +263,6 @@ async fn an_authored_row_of_the_same_name_wins_and_appears_once() {
 
     let only = row(&v, DERIVED).expect("the authored row");
     assert_eq!(only["title"], "Bookkeeping — hand-tuned");
-    assert_eq!(
-        only["wip_limit"], 5,
-        "the authored row's own settings must survive the merge"
-    );
 }
 
 /// The load surface agrees with the per-station queue.
@@ -342,5 +337,5 @@ async fn an_idle_station_is_reported_with_no_age() {
         .expect("the derived station is listed even with nothing in it");
     assert_eq!(row["depth"], 0);
     assert!(row["oldest_age_days"].is_null());
-    assert_eq!(row["over_limit"], false);
+    assert!(row.get("over_limit").is_none());
 }

@@ -6,3 +6,5 @@ id = "automation:ops-runner"
 role = "platform-admin"
 description = 'Runs the allowlisted verb an ops-request names on its host (infra/ops/ops-runner.sh). Each pass claims as automation:ops-runner:<host>:<moment>-<pid> (mint_claimant), so that family signs as this row.'
 signs_for = "automation:ops-runner:"
+# Host station: operations (backlog 6ecb5480, station-tree.md section 6).
+station = "9660c60f-eb47-4405-ae08-fcbb30c71e5f"

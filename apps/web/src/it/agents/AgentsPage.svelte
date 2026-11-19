@@ -15,10 +15,9 @@
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import Link from '@boss/web-kit/ui/Link.svelte';
   import { href } from '../../router';
-  import { costText } from '../crew/crew';
   import {
     budgetText,
-    capText,
+    costText,
     effortsRun,
     fetchAgentDetail,
     fetchAgents,
@@ -78,10 +77,10 @@
           <dd class="mono">{a.department ?? 'not declared'}</dd>
           <dt>Default model</dt>
           <dd class="mono">{a.defaultModel ?? 'not declared'}</dd>
+          <dt>Model class</dt>
+          <dd class="mono">{a.modelClass ?? 'records none'}</dd>
           <dt>Hourly budget</dt>
           <dd class="mono">{budgetText(a.hourlyBudgetUsdMicros)}</dd>
-          <dt>Concurrent runs, at most</dt>
-          <dd class="mono">{capText(a.maxConcurrentRuns)}</dd>
           <dt>Open steps held</dt>
           <dd class="mono">
             {#if !d}

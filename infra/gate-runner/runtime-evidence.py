@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import sys
 import time
+import zlib
 
 RAW_BYTES = 2048
 JOURNAL_BYTES = 2 * 1024 * 1024
@@ -18,7 +19,15 @@ RECEIPT_SAMPLES = 32
 JOURNAL_ROWS = 512
 ERRORS = 16
 FILES = ("cpu.max", "cpuset.cpus.effective", "cpu.stat", "cpu.pressure",
-         "memory.pressure", "io.pressure", "memory.current", "memory.peak", "memory.events")
+         "memory.pressure", "io.pressure", "io.stat", "memory.current", "memory.peak", "memory.events")
+# A journal written before io.stat was read stays readable without it; its
+# bytes are then unknown, never zero (backlog f42bd52f).
+LEGACY_FILES = tuple(name for name in FILES if name != "io.stat")
+# The phases a receipt NAMES with their bytes, heaviest first; the rest are
+# folded into one count so nothing is dropped from the total (f42bd52f).
+IO_PHASES = 16
+# Where a block device's major:minor resolves to its sysfs node (a test seam).
+SYS_BLOCK_ENV = "BOSS_RUNTIME_SYS_BLOCK"
 IDENTITY = ("GATE_RUN_JOB_ID", "BOSS_AGENT_RUN", "BOSS_GATE_SOURCE_HEAD", "POD_NAME",
             "POD_UID", "NODE_NAME", "NATIVE_JOB_NAME", "NATIVE_JOB_UID")
 RESOURCES = ("GATE_CPU_REQUEST", "GATE_CPU_LIMIT", "GATE_MEMORY_REQUEST", "GATE_MEMORY_LIMIT")
@@ -40,6 +49,23 @@ PGDATA_FULL = 0.95
 # when it starts, one for its first failed reading, one if it dies. Never a
 # line per reading.
 WATCH_BYTES = 4096
+# GATE.LOG, FRAMED WHOLE BEFORE ANYTHING REDUCES IT (backlog 7c49bd38; design
+# 5a274e7c car 1, decided 2026-11-13). The bound is on the GZIP, 4 MiB: about
+# 5.6 MiB of base64 frames beside an outer log measured at ~1.5 MB, so the pod
+# log stays under the kubelet's 10 Mi rotation, and build chatter compresses
+# about tenfold, so it covers a gate.log of roughly 40 MB. A frame carries
+# 3072 gzip bytes, the raw journal's chunk, so no line nears the runtime's
+# 16 KiB line split. The log is read in blocks and each block is flushed into
+# the gzip on its own, so the retained bytes are always whole blocks and a
+# block that would cross the bound is left out rather than cut.
+LOG_GZ_BYTES = 4 * 1024 * 1024
+LOG_BLOCK = 64 * 1024
+LOG_FRAME_BYTES = 3072
+# The final deflate block and gzip's 8-byte trailer, written by the finish.
+LOG_GZ_FINISH = 64
+# A block's deflate output never exceeds its length plus a few stored-block
+# headers and the sync marker; below this much headroom no trial copy is needed.
+LOG_BLOCK_SLACK = 1024
 
 
 def text(value, bound=RAW_BYTES):
@@ -111,7 +137,8 @@ def validate_sample(row):
                               ("workers", ("cargo", "rust_tests"), "control"),
                               ("resources", RESOURCES, "resource")):
         values = row[field]
-        if not isinstance(values, dict) or set(values) != set(keys) or any(
+        allowed = (set(keys), set(LEGACY_FILES)) if field == "files" else (set(keys),)
+        if not isinstance(values, dict) or set(values) not in allowed or any(
                 not observation(value, kind) for value in values.values()):
             raise ValueError("invalid " + field + " observations")
     for name, value in row["resources"].items():
@@ -255,6 +282,141 @@ def interval(before, after):
     except (KeyError, TypeError, ValueError) as error:
         result["reason"] = str(error)
     return result
+
+
+# BYTES PER DEVICE PER PHASE (backlog f42bd52f, car 2 of design 121f44a1,
+# D4). The gate drive's budget is a byte count, and io.pressure says only how
+# long a check waited on it. io.stat is the cgroup's cumulative read and
+# write bytes per block device, so a difference across a check is that
+# check's bytes. It is a SUMMARY over every sample, computed before the
+# receipt's reductions, and not a field on each interval: on 2026-11-12 two
+# green receipts kept 115 of ~225 intervals and the last one kept was a
+# pre-flight lint, so build and test, the phases that write the drive, never
+# reach the record that way (the first attempt, bb4eeee6, kept 79 of 229).
+IO_METHOD = ("cgroup v2 io.stat read and write byte deltas of the gate container, per "
+             "major:minor as io.stat keys it (a whole disk), over every sample before the "
+             "receipt's reductions; bytes this cgroup issued, not device wear; evidence "
+             "only, it changes no verdict")
+WORKSPACE_METHOD = ("stat of the gate's working directory, and its whole disk from sysfs (a "
+                    "partition's parent), which is the key io.stat counts it under")
+
+
+def io_counters(row):
+    source = row["files"].get("io.stat", {"state": "unavailable", "reason": "not read by this collector"})
+    if source.get("state") != "measured":
+        raise ValueError("io.stat " + str(source.get("state")) + " at " + row["label"]
+                         + (": " + source["reason"] if "reason" in source else ""))
+    devices = {}
+    for line in source["raw"].splitlines():
+        parts = line.split()
+        if not parts or not re.fullmatch(r"[0-9]+:[0-9]+", parts[0]) or parts[0] in devices:
+            raise ValueError("malformed or duplicate io.stat device at " + row["label"])
+        counters = {}
+        for part in parts[1:]:
+            key, separator, value = part.partition("=")
+            if not separator or not key or key in counters or not re.fullmatch(r"[0-9]+", value):
+                raise ValueError("malformed or duplicate io.stat counter at " + row["label"])
+            counters[key] = int(value)
+        if not {"rbytes", "wbytes"} <= counters.keys():
+            raise ValueError("io.stat read/write bytes absent at " + row["label"])
+        devices[parts[0]] = (counters["rbytes"], counters["wbytes"])
+    return devices
+
+
+def io_delta(before, after):
+    """Bytes per device between two samples; raises, saying why, when unknown."""
+    if (not known_lifetime(before) or not known_lifetime(after)
+            or before["lifetime"] != after["lifetime"] or before["identity"] != after["identity"]):
+        raise ValueError("cgroup lifetime or identity changed at " + after["label"])
+    if after["monotonic_ns"] <= before["monotonic_ns"]:
+        raise ValueError("nonpositive monotonic interval at " + after["label"])
+    left, right = io_counters(before), io_counters(after)
+    if left.keys() != right.keys():
+        raise ValueError("io.stat device set changed at " + after["label"])
+    delta = {device: (right[device][0] - left[device][0], right[device][1] - left[device][1])
+             for device in left}
+    if any(value < 0 for pair in delta.values() for value in pair):
+        raise ValueError("io.stat byte counter reset at " + after["label"])
+    return delta
+
+
+def io_bytes(totals):
+    return {device: {"rbytes": pair[0], "wbytes": pair[1]} for device, pair in sorted(totals.items())}
+
+
+def io_sum(deltas, devices):
+    return {device: (sum(delta[device][0] for delta in deltas), sum(delta[device][1] for delta in deltas))
+            for device in devices}
+
+
+def workspace_disk():
+    """The disk under the gate's working directory, as io.stat keys it.
+
+    io.stat counts a whole disk; the gate volume's st_dev is its partition
+    (on 2026-11-12 w-1's nvme1n1p1, 259:7, counted under nvme1n1, 259:6). Read
+    at report time from the directory the gate builds in, never typed: the
+    last layout's numbers went stale the night the volume moved.
+    """
+    try:
+        path = os.getcwd()
+        stat = os.stat(path)
+    except OSError as error:
+        return {"state": "unavailable", "reason": str(error)[:200]}
+    device = "%d:%d" % (os.major(stat.st_dev), os.minor(stat.st_dev))
+    result = {"state": "partial", "path": path, "device": device, "method": WORKSPACE_METHOD}
+    node = os.path.realpath(os.path.join(os.environ.get(SYS_BLOCK_ENV, "/sys/dev/block"), device))
+    try:
+        if os.path.exists(os.path.join(node, "partition")):
+            node = os.path.dirname(node)
+        with open(os.path.join(node, "dev")) as stream:
+            disk = stream.read(64).strip()
+        if not re.fullmatch(r"[0-9]+:[0-9]+", disk):
+            raise ValueError("its sysfs dev reads " + repr(disk[:40]))
+        result.update(state="measured", disk=disk)
+    except (OSError, ValueError) as error:
+        result["reason"] = "no whole disk read for " + device + ": " + str(error)[:200]
+    return result
+
+
+def io_report(rows, incomplete):
+    """Bytes per device: the total, the heaviest phases, the rest, the gaps.
+
+    A phase is a check-start:X sample followed by its check-finish:X. Every
+    boundary is checked, so a reset or a changed identity cannot hide inside
+    endpoints that look monotonic, and an unknown is never a zero: one bad
+    boundary makes the whole table unavailable, saying where, and the raw
+    journal is retained. The named phases, the folded rest and the gaps
+    between phases sum to the endpoint total exactly (conservation).
+    """
+    output = {"state": "unavailable", "method": IO_METHOD, "workspace": workspace_disk()}
+    if incomplete or len(rows) < 2:
+        output["reason"] = "incomplete journal or fewer than two valid samples; raw journal retained"
+        return output
+    try:
+        steps = [(left, right, io_delta(left, right)) for left, right in zip(rows, rows[1:])]
+        total = io_delta(rows[0], rows[-1])
+    except (KeyError, TypeError, ValueError) as error:
+        output["reason"] = str(error)[:200] + "; raw journal retained"
+        return output
+    phases, between = [], []
+    for left, right, delta in steps:
+        name = left["label"][len("check-start:"):]
+        if left["label"].startswith("check-start:") and right["label"] == "check-finish:" + name:
+            phases.append((name, delta))
+        else:
+            between.append(delta)
+    # Heaviest first for the cut (a stable sort keeps ties in run order),
+    # then listed in the order they ran.
+    ranked = sorted(range(len(phases)), key=lambda index: -sum(r + w for r, w in phases[index][1].values()))
+    named = sorted(ranked[:IO_PHASES])
+    folded = [phases[index][1] for index in sorted(ranked[IO_PHASES:])]
+    output.update({"state": "measured", "from": rows[0]["label"], "to": rows[-1]["label"],
+                   "devices": io_bytes(total),
+                   "phases": [{"phase": phases[index][0], "devices": io_bytes(phases[index][1])}
+                              for index in named],
+                   "other_phases": {"count": len(folded), "devices": io_bytes(io_sum(folded, total))},
+                   "between_phases": {"count": len(between), "devices": io_bytes(io_sum(between, total))}})
+    return output
 
 
 def append(path, row):
@@ -521,7 +683,8 @@ def report(path):
     output = {"version": 1, "state": "partial" if errors else "measured",
               "bounds": {"raw_file_bytes": RAW_BYTES, "journal_bytes": JOURNAL_BYTES,
                          "receipt_bytes": RECEIPT_BYTES, "receipt_samples": RECEIPT_SAMPLES,
-                         "journal_rows": JOURNAL_ROWS, "diagnostic_errors": ERRORS},
+                         "journal_rows": JOURNAL_ROWS, "diagnostic_errors": ERRORS,
+                         "io_phases": IO_PHASES},
               "raw_record": str(path), "collection_errors": errors[:ERRORS], "sample_count": len(rows),
               "invalid_rows": invalid_rows,
               "omitted_rows": omitted_rows,
@@ -529,6 +692,7 @@ def report(path):
               # Summaries over EVERY row and reading, computed before the
               # reductions below, which keep neither.
               "pgdata": pgdata_report(path), "memory": memory_report(rows),
+              "io": io_report(rows, bool(errors)),
               "browser": {"state": "unavailable", "reason": "no observed browser runtime record"},
               "browser_policy": {"state": "unavailable", "reason": "no resolved browser configuration"}}
     # The runner copies raw bytes independently of verdict before cleanup;
@@ -545,6 +709,10 @@ def report(path):
     if any(any(v.get("state") != "measured" for v in row.get("files", {}).values())
            or any(value is None for value in row["identity"].values())
            or not known_lifetime(row) for row in rows):
+        output["state"] = "partial"
+    # A legacy row carries no io.stat key at all, so the file check above
+    # cannot see that its bytes are unknown; the summary's own state can.
+    if output["io"]["state"] != "measured":
         output["state"] = "partial"
     if not rows:
         output["state"] = "unavailable"
@@ -658,6 +826,109 @@ def retain(path, receipt):
         raise SystemExit("raw journal was not retained: stdout output failed")
 
 
+def gzip_prefix(stream, bound):
+    """The whole stream's size and hash, and a gzip of its leading blocks that fits bound."""
+    whole, kept = hashlib.sha256(), hashlib.sha256()
+    total = kept_bytes = 0
+    packer, packed, full = zlib.compressobj(6, zlib.DEFLATED, 31), bytearray(), False
+    for block in iter(lambda: stream.read(LOG_BLOCK), b""):
+        whole.update(block)
+        total += len(block)
+        if full:
+            continue
+        # Near the bound, try the block on a copy so a block that does not fit
+        # leaves the gzip exactly as it was.
+        near = len(packed) + len(block) + LOG_BLOCK_SLACK + LOG_GZ_FINISH > bound
+        trial = packer.copy() if near else packer
+        piece = trial.compress(block) + trial.flush(zlib.Z_SYNC_FLUSH)
+        if len(packed) + len(piece) + LOG_GZ_FINISH > bound:
+            full = True
+            continue
+        packer = trial
+        packed += piece
+        kept.update(block)
+        kept_bytes += len(block)
+    packed += packer.flush()
+    return {"bytes": total, "sha256": whole.hexdigest(), "kept_bytes": kept_bytes,
+            "kept_sha256": kept.hexdigest(), "gz": bytes(packed), "full": full}
+
+
+def one_word(value):
+    """A trailer field: no whitespace, never empty ('-' is absent, never a zero)."""
+    word = re.sub(r"\s", "_", str(value))[:RAW_BYTES] if value is not None else ""
+    return word or "-"
+
+
+def retain_log(path, receipt, stream="gate.log"):
+    """Frame a log whole onto runner stdout before anything reduces it, and bind it in the receipt."""
+    reason, measured = None, None
+    try:
+        with path.open("rb") as source:
+            measured = gzip_prefix(source, LOG_GZ_BYTES)
+    except OSError as error:
+        reason = ("%s unavailable: %s" % (stream, error))[:RAW_BYTES]
+    if measured is not None and measured["full"]:
+        reason = ("gzip bound of %d bytes reached: the frames hold the leading %d of %d "
+                  "original bytes" % (LOG_GZ_BYTES, measured["kept_bytes"], measured["bytes"]))
+    packed = measured["gz"] if measured is not None else b""
+    chunks = [packed[at:at + LOG_FRAME_BYTES] for at in range(0, len(packed), LOG_FRAME_BYTES)]
+    record = {
+        "version": 1, "stream": stream,
+        "state": "unavailable" if measured is None else "partial" if measured["full"] else "retained",
+        "reason": reason, "source": str(path)[:RAW_BYTES],
+        "original_bytes": measured["bytes"] if measured else None,
+        "original_sha256": measured["sha256"] if measured else None,
+        "kept_bytes": measured["kept_bytes"] if measured else None,
+        "kept_sha256": measured["kept_sha256"] if measured else None,
+        "encoding": "gzip", "gz_bytes": len(packed) if measured else None,
+        "gz_sha256": hashlib.sha256(packed).hexdigest() if measured else None,
+        "frames": len(chunks), "bound_gz_bytes": LOG_GZ_BYTES, "frame_bytes": LOG_FRAME_BYTES,
+        "job": os.environ.get("NATIVE_JOB_NAME", "")[:RAW_BYTES] or None,
+        "pod_uid": os.environ.get("POD_UID", "")[:RAW_BYTES] or None,
+        "head": os.environ.get("BOSS_GATE_SOURCE_HEAD", "")[:RAW_BYTES] or None,
+        "carrier": "runner stdout: gate-runner-log: frames, then one gate-runner: log-end v1 trailer",
+        "lifetime": "runner stdout until the conductor stores it (design 5a274e7c car 2); "
+                    "until then availability follows pod log retention",
+    }
+    # The binding is prepared before the frames and written only after stdout
+    # has taken them, as the raw journal's is: a sink that refuses the bytes
+    # must never leave `retained` on the receipt. An unreadable receipt is
+    # left exactly as it was - it may be the only copy.
+    body = None
+    try:
+        candidate = json.loads(receipt.read_bytes())
+        if isinstance(candidate, dict) and isinstance(candidate.get("log_retention", {}), dict):
+            body = candidate
+    except (OSError, ValueError, RecursionError):
+        pass
+    trailer = "gate-runner: log-end v1 " + " ".join("%s=%s" % (key, one_word(value)) for key, value in (
+        ("job", record["job"]), ("stream", stream), ("bytes", record["original_bytes"]),
+        ("sha256", record["original_sha256"]), ("kept_bytes", record["kept_bytes"]),
+        ("kept_sha256", record["kept_sha256"]), ("gz_bytes", record["gz_bytes"]),
+        ("gz_sha256", record["gz_sha256"]), ("frames", len(chunks)), ("state", record["state"])))
+    if reason:
+        trailer += " reason=" + reason.replace("\n", " ")
+    output_error = None
+    try:
+        for index, chunk in enumerate(chunks):
+            print("gate-runner-log: " + json.dumps({
+                "stream": stream, "i": index, "of": len(chunks),
+                "b64": base64.b64encode(chunk).decode("ascii"),
+                "sha256": hashlib.sha256(chunk).hexdigest()}, separators=(",", ":")))
+        print(trailer, flush=True)
+    except OSError as error:
+        output_error = error
+        record = dict(record, state="unavailable",
+                      reason=("stdout retention failed: %s" % error)[:RAW_BYTES])
+    if body is not None:
+        body.setdefault("log_retention", {})[stream.replace(".", "_")] = record
+        temporary = receipt.with_suffix(receipt.suffix + ".log-retention-tmp")
+        temporary.write_text(json.dumps(body, separators=(",", ":")))
+        temporary.replace(receipt)
+    if output_error is not None:
+        raise SystemExit("%s was not retained: stdout output failed" % stream)
+
+
 if __name__ == "__main__":
     action, path = sys.argv[1], Path(sys.argv[2])
     if action == "sample":
@@ -672,6 +943,8 @@ if __name__ == "__main__":
         print(json.dumps(browser(path), separators=(",", ":")))
     elif action == "retain":
         retain(path, Path(sys.argv[3]))
+    elif action == "retain-log":
+        retain_log(path, Path(sys.argv[3]))
     elif action == "merge":
         receipt = Path(sys.argv[3])
         body = json.loads(receipt.read_text())

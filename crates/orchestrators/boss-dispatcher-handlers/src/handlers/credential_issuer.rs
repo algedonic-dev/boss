@@ -858,6 +858,35 @@ impl KubeSecretStore {
 /// dispatch for every co-fired rule.
 pub struct Unconfigured(pub String);
 
+impl Unconfigured {
+    /// The fallback for a broker client the dispatcher could not BUILD at
+    /// boot — the forge admin client, the in-cluster k8s client — said as
+    /// an ERROR the moment it is taken (backlog 3107bfb1, review a2172ed3
+    /// of car 01872c8e). Until then the binary registered Unconfigured in
+    /// silence and booted green, and the first anyone heard of a broker
+    /// that could not rotate was a rotation dead-lettering on its packet.
+    /// An unset root token is not this: that is a deployment without the
+    /// broker, and it stays a quiet fallback.
+    pub fn at_boot(why: String) -> Arc<Self> {
+        tracing::error!(
+            reason = %why,
+            "credential broker client unavailable at boot: every rotation it serves will dead-letter"
+        );
+        Arc::new(Self(why))
+    }
+
+    /// Optional deployments have no broker roots. A missing cluster
+    /// credential there is expected, not a broken configured broker
+    /// (backlog b69c2be2). Keep the same refusal for a later invocation.
+    pub fn at_boot_if_configured(why: String, configured: bool) -> Arc<Self> {
+        if configured {
+            Self::at_boot(why)
+        } else {
+            Arc::new(Self(why))
+        }
+    }
+}
+
 #[async_trait]
 impl ForgeTokenIssuer for Unconfigured {
     async fn list_tokens(&self, _u: &str) -> Result<Vec<TokenInfo>, String> {
@@ -2845,6 +2874,90 @@ mod forgejo_tests {
             .await
             .expect_err("unconfigured");
         assert_eq!(err, "broker unconfigured");
+    }
+
+    /// Backlog 3107bfb1 (review a2172ed3 of car 01872c8e): a broker
+    /// client the dispatcher could not BUILD — the forge admin client, the
+    /// in-cluster k8s client — fell back to Unconfigured in silence, and
+    /// the first anyone heard of it was a rotation dead-lettering, days
+    /// later. Every such fallback in the binary goes through
+    /// [`Unconfigured::at_boot`], which says so as an error the moment it
+    /// happens; an `Unconfigured` built straight from an error value is the
+    /// silent shape, including a precomputed reason or wrapped constructor.
+    fn directly_constructs_unconfigured(source: &str) -> bool {
+        source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .contains("Unconfigured(")
+    }
+
+    #[test]
+    fn every_broker_client_the_dispatcher_could_not_build_is_said_at_boot() {
+        let bin = include_str!("../bin/boss_dispatcher.rs");
+        assert!(
+            !directly_constructs_unconfigured(bin),
+            "a broker client that could not be built falls back to Unconfigured \
+             without saying so — use Unconfigured::at_boot or at_boot_if_configured"
+        );
+        // Control: the binary does reach for the fallback at all, so an
+        // empty list above is a judgement and not a file that moved.
+        assert!(bin.contains("Unconfigured::at_boot("), "the fallback moved");
+    }
+
+    #[test]
+    fn optional_broker_boot_is_quiet_but_configured_failures_are_errors() {
+        use std::io::Write;
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for configured in [false, true] {
+            let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer = Capture(bytes.clone());
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || writer.clone())
+                .finish();
+            let fallback = tracing::subscriber::with_default(subscriber, || {
+                Unconfigured::at_boot_if_configured(
+                    "no in-cluster k8s credential".into(),
+                    configured,
+                )
+            });
+            assert_eq!(fallback.0, "no in-cluster k8s credential");
+            let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            assert_eq!(output.contains("ERROR"), configured, "{output}");
+            assert_eq!(
+                output.contains("every rotation it serves will dead-letter"),
+                configured
+            );
+        }
+    }
+
+    #[test]
+    fn boot_pin_catches_dynamic_and_wrapped_unconfigured_construction() {
+        for source in [
+            "Arc::new(Unconfigured(format!(\"{e}\")))",
+            "let why = error; Arc::new(Unconfigured(why))",
+            "Arc::new(\n Unconfigured (why.clone()))",
+        ] {
+            assert!(directly_constructs_unconfigured(source), "{source}");
+        }
+        assert!(!directly_constructs_unconfigured(
+            "Unconfigured::at_boot(why)"
+        ));
+        assert!(!directly_constructs_unconfigured(
+            "Unconfigured::at_boot_if_configured(why, false)"
+        ));
     }
 }
 

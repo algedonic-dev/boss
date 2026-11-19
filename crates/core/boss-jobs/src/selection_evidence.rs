@@ -24,10 +24,13 @@ pub(crate) fn conserve_before(
     receipt: &SelectionReceipt,
     mut claim: Event,
     stamp: &EventStamp,
-    deadline: Option<std::time::Instant>,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<Vec<Event>, JobsError> {
     if receipt["version"] != 2
-        || claim.kind != crate::events::STATION_CLAIMED
+        || !matches!(
+            claim.kind.as_str(),
+            crate::events::STATION_CLAIMED | crate::events::STATION_RESOURCE_REFUSED
+        )
         || claim.source != "jobs"
         || receipt["event_id"] != json!(claim.id)
         || receipt.value().get("event_actor") != claim.payload.get("_actor")
@@ -103,7 +106,10 @@ pub fn reconstruct(events: &[ReplayEvent]) -> Result<Vec<ReplayEvent>, JobsError
             continue;
         }
         let mut copied = event.clone();
-        if event.kind == crate::events::STATION_CLAIMED {
+        if matches!(
+            event.kind.as_str(),
+            crate::events::STATION_CLAIMED | crate::events::STATION_RESOURCE_REFUSED
+        ) {
             let chunks = pending.remove(&event.event_id).unwrap_or_default();
             if let Some(manifest) = event.payload.get("receipt_manifest") {
                 if event.payload.get("receipt_json").is_some() || manifest["version"] != 2 {

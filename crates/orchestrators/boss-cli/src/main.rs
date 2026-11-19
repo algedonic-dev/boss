@@ -5,6 +5,7 @@ use tracing_subscriber::EnvFilter;
 mod attach;
 mod automations;
 mod brief;
+mod browser_observation;
 mod built_from;
 mod bundle_lineage;
 mod cadence;
@@ -13,6 +14,7 @@ mod car_retire;
 mod car_unland;
 mod census;
 mod channels;
+mod classify;
 mod cli_inputs;
 mod core_changes;
 mod correct;
@@ -28,6 +30,7 @@ mod dispatch_launch;
 #[cfg(test)]
 mod dispatch_report_orders;
 mod dispatch_started;
+mod dispatch_worker;
 mod disprove;
 mod dock_preview;
 mod doctor;
@@ -37,8 +40,11 @@ mod door_env;
 mod envelope;
 mod estate;
 mod events;
+mod experiment;
+mod factory;
 mod freshness;
 mod gate;
+mod gate_hold;
 mod gate_retire;
 mod gemini_execution;
 mod git_auth;
@@ -65,6 +71,7 @@ mod orient;
 mod own_temp;
 mod owner;
 mod park;
+mod pool;
 mod prior_work;
 mod probe_door_check;
 mod probe_reader;
@@ -85,9 +92,13 @@ mod roster;
 mod running;
 mod scratch_target;
 mod script;
+mod session_start;
+mod session_window;
 mod shared_checkout;
 mod sor_client;
 mod source_backfill;
+mod start_inputs;
+mod station_pull;
 mod steps;
 mod strike_release;
 mod tenant;
@@ -97,13 +108,18 @@ mod tenant_stamp;
 mod top_board;
 mod train;
 mod train_gate;
+mod train_gate_reuse;
 mod transcript_profile;
 mod transcript_usage;
 mod trust_boundary;
+mod twin;
+mod unpushed;
 mod upgrade;
+mod urgent_first;
 mod workflow;
 #[path = "../workflow_roster.rs"]
 mod workflow_roster;
+mod worktree_release;
 
 #[derive(Parser)]
 #[command(
@@ -121,6 +137,22 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Subcommand)]
+enum StationAction {
+    /// Pull a claim as yourself through the machine door, then open its run.
+    Pull {
+        /// One declared tree station, including the company root.
+        #[arg(long)]
+        station: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        budget: Option<f64>,
+        #[arg(long)]
+        effort: Option<String>,
+    },
+}
+
 /// `large_enum_variant` is allowed deliberately. This enum is the
 /// PARSE of one command line: exactly one value of it exists per
 /// process, built by clap at startup and matched once. `Gate` is the
@@ -132,11 +164,18 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
+    /// Work at declared stations of the company tree.
+    Station {
+        #[command(subcommand)]
+        action: StationAction,
+    },
     /// Installer compatibility check for the published dev controller.
     #[command(hide = true)]
     DevControlContract,
     #[command(flatten)]
     Roster(roster::Cmd),
+    #[command(flatten)]
+    Browser(browser_observation::Cmd),
     #[command(flatten)]
     Launch(launch::Cmd),
     /// Post-install health check — verifies Postgres, NATS, gateway,
@@ -246,10 +285,11 @@ enum Commands {
         // A reason explains a withdrawal and nothing else, so a branch
         // refuses one outright: clap's `requires` on the reason did not
         // fire beside `required_unless_present` (measured under 4.6).
-        // The successor of a retirement is refused the same way.
+        // The successor of a retirement, and a green's reason for one,
+        // are refused the same way.
         #[arg(
             required_unless_present_any = ["withdraw", "retire"],
-            conflicts_with_all = ["reason", "reason_file", "superseded_by"]
+            conflicts_with_all = ["reason", "reason_file", "superseded_by", "green_anyway"]
         )]
         branch: Option<String>,
         /// Retire a CLOSED gate-run no car ever claimed, because another
@@ -259,6 +299,12 @@ enum Commands {
         /// gate-run, and the garage stops drawing its branch. Measured
         /// 2026-10-17: 14 of 17 reds in the garage were superseded and
         /// no door could take them out (backlog c9c48222).
+        ///
+        /// A retirement launches nothing and files no car, so every
+        /// --park-* flag and --namespace is REFUSED beside it rather than
+        /// dropped in silence: an operator who typed one meant something
+        /// this verb would not do (F4 of review 10cfcb8b, backlog
+        /// 1fb357f4). A GREEN is refused unless --green-anyway says why.
         #[arg(
             long,
             value_name = "GATE-RUN",
@@ -266,13 +312,27 @@ enum Commands {
             conflicts_with_all = [
                 "branch", "withdraw", "reason", "reason_file", "wait", "submit", "mode",
                 "manifest", "rebase", "hold", "force_regate", "stale_base_anyway", "park_file",
+                "namespace", "park_summary", "park_excludes", "park_test", "park_verified",
+                "park_backlog_item", "park_partial_item", "park_no_item", "park_design",
+                "park_after", "park_also_answers", "park_probe", "park_probe_file",
+                "park_expect", "park_expect_file", "park_proof_event", "park_waits_on",
+                "park_waits_on_seen", "park_waits_on_owner", "park_waits_on_max_wait_hours",
             ]
         )]
         retire: Option<String>,
         /// The successor that landed (with --retire): its branch, 8+
-        /// characters of its car's id, or the merge sha that landed it.
+        /// characters of its car's id (enough to pick one car), or the
+        /// 7-40 hex sha of the commit that carries the red's work —
+        /// never a revision expression: `main`, `HEAD~N` and
+        /// `<branch>~N` name a commit on main whatever the red carried.
         #[arg(long, requires = "retire", value_name = "LANDED")]
         superseded_by: Option<String>,
+        /// Retire a GREEN (with --retire), saying why. A green no car
+        /// carries is stranded, not superseded, so it is refused without
+        /// this; the reason is recorded on the gate-run as
+        /// `green_anyway`.
+        #[arg(long, requires = "retire", value_name = "WHY")]
+        green_anyway: Option<String>,
         /// Withdraw a gate-run whose purpose is gone, before any runner
         /// pod exists: close it on the protocol's `withdrawn` terminal
         /// with the reason, deleting a queued Job whose pod never
@@ -427,6 +487,8 @@ enum Commands {
         /// on the car as `proof_probe` and RUN — by `boss prove <car>
         /// --from-car`, or by the arrival rule once the car lands — in
         /// exactly the shape `boss prove` records. Needs --park-expect.
+        /// A park gives this or --park-proof-event: one with neither is
+        /// refused, since nothing could ever prove the car (031a3ca9).
         ///
         /// WHERE IT RUNS: on the FORGE HOST, as the low-privilege account
         /// boss-probe, in a read-only view of the converged checkout,
@@ -520,7 +582,8 @@ enum Commands {
         /// default: a landed branch's next step is deletion, and a
         /// re-gate that inherits stale park intent files a twin car
         /// that boards an empty diff (610537b2). Never combines with
-        /// --park-*.
+        /// --park-*, nor with --mode auto on a head already ON main,
+        /// which has no diff for --auto to scope (7c833bd5).
         #[arg(long, value_name = "REASON")]
         force_regate: Option<String>,
         /// Gate a branch whose base is BEHIND origin/main, stating why
@@ -561,6 +624,15 @@ enum Commands {
         /// lands (backlog bd331d38, option A).
         #[arg(long, value_name = "REASON")]
         hold: Option<String>,
+        /// Gate even though the gates station is held (`boss gates
+        /// hold`), stating why this gate cannot wait for the release.
+        /// Refused by default: a hold is a declared quiet window on the
+        /// gate volume, and every automaton defers under it (backlog
+        /// 95401d82). The reason is recorded on the gate-run as
+        /// `despite_hold`, and the resident line launches such a request
+        /// through the hold.
+        #[arg(long, value_name = "REASON")]
+        despite_hold: Option<String>,
     },
     /// Park a gated branch as a car, carrying its receipt.
     ///
@@ -617,6 +689,13 @@ enum Commands {
         #[command(subcommand)]
         action: JobAction,
     },
+    /// An operator session's own record — its work-session packet
+    /// (backlog 37e3295c). Grouped like `Job`: a new session verb lands
+    /// inside `SessionAction`.
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
     /// The cadence registry's write verbs — retire a rule by name,
     /// publish a version from its bundle file (13d1fff3). The loop
     /// that RUNS the schedule is `boss train cadence`.
@@ -626,6 +705,16 @@ enum Commands {
     Cadence {
         #[command(subcommand)]
         action: CadenceAction,
+    },
+    /// The resource-pool registry's write verb — publish one pool row
+    /// through the live pools door, without a code car (backlog
+    /// f399458f).
+    ///
+    /// Grouped like `Workflow`: a new pool verb lands inside
+    /// `PoolAction`, not as another variant here (84f9fbc0).
+    Pool {
+        #[command(subcommand)]
+        action: PoolAction,
     },
     /// A session's first verb: trains in transit, gates running,
     /// stranded greens, the dock, and the task queue — the approach in
@@ -662,6 +751,13 @@ enum Commands {
         /// packet, or a step declaring none, it is `builder`.
         #[arg(long)]
         profile: Option<String>,
+        /// Brief this step (its slug) rather than the packet's first
+        /// open one — the selector `boss dispatch --step` already
+        /// passes (05b9a54d). A slug the packet does not carry is
+        /// refused. Without it, a packet at several open steps is
+        /// briefed on the first, and the brief names the others.
+        #[arg(long)]
+        step: Option<String>,
     },
     /// Hand a protocol step to an agent, as a packet (design c87fb59b
     /// car 2): claims the step as you, opens an `agent-run` with the
@@ -690,6 +786,18 @@ enum Commands {
         /// refused. Carries no timestamp, never creates/reassigns a run.
         #[arg(long, conflicts_with_all=["report","from_hook","next","step","model","budget","effort","force"])]
         started: bool,
+        /// With --started: bind or adopt this run's source worker before
+        /// acknowledging START. The published controller owns retries and
+        /// frees the recorded worker when the run reports.
+        #[arg(long, requires = "started")]
+        local_root: Option<std::path::PathBuf>,
+        /// Print one original a bounded START lists (design e72dc7c9):
+        /// a manifest number, `snapshot` (the packet GET as answered) or
+        /// `legacy` (the complete unbounded brief). `<PACKET>` is the RUN.
+        /// Verified against the run's manifest and the immutable file
+        /// before a byte is printed; the account goes to stderr.
+        #[arg(long, conflicts_with_all=["started","report","from_hook","next","step","model","budget","effort","force"])]
+        original: Option<String>,
         /// The hook's door (design 511fa7d4 car 2b): read a Claude Code
         /// PreToolUse payload on stdin and record the Agent call as a
         /// run — dispatch the packet the prompt names with the prompt as
@@ -705,18 +813,24 @@ enum Commands {
         /// packet from the queue instead.
         #[arg(required_unless_present = "next")]
         packet: Option<String>,
-        /// THE DURABLE INBOX (design 8382bbb2): take the first piece of
-        /// waiting work at --station and dispatch that, instead of a
-        /// packet named here. The queue is the record, so the work
-        /// outlives whatever put it there — a dispatch that lived in a
-        /// session orphaned fifteen runs when that session died on
-        /// 2026-09-19.
-        #[arg(long, requires = "station", conflicts_with_all = ["report", "from_hook", "step"])]
+        /// THE DURABLE INBOX (design 8382bbb2): take the first ready step
+        /// at your own TREE station and its subtree — the seats your
+        /// agents row declares, in order, followed by the company root —
+        /// in its own order (priority, then age), that is nominated to
+        /// you (by any id the agents registry ties to you), else the
+        /// first one nobody holds, and dispatch that instead of a packet
+        /// named here (backlog 67d4344b). Only steps your role, model and
+        /// assignment let you claim are taken: a role or a model is an
+        /// executor filter, not a station (design 6e42c6de). The queue is
+        /// the record, so the work outlives whatever put it there — a
+        /// dispatch that lived in a session orphaned fifteen runs when
+        /// that session died on 2026-09-19.
+        #[arg(long, conflicts_with_all = ["report", "from_hook", "step"])]
         next: bool,
-        /// With --next: the station to pull from, e.g.
-        /// `a.platform-admin.opus-5-1m`. Named, never inferred: an
-        /// agents row's role and a station's role are two vocabularies,
-        /// and a guessed queue answers empty instead of erroring.
+        /// With --next: pull from this one declared tree station (and
+        /// its subtree) instead of your own, e.g. `engineering`. A
+        /// generated `q.<role>.<kind>` or `a.<role>.<model>` name is
+        /// refused, naming this form (design 6e42c6de).
         #[arg(long, requires = "next")]
         station: Option<String>,
         /// The step's slug. Omit it when the packet is at exactly one.
@@ -786,9 +900,28 @@ enum Commands {
         /// already MERGED (a7837d81). The refusal is not a guess about
         /// the tree: it names the car, its branch and its merge. Force
         /// it when the packet asks for more than that car carried —
-        /// and say what the rest is in the run's summary.
+        /// and say what the rest is in the run's summary. On a car's
+        /// `review` step it re-reviews a head its last reviewer already
+        /// judged (80d1c8f5), recorded on the run as `rereview`.
         #[arg(long, conflicts_with_all = ["report", "next", "from_hook"])]
         force: bool,
+        /// Dispatch this STANDARD step although urgent steps assigned or
+        /// nominated to you are ready to start (backlog 90bff1f3). Without
+        /// it the verb refuses before claiming anything, naming each
+        /// urgent step and the `boss dispatch` that starts the first.
+        /// Requires --why (or --why-file): the reason is written to this
+        /// packet's `dispatch_note` and the run's `urgent_first_override`
+        /// before the claim.
+        #[arg(long, conflicts_with_all = ["report", "next", "from_hook", "started", "recover_launch", "replay_launch"])]
+        force_standard: bool,
+        /// With --force-standard: why this standard step goes before your
+        /// urgent work. SINGLE-quote it, or use --why-file.
+        #[arg(long, requires = "force_standard", conflicts_with = "why_file")]
+        why: Option<String>,
+        /// With --force-standard: the why, read from this file — no shell
+        /// in the path (backlog 2376b89e).
+        #[arg(long, requires = "force_standard")]
+        why_file: Option<std::path::PathBuf>,
         /// START the harness the step's model names, instead of only
         /// printing the prompt (backlog 2f7b8c00). The agents registry
         /// row whose default_model is the model names the actor, and the
@@ -997,6 +1130,10 @@ enum Commands {
     /// hand, by --recheck and by --disproved: its reads would carry no
     /// token. The forge's unattended door proves it instead, on the
     /// train's arrival and hourly after (design 00227628).
+    ///
+    /// Probe commands use LC_ALL=C and TZ=UTC at the hand/rehearsal,
+    /// host-free recheck, --disproved and unattended doors, so sorting and dates do
+    /// not depend on the host. Other environment boundaries are unchanged.
     Prove {
         /// Car to prove: its branch, or 8+ characters of its id.
         car: String,
@@ -1051,7 +1188,7 @@ enum Commands {
         /// the car's `proof_probe` / `proof_expect`) instead of one
         /// given here. `--verified` defaults to the car's summary.
         /// Runs HERE, on this box — as you, with no timeout unless a
-        /// reader door opens for it (60 s, and it says so) — but in
+        /// reader door opens for it (180 s, and it says so) — but in
         /// the environment the forge's own door builds: the sanctioned
         /// reader first on PATH and the read-scoped identity and port
         /// table exported, so the two doors run one text one way
@@ -1198,11 +1335,19 @@ enum Commands {
     #[command(flatten)]
     Automations(automations::Cmd),
     #[command(flatten)]
+    Classify(classify::Cmd),
+    #[command(flatten)]
     Correct(correct::Cmd),
     #[command(flatten)]
     Credential(credential::Cmd),
     #[command(flatten)]
     Events(events::Cmd),
+    #[command(flatten)]
+    Experiment(experiment::Cmd),
+    #[command(flatten)]
+    Factory(factory::Cmd),
+    #[command(flatten)]
+    GateHold(gate_hold::Cmd),
     #[command(flatten)]
     Ledger(ledger::Cmd),
     #[command(flatten)]
@@ -1321,8 +1466,18 @@ enum CarAction {
         /// The next observable check, as an RFC3339 time.
         #[arg(long)]
         next_check_at: Option<String>,
+        /// The kind of packet whose CLOSE the probe waits on (gate-run,
+        /// ops-request, ...). When one closes, the dispatcher re-runs the
+        /// car's recorded probe at once instead of at the next hourly
+        /// recheck (rule rerun-waiting-probes-on-their-declared-close).
+        #[arg(long)]
+        event_closes: Option<String>,
+        /// Narrow --event-closes to a closing packet whose title starts
+        /// with this (an ops-request's title leads with its verb).
+        #[arg(long, requires = "event_closes")]
+        event_title: Option<String>,
         /// Remove the declaration.
-        #[arg(long, conflicts_with_all = ["on", "seen", "owner", "max_wait_hours", "next_check_at"])]
+        #[arg(long, conflicts_with_all = ["on", "seen", "owner", "max_wait_hours", "next_check_at", "event_closes"])]
         clear: bool,
         /// Print the PATCH body without writing it.
         #[arg(long)]
@@ -1626,6 +1781,16 @@ enum WorkflowAction {
         /// Lint and report without writing anything.
         #[arg(long)]
         dry_run: bool,
+        /// The publish-a-protocol packet whose passkey-stamped approve
+        /// step signs this publish. The server refuses a publish over a
+        /// passkey-protected live row without one (backlog a4b57aca);
+        /// it reads the packet back and checks it signed these bytes.
+        #[arg(long, requires = "signed_path")]
+        approval: Option<String>,
+        /// The tree path the approve step signed (its `spec_path`), when
+        /// the spec file is a copy of it; sent with the file's bytes.
+        #[arg(long, requires = "approval")]
+        signed_path: Option<String>,
     },
     /// Discard a DRAFT version outright — the resolution the publish
     /// guard's "resolve that draft first" refusal names (ebd7bb70).
@@ -1634,6 +1799,18 @@ enum WorkflowAction {
         /// Workflow kind, e.g. `ship-a-change`.
         kind: String,
         /// The draft version to remove.
+        version: i32,
+    },
+    /// Reject a draft that met traffic and lost — an experiment's
+    /// candidate with packets pinned to it, which the discard refuses
+    /// (backlog 50ded63d). The row is kept for those packets and is
+    /// never published, so it no longer blocks `publish`. Refused while
+    /// an open experiment still splits onto it, for history, and for a
+    /// draft no packet ran (discard that one instead).
+    Reject {
+        /// Workflow kind, e.g. `agent-run`.
+        kind: String,
+        /// The draft version to reject.
         version: i32,
     },
 }
@@ -1656,6 +1833,103 @@ enum CadenceAction {
     Publish {
         /// The bundle file to publish.
         file: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum PoolAction {
+    /// Publish one pool row at the version its file declares
+    /// (`infra/platform/pools/<name>.toml`, or the directory, read by
+    /// the seed loader): lint through the door's `_validate`, refuse a
+    /// live lineage already at or past that version, publish, then
+    /// confirm by reading the lineage back.
+    Publish {
+        /// The pool's name, e.g. `robots:opus`.
+        name: String,
+        /// The pool file, or the pools directory it lives in.
+        file: std::path::PathBuf,
+        /// Lint and report without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Refuse unless the live lineage's newest version is exactly
+        /// this one — the version an approved diff was rendered against
+        /// (infra/gcp/publish-pool.sh passes the signed live version).
+        #[arg(long, value_name = "VERSION")]
+        over: Option<i64>,
+    },
+    /// File a publish-a-protocol packet asking the platform owner to
+    /// approve this pool row from the website, instead of publishing it
+    /// (backlog f399458f): the dry run, the diff against live, the row's
+    /// bytes and their sha256 ride on the packet, and on a passkey
+    /// approval the publish-pool verb publishes exactly those bytes. The
+    /// file must be the row's own `<name>.toml`.
+    Request {
+        /// The pool's name, e.g. `robots:opus`.
+        name: String,
+        /// The row's file, `infra/platform/pools/<name>.toml`.
+        file: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// Read or set a session's working window — the hours it works, as
+    /// data on its work-session packet rather than a line in its chat
+    /// (backlog 37e3295c). With no window flag it prints the window;
+    /// `--until`/`--hours`/`--open` set one (an extension is the same
+    /// write); `--close --handoff-file` closes it and leaves the handoff
+    /// on the packet. The session's prompt hook reads it back onto its
+    /// context every prompt, and `boss orient` lists every open
+    /// session's window.
+    Window {
+        /// The work-session packet (full uuid or 8+ characters). Omit it
+        /// to take the newest open work-session of `--actor`.
+        packet: Option<String>,
+        /// Whose open session: matched as its `actor` or `opened_by`.
+        /// Defaults to the actor running this.
+        #[arg(long)]
+        actor: Option<String>,
+        /// The instant the window ends, RFC3339.
+        #[arg(long)]
+        until: Option<String>,
+        /// The window ends this many hours from now — stored as the
+        /// instant, read from the clock at write time.
+        #[arg(long)]
+        hours: Option<f64>,
+        /// Open-ended: the session works until someone sets an end.
+        #[arg(long)]
+        open: bool,
+        /// Close the window; needs `--handoff-file`.
+        #[arg(long, requires = "handoff_file")]
+        close: bool,
+        /// What the closing session leaves for whoever reads next. A
+        /// file, so prose keeps its backticks (2376b89e).
+        #[arg(long, requires = "close")]
+        handoff_file: Option<std::path::PathBuf>,
+        /// Why the window is what it is — who asked, and when.
+        /// Single-quote it.
+        #[arg(long)]
+        why: Option<String>,
+    },
+    /// Start an interactive agent session on the dev pod that is not
+    /// running — `codex` (menu option 2, tmux `codex`) or `claude-b`
+    /// (option 5, tmux `claude-b`) — through the main checkout's
+    /// `infra/dev/dev-session.sh --detached`, the menu's own definition
+    /// (backlog 2a2d11b2). A running session is refused, never joined;
+    /// nothing is killed or typed. What it saw and did is written as
+    /// `session_start_<stamp>` on the agent's newest work-session. Run
+    /// it in the dev pod.
+    Start {
+        /// Which agent's session.
+        #[arg(value_enum)]
+        agent: session_start::Agent,
+        /// Why it is being started — recorded on the note. SINGLE-quote
+        /// it, or use --why-file.
+        #[arg(long, required_unless_present = "why_file")]
+        why: Option<String>,
+        /// The reason, read from this file (2376b89e). Exclusive with --why.
+        #[arg(long, conflicts_with = "why")]
+        why_file: Option<std::path::PathBuf>,
     },
 }
 
@@ -1788,6 +2062,24 @@ enum JobAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Move a packet's priority, with a reason, on the record (backlog
+    /// eb26059d): one narrow write (`PUT /api/jobs/{id}/priority`) that
+    /// sets the field and appends from/to/by/why/at to the packet's
+    /// `priority_changes` — never a whole-body PUT. Refused on a closed
+    /// packet; confirmed by reading it back.
+    Priority {
+        /// Full uuid, 8+ characters of the id, or the car's branch.
+        job: String,
+        /// emergency | urgent | standard | scheduled
+        priority: String,
+        /// Why it moves — recorded beside who moved it. Single-quote it.
+        #[arg(long, required_unless_present = "why_file")]
+        why: Option<String>,
+        /// The reason, read from this file — no shell between the bytes
+        /// and the record (2376b89e). Exclusive with --why.
+        #[arg(long, conflicts_with = "why")]
+        why_file: Option<std::path::PathBuf>,
+    },
     /// Write the `outcome` a CLOSED packet lost, re-derived from its
     /// completed declared terminal under the version it is pinned to —
     /// never typed, and never over a recorded one (228c9a7d: a racing
@@ -1836,6 +2128,7 @@ async fn main() -> Result<()> {
         }
         Commands::Launch(cmd) => launch::dispatch(cmd).await,
         Commands::Roster(cmd) => roster::dispatch(cmd).await,
+        Commands::Browser(cmd) => browser_observation::dispatch(cmd).await,
         Commands::Doctor => doctor::run_install().await,
         Commands::Emit { kind, payload } => cmd_emit(kind, payload).await,
         Commands::Upgrade => upgrade::run().await,
@@ -1975,6 +2268,8 @@ async fn main() -> Result<()> {
                 owner,
                 max_wait_hours,
                 next_check_at,
+                event_closes,
+                event_title,
                 clear,
                 dry_run,
             } => {
@@ -1985,6 +2280,10 @@ async fn main() -> Result<()> {
                     max_wait_hours,
                     next_check_at,
                     clean_window: None,
+                    event: event_closes.map(|closes| car::WaitEventFields {
+                        closes,
+                        title: event_title,
+                    }),
                 };
                 car::waits_on(&given, &fields, clear, dry_run).await
             }
@@ -2017,8 +2316,11 @@ async fn main() -> Result<()> {
                 kind,
                 spec,
                 dry_run,
-            } => workflow::publish(&kind, &spec, dry_run).await,
+                approval,
+                signed_path,
+            } => workflow::publish(&kind, &spec, dry_run, approval.zip(signed_path)).await,
             WorkflowAction::Discard { kind, version } => workflow::discard(&kind, version).await,
+            WorkflowAction::Reject { kind, version } => workflow::reject(&kind, version).await,
         },
         Commands::Ops {
             host,
@@ -2032,6 +2334,15 @@ async fn main() -> Result<()> {
         Commands::Cadence { action } => match action {
             CadenceAction::Retire { name } => cadence::retire(&name).await,
             CadenceAction::Publish { file } => cadence::publish(&file).await,
+        },
+        Commands::Pool { action } => match action {
+            PoolAction::Publish {
+                name,
+                file,
+                dry_run,
+                over,
+            } => pool::publish(&name, &file, dry_run, over).await,
+            PoolAction::Request { name, file } => pool::request(&name, &file).await,
         },
         Commands::Job { action } => match action {
             JobAction::Get { job, json } => job::get(&job, json).await,
@@ -2077,9 +2388,58 @@ async fn main() -> Result<()> {
                 job::convert(&job, to.as_deref(), dry_run).await
             }
             JobAction::Outcome { job, dry_run } => job::outcome(&job, dry_run).await,
+            JobAction::Priority {
+                job,
+                priority,
+                why,
+                why_file,
+            } => {
+                let why =
+                    crate::prose::text_or_file("--why", "--why-file", why, why_file.as_deref())?;
+                job::priority(&job, &priority, &why).await
+            }
         },
+        Commands::Session {
+            action:
+                SessionAction::Window {
+                    packet,
+                    actor,
+                    until,
+                    hours,
+                    open,
+                    close: _,
+                    handoff_file,
+                    why,
+                },
+        } => {
+            session_window::run(session_window::Args {
+                packet,
+                actor,
+                until,
+                hours,
+                open,
+                handoff_file,
+                why,
+            })
+            .await
+        }
+        Commands::Session {
+            action:
+                SessionAction::Start {
+                    agent,
+                    why,
+                    why_file,
+                },
+        } => {
+            let why = crate::prose::text_or_file("--why", "--why-file", why, why_file.as_deref())?;
+            session_start::run(agent, why.trim()).await
+        }
         Commands::Orient { all } => orient::run(all).await,
-        Commands::Brief { packet, profile } => brief::run(packet, profile).await,
+        Commands::Brief {
+            packet,
+            profile,
+            step,
+        } => brief::run(packet, profile, step).await,
         Commands::Dispatch {
             replay_launch: true,
             packet,
@@ -2105,13 +2465,35 @@ async fn main() -> Result<()> {
         Commands::Dispatch {
             started: true,
             packet,
+            local_root,
             ..
-        } => dispatch_started::started(packet.expect("clap requires an exact run")).await,
+        } => {
+            dispatch_started::started(
+                packet.expect("clap requires an exact run"),
+                local_root,
+                chrono::Utc::now(),
+            )
+            .await
+        }
+        Commands::Dispatch {
+            original: Some(which),
+            packet,
+            ..
+        } => start_inputs::original(packet, which).await,
         Commands::Dispatch {
             from_hook: true,
             packet,
             ..
         } => dispatch_hook::run(packet.unwrap_or_default()).await,
+        Commands::Station {
+            action:
+                StationAction::Pull {
+                    station,
+                    model,
+                    budget,
+                    effort,
+                },
+        } => dispatch::next(station, model, budget, effort).await,
         Commands::Dispatch {
             next: true,
             station,
@@ -2119,15 +2501,7 @@ async fn main() -> Result<()> {
             budget,
             effort,
             ..
-        } => {
-            dispatch::next(
-                station.expect("clap requires --station with --next"),
-                model,
-                budget,
-                effort,
-            )
-            .await
-        }
+        } => dispatch::next(station, model, budget, effort).await,
         Commands::Dispatch {
             from_hook: false,
             packet,
@@ -2145,6 +2519,9 @@ async fn main() -> Result<()> {
             tenant_branch,
             tenant_sha,
             force,
+            force_standard,
+            why,
+            why_file,
             launch,
             launch_dir,
             launch_minutes,
@@ -2196,7 +2573,29 @@ async fn main() -> Result<()> {
                     }
                     _ => None,
                 };
-                dispatch::run(packet, step, model, budget, effort, force, launch).await
+                // The why is required with the flag and read through the
+                // one prose door, so an empty or shell-eaten reason is
+                // refused before anything is read (backlog 90bff1f3).
+                let force_standard = match force_standard {
+                    true => Some(crate::prose::text_or_file(
+                        "--why",
+                        "--why-file",
+                        why,
+                        why_file.as_deref(),
+                    )?),
+                    false => None,
+                };
+                dispatch::run(
+                    packet,
+                    step,
+                    model,
+                    budget,
+                    effort,
+                    force,
+                    force_standard,
+                    launch,
+                )
+                .await
             }
         }
         Commands::Channels {
@@ -2400,6 +2799,7 @@ async fn main() -> Result<()> {
         Commands::Gate {
             retire: Some(packet),
             superseded_by,
+            green_anyway,
             dry_run,
             ..
         } => {
@@ -2407,13 +2807,14 @@ async fn main() -> Result<()> {
             let by = superseded_by.ok_or_else(|| {
                 anyhow::anyhow!("boss gate --retire: --superseded-by <landed> is required")
             })?;
-            gate_retire::retire(&packet, &by, dry_run).await
+            gate_retire::retire(&packet, &by, green_anyway.as_deref(), dry_run).await
         }
         Commands::Gate {
             branch,
             withdraw: _,
             retire: _,
             superseded_by: _,
+            green_anyway: _,
             reason: _,
             reason_file: _,
             mode,
@@ -2446,6 +2847,7 @@ async fn main() -> Result<()> {
             stale_base_anyway,
             rebase,
             hold,
+            despite_hold,
         } => {
             // clap holds --park-file exclusive with every flag it
             // carries, so at most one side of each `or` is present.
@@ -2487,6 +2889,7 @@ async fn main() -> Result<()> {
                     max_wait_hours: park_waits_on_max_wait_hours,
                     next_check_at: None,
                     clean_window: None,
+                    event: None,
                 }),
             };
             // clap requires the branch unless --withdraw is present, and
@@ -2506,6 +2909,7 @@ async fn main() -> Result<()> {
                 stale_base_anyway,
                 rebase,
                 hold,
+                despite_hold,
                 // Wall-clock at the CLI boundary, minted once: the queue's
                 // ordering key and its heartbeat are real elapsed time on
                 // a real build node, not a business date. The waiting loop
@@ -2558,14 +2962,18 @@ async fn main() -> Result<()> {
         // `Commands` says why (84f9fbc0).
         Commands::Attach(cmd) => attach::dispatch(cmd).await,
         Commands::Automations(cmd) => automations::dispatch(cmd, chrono::Utc::now()).await,
+        Commands::Classify(cmd) => classify::dispatch(cmd).await,
         Commands::Correct(cmd) => correct::dispatch(cmd).await,
         Commands::Credential(cmd) => credential::dispatch(cmd).await,
         Commands::Events(cmd) => events::dispatch(cmd).await,
+        Commands::Experiment(cmd) => experiment::dispatch(cmd, chrono::Utc::now).await,
+        Commands::Factory(cmd) => factory::dispatch(cmd).await,
+        Commands::GateHold(cmd) => gate_hold::dispatch(cmd, chrono::Utc::now()).await,
         Commands::Ledger(cmd) => ledger::dispatch(cmd).await,
         Commands::Merged(cmd) => merged::dispatch(cmd),
         Commands::Receipt(cmd) => receipt::dispatch(cmd).await,
         Commands::Repair(cmd) => repair::dispatch(cmd).await,
-        Commands::Running(cmd) => running::dispatch(cmd),
+        Commands::Running(cmd) => running::dispatch(cmd).await,
         Commands::Steps(cmd) => steps::dispatch(cmd).await,
         Commands::Tenant(cmd) => tenant::dispatch(cmd).await,
         Commands::Estate(cmd) => estate::dispatch(cmd),
@@ -2614,6 +3022,39 @@ async fn cmd_emit(kind: String, payload: String) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_robot_can_explicitly_pull_the_company_root() {
+        use clap::Parser;
+        let answer =
+            super::Cli::try_parse_from(["boss", "station", "pull", "--station", "company"]);
+        assert!(
+            answer.is_ok(),
+            "the root pull door must parse: {}",
+            answer.err().unwrap()
+        );
+    }
+
+    /// `boss brief <packet> --step <slug>` parses to the selector the
+    /// renderer takes (05b9a54d); without it there is none.
+    #[test]
+    fn boss_brief_takes_a_step() {
+        use clap::Parser;
+        let parsed = super::Cli::try_parse_from(["boss", "brief", "05b9a54d", "--step", "proven"])
+            .expect("parses");
+        assert!(
+            matches!(
+                parsed.command,
+                super::Commands::Brief { step: Some(ref s), .. } if s == "proven"
+            ),
+            "the step reaches the command"
+        );
+        let bare = super::Cli::try_parse_from(["boss", "brief", "05b9a54d"]).expect("parses");
+        assert!(matches!(
+            bare.command,
+            super::Commands::Brief { step: None, .. }
+        ));
+    }
+
     #[test]
     fn compiler_input_collection_is_an_exclusive_local_read() {
         use clap::Parser;
@@ -2783,6 +3224,24 @@ mod tests {
     #[test]
     fn command_tree_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn prove_help_states_the_probe_locale_and_timezone() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("prove")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for promise in ["LC_ALL=C", "TZ=UTC", "rehearsal", "unattended"] {
+            assert!(help.contains(promise), "missing {promise}: {help}");
+        }
+        let words = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains("host-free recheck, --disproved and unattended doors"),
+            "the locale promise must name the disproved door too: {help}"
+        );
     }
 
     /// NO VERB DEFAULTS TO A DATABASE (backlog 05cd6572, 52dc6ffb). Five
@@ -3104,6 +3563,68 @@ mod tests {
         }
     }
 
+    /// A retirement launches nothing and files no car, so a park or
+    /// namespace flag beside it is REFUSED by name, never dropped in
+    /// silence (F4 of review 10cfcb8b, backlog 1fb357f4) — and
+    /// --namespace's default does not count as typing it. A green's
+    /// reason means nothing without the retirement it explains.
+    #[test]
+    fn a_retirement_refuses_the_park_and_namespace_flags_by_name() {
+        let retire = [
+            "boss",
+            "gate",
+            "--retire",
+            "02686d0a",
+            "--superseded-by",
+            "feat/x-2",
+        ];
+        Cli::try_parse_from(retire)
+            .unwrap_or_else(|e| panic!("the namespace default is not a conflict: {e}"));
+        Cli::try_parse_from(retire.iter().copied().chain(["--green-anyway", "why"]))
+            .unwrap_or_else(|e| panic!("a green retired on purpose parses: {e}"));
+        for (flag, value) in [
+            ("--namespace", "boss-dev"),
+            ("--park-summary", "s"),
+            ("--park-excludes", "e"),
+            ("--park-test", "t"),
+            ("--park-verified", "v"),
+            ("--park-backlog-item", "1fb357f4"),
+            ("--park-partial-item", "1fb357f4"),
+            ("--park-no-item", "why"),
+            ("--park-design", "d"),
+            ("--park-after", "c"),
+            ("--park-also-answers", "i"),
+            ("--park-probe", "true"),
+            ("--park-probe-file", "p.sh"),
+            ("--park-expect", "ok"),
+            ("--park-expect-file", "e.txt"),
+            ("--park-proof-event", "ev"),
+            ("--park-waits-on", "w"),
+            ("--park-waits-on-seen", "true"),
+            ("--park-waits-on-owner", "world"),
+            ("--park-waits-on-max-wait-hours", "4"),
+            ("--park-file", "park.toml"),
+        ] {
+            let e = Cli::try_parse_from(retire.iter().copied().chain([flag, value]))
+                .err()
+                .unwrap_or_else(|| panic!("--retire beside {flag} must be refused"));
+            assert_eq!(
+                e.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flag}: {e}"
+            );
+            let said = e.to_string();
+            assert!(
+                said.contains("--retire") && said.contains(flag),
+                "{flag}: the refusal names both flags: {said}"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["boss", "gate", "feat/x", "--green-anyway", "why"]).is_err(),
+            "--green-anyway needs --retire"
+        );
+    }
+
     /// The OPTIONAL prose flags get the same twin (backlog 6f1e9b99):
     /// absent is still absent, either alone parses, both together are
     /// refused. `boss prove --verified` and `--method` are sentences a
@@ -3174,6 +3695,45 @@ mod tests {
                 "--unattended with {flag}"
             );
         }
+    }
+
+    #[test]
+    fn bounded_original_reads_and_worker_binding_keep_their_distinct_flags() {
+        assert!(
+            Cli::try_parse_from([
+                "boss",
+                "dispatch",
+                "own-run",
+                "--started",
+                "--local-root",
+                "/workspace/source"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "boss",
+                "dispatch",
+                "own-run",
+                "--local-root",
+                "/workspace/source"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["boss", "dispatch", "own-run", "--original", "snapshot"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "boss",
+                "dispatch",
+                "own-run",
+                "--original",
+                "snapshot",
+                "--started"
+            ])
+            .is_err()
+        );
     }
 
     /// ONE FILE FOR A PARK, NOT SIX TWINS (backlog 6f1e9b99). The park
@@ -3316,10 +3876,20 @@ mod tests {
                 "`boss job {expected}` is gone; present: {under_job:?}"
             );
         }
-        // `station` is NOT a top-level verb: a new packet-read verb
-        // belongs inside this grouping, which touches no contended line.
+        // Reading a station stays under job. The top-level station
+        // command owns only the native pull mutation, not another reader.
         let top: Vec<&str> = cmd.get_subcommands().map(|c| c.get_name()).collect();
-        assert!(!top.contains(&"station"), "present: {top:?}");
+        let station = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "station")
+            .expect("native station pull");
+        assert_eq!(
+            station
+                .get_subcommands()
+                .map(|c| c.get_name())
+                .collect::<Vec<_>>(),
+            vec!["pull"]
+        );
         assert!(
             !top.contains(&"show"),
             "`boss job get` already reads a packet — a second way to read one is the \

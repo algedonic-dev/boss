@@ -65,6 +65,18 @@
 //! them. Nothing in this module names a finding class: the raiser's
 //! vocabulary is the recovery vocabulary.
 //!
+//! A RECOVERY IS HELD OPEN BEFORE IT CLOSES (backlog f4b0ad41, THE HOLD
+//! — decided by David 2026-11-17; `common::hold`). The first pass that
+//! reads the finding absent N times writes the RECOVERED note and leaves
+//! the alarm open for the rule's `hold_days` window (seven by default).
+//! A comparison that carries the finding again inside the window is a
+//! relapse, appended to this alarm through `alarm_item` with the note
+//! withdrawn — the branch below that has always withdrawn a note. Only
+//! the first pass at or past the window, still reading N clean
+//! comparisons, closes it as described next, with `recovered_at` the
+//! instant the note was written. Measured by run 3f4ed839: closing on
+//! the clear had filed 55 estate items the hold would have appended.
+//!
 //! THE CLOSE IS THE STEP THE PACKET IS WAITING ON — `triage`, or, once
 //! a person has routed the alarm, the ready `build`/`measure` it was
 //! routed to; where the machine may not complete that step it writes a
@@ -75,10 +87,11 @@
 //! holds", and what all three hand-closes chose — plus `evidence`
 //! naming the finding, the host, and the N clean comparisons with
 //! their instants. `recovered_at` rides both the step and the packet's
-//! metadata (PATCH, merge) so the recovery can be read off the packet
-//! without opening the step; the instant is the newest clean
-//! comparison's own stamp — a fact of the record, the same on every
-//! redelivery — not the moment the machine noticed. The step is
+//! metadata (the held note put it there) so the recovery can be read off
+//! the packet without opening the step; the instant is the newest clean
+//! comparison's own stamp when the note was written — a fact of the
+//! record, the same on every redelivery — not the moment the machine
+//! noticed. The step is
 //! stamped [`CLEARED_BY`] so the raiser's settled-suppression can tell
 //! a machine clear from a human's answer: a finding that recovers and
 //! then persists again is a new fact and must re-raise, where a human's
@@ -97,9 +110,11 @@ use serde_json::{Map, Value, json};
 
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 
+use super::alarm_item::{self, Occurrence};
 use super::common::{
-    RECOVERED_AT, Retraction, api_client, complete_step, get_json, recovery_note, relapse_patch,
-    retraction, rows_or_refuse, write_json,
+    Hold, Retraction, api_client, complete_step, get_json, held_evidence, held_recovery, hold,
+    hold_end_note, hold_note, hold_window, recovery_note, retraction, rows_or_refuse,
+    told_recovered, write_json,
 };
 use super::estate_alarm::{DEDUP_PAGE, PERSIST_N, evaluated, query_safe, unrecovered_keys};
 
@@ -242,7 +257,10 @@ pub(super) fn recovered(
                 return None;
             }
             let retraction = retraction(alarm)?;
-            if matches!(retraction, Retraction::Annotate { .. }) && already_told(alarm) {
+            if matches!(retraction, Retraction::Annotate { .. })
+                && told_recovered(alarm)
+                && !held_recovery(alarm)
+            {
                 return None;
             }
             Some(Recovery {
@@ -255,14 +273,6 @@ pub(super) fn recovered(
             })
         })
         .collect()
-}
-
-/// Does this open alarm already carry a recovery note?
-fn already_told(alarm: &Value) -> bool {
-    alarm
-        .get("metadata")
-        .and_then(|m| m.get(RECOVERED_AT))
-        .is_some_and(|v| !v.is_null())
 }
 
 /// The fields that close one recovered alarm — at `triage`, or at the
@@ -304,7 +314,7 @@ fn evidence(r: &Recovery, n: usize) -> String {
          (a comparison whose reading of it was unmeasured or unread is not \
          counted). The condition has recovered, so the claim this alarm \
          carried no longer holds. \
-         Closed by machine from the record, not by judgement (backlog \
+         Read by machine from the record, not by judgement (backlog \
          ef421cd3: three of these were read off the record and typed in by \
          hand). The series rides /api/estate/comparisons?scope={scope}.",
         scope = r.scope,
@@ -323,10 +333,35 @@ fn recovered_at(r: &Recovery) -> String {
         .unwrap_or_default()
 }
 
-/// The merge onto the packet's own metadata: the recovery, readable
-/// without opening the step.
-pub(super) fn recovered_patch(r: &Recovery) -> Value {
-    json!({"recovered_at": recovered_at(r)})
+/// The RECOVERED note that holds a recovered alarm open for its window
+/// (backlog f4b0ad41): the recovery, readable without opening the step,
+/// stamped with the newest clean comparison's instant.
+pub(super) fn held_patch(r: &Recovery, n: usize, window: chrono::Duration) -> Value {
+    Value::Object(hold_note(
+        &evidence(r, n),
+        CLEARED_BY,
+        &recovered_at(r),
+        window,
+    ))
+}
+
+/// The fields that withdraw a held alarm whose window passed with no
+/// relapse: [`clear_step_fields`], with the hold said first and the
+/// instant the record first showed the recovery — the one the note
+/// carried — rather than this pass's newest clean comparison.
+pub(super) fn held_step_fields(
+    r: &Recovery,
+    n: usize,
+    held: &str,
+    told_at: &str,
+) -> Map<String, Value> {
+    let mut fields = clear_step_fields(r, n);
+    fields.insert(
+        "evidence".into(),
+        json!(format!("{held} {}", evidence(r, n))),
+    );
+    fields.insert("recovered_at".into(), json!(told_at));
+    fields
 }
 
 #[async_trait]
@@ -337,9 +372,10 @@ impl Handler for EstateRecover {
 
     async fn invoke(
         &self,
-        _args: &[(String, boss_dispatcher::rules::expr::Value)],
+        args: &[(String, boss_dispatcher::rules::expr::Value)],
         ctx: &InvocationContext,
     ) -> Result<(), HandlerError> {
+        let window = hold_window(args).map_err(HandlerError::Permanent)?;
         let comparison = &ctx.event_payload;
         let scope = comparison
             .get("scope")
@@ -407,16 +443,29 @@ impl Handler for EstateRecover {
         // A routed alarm told RECOVERED whose finding is back must stop
         // saying so (a2d8bad3): the note is withdrawn on the first
         // reading that carries the finding again.
-        for a in alarms.iter().filter(|a| already_told(a) && is_present(a)) {
+        for a in alarms.iter().filter(|a| told_recovered(a) && is_present(a)) {
             let (Some(id), Some(key)) = (a.get("id").and_then(Value::as_str), finding_key(a))
             else {
                 continue;
+            };
+            // The relapse is an occurrence on the alarm, recorded beside
+            // the withdrawal (backlog f4b0ad41) — this handler is its one
+            // writer for estate alarms; `estate.alarm` holds while open.
+            let occ = Occurrence {
+                at: comparison
+                    .get("observed_at")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| ctx.firing_instant().ok().map(|t| t.to_rfc3339())),
+                ..Occurrence::unstamped(format!(
+                    "estate.recover: a {scope} comparison carries {key} again"
+                ))
             };
             if let Err(e) = write_json(
                 &self.client,
                 reqwest::Method::PATCH,
                 &format!("{}/api/jobs/{id}/metadata", self.base()),
-                &relapse_patch(),
+                &Value::Object(alarm_item::occurrence_patch(a, &occ)),
                 &ctx.rule_name,
             )
             .await
@@ -462,36 +511,76 @@ impl Handler for EstateRecover {
         )
         .map_err(HandlerError::Downstream)?;
 
+        // When this pass reads the record: the comparison's own stamp,
+        // else the firing's. With neither, a held alarm's window is never
+        // judged to have passed (`common::hold`).
+        let now = comparison
+            .get("observed_at")
+            .and_then(Value::as_str)
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&Utc))
+            .or_else(|| ctx.firing_instant().ok());
+
         for r in recovered(&open_rows, &rows, scope, host, PERSIST_N) {
             let key = &r.key;
-            let (slug, step_id) = match &r.retraction {
-                Retraction::Complete { slug, step_id } => (slug, step_id),
-                // A route the machine may not complete: tell the packet.
-                Retraction::Annotate { why_open } => {
+            let Some(alarm) = alarms
+                .iter()
+                .find(|a| a.get("id").and_then(Value::as_str) == Some(r.job_id.as_str()))
+            else {
+                continue;
+            };
+            // THE HOLD (backlog f4b0ad41): a recovery is a RECOVERED note
+            // and the alarm stays open; only a window with no relapse —
+            // the relapse branch above withdraws the note — closes it.
+            let (slug, step_id, told_at) = match hold(alarm, r.retraction.clone(), now, window) {
+                Hold::Holding => continue,
+                Hold::Withdraw {
+                    slug,
+                    step_id,
+                    recovered_at,
+                } => (slug, step_id, recovered_at),
+                // Held open, or — a route the machine may not
+                // complete — told, for a person to close.
+                told => {
+                    let (note, what) = match &told {
+                        Hold::End { why_open } => (
+                            Value::Object(hold_end_note(&evidence(&r, PERSIST_N), why_open)),
+                            "ended the recovery hold on the routed alarm",
+                        ),
+                        Hold::Annotate { why_open } => {
+                            (note_patch(&r, PERSIST_N, why_open), "told the routed alarm")
+                        }
+                        _ => (
+                            held_patch(&r, PERSIST_N, window),
+                            "held the alarm open RECOVERED for its window",
+                        ),
+                    };
                     if let Err(e) = write_json(
                         &self.client,
                         reqwest::Method::PATCH,
                         &format!("{}/api/jobs/{}/metadata", self.base(), r.job_id),
-                        &note_patch(&r, PERSIST_N, why_open),
+                        &note,
                         &ctx.rule_name,
                     )
                     .await
                     {
-                        errors.push(format!(
-                            "recovery note on the routed alarm for {key} failed: {e}"
-                        ));
+                        errors.push(format!("recovery note on the alarm for {key} failed: {e}"));
                         continue;
                     }
-                    tracing::info!(finding = %key, packet = %r.job_id, why_open = %why_open, "estate.recover: the finding has recovered; told the routed alarm");
+                    tracing::info!(finding = %key, packet = %r.job_id, "estate.recover: the finding has recovered; {what}");
                     continue;
                 }
+            };
+            let held = match now {
+                Some(now) => held_evidence(alarm, CLEARED_BY, window, now),
+                None => continue,
             };
             if let Err(e) = complete_step(
                 &self.client,
                 self.base(),
                 &r.job_id,
-                step_id,
-                clear_step_fields(&r, PERSIST_N),
+                &step_id,
+                held_step_fields(&r, PERSIST_N, &held, &told_at),
                 &ctx.rule_name,
             )
             .await
@@ -501,25 +590,11 @@ impl Handler for EstateRecover {
                 ));
                 continue;
             }
-            if let Err(e) = write_json(
-                &self.client,
-                reqwest::Method::PATCH,
-                &format!("{}/api/jobs/{}/metadata", self.base(), r.job_id),
-                &recovered_patch(&r),
-                &ctx.rule_name,
-            )
-            .await
-            {
-                errors.push(format!(
-                    "recovered_at annotation on the closed alarm for {key} failed (the step carries it): {e}"
-                ));
-                continue;
-            }
             tracing::info!(
                 finding = %key,
                 scope,
                 packet = %r.job_id,
-                "estate.recover closed an alarm — the finding has been absent {PERSIST_N} consecutive comparisons"
+                "estate.recover closed an alarm — held open RECOVERED for its window with no relapse"
             );
         }
 
@@ -543,6 +618,7 @@ fn finish(errors: Vec<String>) -> Result<(), HandlerError> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::common::RECOVERED_AT;
     use super::*;
     use chrono::TimeZone;
 
@@ -1117,7 +1193,10 @@ mod tests {
                 compare_volumes(&json!({"scope": "instance-volumes", "nodes": [{
                     "id": "boss/pgdata-postgres-0", "namespace": "boss",
                     "claim": "pgdata-postgres-0", "volume": "pvc-93e11a6e",
-                    "capacity_bytes": 32_212_254_720_i64, "free_bytes": 1_073_741_824_i64}]})),
+                    "capacity_bytes": 32_212_254_720_i64, "free_bytes": 1_073_741_824_i64,
+                    "scheduled_job": {"id":"boss/boss-pg-backup", "state":"failed",
+                        "job_uid":"failed-uid", "cronjob_uid":"cron-uid",
+                        "reason":"BackoffLimitExceeded"}}]})),
             ),
             (
                 "kubernetes-nodes",
@@ -1126,10 +1205,12 @@ mod tests {
                         json!({"id": "cp-2", "role": "talos-worker"}),
                         json!({"id": "w-2", "role": "talos-worker"}),
                     ],
-                    &json!({"scope": "kubernetes-nodes",
+                    &json!({"scope": "kubernetes-nodes", "observed_at":"2026-10-30T14:00:00Z",
                         "nodes": [{"id": "cp-2", "ready": false, "disk_gb": 929, "disk_free_gb": 10}],
                         "dispatcher": {"dead_letters": 5, "dead_letters_unrecorded": 2,
-                                       "last_unrecorded_dead_letter_unix": 0}}),
+                                       "last_unrecorded_dead_letter_unix": 1793368800,
+                                       "rules_consumer_lag":{"status":"observed","observed_at_unix":1793368800,
+                                           "pending":1001,"ack_pending":12}}}),
                 ),
             ),
             (
@@ -1250,15 +1331,39 @@ mod tests {
         );
     }
 
+    /// The held note carries the recovery instant, who read it, and the
+    /// evidence — the three keys a relapse withdraws (f4b0ad41).
     #[test]
-    fn the_packet_patch_carries_the_recovery_instant() {
-        let patch = recovered_patch(&a_recovery());
-        assert_eq!(patch["recovered_at"], at(45).to_rfc3339());
+    fn the_held_note_carries_the_recovery_instant_and_the_window() {
+        let patch = held_patch(&a_recovery(), 3, chrono::Duration::days(7));
+        assert_eq!(patch[RECOVERED_AT], at(45).to_rfc3339());
+        assert_eq!(patch["recovered_by"], CLEARED_BY);
+        let text = patch["recovery"].as_str().expect("a sentence");
+        assert!(text.contains(KEY), "{text}");
+        assert!(text.contains("HELD OPEN for 7 day(s)"), "{text}");
+        let relapse = super::super::common::relapse_patch();
         assert_eq!(
-            patch.as_object().map(Map::len),
-            Some(1),
-            "a merge of exactly the recovery instant — who closed it lives once, on the step"
+            patch.as_object().map(|m| m.keys().collect::<Vec<_>>()),
+            relapse.as_object().map(|m| m.keys().collect::<Vec<_>>()),
         );
+    }
+
+    /// The close at the end of a quiet window: the workflow's fields,
+    /// the hold said first, and the instant the NOTE carried.
+    #[test]
+    fn a_held_close_carries_the_instant_it_was_told() {
+        let m = held_step_fields(
+            &a_recovery(),
+            3,
+            "held seven days.",
+            "2026-09-05T00:00:00+00:00",
+        );
+        assert_eq!(m["disposition"], "stale");
+        assert_eq!(m["cleared_by"], CLEARED_BY);
+        assert_eq!(m["recovered_at"], "2026-09-05T00:00:00+00:00");
+        let evidence = m["evidence"].as_str().unwrap();
+        assert!(evidence.starts_with("held seven days. "), "{evidence}");
+        assert!(evidence.contains("3 consecutive"), "{evidence}");
     }
 
     // ----- the writes, witnessed against a stub jobs API -----
@@ -1385,15 +1490,11 @@ mod tests {
         }
     }
 
+    /// THE HOLD, pin 1 (backlog f4b0ad41): a recovered alarm is NOT
+    /// closed — it stays open, told RECOVERED, with no step written.
     #[tokio::test]
-    async fn a_recovered_alarm_is_closed_through_its_triage_step_and_stamped() {
-        let clean = units_row("boss-gcp", &[], at(45));
-        let rows = vec![
-            clean.clone(),
-            units_row("boss-gcp", &[], at(40)),
-            units_row("boss-gcp", &[], at(35)),
-            units_row("boss-gcp", &[UNIT], at(-5)),
-        ];
+    async fn a_clear_keeps_the_item_open_and_recovered() {
+        let (clean, rows) = clean_series();
         let open = vec![alarm(
             "fdd10ec8",
             KEY,
@@ -1402,28 +1503,157 @@ mod tests {
             "open",
         )];
         let (base, puts, patches) = stub(open, rows).await;
-        let handler = EstateRecover::new(&base);
+        EstateRecover::new(&base)
+            .invoke(&[], &firing(payload(&clean).clone()))
+            .await
+            .expect("the note answered");
 
-        handler
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "no step is completed on the clear: {:?}",
+            puts.lock().unwrap()
+        );
+        let patches = patches.lock().unwrap();
+        assert_eq!(patches.len(), 1, "one note: {patches:?}");
+        assert_eq!(patches[0].0, "fdd10ec8");
+        assert_eq!(patches[0].1[RECOVERED_AT], at(45).to_rfc3339());
+        assert_eq!(patches[0].1["recovered_by"], CLEARED_BY);
+        let text = patches[0].1["recovery"].as_str().expect("a sentence");
+        assert!(text.contains("HELD OPEN for 7 day(s)"), "{text}");
+    }
+
+    /// The alarm the clear above left: open, told RECOVERED at `told`.
+    fn held(id: &str, told: DateTime<Utc>) -> Value {
+        let mut a = alarm(id, KEY, "host-units", Some("boss-gcp"), "open");
+        a["metadata"][RECOVERED_AT] = json!(told.to_rfc3339());
+        a["metadata"]["recovered_by"] = json!(CLEARED_BY);
+        a["metadata"]["recovery"] = json!("RECOVERED — ... HELD OPEN for 7 day(s) ...");
+        a
+    }
+
+    /// The same clean series as [`clean_series`], `days` later.
+    fn clean_series_after(days: i64) -> (Value, Vec<Value>) {
+        let d = days * 1440;
+        let clean = units_row("boss-gcp", &[], at(d + 45));
+        let rows = vec![
+            clean.clone(),
+            units_row("boss-gcp", &[], at(d + 40)),
+            units_row("boss-gcp", &[], at(d + 35)),
+            units_row("boss-gcp", &[UNIT], at(-5)),
+        ];
+        (clean, rows)
+    }
+
+    /// Inside its window a held alarm is left alone: the comparison
+    /// fires every few minutes, and a packet told once is told.
+    #[tokio::test]
+    async fn a_held_alarm_inside_its_window_writes_nothing() {
+        let (clean, rows) = clean_series_after(6);
+        let (base, puts, patches) = stub(vec![held("fdd10ec8", at(45))], rows).await;
+        EstateRecover::new(&base)
+            .invoke(&[], &firing(payload(&clean).clone()))
+            .await
+            .expect("a hold is not an error");
+        assert!(puts.lock().unwrap().is_empty());
+        assert!(patches.lock().unwrap().is_empty());
+    }
+
+    /// THE HOLD, pin 3: the first comparison at or past the window,
+    /// still clean, withdraws the alarm through its triage step, stamped
+    /// `cleared_by` (so the raiser re-raises a later persistence) and
+    /// carrying the instant it was told.
+    #[tokio::test]
+    async fn a_quiet_window_withdraws_the_held_alarm() {
+        let (clean, rows) = clean_series_after(7);
+        let (base, puts, patches) = stub(vec![held("fdd10ec8", at(45))], rows).await;
+        EstateRecover::new(&base)
             .invoke(&[], &firing(payload(&clean).clone()))
             .await
             .expect("both writes answered");
-
         let puts = puts.lock().unwrap();
-        assert_eq!(
-            puts.len(),
-            2,
-            "one recovery: the fields through the merge door, then the flip: {puts:?}"
-        );
+        assert_eq!(puts.len(), 2, "the merge, then the flip: {puts:?}");
         assert_eq!(puts[0].0, "fdd10ec8-triage/metadata");
         assert_eq!(puts[0].1["disposition"], "stale");
         assert_eq!(puts[0].1["cleared_by"], CLEARED_BY);
+        assert_eq!(puts[0].1["recovered_at"], at(45).to_rfc3339());
+        let evidence = puts[0].1["evidence"].as_str().unwrap();
+        assert!(
+            evidence.contains("held this item open 7 day(s)"),
+            "{evidence}"
+        );
         assert_eq!(puts[1].0, "fdd10ec8-triage");
         assert_eq!(puts[1].1, json!({"status": "completed"}));
+        assert!(
+            patches.lock().unwrap().is_empty(),
+            "the packet already carries recovered_at — the note put it there"
+        );
+    }
+
+    /// THE HOLD, pin 2: a relapse inside the window is appended to the
+    /// held alarm — counted, logged as a relapse — and the note is
+    /// withdrawn; nothing is closed and nothing new is filed.
+    #[tokio::test]
+    async fn a_relapse_in_the_window_appends_to_the_held_alarm() {
+        let sick = units_row("boss-gcp", &[UNIT], at(3 * 1440));
+        let (base, puts, patches) = stub(vec![held("fdd10ec8", at(45))], vec![sick.clone()]).await;
+        EstateRecover::new(&base)
+            .invoke(&[], &firing(payload(&sick).clone()))
+            .await
+            .expect("the append answered");
+        assert!(puts.lock().unwrap().is_empty());
         let patches = patches.lock().unwrap();
-        assert_eq!(patches.len(), 1, "one recovery, one packet annotation");
+        assert_eq!(patches.len(), 1, "one append: {patches:?}");
         assert_eq!(patches[0].0, "fdd10ec8");
-        assert_eq!(patches[0].1["recovered_at"], at(45).to_rfc3339());
+        assert_eq!(patches[0].1[RECOVERED_AT], Value::Null);
+        assert_eq!(patches[0].1["recovery"], Value::Null);
+        assert_eq!(patches[0].1[alarm_item::OCCURRENCES], 2);
+        assert_eq!(patches[0].1[alarm_item::OCCURRENCE_LOG][0]["relapse"], true);
+    }
+
+    /// The shipped row declares the seven-day hold of David's decision
+    /// rather than leaving it to the default.
+    #[test]
+    fn the_shipped_rule_declares_a_seven_day_hold() {
+        let raw =
+            boss_dispatcher::rules::registry::parse_raw_path(boss_testing::dispatcher_rules_dir())
+                .expect("parse the shipped rule registry");
+        let declared: Vec<&str> = raw
+            .rules
+            .iter()
+            .flat_map(|r| r.do_steps.iter())
+            .filter(|d| d.handler == "estate.recover")
+            .filter_map(|d| d.args.get(super::super::common::HOLD_DAYS))
+            .map(|v| v.trim())
+            .collect();
+        assert_eq!(declared, ["7"]);
+    }
+
+    /// The window is the rule's: a declared `hold_days` shortens it, and
+    /// a malformed one refuses the firing by name before any write.
+    #[tokio::test]
+    async fn the_window_is_the_rules_hold_days() {
+        use boss_dispatcher::rules::expr::Value as Arg;
+        let (clean, rows) = clean_series_after(2);
+        let (base, puts, _) = stub(vec![held("fdd10ec8", at(45))], rows).await;
+        let handler = EstateRecover::new(&base);
+        handler
+            .invoke(
+                &[(super::super::common::HOLD_DAYS.into(), Arg::Int(2))],
+                &firing(payload(&clean).clone()),
+            )
+            .await
+            .expect("both writes answered");
+        assert_eq!(puts.lock().unwrap().len(), 2, "two days is a passed window");
+        let refused = handler
+            .invoke(
+                &[(super::super::common::HOLD_DAYS.into(), Arg::Int(0))],
+                &firing(payload(&clean).clone()),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(HandlerError::Permanent(_))),
+            "{refused:?}"
+        );
     }
 
     /// THE OPEN-ALARM READ ASKS ONLY FOR ESTATE PACKETS (backlog
@@ -1449,14 +1679,19 @@ mod tests {
             Some("boss-gcp"),
             "open",
         )];
-        let (base, puts, _) = stub(open, rows).await;
+        let (base, _, patches) = stub(open, rows).await;
         EstateRecover::new(&base)
             .invoke(&[], &firing(payload(&clean).clone()))
             .await
-            .expect("both writes answered");
-        let puts = puts.lock().unwrap();
-        assert_eq!(puts.len(), 2, "found past the page and closed: {puts:?}");
-        assert_eq!(puts[1].0, "fdd10ec8-triage");
+            .expect("the note answered");
+        let patches = patches.lock().unwrap();
+        assert_eq!(
+            patches.len(),
+            1,
+            "found past the page and held: {patches:?}"
+        );
+        assert_eq!(patches[0].0, "fdd10ec8");
+        assert_eq!(patches[0].1[RECOVERED_AT], at(45).to_rfc3339());
     }
 
     /// The alarm after a person triaged it: `triage` completed with
@@ -1488,12 +1723,14 @@ mod tests {
     /// (disk_tight:w-1) and c6c797cd were triaged to `build`, and the
     /// machine's only exit was the triage step a person had already
     /// completed. Now it withdraws at the ready build step, stamped, so
-    /// the raiser reads it as a machine clear and re-raises a relapse.
+    /// the raiser reads it as a machine clear and re-raises a relapse —
+    /// once its hold window has passed (f4b0ad41).
     #[tokio::test]
     async fn a_recovered_alarm_routed_to_build_closes_at_its_build_step() {
-        let (clean, rows) = clean_series();
-        let (base, puts, patches) =
-            stub(vec![routed("e1fea3b2", "build", "build", "ready")], rows).await;
+        let (clean, rows) = clean_series_after(7);
+        let mut routed = routed("e1fea3b2", "build", "build", "ready");
+        routed["metadata"][RECOVERED_AT] = json!(at(45).to_rfc3339());
+        let (base, puts, patches) = stub(vec![routed], rows).await;
         EstateRecover::new(&base)
             .invoke(&[], &firing(payload(&clean).clone()))
             .await
@@ -1510,16 +1747,38 @@ mod tests {
             puts[0].1.get("agent_profile").is_none(),
             "the step's own keys are not re-sent: the merge door keeps them"
         );
+        assert_eq!(puts[0].1["recovered_at"], at(45).to_rfc3339());
         assert_eq!(puts[1].0, "e1fea3b2-build");
         assert_eq!(puts[1].1, json!({"status": "completed"}));
-        let patches = patches.lock().unwrap();
-        assert_eq!(patches.len(), 1);
-        assert_eq!(patches[0].1["recovered_at"], at(45).to_rfc3339());
+        assert!(patches.lock().unwrap().is_empty());
     }
 
     /// A route the machine may not complete — the design route here —
     /// is TOLD: no step write, one packet note saying RECOVERED and why
     /// it is still open.
+    #[tokio::test]
+    async fn a_recovery_hold_ends_on_a_design_routed_estate_alarm_without_completing_it() {
+        let (clean, rows) = clean_series();
+        let mut alarm = routed("d1", "design", "draft-design", "ready");
+        alarm["metadata"][RECOVERED_AT] = json!(at(40).to_rfc3339());
+        alarm["metadata"]["held_days"] = json!(7);
+        let (base, puts, patches) = stub(vec![alarm], rows).await;
+        EstateRecover::new(&base)
+            .invoke(&[], &firing(payload(&clean).clone()))
+            .await
+            .unwrap();
+        assert!(puts.lock().unwrap().is_empty());
+        let patches = patches.lock().unwrap();
+        assert_eq!(patches.len(), 1, "{patches:?}");
+        assert_eq!(patches[0].1.get("held_days"), Some(&Value::Null));
+        assert!(
+            patches[0].1["recovery"]
+                .as_str()
+                .unwrap()
+                .contains("HOLD ENDED")
+        );
+    }
+
     #[tokio::test]
     async fn a_recovered_alarm_routed_to_design_is_told_not_closed() {
         let (clean, rows) = clean_series();
@@ -1571,7 +1830,12 @@ mod tests {
         let patches = patches.lock().unwrap();
         assert_eq!(patches.len(), 1, "one withdrawal");
         assert_eq!(patches[0].0, "d1");
-        assert_eq!(patches[0].1, super::super::common::relapse_patch());
+        for (key, withdrawn) in super::super::common::relapse_patch().as_object().unwrap() {
+            assert_eq!(&patches[0].1[key], withdrawn, "{key}: {patches:?}");
+        }
+        // The relapse is an occurrence on the alarm (backlog f4b0ad41).
+        assert_eq!(patches[0].1[alarm_item::OCCURRENCES], 2);
+        assert_eq!(patches[0].1[alarm_item::OCCURRENCE_LOG][0]["relapse"], true);
     }
 
     #[tokio::test]
@@ -1694,11 +1958,10 @@ mod tests {
             .invoke(&[], &firing(payload(&gcp[0]).clone()))
             .await
             .expect("the pass completes");
-        assert!(
-            stub.writes()
-                .contains(&"PUT /api/jobs/b0550c9e/steps/b0550c9e-triage".to_string()),
-            "the recovered alarm is closed: {:?}",
-            stub.writes()
+        assert_eq!(
+            stub.writes(),
+            vec!["PATCH /api/jobs/b0550c9e/metadata".to_string()],
+            "the recovered alarm is held open RECOVERED (f4b0ad41)"
         );
     }
 

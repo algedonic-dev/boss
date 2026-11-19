@@ -123,28 +123,19 @@
     return app === 'home' || app === 'simulator' ? '' : departmentLabel(app, departments());
   }
 
-  // Work group is All jobs, for every role (backlog 0f9be7c0,
-  // 2026-09-24). It was role-keyed — a closed map until 6a3b93eb, then
-  // each role row's `metadata.work` — but visible() drops every entry
-  // whose catalog owner is not home, so of any list only `jobs` could
-  // render and a list without it left Work empty. Each department app
-  // has its own sidebar; a role's surfaces are gated there, by the
-  // row's `surfaces`, and Work here is the same filter over one row.
-  const WORK: NavGroup = {
-    label: 'Work',
-    items: [ROUTE_CATALOG.jobs],
-  };
-
+  // Home had a Work group above Mine, holding All jobs for every role
+  // (backlog 0f9be7c0, 2026-09-24); it went with the jobs list in step 1
+  // of design 01fa5bdf (review df7aeb9c).
+  //
   // Home — personal work, whichever domain it belongs to: "what am I
-  // meant to be doing" is one question, and its answer (All jobs, My
-  // Day) crosses every department freely.
+  // meant to be doing" is one question, and its answer (My Day, the
+  // inbox) crosses every department freely.
   //
   // Mine lists Home surfaces only. It carried Exec until backlog
   // e8fe5e5a (2026-09-24), a row visible() dropped for every role —
   // Exec's catalog owner is executive — so it never rendered here; it is
   // the Executive department's row, under a tab every role is offered.
   const HOME_GROUPS: ReadonlyArray<NavGroup> = [
-    WORK,
     {
       label: 'Mine',
       items: [
@@ -153,7 +144,6 @@
         { id: 'my-day', label: 'My Day', path: '/' },
         ROUTE_CATALOG.inbox,
         ROUTE_CATALOG.schedule,
-        ROUTE_CATALOG['company-map'],
         ROUTE_CATALOG.manual,
       ],
     },
@@ -217,13 +207,7 @@
               >{unreadDirect}</span>
             {/if}
           </a>
-          <a
-            href="/ux/shop"
-            class="shell-nav-item {activeSection === 'shop' ? 'shell-nav-item-active' : ''}"
-            onclick={(e) => onLinkClick(e, '/ux/shop')}
-          >
-            Shop
-          </a>
+          <!-- The Shop row went with the /ux/shop page (design 01fa5bdf). -->
         </div>
       {/if}
 

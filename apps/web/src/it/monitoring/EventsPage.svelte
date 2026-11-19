@@ -887,7 +887,7 @@
     line-height: 1.5;
   }
   .events-download-hint code {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: var(--font-mono);
     background: var(--wash);
     padding: 1px 4px;
     border-radius: 2px;
@@ -917,7 +917,7 @@
     font-weight: 500;
   }
   .events-table .mono {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: var(--font-mono);
     font-size: 12px;
   }
   .events-payload-row td {
@@ -928,7 +928,7 @@
   .events-payload {
     margin: 0;
     padding: 12px 16px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: var(--font-mono);
     font-size: 12px;
     line-height: 1.5;
     white-space: pre-wrap;
@@ -948,7 +948,7 @@
     color: var(--static);
   }
   .events-packet a {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: var(--font-mono);
   }
 
   .events-stats-note { margin: 0; opacity: 0.8; }

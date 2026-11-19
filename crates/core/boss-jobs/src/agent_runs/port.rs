@@ -177,6 +177,18 @@ pub trait AgentRunLog: Send + Sync {
     /// (backlog 11a0998a). A limit is not a filter.
     async fn count_runs(&self, filter: &RunFilter) -> Result<u64, AgentRunError>;
 
+    /// The protocol each named packet runs under — `jobs.kind` for
+    /// every id in `job_ids` the record holds (backlog 05bf580b). An id
+    /// it does not hold is ABSENT from the answer, never an error: the
+    /// per-protocol reading counts that run as an unknown packet rather
+    /// than dropping it, which is what an inner join would do. A failed
+    /// read is an error — an empty map would read as "every run is
+    /// unattributed", a confident wrong answer.
+    async fn job_kinds(
+        &self,
+        job_ids: &[uuid::Uuid],
+    ) -> Result<std::collections::HashMap<uuid::Uuid, String>, AgentRunError>;
+
     /// The rate card, model-ordered. Read-only on purpose — see
     /// `super::mod`'s doc comment for why a price is a tree change.
     async fn rate_card(&self) -> Result<Vec<RateCardRow>, AgentRunError>;

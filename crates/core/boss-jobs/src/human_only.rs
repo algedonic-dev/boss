@@ -273,8 +273,10 @@ pub const CONTEXT_KEYS: &[&str] = &["context_md", "sign_off_context"];
 pub const WRITE_RULE: &str = "metadata.human_only = true: while the step is open, a write \
                               signed by an automation or agent session may change only \
                               context for the person — context_md, sign_off_context, or a \
-                              field the step declares filled_by = \"filer\"; every other key \
-                              is the person's record";
+                              field the step declares filled_by = \"filer\". A declared \
+                              credential-bound writer may supply its own context after \
+                              credential validation and before the person's decision; \
+                              every other key is the person's record";
 
 /// PURE: the keys a write by a NON-PERSON would change on an open
 /// human-only step that are not context — added, changed, or deleted
@@ -321,6 +323,72 @@ pub fn record_keys_changed(
     changed.sort();
     changed.dedup();
     changed
+}
+
+/// The protocol can also name a credential-bound context writer. Its
+/// existing credential/host guard must admit each field; an actor-shaped
+/// header is never evidence. A signer-owned record or stamp closes this
+/// window, so rendered context cannot move underneath a person's act.
+pub fn record_keys_changed_by_writer(
+    step: &boss_core::job::Step,
+    next: &Value,
+    caller: Option<&crate::field_writer::CredentialedCaller>,
+    job_host: Option<&str>,
+) -> Vec<String> {
+    let changed = record_keys_changed(&step.metadata, next, &step.fields);
+    let has_record = |value: &Value| match value {
+        Value::Null => false,
+        Value::String(s) => !s.trim().is_empty() && s != "pending",
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+        _ => true,
+    };
+    let decided = !step.sign_offs.is_empty()
+        || step.metadata.get("decision").is_some_and(has_record)
+        || step.fields.iter().any(|field| {
+            field.writer.as_deref() == Some(crate::field_writer::SIGNER_WRITER)
+                && step.metadata.get(&field.name).is_some_and(has_record)
+        });
+    if decided {
+        return changed;
+    }
+    changed
+        .into_iter()
+        .filter(|key| {
+            !step.fields.iter().any(|field| {
+                field.name == *key && credential_context_field(field, caller, job_host)
+            })
+        })
+        .collect()
+}
+
+fn credential_context_field(
+    field: &boss_core::job::StepField,
+    caller: Option<&crate::field_writer::CredentialedCaller>,
+    job_host: Option<&str>,
+) -> bool {
+    field.writer.as_deref().is_some_and(|writer| {
+        crate::field_writer::RESOLVABLE_PRINCIPALS.contains(&writer)
+            && crate::field_writer::admits(caller, writer, job_host).is_ok()
+    })
+}
+
+/// A supplied declared credential-context key needs a whole-row fence
+/// even when it equals the read value: an intervening writer can change
+/// it before the merge, and an unchecked retry would restore stale bytes.
+/// Ordinary context and person writes retain their existing guards.
+pub fn credential_context_supplied(
+    step: &boss_core::job::Step,
+    patch: &serde_json::Map<String, Value>,
+    caller: Option<&crate::field_writer::CredentialedCaller>,
+    job_host: Option<&str>,
+) -> bool {
+    if !declared(&step.metadata) {
+        return false;
+    }
+    step.fields.iter().any(|field| {
+        patch.contains_key(&field.name) && credential_context_field(field, caller, job_host)
+    })
 }
 
 /// The write refusal: names the step, the actor that signed the write,

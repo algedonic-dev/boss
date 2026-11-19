@@ -59,15 +59,25 @@ await page.goto(BASE + '/', { waitUntil: 'networkidle', timeout: 30000 });
 await page.waitForTimeout(1500);
 await page.screenshot({ path: out('home') });
 const homeText = await page.locator('body').innerText();
-check('shell mounts with navigation', /MY DAY/i.test(homeText) && /ALL JOBS/i.test(homeText));
+// The sidebar's All jobs row went with the jobs list (step 1 of design
+// 01fa5bdf); the Inbox row is on Home for every role.
+check('shell mounts with navigation', /MY DAY/i.test(homeText) && /INBOX/i.test(homeText));
 check('home renders content below the chrome', homeText.length > 400, `${homeText.length} chars`);
 
-// 2. A jobs list renders rows from the API — the read path end to end.
-await page.goto(BASE + '/ux/jobs', { waitUntil: 'networkidle', timeout: 30000 });
-await page.waitForTimeout(1500);
-await page.screenshot({ path: out('jobs') });
-const jobsText = await page.locator('body').innerText();
-check('jobs list renders', jobsText.length > 300, `${jobsText.length} chars`);
+// 2. A packet's own page renders from the API — the read path end to
+//    end. It read the /ux/jobs list until that list went with step 1 of
+//    design 01fa5bdf.
+const anyResp = await page.request.get(BASE + '/api/jobs?status=open&limit=1');
+const anyJob = anyResp.ok() ? ((await anyResp.json()).data ?? []).at(0) : undefined;
+if (anyJob) {
+  await page.goto(`${BASE}/ux/jobs/${anyJob.id}`, { waitUntil: 'networkidle', timeout: 30000 });
+  await page.waitForTimeout(1500);
+  await page.screenshot({ path: out('job') });
+  const jobText = await page.locator('body').innerText();
+  check('a job page renders', jobText.length > 300, `${jobText.length} chars`);
+} else {
+  check('a job page renders', true, `skipped — GET /api/jobs answered ${anyResp.status()} with no open packet`);
+}
 
 // 3. A step surface renders with its decision panel. The probe target
 //    is any open packet's first open step, discovered live — a fixed

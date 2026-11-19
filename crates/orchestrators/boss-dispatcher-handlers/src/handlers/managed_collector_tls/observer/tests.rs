@@ -1,7 +1,36 @@
 use super::*;
 use std::io::{Read, Write};
 
-async fn synthetic_leaf(trust_override: bool) -> Result<Vec<u8>, Refused> {
+/// What OpenSSL says when it refuses the peer's certificate: a foreign
+/// root, a wrong hostname and an expired leaf all read this way.
+const VERIFY_REFUSAL: &str = "certificate verify failed";
+
+/// Release a `serve` thread still waiting in accept() for a client that
+/// never came. Never accepted when the client already was.
+fn release(address: std::net::SocketAddr) {
+    drop(std::net::TcpStream::connect(address));
+}
+
+/// What the observer did, asserted on its Result rather than on
+/// `is_ok()` (backlog d17da356). An expected accept that failed panics
+/// WITH the observer's error, so a deadline reads as a deadline in a gate
+/// receipt; an expected refusal must be the TLS verification refusing the
+/// peer, because a socket that never answered is not a refusal.
+fn assert_observed(result: &Result<Vec<u8>, String>, accepted: bool, case: &str) {
+    match (result, accepted) {
+        (Ok(_), true) => {}
+        (Err(error), true) => {
+            panic!("{case}: the TLS observer was expected to accept and failed: {error}")
+        }
+        (Ok(_), false) => panic!("{case}: the TLS observer was expected to refuse and accepted"),
+        (Err(error), false) => assert!(
+            error.contains(VERIFY_REFUSAL),
+            "{case}: the TLS observer was expected to refuse with {VERIFY_REFUSAL:?} and failed otherwise: {error}"
+        ),
+    }
+}
+
+async fn synthetic_leaf(trust_override: bool) {
     let pair = OpenSslIssuer.mint(Utc::now()).await.unwrap();
     let trust = if trust_override {
         OpenSslIssuer.mint(Utc::now()).await.unwrap().trust
@@ -11,12 +40,20 @@ async fn synthetic_leaf(trust_override: bool) -> Result<Vec<u8>, Refused> {
     let (address, server) = serve(&pair);
     // The injection is test-only. Production has only the fixed cluster target.
     let result = ServedLeaf.observe_test(&trust, address).await;
+    release(address);
     server.join().unwrap();
-    if !trust_override {
-        assert_eq!(result.as_ref().unwrap(), pair.pem.as_bytes());
+    assert_observed(&result, !trust_override, "synthetic leaf");
+    if let Ok(pem) = &result {
+        assert_eq!(pem, pair.pem.as_bytes());
     }
-    result
 }
+// No clock decides this exchange (d17da356, the f357be08 rule). The
+// server waited 4 s for its client, from BEFORE the parent spawned the
+// isolated child, so a fresh process's start under a loaded bay ran out
+// the window, the listener closed and the child's connect was refused:
+// "isolated synthetic child failed" on train ed012255 and gate c916002b.
+// Every wait now ends on an event the other side always produces — the
+// client's connect or `release`, its handshake or its refusal, its close.
 fn serve(pair: &Certificate) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
     let mut builder =
         openssl::ssl::SslAcceptor::mozilla_intermediate_v5(openssl::ssl::SslMethod::tls()).unwrap();
@@ -28,31 +65,11 @@ fn serve(pair: &Certificate) -> (std::net::SocketAddr, std::thread::JoinHandle<(
         .unwrap();
     let acceptor = builder.build();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(4);
-        let socket = loop {
-            match listener.accept() {
-                Ok((s, _)) => break Some(s),
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        && std::time::Instant::now() < until =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(10))
-                }
-                _ => break None,
-            }
-        };
-        let Some(socket) = socket else {
+        let Ok((socket, _)) = listener.accept() else {
             return;
         };
-        socket
-            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
-            .unwrap();
-        socket
-            .set_write_timeout(Some(std::time::Duration::from_secs(3)))
-            .unwrap();
         if let Ok(mut stream) = acceptor.accept(socket) {
             let mut request = [0; 4096];
             let _ = stream.read(&mut request);
@@ -64,12 +81,12 @@ fn serve(pair: &Certificate) -> (std::net::SocketAddr, std::thread::JoinHandle<(
 
 #[tokio::test]
 async fn a_real_tls_peer_returns_its_canonical_leaf_with_only_selected_trust() {
-    assert!(synthetic_leaf(false).await.is_ok());
+    synthetic_leaf(false).await;
 }
 
 #[tokio::test]
 async fn a_foreign_public_root_cannot_qualify_a_served_leaf() {
-    assert!(synthetic_leaf(true).await.is_err());
+    synthetic_leaf(true).await;
 }
 
 #[tokio::test]
@@ -121,12 +138,14 @@ async fn a_trusted_peer_still_requires_the_fixed_hostname_and_current_certificat
         pair.pem = String::from_utf8(certificate.build().to_pem().unwrap()).unwrap();
         pair.trust = pair.pem.clone();
         let (address, server) = serve(&pair);
-        assert_eq!(
-            ServedLeaf.observe_test(&pair.trust, address).await.is_ok(),
-            accepted,
-            "host {host}, expired {expired}"
-        );
+        let result = ServedLeaf.observe_test(&pair.trust, address).await;
+        release(address);
         server.join().unwrap();
+        assert_observed(
+            &result,
+            accepted,
+            &format!("host {host}, expired {expired}"),
+        );
     }
 }
 
@@ -141,10 +160,8 @@ async fn isolated_tls_environment_child() {
         .parse()
         .unwrap();
     let expected = std::env::var("BOSS_TLS_TEST_EXPECT").unwrap() == "accepted";
-    assert_eq!(
-        ServedLeaf.observe_test(&trust, address).await.is_ok(),
-        expected
-    );
+    let result = ServedLeaf.observe_test(&trust, address).await;
+    assert_observed(&result, expected, &format!("isolated child at {address}"));
 }
 
 #[tokio::test]
@@ -163,26 +180,19 @@ async fn inherited_keylogging_ambient_ca_and_proxy_settings_cannot_change_the_tl
         std::fs::write(&ambient, pair.trust.as_bytes()).unwrap();
         std::fs::write(&selected_path, selected.as_bytes()).unwrap();
         let (address, server) = serve(&pair);
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "handlers::managed_collector_tls::observer::tests::isolated_tls_environment_child",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env("BOSS_TLS_TEST_SELECTED_PUBLIC_CA", &selected_path)
-            .env("BOSS_TLS_TEST_ADDRESS", address.to_string())
-            .env(
-                "BOSS_TLS_TEST_EXPECT",
-                if foreign { "refused" } else { "accepted" },
-            )
-            .env("SSLKEYLOGFILE", &keylog)
-            .env("SSL_CERT_FILE", &ambient)
-            .env("SSL_CERT_DIR", &root)
-            .env("HTTPS_PROXY", "http://127.0.0.1:1")
-            .env("ALL_PROXY", "http://127.0.0.1:1")
-            .output()
-            .unwrap();
+        let output = isolated_child(
+            &selected_path,
+            address,
+            if foreign { "refused" } else { "accepted" },
+        )
+        .env("SSLKEYLOGFILE", &keylog)
+        .env("SSL_CERT_FILE", &ambient)
+        .env("SSL_CERT_DIR", &root)
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .output()
+        .unwrap();
+        release(address);
         server.join().unwrap();
         std::fs::write(root.join("child.stdout"), &output.stdout).unwrap();
         std::fs::write(root.join("child.stderr"), &output.stderr).unwrap();
@@ -198,10 +208,126 @@ async fn inherited_keylogging_ambient_ca_and_proxy_settings_cannot_change_the_tl
     }
 }
 
+/// `isolated_tls_environment_child` in a fresh process of this test
+/// binary, observing `address` with the trust at `selected`.
+fn isolated_child(
+    selected: &std::path::Path,
+    address: std::net::SocketAddr,
+    expect: &str,
+) -> std::process::Command {
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "handlers::managed_collector_tls::observer::tests::isolated_tls_environment_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("BOSS_TLS_TEST_SELECTED_PUBLIC_CA", selected)
+        .env("BOSS_TLS_TEST_ADDRESS", address.to_string())
+        .env("BOSS_TLS_TEST_EXPECT", expect);
+    child
+}
+
+/// A loopback port nothing listens on, HELD so no other bind(0) can be
+/// handed it while the child connects, and the error a connect to it
+/// reads — the text the observer itself would carry.
+fn a_dead_address() -> (boss_testing::DarkPort, String) {
+    let dark = boss_testing::dark_port();
+    let error = std::net::TcpStream::connect(dark.addr)
+        .unwrap_err()
+        .to_string();
+    (dark, error)
+}
+
+// Backlog d17da356: the child asserted `observe_test(..).is_ok() ==
+// expected`, so on train ed012255 and gate c916002b a failed observation
+// reached the receipt as "left: false, right: true" and nothing else —
+// assertion-shaped, so the equipment classifier read it as the branch's.
+// An expected accept that fails must carry the observer's own error.
+#[tokio::test]
+async fn an_isolated_child_that_cannot_observe_names_the_observers_error() {
+    let root = boss_testing::scratch_dir("tls-observer-child-names-its-error");
+    let selected = root.join("selected-public-ca.pem");
+    std::fs::write(
+        &selected,
+        OpenSslIssuer.mint(Utc::now()).await.unwrap().trust,
+    )
+    .unwrap();
+    let (dark, error) = a_dead_address();
+    let output = isolated_child(&selected, dark.addr, "accepted")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the child observed a dead socket");
+    assert!(
+        stderr.contains(&error),
+        "the child's failure must name the observer's error {error:?}: {stderr}"
+    );
+}
+
+// The same child expecting a refusal passed on ANY error, so a socket
+// that never answered counted as the observer refusing a foreign root.
+// A refusal is the TLS verification refusing the peer, or it is a failure.
+#[tokio::test]
+async fn an_isolated_child_expecting_refusal_does_not_count_a_dead_socket() {
+    let root = boss_testing::scratch_dir("tls-observer-child-refusal-kind");
+    let selected = root.join("selected-public-ca.pem");
+    std::fs::write(
+        &selected,
+        OpenSslIssuer.mint(Utc::now()).await.unwrap().trust,
+    )
+    .unwrap();
+    let (dark, error) = a_dead_address();
+    let output = isolated_child(&selected, dark.addr, "refused")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a dead socket passed as a TLS refusal"
+    );
+    assert!(
+        stderr.contains(VERIFY_REFUSAL) && stderr.contains(&error),
+        "the child must say it wanted a verification refusal and got {error:?}: {stderr}"
+    );
+}
+
+// The true cause of the two reds. `serve` gave its client a 4 s accept
+// window that started BEFORE the parent spawned the child, so the whole
+// of a fresh test process's start under a loaded bay ran inside it; past
+// it the listener was gone and the child's connect was refused. The
+// server now waits for the event its client always produces (f357be08).
+#[tokio::test]
+async fn a_child_that_starts_after_its_server_is_still_served() {
+    let pair = OpenSslIssuer.mint(Utc::now()).await.unwrap();
+    let root = boss_testing::scratch_dir("tls-observer-late-child");
+    let selected = root.join("selected-public-ca.pem");
+    std::fs::write(&selected, pair.trust.as_bytes()).unwrap();
+    let (address, server) = serve(&pair);
+    // Past the old window, standing in for a slow process start.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    let output = isolated_child(&selected, address, "accepted")
+        .output()
+        .unwrap();
+    release(address);
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "a late child was not served: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 use super::evidence::LeafReader;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// The wait every loopback stub read below holds: the test's own, not the
+/// production 15 s a loaded gate drive outlived (backlog edca7e41: red
+/// train 1b2ef0e0 recorded no status from a stub that was there).
+const TEST_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 struct Native {
     secret: Value,
@@ -409,13 +535,14 @@ async fn native_http_retains_raw_body_status_and_headers_without_following_redir
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let public = OpenSslIssuer.mint(Utc::now()).await.unwrap().trust;
-        let reader = installation::HttpPodReader::new(
+        let reader = installation::HttpPodReader::with_timeout(
             reqwest::Certificate::from_pem(public.as_bytes()).unwrap(),
             "synthetic-observer".into(),
+            TEST_WAIT,
         )
         .unwrap();
         let original = reader.read_at(Target::Secret, &base).await.unwrap();
-        assert_eq!(original.status, Some(status));
+        assert_eq!(original.status, Some(status), "{:?}", original.error);
         assert_eq!(original.body, raw);
         assert!(original.error.is_none());
         assert!(
@@ -1041,9 +1168,10 @@ async fn fixed_native_paths_refuse_traversal_and_conserve_bounded_incomplete_ori
     let base = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let public = OpenSslIssuer.mint(Utc::now()).await.unwrap().trust;
-    let reader = installation::HttpPodReader::new(
+    let reader = installation::HttpPodReader::with_timeout(
         reqwest::Certificate::from_pem(public.as_bytes()).unwrap(),
         "synthetic-observer".into(),
+        TEST_WAIT,
     )
     .unwrap();
     for target in [
@@ -1053,7 +1181,7 @@ async fn fixed_native_paths_refuse_traversal_and_conserve_bounded_incomplete_ori
         Target::CollectorPod("original-pod".into()),
     ] {
         let original = reader.read_at(target, &base).await.unwrap();
-        assert_eq!(original.status, Some(200));
+        assert_eq!(original.status, Some(200), "{:?}", original.error);
         assert_eq!(original.body.len(), 128 * 1024 + 1);
         assert!(original.error.as_ref().unwrap().contains("incomplete"));
     }
@@ -1070,5 +1198,33 @@ async fn fixed_native_paths_refuse_traversal_and_conserve_bounded_incomplete_ori
         4,
         "invalid names must refuse before any HTTP request"
     );
+    server.abort();
+}
+
+/// A native read that outlives its client's wait records no status, and
+/// the error it records must say it timed out. Red train 1b2ef0e0 failed
+/// `left: None` on a loopback stub read under the production 15 s wait,
+/// and nothing in the record said why (backlog edca7e41).
+#[tokio::test]
+async fn a_native_read_that_outlives_its_wait_records_that_it_timed_out() {
+    use axum::{Router, response::IntoResponse};
+    let app = Router::new().fallback(|| async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        (axum::http::StatusCode::OK, "late").into_response()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let public = OpenSslIssuer.mint(Utc::now()).await.unwrap().trust;
+    let reader = installation::HttpPodReader::with_timeout(
+        reqwest::Certificate::from_pem(public.as_bytes()).unwrap(),
+        "synthetic-observer".into(),
+        std::time::Duration::from_millis(50),
+    )
+    .unwrap();
+    let original = reader.read_at(Target::PublicTrust, &base).await.unwrap();
+    assert_eq!(original.status, None, "{:?}", original.error);
+    let error = original.error.unwrap_or_default();
+    assert!(error.contains("timed out"), "{error}");
     server.abort();
 }

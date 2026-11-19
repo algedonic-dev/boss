@@ -1,0 +1,59 @@
+# A post-start schema pass that keeps failing is alarmed off its own
+# record (backlog f93bdee4).
+#
+# boss-post-start-schema (infra/cluster/manifests/boss-post-start-schema.yaml)
+# runs every minute. A pass whose precheck finds nothing owed files no
+# packet; any other pass files a maintenance-post-start-schema packet
+# through boss-chore.sh, which records `result` (ok or failed),
+# `exit_status` and the whole `output` on its `run` step, and the packet
+# closes `failed` at "Post-start indexes still owed". From 2026-11-01 to
+# 2026-11-09 every pass failed — 11,299 packets, each one "command left
+# descendants; refusing success", exit 125, the lock session migrate.sh
+# never ended — and none of it reached anyone: the cadence-silence sweep
+# watches ARRIVAL only, and a pass failing every minute arrives on time.
+# "A check nobody reads is a check that is not running" (CLAUDE.md,
+# Diagnosis).
+#
+# THE RULE SELECTS THE TICK; THE HANDLER COUNTS — the streak judge the
+# boss-gcp deposit-key audit uses, so this is a row and not code. On a
+# failed run it reads the newest packets of the kind back from the jobs
+# API and files ONE backlog-item only when the newest `n` completed runs
+# ALL read failed; an `ok` run between them resets the count.
+#
+# N = 5 AGAINST THE ONE-MINUTE TICK. One failure is weather the design
+# expects — a concurrent build that outwaits its 600 s deadline behind
+# an old snapshot, retried by the next tick. A fault repeats every
+# minute, so five in a row is five minutes of a broken pass (an hour if
+# each one runs to its deadline), which is a condition. The item is
+# standard priority: a pass failing is debt unpaid, not the factory
+# stopped.
+#
+# ONE ITEM WHILE IT IS OPEN, deduped by the route below. A closed item
+# files again on the next streak: a recurrence after a fix is a new
+# fact. An `ok` run — a pass that paid owed debt — ends a streak and
+# closes the item this judge filed, if nobody has acted on it. A pass
+# that finds nothing owed files no packet, so it cannot close one: after
+# a fix like f93bdee4's the packets simply stop, and the item is the
+# reader's to close.
+[[rule]]
+name = "file-backlog-items-on-post-start-schema-failing"
+why = """
+A THRESHOLD, the second of the dispatcher's three sanctioned roles
+(David, 2026-08-14: clock, threshold, matchmaking). What files is a
+LEVEL integrated over time — the same result on N consecutive runs of a
+maintenance packet — which no Workflow consequence can express: the
+pass's protocol records its own run and closes it failed, and cannot
+see its previous runs or open another kind's packet. Measured
+2026-11-09 (backlog f93bdee4): 11,299 consecutive failed passes since
+2026-11-01, one a minute, read by nothing. No authority widened: the
+handler (maintenance.verdict.streak) is the deposit-key audit's judge,
+its only writes are one standard backlog-item owned by the platform
+owner, one `verdict_streak` note on the pass's own packet, and, on an
+ok run, the stale close of an item it filed that nobody has touched.
+Nothing about how the pass applies schema changes.
+"""
+on_event = "step.done.task"
+when = 'workflow_kind = "maintenance-post-start-schema" AND spec_slug = "run" AND (metadata.result = "failed" OR metadata.result = "ok")'
+[[rule.do]]
+handler = "maintenance.verdict.streak"
+args = { step = "\"run\"", field = "\"result\"", value = "\"failed\"", n = "5", evidence = "\"output\"", route = "\"post-start-schema/failing\"", title = "\"The post-start schema pass keeps failing\"", design = "\"f93bdee4\"", area = "\"infra/postgres\"" }

@@ -247,6 +247,19 @@ async fn main() -> Result<()> {
         },
     ));
 
+    // The roster pools' observation door (backlog a6cb448a): the
+    // dispatcher's clock rule fires it, this service's snapshot is the
+    // source, and the jobs crate's pool owner — over this same database —
+    // publishes a changed count as the pool's next version.
+    app = app.merge(boss_people::roster_refresh::roster_refresh_router(
+        boss_people::roster_refresh::RosterRefreshState {
+            registry: Arc::new(boss_jobs::pools::PgPools::new(pool.clone())),
+            source: people.clone(),
+            policy: Some(policy.clone()),
+            clock: clock.clone(),
+        },
+    ));
+
     let state = PeopleApiState {
         people,
         publisher,

@@ -56,17 +56,21 @@ describe('the roster is the catalog', () => {
 
   it('the department is the owner the catalog assigns, and Home is IT', () => {
     const by = new Map(catalogRoutes().map((r) => [r.route, r.department]));
-    expect(by.get('/ux/support')).toBe('support');
-    expect(by.get('/ux/sales')).toBe('sales');
-    expect(by.get('/ux/vendors')).toBe('finance');
+    // /ux/support and /ux/sales went with step 1 of design 01fa5bdf;
+    // Sales owns the watchlist now.
+    expect(by.has('/ux/support')).toBe(false);
+    expect(by.get('/watchlist')).toBe('sales');
+    expect(by.get('/finance/vendors')).toBe('finance');
     expect(by.get('/it/design')).toBe('it');
     // f7f515ee: retiring Views removes it from the audit march too;
     // it is neither a relocated Home page nor an alias.
     expect(by.has('/ux/views')).toBe(false);
     expect(by.has('/views')).toBe(false);
-    for (const home of ['/ux/jobs', '/ux/inbox', '/ux/calendar/me', '/manual']) {
+    for (const home of ['/ux/inbox', '/ux/calendar/me', '/manual']) {
       expect(by.get(home), home).toBe(HOME_DEPARTMENT);
     }
+    // The jobs list went with step 1 of design 01fa5bdf: no audit marches to it.
+    expect(by.has('/ux/jobs')).toBe(false);
     // Every department is a code the catalog's `owner` names, so the
     // readiness read has something to answer for — never `home`.
     expect([...new Set(by.values())]).not.toContain('home');
@@ -81,11 +85,12 @@ describe('the march order', () => {
     // contiguous.
     const firstSeen = (d: string) => depts.indexOf(d);
     const present = FIRST_DEPARTMENTS.filter((d) => depts.includes(d));
-    expect(present).toEqual(['support', 'sales', 'finance', 'marketing']);
+    // Support and Marketing own no page since step 1 of design 01fa5bdf.
+    expect(present).toEqual(['sales', 'finance']);
     for (let i = 1; i < present.length; i += 1) {
       expect(firstSeen(present[i]!)).toBeGreaterThan(firstSeen(present[i - 1]!));
     }
-    expect(order[0]!.route).toBe('/ux/support');
+    expect(order[0]!.route).toBe('/watchlist');
     // Nothing from the head appears after a department outside it.
     const lastHead = Math.max(...present.map((d) => depts.lastIndexOf(d)));
     const firstOther = depts.findIndex((d) => !FIRST_DEPARTMENTS.includes(d));
@@ -172,11 +177,13 @@ describe('idempotence', () => {
 
 describe('one route by name', () => {
   it('answers a catalogued path, and a department jobs view by its code', () => {
-    expect(routeByName('/ux/support')).toEqual({
-      route: '/ux/support',
-      department: 'support',
-      label: 'Support',
+    expect(routeByName('/finance/vendors')).toEqual({
+      route: '/finance/vendors',
+      department: 'finance',
+      label: 'Vendors',
     });
+    // Removed with step 1 of design 01fa5bdf: not a page to audit.
+    expect(routeByName('/ux/support')).toBeUndefined();
     expect(routeByName('/sales/jobs')).toEqual({
       route: '/sales/jobs',
       department: 'sales',

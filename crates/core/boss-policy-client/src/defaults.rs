@@ -135,6 +135,20 @@ pub fn default_rules() -> Vec<Rule> {
         Scope::All,
     ));
 
+    // Reading an unpublished draft without authoring one (backlog
+    // f21804d8, design 600c07d7, decided 2026-10-17): the read-only fourth
+    // leg of `boss-jobs` http/kinds.rs `may_read_drafts`. The deploy
+    // superuser already reads every draft through its authoring grants, so
+    // this row widens nothing; it keeps the control held by someone. Not
+    // shipped, so the read-only roles inherit none of it; an install
+    // grants a named observer role as a policy row.
+    rules.push(Rule::new(
+        "platform-admin",
+        Resource::workflow_draft(),
+        Read,
+        Scope::All,
+    ));
+
     // Dispatcher rule writes (backlog 847af5c7, 2026-09-27): draft
     // (Create), make live (Publish), take out of service (Retire). A rule
     // spawns packets and files ops-requests, so the registry that holds
@@ -146,6 +160,20 @@ pub fn default_rules() -> Vec<Rule> {
         rules.push(Rule::new(
             "platform-admin",
             Resource::dispatcher_rule(),
+            action,
+            Scope::All,
+        ));
+    }
+
+    // The live pools door (backlog f399458f, 2026-11-08): read a pool's
+    // lineage, publish a version, retire the active one. A pool amount
+    // is how much work the factory admits at once, so it is the deploy
+    // superuser's until a tenant grants it as a policy row. Not shipped,
+    // so the read-only roles inherit none of it.
+    for action in [Read, Publish, Retire] {
+        rules.push(Rule::new(
+            "platform-admin",
+            Resource::pool(),
             action,
             Scope::All,
         ));
@@ -325,8 +353,9 @@ pub fn default_rules() -> Vec<Rule> {
     // public in the repo": an install's own protocols are not in any
     // repo, and its unpublished drafts of workflows and stations are its
     // authors' workspace, which Read does not open — a draft needs
-    // Create, Update or Publish on `workflow` (backlog 1a4a4d03,
-    // `boss-jobs` http/kinds.rs `may_read_drafts`). Nor does Read on
+    // Create, Update or Publish on `workflow`, or Read on the unshipped
+    // `workflow-draft` (backlog 1a4a4d03, f21804d8; `boss-jobs`
+    // http/kinds.rs `may_read_drafts`). Nor does Read on
     // `step-plugin` count anyone's work: the in-flight count asks Read
     // on `step` at scope all. The install widens it with `visitor` rows in its own
     // `policy_rules.toml`; widening is one row, and a stranger's read
@@ -793,6 +822,28 @@ mod tests {
         assert!(!shipped_resources().contains(&Resource::dispatcher_rule()));
     }
 
+    /// The pools door (backlog f399458f) is the deploy superuser's alone
+    /// by default, for the dispatcher-rule reason: a pool amount decides
+    /// how much the factory admits, and a second holder here is a
+    /// widening. Not shipped, so the read-only roles inherit none.
+    #[test]
+    fn only_platform_admin_holds_the_pools_door_by_default() {
+        let holders: Vec<_> = default_rules()
+            .into_iter()
+            .filter(|r| r.resource == Resource::pool())
+            .map(|r| (r.role, r.action, r.scope))
+            .collect();
+        assert_eq!(
+            holders,
+            vec![
+                ("platform-admin".to_string(), Action::Read, Scope::All),
+                ("platform-admin".to_string(), Action::Publish, Scope::All),
+                ("platform-admin".to_string(), Action::Retire, Scope::All),
+            ]
+        );
+        assert!(!shipped_resources().contains(&Resource::pool()));
+    }
+
     /// The SubjectKind registry's metadata door (backlog abc2e9d5) is
     /// the deploy superuser's alone by default — an equality pin for the
     /// dispatcher-rule reason: the vocabulary every Subject is typed by
@@ -864,6 +915,30 @@ mod tests {
             assert_eq!(holders, want, "{resource}");
             assert!(!shipped_resources().contains(&resource), "{resource}");
         }
+    }
+
+    /// Reading an unpublished draft is its own grant (backlog f21804d8,
+    /// design 600c07d7, decided 2026-10-17), held by default only by the
+    /// deploy superuser — who already reads every draft through its
+    /// authoring grants, so the row widens nothing and keeps coverage
+    /// from reporting a control no one holds. An equality pin, because a
+    /// second default holder is a widening: the design names visitors,
+    /// ordinary readers, agents and all auditors as the roles it must
+    /// NOT reach. Not shipped, so `audit-readonly` (also the audit-opted
+    /// guest), `smoke-tester` and `visitor` inherit none of it; an
+    /// install grants it to a named observer role as a policy row.
+    #[test]
+    fn only_platform_admin_reads_workflow_drafts_by_default() {
+        let holders: Vec<_> = default_rules()
+            .into_iter()
+            .filter(|r| r.resource == Resource::workflow_draft())
+            .map(|r| (r.role, r.action, r.scope))
+            .collect();
+        assert_eq!(
+            holders,
+            vec![("platform-admin".to_string(), Action::Read, Scope::All)]
+        );
+        assert!(!shipped_resources().contains(&Resource::workflow_draft()));
     }
 
     /// The posting-rule registry — `gl_posting_rules` and

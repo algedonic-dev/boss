@@ -90,8 +90,8 @@ pub fn count_jobs_for_day(
 /// math). At `Tick::day()` granularity this is identical to
 /// `count_jobs_for_day`.
 ///
-/// Phase A of the sub-day-tick rollout — TODO.md "Hourly tick
-/// granularity for the live sim."
+/// Phase A of the sub-day-tick rollout, which landed: the example
+/// tenant's seed sets `tick_duration = "1m"`.
 ///
 /// When `jr.deterministic` is set the Poisson draw is replaced by a
 /// fixed daily count — see [`deterministic_count_for_tick`]. This is

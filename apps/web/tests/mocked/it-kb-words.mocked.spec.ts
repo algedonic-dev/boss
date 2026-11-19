@@ -94,13 +94,9 @@ test.describe('/it/kb — the words the audit decided', () => {
   });
 });
 
+// The System atlas was the other header here until it went with step 1
+// of design 01fa5bdf.
 test.describe('839a7f0f: the other IT headers that still said System Model', () => {
-  test('the System atlas', async ({ page }) => {
-    await installSmokeMocks(page);
-    await mountPage(page, '/it/operate/atlas');
-    await expect(page.locator('.exec-eyebrow').first()).toHaveText('IT · System atlas');
-  });
-
   test('Observability', async ({ page }) => {
     await installSmokeMocks(page);
     await mountPage(page, '/it/operate/perf');

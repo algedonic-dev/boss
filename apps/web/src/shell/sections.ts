@@ -32,12 +32,12 @@ export const HOME_CHROME_SECTIONS: ReadonlyMap<string, string> = new Map([
   [
     'me',
     'the personal fallback: login/stepFocus/home render outside AppShell ' +
-      'entirely, and search is cross-cutting with no sidebar row',
+      'entirely, and search and a packet\'s own page are cross-cutting ' +
+      'with no sidebar row',
   ],
-  // 'hr' and 'manual' graduated out of this map on 2026-09-02 (CAR-6):
-  // People claimed HR and Home claimed the manual, so both are real
-  // catalog entries now — exactly the departure their rows here said
-  // they were waiting for.
+  // 'manual' graduated out of this map on 2026-09-02 (CAR-6): Home
+  // claimed it, so it is a real catalog entry — exactly the departure
+  // its row here said it was waiting for.
 ]);
 
 /// Sections whose APP is carried by the route rather than by a catalog
@@ -166,25 +166,21 @@ const SECTION_FOR_KIND: Readonly<Record<Route['kind'], string>> = {
   login: 'me',
   stepFocus: 'me',
   home: 'me',
-  companyMap: 'company-map',
   // The kind half only: `sectionForRoute` answers by the path's
   // department, the way it answers a yard floor by its region.
   notFound: 'me',
   search: 'me',
   me: 'me',
-  hr: 'hr',
   manual: 'manual',
   manualSection: 'manual',
 
   inbox: 'inbox',
-  jobs: 'jobs',
-  jobDetail: 'jobs',
-  service: 'service',
-  sales: 'sales',
-  assets: 'assets',
-  asset: 'assets',
-  accounts: 'accounts',
-  account: 'accounts',
+  // A packet's own page has no sidebar row: it lit All jobs until that
+  // list went with step 1 of design 01fa5bdf (review df7aeb9c), and is
+  // cross-cutting like search, so it takes the personal fallback.
+  jobDetail: 'me',
+  // The Churn watchlist is the `accounts` entry since design 01fa5bdf
+  // removed the Accounts page it sat beside.
   watchlist: 'accounts',
   vendors: 'vendors',
   vendor: 'vendors',
@@ -192,71 +188,45 @@ const SECTION_FOR_KIND: Readonly<Record<Route['kind'], string>> = {
   // neither has a sidebar row of its own (design45fad3bb).
   po: 'purchase-order',
   vendorInvoice: 'vendor-invoice',
-  people: 'people',
-  employee: 'people',
-  parts: 'parts',
-  part: 'parts',
   finance: 'finance',
   invoice: 'finance',
   newInvoice: 'finance',
   newJournalEntry: 'finance',
-  shipping: 'shipping',
-  shipmentDetail: 'shipping',
-  support: 'support',
-  qa: 'qa',
   // /ux/calendar/me is the `schedule` row's own path (Home, "My
   // schedule"). It lit `calendar` until 2026-09-24, so it highlighted
   // Release calendar and was gated on the calendar module — off on the
   // live instance, so the page was ModuleDisabled (eff0c5e5).
   myCalendar: 'schedule',
-  // /ux/service/schedule is the service department's week grid of
-  // every tech, not a personal schedule: it lights the Service queue
-  // row and takes that row's module gate. It lit `schedule` until
-  // 2026-09-24, so with the line above two pages lit My schedule
-  // (backlog 3b50fe11).
-  schedule: 'service',
-  exec: 'exec',
-  warehouse: 'warehouse',
   // The department jobs view: its app is the route's own code, not a
   // catalog field — see DYNAMIC_APP_SECTIONS and `appForRoute`.
   department: 'department-jobs',
-  catalog: 'catalog',
-  device: 'catalog',
-  marketingAssets: 'marketing-assets',
-  marketingAsset: 'marketing-assets',
-  products: 'products',
-  product: 'products',
-  shop: 'shop',
-  shopProduct: 'shop',
 
-  // Operate-family kinds highlight the Operate row (2026-08-31
-  // consolidation); registry- and design-family kinds highlight
+  // Operate-family kinds highlight the Operate row, the audit log
+  // (2026-08-31 consolidation; the incidents surface led it until
+  // design 01fa5bdf); registry- and design-family kinds highlight
   // theirs the same way, via their own catalog ids whose paths now
   // live under the family surface.
-  systemMonitoringPerf: 'system-incidents',
-  systemMonitoringEvents: 'system-incidents',
-  systemMonitoringAtlas: 'system-incidents',
-  systemFleet: 'system-incidents',
+  systemMonitoringPerf: 'system-monitoring',
+  systemMonitoringEvents: 'system-monitoring',
   systemStepPlugins: 'system-step-plugins',
   systemStepPluginDetail: 'system-step-plugins',
   systemSubjects: 'system-subjects',
   systemRegistryDrift: 'system-registry-drift',
   systemAgents: 'system-agents',
   systemCredentials: 'system-credentials',
-  // The Department Map (design e765b3fc, car N1): the landing and every
-  // selection on it light its one row. The floors, the crew board, yard
-  // status, the conductor's feed and the feedback and backlog boards
-  // were pages with rows of their own until car N3 made each one a
-  // selection's panel.
+  // The alarms board at /it — what stays of the Department Map (design
+  // e765b3fc) after design 01fa5bdf — and every selection on it light
+  // its one row.
   systemYard: 'system-yard',
+  // The station tree floor (T7, backlog 94a9dad4).
+  systemTree: 'system-yard',
+  // The station page (design c4854fd4 E2) is a station of that floor, opened.
+  systemStation: 'system-yard',
   systemEstate: 'system-estate',
-  incidents: 'system-incidents',
   systemKb: 'system-kb',
   systemDesign: 'system-design',
   // The codebase has its own row since 2026-09-14 (feedback 9827c699).
   systemCodebase: 'system-codebase',
-  experiments: 'system-experiments',
-  policy: 'policy',
   authAdmin: 'auth-admin',
   dispatcherRules: 'system-dispatcher',
   dispatcherRulesList: 'system-dispatcher',

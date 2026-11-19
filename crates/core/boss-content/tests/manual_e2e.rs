@@ -21,6 +21,8 @@ fn draft(slug: &str, parent: Option<&str>, title: &str) -> ManualSectionDraft {
         sort_order: 0,
         audience: Audience::all(),
         published: true,
+        owner_station: None,
+        authoring_job_id: None,
     }
 }
 

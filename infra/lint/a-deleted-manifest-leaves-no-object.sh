@@ -445,13 +445,13 @@ deleted_paths=$(
     {
         while IFS= read -r sha; do
             [ -n "$sha" ] || continue
-            git show -m --first-parent --diff-filter=D --name-only --format= \
+            git show -m --first-parent --no-renames --diff-filter=D --name-only --format= \
                 "$sha" -- "$DIR" 2>/dev/null
         done <<EOF
 $deleted_shas
 EOF
-        git diff --diff-filter=D --name-only HEAD -- "$DIR" 2>/dev/null
-        git diff --cached --diff-filter=D --name-only -- "$DIR" 2>/dev/null
+        git diff --no-renames --diff-filter=D --name-only HEAD -- "$DIR" 2>/dev/null
+        git diff --no-renames --cached --diff-filter=D --name-only -- "$DIR" 2>/dev/null
     } | grep -E '\.yaml$' | LC_ALL=C sort -u
 )
 

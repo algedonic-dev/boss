@@ -1,0 +1,10 @@
+{
+  "about": "READ-ONLY: renders what retire-volume-claim WOULD delete, and deletes nothing (infra/forge/retire-volume-claim.sh --plan <namespace> <claim>; backlog f36eb7ce, design b4b1c99d). One claim, named in full. Every bound of the write is applied, each refusing by name (exit 78): the names are DNS labels; the claim is not protected (pgdata-postgres-0, boss-dev-work, in any namespace); the manifest directories are clean in git, read as the checkout's owner; infra/cluster/undeclared-objects.sh --check names PersistentVolumeClaim/<namespace>/<claim> undeclared, which refuses a namespace the tree does not own, a declared claim (volumeClaimTemplates included), an exempt object, a controller-owned claim and one that is not live; the claim is not being deleted and has no owner; its PersistentVolume names it by uid and reclaims by Retain, or by Delete on a Longhorn volume that is detached; and no Pod in any phase, Job, CronJob, Deployment, StatefulSet, DaemonSet or ReplicaSet in its namespace mounts it or would stamp it again. A namespace that cannot be read is a failure (exit 1), never an empty one. The plan names the claim (uid, size, class, labels, finalizers, creation), its volume (uid, reclaim policy, source), the Longhorn volume (size, state), the consumer verdict and the one DELETE it authorises, with no clock, resourceVersion or tree sha, so two renders of one state are byte-identical; its sha256 rides stderr as plan-sha256 and David's passkey signs those bytes. Reads go through the forge ops_kubectl door (the derivation's --kubectl). Timeout 300 covers the derivation's manifest parse, as delete-orphan-object's does.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/retire-volume-claim.sh", "--plan", "{1}", "{2}"],
+  "params": [
+    {"name": "namespace", "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"},
+    {"name": "claim", "pattern": "^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$"}
+  ],
+  "timeout": 300
+}

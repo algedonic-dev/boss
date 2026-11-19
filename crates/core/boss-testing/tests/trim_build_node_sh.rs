@@ -37,7 +37,7 @@
 //! a refusal can be shown to have written nothing. Nothing here reaches a
 //! cluster.
 
-use boss_testing::{repo_root, scratch_dir, write_exec, write_file};
+use boss_testing::{repo_root, scratch_dir, with_default_signals, write_exec, write_file};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -1359,8 +1359,11 @@ exec /bin/sleep 1
         std::env::var("PATH").unwrap_or_default()
     );
     // A separate watchdog bounds missing readiness and a stuck TERM
-    // cleanup; it never supplies the cancellation being tested.
-    let mut child = Command::new("timeout")
+    // cleanup; it never supplies the cancellation being tested. Every
+    // signal starts at its default, so the TERM below is the one the
+    // script traps, whatever the runner handed the suite (backlog
+    // 5f6a2cde).
+    let mut child = with_default_signals("timeout")
         .args(["--preserve-status", "--kill-after=2", "30"])
         .arg("bash")
         .arg(repo_root().join(SCRIPT))

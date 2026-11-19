@@ -1,0 +1,57 @@
+# A review step nominated to its own car's builder, or nominated to
+# anyone and left unclaimed past a bound, goes back to its station's
+# queue (backlog eb86a174, the first rule of "the factory routes
+# stranded work itself").
+#
+# THE CASE. David, 2026-11-15: "The factory is supposed to handle this
+# automatically so we aren't relying on executor attention to keep work
+# moving." Measured the same evening (18:0xZ, 136 open ship-a-change
+# cars): 47 READY review steps held by a named reviewer nobody had
+# claimed for 7.6 to 13.9 hours — 41 `landed-review`s on agent-claude-b,
+# 6 held `review`s on agent-codex — each put there by a hand's `boss step
+# nominate`. Forty of the 41 were named to the agent that BUILT the car:
+# those cars were opened at green, carry no `built_by`, and the
+# nominator read the builder as "the auto-park automation". Since the
+# matchmaker was retired (e1eaf72b) work stands at its station and a
+# reviewer PULLS it, and the pull walks past a step someone else holds:
+# a nomination nobody acts on is a step no other reviewer can reach.
+#
+# WHAT IT MOVES. A READY step with a holder whose agent block declares
+# `profile` — never a claimed (`active`) step, never a step whose
+# `agent_run` names a run still open. Its BUILDER (the car's `built_by`,
+# else its builder run's `building` holder, one actor by id or alias)
+# goes back on the first tick; ANY holder goes back once the
+# `nomination_requested` record naming it is `unclaimed_minutes` old,
+# the review step's own two-hour expectation. An undated nomination is
+# left and said so. The step returns to `ready` and nobody's, at its
+# `at` station, with a `returned_to_station` note; its run edge is never
+# touched, because a held car's release door reads it. A car with no
+# `built_by` has it stamped from the builder run first, so the station
+# pull's own-review exclusion keeps the builder out of the queue too.
+#
+# EVERY FIFTEEN MINUTES: the builder half should not wait an hour, and
+# the read is one slim page of open cars; only a car holding a
+# nomination is read whole. Its event twin,
+# `a-review-nominated-to-its-builder-returns-to-its-station`, answers
+# the builder half on the `step.assigned` marker itself (c9cbf382); this
+# sweep keeps the residue no marker announces and the unclaimed half.
+[[rule]]
+name = "a-stranded-review-nomination-returns-to-its-station"
+why = """
+A TIMER over an ABSENCE, the standing exemption: the condition is a
+claim that did NOT happen — a nomination standing unclaimed past its
+bound — and no event says "two hours passed and nobody took this
+review". A Workflow can say who a step is for; it cannot notice that
+the actor a hand named has not come, nor that the hand named the car's
+own builder. Measured 2026-11-15 (backlog eb86a174): 47 ready reviews
+held 7.6 to 13.9 h by a nominee that never claimed them, 40 of them
+named to the agent that built the car. It adds no routing beyond the
+return, which puts a nomination back in the state its station holds
+unplaced work in — `ready`, nobody's — for any admissible reviewer to
+pull; it nominates nobody and claims nothing.
+"""
+version = 1
+schedule = { cadence = "every-15-minutes", anchor_date = "2026-11-15" }
+[[rule.do]]
+handler = "jobs.return_stranded_review"
+args = { kind = "\"ship-a-change\"", profile = "\"reviewer\"", unclaimed_minutes = "120" }
