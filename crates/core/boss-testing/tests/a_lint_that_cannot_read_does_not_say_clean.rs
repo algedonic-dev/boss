@@ -140,6 +140,7 @@ impl Fixture {
         for lib in [
             "git-answer.sh",
             "trunk-ref.sh",
+            "public-mirror.sh",
             "pattern-scan.sh",
             "scanned.sh",
             "allowlist.sh",
@@ -263,6 +264,11 @@ exec {} "$@"
             // The fixture has only `main`, and naming it explicitly keeps
             // the test independent of any remote the fixture might grow.
             .env("BOSS_TRUNK_REF", "main")
+            // The public mirror runs this suite with BOSS_TRUNK=none
+            // declared (backlog 2d28df78); beside the ref named above it
+            // is refused as a contradiction, and these cases are about a
+            // checkout that has a trunk.
+            .env_remove("BOSS_TRUNK")
             .env("LINT_GIT_SHIM_BREAK", break_git);
         if !break_git.is_empty() {
             let path = std::env::var("PATH").unwrap_or_default();
@@ -314,6 +320,9 @@ const LINTS: &[&str] = &[
     "steptype-bundle-ratchet",
     "a-new-style-has-a-caller",
     "a-rule-edit-bumps-its-version",
+    // Joined 2026-11-17 (backlog fce9a81e), when it began asking git
+    // which tracked files cite the roadmap file.
+    "no-todo-citation",
 ];
 
 /// The fixture's one dispatcher rule, for `a-rule-edit-bumps-its-version`.
@@ -1127,6 +1136,82 @@ fn no_secrets_reads_the_tree_or_says_it_could_not() {
     // has a meaning for.
     let (code, out) = fx.run(lint, "ls-files", false);
     assert_refusal(lint, code, &out, "git ls-files", SHIM_SAID);
+    let (code, out) = fx.run(lint, "", true);
+    assert_refusal(lint, code, &out, "git ls-files", OWNER_SAID);
+}
+
+// ---------------------------------------------------------------------
+// no-todo-citation: a citation of a file that holds no sections
+// ---------------------------------------------------------------------
+
+/// The roadmap file was cut to a pointer on 2026-11-16 (backlog
+/// d83cbd3f), and the repair run that cut it measured code, seeds and
+/// lints citing sections of it that were in no version of the file —
+/// "Strip BatchEngine", "Hourly tick granularity for the live sim" — and
+/// a login page telling every evaluator to see it (backlog fce9a81e).
+/// The lint refuses a mention of the file anywhere outside Markdown,
+/// unless the mention is pinned to a commit (`git show <sha>:<file>`),
+/// which resolves whatever the file says today.
+#[test]
+fn no_todo_citation_reads_the_tree_or_says_it_could_not() {
+    let fx = Fixture::new("no-todo-citation");
+    let lint = "no-todo-citation";
+    // ASSEMBLED, not written out: this file is tracked and not Markdown,
+    // so the lint reads it, and the literal would red the real tree.
+    let file = format!("{}.md", "TODO");
+
+    // 1. Markdown may link the pointer — that is what the pointer is for
+    //    — and a citation pinned to a commit resolves.
+    fx.write("README.md", &format!("Open work: see [{file}]({file}).\n"));
+    fx.write(
+        "apps/web/src/pinned.ts",
+        &format!("// its last full text: git show dab00c7bb6f3:{file}\n"),
+    );
+    fx.commit("a pointer link and a pinned citation");
+    let (code, out) = fx.run(lint, "", false);
+    assert_eq!(
+        code, 0,
+        "a link in Markdown and a pinned citation must pass:\n{out}"
+    );
+    assert!(
+        out.contains(&format!("{lint}: clean")),
+        "a clean fixture must say clean:\n{out}"
+    );
+
+    // 2. The two shapes the packet measured: a seed comment citing a
+    //    section, and user-facing text sending the reader to the file.
+    //    A pinned mention earlier on the same line does not excuse an
+    //    unpinned one after it.
+    fx.write(
+        "crates/core/boss-jobs/seeds/tenant.toml",
+        &format!("# retired 2026-05-06 — see {file} \"Strip BatchEngine\".\n"),
+    );
+    fx.write(
+        "apps/web/src/Login.svelte",
+        &format!("<p>was git show dab00c7bb6f3:{file}; now see {file}.</p>\n"),
+    );
+    fx.commit("two citations that lead nowhere");
+    let (code, out) = fx.run(lint, "", false);
+    assert_eq!(
+        code, 1,
+        "an unpinned citation outside Markdown must fail:\n{out}"
+    );
+    for named in [
+        "crates/core/boss-jobs/seeds/tenant.toml",
+        "apps/web/src/Login.svelte",
+    ] {
+        assert!(out.contains(named), "the failure must name {named}:\n{out}");
+    }
+    assert!(
+        !out.contains("apps/web/src/pinned.ts"),
+        "the pinned citation must not be named:\n{out}"
+    );
+
+    // 3. Both git failures, on both of the lint's git calls.
+    let (code, out) = fx.run(lint, "ls-files", false);
+    assert_refusal(lint, code, &out, "git ls-files", SHIM_SAID);
+    let (code, out) = fx.run(lint, "grep", false);
+    assert_refusal(lint, code, &out, "git grep", SHIM_SAID);
     let (code, out) = fx.run(lint, "", true);
     assert_refusal(lint, code, &out, "git ls-files", OWNER_SAID);
 }

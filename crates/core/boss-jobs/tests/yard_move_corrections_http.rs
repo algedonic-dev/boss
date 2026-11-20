@@ -50,7 +50,7 @@ async fn audit_cause_clock_uses_exact_insertion_instead_of_producer_time() {
     let result =
         move_diagnosis::diagnose(Uuid::new_v4(), receipt.original, receipt.inputs).unwrap();
     assert_eq!(result.status, Status::Eligible, "{}", result.why);
-    assert!(result.model.starts_with("registered-agent-handoff-v2:"));
+    assert!(result.model.starts_with("registered-agent-handoff-v3:"));
     assert_eq!(result.model.split_once(':').unwrap().1.len(), 64);
     assert_eq!(serde_json::to_value(&result.original).unwrap(), original);
     assert_eq!(serde_json::to_value(&result.inputs).unwrap(), inputs);
@@ -327,7 +327,9 @@ async fn the_record_conserves_raw_active_superseded_and_withdrawn_rows() {
     assert_eq!(after["undeclared"]["moves"], 0);
     assert_eq!(
         after["history"],
-        json!({"raw":1,"active":0,"superseded":1,"unknown":0})
+        // raw = active + superseded + unknown + superseded_mover: a row
+        // another mover wrote is its own count (backlog 3976779c).
+        json!({"raw":1,"active":0,"superseded":1,"unknown":0,"superseded_mover":0})
     );
     let (status, body) = post(
         app.clone(),
@@ -482,4 +484,44 @@ async fn a_forged_status_future_protocol_or_unsupported_carriage_never_becomes_p
             result.why
         );
     }
+}
+
+/// A rejected version is a draft that never will be published (backlog
+/// 50ded63d), so a move pinned to one was diagnosed onto a protocol that
+/// was never available — the v2 model read only `Draft` and called it
+/// available (backlog f9cbf891). The v3 model asks `was_published()`, the
+/// question every other door asks, and stays UNKNOWN.
+#[tokio::test]
+async fn a_rejected_pinned_protocol_is_not_available_under_the_v3_model() {
+    use boss_jobs::{
+        move_diagnosis::{self, Diagnosis, Status},
+        registry::WorkflowStatus,
+    };
+    let (_, body) = post(
+        fixture().await,
+        "/api/yard/moves/1/diagnoses",
+        json!({"request_id":Uuid::new_v4()}),
+    )
+    .await;
+    let receipt: Diagnosis = serde_json::from_value(body).unwrap();
+    assert_eq!(receipt.status, Status::Eligible, "{}", receipt.why);
+    for (status, expected) in [
+        (WorkflowStatus::Active, Status::Eligible),
+        (WorkflowStatus::Draft, Status::Unknown),
+        (WorkflowStatus::Rejected, Status::Unknown),
+    ] {
+        let mut inputs = receipt.inputs.clone();
+        inputs.workflows[0].status = status;
+        let result =
+            move_diagnosis::diagnose(Uuid::new_v4(), receipt.original.clone(), inputs).unwrap();
+        assert_eq!(result.status, expected, "{status:?}: {}", result.why);
+        if expected == Status::Unknown {
+            assert_eq!(
+                result.why,
+                "pinned protocol was not available at the original cause"
+            );
+        }
+    }
+    // A changed answer is a new model, never a silent edit of v2.
+    assert!(receipt.model.starts_with("registered-agent-handoff-v3:"));
 }

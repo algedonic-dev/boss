@@ -481,6 +481,59 @@ async fn a_draft_is_not_a_version_a_packet_is_moved_to() {
     assert!(repinned_events(&jobs).is_empty());
 }
 
+/// Backlog 50ded63d, the review of car e3c4a326 (B2, M3). A REJECTED
+/// candidate lost its experiment and was never published, so it is no
+/// more a target than the draft it was — and unlike a draft there is no
+/// "publish it, then move": the obstacle says it is rejected. Nothing
+/// is written.
+#[tokio::test]
+async fn a_rejected_candidate_is_not_a_version_a_packet_is_moved_to() {
+    let App {
+        router: app,
+        kinds,
+        jobs,
+    } = app();
+    let id = open_at_build(&app).await;
+    let pinned = get_job(&app, &id).await["workflow_version"].clone();
+    let rejected = later_version(1, WorkflowStatus::Rejected, |s| {
+        set_procedure(s, "build", "The losing candidate's text.")
+    });
+    let to = rejected.version;
+    kinds.seed(rejected).expect("seed the rejected candidate");
+
+    let (status, body) = send(
+        &app,
+        req(
+            "GET",
+            &format!("/api/jobs/{id}/convert?to_version={to}"),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["convertible"], false, "{body}");
+
+    let (status, body) = convert(&app, &id, to).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["converted"], false);
+    let reasons: Vec<&str> = body["obstacles"]
+        .as_array()
+        .expect("obstacles")
+        .iter()
+        .filter_map(|o| o["reason"].as_str())
+        .collect();
+    assert!(
+        reasons.iter().any(|r| r.contains("is rejected")),
+        "the obstacle says the target is rejected: {body}"
+    );
+    assert!(
+        reasons.iter().all(|r| !r.contains("publish it")),
+        "a rejected row is never published, so nothing says to: {body}"
+    );
+    assert_eq!(get_job(&app, &id).await["workflow_version"], pinned);
+    assert!(repinned_events(&jobs).is_empty());
+}
+
 /// Q1: the dry run is a READ — the verdict and the plan the write would
 /// carry, with nothing written. A cohort is previewed by running it in
 /// a loop, which is why a job reader may ask it.

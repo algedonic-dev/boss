@@ -62,6 +62,103 @@ const EFFECT_UNREAD: &[&str] = &["publish-github-pr"];
 /// is also checked against its own `FAILED — ` and `REFUSED — ` lines
 /// (see the test).
 const NOT_EFFECTS: &[(&str, &str)] = &[
+    // registry-probe (backlog 01927489), at the head as the entries below
+    // are: the bounds-hold line, the create's answer and the removal of
+    // its own Job (a Job made, or removed, is not a pull), and a completed
+    // Job whose pull the run could not vouch for.
+    (
+        "registry-probe",
+        "registry-probe: every bound holds — w-3 is a talos-worker at 10.20.0.17, not cordoned; no probe running (none). Creating Job boss-dev/registry-probe from infra/forge/registry-probe.yaml, pinned to w-3, pulling reg.test/david/alpine-k8s:1.33.3@sha256:cdeda0da2cd6896023cc5f96505bc94a699a989dff2bfc3e2008ab92eab1e93a (imagePullPolicy Always).",
+    ),
+    (
+        "registry-probe",
+        "registry-probe: created Job boss-dev/registry-probe (uid 6f1e9b99-0000-4000-8000-0000000000ae); waiting up to 240s (its own deadline of 180s and 60s for the controller)",
+    ),
+    (
+        "registry-probe",
+        "registry-probe: removed this run's Job boss-dev/registry-probe (uid 6f1e9b99-0000-4000-8000-0000000000ae; read back gone)",
+    ),
+    (
+        "registry-probe",
+        "registry-probe: FAILED — Job boss-dev/registry-probe completed, and the pull is not vouched for: its pod ran on 'w-2', not w-3. Its whole log is above",
+    ),
+    // prove-gate-volume (backlog ae59464b), at the head as the entries
+    // below are: the previous proof's removal, the bounds-hold line and
+    // the create's answer (a Job made is not a proof), and a completed Job
+    // whose log does not vouch.
+    (
+        "prove-gate-volume",
+        "prove-gate-volume: removed the previous proof Job boss-dev/gate-volume-proof (uid 6f1e9b99-0000-4000-8000-0000000000aa; read back gone)",
+    ),
+    (
+        "prove-gate-volume",
+        "prove-gate-volume: every bound holds — w-1 is a talos-worker at 10.20.0.14, not cordoned; claim boss-dev/gate is Bound to gate-w-1 (/var/mnt/gate) on w-1; no gate in flight on it; no proof running (none). Creating Job boss-dev/gate-volume-proof from infra/gate-runner/gate-volume-proof.yaml, pinned to w-1.",
+    ),
+    (
+        "prove-gate-volume",
+        "prove-gate-volume: created Job boss-dev/gate-volume-proof (uid 6f1e9b99-0000-4000-8000-0000000000ae); waiting up to 360s (its own deadline of 300s and 60s for the controller)",
+    ),
+    (
+        "prove-gate-volume",
+        "prove-gate-volume: FAILED — Job boss-dev/gate-volume-proof completed, and the proof is not vouched for: the marker it read back names node 'w-2', not w-1. Its whole log is above",
+    ),
+    // retire-access-object (backlog 526bedf2), at the head as the entries
+    // below are: the plan-still-holds line, the capture's receipt and the
+    // delete's announcement (none of them a read-back), and the two ways
+    // the read-back refuses to vouch — the object still there, and a
+    // read-back that could not read.
+    (
+        "retire-access-object",
+        "retire-access-object: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — capturing RoleBinding boss-dev/old-runner onto request 0e0e0e0e-0000-4000-8000-0000000000aa before the delete",
+    ),
+    (
+        "retire-access-object",
+        "retire-access-object: captured RoleBinding boss-dev/old-runner (812 bytes, sha256 64897706f647cfe251a61343ad71eea50ef82e6525e7e3e767c683660c90d41d) onto request 0e0e0e0e-0000-4000-8000-0000000000aa as file 0f0f0f0f-0000-4000-8000-00000000000a, read back byte-identical",
+    ),
+    (
+        "retire-access-object",
+        "retire-access-object: deleting RoleBinding boss-dev/old-runner with preconditions.uid=6f1e9b99-0000-4000-8000-0000000000a3",
+    ),
+    (
+        "retire-access-object",
+        "retire-access-object: FAILED — the delete of RoleBinding boss-dev/old-runner was accepted and after 60s uid 6f1e9b99-0000-4000-8000-0000000000a3 is still there, present. Nothing more was done; read it with plan-an-access-object-retirement",
+    ),
+    (
+        "retire-access-object",
+        "retire-access-object: FAILED — deleted, not proven gone: the delete of RoleBinding boss-dev/old-runner was accepted and the read-back is unreadable: Error from server (Forbidden): rolebindings is forbidden",
+    ),
+    // publish-tenant (backlog 1610115d): the plan-still-holds line,
+    // printed before the publish runs.
+    (
+        "publish-tenant",
+        "publish-tenant: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — publishing david/algedonic-llc@0123456789abcdef0123456789abcdef01234567 into prod (take classes)",
+    ),
+    // retire-volume-claim (backlog f36eb7ce, design b4b1c99d), at the
+    // head as the entries below are: the plan-still-holds line, the
+    // capture's receipt and the delete's announcement (none of them a
+    // read-back), and the two ways the read-back refuses to vouch — a
+    // claim held Terminating, and a Longhorn volume that outlived its
+    // Delete reclaim after the claim and the PV went.
+    (
+        "retire-volume-claim",
+        "retire-volume-claim: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — capturing boss-dev/gate-runner-disk onto request 0e0e0e0e-0000-4000-8000-0000000000aa before the delete",
+    ),
+    (
+        "retire-volume-claim",
+        "retire-volume-claim: captured boss-dev/gate-runner-disk (2113 bytes, sha256 64897706f647cfe251a61343ad71eea50ef82e6525e7e3e767c683660c90d41d) onto request 0e0e0e0e-0000-4000-8000-0000000000aa as file 0f0f0f0f-0000-4000-8000-00000000000a, read back byte-identical",
+    ),
+    (
+        "retire-volume-claim",
+        "retire-volume-claim: deleting boss-dev/gate-runner-disk with preconditions.uid=6f1e9b99-0000-4000-8000-0000000000c1",
+    ),
+    (
+        "retire-volume-claim",
+        "retire-volume-claim: FAILED — the delete of boss-dev/gate-runner-disk was accepted and after 180s uid 6f1e9b99-0000-4000-8000-0000000000c1 is still there, being deleted since 2026-10-18T12:00:00Z, held by finalizers kubernetes.io/pvc-protection — something mounted it after the plan was rendered, and Kubernetes holds it until that consumer goes. Nothing more was done; read it with plan-a-volume-claim-retirement",
+    ),
+    (
+        "retire-volume-claim",
+        "retire-volume-claim: FAILED — PersistentVolumeClaim boss-dev/gate-runner-disk uid 6f1e9b99-0000-4000-8000-0000000000c1 is gone (read back: NotFound) and PersistentVolume pvc-11111111-1111-4111-8111-111111111111 is gone, but Longhorn volume pvc-11111111-1111-4111-8111-111111111111 is still there after 180s, present, phase unknown — its replicas are not proven released",
+    ),
     // trim-build-node (backlog 30a6bf39), at the head as the entries
     // below are: the bounds holding and the create's answer (a Job made
     // is not a trim run), and a trim that succeeded whose Job could not
@@ -124,6 +221,25 @@ const NOT_EFFECTS: &[(&str, &str)] = &[
         "retire-ops-runner",
         "retire-ops-runner: CANNOT ANSWER — disable --now returned success but systemctl gave no reading of boss-ops-runner.timer afterwards (is-enabled: ; is-active: ), so it is not proven off. The marker stands: the converge's own reading settles it.",
     ),
+    // suspend-a-chore (backlog d28c0051): the plan-still-holds line, the
+    // live state it prints at the write, the API server's acceptance of
+    // the patch, and the read-back that found the other value.
+    (
+        "suspend-a-chore",
+        "suspend-a-chore: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — setting spec.suspend of cronjob boss/boss-search-reindex from false to true",
+    ),
+    (
+        "suspend-a-chore",
+        "suspend-a-chore: at the write: last scheduled 2026-11-11T05:07:00Z; active Jobs (1): boss-search-reindex-29380387",
+    ),
+    (
+        "suspend-a-chore",
+        "suspend-a-chore: the API server accepted spec.suspend=true on cronjob boss/boss-search-reindex — reading it back",
+    ),
+    (
+        "suspend-a-chore",
+        "suspend-a-chore: FAILED — the patch was accepted, and cronjob boss/boss-search-reindex reads back spec.suspend false, not true — NOT proven. Read it again with plan-a-chore-suspend",
+    ),
     // set-longhorn-drain-policy (backlog 46584350), at the head so it
     // does not share the tail line with the volume-replicas car: the
     // plan-still-holds line, Longhorn's acceptance of the patch, and the
@@ -131,6 +247,12 @@ const NOT_EFFECTS: &[(&str, &str)] = &[
     (
         "set-longhorn-drain-policy",
         "set-longhorn-drain-policy: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — setting node-drain-policy from block-if-contains-last-replica to allow-if-replica-is-stopped",
+    ),
+    // The volumes it decides for, read again at the run and listed
+    // before the patch (backlog 6fa13f0f): a report, never the effect.
+    (
+        "set-longhorn-drain-policy",
+        "set-longhorn-drain-policy: read at this run, not signed: 1 longhorn volume(s) whose only healthy replica is on a worker — the volumes node-drain-policy decides for once it is block-if-contains-last-replica:",
     ),
     (
         "set-longhorn-drain-policy",
@@ -209,6 +331,16 @@ const NOT_EFFECTS: &[(&str, &str)] = &[
     (
         "reap-terminated-pods",
         "reap-terminated-pods: plan 0123456789abcdef still holds — reaping 3 pod(s)",
+    ),
+    // revoke-logged-calendar-tokens (backlog 77dc1579): the line before
+    // the POST, and the revoke answered but the count did not read back 0.
+    (
+        "revoke-logged-calendar-tokens",
+        "revoke-logged-calendar-tokens: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — revoking 3 in boss-playground as automation:ops-runner (ops-request unnamed)",
+    ),
+    (
+        "revoke-logged-calendar-tokens",
+        "revoke-logged-calendar-tokens: FAILED — the revoke answered revoked 3, and read back: logged_raw 3 (was 3) — NOT proven; the request stands",
     ),
     // delete-orphan-object (backlog 1058e686, car B): the line before the
     // delete, the OK it printed before gone meant NotFound, and the two
@@ -469,6 +601,18 @@ const NOT_EFFECTS: &[(&str, &str)] = &[
         "node-converge",
         "node-converge: FAILED — Talos accepted the patch on w-1, and after 121s it is NOT proven to carry its declaration: the machine config reads every declared entry MATCH, and the Node was back and is NOT any more: Ready=False, kubelet lease renewTime 2026-09-30T15:00:40.000000Z. The patch stands — read it again with plan-a-node-converge w-1 0123456789abcdef0123456789abcdef01234567",
     ),
+    // The narrowed patch (backlog 9cf1673d, built for 67e98635): its
+    // plan-still-holds line, and the read-back's refusal when an entry
+    // the patch did not carry moved — every applied entry MATCH, which a
+    // read of the applied entries alone would call done.
+    (
+        "node-converge",
+        "node-converge: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — applying infra/cluster/talos/patches/w-1.yaml at 0123456789abcdef0123456789abcdef01234567, narrowed to its 2 entries ABSENT live, to w-1 (10.20.0.14)",
+    ),
+    (
+        "node-converge",
+        "node-converge: FAILED — Talos accepted the patch on w-1, and after 121s it is NOT proven to carry its declaration: every entry the patch applied reads MATCH, and declared entries it did not carry read differently than before the apply: machine.files[/var/local/gate-seed/.declared-by-talos]. The patch stands — read it again with plan-a-node-converge w-1 0123456789abcdef0123456789abcdef01234567",
+    ),
     // move-volume-replica (backlog ab39a34e), above set-volume-replicas'
     // so neither shares the other's line: the plan-still-holds line, the
     // raise Longhorn accepted, the new replica healthy before the old one
@@ -542,6 +686,240 @@ const NOT_EFFECTS: &[(&str, &str)] = &[
     (
         "retire-volume-replica",
         "retire-volume-replica: FAILED — the retirement of pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab is NOT proven after 181s: pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab gone, spec.numberOfReplicas 3, robustness degraded, healthy on cp-1, cp-2, cp-3, replicas pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-03f4dac5, pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-1269eb6e, pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-7c1934ba (planned to remain: pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-03f4dac5, pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-1269eb6e, pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-7c1934ba); not healthy: none. Read the volume again with plan-a-volume-replica-retirement",
+    ),
+    // add-longhorn-disk (backlog 493a02b6), at the tail so it shares no
+    // line with any entry above: the plan-still-holds line, Longhorn's
+    // acceptance of the patch (what a verb reading kubectl's exit code
+    // alone would call success), and the read-back's refusal of a disk
+    // Longhorn does not read Ready.
+    (
+        "add-longhorn-disk",
+        "add-longhorn-disk: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — adding Longhorn disk u-longhorn at /var/mnt/longhorn to w-2",
+    ),
+    (
+        "add-longhorn-disk",
+        "add-longhorn-disk: Longhorn accepted disk u-longhorn on w-2 — reading it back (up to 300s: the disk's spec, every other disk unchanged, and Longhorn's Ready and Schedulable for u-longhorn)",
+    ),
+    (
+        "add-longhorn-disk",
+        "add-longhorn-disk: FAILED — Longhorn accepted disk u-longhorn on w-2, and after 301s it is NOT proven: Longhorn reads u-longhorn Ready=False (DiskFilesystemChanged disk u-longhorn has a different file system than the one recorded) and Schedulable=False (DiskFilesystemChanged). The disk stands, and Longhorn schedules nothing to a disk it does not read Ready — read it with node-disk-usage w-2",
+    ),
+    // remove-longhorn-disk (backlog b791c5b4), the add's inverse, below
+    // it at the tail: the plan-still-holds line, the scheduling patch's
+    // acceptance, the second read finding a replica placed in the window,
+    // the removal's acceptance (what a verb reading kubectl's exit code
+    // alone would call success), and the read-back's refusal.
+    (
+        "remove-longhorn-disk",
+        "remove-longhorn-disk: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — removing Longhorn disk u-longhorn at /var/mnt/longhorn from w-2",
+    ),
+    (
+        "remove-longhorn-disk",
+        "remove-longhorn-disk: disk u-longhorn on w-2 is unschedulable — reading what is on it again after 15s, before the removal",
+    ),
+    (
+        "remove-longhorn-disk",
+        "remove-longhorn-disk: FAILED — Longhorn disk u-longhorn at /var/mnt/longhorn on w-2 now holds: replica pvc-77-r-late of volume pvc-77 (diskID 0b0b0b0b-1111-4222-8333-444455556666, diskPath /var/mnt/longhorn). It stays in spec.disks with allowScheduling false, so Longhorn places nothing new there, and nothing was removed — move what is on it, then plan again",
+    ),
+    (
+        "remove-longhorn-disk",
+        "remove-longhorn-disk: Longhorn accepted the removal of disk u-longhorn from w-2 — reading it back (up to 180s: gone from spec.disks and from Longhorn's diskStatus, every other disk unchanged)",
+    ),
+    (
+        "remove-longhorn-disk",
+        "remove-longhorn-disk: FAILED — Longhorn accepted the removal of disk u-longhorn from w-2, and after 181s it is NOT proven: Longhorn still reports status for u-longhorn — read it with node-disk-usage w-2",
+    ),
+    // reregister-longhorn-disk (backlog 36d2c484), the family's third
+    // pair, below the removal at the tail: the plan-still-holds line, the
+    // scheduling patch's acceptance, the removal's acceptance, a stale
+    // status Longhorn never dropped (the record re-added as it was), the
+    // re-add's acceptance (what a verb reading kubectl's exit code alone
+    // would call success), and the read-back's refusal of a record
+    // Longhorn still reads DiskFilesystemChanged.
+    (
+        "reregister-longhorn-disk",
+        "reregister-longhorn-disk: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — re-registering Longhorn disk default-disk-080400000000 at /var/lib/longhorn on w-2 (recorded diskUUID 6e6e6e6e-1111-4222-8333-444455556666, on the disk 0b0b0b0b-1111-4222-8333-444455556666)",
+    ),
+    (
+        "reregister-longhorn-disk",
+        "reregister-longhorn-disk: record default-disk-080400000000 on w-2 is unschedulable — reading what names it again after 15s, before the removal",
+    ),
+    (
+        "reregister-longhorn-disk",
+        "reregister-longhorn-disk: Longhorn accepted the removal of record default-disk-080400000000 from w-2 — waiting up to 300s for Longhorn to drop its status for default-disk-080400000000 before the record is added back",
+    ),
+    (
+        "reregister-longhorn-disk",
+        "reregister-longhorn-disk: FAILED — Longhorn accepted the removal of record default-disk-080400000000 from w-2, and after 300s it still read: Longhorn still reports status for default-disk-080400000000 (diskUUID 6e6e6e6e-1111-4222-8333-444455556666). The record was added back all the same, so w-2 reads as it did before this run — the re-registration is NOT proven; read it with node-disk-usage w-2",
+    ),
+    (
+        "reregister-longhorn-disk",
+        "reregister-longhorn-disk: Longhorn accepted record default-disk-080400000000 back on w-2 at /var/lib/longhorn — reading it back (up to 300s: the disks as planned, and Longhorn's Ready, Schedulable and diskUUID for default-disk-080400000000)",
+    ),
+    (
+        "reregister-longhorn-disk",
+        "reregister-longhorn-disk: FAILED — Longhorn accepted record default-disk-080400000000 back on w-2, and after 301s it is NOT proven: Longhorn reads default-disk-080400000000 Ready=False (DiskFilesystemChanged record diskUUID does not match the one on the disk) and Schedulable=False (DiskNotReady). The record stands — read it with node-disk-usage w-2",
+    ),
+    // rebuild-a-failed-replica (backlog 776bcb59), at the tail: the
+    // plan-still-holds line, the delete's announcement (what a verb
+    // reading kubectl's exit code alone would call success), the rebuild
+    // STARTING (a replacement listed is not a replacement built), and the
+    // read-back's refusal of a rebuild that did not finish.
+    (
+        "rebuild-a-failed-replica",
+        "rebuild-a-failed-replica: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — deleting replica pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-1269eb6e of pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56 so Longhorn rebuilds it: numberOfReplicas 3 unchanged",
+    ),
+    (
+        "rebuild-a-failed-replica",
+        "rebuild-a-failed-replica: deleted pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-1269eb6e (uid 0b1c2d3e-0000-4000-8000-00000000cp02) — watching up to 300s for it to go and for Longhorn to start one replacement",
+    ),
+    (
+        "rebuild-a-failed-replica",
+        "rebuild-a-failed-replica: Longhorn is rebuilding pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56: pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-1269eb6e is gone and pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-feedface on w-1 (mode WO) is listed — reading back for up to 1200s",
+    ),
+    (
+        "rebuild-a-failed-replica",
+        "rebuild-a-failed-replica: FAILED — the rebuild of pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56 started but is NOT proven after 1201s: spec.numberOfReplicas 3, robustness degraded, replicas pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-2bd9cc5a on cp-1 (mode RW, healthy), pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-90eaac42 on cp-3 (mode RW, healthy), pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-feedface on w-1 (mode WO, not healthy (healthyAt empty)); retained not RW and healthy: none; retained gone: none. The delete stands and Longhorn goes on rebuilding; re-measure with plan-a-failed-replica-rebuild or read-volume-replica-history",
+    ),
+    // ...and a rebuild still MOVING at the bound (backlog 090643a1): a
+    // not-yet, exit 75, and still no effect.
+    (
+        "rebuild-a-failed-replica",
+        "rebuild-a-failed-replica: IN PROGRESS — volume pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56 is still rebuilding after 1201s, last moved 14s ago: spec.numberOfReplicas 3, robustness degraded, replicas pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-feedface on w-1 (mode WO, not healthy (healthyAt empty)); rebuilding: tcp://10.244.4.4:10000 at 61% copied — not yet proven; nothing more is written, and read-a-replica-rebuild pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56 reads it again",
+    ),
+    // retire-a-user-volume (backlog 412d504c), at the tail: the
+    // plan-still-holds line, Talos's acceptance of the delete (what a verb
+    // reading talosctl's exit code alone would call success), and the
+    // read-back's refusal of a volume Talos still holds.
+    (
+        "retire-a-user-volume",
+        "retire-a-user-volume: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — deleting UserVolumeConfig gate on w-1 (10.20.0.14); partition /dev/nvme1n1p1 is kept",
+    ),
+    (
+        "retire-a-user-volume",
+        "retire-a-user-volume: Talos accepted the delete of UserVolumeConfig gate on w-1 — reading it back (up to 180s: the live config, volumestatus u-gate, and partition /dev/nvme1n1p1's label)",
+    ),
+    (
+        "retire-a-user-volume",
+        "retire-a-user-volume: FAILED — Talos accepted the delete of UserVolumeConfig gate on w-1, and after 181s the retirement is NOT proven: live config UserVolumeConfig[gate] ABSENT; volumestatus u-gate still there, phase ready; partition /dev/nvme1n1p1 label u-gate. Read it again with talos-get w-1 volumestatus u-gate",
+    ),
+    // wipe-a-partition (backlog c98e3425), at the tail: the plan's own
+    // last line, the plan-still-holds line, talosctl's acceptance of the
+    // wipe (what a verb reading talosctl's exit code alone would call
+    // success), and the read-back's refusal of a partition still there.
+    (
+        "wipe-a-partition",
+        "command: talosctl -n 10.20.0.14 wipe disk nvme1n1p1 --drop-partition — clears the partition's signatures (FAST) and removes its entry from nvme1n1's partition table. The data on it is gone; the disk itself stays.",
+    ),
+    (
+        "wipe-a-partition",
+        "wipe-a-partition: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — wiping nvme1n1p1 on w-1 (10.20.0.14)",
+    ),
+    (
+        "wipe-a-partition",
+        "wipe-a-partition: talosctl accepted the wipe of nvme1n1p1 on w-1 — reading it back (up to 120s: Talos's discoveredvolumes and disks)",
+    ),
+    (
+        "wipe-a-partition",
+        "wipe-a-partition: FAILED — talosctl accepted the wipe of nvme1n1p1 on w-1, and after 121s it is NOT proven gone: Talos still discovers: nvme1n1p1; nvme1n1 reads serial 'TESTKINGSTON01' (planned TESTKINGSTON01); partitions on nvme1n1: nvme1n1p1 — read it again with plan-a-partition-wipe w-1 nvme1n1p1 or talos-get w-1 disks",
+    ),
+    // upgrade-forgejo (backlog cecf62b3): the plan-still-holds line, the
+    // dump's name, the swap, compose's acceptance (what a verb reading
+    // its exit code alone would call success), and the read-back's
+    // refusal — which names the same rollback target the effect does.
+    (
+        "upgrade-forgejo",
+        "upgrade-forgejo: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — taking the dump before anything changes",
+    ),
+    (
+        "upgrade-forgejo",
+        "upgrade-forgejo: dump: /var/backups/boss/forge/forge-20261022-120000.tar.gz (sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef) — the database half of the rollback target",
+    ),
+    (
+        "upgrade-forgejo",
+        "upgrade-forgejo: /opt/forgejo/docker-compose.yml now declares codeberg.org/forgejo/forgejo:16.0.3 — recreating forgejo",
+    ),
+    (
+        "upgrade-forgejo",
+        "upgrade-forgejo: compose accepted the upgrade of forgejo to 16.0.3 — reading it back (up to 600s: the container's image, /api/healthz, /api/v1/version, and refs/heads/main)",
+    ),
+    (
+        "upgrade-forgejo",
+        "upgrade-forgejo: FAILED — compose accepted the upgrade of forgejo to 16.0.3, and after 601s it is NOT proven: image sha256:1111111111111111111111111111111111111111111111111111111111111111 (want sha256:1111111111111111111111111111111111111111111111111111111111111111), /api/healthz HTTP 503 status fail, /api/v1/version 16.0.2, refs/heads/main holds 0123456789ab. Rollback target: image codeberg.org/forgejo/forgejo:16.0.2 (sha256:2222222222222222222222222222222222222222222222222222222222222222), compose file /opt/forgejo/docker-compose.yml.pre-upgrade-16.0.2, database dump /var/backups/boss/forge/forge-20261022-120000.tar.gz (sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef) — Forgejo does not run 16.0.2 against a database 16.0.3 migrated, so going back is that compose file AND a restore of the dump's forgejo-db.sql",
+    ),
+    // set-longhorn-disk-tags (backlog aa650aaf), at the tail: the
+    // plan-still-holds line, Longhorn's acceptance of the patch (what a
+    // verb reading kubectl's exit code alone would call success), and the
+    // read-back's refusal of tags that did not land.
+    (
+        "set-longhorn-disk-tags",
+        "set-longhorn-disk-tags: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — setting the tags of Longhorn disk u-postgres on w-3 to [durable, postgres]",
+    ),
+    (
+        "set-longhorn-disk-tags",
+        "set-longhorn-disk-tags: Longhorn accepted tags [durable, postgres] for disk u-postgres on w-3 — reading it back (up to 300s: the disk's tags, every other field and disk unchanged, and Longhorn's Ready and Schedulable for u-postgres)",
+    ),
+    (
+        "set-longhorn-disk-tags",
+        "set-longhorn-disk-tags: FAILED — Longhorn accepted tags [durable, postgres] for disk u-postgres on w-3, and after 301s they are NOT proven: spec.disks/u-postgres/tags reads [scratch]. The patch stands — read it with read-longhorn-node-tags w-3, and if they must go, the tags before are set-longhorn-disk-tags w-3 u-postgres none",
+    ),
+    (
+        "drill-gcs-restore",
+        "drill-gcs-restore: every bound holds — StorageClass longhorn-restore-drill (diskSelector postgres, one replica), data node w-3 schedulable, both Secrets present by name, no drill standing. Creating Job boss/boss-restore-drill pinned by boss.dev/purpose=database.",
+    ),
+    (
+        "drill-gcs-restore",
+        "drill-gcs-restore: REFUSED — a drill stands FINISHED (complete, uid 6f1e9b99-0000-4000-8000-0000000000ae) and its verdict has not been read — boss ops forge read-restore-drill --wait reads it and removes it; nothing was created",
+    ),
+    (
+        "read-restore-drill",
+        "read-restore-drill: STILL RUNNING — Job boss/boss-restore-drill (uid 6f1e9b99-0000-4000-8000-0000000000ae) started 2026-11-14T16:00:00Z, 1080s ago; pod boss-restore-drill-abcde on w-3; the restore ends itself at 14400s and the Job's backstop is 18000s. Nothing was removed; read it again with boss ops forge read-restore-drill --wait.",
+    ),
+    (
+        "read-restore-drill",
+        "read-restore-drill: removed Job boss/boss-restore-drill (uid 6f1e9b99-0000-4000-8000-0000000000ae) — the Job, its scratch claim and its ConfigMap read back gone",
+    ),
+    (
+        "read-restore-drill",
+        "read-restore-drill: FAILED — the drill did not complete: the Job's Failed condition says BackoffLimitExceeded: Job has reached the specified backoff limit (the Job ran 14700s); the last words of the restore container: restore-drill: FAILED — the restore exceeded its inner deadline after 14400s",
+    ),
+    // move-volume-replica-to-disk (backlog b9789705), at the tail: the
+    // plan-still-holds line, the raise Longhorn accepted, the new replica
+    // healthy before the old one goes, and the delete — none a read-back.
+    (
+        "move-volume-replica-to-disk",
+        "move-volume-replica-to-disk: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — moving replica pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-b407252b of pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56 to u-postgres on w-3: numberOfReplicas 3 -> 4, spec.diskSelector [] -> [\"durable\",\"postgres\"], spec.replicaSoftAntiAffinity ignored -> enabled",
+    ),
+    (
+        "move-volume-replica-to-disk",
+        "move-volume-replica-to-disk: Longhorn accepted spec.numberOfReplicas=4 for pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56 — waiting up to 1200s for a new replica healthy on a target disk (0b0b0b0b-1111-4222-8333-444455556666)",
+    ),
+    (
+        "move-volume-replica-to-disk",
+        "move-volume-replica-to-disk: new replica pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-e0e0e0e1 is healthy on w-3 (disk 0b0b0b0b-1111-4222-8333-444455556666) — 4 healthy on cp-2, cp-3, w-3; lowering spec.numberOfReplicas to 3 and putting back spec.diskSelector [] and spec.replicaSoftAntiAffinity ignored, then deleting pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-b407252b",
+    ),
+    (
+        "move-volume-replica-to-disk",
+        "move-volume-replica-to-disk: deleted pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-b407252b — reading it back (up to 180s: pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-b407252b gone once its finalizer clears, 3 healthy replicas on 3 distinct nodes, every replica's disk admitting growth to 64424509440 bytes)",
+    ),
+    // finish-volume-replica-move (backlog 6d0b3c96), at the tail: the
+    // plan-still-holds line, the pair read before the compare-and-set,
+    // the delete, and the growth note beside the effect — none a read-back.
+    (
+        "finish-volume-replica-move",
+        "finish-volume-replica-move: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — retiring replica pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-b407252b of pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56, which shares w-3 with pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-d1d689a5: numberOfReplicas 4 -> 3, spec.diskSelector [] -> [], spec.replicaSoftAntiAffinity ignored -> ignored",
+    ),
+    (
+        "finish-volume-replica-move",
+        "finish-volume-replica-move: pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-d1d689a5 stays healthy on w-3 (disk 836a05b1-15cf-4283-aea5-235f4e2adb6a) — 4 healthy on cp-3, w-1, w-3; sending the finish's compare-and-set (spec.numberOfReplicas 4 -> 3, spec.diskSelector [], spec.replicaSoftAntiAffinity ignored), then deleting pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-b407252b",
+    ),
+    (
+        "finish-volume-replica-move",
+        "finish-volume-replica-move: deleted pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-b407252b — reading it back (up to 180s: pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-b407252b gone once its finalizer clears, 3 healthy replicas on 3 distinct nodes, pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-d1d689a5 on disk 836a05b1-15cf-4283-aea5-235f4e2adb6a)",
+    ),
+    (
+        "finish-volume-replica-move",
+        "finish-volume-replica-move: not judged by this door, read for the next one: disk 9430cd68-91a7-41e9-9bfb-7bcb98bc8cb1 (default-disk-1030700000000 on cp-3), 1 replica(s) growing 107374182400 each: Scheduling space condition failed",
     ),
 ];
 

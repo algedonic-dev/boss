@@ -2,7 +2,7 @@
 // local gate to forge alone rejected removal of a duplicate typecheck.
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { webCoverage } from './web-ci-coverage';
+import { STAMP_RUN, webCoverage } from './web-ci-coverage';
 
 const read = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8');
 const current = {
@@ -11,17 +11,30 @@ const current = {
   typecheck: read('../../../../infra/lint/svelte-check.sh'),
   scripts: (JSON.parse(read('../../package.json')) as { scripts: Record<string, string> }).scripts,
 };
-// Exact Typecheck-step removal from car62e4423/train644e8417.
-const residual = { ...current, workflow: current.workflow.replace(
-  /      - name: Typecheck\n        working-directory: apps\/web\n        run: bun run typecheck\n\n/, '',
-) };
+// The two check lines through which the train gate pays for apps/web.
+const WEB_SUITE = `check "web-suite (unit+build+mocked)" output_to "$web_out" bash -c 'cd apps/web && bun run test:unit && bun run build && bun run test:mocked'`;
+const WEB_UNIT = `check "web unit" bash -c 'cd apps/web && bun run test:unit'`;
+const RECIPE_GUARD = "        if: steps.recipe.outputs.changed != 'no'\n";
+// THE RESIDUAL FORGE LANE, ALONE (81ee98b3): the kept web steps without
+// their recipe guard, and a gate whose web phase pays for nothing, so
+// every apps/web check must come from the forge job. The forge lane's
+// adversarial controls run on this shape; the gate lane's on `current`.
+const residual = {
+  ...current,
+  workflow: current.workflow.replaceAll(RECIPE_GUARD, ''),
+  gate: current.gate.replace(WEB_SUITE, ':').replace(WEB_UNIT, ':'),
+};
 const removeStep = (workflow: string, name: string) => workflow.replace(
   new RegExp(`      - name: ${name}\\n[\\s\\S]*?(?=      - name:|\\n  # THE RUST|$)`), '',
 );
+const mutate = (text: string, from: string, to: string) => {
+  expect(text).toContain(from);
+  return text.replace(from, to);
+};
 type WorkflowFixture = {
   defaults?: unknown;
   jobs: {
-    'delivery-plan': { steps: { id?: string; shell?: unknown }[] };
+    'delivery-plan': { steps: { id?: string; shell?: unknown; run?: string }[] };
     web: { defaults?: unknown; steps: { name?: string; run?: string; shell?: unknown }[] };
   };
 };
@@ -54,9 +67,72 @@ describe('web coverage across both required train lanes', () => {
       expect(webCoverage({ ...residual, workflow: residual.workflow.replace(before, after) }).length).toBeGreaterThan(0);
     }
   });
+  // 399ee6c3, train 7474e3e0: delivery-plan's one other output producer
+  // names the CI runner image. Admitted only as known text that writes
+  // ci_stamp and nothing else; every other shape is a second writer.
+  test('the runner-image stamp step is the one other producer, and only as known text', () => {
+    const stampLine = '.hexdigest())\' >> "$GITHUB_OUTPUT"';
+    expect(residual.workflow).toContain(stampLine);
+    for (const [before, after] of [
+      [stampLine, '.hexdigest() + "\\nroute=data")\' >> "$GITHUB_OUTPUT"'],
+      [stampLine, `${stampLine}\n          echo route=data >> "$GITHUB_OUTPUT"`],
+      ['        id: stamp\n', '        id: image\n'],
+      ['        id: stamp\n', '        id: stamp\n        shell: bash -c \'echo route=data >> "$GITHUB_OUTPUT"\' {0}\n'],
+    ] as const) {
+      const workflow = residual.workflow.replace(before, after);
+      expect(workflow).not.toEqual(residual.workflow);
+      expect(webCoverage({ ...residual, workflow }).length).toBeGreaterThan(0);
+    }
+  });
+  // 66aaea77: the stamp step's text lives in ci.yml AND in this reader as
+  // STAMP_RUN, on purpose — the reader admits it as exact text, so a
+  // change to the step is a change to the reader, reviewed together. The
+  // pin below holds the two equal; the mutation shows a drift NAMES the
+  // stamp text rather than reading as an absent web job, which is what
+  // it said until this car.
+  test('the stamp step ci.yml runs is the exact text the reader admits', () => {
+    const stamp = fixture().jobs['delivery-plan'].steps.find((step) => step.id === 'stamp');
+    expect(stamp?.run?.trim()).toBe(STAMP_RUN);
+    const harmless = mutate(residual.workflow, '("Dockerfile", "required-tools.txt")',
+      '("Dockerfile", "required-tools.txt", "build.sh")');
+    const errors = webCoverage({ ...residual, workflow: harmless }).join('\n');
+    expect(errors).toContain('STAMP_RUN');
+    expect(errors).not.toContain('forge web job is absent');
+  });
   test('current and assembled residual forge shapes cover the local gate', () => {
     expect(webCoverage(current)).toEqual([]);
     expect(webCoverage(residual)).toEqual([]);
+    // Each lane alone: the residual shape is not the current one twice.
+    expect(residual.workflow).not.toEqual(current.workflow);
+    expect(residual.gate).not.toEqual(current.gate);
+  });
+  test('the forge web steps run only on a new recipe, so without the gate lane nothing pays', () => {
+    const errors = webCoverage({ ...current, gate: residual.gate }).join('\n');
+    for (const command of ['test:unit', 'build', 'test:mocked']) expect(errors).toContain(`required train lanes lost ${command}`);
+  });
+  test('the gate lane pays only through its exact web phase', () => {
+    const open = 'if [ "$AUTO" -eq 0 ] || [ "$(web_touched)" = "yes" ]; then';
+    for (const [gate, lost] of [
+      // A check line gone from either branch.
+      [mutate(current.gate, WEB_SUITE, ':'), ['test:unit', 'build', 'test:mocked']],
+      [mutate(current.gate, WEB_UNIT, ':'), ['test:unit']],
+      // A check line that changed, nested, or continues a command.
+      [mutate(current.gate, WEB_SUITE, WEB_SUITE.replace('&& bun run build &&', '&& (bun run build || true) &&')), ['build']],
+      [mutate(current.gate, WEB_SUITE, `if false; then\n    ${WEB_SUITE}\n    fi`), ['build', 'test:mocked']],
+      [mutate(current.gate, WEB_SUITE, `false &&\n    ${WEB_SUITE}`), ['build', 'test:mocked']],
+      [mutate(current.gate, "\nelse\n    # apps/web's unit files", "\nelif false; then\n    # apps/web's unit files"), ['test:unit']],
+      // A narrower condition, or a derivation that answers no when it cannot answer.
+      [mutate(current.gate, open, 'if [ "$AUTO" -eq 0 ]; then'), ['build', 'test:mocked']],
+      [mutate(current.gate, 'so the web suite runs" >&2; echo yes ;;', 'so the web suite runs" >&2; echo no ;;'), ['build', 'test:mocked']],
+      // output_to that does not run the suite, or drops its failure.
+      [mutate(current.gate, 'return "${PIPESTATUS[0]}"', 'return 0'), ['build', 'test:mocked']],
+      [mutate(current.gate, 'output_to() { # <file, or empty> <cmd...>: run it, its output ALSO written to the file\n',
+        'output_to() { # <file, or empty> <cmd...>: run it, its output ALSO written to the file\n    return 0\n'), ['build', 'test:mocked']],
+    ] as const) {
+      expect(gate).not.toEqual(current.gate);
+      const errors = webCoverage({ ...current, gate }).join('\n');
+      for (const command of lost) expect(errors).toContain(`required train lanes lost ${command}`);
+    }
   });
   test('typecheck cannot disappear from both lanes', () => {
     const gate = residual.gate.replace(/^check "svelte-check".*$/m, '');
@@ -67,9 +143,13 @@ describe('web coverage across both required train lanes', () => {
       (line) => `if [ "$AUTO" -eq 0 ]; then\n${line}\nfi`);
     expect(webCoverage({ ...residual, gate }).join('\n')).toContain('typecheck');
   });
-  test('an uncalled function cannot hide the final train check', () => {
-    const gate = residual.gate.replace('web_touched() {', 'uncalled() {\nweb_touched() {') + '\n}\n';
-    expect(webCoverage({ ...residual, gate }).join('\n')).toContain('typecheck');
+  test('an uncalled function cannot hide the final train checks', () => {
+    for (const lane of [residual, current]) {
+      const gate = lane.gate.replace('web_touched() {', 'uncalled() {\nweb_touched() {') + '\n}\n';
+      expect(webCoverage({ ...lane, gate }).join('\n')).toContain('typecheck');
+    }
+    const gate = current.gate.replace('web_touched() {', 'uncalled() {\nweb_touched() {') + '\n}\n';
+    expect(webCoverage({ ...current, gate }).join('\n')).toContain('required train lanes lost build');
   });
   test('inert typecheck mentions supply nothing', () => {
     const gate = residual.gate.replace(/^check "svelte-check".*$/m, (line) => `# ${line}`);
@@ -96,12 +176,13 @@ describe('web coverage across both required train lanes', () => {
       expect(webCoverage({ ...residual, gate }).join('\n')).toContain('typecheck');
     }
   });
-  test('unit steps retain their working-directory identities', () => {
-    for (const [name, identity] of [['Unit tests', 'apps/web:test:unit'], ['web-kit unit tests', 'libs/web-kit:test:unit']]) {
-      expect(webCoverage({ ...residual, workflow: removeStep(residual.workflow, name!) }).join('\n')).toContain(identity!);
-    }
+  test('a forge unit step keeps its working-directory identity', () => {
+    // web-kit's step runs the same command from libs/web-kit; it cannot
+    // pay for apps/web's unit files.
+    expect(webCoverage({ ...residual, workflow: removeStep(residual.workflow, 'Unit tests') }).join('\n'))
+      .toContain('required train lanes lost test:unit');
   });
-  test('build and mocked browser checks stay on the residual lane', () => {
+  test('build and mocked browser checks stay on the forge lane when it is the only one', () => {
     for (const name of ['Build', 'Frontend smoke \\(mocked backend\\)']) {
       expect(webCoverage({ ...residual, workflow: removeStep(residual.workflow, name) }).length).toBeGreaterThan(0);
     }
@@ -121,6 +202,7 @@ describe('web coverage across both required train lanes', () => {
     const toleratedStep = residual.workflow.replace('- name: Unit tests', '- name: Unit tests\n        continue-on-error: true');
     const toleratedJob = residual.workflow.replace('  web:\n', '  web:\n    continue-on-error: true\n');
     for (const workflow of [shellConditional, toleratedStep, toleratedJob]) {
+      expect(workflow).not.toEqual(residual.workflow);
       expect(webCoverage({ ...residual, workflow }).length).toBeGreaterThan(0);
     }
   });

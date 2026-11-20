@@ -44,12 +44,12 @@ const STORAGE: &str = "postgres";
 const STORAGE: &str = "in-memory";
 
 /// Standard health probe — see boss-classes/src/http.rs for context.
-async fn health() -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({
-        "status": "ok",
-        "service": "boss-locations-api",
-        "storage": STORAGE,
-    }))
+async fn health() -> axum::Json<boss_core::startup::HealthResponse> {
+    axum::Json(boss_core::startup::health_response(
+        "boss-locations-api",
+        env!("CARGO_PKG_VERSION"),
+        STORAGE,
+    ))
 }
 
 /// How every door answers a store error — one mapping, by variant

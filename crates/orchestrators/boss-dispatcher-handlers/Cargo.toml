@@ -25,7 +25,6 @@ boss-events = { path = "../../core/boss-events" }
 # used it before the binary did.
 boss-policy-client = { path = "../../core/boss-policy-client" }
 anyhow = { workspace = true }
-async-nats = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 base64 = "0.22"

@@ -27,6 +27,7 @@
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import { navigate } from '../../router';
+  import { pageHref } from '../../shell/stationAddresses.svelte';
   import DecidedDesigns from './DecidedDesigns.svelte';
   import {
     pageHeader,
@@ -95,7 +96,7 @@
   }
 
   async function enterReview(packet: ReviewPacket): Promise<void> {
-    navigate(reviewHref(packet.id, packet.reviewStepId ?? (await reviewStepId(packet.id))));
+    navigate(reviewHref(packet.id, packet.reviewStepId ?? (await reviewStepId(packet.id)), pageHref('system-design')));
   }
 
   $effect(() => {

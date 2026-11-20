@@ -192,6 +192,16 @@ pub struct HttpPodReader {
 }
 impl HttpPodReader {
     pub fn new(ca: reqwest::Certificate, token: String) -> Result<Self, Refused> {
+        Self::with_timeout(ca, token, std::time::Duration::from_secs(15))
+    }
+    /// [`Self::new`] with a per-call wait the caller owns, so a test reading
+    /// a loopback stub waits on its own clock rather than the production
+    /// 15 s a loaded gate drive outlived (backlog edca7e41).
+    pub(super) fn with_timeout(
+        ca: reqwest::Certificate,
+        token: String,
+        timeout: std::time::Duration,
+    ) -> Result<Self, Refused> {
         if token.is_empty() {
             return Err(Refused);
         }
@@ -200,7 +210,7 @@ impl HttpPodReader {
             .redirect(reqwest::redirect::Policy::none())
             .tls_built_in_root_certs(false)
             .add_root_certificate(ca)
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(timeout)
             .build()
             .map_err(|_| Refused)?;
         Ok(Self { client, token })

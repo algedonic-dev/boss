@@ -1267,7 +1267,19 @@ fn the_grant_is_one_role_entry_and_the_job_holds_no_role() {
         );
     }
     assert!(m.iter().any(|l| l.trim() == "concurrencyPolicy: Forbid"));
-    assert!(m.iter().any(|l| l.trim() == "activeDeadlineSeconds: 240"));
+    // A wedged run is ended, and before the next ten-minute firing, which
+    // concurrencyPolicy Forbid would otherwise drop. How LONG it must be
+    // is every_maintenance_wrap_caller_retries_its_open.rs's to say: the
+    // packet open's worst case plus the push (review 0aced427).
+    let deadline: Vec<u32> = m
+        .iter()
+        .filter_map(|l| l.trim().strip_prefix("activeDeadlineSeconds: "))
+        .map(|n| n.parse().unwrap())
+        .collect();
+    assert!(
+        matches!(deadline[..], [d] if d < 600),
+        "one activeDeadlineSeconds, under the 600 s schedule: {deadline:?}"
+    );
     assert!(m.iter().any(|l| l.trim() == "backoffLimit: 0"));
     assert!(
         read(RECV).contains("stage=\"${BOSS_RECV_STAGE_DIR:-/run}\""),

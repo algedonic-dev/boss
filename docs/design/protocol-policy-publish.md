@@ -1,6 +1,11 @@
 # Design: Protocol, Policy, Publish — the network's API
 
-**Status**: decided — all 6 questions resolved 2026-08-12 via the in-app tracker; see Decisions.
+**Status**: living reference (re-statused 2026-11-18, backlog 924de432).
+All 6 questions were decided by David on 2026-08-12 (see Decisions), and
+the decisions are folded into `docs/architecture-decisions.md`
+§Dispatcher. The file stays because the rule census it holds is the
+contract every dispatcher rule's `why` and the rule loader's refusal
+cite; new decisions about admission go on design packets, not here.
 **Origin:** David, 2026-08-12 (verbatim, feedback `63bf89d1`): "whether
 we should have a Protocol, Policy, and Publish service that is
 essentially the API for the network. It can evaluate the payload
@@ -8,7 +13,7 @@ against the protocol, ensure policy is met, and then publish to the
 proper queue. We should be able to shrink the need for the dispatcher
 to have a bunch of automated rules, which are now encoded in the
 protocol/workflow definition."
-**Related**: [job-packet-network.md](./job-packet-network.md) — the
+**Related**: [job-packet-network, folded into the decision record](../architecture-decisions.md) — the
 packet model this is the API for ·
 [requirements-based-addressing, folded into the decision record](../architecture-decisions.md) —
 Q2's evaluator is this doc's evaluator ·

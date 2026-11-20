@@ -1,0 +1,11 @@
+-- A station may cap what it borrows (backlog 30c1efe8; David 2026-11-19:
+-- "Stations may also have internal limits on the dynamic resources they
+-- request for their own reasons"). `allocation` stays the one fact of what
+-- a station reserves from its parent; this column is the most it, with
+-- everything standing in it, borrows of each pool from its parent at
+-- once: an object of pool name to exact decimal string. ADDITIVE ONLY:
+-- the default `{}` reads every row before it as borrowing without a limit
+-- of its own, which StationSpec skips on the wire, so such a row
+-- serializes as before. The admission rule that reads it is
+-- boss_jobs::flow_resources::plan.
+ALTER TABLE stations ADD COLUMN borrow_limit JSONB NOT NULL DEFAULT '{}'::jsonb;

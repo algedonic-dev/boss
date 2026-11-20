@@ -301,14 +301,23 @@ describe('decidedRows — WORKING and OUT', () => {
 
 describe('reviewHref', () => {
   test('goes to the full-page step surface when the step is known', () => {
-    const href = reviewHref('job-1', 'step-9');
+    const href = reviewHref('job-1', 'step-9', '/engineering/design');
     expect(href).toStartWith('/jobs/job-1/steps/step-9?');
-    expect(href).toContain('from=%2Fit%2Fdesign');
+    expect(href).toContain('from=%2Fengineering%2Fdesign');
     expect(href).toContain('from_label=Design%20Review');
   });
 
+  // Back returns to the page the review was opened from, at the address
+  // the page has NOW: the design page moves with its host station
+  // (backlog 0bc2eb68), and a hard-coded /it/design sent Back to a page
+  // that no longer answers.
+  test('Back is the address it is handed, and with none there is no Back', () => {
+    expect(reviewHref('job-1', 'step-9', '/x/design')).toContain('from=%2Fx%2Fdesign');
+    expect(reviewHref('job-1', 'step-9', null)).toBe('/jobs/job-1/steps/step-9');
+  });
+
   test('falls back to the job page for a packet whose steps have not materialized', () => {
-    expect(reviewHref('job-1')).toBe('/service/job-1');
-    expect(reviewHref('job-1', null)).toBe('/service/job-1');
+    expect(reviewHref('job-1', undefined, '/engineering/design')).toBe('/jobs/job-1');
+    expect(reviewHref('job-1', null, '/engineering/design')).toBe('/jobs/job-1');
   });
 });

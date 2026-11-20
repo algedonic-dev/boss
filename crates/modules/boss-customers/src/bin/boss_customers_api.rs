@@ -60,10 +60,15 @@ async fn main() -> Result<()> {
     );
     info!(%clock_url, "clock client wired");
 
-    let state = CustomersApiState {
-        customers: Arc::new(PgCustomers::new(pool.clone())),
-        clock,
-    };
+    // The same wrapping the ledger and commerce reads use: on a sim
+    // instance a sim caller is authorized at the boundary; everything
+    // else is judged per role (backlog 85e7f10f).
+    let policy = boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
+        boss_policy_client::ReqwestPolicyClient::new(
+            "customers",
+            std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
+        ),
+    ));
 
     let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
         boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
@@ -78,14 +83,18 @@ async fn main() -> Result<()> {
     let wiring = boss_policy_client::role_service::assemble(
         "customers",
         "/api/customers/actor-role-reports",
-        Arc::new(boss_policy_client::ReqwestPolicyClient::new(
-            "customers",
-            std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
-        )),
+        policy,
         roles.clone(),
         mode.clone(),
         boss_events::role_tally::durable("customers", mode.clone(), Some(&pool)),
     );
+    let state = CustomersApiState {
+        customers: Arc::new(PgCustomers::new(pool.clone())),
+        clock,
+        // Every read asks it (backlog cda177ef): until 2026-11-19 the
+        // reads took no caller, so a Basic guest read every buyer.
+        policy: wiring.policy,
+    };
     let app = customers_http_router(router(state), wiring.inventory);
 
     let http_addr: SocketAddr = cfg
@@ -149,7 +158,7 @@ mod role_inventory_tests {
         let wiring = boss_policy_client::role_service::assemble(
             "customers",
             "/api/customers/actor-role-reports",
-            policy,
+            policy.clone(),
             roles,
             Arc::new(boss_policy_client::role_reporting::ReportMode::Report),
             tally.clone(),
@@ -158,6 +167,7 @@ mod role_inventory_tests {
             router(CustomersApiState {
                 customers: Arc::new(boss_customers::InMemoryCustomers::new()),
                 clock: Arc::new(boss_clock_client::WallClockClient),
+                policy,
             }),
             wiring.inventory,
         );
@@ -172,11 +182,17 @@ mod role_inventory_tests {
             .await
             .unwrap();
         assert_eq!(domain.status(), StatusCode::OK);
-        assert_eq!(
-            axum::body::to_bytes(domain.into_body(), 4096)
+        let health: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(domain.into_body(), 4096)
                 .await
                 .unwrap(),
-            r#"{"status":"ok"}"#
+        )
+        .unwrap();
+        assert_eq!(health["status"], "ok", "{health}");
+        assert_eq!(
+            health["capabilities"]["commit"],
+            serde_json::json!(boss_core::startup::build_commit()),
+            "the health body names the build that answered (backlog 56f88ada): {health}"
         );
         let denied = app
             .clone()

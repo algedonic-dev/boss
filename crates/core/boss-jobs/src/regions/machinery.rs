@@ -19,11 +19,9 @@ pub const OPS_RUNNER_ROLE: &str = "ops-runner";
 /// SessionStart hook files it and the prompt hook heartbeats it.
 pub const SESSION_KIND: &str = "work-session";
 
-/// Silent this long and a crew is drawn IDLE rather than at work — the
-/// crew board's own `IDLE_AFTER_MS` (`apps/web/src/it/crew/crew.ts`),
-/// ported here so the map and the board stop calling a session
-/// "working" at the same moment, and pinned equal by `crew.test.ts`
-/// (CLAUDE.md §9a). The session's own silence rule ends it at six
+/// Silent this long and a crew is drawn IDLE rather than at work. The
+/// one copy since the Crew Board and its `IDLE_AFTER_MS` were deleted
+/// (backlog 462fb22a). The session's own silence rule ends it at six
 /// hours; this is only where the floor stops crediting it with work.
 pub const CREW_IDLE_HOURS: i64 = 1;
 
@@ -182,20 +180,20 @@ fn conductor_machine(h: Option<&ConductorHealth>) -> Machine {
     }
 }
 
-/// A STATION THE SERVER CANNOT JUDGE: within its WIP limit, with flow
-/// the cube is blind to — the `(false, None)` arm below, which draws the
+/// A STATION THE SERVER CANNOT JUDGE: flow the membership reader could
+/// not count — the `None` arm below, which draws the
 /// `?` glyph. Marshalling's header counts these ("2 stations
 /// unjudged", design 62de32ae decision 11) so that blindness is itself
 /// a number; the test
 /// `marshalling_counts_the_stations_it_cannot_judge_in_its_header` holds
 /// the header's count to the glyphs'.
 pub(super) fn unjudged(s: &StationReading) -> bool {
-    !s.over_limit && s.served.is_none()
+    s.served.is_none()
 }
 
 /// THE STATIONS. Each is a registry row this process evaluated, so its
-/// presence is a fact and an empty one is genuinely idle. Flow the cube
-/// is blind to is unknown, not zero: a station holding work whose
+/// presence is a fact and an empty one is genuinely idle. Flow the reader
+/// could not count is unknown, not zero: a station holding work whose
 /// movement nobody can count is exactly the case an idle glyph would
 /// lie about.
 fn station_machines(inputs: &RegionInputs<'_>) -> Vec<Machine> {
@@ -211,33 +209,55 @@ fn station_machines(inputs: &RegionInputs<'_>) -> Vec<Machine> {
         .map(|s| {
             let held = s.members.len();
             let id = format!("station:{}", s.name);
-            let (state, why) = match (s.over_limit, s.served) {
-                (true, _) => (
-                    MachineState::Failed,
-                    s.flow_blind.map_or_else(
-                        || format!("{held} standing — over its WIP limit"),
-                        |blind| format!("{held} standing — over its WIP limit; {}", blind.reason()),
+            let (state, why) = match (s.served, s.flow_stale_since) {
+                (None, Some(since)) => (
+                    MachineState::Stale,
+                    format!(
+                        "{held} standing — stale since {}: {}",
+                        since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        s.flow_unread
+                            .as_deref()
+                            .unwrap_or("the membership projection stopped refreshing")
                     ),
                 ),
-                (false, None) => (
+                (None, None) => (
                     MachineState::Unknown,
                     format!(
                         "{held} standing — {}",
-                        s.flow_blind.map_or(
-                            "the flow cube is blind to this station's predicate, so whether it moves cannot be told",
-                            crate::station_flow::FlowBlind::reason,
+                        s.flow_unread.as_deref().unwrap_or(
+                            "this station's flow was not read, so whether it moves cannot be told"
                         )
                     ),
                 ),
-                (false, Some(0)) if held > 0 => (
-                    MachineState::Failed,
-                    format!("{held} standing and nothing served in the window — not draining"),
-                ),
-                (false, Some(n)) if n > 0 => (
+                // Nothing served: judged on what stands there, by the
+                // region's own rule (backlog 6254e602) — a station whose
+                // every step waits on its named owner inside its declared
+                // bound is not a failed machine, only a quiet one.
+                (Some(0), _) if held > 0 => match super::marshalling::station_wait(
+                    s,
+                    inputs.internal_protocols,
+                    inputs.now,
+                ) {
+                    Ok(waits) => (
+                        MachineState::Idle,
+                        format!(
+                            "{held} standing and nothing served in the window — waiting on named owners inside their declared bounds: {}",
+                            super::marshalling::waits_text(&waits)
+                        ),
+                    ),
+                    Err(why) => (
+                        MachineState::Failed,
+                        format!(
+                            "{held} standing and nothing served in the window — not draining: {}",
+                            super::marshalling::capped(&why)
+                        ),
+                    ),
+                },
+                (Some(n), _) if n > 0 => (
                     MachineState::Running,
                     format!("{n} served in the window, {held} standing"),
                 ),
-                (false, Some(_)) => (
+                (Some(_), _) => (
                     MachineState::Idle,
                     "nothing standing, nothing served in the window".to_string(),
                 ),
@@ -297,41 +317,85 @@ fn judge_request(id: String, name: &str, verb: &str, job: &Job, steps: &[Step]) 
         );
     }
     let execute = find_step(steps, "execute", "Execute the verb");
-    let disposition = execute
-        .map(|s| md_str(&s.metadata, "disposition"))
-        .unwrap_or("");
-    let exit = execute
-        .map(|s| md_str(&s.metadata, "exit_code"))
-        .unwrap_or("");
-    match disposition {
-        "answered" => machine(
-            id,
-            name,
-            MachineState::Idle,
-            format!(
-                "last {verb} answered{}{}",
-                if exit.is_empty() {
-                    String::new()
-                } else {
-                    format!(" exit {exit}")
-                },
-                match closed_at(job) {
-                    Some(at) => format!(" at {}", at.format("%H:%MZ")),
-                    None => String::new(),
-                }
-            ),
-        ),
-        "refused" => machine(
-            id,
-            name,
-            MachineState::Failed,
-            format!("the last {verb} request was refused — outside the allowlist"),
-        ),
-        _ => machine(
+    let at = match closed_at(job) {
+        Some(at) => format!(" at {}", at.format("%H:%MZ")),
+        None => String::new(),
+    };
+    // HOW THE VERB ENDED IS READ ONCE, by the one classifier (design
+    // b7bb1625, backlog 50a1578f): this glyph said "answered exit 1" for
+    // ops-request 02035ff0's failed move. A verb that ran and failed
+    // leaves the RUNNER idle — that is the verb's business, and 75 is
+    // most probe passes — but the words say FAILED. An answer recorded
+    // with no trustworthy exit IS the runner's failure: it writes an
+    // exit on every invocation it records.
+    let Some(md) = execute
+        .map(|s| &s.metadata)
+        .filter(|md| !md_str(md, "disposition").is_empty())
+    else {
+        return machine(
             id,
             name,
             MachineState::Failed,
             format!("the last {verb} request closed with no answer recorded"),
+        );
+    };
+    use crate::ops_execution::{Effect, Execution, NOT_YET_EXIT, classify};
+    match classify(md) {
+        // Exit 0 is execution success, never proof of the effect, so the
+        // qualification rides beside the answer (review 6f984dc7 finding
+        // 1: this arm read `Answered { .. }` and an unproven converge
+        // said only "answered exit 0"). The runner stays idle, as it does
+        // for a failed exit: the effect is the verb's business.
+        Execution::Answered { effect } => machine(
+            id,
+            name,
+            MachineState::Idle,
+            format!(
+                "last {verb} answered exit 0{at} — {}",
+                match effect {
+                    Effect::Unproven(why) => format!("EFFECT UNPROVEN: {why}"),
+                    Effect::Shown(line) => format!("effect shown: {line}"),
+                    Effect::Unread(why) => format!("effect unread: {why}"),
+                    Effect::Undeclared => "no effect qualification recorded".to_string(),
+                }
+            ),
+        ),
+        Execution::Failed { exit, timed_out } => machine(
+            id,
+            name,
+            MachineState::Idle,
+            format!(
+                "last {verb} FAILED exit {exit}{}{at}",
+                if exit == NOT_YET_EXIT {
+                    " (not yet)"
+                } else if timed_out {
+                    " (killed at its timeout)"
+                } else {
+                    ""
+                },
+            ),
+        ),
+        // A refusal keeps its own reason (review 6f984dc7 finding 2: this
+        // arm printed "outside the allowlist" for every refusal, an
+        // expired approval included). None recorded is said, not invented.
+        Execution::Refused { reason } => machine(
+            id,
+            name,
+            MachineState::Failed,
+            format!(
+                "the last {verb} request was refused — {}",
+                reason.as_deref().unwrap_or("no reason recorded")
+            ),
+        ),
+        Execution::Indeterminate { raw, cause } => machine(
+            id,
+            name,
+            MachineState::Failed,
+            format!(
+                "the last {verb} request is INDETERMINATE — {cause}{}",
+                raw.map(|r| format!(" (exit recorded as {r:?})"))
+                    .unwrap_or_default()
+            ),
         ),
     }
 }
@@ -631,6 +695,56 @@ mod tests {
         assert!(track.why.contains("no train on the track"), "{}", track.why);
     }
 
+    /// THE GLYPH STILL REPORTS THE RUNNER, AND ITS WORDS NAME HOW THE
+    /// VERB ENDED (design b7bb1625, backlog 50a1578f). Ops-request
+    /// 02035ff0 exited 1 and this machine said "last converge answered
+    /// exit 1" — the word a reader takes for success. A verb that ran
+    /// and failed leaves the runner idle and says FAILED; an answer
+    /// recorded with no exit is the runner's own defect (it writes one
+    /// on every invocation), so the runner fails, naming the unknown.
+    #[test]
+    fn a_runner_names_a_failed_verb_and_an_unknown_result_fails_the_runner() {
+        let status = empty_status();
+        let mut i = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let failed = [ops_request(
+            "converge",
+            JobStatus::Closed,
+            Some("answered"),
+            Some("1"),
+        )];
+        i.ops_requests = Some(&failed);
+        let out = regions(&i);
+        let m = machines_in(&out, "arrivals")
+            .iter()
+            .find(|m| m.id == "runner:converge")
+            .expect("the converge runner");
+        assert_eq!(m.state, MachineState::Idle);
+        assert!(
+            m.why.starts_with("last converge FAILED exit 1") && !m.why.contains("answered"),
+            "{}",
+            m.why
+        );
+
+        let unknown = [ops_request(
+            "converge",
+            JobStatus::Closed,
+            Some("answered"),
+            None,
+        )];
+        i.ops_requests = Some(&unknown);
+        let out = regions(&i);
+        let m = machines_in(&out, "arrivals")
+            .iter()
+            .find(|m| m.id == "runner:converge")
+            .expect("the converge runner");
+        assert_eq!(m.state, MachineState::Failed);
+        assert!(
+            m.why.contains("INDETERMINATE") && m.why.contains("no exit was recorded"),
+            "{}",
+            m.why
+        );
+    }
+
     /// The runner machine reports the RUNNER, not the verb's verdict:
     /// `run-car-probe` answers 75 ("not yet") on most passes and the
     /// runner is fine. A refusal is its failure.
@@ -677,6 +791,109 @@ mod tests {
         assert_eq!(
             machine_state(&regions(&i), "arrivals", "runner:converge"),
             MachineState::Running
+        );
+    }
+
+    /// An ops-request whose execute record carries more than the
+    /// disposition and the exit: the effect qualification, a refusal's
+    /// reason — the keys the runner writes beside them.
+    fn ops_request_with(
+        verb: &str,
+        disposition: &str,
+        exit: Option<&str>,
+        extra: Value,
+    ) -> (Job, Vec<Step>) {
+        let (job, mut steps) = ops_request(verb, JobStatus::Closed, Some(disposition), exit);
+        if let (Some(md), Some(add)) = (steps[0].metadata.as_object_mut(), extra.as_object()) {
+            md.extend(add.clone());
+        }
+        (job, steps)
+    }
+
+    /// The converge runner's state and sentence over these rows alone.
+    fn converge_why(rows: &[(Job, Vec<Step>)]) -> (MachineState, String) {
+        let status = empty_status();
+        let mut i = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        i.ops_requests = Some(rows);
+        let out = regions(&i);
+        let m = machines_in(&out, "arrivals")
+            .iter()
+            .find(|m| m.id == "runner:converge")
+            .expect("the converge runner");
+        (m.state, m.why.clone())
+    }
+
+    /// AN EXIT 0 IS EXECUTION SUCCESS, NEVER PROOF OF THE EFFECT, AND
+    /// THE GLYPH SAYS WHICH (design b7bb1625; review 6f984dc7 finding
+    /// 1). The classifier kept `effect_unproven` beside the answer and
+    /// this reader dropped it through `Answered { .. }`, so a converge
+    /// whose replicas were never observed read "answered exit 0" and
+    /// nothing else. Each qualification rides beside the answer, and a
+    /// record carrying none says so rather than reading as a clean one.
+    /// The runner stays idle: the effect is the verb's business, as a
+    /// failed exit is.
+    #[test]
+    fn an_exit_zero_keeps_its_effect_qualification_beside_the_answer() {
+        for (key, text, word) in [
+            (
+                "effect_unproven",
+                "expected replicas were not observed",
+                "EFFECT UNPROVEN",
+            ),
+            ("effect_unread", "prints no re-list", "effect unread"),
+            ("effect", "acts: OK — deleted 3", "effect shown"),
+        ] {
+            let rows = [ops_request_with(
+                "converge",
+                "answered",
+                Some("0"),
+                json!({ key: text }),
+            )];
+            let (state, why) = converge_why(&rows);
+            assert_eq!(state, MachineState::Idle, "{key}: {why}");
+            assert!(
+                why.starts_with("last converge answered exit 0")
+                    && why.contains(word)
+                    && why.contains(text),
+                "{key}: {why}"
+            );
+        }
+        let rows = [ops_request_with(
+            "converge",
+            "answered",
+            Some("0"),
+            json!({}),
+        )];
+        let (_, why) = converge_why(&rows);
+        assert!(why.contains("no effect qualification recorded"), "{why}");
+    }
+
+    /// A REFUSAL KEEPS ITS OWN REASON (design b7bb1625; review 6f984dc7
+    /// finding 2). This reader printed "outside the allowlist" for every
+    /// refusal, sending a reader of an expired approval to the wrong
+    /// cause. The recorded reason is the sentence; a refusal recording
+    /// none says that, and never invents one.
+    #[test]
+    fn a_refused_runner_names_the_reason_its_record_gives() {
+        let rows = [ops_request_with(
+            "converge",
+            "refused",
+            None,
+            json!({ "reason": "approval expired before execution" }),
+        )];
+        let (state, why) = converge_why(&rows);
+        assert_eq!(state, MachineState::Failed);
+        assert!(
+            why.contains("refused — approval expired before execution")
+                && !why.contains("allowlist"),
+            "{why}"
+        );
+        let rows = [ops_request_with("converge", "refused", None, json!({}))];
+        let (state, why) = converge_why(&rows);
+        assert_eq!(state, MachineState::Failed);
+        assert!(
+            why.contains("no reason recorded") && !why.contains("allowlist"),
+            "{why}"
         );
     }
 
@@ -728,35 +945,41 @@ mod tests {
     /// A station whose flow the cube cannot count is UNKNOWN even while
     /// it holds work — the reading an idle glyph would lie about.
     #[test]
-    fn a_station_with_uncountable_flow_is_unknown_and_an_over_limit_one_fails() {
+    fn a_station_with_uncountable_flow_is_unknown_and_draining_is_clear() {
         let status = empty_status();
         let rows = [
             StationReading {
                 name: "design-review".into(),
-                over_limit: false,
                 members: vec!["a".into(), "b".into()],
                 served: None,
-                flow_blind: None,
+                flow_unread: None,
+                flow_stale_since: None,
                 previous_served: None,
+                flow_folded: false,
                 opened: Default::default(),
+                standing: Vec::new(),
             },
             StationReading {
                 name: "backlog".into(),
-                over_limit: true,
                 members: vec!["c".into()],
                 served: Some(3),
-                flow_blind: None,
+                flow_unread: None,
+                flow_stale_since: None,
                 previous_served: Some(2),
+                flow_folded: false,
                 opened: Default::default(),
+                standing: Vec::new(),
             },
             StationReading {
                 name: "quiet".into(),
-                over_limit: false,
                 members: vec![],
                 served: Some(0),
-                flow_blind: None,
+                flow_unread: None,
+                flow_stale_since: None,
                 previous_served: Some(0),
+                flow_folded: false,
                 opened: Default::default(),
+                standing: Vec::new(),
             },
         ];
         let out = regions(&inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&rows)));
@@ -766,7 +989,7 @@ mod tests {
         );
         assert_eq!(
             machine_state(&out, "marshalling", "station:backlog"),
-            MachineState::Failed
+            MachineState::Running
         );
         assert_eq!(
             machine_state(&out, "marshalling", "station:quiet"),
@@ -775,43 +998,85 @@ mod tests {
     }
 
     #[test]
-    fn each_original_flow_refusal_survives_empty_and_over_limit_machine_readings() {
-        use crate::station_flow::FlowBlind;
+    fn each_original_flow_refusal_survives_machine_readings() {
         let status = empty_status();
-        for blind in [
-            FlowBlind::NoStepClause,
-            FlowBlind::StatusIsNotAWait,
-            FlowBlind::JobMetadataClause,
-            FlowBlind::JobTagsClause,
-            FlowBlind::SelfBound,
-            FlowBlind::StepAssigneeClause,
-            FlowBlind::StepMetadataBeyondRole,
+        for why in [
+            "native membership starting state exceeds row bound",
+            "native membership starting state exceeds byte bound",
+            "committed original membership or registry facts await audit relay",
         ] {
-            for over_limit in [false, true] {
-                let rows = [StationReading {
-                    name: "refused-flow".into(),
-                    over_limit,
-                    flow_blind: Some(blind),
-                    ..Default::default()
-                }];
-                let out = regions(&inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&rows)));
-                let machines = machines_in(&out, "marshalling");
-                let station = machines
-                    .iter()
-                    .find(|machine| machine.id == "station:refused-flow")
-                    .unwrap();
-                assert_eq!(
-                    station.state,
-                    if over_limit {
-                        MachineState::Failed
-                    } else {
-                        MachineState::Unknown
-                    }
-                );
-                assert!(station.why.contains(blind.reason()), "{blind:?}");
-                assert_eq!(station.why.contains("over its WIP limit"), over_limit);
-            }
+            let rows = [StationReading {
+                name: "refused-flow".into(),
+                flow_unread: Some(why.into()),
+                ..Default::default()
+            }];
+            let out = regions(&inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&rows)));
+            let machines = machines_in(&out, "marshalling");
+            let station = machines
+                .iter()
+                .find(|m| m.id == "station:refused-flow")
+                .unwrap();
+            assert_eq!(station.state, MachineState::Unknown);
+            assert!(station.why.contains(why), "{why:?}");
         }
+    }
+
+    /// Backlog 4db21aaf: a flow unread because the projection's last
+    /// generation went stale draws the station STALE and names that
+    /// generation's instant, where it drew `unknown` for eight days
+    /// (orient: "UNKNOWN marshalling gates — 1 standing — membership
+    /// projection is stale; ..."). An over-limit station still fails, and
+    /// an unread flow with no generation behind it is still unknown.
+    #[test]
+    fn a_station_whose_projection_went_stale_is_drawn_stale_since_its_last_generation() {
+        let status = empty_status();
+        let since = parse_instant("2026-10-30T16:58:57Z").unwrap();
+        let why = "membership projection is stale; latest refresh refused: 48-hour history: storage failure: complete native membership history exceeds row bound; last generation 2026-10-30 16:58:57.518989 UTC";
+        let rows = [
+            StationReading {
+                name: "gates".into(),
+                members: vec!["a".into()],
+                flow_unread: Some(why.into()),
+                flow_stale_since: Some(since),
+                ..Default::default()
+            },
+            StationReading {
+                name: "crowded".into(),
+                members: vec!["b".into()],
+                flow_unread: Some(why.into()),
+                flow_stale_since: Some(since),
+                ..Default::default()
+            },
+            StationReading {
+                name: "never-read".into(),
+                members: vec!["c".into()],
+                flow_unread: Some("membership generation pending".into()),
+                ..Default::default()
+            },
+        ];
+        let out = regions(&inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&rows)));
+        let machines = machines_in(&out, "marshalling");
+        let gates = machines
+            .iter()
+            .find(|machine| machine.id == "station:gates")
+            .unwrap();
+        assert_eq!(gates.state, MachineState::Stale);
+        assert!(
+            gates
+                .why
+                .starts_with("1 standing — stale since 2026-10-30T16:58:57Z: "),
+            "{}",
+            gates.why
+        );
+        assert!(gates.why.contains(why), "{}", gates.why);
+        assert_eq!(
+            machine_state(&out, "marshalling", "station:crowded"),
+            MachineState::Stale
+        );
+        assert_eq!(
+            machine_state(&out, "marshalling", "station:never-read"),
+            MachineState::Unknown
+        );
     }
 
     /// The verbs the handler fetches are DERIVED from the runner table
@@ -959,6 +1224,7 @@ mod tests {
             disk_gb: None,
             notes: None,
             retired,
+            disks: vec![],
         };
         let nodes = [
             node("forge", &[OPS_RUNNER_ROLE, "cluster-operator"], false),

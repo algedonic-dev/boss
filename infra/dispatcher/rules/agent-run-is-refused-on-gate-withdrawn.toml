@@ -1,0 +1,50 @@
+# An agent's run ENDS when the gate it was handed to is WITHDRAWN
+# (backlog 19a674cf, folded from cb4d725c), as it ends when that gate
+# goes red (`agent-run-is-refused-on-gate-red`, whose edge and guards
+# this rule reads the same way, pinned equal by
+# platform_bundle_agent_run.rs).
+#
+# WHY A WITHDRAWAL ENDS THE RUN. A gate-run is withdrawn only before any
+# runner pod exists (gate-run.toml, the `withdrawn` outcome): it judged
+# nothing, so neither the green nor the red rule will ever reach the run
+# `boss gate` handed it. The run kept waiting on `verdict` until
+# `agent-run-dies-when-its-verdict-never-comes` aged it `died` some four
+# hours later, and meanwhile its source-run binding refused a re-gate of
+# the moved head and its item's build stayed held. Measured 2026-11-13
+# on run 34afbfff (gate d057530d) and again 2026-11-19 on run b747a2b2
+# (gate-run 9b0c582a), whose verdict was ended by hand in exactly this
+# shape. The run cannot be re-gated under its first binding (that
+# retained identity is deliberate, source_claim.rs), so it is finished
+# the moment its gate is withdrawn, as a red run is.
+#
+# WHAT IT WRITES. The open one of `building` / `verdict` is completed
+# with `result = refused` — the value the red writes, so
+# `a-red-gate-returns-the-build-to-its-station` frees the item's build
+# at once rather than after a death — and `category = gate-withdrawn`
+# (a field the `task` kind declares) so the record says WHICH ending it
+# was, with the gate-run's id and branch under `gate_run`. Every other
+# arg, the immutable-source guard included, is the red rule's.
+# `done_metadata` fills absent keys only and a completed step is every
+# writer's first no-op, so a run already ended by hand or by the clock
+# is untouched.
+#
+# ONLY `withdrawn`. `lost` and the gate-run's own `refused` still keep
+# the silence clock's ending; each is its own question.
+[[rule]]
+name = "agent-run-is-refused-on-gate-withdrawn"
+why = """
+A CROSS-PROTOCOL REACTOR, the withdrawn twin of
+`agent-run-is-refused-on-gate-red`: a `gate-run` packet's WITHDRAWN
+terminal ends an `agent-run` packet — two protocols, so no single
+Workflow definition can declare it. Measured 2026-11-13 (backlog
+19a674cf, run 34afbfff, gate d057530d) and 2026-11-19 (cb4d725c, run
+b747a2b2): a withdrawn gate landed nothing on its run, which waited on a
+verdict that could never come until the four-hour silence clock wrote
+`died`, refusing its re-gate and holding its item's build meanwhile.
+"""
+version = 1
+on_event = "jobs.job.closed"
+when = "kind = \"gate-run\" AND outcome = \"withdrawn\""
+[[rule.do]]
+handler = "jobs.complete_linked_step"
+args = { link = "\"agent_run\"", steps = "\"building,verdict\"", evidence_key = "\"gate_run\"", done_metadata = '"{\"result\": \"refused\", \"category\": \"gate-withdrawn\"}"', metadata_envelope = '"gate_submission"', metadata_pointer = '"/source"', metadata_version = '"1"', metadata_equal = '"branch,sha,agent_run,worktree"' }

@@ -36,6 +36,77 @@ use boss_jobs::car::{
 // fixtures with it and imports it itself.
 use serde_json::Value;
 
+/// One verdict on record for a branch: what it said, the receipt it
+/// carries, the gate-run that said it, and when that run last launched.
+#[derive(Clone, Copy)]
+struct Reported<'a> {
+    verdict: &'a str,
+    raw: &'a str,
+    run: &'a str,
+    at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// When a gate-run packet last LAUNCHED: the latest of its `opened_at`
+/// (the column, else the filer's stamp) and the launch stamps `boss
+/// gate` writes. The latest, because a packet a dead waiter filed is
+/// REUSED by the next launch at that branch and sha, and keeps the
+/// first run's `opened_at` — the run that said its verdict started at
+/// `launching_at` / `launched_at`. `None` when the packet carries none.
+fn launched_at(p: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    let md = p.get("metadata");
+    [
+        p.get("opened_at"),
+        md.and_then(|m| m.get("opened_at")),
+        md.and_then(|m| m.get(crate::gate::LAUNCHING_AT)),
+        md.and_then(|m| m.get(crate::gate::LAUNCHED_AT)),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .filter_map(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+    .map(|t| t.with_timezone(&chrono::Utc))
+    .max()
+}
+
+/// The verdict that stands for one head: the NEWEST real one, green or
+/// failed (backlog 81e5fee6). `lost` is not a word about the code, so it
+/// is never chosen here (ed7f1355); `None` when nothing real is on record.
+///
+/// A green stands over a red only when BOTH are dated and the green is
+/// strictly later. A red with no date, or one launched in the same
+/// instant as the green, cannot be placed behind it, so the red is
+/// chosen and the verb refuses: "the green was probably later" is a
+/// belief, and the receipt has to be a fact.
+fn newest_word<'r, 'a>(at_head: &[&'r Reported<'a>]) -> Option<&'r Reported<'a>> {
+    let newest = |verdict: &str| {
+        at_head
+            .iter()
+            .copied()
+            .filter(|r| r.verdict == verdict)
+            .max_by_key(|r| r.at)
+    };
+    let red = at_head
+        .iter()
+        .copied()
+        .find(|r| r.verdict == "failed" && r.at.is_none())
+        .or_else(|| newest("failed"));
+    match (newest("green"), red) {
+        (Some(green), Some(red)) if red.at.is_some() && green.at > red.at => Some(green),
+        (_, Some(red)) => Some(red),
+        (green, None) => green,
+    }
+}
+
+/// PURE: is this raw receipt a lint delta's — gate.sh's `--lints` mode
+/// (`gate::LINTS_RECEIPT_MODE`)? An unparseable receipt is not one.
+fn is_lint_delta(raw: &str) -> bool {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|v| v.get("mode").and_then(Value::as_str).map(str::to_string))
+        .as_deref()
+        == Some(crate::gate::LINTS_RECEIPT_MODE)
+}
+
 /// Find the receipt for `branch` among gate-run packets, or refuse.
 ///
 /// Refuses on every path that would otherwise put an unvouched car on a
@@ -43,11 +114,18 @@ use serde_json::Value;
 /// matters — a packet whose verdict is `failed` or `lost`. A `lost` run
 /// is refused as loudly as a failed one: it means the environment died
 /// before saying anything, so there is no evidence either way, and
-/// "we don't know" must not read as "fine".
+/// "we don't know" must not read as "fine". At one head, the newest real
+/// verdict decides ([`newest_word`]), and a red refusal names its run.
 pub(crate) fn receipt_for(packets: &[Value], branch: &str, head_now: &str) -> Result<Receipt> {
     // Every reported gate for this branch, in the order the API gave them.
-    let mut reported: Vec<(&str, &str)> = Vec::new(); // (verdict, receipt)
+    let mut reported: Vec<Reported> = Vec::new();
     let mut seen_branch = false;
+    // A LINT DELTA IS NOT A CAR'S GATE (backlog ce60b5c6): the dock runs
+    // main's changed lints against a parked car's own head, so its run sits
+    // on this branch at this head. Its word, green or red, is about those
+    // lints alone, so it is left out of every choice below — never copied
+    // as a receipt, never shadowing the full gate it did not repeat.
+    let mut deltas = 0usize;
     for p in packets {
         let b = p
             .get("metadata")
@@ -58,6 +136,8 @@ pub(crate) fn receipt_for(packets: &[Value], branch: &str, head_now: &str) -> Re
             continue;
         }
         seen_branch = true;
+        let run = p.get("id").and_then(Value::as_str).unwrap_or("?");
+        let at = launched_at(p);
         for s in p
             .get("steps")
             .and_then(Value::as_array)
@@ -67,8 +147,17 @@ pub(crate) fn receipt_for(packets: &[Value], branch: &str, head_now: &str) -> Re
             let sm = s.get("metadata");
             let verdict = sm.and_then(|m| m.get("verdict")).and_then(Value::as_str);
             let raw = sm.and_then(|m| m.get("receipt")).and_then(Value::as_str);
-            if let (Some(v), Some(r)) = (verdict, raw) {
-                reported.push((v, r));
+            if let (Some(verdict), Some(raw)) = (verdict, raw) {
+                if is_lint_delta(raw) {
+                    deltas += 1;
+                    continue;
+                }
+                reported.push(Reported {
+                    verdict,
+                    raw,
+                    run,
+                    at,
+                });
             }
         }
     }
@@ -77,6 +166,13 @@ pub(crate) fn receipt_for(packets: &[Value], branch: &str, head_now: &str) -> Re
         bail!(
             "no gate-run packet for `{branch}`. A car does not ride a train without a \
              receipt — gate it first (`boss gate {branch}`), then park it."
+        );
+    }
+    if reported.is_empty() && deltas > 0 {
+        bail!(
+            "the only verdicts on record for `{branch}` are {deltas} lint delta(s) — the \
+             dock's run of main's changed lints, never a car's gate (backlog ce60b5c6). Gate \
+             it (`boss gate {branch}`) for a receipt a car can carry."
         );
     }
     if reported.is_empty() {
@@ -99,26 +195,37 @@ pub(crate) fn receipt_for(packets: &[Value], branch: &str, head_now: &str) -> Re
     // contract — depending on it parked a car on a two-rebases-old
     // receipt on 2026-08-28. The only packet that matters is the one
     // vouching for the commit that would actually ride the train.
-    // ...and among packets vouching for the SAME head, prefer a green
-    // one: a dead `lost` packet (a refused launch, a killed runner) must
-    // not shadow the real verdict that followed it — on 2026-08-30 that
+    // ...and among packets vouching for the SAME head, the NEWEST REAL
+    // verdict stands (backlog 81e5fee6). A dead `lost` packet (a refused
+    // launch, a killed runner) says nothing about the code, so it must
+    // not shadow a real verdict before or after it — on 2026-08-30 that
     // shadow forced editing a closed packet's metadata to unblock a true
-    // green (ed7f1355). When no green exists the first match stands, so
-    // the honest lost/failed refusal below still names what happened.
+    // green (ed7f1355). But this used to prefer ANY green at the head,
+    // so an older green overrode a newer red at the same commit, through
+    // this verb and `boss rerail --finish` alike (review 08805508 N1).
+    // When only `lost` is on record the first match stands, so the
+    // honest no-evidence refusal below still names what happened.
     let known_head = head_now.len() >= 40;
+    let at_head: Vec<&Reported> = reported
+        .iter()
+        .filter(|r| head_of(r.raw) == head_now)
+        .collect();
     let chosen = if known_head {
-        reported
-            .iter()
-            .find(|(v, raw)| *v == "green" && head_of(raw) == head_now)
-            .or_else(|| reported.iter().find(|(_, raw)| head_of(raw) == head_now))
+        newest_word(&at_head).or_else(|| at_head.first().copied())
     } else {
         reported.last()
     };
 
-    let Some((verdict, raw)) = chosen else {
+    let Some(&Reported {
+        verdict, raw, run, ..
+    }) = chosen
+    else {
         let heads: Vec<String> = reported
             .iter()
-            .map(|(v, r)| format!("{}@{}", v, &head_of(r)[..12.min(head_of(r).len())]))
+            .map(|r| {
+                let h = head_of(r.raw);
+                format!("{}@{}", r.verdict, &h[..12.min(h.len())])
+            })
             .collect();
         bail!(
             "no gate for `{branch}` vouches for its current head {} — refusing to park it.\n  \
@@ -131,10 +238,27 @@ pub(crate) fn receipt_for(packets: &[Value], branch: &str, head_now: &str) -> Re
         );
     };
 
-    if *verdict != "green" {
+    if verdict != "green" {
+        // A green this verdict outranks is named, so the reader is not
+        // left wondering why a green on record did not count.
+        let older_green = at_head
+            .iter()
+            .find(|r| r.verdict == "green")
+            .map(|g| {
+                format!(
+                    "  gate-run {} recorded a green at this head too, but it is not the newest \
+                     verdict for it (or cannot be ordered against this one), and the newest \
+                     verdict for a head is the one that stands — re-gate (`boss gate {branch}`) \
+                     to put a newer word on record.\n",
+                    g.run
+                )
+            })
+            .unwrap_or_default();
         bail!(
-            "the gate for `{branch}` is `{verdict}`, not green — refusing to park it.\n  \
-             receipt: {raw}\n  \
+            "the gate for `{branch}` is `{verdict}`, not green (gate-run {run}) — refusing to \
+             park it.\n  \
+             receipt: {raw}\n\
+             {older_green}  \
              A `lost` verdict is refused for the same reason as a failed one: the run \
              said nothing, so there is no evidence, and no evidence is not a pass."
         );
@@ -336,6 +460,27 @@ fn routed_line(verb: &str, item: &Value) -> String {
     )
 }
 
+/// THE PROOF A HAND PARK CARRIES, OR ITS REFUSAL (backlog 031a3ca9).
+/// This verb has no probe flag: what it can carry is the proof intent
+/// the green it copies stated (`park_probe` / `park_expect` /
+/// `park_proof_event`, read by the same function `boss rerail --finish`
+/// reads), and what the car it lands on (`existing`, parked or opened at
+/// build start; `None` when this park files one) already carries. When
+/// neither holds a probe or an event, the car could never be proven, so
+/// the park is refused with the text every park door says.
+pub(crate) fn proof_for_park(
+    gate_runs: &[Value],
+    branch: &str,
+    receipt_raw: &str,
+    existing: Option<&Value>,
+) -> Result<serde_json::Map<String, Value>> {
+    let proof = crate::rerail::proof_carried(gate_runs, branch, receipt_raw);
+    match boss_jobs::car::unproven_park(existing, &proof) {
+        Some(why) => bail!("boss park: {branch}: {why}"),
+        None => Ok(proof),
+    }
+}
+
 /// File a car for `branch` and fill it up to `review`.
 pub(crate) async fn run(
     branch: &str,
@@ -348,6 +493,9 @@ pub(crate) async fn run(
     // The operator's now, taken once at the CLI entry point.
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
+    // Judge the receipt's repository before any system-of-record read
+    // or client is needed; a wrong target is a local refusal (8456a6cc).
+    let head_now = crate::gate::resolve_sha(branch)?;
     let http = crate::sor_client::machine_client()?;
 
     // The receipt first: refuse before anything is created, so a red
@@ -361,7 +509,6 @@ pub(crate) async fn run(
         )
         .await?,
     )?;
-    let head_now = crate::gate::resolve_sha(branch);
     let receipt = receipt_for(&open, branch, &head_now)?;
     // A CAR THAT TOUCHES A MUTATING VERB IS NOT PARKED BY A VERB THAT
     // CANNOT HOLD IT (backlog fdbb447e part 3): this one files and
@@ -456,6 +603,15 @@ pub(crate) async fn run(
     // past page one is found too (a-limit-is-not-a-filter: 832
     // ship-a-change packets exist as of 2026-09-09).
     let parked = crate::sor_client::all_open_cars(&http).await?;
+    // The car this park lands on, parked or opened at build start, must
+    // end up carrying a proof — refused here, before any write, a dry
+    // run included (backlog 031a3ca9).
+    let proof = proof_for_park(
+        &open,
+        branch,
+        &receipt.raw,
+        parked_car_for(&parked, branch).or_else(|| building_car_for(&parked, branch)),
+    )?;
     if let Some(car) = parked_car_for(&parked, branch) {
         let id = car
             .get("id")
@@ -489,6 +645,9 @@ pub(crate) async fn run(
             // The tiers the re-gated diff touches (ba429e7f), re-read
             // beside the channel for the same reason the channel is.
             m.extend(crate::channels::tier_stamps_for(branch));
+            // The proof the green stated replaces the car's, as the
+            // auto-park refresh does; a bare green writes none.
+            m.extend(proof.clone());
         }
         crate::sor_client::api(
             &http,
@@ -572,6 +731,20 @@ pub(crate) async fn run(
                 .to_string()
         }
     };
+
+    // The proof the green stated rides the car BEFORE its steps complete,
+    // as the auto-park adopt writes it, so the car never stands at review
+    // without it (backlog 031a3ca9). A bare green on a car that already
+    // carries one writes nothing.
+    if !proof.is_empty() {
+        crate::sor_client::api(
+            &http,
+            reqwest::Method::PATCH,
+            &format!("/api/jobs/{car}/metadata"),
+            Some(Value::Object(proof)),
+        )
+        .await?;
+    }
 
     let job = crate::sor_client::api(
         &http,
@@ -664,6 +837,38 @@ mod tests {
 
     const HEAD: &str = "e16708f69bc5b0a0a3f4bd1572f9db6dec76e7c8";
     const GREEN: &str = r#"{"verdict": "green", "head": "e16708f69bc5b0a0a3f4bd1572f9db6dec76e7c8", "mode": "full", "fails": []}"#;
+
+    /// A HAND PARK IS A PARK DOOR (backlog 031a3ca9): it files, finishes
+    /// or refreshes a car, and it has no flag to state a probe. So it
+    /// carries the proof the green it copies stated, keeps the one the
+    /// car already holds, and refuses when there is neither.
+    #[test]
+    fn a_hand_park_carries_the_greens_proof_and_refuses_a_car_with_none() {
+        let bare = vec![packet("feat/x", Some("green"), Some(GREEN))];
+        let e = proof_for_park(&bare, "feat/x", GREEN, None)
+            .expect_err("a bare green files an unprovable car")
+            .to_string();
+        assert!(e.contains(boss_jobs::car::UNPROVEN_PARK), "{e}");
+        let unprobed = car("c1", "feat/x", "feat/x");
+        assert!(proof_for_park(&bare, "feat/x", GREEN, Some(&unprobed)).is_err());
+
+        let mut probed_car = unprobed.clone();
+        probed_car["metadata"][boss_jobs::car::PROOF_PROBE] = json!("echo ok");
+        probed_car["metadata"][boss_jobs::car::PROOF_EXPECT] = json!("ok");
+        let kept = proof_for_park(&bare, "feat/x", GREEN, Some(&probed_car))
+            .expect("the car's own probe stands");
+        assert!(kept.is_empty(), "a bare green writes no proof: {kept:?}");
+
+        let mut stated = bare.clone();
+        stated[0]["metadata"][boss_jobs::car::PARK_PROBE] = json!("git show HEAD:a | grep -c b");
+        stated[0]["metadata"][boss_jobs::car::PARK_EXPECT] = json!("1");
+        let carried = proof_for_park(&stated, "feat/x", GREEN, None).expect("a stated probe parks");
+        assert_eq!(
+            carried[boss_jobs::car::PROOF_PROBE],
+            "git show HEAD:a | grep -c b"
+        );
+        assert_eq!(carried[boss_jobs::car::PROOF_EXPECT], "1");
+    }
 
     #[test]
     fn a_green_receipt_is_copied_verbatim_not_rebuilt() {
@@ -954,6 +1159,163 @@ mod tests {
         let ps = vec![packet("feat/x", Some("lost"), Some(&lost))];
         let e = receipt_for(&ps, "feat/x", HEAD).unwrap_err().to_string();
         assert!(e.contains("`lost`"), "{e}");
+    }
+
+    /// A gate-run packet with an id and the instant it opened, as the
+    /// list rows carry them (the `opened_at` column, backlog 6c2eba00).
+    fn run_at(id: &str, opened_at: &str, verdict: &str, receipt: &str) -> Value {
+        let mut p = packet("feat/x", Some(verdict), Some(receipt));
+        p["id"] = json!(id);
+        p["opened_at"] = json!(opened_at);
+        p
+    }
+
+    const G: &str = "67676767-0000-4000-8000-000000000001";
+    const N: &str = "4e4e4e4e-0000-4000-8000-000000000002";
+
+    fn red_at_head() -> String {
+        format!(r#"{{"verdict": "failed", "head": "{HEAD}", "mode": "full", "fails": ["test"]}}"#)
+    }
+
+    /// THE NEWEST VERDICT FOR A HEAD STANDS (backlog 81e5fee6, review
+    /// 08805508 N1). Green G at H, then a later gate N at the SAME H
+    /// failed: preferring any green at the head let G's older word
+    /// override N's newer one, through `boss park` and `boss rerail
+    /// --finish` alike. Whichever way the API lists them, N decides, and
+    /// the refusal names it.
+    #[test]
+    fn a_newer_red_at_the_head_is_not_overridden_by_an_older_green() {
+        let red = red_at_head();
+        for order in 0..2 {
+            let mut ps = vec![
+                run_at(G, "2026-11-11T10:00:00Z", "green", GREEN),
+                run_at(N, "2026-11-11T11:00:00Z", "failed", &red),
+            ];
+            if order == 1 {
+                ps.reverse();
+            }
+            let e = receipt_for(&ps, "feat/x", HEAD)
+                .expect_err("a newer red at the head must refuse")
+                .to_string();
+            assert!(e.contains("is `failed`"), "order {order}: {e}");
+            assert!(e.contains(N), "order {order}: names the red gate-run: {e}");
+        }
+    }
+
+    /// ...and the other way round is a re-gate after a red (a flake, a
+    /// fix to the gate rather than the branch): the NEWER green stands.
+    #[test]
+    fn a_newer_green_at_the_head_stands_over_an_older_red() {
+        let red = red_at_head();
+        for order in 0..2 {
+            let mut ps = vec![
+                run_at(N, "2026-11-11T10:00:00Z", "failed", &red),
+                run_at(G, "2026-11-11T11:00:00Z", "green", GREEN),
+            ];
+            if order == 1 {
+                ps.reverse();
+            }
+            let r = receipt_for(&ps, "feat/x", HEAD)
+                .unwrap_or_else(|e| panic!("order {order} failed: {e}"));
+            assert_eq!(r.raw, GREEN, "order {order}");
+        }
+    }
+
+    /// A LINT DELTA IS NOT A CAR'S GATE (backlog ce60b5c6). The dock runs
+    /// main's changed lints against a parked car's own head — #1850's one
+    /// lint is the measured case — and that green sits on the car's branch
+    /// at the car's head. It must never become the receipt `boss park` or
+    /// `boss rerail --finish` copies onto a car, however new it is, and
+    /// its red must not shadow the full green it was never a test of. A
+    /// branch with only a delta on record has no car gate to copy.
+    #[test]
+    fn a_lint_delta_at_the_head_is_never_a_cars_receipt() {
+        let delta = |verdict: &str| {
+            format!(
+                r#"{{"verdict": "{verdict}", "head": "{HEAD}", "mode": "lints",
+                    "lints": {{"main": "da7f747e5375a6679adeac533c960ee5b4a56ee2"}},
+                    "checks": [{{"name": "the-controls-are-bounded-verbs", "result": "pass", "seconds": 4}}]}}"#
+            )
+        };
+        let (green, red) = (delta("green"), delta("failed"));
+        for newer in [&green, &red] {
+            let verdict = if newer == &green { "green" } else { "failed" };
+            let ps = vec![
+                run_at(G, "2026-11-19T10:00:00Z", "green", GREEN),
+                run_at(N, "2026-11-19T17:00:00Z", verdict, newer),
+            ];
+            let r = receipt_for(&ps, "feat/x", HEAD)
+                .unwrap_or_else(|e| panic!("a {verdict} delta shadowed the car's gate: {e}"));
+            assert_eq!(
+                r.raw, GREEN,
+                "the full gate stands, not the {verdict} delta"
+            );
+        }
+        let only = vec![run_at(N, "2026-11-19T17:00:00Z", "green", &green)];
+        let e = receipt_for(&only, "feat/x", HEAD)
+            .expect_err("a delta alone is no receipt")
+            .to_string();
+        assert!(e.contains("lint delta"), "{e}");
+    }
+
+    /// A `lost` verdict says nothing about the code, so it is never the
+    /// newest WORD while a real verdict exists at the head: a lost run
+    /// opened after the green still does not shadow it (ed7f1355 kept).
+    #[test]
+    fn a_newer_lost_at_the_head_does_not_shadow_the_green() {
+        let lost = format!(
+            r#"{{"verdict": "lost", "head": "{HEAD}", "mode": "", "fails": ["runner died"]}}"#
+        );
+        for order in 0..2 {
+            let mut ps = vec![
+                run_at(G, "2026-11-11T10:00:00Z", "green", GREEN),
+                run_at(N, "2026-11-11T11:00:00Z", "lost", &lost),
+            ];
+            if order == 1 {
+                ps.reverse();
+            }
+            let r = receipt_for(&ps, "feat/x", HEAD)
+                .unwrap_or_else(|e| panic!("order {order} failed: {e}"));
+            assert_eq!(r.raw, GREEN, "order {order}");
+        }
+    }
+
+    /// A REUSED packet keeps the `opened_at` of the run that filed it and
+    /// died, so its own launch is the later stamp (`launching_at`,
+    /// `launched_at`). A red launched onto a reused packet after the green
+    /// is newer evidence, though the packet opened first.
+    #[test]
+    fn a_reused_packet_is_as_new_as_its_latest_launch() {
+        let red = red_at_head();
+        let mut reused = run_at(N, "2026-11-11T09:00:00Z", "failed", &red);
+        reused["metadata"][crate::gate::LAUNCHING_AT] = json!("2026-11-11T11:00:00Z");
+        let ps = vec![run_at(G, "2026-11-11T10:00:00Z", "green", GREEN), reused];
+        let e = receipt_for(&ps, "feat/x", HEAD).unwrap_err().to_string();
+        assert!(e.contains(N), "{e}");
+    }
+
+    /// A green and a red at the head that cannot be ORDERED — a packet
+    /// with no stamp, or two launched in the same instant — refuse,
+    /// naming the red: "probably the green was later" is the mostly-sure
+    /// this verb exists to refuse.
+    #[test]
+    fn a_green_and_a_red_that_cannot_be_ordered_refuse() {
+        let red = red_at_head();
+        let mut unstamped = run_at(N, "2026-11-11T11:00:00Z", "failed", &red);
+        unstamped
+            .as_object_mut()
+            .expect("object")
+            .remove("opened_at");
+        for ps in [
+            vec![run_at(G, "2026-11-11T10:00:00Z", "green", GREEN), unstamped],
+            vec![
+                run_at(G, "2026-11-11T10:00:00Z", "green", GREEN),
+                run_at(N, "2026-11-11T10:00:00Z", "failed", &red),
+            ],
+        ] {
+            let e = receipt_for(&ps, "feat/x", HEAD).unwrap_err().to_string();
+            assert!(e.contains(N), "{e}");
+        }
     }
     /// A RE-RAILED CAR IS FOUND WHEN PARKING THE BRANCH IT NOW CARRIES.
     ///

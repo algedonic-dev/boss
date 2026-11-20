@@ -28,7 +28,8 @@
 #
 # The fork on `execute` is a closed enum — the correct-the-record
 # lesson, "an enum makes the fork total": every disposition a runner
-# can write leads to exactly one terminal. `exit_code` is authored
+# can write, with every exit it can record beside it, leads to exactly
+# one terminal (the exit half since design b7bb1625; see `answered`). `exit_code` is authored
 # OPTIONAL because field requiredness cannot depend on the
 # disposition, and a refusal has no exit code — nothing ran. The
 # runner (in-tree, reviewed code) always writes it on the answered
@@ -42,7 +43,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "A host-side debug read, as a packet instead of an ssh session. The requester names a host (the Subject: custom/<estate node id>) and an allowlisted read-only verb in job metadata (`host`, `verb`, `args`); the runner on that host polls about once a minute, executes the verb from infra/ops/verbs.json — never a packet-supplied string — and completes `execute` with the output and exit code. `answered` is the output arriving in the system of record with provenance; `refused` is the runner declining a verb outside the allowlist or an arg outside its pattern, with the reason in `output`. Phase 1 is read-only; mutating verbs are phase 2, behind per-verb policy. The operator stops being the transport."
-metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
+metadata = { owner = "9660c60f-eb47-4405-ae08-fcbb30c71e5f", department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
 
 [[workflow.step]]
 title = "filed"
@@ -184,7 +185,7 @@ assurance_required = "presence"
 sign_offs_required = ["platform-admin"]
 title_template = "Approve the plan: {metadata.verb} on {metadata.host}"
 authority_role = "platform-admin"
-metadata_defaults = { procedure = "READ THE PLAN ON THIS STEP AND NOTHING ELSE. `plan` holds the document rendered on the host itself: the target named by-id, the kernel name it resolved to AT PLAN TIME, what was observed about it, and the argv that would run. The kernel name is shown because it is the thing that moves — it is evidence about when the plan was made, never the target.\n\nYOUR PASSKEY SIGNS THESE EXACT BYTES. If anything about the plan changes after you sign, the signature stops matching and the runner refuses. If the plan looks wrong, do not approve it and say why — a plan that needs an operator to eyeball which thing is meant is a verb that should not be on this path at all (q3)." }
+metadata_defaults = { human_only = true, human_presentation = { ask = "Authorize this exact operational request", why_person = "Your passkey authorizes the reviewed operation and its bound plan.", action = "Read the plan and approve or reject", after = "Approval permits the existing executor path; it does not prove the operation ran.", evidence = "current-step" }, procedure = "READ THE PLAN ON THIS STEP AND NOTHING ELSE. `plan` holds the document rendered on the host itself: the target named by-id, the kernel name it resolved to AT PLAN TIME, what was observed about it, and the argv that would run. The kernel name is shown because it is the thing that moves — it is evidence about when the plan was made, never the target.\n\nYOUR PASSKEY SIGNS THESE EXACT BYTES. If anything about the plan changes after you sign, the signature stops matching and the runner refuses.\n\n`plan_stderr`, WHEN PRESENT, IS NOT PART OF THE PLAN. It is what the plan verb printed beside the plan when it rendered it: its `plan-sha256:` line and the live figures behind its verdicts, kept out of the plan's bytes because they move. Your passkey signs it with the rest of this step, exactly as shown, but `rendered_plan_sha256` does not cover it, and before the write runs the runner compares only the plan's bytes: the write still runs when these figures have moved since you read them, and records the ones it saw on its execute step. Read them as evidence for the verdicts, as of when the plan was rendered.\n\nIf the plan looks wrong, do not approve it and say why — a plan that needs an operator to eyeball which thing is meant is a verb that should not be on this path at all (q3)." }
 # EVERY KEY THE RUNNER RENDERS HERE IS A FIELD (backlog 6c9183de, review
 # S4 of car 1e603cfd, 2026-09-26). The runner writes the plan with the
 # request it was rendered for, in one patch (ops-runner.sh render_plan),
@@ -291,6 +292,18 @@ fields = [
     # the runner with the plan in the same patch, so the passkey signs it;
     # absent on every request whose verb asks for no review.
     { name = "review_run", field_type = "string", required = false, writer = "runner:ops" },
+    # What the plan verb printed on stderr beside the plan (backlog
+    # 204e27ba): the volatile figures ten plan verbs keep OUT of the signed
+    # bytes so that a moving figure cannot void an unchanged verdict, and
+    # which reached nobody before the decision. Written by the runner in
+    # the same patch as the plan, and ONLY onto a step that declares it
+    # here (ops-runner.sh plan_stderr_of), so it is never on a step
+    # unreserved. It is inside the shape the passkey signs, like every key
+    # on this step, and OUTSIDE the plan bytes `rendered_plan_sha256` binds,
+    # which are all the execute-time re-render compares; the procedure
+    # above says both to the approver. Not required: a request rendered
+    # by a runner from before it completes without it.
+    { name = "plan_stderr", field_type = "string", required = false, writer = "runner:ops" },
 ]
 
 [[workflow.step]]
@@ -365,14 +378,81 @@ name = "exit_code"
 field_type = "string"
 required = false
 writer = "runner:ops"
+[[workflow.step.fields]]
+# 2c: what the credentialed runner actually executed, never request metadata.
+# Optional because a refusal before execution has no argv. Older pinned
+# versions cannot qualify physical returns; David publishes this held row.
+name = "executed"
+field_type = "object"
+required = false
+writer = "runner:ops"
 
+# HOW THE VERB ENDED PICKS THE TERMINAL (design b7bb1625, decided by
+# David 2026-11-17; backlog 50a1578f). Ops-request 02035ff0 ran a
+# replica move that failed after 1,204 s with exit 1 and closed
+# `answered` / outcome_kind completed, because this fork read the
+# disposition alone: nothing on the packet looked failed. The
+# disposition still says only whether the verb RAN (`refused`: nothing
+# did); the exit beside it now picks among four terminals, exactly as
+# the one classifier every reader shares reads the same record
+# (crates/core/boss-jobs/src/ops_execution.rs):
+#
+# - `answered` — exit 0. Execution success, never proof of the effect:
+#   `effect`, `effect_unproven` and `effect_unread` ride on execute.
+# - `not-yet` — exit 75, the estate's EX_TEMPFAIL (decided on the item
+#   2026-11-18): an answer about the world, so it closes on the
+#   `answered` outcome every rule already hears, with outcome_kind
+#   `not_yet` — never failed, never rerun.
+# - `failed` — any other exit the runner recorded. The raw exit stays
+#   on execute; the row cannot read digits, so a recorded exit that is
+#   not a status (the runner writes `$?`, which always is) closes here
+#   too, where the classifier says indeterminate — both outcome_kind
+#   failed.
+# - `indeterminate` — invoked with no exit recorded (absent, null or
+#   empty), or a refusal that records one (it contradicts itself).
+#   outcome_kind failed: missing evidence is never success and never
+#   "nothing ran".
+#
+# Neither failed nor indeterminate reruns anything. `exit_code > ""` is
+# the present-and-non-empty idiom (boss-expr), guarded by `!= null`
+# first because a null orders against nothing and would raise. Pinned
+# through the real engine, against the classifier, by boss-jobs'
+# the_terminal_a_request_closes_on_is_how_its_verb_ended; every rule
+# that hears `answered` hears `failed` and `indeterminate` too, pinned
+# by boss-dispatcher's an_ops_request_rule_that_hears_an_answer_hears_a_failure.
+# A request pinned to an older version keeps the fork it was admitted
+# under, and reads failed from its record through the classifier.
 [[workflow.step]]
 title = "answered"
 kind = "outcome"
-ready_when = "steps.execute.done AND steps.execute.metadata.disposition = \"answered\""
+ready_when = "steps.execute.done AND steps.execute.metadata.disposition = \"answered\" AND steps.execute.metadata.exit_code = \"0\""
 title_template = "Answered"
 metadata_defaults = { outcome_kind = "completed" }
 terminal = { outcome = "answered" }
+
+[[workflow.step]]
+title = "not-yet"
+kind = "outcome"
+ready_when = "steps.execute.done AND steps.execute.metadata.disposition = \"answered\" AND steps.execute.metadata.exit_code = \"75\""
+title_template = "Answered — not yet (exit 75)"
+metadata_defaults = { outcome_kind = "not_yet" }
+terminal = { outcome = "answered" }
+
+[[workflow.step]]
+title = "failed"
+kind = "outcome"
+ready_when = "steps.execute.done AND steps.execute.metadata.disposition = \"answered\" AND steps.execute.metadata.exit_code != null AND steps.execute.metadata.exit_code > \"\" AND steps.execute.metadata.exit_code != \"0\" AND steps.execute.metadata.exit_code != \"75\""
+title_template = "Failed — the verb ran and exited nonzero"
+metadata_defaults = { outcome_kind = "failed" }
+terminal = { outcome = "failed" }
+
+[[workflow.step]]
+title = "indeterminate"
+kind = "outcome"
+ready_when = "steps.execute.done AND ((steps.execute.metadata.disposition = \"answered\" AND (steps.execute.metadata.exit_code = null OR NOT (steps.execute.metadata.exit_code > \"\"))) OR (steps.execute.metadata.disposition = \"refused\" AND steps.execute.metadata.exit_code != null AND steps.execute.metadata.exit_code > \"\"))"
+title_template = "Indeterminate — the record does not say how the verb ended"
+metadata_defaults = { outcome_kind = "failed" }
+terminal = { outcome = "indeterminate" }
 
 [[workflow.step]]
 title = "refused"
@@ -387,7 +467,9 @@ kind = "outcome"
 # here: this title is rendered when the request is filed, so a request
 # its reviewer sent back read "outside the allowlist" (review N4 of car
 # e1f4fc2a, run bd3091d2).
-ready_when = "(steps.execute.done AND steps.execute.metadata.disposition = \"refused\") OR (steps.approve.done AND NOT (steps.approve.metadata.decision = \"approved\"))"
+# A refusal ran nothing, so it records no exit; one that does closes on
+# `indeterminate` above instead (b7bb1625).
+ready_when = "(steps.execute.done AND steps.execute.metadata.disposition = \"refused\" AND (steps.execute.metadata.exit_code = null OR NOT (steps.execute.metadata.exit_code > \"\"))) OR (steps.approve.done AND NOT (steps.approve.metadata.decision = \"approved\"))"
 title_template = "Refused — outside the allowlist"
 # `aborted`, matching backlog-item's `declined`: the request was turned
 # down, not taken back by its filer.

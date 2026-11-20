@@ -35,3 +35,12 @@ machine:
     extraConfig:
       imageGCHighThresholdPercent: 50
       imageGCLowThresholdPercent: 40
+  # THE LONGHORN TAG (backlog e14a472d), w-1's and every worker's: this
+  # node's disks may hold a dev-build worker's replica. The volume class
+  # longhorn-dev-build (infra/cluster/manifests/boss-dev.yaml) selects
+  # Longhorn nodes tagged dev-build, and Longhorn copies this annotation
+  # into the node's tags only while its tag list is empty (all five read
+  # tags=[] on 2026-10-29). No control plane declares it, which is what
+  # keeps those replicas off the disks that carry etcd and the database.
+  nodeAnnotations:
+    node.longhorn.io/default-node-tags: '["dev-build"]'

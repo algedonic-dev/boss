@@ -79,6 +79,19 @@ fn reaches_with_report(
     reported_done: bool,
     reported_md: serde_json::Value,
 ) -> bool {
+    reaches_through(spec, title, building_md, None, reported_done, reported_md)
+}
+
+/// The same, for a run handed to its gate (backlog 87d1ae40): `verdict`
+/// done carrying `verdict_md`, or still waiting when `None`.
+fn reaches_through(
+    spec: &WorkflowSpec,
+    title: &str,
+    building_md: serde_json::Value,
+    verdict_md: Option<serde_json::Value>,
+    reported_done: bool,
+    reported_md: serde_json::Value,
+) -> bool {
     let payload = json!({
         "subject": { "id": "bosspipeline", "subject_kind": "custom" },
         "job": { "metadata": { "packet": "p", "step": "build" } },
@@ -86,6 +99,10 @@ fn reaches_with_report(
             "claimed": { "done": true, "metadata": {} },
             "briefed": { "done": true, "metadata": { "prompt_bytes": "1" } },
             "building": { "done": true, "metadata": building_md },
+            "verdict": {
+                "done": verdict_md.is_some(),
+                "metadata": verdict_md.unwrap_or_else(|| json!({})),
+            },
             "reported": { "done": reported_done, "metadata": reported_md },
         },
     });
@@ -112,6 +129,7 @@ fn the_run_has_the_decided_steps_in_order() {
             "claimed",
             "briefed",
             "building",
+            "verdict",
             "reported",
             "landed",
             "unreported",
@@ -122,11 +140,13 @@ fn the_run_has_the_decided_steps_in_order() {
     assert_eq!(step(&run, "claimed").kind, "trigger");
     assert_eq!(step(&run, "briefed").ready_when, "steps.claimed.done");
     assert_eq!(step(&run, "building").ready_when, "steps.briefed.done");
-    // The report opens on the green OR on delivered work, and the run
-    // lands on the report either way.
+    // The report opens on the green OR on delivered work — the green
+    // written on `building` (a run admitted before backlog 87d1ae40) or
+    // on `verdict` (a run handed to its gate) — and the run lands on the
+    // report either way.
     assert_eq!(
         step(&run, "reported").ready_when,
-        "steps.building.done AND (steps.building.metadata.result = \"gated\" OR steps.building.metadata.result = \"delivered\")"
+        "(steps.building.done AND (steps.building.metadata.result = \"gated\" OR steps.building.metadata.result = \"delivered\")) OR (steps.verdict.done AND steps.verdict.metadata.result = \"gated\")"
     );
     assert_eq!(
         step(&run, "landed").ready_when,
@@ -145,7 +165,7 @@ fn building_says_how_it_ended_and_every_value_routes_once() {
         .find(|f| f.name == "result")
         .expect("building declares `result`");
     assert!(field.required);
-    assert_eq!(field.field_type, "gated|delivered|refused|died");
+    assert_eq!(field.field_type, "gated|delivered|handed|refused|died");
 
     let outcomes: Vec<(&str, &str)> = run
         .steps
@@ -166,18 +186,87 @@ fn building_says_how_it_ended_and_every_value_routes_once() {
         ]
     );
 
-    for value in ["gated", "delivered", "refused", "died"] {
+    for value in ["gated", "delivered", "handed", "refused", "died"] {
         let md = json!({ "result": value });
-        let reached: Vec<&str> = ["reported", "refused", "died"]
+        let reached: Vec<&str> = ["verdict", "reported", "refused", "died"]
             .into_iter()
             .filter(|t| reaches(&run, t, md.clone(), false))
             .collect();
-        let want = if value == "gated" || value == "delivered" {
-            "reported"
-        } else {
-            value
+        let want = match value {
+            "gated" | "delivered" => "reported",
+            "handed" => "verdict",
+            other => other,
         };
         assert_eq!(reached, vec![want], "result = {value}");
+    }
+}
+
+/// THE BUILDER STATION FINISHES AT THE HAND-OFF (backlog 87d1ae40; David
+/// 2026-11-08: "A station never needs to worry about what happens next.
+/// It should just be able to finish its work and send the job on ... so
+/// that resources can be reallocated"). Measured that evening: robots:opus
+/// 6 of 6 held while one robot was building — five runs held a slot
+/// through a 30-80 minute gate wait. A run `handed` to its gate ends
+/// `building` (whose bill is the slot) and waits on `verdict`, which
+/// bills nothing; the verdict is a second total fork onto the same
+/// terminals, so green still lands it and red still marks it refused.
+#[test]
+fn a_handed_run_waits_on_its_verdict_holding_no_slot_and_the_verdict_routes_once() {
+    let run = bundled("agent-run");
+    let verdict = step(&run, "verdict");
+    assert!(
+        verdict.resources.is_none(),
+        "the verdict step bills nothing: the slot left with `building` ({:?})",
+        verdict.resources
+    );
+    assert!(
+        step(&run, "building").resources.is_some(),
+        "`building` still bills the run's model slot"
+    );
+    let field = verdict
+        .fields
+        .iter()
+        .find(|f| f.name == "result")
+        .expect("verdict declares `result`");
+    assert!(field.required);
+    assert_eq!(field.field_type, "gated|refused|died");
+    let handed = json!({ "result": "handed" });
+    for value in ["gated", "refused", "died"] {
+        let reached: Vec<&str> = ["verdict", "reported", "refused", "died"]
+            .into_iter()
+            .filter(|t| {
+                reaches_through(
+                    &run,
+                    t,
+                    handed.clone(),
+                    Some(json!({ "result": value })),
+                    false,
+                    json!({}),
+                )
+            })
+            .collect();
+        // `verdict` itself stays "reachable" once done; what matters is
+        // the one successor its value opens.
+        let want = if value == "gated" { "reported" } else { value };
+        assert_eq!(reached, vec!["verdict", want], "verdict = {value}");
+    }
+    // A gated verdict lands on the report, exactly as a gated building.
+    assert!(reaches_through(
+        &run,
+        "landed",
+        handed.clone(),
+        Some(json!({ "result": "gated" })),
+        true,
+        json!({}),
+    ));
+    // f6fefad6: while the verdict waits, `reported` is NOT open, so the
+    // unreported clock has nothing to age and cannot close the run under
+    // a queued or running gate — and no terminal is reachable either.
+    for title in ["reported", "landed", "unreported", "refused", "died"] {
+        assert!(
+            !reaches_through(&run, title, handed.clone(), None, false, json!({})),
+            "`{title}` must not open while a handed run waits on its verdict"
+        );
     }
 }
 
@@ -473,6 +562,62 @@ fn the_silence_bound_is_twice_the_build_steps_duration() {
     );
 }
 
+/// A VERDICT THAT NEVER COMES STILL ENDS THE RUN, AND A LIVE GATE IS
+/// NEVER KILLED BY THAT CLOCK (backlog 87d1ae40 with f6fefad6). A handed
+/// run's `building` is done, so the building clock no longer watches it;
+/// a lost or refused gate would leave it waiting forever, and its item's
+/// step held by its holder, unless a clock ends it. That clock is the
+/// building clock aimed at `verdict`: same handler, same bound idiom (2x
+/// the step's duration), and the SAME progress guard — a gate queued,
+/// launched or green spares the run, because the resident supervisor
+/// launches a queued gate only under its exact OPEN run and a run closed
+/// under it withdrew a correct gate after 2h20m (f6fefad6). Pinned equal
+/// on every arg but the step and the bound. And the run that dies there
+/// frees its item's step exactly as one that died at `building` does.
+#[test]
+fn a_verdict_that_never_comes_is_aged_like_a_silent_build_and_spares_a_live_gate() {
+    let run = bundled("agent-run");
+    let building_clock = rule_args("agent-run-dies-when-building-is-silent");
+    let verdict_clock = rule_args("agent-run-dies-when-its-verdict-never-comes");
+    let without = |args: &toml::Value| {
+        let mut a = args.as_table().cloned().unwrap_or_default();
+        a.remove("step");
+        a.remove("hours");
+        a
+    };
+    assert_eq!(
+        without(&verdict_clock),
+        without(&building_clock),
+        "the verdict clock is the building clock, guard and all"
+    );
+    assert_eq!(unquoted(&verdict_clock["step"]), "verdict");
+    let duration = step(&run, "verdict")
+        .duration_hours
+        .expect("verdict authors duration_hours");
+    let hours: f64 = unquoted(&verdict_clock["hours"])
+        .parse()
+        .expect("hours is a number");
+    assert_eq!(hours, 2.0 * duration, "the bound is 2x the step's duration");
+    let guard = json_arg(&verdict_clock["unless_linked_job_proves_progress"]);
+    assert_eq!(guard["kind"], "gate-run");
+    assert_eq!(guard["link"], "agent_run");
+    assert!(
+        guard.get("queued_formats").is_some(),
+        "a place in the gate line is work in flight: {guard}"
+    );
+
+    let building_reclaim = rule_args("an-abandoned-step-is-reclaimed-when-its-run-died");
+    let verdict_reclaim = rule_args("an-abandoned-step-is-reclaimed-when-its-verdict-died");
+    let mut a = verdict_reclaim.as_table().cloned().unwrap_or_default();
+    let mut b = building_reclaim.as_table().cloned().unwrap_or_default();
+    assert_eq!(a.remove("run_step").as_ref().map(unquoted), Some("verdict"));
+    b.remove("run_step");
+    assert_eq!(
+        a, b,
+        "a run dead at its verdict frees its step the same way"
+    );
+}
+
 /// The landing rule names the run's `building` step through the edge
 /// `boss gate` writes on the gate-run.
 #[test]
@@ -494,7 +639,13 @@ fn the_landing_rule_follows_the_gates_agent_run_edge() {
         Some("jobs.complete_linked_step")
     );
     assert_eq!(action["args"]["link"].as_str(), Some("\"agent_run\""));
-    assert_eq!(action["args"]["steps"].as_str(), Some("\"building\""));
+    // `building` for a run admitted before backlog 87d1ae40 (it holds its
+    // slot to the verdict), `verdict` for a run handed to its gate; the
+    // handler completes whichever of the two is open.
+    assert_eq!(
+        action["args"]["steps"].as_str(),
+        Some("\"building,verdict\"")
+    );
     // Green is the gate-run's own terminal label for green.
     let gate = bundled("gate-run");
     assert_eq!(
@@ -503,6 +654,179 @@ fn the_landing_rule_follows_the_gates_agent_run_edge() {
             .as_ref()
             .map(|t| t.outcome.as_str()),
         Some("completed")
+    );
+}
+
+/// THE RED ENDS THE RUN BY THE SAME EDGE (backlog e5cec272). The red
+/// rule follows the run exactly as the green's landing does — the same
+/// handler, the same edge, the same immutable-source guard — and differs
+/// in its `when` (the gate-run's `failed` terminal) and its `result`
+/// (`refused`, a value `building` declares). Pinned equal on every other
+/// arg, because a red rule that drifted from the green on the guard
+/// would end a run the green would refuse to land (CLAUDE.md 9a).
+#[test]
+fn the_red_rule_follows_the_same_agent_run_edge_as_the_gates_green() {
+    let rules = boss_testing::repo_root().join("infra/dispatcher/rules");
+    let read = |name: &str| -> toml::Value {
+        toml::from_str(
+            &std::fs::read_to_string(rules.join(name))
+                .unwrap_or_else(|e| panic!("{name} is authored: {e}")),
+        )
+        .expect("the rule file parses")
+    };
+    let on_red = read("agent-run-is-refused-on-gate-red.toml");
+    let on_green = read("agent-run-lands-on-gate-green.toml");
+    let (red, green) = (&on_red["rule"][0], &on_green["rule"][0]);
+    assert_eq!(red["on_event"], green["on_event"]);
+    assert_eq!(
+        red["when"].as_str(),
+        Some("kind = \"gate-run\" AND outcome = \"failed\"")
+    );
+    let (red_do, green_do) = (&red["do"][0], &green["do"][0]);
+    assert_eq!(red_do["handler"], green_do["handler"]);
+    let args = |d: &toml::Value| {
+        let mut a = d["args"].as_table().cloned().unwrap_or_default();
+        a.remove("done_metadata");
+        a
+    };
+    assert_eq!(
+        args(red_do),
+        args(green_do),
+        "the red and green rules follow one edge"
+    );
+    assert_eq!(
+        red_do["args"]["done_metadata"].as_str(),
+        Some(r#""{\"result\": \"refused\"}""#)
+    );
+    let gate = bundled("gate-run");
+    assert_eq!(
+        step(&gate, "failed")
+            .terminal
+            .as_ref()
+            .map(|t| t.outcome.as_str()),
+        Some("failed"),
+        "`failed` is the gate-run's own terminal label for red"
+    );
+}
+
+/// THE RED'S RETURN READS THE ENDING THE RED WRITES (backlog 2b927025,
+/// design d32b58b7 step 3). `a-red-gate-returns-the-build-to-its-station`
+/// frees the item's build on the run's own ending, and that ending is
+/// authored in another file: the red rule's `steps`, its `result` and
+/// its `evidence_key`. Three facts that live twice, so they are held
+/// equal here (CLAUDE.md 9a) — a red rule that renamed its evidence key
+/// or its result would leave every red's build held by a closed run
+/// again, silently. It also follows the same run edge as the death
+/// reclaims, and `refused` is a value `verdict` declares.
+#[test]
+fn the_red_return_reads_the_ending_the_red_rule_writes() {
+    let red = rule_args("agent-run-is-refused-on-gate-red");
+    let back = rule_args("a-red-gate-returns-the-build-to-its-station");
+    let died = rule_args("an-abandoned-step-is-reclaimed-when-its-verdict-died");
+    assert_eq!(unquoted(&back["run_step"]), "verdict");
+    assert!(
+        unquoted(&red["steps"])
+            .split(',')
+            .any(|s| s == unquoted(&back["run_step"])),
+        "the red rule completes the step the return reads"
+    );
+    assert_eq!(
+        json_arg(&red["done_metadata"])["result"].as_str(),
+        Some(unquoted(&back["dead_result"])),
+        "the return frees on the result the red writes"
+    );
+    assert_eq!(
+        unquoted(&back["carry"]),
+        unquoted(&red["evidence_key"]),
+        "the return carries the evidence the red stamps"
+    );
+    for arg in ["run_kind", "link"] {
+        assert_eq!(back[arg], died[arg], "`{arg}` is the reclaims' own");
+    }
+    assert_eq!(unquoted(&back["after_hours"]), "0");
+    let run = bundled("agent-run");
+    let verdict = step(&run, "verdict");
+    assert!(
+        verdict
+            .fields
+            .iter()
+            .any(|f| f.name == "result" && f.field_type.split('|').any(|v| v == "refused")),
+        "`refused` is a result `verdict` declares"
+    );
+}
+
+/// A WITHDRAWN GATE ENDS ITS RUN BY THE RED'S OWN EDGE (backlog
+/// 19a674cf, folded from cb4d725c). A gate withdrawn before any runner
+/// pod existed judged nothing, so no green and no red will ever reach
+/// the run it was handed — the run sat on `verdict` until the four-hour
+/// silence clock wrote `died`, holding dispatch and re-gate meanwhile.
+/// The withdrawn rule is the red's twin: equal on every arg but its
+/// `done_metadata`, which writes the same `refused` (so the red's
+/// return frees the build at once) and names the cause in `category`,
+/// a field the `verdict` step's `task` kind declares.
+#[test]
+fn a_withdrawn_gate_refuses_its_run_by_the_same_edge_as_the_red() {
+    let rules = boss_testing::repo_root().join("infra/dispatcher/rules");
+    let read = |name: &str| -> toml::Value {
+        toml::from_str(
+            &std::fs::read_to_string(rules.join(name))
+                .unwrap_or_else(|e| panic!("{name} is authored: {e}")),
+        )
+        .expect("the rule file parses")
+    };
+    let on_withdrawn = read("agent-run-is-refused-on-gate-withdrawn.toml");
+    let on_red = read("agent-run-is-refused-on-gate-red.toml");
+    let (withdrawn, red) = (&on_withdrawn["rule"][0], &on_red["rule"][0]);
+    assert_eq!(
+        withdrawn["name"].as_str(),
+        Some("agent-run-is-refused-on-gate-withdrawn")
+    );
+    assert_eq!(withdrawn["on_event"], red["on_event"]);
+    assert_eq!(
+        withdrawn["when"].as_str(),
+        Some("kind = \"gate-run\" AND outcome = \"withdrawn\"")
+    );
+    let (w_do, r_do) = (&withdrawn["do"][0], &red["do"][0]);
+    assert_eq!(w_do["handler"], r_do["handler"]);
+    let args = |d: &toml::Value| {
+        let mut a = d["args"].as_table().cloned().unwrap_or_default();
+        a.remove("done_metadata");
+        a
+    };
+    assert_eq!(
+        args(w_do),
+        args(r_do),
+        "the withdrawn and red rules follow one edge"
+    );
+    let done = json_arg(&w_do["args"]["done_metadata"]);
+    assert_eq!(
+        done,
+        json!({"result": "refused", "category": "gate-withdrawn"})
+    );
+    assert_eq!(
+        done["result"],
+        json_arg(&r_do["args"]["done_metadata"])["result"],
+        "a withdrawal ends the run as the red does, so the red's return frees its build"
+    );
+    let gate = bundled("gate-run");
+    assert_eq!(
+        step(&gate, "withdrawn")
+            .terminal
+            .as_ref()
+            .map(|t| t.outcome.as_str()),
+        Some("withdrawn"),
+        "`withdrawn` is the gate-run's own terminal label"
+    );
+    let run = bundled("agent-run");
+    let verdict = step(&run, "verdict");
+    let task = boss_jobs::step_registry::StepRegistry::v1();
+    let kind = task
+        .get(&verdict.kind)
+        .expect("the verdict's kind is registered");
+    assert!(
+        kind.fields.iter().any(|f| f.name == "category"),
+        "`category` is a field the verdict step's `{}` kind declares",
+        verdict.kind
     );
 }
 

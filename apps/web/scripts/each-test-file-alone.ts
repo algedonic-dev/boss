@@ -130,6 +130,7 @@ export async function runEachAlone(
   return results;
 }
 
+// web-suite-reads: none — runs the unit files under the package it is started in; the build and the mocked suite never load it
 async function main(roots: ReadonlyArray<string>): Promise<number> {
   const cwd = process.cwd();
   if (roots.length === 0) {

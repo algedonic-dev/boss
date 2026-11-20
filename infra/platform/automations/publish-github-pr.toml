@@ -5,3 +5,5 @@
 id = "automation:publish-github-pr"
 role = "platform-admin"
 description = 'Opens the daily GitHub publish PR and answers its step (infra/forge/publish-github-pr.sh).'
+# Host station: forge (backlog 6ecb5480, station-tree.md section 6).
+station = "b8f8a23b-f8da-428f-8df2-731be4ae597a"

@@ -61,7 +61,7 @@ category = "platform"
 subject_kinds = ["employee"]
 owning_team = "platform"
 description = "Promote ONE of the platform owner's stored passkeys to the operator tier, the tier that can raise his session to operator (design 2cb6256f). The gateway files it from /me naming the key (owner, credential id, label, when enrolled); the owner approves `authorise` with a presence stamp over exactly that; then, on /me, he touches the key being promoted and a break-glass hardware key, and the gateway, re-judging owner, stamp and packet, asks boss-people to flip the row (which records auth.passkey.promoted) and completes `promote` with what it spent. `declined` is an authorisation the approver did not approve. Demotion is removing the key."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { owner = "00b04483-90c6-46b9-b911-8e19d2a0b410", department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "filed"
@@ -78,7 +78,7 @@ assurance_required = "presence"
 sign_offs_required = ["platform-admin"]
 title_template = "Authorise making {metadata.label} an operator key"
 authority_role = "platform-admin"
-metadata_defaults = { employee_id = "{metadata.employee_id}", credential_id = "{metadata.credential_id}", label = "{metadata.label}", registered_at = "{metadata.registered_at}", public_key_sha256 = "{metadata.public_key_sha256}", procedure = "YOUR PASSKEY SIGNS THIS STEP'S CONTENT, and the gateway promotes exactly the key it names: the `label`, the `credential_id`, the `registered_at` and the `public_key_sha256` (the fingerprint of its stored public key) of one key on the account `employee_id`. An operator-tier key can raise your session to operator, so approve only a request you made, for a key you hold. After approving, open /me SIGNED IN AS YOURSELF and press Finish: touch the key being promoted, then a break-glass hardware key. The promotion is refused from anyone else's session, and for anyone but the platform owner." }
+metadata_defaults = { human_only = true, human_presentation = { ask = "Authorize this exact operator-key promotion", why_person = "Your passkey authorizes changing this account key into an operator key.", action = "Read the key identity and approve or reject", after = "The owner must still touch both keys through the gateway to finish promotion.", evidence = "current-step" }, employee_id = "{metadata.employee_id}", credential_id = "{metadata.credential_id}", label = "{metadata.label}", registered_at = "{metadata.registered_at}", public_key_sha256 = "{metadata.public_key_sha256}", procedure = "YOUR PASSKEY SIGNS THIS STEP'S CONTENT, and the gateway promotes exactly the key it names: the `label`, the `credential_id`, the `registered_at` and the `public_key_sha256` (the fingerprint of its stored public key) of one key on the account `employee_id`. An operator-tier key can raise your session to operator, so approve only a request you made, for a key you hold. After approving, open /me SIGNED IN AS YOURSELF and press Finish: touch the key being promoted, then a break-glass hardware key. The promotion is refused from anyone else's session, and for anyone but the platform owner." }
 
 [[workflow.step.fields]]
 name = "employee_id"

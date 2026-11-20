@@ -1,0 +1,19 @@
+# host:cp-3 — a control-plane node's vCPUs, a root pool of the station
+# tree (T5 of design 4b27a65a, backlog 3f58c823). One host pool per estate
+# node, capacity its `cpu` in infra/estate/estate.toml; see host:w-1.toml.
+# v2 (backlog 84f570a1): `capacity_from` says where the capacity number
+# comes from, for the console to show beside it (station-tree.md section 3).
+# v3 (backlog 42cd9a83): `keeper` names the station that keeps the box,
+# operations, which owns none of its capacity: "owning capacity is an
+# allocation; keeping the box is a mandate" (station-tree.md section 3).
+# Bumped from the live newest, v2.
+[[pool]]
+name = "host:cp-3"
+version = 3
+status = "active"
+unit = "vCPU"
+kind = "flow"
+shape = "capacity"
+capacity = { state = "configured", amount = 8 }
+capacity_from = 'infra/estate/estate.toml: the `cpu` of estate node cp-3, the box this pool is; the estate registry serves the node beside the pool (GET /api/stations?under=), and the pin every_estate_node_has_its_host_pool_and_no_other holds the two equal.'
+keeper = "operations"

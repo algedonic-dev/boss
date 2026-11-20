@@ -87,3 +87,17 @@ fn the_emergency_merge_keeps_its_decided_shape() {
         vec!["rolled-back", "not-green", "refused", "merged"]
     );
 }
+
+#[test]
+fn the_train_bypass_requires_a_human_decision() {
+    let lane = bundled("emergency-merge");
+    let approve = lane
+        .steps
+        .iter()
+        .find(|step| step.title == "approve")
+        .unwrap();
+    assert!(
+        boss_jobs::human_only::declared(&approve.metadata_defaults),
+        "the train bypass is a human decision, not an agent-held role"
+    );
+}

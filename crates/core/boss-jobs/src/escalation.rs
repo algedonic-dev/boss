@@ -29,7 +29,6 @@ use std::time::Duration;
 
 use boss_core::event::Event;
 use boss_core::job::{Job, Priority, Subject};
-use boss_core::port::EventBus;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -94,9 +93,9 @@ struct Employee {
 /// drop silently never notified anyone — feedback `50ff6193`).
 /// Redelivery is safe because the signal's deterministic message id
 /// collapses duplicates (`signal_payload`). If the durable consumer
-/// cannot be opened (no JetStream on this deployment), the router
-/// degrades loudly to the old at-most-once subscription rather than
-/// disabling itself.
+/// cannot be opened yet (a dark bus, a stream not ensured), the router
+/// retries with capped backoff, warning on each attempt, rather than
+/// degrading to at-most-once (backlog 2e45840a, design ad9519bc car 2).
 /// Who the router is on the wire. Its signals are sent AS this id
 /// (`signal_payload`'s `sender_id`), and every call it makes — the
 /// account and roster reads, the sends — carries it as `x-boss-user`.
@@ -153,88 +152,105 @@ pub fn spawn_router(
     };
 
     tokio::spawn(async move {
-        use futures::StreamExt;
         let js = bus.jetstream();
-        match boss_nats::durable::open_durable(
-            &js,
-            boss_nats::durable::STREAM_NAME,
-            "jobs-escalation",
-            vec![JOB_CREATED.to_string()],
+        let never = route(
+            || {
+                boss_nats::durable::open_durable(
+                    &js,
+                    boss_nats::durable::STREAM_NAME,
+                    "jobs-escalation",
+                    vec![JOB_CREATED.to_string()],
+                )
+            },
+            &client,
+            &config,
         )
-        .await
-        {
-            Ok(messages) => {
-                info!(
-                    people_url = %config.people_url,
-                    messages_url = %config.messages_url,
-                    "escalation router: durable consumer 'jobs-escalation' on {}",
-                    JOB_CREATED,
-                );
-                messages
-                    .for_each(|msg| {
-                        let client = client.clone();
-                        let config = config.clone();
-                        async move {
-                            let msg = match msg {
-                                Ok(m) => m,
-                                Err(e) => {
-                                    warn!(error = %e, "escalation router: message stream error");
-                                    return;
-                                }
-                            };
-                            // The publisher's envelope IS the serialized
-                            // Event — decode it whole; `handle_event`
-                            // reads the Job out of `payload` itself.
-                            let event: Event = match serde_json::from_slice(&msg.payload) {
-                                Ok(ev) => ev,
-                                Err(e) => {
-                                    debug!(error = %e, "escalation router: non-Event payload (ACK)");
-                                    let _ = msg.ack().await;
-                                    return;
-                                }
-                            };
-                            // Inherit the triggering event's partition so a
-                            // simulated Job's escalation writes simulated
-                            // messages (same task-local the dispatcher sets).
-                            // A shadow packet's escalation rides the same
-                            // not-real chain: it fails closed exactly as a
-                            // simulated one does (packet 508cc38c).
-                            let partition =
-                                boss_core::partition::Partition::from_event_payload(&event.payload);
-                            let outcome = boss_core::sim_origin::with_sim_chain(
-                                partition.fails_closed(),
-                                handle_event(&client, &config, &event),
-                            )
-                            .await;
-                            boss_nats::durable::settle(&msg, outcome).await;
-                        }
-                    })
-                    .await;
-                info!("escalation router durable stream closed");
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "escalation router: durable consumer unavailable — falling back \
-                     to at-most-once core subscription (a dropped event is a lost \
-                     escalation on this deployment)"
-                );
-                let mut stream = match bus.subscribe(JOB_CREATED).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!(error = %e, "escalation router: subscribe failed; disabled");
-                        return;
-                    }
-                };
-                while let Some(event) = stream.next().await {
-                    if let Err(e) = handle_event(&client, &config, &event).await {
-                        warn!(error = %e, "escalation router: handler error");
-                    }
-                }
-                info!("escalation router stream closed");
-            }
-        }
+        .await;
+        match never {}
     })
+}
+
+/// Bind the router's durable consumer with `open` and route what it
+/// delivers, for the life of the caller.
+///
+/// Waits for the bus rather than degrading (backlog 2e45840a, design
+/// ad9519bc car 2). A failed one-shot open used to fall back to an
+/// at-most-once core subscription for the life of the process — and
+/// since car 1 a dark NATS at boot made every open fail, so one outage
+/// left escalations droppable until a restart. And a bound stream that
+/// ENDS is opened again (`boss_nats::durable::keep_bound`, the
+/// remainder of car 3's part b): the router used to return then, and
+/// no escalation was routed again until a restart.
+async fn route<Open, OpenFut, OpenErr, S, E>(
+    open: Open,
+    client: &boss_core::machine_token::Client,
+    config: &EscalationConfig,
+) -> std::convert::Infallible
+where
+    Open: FnMut() -> OpenFut,
+    OpenFut: std::future::Future<Output = Result<S, OpenErr>>,
+    OpenErr: std::fmt::Display,
+    S: futures::Stream<Item = Result<async_nats::jetstream::Message, E>>,
+    E: std::fmt::Display,
+{
+    boss_nats::durable::keep_bound("jobs-escalation", open, |messages| {
+        route_session(client, config, messages)
+    })
+    .await
+}
+
+/// One bound session: settle every message the consumer delivers, until
+/// its stream ends.
+async fn route_session<S, E>(
+    client: &boss_core::machine_token::Client,
+    config: &EscalationConfig,
+    messages: S,
+) where
+    S: futures::Stream<Item = Result<async_nats::jetstream::Message, E>>,
+    E: std::fmt::Display,
+{
+    use futures::StreamExt;
+    info!(
+        people_url = %config.people_url,
+        messages_url = %config.messages_url,
+        "escalation router: durable consumer 'jobs-escalation' on {}",
+        JOB_CREATED,
+    );
+    messages
+        .for_each(|msg| async move {
+            let msg = match msg {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "escalation router: message stream error");
+                    return;
+                }
+            };
+            // The publisher's envelope IS the serialized
+            // Event — decode it whole; `handle_event`
+            // reads the Job out of `payload` itself.
+            let event: Event = match serde_json::from_slice(&msg.payload) {
+                Ok(ev) => ev,
+                Err(e) => {
+                    debug!(error = %e, "escalation router: non-Event payload (ACK)");
+                    let _ = msg.ack().await;
+                    return;
+                }
+            };
+            // Inherit the triggering event's partition so a
+            // simulated Job's escalation writes simulated
+            // messages (same task-local the dispatcher sets).
+            // A shadow packet's escalation rides the same
+            // not-real chain: it fails closed exactly as a
+            // simulated one does (packet 508cc38c).
+            let partition = boss_core::partition::Partition::from_event_payload(&event.payload);
+            let outcome = boss_core::sim_origin::with_sim_chain(
+                partition.fails_closed(),
+                handle_event(client, config, &event),
+            )
+            .await;
+            boss_nats::durable::settle(&msg, outcome).await;
+        })
+        .await;
 }
 
 async fn handle_event(
@@ -477,6 +493,51 @@ mod tests {
     fn asset_subject_skipped_in_v1() {
         let s = Subject::new("asset", "SYS-123");
         assert_eq!(account_id_for_subject(&s), None);
+    }
+
+    /// Backlog 2e45840a (outage 05fd165a, design ad9519bc): the router
+    /// opened its consumer once, so a bound stream that ENDED — the
+    /// client ends a pull stream whose consumer the server deleted —
+    /// left escalations unrouted for the life of the process. Every
+    /// stream here ends the moment it opens; the router must still be
+    /// bound at the end of the window, having opened again.
+    #[tokio::test(start_paused = true)]
+    async fn the_router_opens_its_consumer_again_when_its_stream_ends() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let opens = AtomicU32::new(0);
+        let client = boss_core::machine_token::Client::unstamped(reqwest::Client::builder())
+            .expect("an unstamped client builds");
+        let config = EscalationConfig {
+            people_url: "http://127.0.0.1:9".into(),
+            accounts_url: "http://127.0.0.1:9".into(),
+            messages_url: "http://127.0.0.1:9".into(),
+            request_timeout: Duration::from_secs(1),
+        };
+        let routed = tokio::time::timeout(
+            Duration::from_secs(100),
+            route(
+                || {
+                    opens.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        Ok::<_, String>(futures::stream::empty::<
+                            Result<async_nats::jetstream::Message, String>,
+                        >())
+                    }
+                },
+                &client,
+                &config,
+            ),
+        )
+        .await;
+        assert!(
+            routed.is_err(),
+            "the router returned when its stream ended; it must open the consumer again"
+        );
+        let opens = opens.load(Ordering::SeqCst);
+        assert!(
+            opens > 1,
+            "opened {opens} time(s) in 100 s of ended streams"
+        );
     }
 
     /// Pin the wire-shape contract for `/api/people/accounts/{id}`.

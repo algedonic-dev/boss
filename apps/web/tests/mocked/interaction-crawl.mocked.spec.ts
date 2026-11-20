@@ -115,7 +115,7 @@ import { isPageWrite, isShellWrite } from './_smokeMocks';
 // rest are KNOWN_GAPS below.
 //
 // Run: bunx playwright test -c playwright.mocked.config.ts tests/mocked/interaction-crawl.mocked.spec.ts
-//   CRAWL_ROUTES=/ux/inbox,/it   crawl only these routes
+//   CRAWL_ROUTES=/me/inbox,/it   crawl only these routes
 //   CRAWL_VERBOSE=1              print every click's outcome
 
 import { test, expect, type Page, type Request } from './_test';
@@ -124,6 +124,7 @@ import {
 } from './_smokeMocks';
 import { FAILURE_MARKER, NOT_FOUND_ROW, ROUTES } from './_routes';
 import { parseRoute, routable } from '../../src/router';
+import { ADDRESSES } from '../fixtures/station-tree';
 import { scaled } from '../../src/dev-load';
 import { pageRequests, readsSettled, recordPageRequests } from './_helpers';
 
@@ -154,7 +155,9 @@ const OFF_SPA: ReadonlyArray<RegExp> = [
 /// its patterns (CLAUDE.md §9a).
 function servedBySpa(href: string): boolean {
   const [path = '', query = ''] = href.split('#')[0]!.split('?');
-  return parseRoute(path, query ? `?${query}` : '').kind !== 'notFound';
+  // Against the tree the floor serves: a hosted page's address is its
+  // host station's in it (backlog 0bc2eb68).
+  return parseRoute(path, query ? `?${query}` : '', ADDRESSES).kind !== 'notFound';
 }
 
 /// Does this href land on / — My Day, the landing? `/`, `/#`, `/?x`
@@ -233,7 +236,7 @@ type Scope = 'page' | 'chrome' | 'dialog';
 /// How long one control gets to become clickable. It was 3 000 ms until
 /// 2026-09-18, and that redded train #461's gate at 22:00Z with a
 /// finding that was the HOST, not the page: "[/ux/views] id: not
-/// clickable: locator.click: Timeout 3000ms exceeded" and "[/ux/me]
+/// clickable: locator.click: Timeout 3000ms exceeded" and "[/me]
 /// MORE ▾: not clickable …" while cargo tests ran beside the web-suite
 /// (the crawl took 2.0 min); the same flake fired once on the dev pod
 /// under builder load the same day — the second web-suite flake at a
@@ -343,7 +346,7 @@ async function open(page: Page, route: string): Promise<boolean> {
 const pathOf = (page: Page): string => new URL(page.url()).pathname;
 
 /// Where a crawled ROW is — its path, and its query when the row names
-/// one. `/it?at=gates` is the Department Map with the gates selected
+/// one. `/it?at=dock` is the alarms board with the dock selected
 /// (design e765b3fc, car N3, whose station panels are the crawl rows of
 /// the pages they replaced): a selection is a place, so a click that
 /// selects another station has left it and back must return to it. A
@@ -396,7 +399,7 @@ const EMPTIED: ReadonlyArray<readonly [RegExp, unknown]> = [
 /// window.print() opens the browser's print dialog — a native dialog the
 /// user sees, so a response under THE JUDGING RULE — but Playwright's
 /// `dialog` event covers alert, confirm, prompt and beforeunload only,
-/// and headless Chromium shows nothing, so /ux/finance's Print / PDF
+/// and headless Chromium shows nothing, so /finance's Print / PDF
 /// read "no observable response" the day the route left DEFERRED (page
 /// audit 3f964c57, 2026-09-25). The call is counted instead, and not
 /// made: a headed debugging run would block on the real dialog.
@@ -453,7 +456,7 @@ async function clickLeg(
   // a throw while the route loads lands in `errors` — and until
   // 2026-09-18 nothing read it there. The first click cleared it, and
   // a route with no controls never read it at all, so the
-  // /it/registry/dispatcher crash the nightly playground crawl found
+  // /engineering/registry/dispatcher crash the nightly playground crawl found
   // (backlog ee86a789) was invisible here even with the reproducing
   // fixture installed. A load-time throw is a finding of its own kind,
   // named `page (load)`, reported once (on the main leg; the refused
@@ -471,21 +474,6 @@ async function clickLeg(
   // (a) every in-app href is served — and one that lands on / says
   // Home (HOME_LINK above).
   if (leg === 'main' && scope === 'page') {
-    // 50ab513c: a green link crawl must actually have product rows to
-    // judge. Dedicated page specs cannot prove the shared mock paints them.
-    if (route === '/ux/products') {
-      const rows = page.locator('.prod-table tbody tr');
-      await expect(rows).toHaveCount(2);
-      const active = rows.filter({ hasText: 'CRAWL-ACTIVE' });
-      const retired = rows.filter({ hasText: 'CRAWL-RETIRED' });
-      await expect(active.locator('td').nth(4)).toHaveText('23');
-      await expect(retired.locator('td').nth(4)).toHaveText('7');
-      await expect(active).not.toHaveClass(/retired/);
-      await expect(retired).toHaveClass(/retired/);
-      await expect(retired).toHaveCSS('opacity', '0.5');
-      await expect(active.locator('a')).toHaveAttribute('href', '/ux/products/CRAWL-ACTIVE');
-      await expect(retired.locator('a')).toHaveAttribute('href', '/ux/products/CRAWL-RETIRED');
-    }
     const anchors = await page.locator('a[href]').evaluateAll((els) =>
       els.map((a) => ({
         href: a.getAttribute('href') ?? '',
@@ -756,30 +744,30 @@ type Gap = Readonly<{ route: string; control: string; chrome?: true; why: string
 
 /// Where the chrome is crawled. Any route would do — the chrome is the
 /// same everywhere — and this is the one sign-in lands on.
-const CHROME_ROUTE = '/ux/me';
+const CHROME_ROUTE = '/me';
 
 /// The route the load-time-throw pin opens, and what it throws. Any
 /// crawled route would do — the pin is about the crawl, not the page —
 /// and this one carries few controls, so the pin is short.
-const LOAD_THROW_ROUTE = '/ux/manual';
+const LOAD_THROW_ROUTE = '/engineering/manual';
 const LOAD_THROW_TEXT = 'crawl pin: thrown while the route loaded';
 
 /// The judging-rule pins (backlog 840c5a76). The race is the route the
 /// flake named, forced: its Reset POST answered RACE_ANSWER_HELD_MS late
 /// and its request event handed on RACE_EVENT_LATE_MS late — both far
 /// past the 250 ms settle, so the old judge read them as nothing.
-const RACE_ROUTE = '/it/operate/perf';
+const RACE_ROUTE = '/operations/perf';
 const RACE_WRITE = '**/api/gateway/perf/reset';
 const RACE_ANSWER_HELD_MS = 3_000;
 const RACE_EVENT_LATE_MS = 1_500;
 /// The silent-control pin plants an inert button on a quiet route and a
 /// poll fast enough that a request lands in every judging window.
-const SILENT_ROUTE = '/ux/manual';
+const SILENT_ROUTE = '/engineering/manual';
 const SILENT_LABEL = 'crawl pin: an inert control';
 const SILENT_POLL_MS = 40;
 /// The Home pin (backlog 7c69a45f) plants its links and button on a
 /// quiet route too.
-const HOME_PIN_ROUTE = '/ux/manual';
+const HOME_PIN_ROUTE = '/engineering/manual';
 const HOME_PIN_BUTTON = 'crawl pin: a button that lands on /';
 
 const KNOWN_GAPS: ReadonlyArray<Gap> = [
@@ -808,18 +796,8 @@ test.describe('the interaction crawl — every rendered link lands, every contro
     expect((await controls(page, 'page')).map(control => control.label)).toEqual(['Available', 'Hidden until opened', 'Legend exception', 'SVG control']);
   });
 
-  test('the policy control census does not try to click a closed prepared-input button', async ({ page }) => {
-    await installLegs(page, { refuse: false, empty: false });
-    await page.goto('/it/registry/policy');
-    await expect(page.getByRole('heading', { name: 'Named-person permissions' })).toBeVisible();
-    const measured = await page.locator('button').evaluateAll(buttons => buttons.map((button, index) => ({
-      index, text: button.textContent?.trim(), innerText: (button as HTMLButtonElement).innerText,
-      visible: button.checkVisibility(), disabled: button.matches(':disabled'),
-      ownDisabled: (button as HTMLButtonElement).disabled, closedDetails: !!button.closest('details:not([open])'),
-    })));
-    console.log('policy native button observations', JSON.stringify(measured));
-    expect((await controls(page, 'page')).some(control => control.label.startsWith('<button #'))).toBe(false);
-  });
+  // The policy page's control census ran here until the page went with
+  // step 1 of design 01fa5bdf; the closed-details case is the test above.
 
   for (let shard = 0; shard < SHARDS; shard++) {
     test(`shard ${shard + 1}/${SHARDS}: links, clicks, back, empty backend, refused writes`, async ({ page }) => {
@@ -840,16 +818,6 @@ test.describe('the interaction crawl — every rendered link lands, every contro
         mode.refuse = false;
         mode.empty = false;
         found.push(...(await clickLeg(page, route, 'main', 'page', tally, errors)));
-        if (route === '/ux/products') {
-          for (const [sku, name] of [['CRAWL-ACTIVE', 'Crawl output'], ['CRAWL-RETIRED', 'Retired crawl output']] as const) {
-            await page.locator('.prod-table').getByRole('link', { name: sku, exact: true }).click();
-            await expect(page).toHaveURL(new RegExp(`/ux/products/${sku}$`));
-            await expect(page.locator('h1')).toContainText(name);
-            await page.goBack();
-            await expect(page).toHaveURL(/\/ux\/products$/);
-            await expect(page.locator('.prod-table tbody tr')).toHaveCount(2);
-          }
-        }
         mode.refuse = true;
         found.push(...(await clickLeg(page, route, 'refused', 'page', tally, errors)));
         mode.refuse = false;
@@ -900,7 +868,7 @@ test.describe('the interaction crawl — every rendered link lands, every contro
   test.describe('a planted load throw', () => {
     test.use({ expectedPageErrors: [{ name: 'the crawl pin\'s planted load throw', pattern: new RegExp(`^Error: ${LOAD_THROW_TEXT}$`) }] });
     test('a route that throws while it loads is a finding of its own, before any control is clicked', async ({ page }) => {
-      // The /it/registry/dispatcher crash the first nightly playground
+      // The /engineering/registry/dispatcher crash the first nightly playground
       // crawl found (2026-09-18, backlog ee86a789) threw while the page
       // LOADED, and this crawl could not see it even with the reproducing
       // fixture installed: it read pageerrors only after a click, and

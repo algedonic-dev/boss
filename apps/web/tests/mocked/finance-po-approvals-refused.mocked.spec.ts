@@ -1,4 +1,4 @@
-// /ux/finance PO Approvals — a refused Approve says so, beside its row
+// /finance PO Approvals — a refused Approve says so, beside its row
 // (backlog 1acaa10e, page audit 3f964c57 gap 11).
 //
 // ApprovalsTab stored `error: <status>` on a failed PUT
@@ -14,7 +14,7 @@ import { mountPage } from './_helpers';
 import { installSmokeMocks } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
 
-const PATH = '/ux/finance';
+const PATH = '/finance';
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });

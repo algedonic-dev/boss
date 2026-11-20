@@ -26,12 +26,21 @@ convenience, not a second supported install.
 > on one machine. Auth is the file-backed local-auth provider —
 > real Argon2id-hashed credentials, signed session cookies,
 > admin-issued password reset tokens; see
-> [Authentication](#authentication) — but there is no SSO, no
-> MFA, no account lockout, no rate limiting, no edge-tier
-> hardening. For production deployments see the **Post-release**
-> section in [`TODO.md`](../../TODO.md) — **Production
-> infrastructure template**, **Integrated IAM** (Authelia /
-> OIDC), and Workflow modeling UX are queued there.
+> [Authentication](#authentication) — but it has no MFA, no
+> account lockout, no rate limiting, no edge-tier hardening.
+> The gateway can also sign people in through an external OIDC
+> identity provider (auth-code + PKCE, under `/api/auth/oidc/`)
+> when `BOSS_OIDC_ISSUER`, `BOSS_OIDC_CLIENT_ID` and
+> `BOSS_OIDC_CLIENT_SECRET` are set; this quickstart leaves all
+> three unset, so OIDC sign-in is off here. There is no
+> production deployment template, and forward-auth (identity in
+> headers such as `Remote-User` from a fronting proxy) is not
+> supported. The project's open work is tracked inside BOSS
+> itself, not in this repository; to ask for either, open a
+> GitHub issue (see
+> [`CONTRIBUTING.md`](../../CONTRIBUTING.md)). The mid-2026
+> roadmap that listed them is in git history — see
+> [`TODO.md`](../../TODO.md).
 
 ## Install
 
@@ -132,14 +141,18 @@ load and fills in as the sim runs.
 
 Try:
 
-- `/ux/exec` — the executive dashboard.
-- `/system/monitoring` — service health, deployment topology, ML
-  oversight.
-- `/system/kb` — architecture diagrams, ADRs, hardware/software
-  reference.
-- `/ux/jobs` — every Job in flight.
-- `/system/workflows` — the Workflow catalog + authoring (writes
+- `/it/tree` — the company as a tree of stations, the work moving
+  through it.
+- `/operations/audit` — the audit log, with performance as a tab.
+- `/engineering/kb` — the reading frame and the architecture diagrams
+  (state / surfaces / work framing, primitives, service map,
+  deployment topology).
+- `/engineering/registry` — the Workflow catalog + authoring (writes
   need your platform-admin role).
+
+A page's address is the address of the station that hosts it in the
+station tree, plus the page's own slug, so these are the platform
+tree's addresses; a tree arranged differently moves them.
 
 ## Developing against the source tree
 
@@ -158,7 +171,8 @@ For the Rust and web toolchains, tests and lints — everything that
 runs before a change reaches the image — see
 [`docs/runbooks/dev-environment-bootstrap.md`](../../docs/runbooks/dev-environment-bootstrap.md).
 BOSS's own development runs on a cluster dev pod
-([`docs/design/dev-cluster.md`](../../docs/design/dev-cluster.md)).
+([`docs/architecture-decisions.md`](../../docs/architecture-decisions.md)
+§Deployment, the forge, and the cluster).
 
 Re-run against a clean demo: the sim builds the demo live from an
 empty `audit_log`, so starting over is dropping the volume:
@@ -203,8 +217,7 @@ The Docker compose stack does not bundle Caddy; bringing it up
 is a separate concern outside the container. v1's framing is
 "an install that runs on a single VM"; multi-tier production
 deploys (HA gateway, separate TLS terminator, dedicated DB)
-are tracked under the **Production infrastructure template**
-TODO.
+have no template in this repository.
 
 ## Authentication
 
@@ -219,7 +232,7 @@ takes one of three answers, and the quickstart ships `basic`:
 
 | value | what a stranger who clicks the button gets |
 |---|---|
-| `basic` (the quickstart's) | a session as `guest@algedonic.dev` with the `visitor` role. Core grants it Read on workflows and step plugins — the operating model this install has published, active and retired versions alike; an unpublished draft of a workflow or a station is read only by a role that may author one, and counting steps in flight takes Read on steps — and nothing more; on every read that asks policy, it reads anything else only where this install's policy grants `visitor` more (rules naming that role in the tenant's `policy_rules.toml`): a page whose data the role cannot read shows empty or refused, not an error. **Not every read asks yet.** The employee roster does; many module services' reads — accounts, assets, invoices, inventory, shipments, products, customers, campaigns, the catalog — still answer any session, a guest's included. Until they ask, offer `basic` guests only on an install whose records you would publish. |
+| `basic` (the quickstart's) | a session as `guest@algedonic.dev` with the `visitor` role. Core grants it Read on workflows and step plugins — the operating model this install has published, active and retired versions alike; an unpublished draft of a workflow or a station is read only by a role that may author one, and counting steps in flight takes Read on steps — and nothing more; on every read that asks policy, it reads anything else only where this install's policy grants `visitor` more (rules naming that role in the tenant's `policy_rules.toml`): a page whose data the role cannot read shows empty or refused, not an error. **Not every read asks yet.** The employee roster and the shop's customers do; many module services' reads — accounts, assets, invoices, inventory, shipments, products, campaigns, the catalog — still answer any session, a guest's included. Until they ask, offer `basic` guests only on an install whose records you would publish. |
 | `audit` | the `audit-readonly` role: Read on every shipped resource, the employee roster and the books included — except the policy rule table, which an anonymous visitor never reads whatever its role. Right for a public demo whose company is synthetic; wrong for your own records. |
 | `0`, or unset | no button. A login is the only way in. |
 
@@ -269,10 +282,14 @@ only way in.
 
 > ⚠  This is the v1 launch auth — file-backed credentials, no
 > account lockout, no email-based password reset, no MFA.
-> Production deployments will use Authelia (or any OIDC IDP)
-> fronting the gateway via forward-auth headers; tracked under
-> the **Integrated IAM** post-release entry in
-> [`TODO.md`](../../TODO.md).
+> OIDC sign-in is built in but off in this stack: set
+> `BOSS_OIDC_ISSUER`, `BOSS_OIDC_CLIENT_ID` and
+> `BOSS_OIDC_CLIENT_SECRET` on the gateway to turn it on.
+> Fronting the gateway with Authelia (or any proxy) via
+> forward-auth headers is not supported today; the mid-2026
+> roadmap's **Integrated IAM** entry that described it is in git
+> history (see [`TODO.md`](../../TODO.md)), and open work is
+> tracked inside BOSS, not in this repository.
 
 ## Troubleshooting
 

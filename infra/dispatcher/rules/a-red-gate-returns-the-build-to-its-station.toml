@@ -1,0 +1,55 @@
+# A red gate returns its item's build to the item's station, carrying
+# the red, where any build seat pulls it as that car's repair (backlog
+# 2b927025, design d32b58b7 step 3).
+#
+# WHAT HAPPENED. A red gate ended its builder's run
+# (`agent-run-is-refused-on-gate-red` completes the handed run's
+# `verdict` as `refused` and stamps the gate-run under `gate_run`), and
+# nothing moved the item: its `build` stayed ACTIVE on the actor that
+# had dispatched it, naming a run that was closed. The repair door
+# existed — `boss dispatch <item>` admits an unfinished car whose
+# building run has ended as that car's REPAIR (7b13c000) — but the step
+# was somebody's, so no station pull could reach it. Measured 2026-11-17:
+# six repair dispatches made by hand.
+#
+# WHAT IT DOES. The reclaim that frees a dead run's step
+# (`an-abandoned-step-is-reclaimed-when-its-verdict-died`), aimed at the
+# one ending a red writes: `verdict` completed `refused`. Only the red
+# rule writes that value on `verdict` — a builder that stops without
+# building ends `building`, never `verdict` — so nothing else frees a
+# step through this file. The step's run edge is cleared, the step goes
+# back to `ready` and nobody's, and `returned_for_red` records the run it
+# was taken from and, through `carry`, the run's `gate_run` evidence:
+# the red gate-run's id and branch. The next builder's brief prints the
+# step's metadata verbatim, so the repair starts from the red.
+#
+# WHY NO BOUND. The death rules keep "dead" and "free" an `after_hours`
+# apart so the record says the run is dead before its work moves. A red
+# is that fact already on the record — a closed gate-run with `failed`,
+# a closed run with `refused` — and the repair is owed now, so the bound
+# is zero and the cadence alone separates them.
+#
+# WHAT IT LEAVES. A step whose edge names an open run (a repair already
+# dispatched writes its own run there), a step with no edge, a run that
+# moved after its red, and a run that ended any other way. Each is the
+# reclaim handler's existing guard, unchanged.
+[[rule]]
+name = "a-red-gate-returns-the-build-to-its-station"
+why = """
+A TIMER, the standing exemption the reclaim rules share: the condition
+is a step still CLAIMED by a run a red gate already ended, and the red
+is an event on the gate-run while the step lives on a third packet, the
+item the run was dispatched for — three protocols, so no single Workflow
+can declare it, and the reclaim handler reads the claimed steps off the
+open board rather than following one event. Measured 2026-11-17 (design
+d32b58b7, backlog 2b927025): six repairs were dispatched by hand because
+the item's build stood active on the coordinator after its run was
+refused. It adds no routing beyond the release: the step returns to
+`ready` and unassigned at its own station, and the repair door judges
+the repair when a build seat pulls it.
+"""
+version = 1
+schedule = { cadence = "every-15-minutes", anchor_date = "2026-11-18" }
+[[rule.do]]
+handler = "jobs.reclaim_abandoned_step"
+args = { run_kind = "\"agent-run\"", run_step = "\"verdict\"", dead_result = "\"refused\"", link = "\"agent_run\"", after_hours = "\"0\"", evidence_key = "\"returned_for_red\"", carry = "\"gate_run\"" }

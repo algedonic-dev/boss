@@ -26,6 +26,7 @@ pub mod pto;
 pub mod rebuild;
 #[cfg(feature = "postgres")]
 pub mod requisitions;
+pub mod roster_refresh;
 #[cfg(feature = "postgres")]
 pub mod scope;
 #[cfg(feature = "postgres")]
@@ -47,3 +48,5 @@ pub use postgres::PgPeople;
 pub use rebuild::{RebuildError, RebuildReport, rebuild_people};
 pub use types::*;
 pub mod events;
+#[cfg(feature = "postgres")]
+mod roster_capacity;

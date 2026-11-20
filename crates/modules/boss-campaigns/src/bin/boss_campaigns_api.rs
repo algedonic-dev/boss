@@ -172,11 +172,17 @@ mod role_inventory_tests {
             .await
             .unwrap();
         assert_eq!(domain.status(), StatusCode::OK);
-        assert_eq!(
-            axum::body::to_bytes(domain.into_body(), 4096)
+        let health: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(domain.into_body(), 4096)
                 .await
                 .unwrap(),
-            r#"{"status":"ok"}"#
+        )
+        .unwrap();
+        assert_eq!(health["status"], "ok", "{health}");
+        assert_eq!(
+            health["capabilities"]["commit"],
+            serde_json::json!(boss_core::startup::build_commit()),
+            "the health body names the build that answered (backlog 56f88ada): {health}"
         );
         let denied = app
             .clone()

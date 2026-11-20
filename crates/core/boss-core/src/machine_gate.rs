@@ -2114,6 +2114,34 @@ pub fn gated(router: Router, gate: Arc<MachineGate>) -> Router {
         .layer(axum::middleware::from_fn_with_state(gate, machine_gate))
 }
 
+pub(crate) fn gated_with_request_latency(
+    router: Router,
+    gate: Arc<MachineGate>,
+    timing: Arc<crate::request_latency::Timing>,
+) -> Router {
+    crate::request_latency::mount(gated(router, gate), timing)
+}
+
+/// The same machine gate with operational timing outside its refusal edge.
+/// No routes or authority are added by the observer. ConnectInfo is retained.
+pub fn mount_with_request_latency(
+    router: Router,
+    service: &str,
+    health: &[&str],
+    recorder: Option<Arc<dyn EventRecorder>>,
+    timing: Arc<crate::request_latency::Timing>,
+) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr> {
+    let gate = launched_gate(
+        service,
+        health,
+        recorder,
+        MountedFiles::from_env(),
+        std::env::var(crate::gate_window::LAUNCH_RECORD_ENV).ok(),
+    );
+    gated_with_request_latency(router, gate, timing)
+        .into_make_service_with_connect_info::<SocketAddr>()
+}
+
 /// Mount the gate on a service's finished router and hand back what
 /// `axum::serve` takes — with the peer address on every request, which
 /// the tally keys on. `service` is the service's `boss-ports` name;
@@ -2166,6 +2194,20 @@ pub fn mount_launched(
     files: MountedFiles,
     launch_record: Option<String>,
 ) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr> {
+    gated(
+        router,
+        launched_gate(service, health, recorder, files, launch_record),
+    )
+    .into_make_service_with_connect_info::<SocketAddr>()
+}
+
+fn launched_gate(
+    service: &str,
+    health: &[&str],
+    recorder: Option<Arc<dyn EventRecorder>>,
+    files: MountedFiles,
+    launch_record: Option<String>,
+) -> Arc<MachineGate> {
     let evidence = match recorder {
         Some(r) => Evidence::spawn(EvidenceGate::MachineGate, service, r),
         None => {
@@ -2207,7 +2249,7 @@ pub fn mount_launched(
             "machine gate mounted outside a runtime: its mode and slots will not be re-read"
         );
     }
-    gated(router, gate).into_make_service_with_connect_info::<SocketAddr>()
+    gate
 }
 
 #[cfg(test)]

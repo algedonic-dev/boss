@@ -13,6 +13,7 @@ fn the_dev_controller_preserves_its_worker_and_receipt_contract() {
         "control-artifact_test.py",
         "activate-control_test.py",
         "control-tools_test.py",
+        "preflight-control_test.py",
     ] {
         let output = Command::new("python3")
             .arg("-I")

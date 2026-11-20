@@ -5,8 +5,12 @@
 # Source it, then read:
 #
 #   . infra/lint/lib/sor-read.sh || exit 3
-#   code=$(lint_sor_read "$NAME" "the jobs API" "$URL" "$body")
+#   code=$(lint_sor_read "$NAME" "the jobs API" "$URL" "$body" BOSS_JOBS_URL)
 #   [ "$code" = "200" ] || skip "$URL answered HTTP $code"
+#
+# The last argument is the NAME of the env var the lint's header gives
+# for its read surface: unset, the lint is reading its default, and a
+# door on PATH answers it (A LINT RUN BY HAND, below).
 #
 # The code is curl's `%{http_code}`, and `000` when nothing answered —
 # the word each lint's skip already read as "never got an answer", so a
@@ -105,9 +109,56 @@ lint_sor_handed() { # WHO URL BODY_FILE — prints the HTTP code
     printf '%s' "$code"
 }
 
-# lint_sor_read WHO SERVICE URL BODY_FILE — prints the HTTP code.
+# A LINT RUN BY HAND READS THROUGH THE DOOR (backlog 83bff88b, from
+# 0914f277). The hand-over above serves a launcher that holds the token;
+# an agent or operator running the-live-protocols or the-live-rules by
+# hand on the dev pod has none, so the read below went out with no token,
+# signed automation:gate-runner — three would-refuse facts from the dev
+# pod on the machine gate's window, 2026-10-09 17:17-20:01Z. That
+# container holds the token for its doors (infra/dev/machine-token-dir),
+# so the read goes through `boss-api`, which stamps it — the way the
+# pod's boss-sor-read closed the same hole for a probe rehearsal
+# (37742794 R3) and the pre-flight for the edit level (R2). Only when:
+#   - nothing was handed in (that branch runs first and sends nothing);
+#   - the run names no instance: neither the lint's own URL variable
+#     (the fifth argument) nor BOSS_JOBS_URL, which is the door's base,
+#     so a lint aimed at a named instance reads THAT instance, unstamped,
+#     exactly as before;
+#   - a `boss-api` is on PATH. The gate's runner has none, so the gate
+#     reads exactly as it did.
+# The door is asked for the URL's path with the lint's window, and the
+# path decides the service: a BOSS_SOR_SERVICE the caller's shell carried
+# is dropped, or a dispatcher question would go to the gateway. The door
+# signs as the session's actor where one is named (the same world on
+# every list as audit-readonly, 61085a9e), and as audit-readonly where
+# none is. A door that cannot answer is NO ANSWER (000), with its own
+# words on stderr — never a curl in its place, which would be the
+# tokenless read this exists to remove (the rule the hand-over keeps).
+# Pinned by a_hand_run_lint_reads_the_record_through_the_door.rs.
+lint_sor_through_the_door() { # WHO URL BODY_FILE WINDOW — prints the HTTP code
+    local who=$1 url=$2 body=$3 window=$4 rest path err code
+    rest=${url#*://}
+    case "$rest" in
+        */*) path="/${rest#*/}" ;;
+        *)
+            echo "$who: $url names no path to ask the door (boss-api) for — no request is sent" >&2
+            printf '000'
+            return 0
+            ;;
+    esac
+    err=$(mktemp) || { printf '000'; return 0; }
+    (unset BOSS_SOR_SERVICE; BOSS_SOR_WAIT_SECONDS=$window boss-api GET "$path" >"$body" 2>"$err" </dev/null)
+    code=$(sed -n 's/^HTTP:\([0-9][0-9][0-9]\)$/\1/p' "$err" | tail -n 1)
+    grep -v '^HTTP:[0-9][0-9][0-9]$' "$err" >&2 || true
+    rm -f "$err"
+    code=${code:-000}
+    echo "$who: GET $path was read through the door (boss-api, which presents this container's machine token) — HTTP $code, and no request from this lint" >&2
+    printf '%s' "$code"
+}
+
+# lint_sor_read WHO SERVICE URL BODY_FILE URL_VAR — prints the HTTP code.
 lint_sor_read() {
-    local who=$1 service=$2 url=$3 body=$4 code
+    local who=$1 service=$2 url=$3 body=$4 url_var=${5:-} code
     if [ -n "${BOSS_LINT_SOR_HANDED_URL:-}" ]; then
         lint_sor_handed "$who" "$url" "$body"
         return 0
@@ -120,6 +171,20 @@ lint_sor_read() {
             return 0
             ;;
     esac
+    # A caller that cannot say which variable names its instance cannot
+    # say whether one was named: refused, never guessed either way.
+    case "$url_var" in
+        '' | *[!A-Za-z0-9_]*)
+            echo "$who: lint_sor_read was not told which variable names this lint's read surface (got '$url_var') — refusing to read $url" >&2
+            printf '000'
+            return 0
+            ;;
+    esac
+    if [ -z "${!url_var:-}" ] && [ -z "${BOSS_JOBS_URL:-}" ] \
+        && command -v boss-api >/dev/null 2>&1; then
+        lint_sor_through_the_door "$who" "$url" "$body" "$window"
+        return 0
+    fi
     code=$(curl_through_a_roll "$window" "$who" "$service" "GET $url" \
         -sS -m 10 -H "x-boss-user: $LINT_SOR_READER" \
         -o "$body" -w '%{http_code}' "$url") || true

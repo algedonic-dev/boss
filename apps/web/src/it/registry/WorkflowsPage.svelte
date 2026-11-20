@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { pageLink } from '../../shell/stationAddresses.svelte';
   // /it/registry — the Workflow registry's catalog: every active
   // Workflow, grouped by category, each linking to its detail page
   // (/it/registry/<kind>), with how many packets of that kind are in
@@ -163,7 +164,7 @@
     <!-- Authoring entry point. Workflows is the single UI surface for
          Workflows (the "Job kinds" sidebar entry was retired); the
          authoring routes (/it/registry*) are reached from here. -->
-    <Link to={href('/it/registry/new')} className="wf-new">+ New workflow</Link>
+    <Link to={pageLink('workflows', {}, '/new')} className="wf-new">+ New workflow</Link>
   </div>
 
   <div class="tab-grid">
@@ -174,7 +175,7 @@
             {#each rows as k (k.kind)}
               <li class="kb-workflow-row">
                 <div class="kb-workflow-header">
-                  <Link to={href(`/it/registry/${encodeURIComponent(k.kind)}`)}>
+                  <Link to={pageLink('workflows', {}, `/${encodeURIComponent(k.kind)}`)}>
                     <span class="kb-workflow-kind mono">{k.kind}</span>
                   </Link>
                   <span class="kb-workflow-label">{k.label}</span>

@@ -241,7 +241,7 @@ fn build_app_with_station(selection: bool) -> (Router, Arc<InMemoryJobs>, Arc<He
     let mut station = StationSpec::draft(
         "visits",
         "Visits",
-        StationKind::Batch,
+        StationKind::Group,
         boss_jobs::station_queue::StationPredicate {
             kind: Some("service-visit".into()),
             step: Some(boss_jobs::station_queue::StepMatch {
@@ -768,4 +768,113 @@ async fn someone_elses_reservation_still_refuses_the_start() {
         jobs.get_step(&step.id).await.unwrap().unwrap().status,
         StepStatus::Ready
     );
+}
+
+/// A hold an attempt on `step_id` placed `minutes_ago` and then never
+/// settled — reserved, and cut off before its write (backlog 868c2cf9):
+/// the assignee, from `start` ("HH:MM" on the visit's day) for 90 minutes.
+fn left_behind(
+    calendar: &HeldCalendar,
+    step_id: StepId,
+    start: &str,
+    minutes_ago: i64,
+) -> ReservationId {
+    let start_at = chrono::DateTime::parse_from_rfc3339(&format!("2026-09-26T{start}:00Z"))
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let id = ReservationId::new();
+    calendar.held.lock().unwrap().push(Reservation {
+        id,
+        subject: Subject::new("employee", "emp-tech"),
+        window: TimeWindow::new(start_at, start_at + chrono::Duration::minutes(90)).unwrap(),
+        reason_kind: boss_core::calendar::reason::JOB_STEP.to_string(),
+        reason_ref_id: step_id.to_string(),
+        strength: boss_core::calendar::ReservationStrength::Hard,
+        notes: None,
+        created_by: "emp-tech".into(),
+        created_at: chrono::Utc::now() - chrono::Duration::minutes(minutes_ago),
+        cancelled_at: None,
+    });
+    id
+}
+
+#[tokio::test]
+async fn a_hold_left_by_a_dead_attempt_does_not_refuse_the_rescheduled_start() {
+    // Backlog 868c2cf9 (the round-2 review of car 983696b5): an attempt
+    // reserved 09:30 and was cut off before its write; the visit was
+    // then moved to 10:00. The leftover overlaps the new window and is
+    // not the same window, so it is not the step's hold on this time —
+    // and the start met it as "calendar conflict" until someone
+    // cancelled it by hand. The step holds no time as stored (Ready), and
+    // an hour is past any attempt's life, so the start hands it back.
+    let (app, jobs, calendar) = build_app();
+    let (job, step) = scheduled(&jobs).await;
+    let leftover = left_behind(&calendar, step.id, "09:30", 60);
+
+    let (status, body) = start(&app, &job, &step).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let live = calendar.live_ids(&step.id.to_string());
+    assert_eq!(live.len(), 1, "the start's own hold, and only it");
+    assert_ne!(live[0], leftover, "the leftover went back");
+    assert_eq!(
+        jobs.get_step(&step.id).await.unwrap().unwrap().status,
+        StepStatus::Active
+    );
+}
+
+#[tokio::test]
+async fn a_skipped_steps_leftover_does_not_refuse_another_steps_start() {
+    // A skip that landed and was cut off before its release left a
+    // Skipped step holding the assignee's time (868c2cf9). A Skipped
+    // step holds nothing, so the first start that time blocks hands it
+    // back.
+    let (app, jobs, calendar) = build_app();
+    let (job, step) = scheduled(&jobs).await;
+    let mut skipped = Step::new(job.id, "task", "An abandoned branch", 2);
+    skipped.status = StepStatus::Skipped;
+    skipped.assignee_id = Some("emp-tech".into());
+    jobs.add_step(&skipped).await.unwrap();
+    left_behind(&calendar, skipped.id, "10:30", 60);
+
+    let (status, body) = start(&app, &job, &step).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(calendar.live_for(&skipped.id.to_string()), 0);
+    assert_eq!(calendar.live_for(&step.id.to_string()), 1);
+}
+
+#[tokio::test]
+async fn a_hold_an_attempt_may_still_be_writing_refuses_the_start_as_before() {
+    // Placed a minute ago, the hold may belong to a start between its
+    // reservation and its write; releasing it would leave that start,
+    // landing, Active and holding nothing (983696b5). It stays a
+    // conflict until no attempt can still be alive.
+    let (app, jobs, calendar) = build_app();
+    let (job, step) = scheduled(&jobs).await;
+    let fresh = left_behind(&calendar, step.id, "09:30", 1);
+
+    let (status, body) = start(&app, &job, &step).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("calendar conflict"), "{body}");
+    assert_eq!(calendar.live_ids(&step.id.to_string()), vec![fresh]);
+}
+
+#[tokio::test]
+async fn an_active_steps_hold_still_refuses_another_steps_start() {
+    // Old is not abandoned: a step Active over exactly this time holds
+    // it, however long ago it was reserved.
+    let (app, jobs, calendar) = build_app();
+    let (job, step) = scheduled(&jobs).await;
+    let mut other = Step::new(job.id, "task", "Another visit", 2);
+    other.status = StepStatus::Active;
+    other.assignee_id = Some("emp-tech".into());
+    other.metadata = serde_json::json!({
+        "scheduled_at": "2026-09-26T10:30:00Z",
+        "duration_minutes": 90,
+    });
+    jobs.add_step(&other).await.unwrap();
+    let its_hold = left_behind(&calendar, other.id, "10:30", 600);
+
+    let (status, body) = start(&app, &job, &step).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(calendar.live_ids(&other.id.to_string()), vec![its_hold]);
 }

@@ -29,7 +29,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "Meta-kind: every design doc under docs/design/ gets reviewed via a Job of this kind. The `review-design` step uses a custom Step UX plugin that reads the questions the packet carries and gates completion until each one has a recorded resolution. Resolutions land on the step, which IS the record; each release, settled material folds into `docs/architecture-decisions.md`. A LEGACY packet carrying only a `doc_path` and no questions is no longer readable: the corpus index that parsed `### Qn:` headings out of the file was deleted on 2026-09-10 (backlog f5da586c), and the surface says so rather than fetching a service that is gone. Replaces the in-app decision-tracker surface retired on 2026-05-03."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { owner = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5", department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "open"
@@ -50,7 +50,7 @@ kind = "review-design"
 ready_when = "steps.open.done"
 title_template = "Review design doc — address open questions"
 authority_role = "platform-admin"
-metadata_defaults = { doc_path = "{subject.id}", resolutions = [] }
+metadata_defaults = { at = "202dc00d-c5a7-4cde-81f5-d6a6fcd26e6b", doc_path = "{subject.id}", resolutions = [] }
 
 [[workflow.step]]
 title = "reviewed"

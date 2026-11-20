@@ -1,6 +1,8 @@
 # ---------------------------------------------------------------------------
 # ship-a-change — the delivery protocol itself, and the last of the
-# high-traffic trio protocols-as-data.md sequences by blast radius:
+# high-traffic trio protocols-as-data sequenced by blast radius
+# (its decisions are in docs/architecture-decisions.md §Jobs, Workflows,
+# Steps):
 # "get those wrong and nothing else can ship, including the fix."
 #
 # WHY `scope` COMES FIRST, AND IS GATED ON A PERSON. A PR's boundary
@@ -59,7 +61,7 @@ description = "One change, from declaring its boundary to merging it. The Subjec
 # Structured wait declarations can record their next actual observation.
 # Optional at admission; an alarm may qualify only a complete record.
 metadata_schema = { type = "object", properties = { waits_on = { type = "object", properties = { next_check_at = { type = "string", format = "date-time", description = "The recorded next observable check, not a date guessed from job age." }, clean_window = { type = "object", required = ["begin_at", "duration_seconds"], additionalProperties = false, properties = { begin_at = { type = "string", format = "date-time" }, duration_seconds = { type = "integer", minimum = 1 } } } } } } }
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { owner = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5", department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "opened"
@@ -74,7 +76,7 @@ kind = "task"
 ready_when = "steps.opened.done"
 title_template = "Declare the boundary"
 authority_role = "platform-admin"
-metadata_defaults = { procedure = """Say what the change contains and what it deliberately EXCLUDES, before writing it. The exclusion is the load-bearing half: it is what keeps a car small enough to review and what stops scope drifting mid-build. Name the feedback or backlog packet this answers in metadata.backlog_item — a ref-checked job edge, so a mistyped id is refused rather than silently pointing at nothing, and the dispatcher follows it on merge to close that packet and tell its filer.
+metadata_defaults = { at = "0409a62b-1022-4b1a-8507-a1522171d71b", procedure = """Say what the change contains and what it deliberately EXCLUDES, before writing it. The exclusion is the load-bearing half: it is what keeps a car small enough to review and what stops scope drifting mid-build. Name the feedback or backlog packet this answers in metadata.backlog_item — a ref-checked job edge, so a mistyped id is refused rather than silently pointing at nothing, and the dispatcher follows it on merge to close that packet and tell its filer.
 
 A DEFECT IN A CAR THAT ALREADY MERGED GETS ITS OWN PACKET, BEFORE THE FIX. Not an inline correction in whatever car you happen to be writing. File it, then name it in this car's `backlog_item` so the repair points at what it repairs.
 
@@ -107,7 +109,7 @@ kind = "task"
 ready_when = "steps.scope.done"
 title_template = "Build it"
 authority_role = "platform-admin"
-metadata_defaults = { procedure = """Make the change, then run the tests for the crates you touched. BEFORE branching, check what the parked cars already touch: two cars editing one file merge cleanly and conflict at assembly, or resolve by taking one side and silently reverting the other. A bare `git merge-tree` CONFLICT check is not sufficient — it under-reports, because a stale branch reverts without conflicting. Read the merged CONTENT instead, which needs no working tree: `TREE=$(git merge-tree --write-tree forge/main <branch>)` then `git cat-file -p $TREE:<a file that landed after the base> | wc -l` compared against main's. A large deletion count in `git diff main..branch` is a SCREEN, NOT A VERDICT: that diff compares two endpoints and ignores history, so everything that landed on main after the branch's base reads as a deletion and healthy cars false-positive. On 2026-08-29 a parked car showed 17 files / 34 insertions / 590 deletions and merged with nothing reverted — 809 lines on main, 809 in the merge result. Acting on the screen alone would have meant rebasing and force-pushing a HEALTHY parked car, which is exactly how a boardable car becomes an unboardable one.
+metadata_defaults = { at = "0409a62b-1022-4b1a-8507-a1522171d71b", procedure = """Make the change, then run the tests for the crates you touched. BEFORE branching, check what the parked cars already touch: two cars editing one file merge cleanly and conflict at assembly, or resolve by taking one side and silently reverting the other. A bare `git merge-tree` CONFLICT check is not sufficient — it under-reports, because a stale branch reverts without conflicting. Read the merged CONTENT instead, which needs no working tree: `TREE=$(git merge-tree --write-tree forge/main <branch>)` then `git cat-file -p $TREE:<a file that landed after the base> | wc -l` compared against main's. A large deletion count in `git diff main..branch` is a SCREEN, NOT A VERDICT: that diff compares two endpoints and ignores history, so everything that landed on main after the branch's base reads as a deletion and healthy cars false-positive. On 2026-08-29 a parked car showed 17 files / 34 insertions / 590 deletions and merged with nothing reverted — 809 lines on main, 809 in the merge result. Acting on the screen alone would have meant rebasing and force-pushing a HEALTHY parked car, which is exactly how a boardable car becomes an unboardable one.
 
 CUT THE BRANCH FROM THE FORGE'S MAIN — AND KNOW WHICH REMOTE THAT IS. On the workstation `origin` is the GITHUB MIRROR, not the forge, and it lags: on 2026-08-29 it reported main as b178a534 while the forge was at e124ba61, which made a healthy tree look like it reverted 5,825 lines and sent a session hunting a defect that did not exist. The forge (http://10.20.0.15:3000) has no credential on the workstation and is reachable only through the conductor clone. Get its view, branch from it, and prove the base:
   git fetch gcp '+refs/remotes/origin/*:refs/remotes/forge/*'
@@ -145,7 +147,7 @@ kind = "task"
 ready_when = "steps.build.done"
 title_template = "Green, and observed working"
 authority_role = "platform-admin"
-metadata_defaults = { procedure = """Pre-flight first: `infra/gate.sh --quick`, about 11 seconds, and the pre-push hook runs it anyway if core.hooksPath is set. Then `boss gate <branch> --wait`. DO NOT push to the branch while its gate is running — the gate tests the head it resolved at launch, and a later commit leaves a receipt vouching for a commit that is no longer the tip. Park with `boss park`, which COPIES the receipt from the gate-run packet: the head is transcribed by a machine, never retyped. It refuses a gate that is red, lost, still running, or green for a commit that is no longer the branch head.
+metadata_defaults = { fulfilled_by = "gate-run", procedure = """Pre-flight first: `infra/gate.sh --quick`, about 11 seconds, and the pre-push hook runs it anyway if core.hooksPath is set. Then `boss gate <branch> --wait`. DO NOT push to the branch while its gate is running — the gate tests the head it resolved at launch, and a later commit leaves a receipt vouching for a commit that is no longer the tip. Park with `boss park`, which COPIES the receipt from the gate-run packet: the head is transcribed by a machine, never retyped. It refuses a gate that is red, lost, still running, or green for a commit that is no longer the branch head.
 
 PUBLISH THE BRANCH TO THE FORGE FIRST — the gate resolves its head from the forge, so an unpublished branch gates the wrong thing or not at all. A workstation has no forge credential, so push to the conductor clone under a temp ref and push THAT to origin from there:
   git push gcp "HEAD:refs/tmp/${BRANCH}"
@@ -186,6 +188,10 @@ duration_hours = 2.0
 ready_when = "steps.gate.done"
 title_template = "Open for review"
 authority_role = "platform-admin"
+# Both reviewer families are admissible (backlog f4425aad). The agent
+# block supplies advisory launch settings; this declaration decides
+# who may claim, and native execution evidence records what ran.
+executor = "model:opus|sol"
 # WHO REVIEWS A HELD CAR (backlog bc9ef34f, 2026-09-30). A trust-
 # boundary car stands here HELD until an adversarial review releases it,
 # and `boss dispatch <car>` refused the step by name — it declared no
@@ -200,7 +206,22 @@ authority_role = "platform-admin"
 # effort, because every car that waits here waits for exactly the
 # review a medium read would wave through.
 agent = { profile = "reviewer", model = "opus-5-5", budget_usd = 3, effort = "high" }
-metadata_defaults = { procedure = "Left ready for the conductor. It completes this when the car boards, recording the train's PR — cars do not open their own PRs, a train opens one for the batch. A car left behind gets a skip_reason on its metadata; if the branch legitimately moved, re-gate and put the fresh receipt in metadata.regate_receipt rather than abandoning the packet, which loses its history." }
+# It stands at engineering's `review` stage (9deb0155), not at the
+# loading-dock: a station's queue is its predicate OR its tree address,
+# so an `at` of the dock would add every held car and every car riding
+# a train to the dock queue its own predicate keeps them out of. A
+# boardable car still stands at the dock through that predicate
+# (review a3a25eb2 of car 89c105cd, B1; infra/platform/stations/
+# loading-dock.toml).
+# The FIVE READS at the procedure's end (backlog cfa2ce64, 2026-11-17)
+# are what the 2026-11-16 reviews found a green does not check; they ride
+# the step a reviewer is dispatched onto, not reviewer-rules.md, because
+# the step is what its brief prints. `landed-review` carries four of them.
+# Measured 2026-11-18: the live active row (v18) equalled origin/main's
+# file step for step, so this car changes only these two procedures; the
+# version that goes live is the registry's, by a deliberate publish (the
+# kind's workflow-hold keeps the drift publish off it).
+metadata_defaults = { at = "9deb0155-9804-4488-a043-14add3a8c5be", procedure = "Left ready for the conductor. It completes this when the car boards, recording the train's PR — cars do not open their own PRs, a train opens one for the batch. A car left behind gets a skip_reason on its metadata; if the branch legitimately moved, re-gate and put the fresh receipt in metadata.regate_receipt rather than abandoning the packet, which loses its history. A HELD car's wait lives on THIS step as door-written metadata, never in a dated key on the car: `hold` says why it stands (boss hold --reason), `releaser` names who its release waits on (boss hold --releaser), and the `release` record its door writes says whose review released it and who gave the release (boss release --review). These values are read-only context, not executor fields; use their doors to change a hold or release. A reviewer of the car also checks that every registry row its diff touches (a workflow, station or pool file under infra/platform/) moved to the station tree's words in this same car, as `boss brief` prints them under `paradigm` and infra/lint/rows-still-in-v1-words.sh counts them: a station row by its id, parent, allocation, capacity and machines, a workflow row by its owner station, and a department read as a tier-1 station. An old key left beside the new one is a finding unless the car's excludes name the live reader that still reads it (backlog 53abeb8d). FIVE READS A GREEN DOES NOT MAKE, each paid for by a review on 2026-11-16; the reviewer's findings say what each found. (1) A MUTATING VERB: walk every exit after its first write, including an error, a signal and kill -9, and say what state each leaves and which door restores it (reviews cf45a112, 1c413d8d). (2) A WRITE ONTO A PACKET: is it bounded under the packet event budget (boss_jobs::packet_budget::BUDGET), and does a refused write still let the step complete (review 75bb4029)? (3) A CONFLICT WITH ANOTHER OPEN CAR: list the open cars from GET /api/jobs?kind=ship-a-change&status=open, held ones included (the loading-dock queue leaves every held car out, review f146734f), and against every one whose diff touches the same files run `git merge-tree --write-tree <this car's head> <that car's head>`, not only against origin/main (review 75bb4029: two cars of one lineage conflicted). Exit 0 is not the verdict: read the merged content of each shared file (`git show <tree>:<path>`), because two lineage blocks numbered alike merged clean (review f146734f). When the two heads sit on different bases, a conflict in a file neither car touches is main's drift between those bases, not a finding. (4) PROSE FOR THE PUBLIC: check every present-tense sentence against the code at the head (reviews 04f504da, 75ea1f87 and 21da8abe each found one false). (5) A TEST STUB of an external tool answers as the tool does for every flag the code passes (curl's -w status, -o, -D, its exit codes), or it turns a correct change red (gate 539ccf80, fixed 091c902c)." }
 [[workflow.step.fields]]
 name = "pr_url"
 field_type = "string"
@@ -209,6 +230,11 @@ required = true
 name = "completed_at"
 field_type = "date-time"
 required = false
+# Door-owned hold/releaser/release/hold_sha stay UNDECLARED (5101e080):
+# their existing readers accept heterogeneous markers, including hold:false.
+# Declaring strings rejects a legal released car at completion and turns
+# these values into editable generic answers. The procedure names the doors;
+# the generic surface retains their metadata as read-only context.
 
 [[workflow.step]]
 title = "proven"
@@ -216,7 +242,19 @@ kind = "task"
 ready_when = "steps.review.done AND job.metadata.merged = \"true\""
 title_template = "Proven in prod"
 authority_role = "platform-admin"
-metadata_defaults = { procedure = """Observe the change working in PRODUCTION, on the deployed artifact — not on a local build, and not by restating that the gate was green.
+# EXECUTED BY EQUIPMENT: THE PROBE SHED (design ccfe87ff, question
+# first-executors, "record-verdict and the probe by equipment", decided
+# by David 2026-11-05; backlog 364b27a3). A claim clears only for the
+# `probe-shed` station's automaton, automation:ops-runner, which answers
+# run-car-probe with `boss prove --from-car --unattended`. Measured
+# 2026-11-05: 60 of the 60 newest closed cars and all 11 open cars
+# already proven record that runner as the completer, each from READY —
+# the dispatcher still nominates the step to a robot and nobody claims
+# it — so no live completion passes the claim door and nothing strands.
+# Held from the unattended drift publish until the station reads back
+# live: infra/platform/workflow-holds/ship-a-change.toml.
+executor = "equipment:probe-shed"
+metadata_defaults = { at = "e24e53d8-62f9-4014-961f-dea0e428a3bb", procedure = """Observe the change working in PRODUCTION, on the deployed artifact — not on a local build, and not by restating that the gate was green.
 
 RUN `boss prove <car> --probe '<command>' --expect '<string>' --verified '<prose>'`. The verb executes the probe itself, captures exit status and output verbatim into the required `proof` field, and REFUSES to record anything unless the probe exits zero and prints what was claimed. Do not fill `proof` by hand: a pasted result is a claim again, and the point is that a machine saw it.
 
@@ -298,17 +336,33 @@ required = false
 [[workflow.step]]
 title = "landed-review"
 kind = "task"
-# A declared review expectation, matching the current agent-run building
-# allowance. Readers consult each packet's pinned workflow, never infer
-# this bound for older versions from the active row.
-duration_hours = 2.0
+# A declared review expectation, MEASURED (backlog ad223688, run e7d004fb,
+# 2026-11-17): the 262 landed reviews completed in the 14 days before,
+# dated from each step's newest step.assigned event to its completion.
+# p50 0.48h, p90 12.73h, p95 31.09h; agent-codex (127) p50 2.54h p90
+# 5.82h, agent-claude-b (35) p50 3.05h p90 3.41h, agent-claude (100) p50
+# 0.05h p90 31.09h. The old 2.0 was the building allowance, and 103 of
+# the 262 ran past it — 64 of them ordinary Codex reviews. 7 and not the
+# p90's 13: the reviews form one continuous body up to 6.11h (232 of
+# 262) and then break to 7.37h, and past the break is a sparse tail (20
+# of its 30 rows held over a day) — the stalls this bound exists to
+# name. The p90 sits INSIDE that tail (rank 236 of 262), so a bound read
+# off it grows with the stalls it is meant to catch. Readers consult
+# each packet's pinned workflow, never infer this bound for older
+# versions from the active row.
+duration_hours = 7.0
 ready_when = "steps.review.done AND job.metadata.merged = \"true\" AND NOT (steps.review.metadata.release.review > \"\") AND NOT (job.metadata.unlanded = \"true\")"
 title_template = "Reviewed after landing"
 authority_role = "platform-admin"
+executor = "model:opus|sol"
 agent = { profile = "reviewer", model = "opus-5-5", budget_usd = 3, effort = "medium" }
-metadata_defaults = { procedure = """An independent review of a change that LANDED without one, because no rule held it: its diff touched nothing mutating_verb::judge holds and its item carried no trust_boundary mark (backlog bd331d38). Never the run that built the car.
+metadata_defaults = { at = "f675e19a-7c36-453f-bbac-e206aced63ab", procedure = """An independent review of a change that LANDED without one, because no rule held it: its diff touched nothing mutating_verb::judge holds and its item carried no trust_boundary mark (backlog bd331d38). Never the run that built the car.
 
 Read the change as it landed. The car's branch is gone once its train merged, so read its own commits: the head its gate vouched for is in the receipt on the `gate` step (`boss receipt <branch>` prints it); `git fetch origin <head>` then `git diff origin/main...<head>` (three dots: from the merge-base, the car's own base, since a squash merge never makes the head an ancestor of main), or the train's squash commit restricted to the car's files when the head is no longer fetchable. Review against what the car claimed (its scope summary and excludes, the item it answers) and the correctness protocol at the tier it touched.
+
+Check that every registry row the diff touched (a workflow, station or pool file under infra/platform/) moved to the station tree's words in the same car, as `boss brief` prints them under `paradigm` and infra/lint/rows-still-in-v1-words.sh counts them: a station row by its id, parent, allocation, capacity and machines, a workflow row by its owner station, a department read as a tier-1 station. An old key left beside the new one is a finding unless the car's excludes name the live reader that still reads it (backlog 53abeb8d).
+
+FOUR READS A GREEN DOES NOT MAKE, each paid for by a review on 2026-11-16; `findings` says what each found. (1) A MUTATING VERB: walk every exit after its first write, including an error, a signal and kill -9, and say what state each leaves and which door restores it (reviews cf45a112, 1c413d8d). (2) A WRITE ONTO A PACKET: is it bounded under the packet event budget (boss_jobs::packet_budget::BUDGET), and does a refused write still let the step complete (review 75bb4029)? (3) PROSE FOR THE PUBLIC: check every present-tense sentence against the code at the head (reviews 04f504da, 75ea1f87 and 21da8abe each found one false). (4) A TEST STUB of an external tool answers as the tool does for every flag the code passes (curl's -w status, -o, -D, its exit codes), or it turns a correct change red (gate 539ccf80, fixed 091c902c). The held review's fifth read, a conflict with the cars still on the dock, is not this one's: a landed car is main now, and each open car's own gate merges it.
 
 Record the verdict here: `boss step complete <car> --step landed-review --field verdict=clean|findings --field reviewed=<the sha you read> --field-file findings=<file>`. `findings` says what you read and why nothing is wrong, or each finding with its file, line, the input that fails and what a reader sees. A finding is NOT a revert and does not reopen the car: file each as its own backlog item and name the items in `findings`, so the defect count stays honest (scope's own rule). The car closes `merged` when this step and its proof are both done.""" }
 [[workflow.step.fields]]
@@ -482,3 +536,19 @@ required = true
 name = "completed_at"
 field_type = "date-time"
 required = false
+
+# ec6fc29a: an explicit independent judgment of attended browser evidence
+# is a different terminal, not a string pretending to be boss prove output.
+# Appended so an open older car may convert explicitly without rewriting its
+# completed steps. Publishing alone never repins an in-flight packet.
+[[workflow.step]]
+title = "attended-qualified"
+kind = "outcome"
+ready_when = "steps.review.done AND job.metadata.merged = \"true\" AND job.metadata.attended_qualified = \"true\""
+title_template = "Qualified by independent attended browser review"
+terminal = { outcome = "attended-qualified" }
+metadata_defaults = { outcome_kind = "completed", qualification_contract = "attended-browser-v1", completion_contract = "attended-browser-accept-v1", records_before_claim = ["attended_qualification"], procedure = "Only boss browser accept <car> --observation <packet> --accept-attended writes this terminal. It re-reads the published pinned protocol, immutable observation and independent qualification records, exact source/suite bindings and whole attachment originals. A raw client pass flag or terminal status is no qualification. The immutable attended_qualification record names both original events/digests and the assurance actually accepted. The existing proven step and boss prove execution semantics remain unchanged; closure may skip its unpaid status but preserves all its evidence. Old cars need an explicit recorded conversion after this protocol is published; never invent this terminal on a pinned older version." }
+[[workflow.step.fields]]
+name = "attended_qualification"
+field_type = "object"
+required = true

@@ -74,6 +74,15 @@ pub struct RebuildReport {
     /// was made and cannot say which, so nothing can show it carried —
     /// and no evidence is not a pass.
     pub sign_offs_unreproduced: u64,
+    /// `jobs.job.closed_over_bound` closes whose replayed row does not
+    /// hash to the `row_sha256` the live close recorded (backlog
+    /// b96df4f8). The delta is the only record of that row after the
+    /// close, so a mismatch says the replay did not reproduce it — most
+    /// likely a column an earlier event never carried exactly. Counted
+    /// and warned per close, never passed in silence, and not a stop: the
+    /// log cannot change, so failing here would make every later rebuild
+    /// impossible over one packet.
+    pub bounded_closes_unreproduced: u64,
 }
 
 /// The operator's one-line summary: EVERY counter, `name=value`.
@@ -92,13 +101,15 @@ impl std::fmt::Display for RebuildReport {
             steps_updated,
             stamps_voided,
             sign_offs_unreproduced,
+            bounded_closes_unreproduced,
         } = self;
         write!(
             f,
             "events_processed={events_processed} events_skipped={events_skipped} \
              jobs_inserted={jobs_inserted} jobs_updated={jobs_updated} \
              steps_inserted={steps_inserted} steps_updated={steps_updated} \
-             stamps_voided={stamps_voided} sign_offs_unreproduced={sign_offs_unreproduced}"
+             stamps_voided={stamps_voided} sign_offs_unreproduced={sign_offs_unreproduced} \
+             bounded_closes_unreproduced={bounded_closes_unreproduced}"
         )
     }
 }
@@ -181,15 +192,17 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
     // rebuild work even if the cascade is ever loosened.
     let conserved = std::sync::Mutex::new(std::collections::HashMap::new());
     let move_ledger = std::sync::Mutex::new(std::collections::HashMap::new());
+    let resource_ledger = std::sync::Mutex::new(std::collections::HashMap::new());
     let admission_observations = std::sync::Mutex::new(std::collections::HashMap::new());
     let conditional_pairs =
         std::sync::Mutex::new(crate::conditional_metadata::replay::Pairs::default());
     let stats = replay_projection_checked(
         pool,
         REBUILD_LOCK_KEY,
-        &["DELETE FROM yard_move_admission_observations", "DELETE FROM yard_move_corrections", "DELETE FROM station_claim_receipts", "DELETE FROM steps", "DELETE FROM jobs"],
-        "kind LIKE 'jobs.job.%' OR kind LIKE 'jobs.step.%' OR kind IN ('jobs.station.claimed', 'jobs.station.selection_evidence', 'jobs.metadata.conditionally_merged') OR kind LIKE 'jobs.yard.move.%'",
+        &["DELETE FROM yard_move_admission_observations", "DELETE FROM yard_move_corrections", "DELETE FROM station_claim_receipts", "DELETE FROM resource_stock_obligations", "DELETE FROM resource_identity_bindings", "DELETE FROM step_resource_allocations", "DELETE FROM step_resource_claims", "DELETE FROM steps", "DELETE FROM jobs"],
+        "kind LIKE 'jobs.job.%' OR kind LIKE 'jobs.step.%' OR kind IN ('jobs.pool.published', 'jobs.station.claimed', 'jobs.station.resource_refused', 'jobs.station.selection_evidence', 'jobs.metadata.conditionally_merged') OR kind LIKE 'jobs.yard.move.%'",
         async |_, events| {
+            *resource_ledger.lock().map_err(|_|"resource ledger unavailable")?=crate::flow_resources_replay::reconstruct(events)?;
             *admission_observations.lock().map_err(|_|"admission observation ledger unavailable")?=crate::move_admission::reconstruct(&events.iter().map(|e|boss_core::event::Event{id:e.event_id,timestamp:e.ts,source:"jobs".into(),kind:e.kind.clone(),payload:e.payload.clone()}).collect::<Vec<_>>())?.into_iter().collect::<std::collections::HashMap<_,_>>();
             *conditional_pairs.lock().map_err(|_|"conditional pair index unavailable")?=
                 crate::conditional_metadata::replay::Pairs::read(events)?;
@@ -204,6 +217,11 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
         },
         async |conn, ev| {
             match ev.kind.as_str() {
+                crate::flow_resources::RESERVED | crate::flow_resources::RELEASED | crate::resource_leases::IDENTITY_BOUND | crate::resource_leases::LEASE_EXPIRED | crate::resource_leases::STOCK_RETURNED => {
+                    let entry=resource_ledger.lock().map_err(|_|"resource ledger unavailable")?.get(&ev.event_id).cloned().ok_or("resource fact was not prevalidated")?;
+                    crate::flow_resources_replay::restore_flow_ledger_in_tx(&mut *conn,&entry).await?;
+                    Ok(Applied::Yes)
+                }
                 crate::move_admission::EVENT_KIND=>{
                     let observation=admission_observations.lock().map_err(|_|"admission observation ledger unavailable")?.get(&ev.event_id).cloned().ok_or("admission observation receipt missing")?;
                     sqlx::query("INSERT INTO yard_move_admission_observations(id,original_seq,diagnosis_id,body,event_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT(id) DO NOTHING")
@@ -218,7 +236,7 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
                     Ok(Applied::Yes)
                 }
 
-                crate::events::STATION_CLAIMED => {
+                crate::events::STATION_CLAIMED | crate::events::STATION_RESOURCE_REFUSED => {
                     let receipt_json = if ev.payload.get("receipt_manifest").is_some() {
                         conserved.lock().map_err(|_| "selection evidence unavailable")?.get(&ev.event_id).cloned()
                     } else { ev.payload.get("receipt_json").and_then(serde_json::Value::as_str).map(str::to_owned) }
@@ -282,6 +300,15 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
                         .execute(&mut *conn).await.map_err(|e| e.to_string())?;
                     Ok(Applied::Yes)
                 }
+                // A close too large to carry its row, carried as a delta
+                // and the row's digest (backlog b96df4f8).
+                crate::events::JOB_CLOSED_OVER_BOUND => {
+                    if !apply_bounded_close(&mut *conn, &ev).await? {
+                        report.bounded_closes_unreproduced += 1;
+                    }
+                    report.jobs_updated += 1;
+                    Ok(Applied::Yes)
+                }
                 "jobs.job.created" | "jobs.job.updated" => {
                     let job: Job = match serde_json::from_value(ev.payload.clone()) {
                         Ok(j) => j,
@@ -305,7 +332,7 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
                         let before=crate::postgres::get_job_on(&mut *conn,&job.id).await
                             .map_err(|error|error.to_string())?.ok_or("conditional state lacks its preceding Job")?;
                         let schema:Option<serde_json::Value>=if receipt.command.guarded_keys.is_empty() && receipt.command.immutable_keys.is_empty(){None}else{
-                            sqlx::query_scalar("SELECT metadata_schema FROM workflows WHERE kind=$1 AND version=$2 AND status <> 'draft'")
+                            sqlx::query_scalar("SELECT metadata_schema FROM workflows WHERE kind=$1 AND version=$2 AND status IN ('active','retired')")
                                 .bind(&before.kind).bind(before.workflow_version).fetch_optional(&mut *conn).await.map_err(|error|error.to_string())?
                         };
                         conditional_pairs.lock().map_err(|_|"conditional pair index unavailable")?
@@ -414,6 +441,9 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
                 // (design 4105b020); it fell to the unknown-kind arm and
                 // warned once per correction on every replay.
                 | "jobs.step.corrected"
+                // A classification's row rides its sibling JOB_UPDATED
+                // the same way (design e72dc7c9).
+                | "jobs.job.input_classified"
                 // A re-pin's rows ride its sibling JOB_UPDATED /
                 // STEP_UPDATED / STEP_CREATED (design 7cf202a9).
                 | "jobs.job.repinned" => Ok(Applied::Skipped),
@@ -441,6 +471,67 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
     report.events_processed = stats.processed;
     report.events_skipped = stats.skipped;
     Ok(report)
+}
+
+/// Replay a close staged as [`crate::packet_budget::BoundedClose`]
+/// (backlog b96df4f8): the close's one UPDATE — status, `closed_on`, its
+/// owned keys merged over the metadata as the row stands — applied to the
+/// row the earlier state events built, then the result checked against
+/// the digest the live close recorded. Answers whether the replayed row
+/// hashes to that digest.
+///
+/// A payload that does not parse, or a close of a row no earlier event
+/// built, is an `Err`: nothing can be applied, and the rebuild's
+/// transaction rolls back rather than keep a row without its close. A
+/// DIGEST that disagrees is `Ok(false)` — the close is applied, warned
+/// by name and counted in [`RebuildReport::bounded_closes_unreproduced`],
+/// the way an unreproduced sign-off is: the log cannot change, so a stop
+/// here would end every later rebuild over one packet.
+async fn apply_bounded_close(
+    conn: &mut sqlx::PgConnection,
+    ev: &boss_events::replay::ReplayEvent,
+) -> Result<bool, String> {
+    let close: crate::packet_budget::BoundedClose = serde_json::from_value(ev.payload.clone())
+        .map_err(|e| format!("a bounded close whose payload does not parse: {e}"))?;
+    let updated = sqlx::query(
+        "UPDATE jobs SET status = $2, closed_on = $3, \
+         metadata = (CASE WHEN jsonb_typeof(metadata) = 'object' \
+                          THEN metadata ELSE '{}'::jsonb END) || $4::jsonb, \
+         updated_at = $5 \
+         WHERE id = $1",
+    )
+    .bind(*close.id.inner().as_uuid())
+    .bind(crate::postgres::job_status_str(close.status))
+    .bind(close.closed_on)
+    .bind(serde_json::Value::Object(close.merged.clone()))
+    .bind(ev.ts)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?;
+    if updated.rows_affected() != 1 {
+        return Err(format!(
+            "the bounded close of job {} names a row no earlier state event built",
+            close.id
+        ));
+    }
+    let job = crate::postgres::get_job_on(&mut *conn, &close.id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("job {} vanished under its bounded close", close.id))?;
+    let (sha, bytes) = crate::packet_budget::row_digest(&job);
+    let reproduced = sha == close.row_sha256 && bytes == close.row_bytes;
+    if !reproduced {
+        warn!(
+            event_id = ev.audit_id,
+            job_id = %close.id,
+            recorded_sha256 = %close.row_sha256,
+            recorded_bytes = close.row_bytes,
+            replayed_sha256 = %sha,
+            replayed_bytes = bytes,
+            "a bounded close whose replayed row does not hash to the row the live close left"
+        );
+    }
+    Ok(reproduced)
 }
 
 /// Upsert a Job row, stamping `created_at` (only on insert) and
@@ -762,11 +853,13 @@ mod tests {
             steps_updated: 6,
             stamps_voided: 7,
             sign_offs_unreproduced: 8,
+            bounded_closes_unreproduced: 9,
         };
         assert_eq!(
             report.to_string(),
             "events_processed=1 events_skipped=2 jobs_inserted=3 jobs_updated=4 \
-             steps_inserted=5 steps_updated=6 stamps_voided=7 sign_offs_unreproduced=8"
+             steps_inserted=5 steps_updated=6 stamps_voided=7 sign_offs_unreproduced=8 \
+             bounded_closes_unreproduced=9"
         );
     }
 

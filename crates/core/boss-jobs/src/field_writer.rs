@@ -69,7 +69,9 @@ use serde_json::Value;
 pub struct CredentialedCaller {
     /// The writer name the credential satisfies (`runner:ops`).
     pub principal: String,
-    /// The actor the credential belongs to, for the record.
+    /// The actor the request acts as, for the record: the credential's
+    /// account, or a pass of that account on the credential's own host
+    /// (`runner_credential::acting_id`, backlog d16c2dae).
     pub actor_id: String,
     /// The host the credential is bound to, when it is bound to one.
     pub host: Option<String>,

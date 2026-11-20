@@ -1,5 +1,8 @@
 import { expect, test } from 'bun:test';
 
+import { scaled } from '../src/dev-load';
+import { runWithin } from './run-within';
+
 const WEB_ROOT = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
 
 // The foreign server answers a shell and names its tree. A responsive
@@ -28,18 +31,11 @@ async function assertOwnTree(mode: 'local' | 'forge-ci'): Promise<void> {
     BOSS_MOCKED_TEST_DIR: './tests/ownership-pin',
     BOSS_EXPECTED_TREE: WEB_ROOT,
   };
-  async function run(command: string[]): Promise<{ code: number; output: string }> {
-    const process = Bun.spawn(command, {
-      cwd: WEB_ROOT, env, stdout: 'pipe', stderr: 'pipe', stdin: 'ignore',
-    });
-    const [out, err, code] = await Promise.all([
-      new Response(process.stdout).text(), new Response(process.stderr).text(), process.exited,
-    ]);
-    return { code, output: `${out}\n${err}` };
-  }
+  const run = (leg: string, command: string[]) =>
+    runWithin(`${mode} ${leg}`, command, { cwd: WEB_ROOT, env, budgetMs: LEG_BUDGET_MS });
   try {
-    const direct = await run(['bun', 'x', 'playwright', 'test', '-c', 'playwright.mocked.config.ts']);
-    const safe = await run(['bun', 'tests/run-mocked.ts']);
+    const direct = await run('direct Playwright', ['bun', 'x', 'playwright', 'test', '-c', 'playwright.mocked.config.ts']);
+    const safe = await run('mocked runner', ['bun', 'tests/run-mocked.ts']);
     expect(safe.code).toBe(0);
     expect(safe.output).toContain(mode === 'forge-ci'
       ? `CI: :${foreign.port} is occupied, starting our own on a free port`
@@ -57,7 +53,18 @@ async function assertOwnTree(mode: 'local' | 'forge-ci'): Promise<void> {
   }
 }
 
+// Each leg's budget, and the test's: two legs and a margin, so a leg that
+// runs out fails as that leg, with its output, and never as the test
+// (backlog 3f421243). Train gate c773d182 killed the forge-ci case at a
+// flat 300 s with nothing to read, while the local case took 29.8 s; a
+// leg takes about 3 s on a quiet worker, and the whole file 12-50 s in
+// the gate (web_timings of the 59 gate-runs before it). Stated quiet and
+// scaled like every web budget (src/dev-load.ts): 35 s a leg here,
+// 140 s in the gate, where the test keeps the 300 s it had.
+const LEG_BUDGET_MS = scaled(35_000);
+const TEST_BUDGET_MS = 2 * LEG_BUDGET_MS + scaled(5_000);
+
 for (const mode of ['local', 'forge-ci'] as const) {
   test(`direct Playwright refuses a foreign server; ${mode} runner tests its own tree`,
-    () => assertOwnTree(mode), 300_000);
+    () => assertOwnTree(mode), TEST_BUDGET_MS);
 }

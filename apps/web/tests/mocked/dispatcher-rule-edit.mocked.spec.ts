@@ -1,5 +1,5 @@
 import { isPageWrite } from './_smokeMocks';
-// /it/registry/rules/:ruleName — the rule editor's four writes, pinned
+// /engineering/registry/rules/:ruleName — the rule editor's four writes, pinned
 // (backlog 91e42a8b, page-audit bd5018e1 gap 5), with the gaps that same
 // audit filed against them.
 //
@@ -47,7 +47,7 @@ const SCHEDULE_RULE = 'cadence-silence-sweep-daily';
 const TENANT_RULE = 'complete-site-live-on-converge-closed';
 const DEAD_LETTER_JOB = 'a1b2c3d4-0000-4000-8000-000000000002';
 
-const editor = (rule: string) => `/it/registry/rules/${rule}`;
+const editor = (rule: string) => `/engineering/registry/rules/${rule}`;
 const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const RULES = /\/api\/dispatcher\/rules$/;
@@ -203,7 +203,7 @@ async function idle(page: Page): Promise<void> {
   await expect(page.getByText(/Saving…|Validating…|Publishing…|Retiring…/)).toHaveCount(0);
 }
 
-test.describe('/it/registry/rules/:ruleName — Validate', () => {
+test.describe('/engineering/registry/rules/:ruleName — Validate', () => {
   test('ok paints Valid, and the body is the spec with no source', async ({ page }) => {
     const h = await install(page, { rule: TENANT_RULE, versions: [TENANT_V1], validate: { status: 200, body: { ok: true, error: null } } });
     await open(page, TENANT_RULE);
@@ -215,7 +215,7 @@ test.describe('/it/registry/rules/:ruleName — Validate', () => {
       {
         method: 'POST',
         path: '/api/dispatcher/rules/_validate',
-        body: { name: TENANT_RULE, on_event: 'jobs.job.closed', when: 'kind = "converge"', do: [{ handler: 'jobs.complete-step', args: {} }], delay: null },
+        body: { name: TENANT_RULE, on_event: 'jobs.job.closed', when: 'kind = "converge"', do: [{ handler: 'jobs.complete-step', args: {} }] },
       },
     ]);
   });
@@ -230,7 +230,7 @@ test.describe('/it/registry/rules/:ruleName — Validate', () => {
   });
 });
 
-test.describe('/it/registry/rules/:ruleName — Save draft', () => {
+test.describe('/engineering/registry/rules/:ruleName — Save draft', () => {
   test('201 posts the product rule with no source, and the versions are read again', async ({ page }) => {
     const h = await install(page, {
       rule: EVENT_RULE,
@@ -249,7 +249,7 @@ test.describe('/it/registry/rules/:ruleName — Save draft', () => {
     expect(h.sent[0]!.path).toBe('/api/dispatcher/rules');
     expect(h.sent[0]!.body).toEqual({
       name: EVENT_RULE, on_event: 'step.done.gate-verdict', when: 'verdict = "green"',
-      do: [{ handler: 'jobs.auto-park', args: {} }], delay: null,
+      do: [{ handler: 'jobs.auto-park', args: {} }],
     });
     await expect(button(page, 'Publish draft')).toBeEnabled();
     await expect(actionError(page)).toHaveCount(0);
@@ -299,7 +299,7 @@ test.describe('/it/registry/rules/:ruleName — Save draft', () => {
 
     const expected = {
       name: SCHEDULE_RULE, schedule: { cadence: 'daily', anchor_date: '2026-09-01' }, when: null,
-      do: [{ handler: 'cadence.silence-sweep', args: {} }], delay: null,
+      do: [{ handler: 'cadence.silence-sweep', args: {} }],
     };
     expect(h.sent.map((s) => [s.path, s.body])).toEqual([
       ['/api/dispatcher/rules/_validate', expected],
@@ -332,6 +332,39 @@ test.describe('/it/registry/rules/:ruleName — Save draft', () => {
     expect(h.sent).toEqual([]);
   });
 
+  // backlog 677e332f: authoring::validate refuses every rule that declares
+  // a delay (car 4c706c5d), so the editor offers no Delay input; a row
+  // that stored one shows it read-only with the reason, and the draft
+  // built from it carries no delay key.
+  test('no Delay input; a stored delay is shown read-only and is not sent', async ({ page }) => {
+    const delayed = { ...EVENT_V2, delay: '7d' };
+    const h = await install(page, {
+      rule: EVENT_RULE,
+      versions: [EVENT_V1, delayed],
+      validate: { status: 200, body: { ok: true, error: null } },
+      draft: { status: 201, body: { ...delayed, version: 3, status: 'draft', delay: null } },
+    });
+    await open(page, EVENT_RULE);
+
+    await expect(page.getByLabel('Delay')).toHaveCount(0);
+    await expect(page.locator('.catalog .stored-delay')).toContainText('7d');
+    await expect(page.locator('.catalog .stored-delay')).toContainText('not supported yet');
+
+    await button(page, 'Validate').click();
+    await expect(page.getByText('✓ Valid')).toHaveCount(1);
+    await button(page, 'Save draft').click();
+    await idle(page);
+    expect(h.sent.map((s) => s.path)).toEqual(['/api/dispatcher/rules/_validate', '/api/dispatcher/rules']);
+    for (const s of h.sent) expect(s.body).not.toHaveProperty('delay');
+  });
+
+  test('a rule with no stored delay shows no delay line at all', async ({ page }) => {
+    await install(page, { rule: EVENT_RULE, versions: [EVENT_V1, EVENT_V2] });
+    await open(page, EVENT_RULE);
+    await expect(page.getByLabel('Delay')).toHaveCount(0);
+    await expect(page.locator('.catalog .stored-delay')).toHaveCount(0);
+  });
+
   // GAP 2 (backlog 636b9868): the draft restates the live row's source.
   test('a tenant rule’s draft carries its tenant source, and the banner names the export', async ({ page }) => {
     const draft = { ...TENANT_V1, version: 2, status: 'draft', published_by: null };
@@ -360,7 +393,7 @@ test.describe('/it/registry/rules/:ruleName — Save draft', () => {
   });
 });
 
-test.describe('/it/registry/rules/:ruleName — Publish draft', () => {
+test.describe('/engineering/registry/rules/:ruleName — Publish draft', () => {
   test('with no draft the button is disabled and says why', async ({ page }) => {
     await install(page, { rule: EVENT_RULE, versions: [EVENT_V1, EVENT_V2] });
     await open(page, EVENT_RULE);
@@ -399,7 +432,7 @@ test.describe('/it/registry/rules/:ruleName — Publish draft', () => {
   });
 });
 
-test.describe('/it/registry/rules/:ruleName — Retire', () => {
+test.describe('/engineering/registry/rules/:ruleName — Retire', () => {
   test('cancelling the confirm sends nothing', async ({ page }) => {
     const h = await install(page, { rule: EVENT_RULE, versions: [EVENT_V1, EVENT_V2] });
     await open(page, EVENT_RULE);
@@ -436,7 +469,7 @@ test.describe('/it/registry/rules/:ruleName — Retire', () => {
 
 // GAP 3 (backlog 0034d5ef): what the list knows about a rule, on the
 // page where Retire is decided.
-test.describe('/it/registry/rules/:ruleName — the summary', () => {
+test.describe('/engineering/registry/rules/:ruleName — the summary', () => {
   const lines = async (page: Page) => {
     const block = page.locator('.catalog .rule-summary');
     const dt = (await block.locator('dt').allTextContents()).map((s) => s.trim());
@@ -499,7 +532,7 @@ test.describe('/it/registry/rules/:ruleName — the summary', () => {
 });
 
 // GAP 4 (backlog 9550ac95) and GAP 7 (backlog 3a42c67b).
-test.describe('/it/registry/rules/:ruleName — the history and the form', () => {
+test.describe('/engineering/registry/rules/:ruleName — the history and the form', () => {
   test('the history names source and authorship, null as unrecorded, and a row expands to its content', async ({ page }) => {
     await install(page, { rule: EVENT_RULE, versions: [EVENT_V1, EVENT_V2] });
     await open(page, EVENT_RULE);

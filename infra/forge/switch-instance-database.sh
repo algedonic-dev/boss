@@ -278,23 +278,16 @@ esac
 # The forge checkout is a user's and the ops-runner is root; git refuses
 # to READ across that boundary ("dubious ownership"), so every git call
 # drops to the directory's owner, read off the directory — never
-# hardcoded (delete-orphan-object.sh's as_owner, ops-request c9877f75).
+# hardcoded (infra/lib/git-owner.sh, ops-request c9877f75; one definition
+# since backlog 5ff118da).
 case "$TREE" in
     *[[:space:]\'\"]*) refuse "the tree path \`$TREE\` contains whitespace or a quote; name one without" ;;
 esac
 [ -d "$TREE" ] || refuse "the tree $TREE does not exist, so the flip cannot be read"
-OWNER="$(stat -c %U "$TREE" 2>/dev/null)"
-if [ -z "$OWNER" ] || [ "$OWNER" = "UNKNOWN" ] || ! id -u "$OWNER" >/dev/null 2>&1; then
-    refuse "cannot resolve the owner of $TREE (stat says '${OWNER:-}'), so there is no account to read its git as"
-fi
-OWNER_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"
-as_owner() { # <command string>
-    if [ "$(id -un)" = "$OWNER" ]; then
-        bash -c "$1"
-    else
-        runuser -u "$OWNER" -- env HOME="${OWNER_HOME:-/}" PATH="$PATH" bash -c "$1"
-    fi
-}
+# shellcheck source=infra/lib/git-owner.sh
+. "$SELF_DIR/../lib/git-owner.sh"
+git_owner_of "$TREE" \
+    || refuse "cannot resolve the owner of $TREE (stat says '${OWNER:-}'), so there is no account to read its git as"
 if ! MAIN_SHA=$(as_owner "git -C '$TREE' rev-parse --short '$MAIN_REF'" 2> "$TMP/git.err"); then
     say "REFUSED — cannot read $MAIN_REF in $TREE (as $OWNER); git said:"
     sed 's/^/    /' "$TMP/git.err" >&2

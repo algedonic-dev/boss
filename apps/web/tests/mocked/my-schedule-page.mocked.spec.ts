@@ -1,5 +1,5 @@
 import { isPageWrite } from './_smokeMocks';
-// /ux/calendar/me — "My schedule", every control and render state
+// /me/calendar — "My schedule", every control and render state
 // pinned as the page behaves TODAY (page audit 0e4fef17, step `test`).
 //
 // Before this spec the route was reached by the two crawls only:
@@ -36,8 +36,9 @@ import {
 } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
 import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
+import { pageAt } from '../fixtures/station-tree';
 
-const PATH = '/ux/calendar/me';
+const PATH = '/me/calendar';
 const EMP_ID = 'emp-001'; // installSmokeMocks' roster persona
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
@@ -109,7 +110,7 @@ function readWindow(url: URL | undefined): Record<string, string | null> {
 const body = (page: Page) => page.locator('.catalog');
 const button = (page: Page, name: string) => page.getByRole('button', { name, exact: true });
 
-test.describe('/ux/calendar/me — reservation step navigation', () => {
+test.describe('/me/calendar — reservation step navigation', () => {
   test('one slow step lookup does not hold a resolved destination', async ({ page }) => {
     let release: () => void = () => {};
     const held = new Promise<void>((resolve) => { release = resolve; });
@@ -147,7 +148,7 @@ test.describe('/ux/calendar/me — reservation step navigation', () => {
     await mountPage(page, PATH, { titleMatch: /week of Mon, Sep 21$/ });
     const link = page.locator('.week-cell-ref a');
     await expect(link).toHaveText(STEP_ID);
-    await expect(link).toHaveAttribute('href', `/jobs/${JOB_ID}/steps/${STEP_ID}?from=%2Fux%2Fcalendar%2Fme&from_label=My+schedule`);
+    await expect(link).toHaveAttribute('href', `/jobs/${JOB_ID}/steps/${STEP_ID}?from=%2Fme%2Fcalendar&from_label=My+schedule`);
     await link.click();
     await expect(page).toHaveURL(new RegExp(`/jobs/${JOB_ID}/steps/${STEP_ID}\\?`));
     expect(seen.writes).toEqual([]);
@@ -200,7 +201,7 @@ test.describe('/ux/calendar/me — reservation step navigation', () => {
   });
 });
 
-test.describe('/ux/calendar/me — State A, the calendar module off (the live instance)', () => {
+test.describe('/me/calendar — State A, the calendar module off (the live instance)', () => {
   // Gap 1 (eff0c5e5, fixed 2026-09-24): this spec pinned ModuleDisabled
   // naming "Release calendar" here, because the route lit the
   // `calendar` row and so answered to its module. It lights its own
@@ -218,7 +219,7 @@ test.describe('/ux/calendar/me — State A, the calendar module off (the live in
       await page.route(RESERVATIONS, (r) => json(r, []));
       await mountPage(page, PATH, { titleMatch: new RegExp(`^${EMP_ID} — week of Mon, Sep 21$`) });
 
-      expect(ROUTE_CATALOG.schedule.path).toBe(PATH);
+      expect(pageAt('schedule')).toBe(PATH);
       expect(ROUTE_CATALOG.schedule.module).toBeUndefined();
       await expect(page.locator('.module-disabled')).toHaveCount(0);
       await expect(page.locator('.week-col-empty')).toHaveCount(7);
@@ -238,7 +239,7 @@ test.describe('/ux/calendar/me — State A, the calendar module off (the live in
   }
 });
 
-test.describe('/ux/calendar/me — State B, the module on: identity', () => {
+test.describe('/me/calendar — State B, the module on: identity', () => {
   test('no session: "Sign in to see your week.", the three buttons disabled, no read', async ({ page }) => {
     await recordPageRequests(page);
     await page.clock.setFixedTime(NOW);
@@ -323,7 +324,7 @@ test.describe('/ux/calendar/me — State B, the module on: identity', () => {
   });
 });
 
-test.describe('/ux/calendar/me — State B, the module on: the read and the week', () => {
+test.describe('/me/calendar — State B, the module on: the read and the week', () => {
   test('mount reads this Mon–Sun once, for the session employee, and an empty answer paints seven dashes', async ({ page }) => {
     const seen = watch(page);
     await installEmployeeSession(page);
@@ -434,7 +435,7 @@ test.describe('/ux/calendar/me — State B, the module on: the read and the week
   });
 });
 
-test.describe('/ux/calendar/me — State B: a failed read is said, never drawn as an empty week', () => {
+test.describe('/me/calendar — State B: a failed read is said, never drawn as an empty week', () => {
   // Gap 8(a) (7c196817): an unavailable service needs retry advice,
   // not an assumed configuration cause or an internal configuration key.
   for (const status of [503, 502]) {

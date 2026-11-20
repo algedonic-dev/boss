@@ -1,13 +1,12 @@
 //! Station read surfaces + the claim-CAS capability gate
-//! (docs/design/stations.md, Q1–Q4 ratified).
+//! (docs/design/station-tree.md; Q1–Q4 ratified, in docs/architecture-decisions.md).
 //!
 //! - `GET /api/stations` lists the active registry rows; a caller
 //!   whose job-read scope is None is REFUSED (403) on every station
 //!   read, never answered an empty collection (backlog 8dcd28ce).
 //! - `GET /api/stations/{name}/queue` evaluates the predicate over
 //!   the caller's policy-scoped open Jobs and orders by the
-//!   discipline; the envelope names the discipline and carries the
-//!   advisory `over_limit`.
+//!   discipline; the envelope names the discipline.
 //! - `POST .../claim?station=<name>` enforces the station's
 //!   capability (Class-registry role vocabulary) and membership
 //!   BEFORE the CAS; a claim without a station keeps today's
@@ -75,7 +74,7 @@ fn dock_station() -> StationSpec {
     let mut s = StationSpec::draft(
         "test-dock",
         "Test dock",
-        StationKind::Batch,
+        StationKind::Group,
         StationPredicate {
             kind: Some("car-kind".into()),
             metadata_present: vec!["branch".into()],
@@ -93,7 +92,6 @@ fn dock_station() -> StationSpec {
         chrono::Utc::now(),
     );
     s.status = boss_jobs::registry::WorkflowStatus::Active;
-    s.wip_limit = Some(2);
     s
 }
 
@@ -170,12 +168,55 @@ fn app_with_policy_and_agents(
     agents: Option<Arc<dyn boss_jobs::agents::AgentsRegistry>>,
     policy_override: Option<Arc<dyn PolicyClient>>,
 ) -> (axum::Router, Arc<InMemoryJobs>) {
+    let tree_owner = workflow.metadata.get("owner").is_some();
     let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds.seed(workflow).unwrap();
     let stations = Arc::new(InMemoryStations::new());
     stations.seed(dock_station()).unwrap();
     stations.seed(gated_station()).unwrap();
-    stations.seed(watchlist_station()).unwrap();
+    if tree_owner {
+        // The live rows stand in the tree: my-watchlist and
+        // design-decided both carry an id and a terminal window
+        // (infra/platform/stations/), which is the shape that paged
+        // every packet ever filed (backlog d650c8e6).
+        let mut watchlist = watchlist_station();
+        watchlist.id = Some("4feca45a-de46-4649-8569-f5a7262b8017".into());
+        watchlist.parent = Some("4c5ddf6c-b8ed-4776-98d9-2f99553317c5".into());
+        stations.seed(watchlist).unwrap();
+        let mut decided = watchlist_station();
+        decided.name = "decided".into();
+        decided.kind = StationKind::Group;
+        decided.id = Some("ebbae18b-5bee-468e-8be7-53aa54a91e87".into());
+        decided.parent = Some("4c5ddf6c-b8ed-4776-98d9-2f99553317c5".into());
+        decided.terminal_window_days = Some(7);
+        decided.predicate = StationPredicate {
+            kind: Some("user-feedback".into()),
+            ..Default::default()
+        };
+        stations.seed(decided).unwrap();
+    } else {
+        stations.seed(watchlist_station()).unwrap();
+    }
+    if tree_owner {
+        let mut engineering = dock_station();
+        engineering.name = "engineering".into();
+        engineering.id = Some("4c5ddf6c-b8ed-4776-98d9-2f99553317c5".into());
+        engineering.parent = None;
+        engineering.predicate = StationPredicate {
+            tags_any: vec!["station:engineering".into()],
+            ..Default::default()
+        };
+        stations.seed(engineering).unwrap();
+        let mut gates = dock_station();
+        gates.name = "gates".into();
+        gates.id = Some("a426acd5-4c77-4ec9-9686-c96cd59b53d7".into());
+        gates.parent = Some("4c5ddf6c-b8ed-4776-98d9-2f99553317c5".into());
+        gates.predicate = StationPredicate {
+            tags_any: vec!["station:gates".into()],
+            ..Default::default()
+        };
+        stations.seed(gates).unwrap();
+    }
     let jobs = Arc::new(InMemoryJobs::for_selection_fixture());
     let policy: Arc<dyn PolicyClient> = policy_override.unwrap_or_else(|| {
         Arc::new(
@@ -295,12 +336,12 @@ async fn list_stations_returns_active_rows() {
         "name-ordered"
     );
     // The rows carry the queue metadata a lens needs.
-    assert_eq!(v["data"][2]["kind"], "batch");
+    assert_eq!(v["data"][2]["kind"], "group");
     assert_eq!(
         v["data"][2]["discipline"],
         serde_json::json!(["priority", "age"])
     );
-    assert_eq!(v["data"][2]["wip_limit"], 2);
+    assert!(v["data"][2].get("wip_limit").is_none());
     // The per-actor row is a registry row like any other — the
     // placeholder is visible in the listing, unbound.
     assert_eq!(v["data"][1]["kind"], "actor");
@@ -339,28 +380,36 @@ async fn a_denied_caller_is_refused_by_every_station_read() {
     }
 }
 
+/// The default flow basis counts the step stamps (design 7b8ed079, car
+/// 1): every station answers a count, never the replay's unknown span,
+/// and the step-events cube stays a separate, named unit.
 #[tokio::test]
-async fn membership_flow_is_explicit_about_missing_original_history_and_keeps_step_basis_separate()
-{
-    let (app, _) = app();
+async fn the_default_flow_is_counted_over_the_steps_and_keeps_step_basis_separate() {
+    let (app, _jobs) = app();
     let (status, value) = get_json(&app, "/api/stations/flow", "emp-ceo", "ceo").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(value["basis"], "packet-membership-v1");
+    assert_eq!(value["basis"], "step-window-v1");
+    let rows = value["data"].as_array().unwrap();
+    assert!(!rows.is_empty(), "{value}");
     assert!(
-        value["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|r| r["arrived"].is_null()
-                && r["departed"].is_null()
-                && r["unknown"].as_array().is_some_and(|u| !u.is_empty()))
+        rows.iter().all(|r| r["basis"] == "step-window-v1"
+            && r["arrived"].is_u64()
+            && r["departed"].is_u64()
+            && r["served"] == r["departed"]
+            && r.get("unknown").is_none()),
+        "{value}"
     );
-    assert!(
-        value["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|r| r["covered"] == serde_json::json!([]))
+    let (status, _) = get_json(
+        &app,
+        "/api/stations/flow?basis=packet-membership-v1",
+        "emp-ceo",
+        "ceo",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the replay basis is retired"
     );
     let (status, steps) = get_json(
         &app,
@@ -424,11 +473,10 @@ async fn legacy_distinct_step_cube_cannot_be_a_global_aggregate_for_a_narrow_rea
 }
 
 #[tokio::test]
-async fn queue_is_evaluated_ordered_and_advisory_flagged() {
+async fn queue_is_evaluated_ordered_without_retired_advisories() {
     let (app, _jobs) = app();
     // Three parked cars + one boarded (not a member): the queue
-    // orders by priority then age, reports its discipline, and flags
-    // the advisory wip_limit breach (limit 2, 3 members).
+    // orders by priority then age and reports its discipline.
     let standard_old = post_car(&app, "feat/a", "standard", "2026-08-01", false).await;
     let urgent_new = post_car(&app, "feat/b", "urgent", "2026-08-10", false).await;
     let urgent_old = post_car(&app, "feat/c", "urgent", "2026-08-03", false).await;
@@ -454,8 +502,152 @@ async fn queue_is_evaluated_ordered_and_advisory_flagged() {
         ],
         "priority first, then age"
     );
-    assert_eq!(v["wip_limit"], 2);
-    assert_eq!(v["over_limit"], true, "advisory: reported, nothing dropped");
+    assert!(v.get("wip_limit").is_none());
+    assert!(v.get("over_limit").is_none());
+}
+
+#[tokio::test]
+async fn a_tree_station_lists_packets_at_its_steps_without_a_legacy_tag() {
+    let mut workflow = car_kind();
+    workflow.metadata = serde_json::json!({"owner": "4c5ddf6c-b8ed-4776-98d9-2f99553317c5"});
+    let (app, _) = app_with_workflow(workflow);
+    let id = post_car(&app, "feat/at-build", "standard", "2026-08-01", false).await;
+    let (status, queue) = get_json(&app, "/api/stations/engineering/queue", "emp-ceo", "ceo").await;
+    assert_eq!(status, StatusCode::OK, "{queue}");
+    assert_eq!(
+        queue["total"], 1,
+        "a ready step of an owned protocol stands at its station: {queue}"
+    );
+    assert_eq!(queue["data"][0]["id"], id);
+}
+
+#[tokio::test]
+async fn a_tree_queue_includes_descendants_and_respects_explicit_addresses() {
+    for (at, expected) in [
+        ("a426acd5-4c77-4ec9-9686-c96cd59b53d7", 1),
+        ("another-station", 0),
+    ] {
+        let mut workflow = car_kind();
+        workflow.metadata = serde_json::json!({"owner": "4c5ddf6c-b8ed-4776-98d9-2f99553317c5"});
+        workflow.steps[0].metadata_defaults = serde_json::json!({"at": at});
+        let (app, _) = app_with_workflow(workflow);
+        post_car(&app, "feat/explicit", "standard", "2026-08-01", false).await;
+        let (status, queue) =
+            get_json(&app, "/api/stations/engineering/queue", "emp-ceo", "ceo").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(queue["total"], expected, "{at}: {queue}");
+        let (status, _) =
+            get_json(&app, "/api/stations/engineering/queue", "nobody", "denied").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+}
+
+/// A station lets you claim what its own queue lists (backlog
+/// 1e7f5372). The queue counts a packet whose current step is
+/// ADDRESSED in the station's subtree as well as one its predicate
+/// matches; the claim door judged `?station=` by the predicate alone,
+/// so it refused "packet is not at this station" for a packet the same
+/// station had just listed — and the root, whose predicate matches
+/// nothing, refused every claim that named it. Measured by builder run
+/// 4d5a0c24 (design 6e42c6de), and the reason `dispatch --next` stopped
+/// sending `?station=` at all. Both doors now ask one function, so each
+/// case below is read through both: listed exactly when claimable.
+#[tokio::test]
+async fn a_station_admits_a_claim_on_exactly_what_its_queue_lists() {
+    const ENGINEERING: &str = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5";
+    const GATES: &str = "a426acd5-4c77-4ec9-9686-c96cd59b53d7";
+    for (station, at, member) in [
+        // The root's predicate matches nothing here (no tag); the step
+        // is addressed to its child, so it stands in the root's queue.
+        ("engineering", GATES, true),
+        // The child's own address.
+        ("gates", GATES, true),
+        // Addressed to the parent: not in the child's subtree, and the
+        // child's predicate does not match it either.
+        ("gates", ENGINEERING, false),
+        // Addressed outside the tree: neither station holds it.
+        ("engineering", "another-station", false),
+    ] {
+        let mut workflow = car_kind();
+        workflow.metadata = serde_json::json!({ "owner": ENGINEERING });
+        workflow.steps[0].metadata_defaults = serde_json::json!({ "at": at });
+        let (app, _) = app_with_workflow(workflow);
+        let job_id = post_car(&app, "feat/addressed", "standard", "2026-08-01", false).await;
+        let step_id = first_step_id(&app, &job_id).await;
+
+        let (status, queue) = get_json(
+            &app,
+            &format!("/api/stations/{station}/queue"),
+            "emp-ceo",
+            "ceo",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{station} at {at}: {queue}");
+        let listed = queue["data"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|j| j["id"] == job_id.as_str()));
+        assert_eq!(listed, member, "{station}'s queue, step at {at}: {queue}");
+
+        let claimed = claim(
+            &app,
+            &job_id,
+            &step_id,
+            &format!("?station={station}"),
+            "emp-ceo",
+            "ceo",
+        )
+        .await;
+        let expected = if member {
+            StatusCode::OK
+        } else {
+            StatusCode::CONFLICT
+        };
+        assert_eq!(
+            claimed, expected,
+            "a claim naming {station} for a step at {at} must answer what its queue \
+             answered (listed: {listed})"
+        );
+    }
+}
+
+#[test]
+fn addressed_work_prefers_active_steps_and_never_guesses_past_a_declaration() {
+    use boss_core::job::{JobId, Step, StepStatus};
+    let mut workflow = car_kind();
+    workflow.metadata = serde_json::json!({"owner": "engineering"});
+    let inside = std::collections::BTreeSet::from(["engineering".into(), "gates".into()]);
+    let mut ready = Step::new(JobId::new(), "task", "ready", 1);
+    ready.status = StepStatus::Ready;
+    let mut active = ready.clone();
+    active.status = StepStatus::Active;
+    active.metadata = serde_json::json!({"at": "outside"});
+    assert!(!boss_jobs::station_queue::addressed_here(
+        &inside,
+        &workflow,
+        &[active.clone(), ready.clone()]
+    ));
+    for (declaration, expected) in [
+        (serde_json::json!({"at": "gates"}), true),
+        (serde_json::json!({"at": 42}), false),
+        (serde_json::json!({"fulfilled_by": "child"}), false),
+        (serde_json::json!({"executor": "equipment:gates"}), true),
+        (
+            serde_json::json!({"audience": {"station": "outside"}}),
+            false,
+        ),
+    ] {
+        active.metadata = declaration;
+        assert_eq!(
+            boss_jobs::station_queue::addressed_here(&inside, &workflow, &[active.clone()]),
+            expected
+        );
+    }
+    ready.status = StepStatus::Completed;
+    assert!(!boss_jobs::station_queue::addressed_here(
+        &inside,
+        &workflow,
+        &[ready]
+    ));
 }
 
 #[tokio::test]
@@ -590,7 +782,7 @@ async fn a_load_row_names_the_workflow_kind_its_station_holds() {
             .cloned()
             .unwrap_or_else(|| panic!("no {name} row in {v}"))
     };
-    assert_eq!(row("test-dock")["kind"], "batch", "the station's own kind");
+    assert_eq!(row("test-dock")["kind"], "group", "the station's own kind");
     assert_eq!(row("test-dock")["workflow_kind"], "car-kind", "{v}");
     assert_eq!(row("brewer-gate")["workflow_kind"], "car-kind");
     assert!(
@@ -800,6 +992,59 @@ async fn a_guest_is_refused_the_watchlist_rather_than_shown_an_empty_one() {
         !v.to_string().contains("Literal placeholder"),
         "the refusal carries no packet: {v}"
     );
+}
+
+/// A windowed tree station reads what its predicate could hold plus
+/// the OPEN packets that could be addressed to it — never the whole
+/// history. Measured on 2026-11-10: design-decided paged all 149,049
+/// packets ever filed and took 297 s, because every tree station
+/// dropped its kind and metadata push-down and a terminal window
+/// dropped the status filter with them (backlog d650c8e6).
+///
+/// The departed packet below is of a kind no registry row describes,
+/// filed by somebody else and closed long ago. A queue that READS it
+/// must look up its protocol to ask whether its steps are addressed
+/// here, finds none, and fails the answer — so a 200 is the evidence
+/// it was never read.
+#[tokio::test]
+async fn a_windowed_tree_station_never_reads_a_departed_packet_it_cannot_hold() {
+    let mut workflow = car_kind();
+    workflow.metadata = serde_json::json!({"owner": "4c5ddf6c-b8ed-4776-98d9-2f99553317c5"});
+    let (app, jobs) = app_with_workflow(workflow);
+    let mut departed = filed_packet("emp-other", "Long settled", 400, Some((300, "completed")));
+    departed.kind = "a-kind-long-retired".into();
+    let mine_open = filed_packet("emp-r", "Column picker forgets my choice", 9, None);
+    let mine_closed = filed_packet("emp-r", "Dark mode contrast", 20, Some((1, "completed")));
+    let mine_stale = filed_packet("emp-r", "Ancient gripe", 90, Some((30, "declined")));
+    for j in [&departed, &mine_open, &mine_closed, &mine_stale] {
+        jobs.create_job(j).await.unwrap();
+    }
+
+    for station in ["my-watchlist", "decided"] {
+        let (status, v) = get_json(
+            &app,
+            &format!("/api/stations/{station}/queue"),
+            "emp-r",
+            "reporter",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{station} read a departed packet: {v}"
+        );
+        let titles: Vec<&str> = v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["Dark mode contrast", "Column picker forgets my choice"],
+            "{station}: open and recently closed members, not the one that aged out"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1206,13 +1451,16 @@ async fn an_actor_role_revoked_after_preflight_cannot_leave_a_selection_claim_or
     use boss_jobs::agents::AgentsRegistry;
     let registry = boss_jobs::agents::InMemoryAgents::new().with_rate_card(["gpt-6.1-sol"]);
     let original = boss_jobs::agents::AgentInput {
+        factory_rotation: Some(true),
         id: "agent-selector".into(),
         display_name: "Selector".into(),
         default_model: "gpt-6.1-sol".into(),
+        model_class: None,
         role: Some("head-brewer".into()),
         department: None,
         hourly_budget_usd_micros: None,
         max_concurrent_runs: None,
+        stations: None,
         aliases: vec![],
     };
     let stamp = boss_core::publisher::EventStamp::new(
@@ -1282,13 +1530,16 @@ async fn unchanged_actor_owner_conserves_its_observation_and_original_replay() {
     let registry =
         Arc::new(boss_jobs::agents::InMemoryAgents::new().with_rate_card(["gpt-6.1-sol"]));
     let declared = boss_jobs::agents::AgentInput {
+        factory_rotation: Some(true),
         id: "agent-selector".into(),
         display_name: "Selector".into(),
         default_model: "gpt-6.1-sol".into(),
+        model_class: None,
         role: Some("head-brewer".into()),
         department: None,
         hourly_budget_usd_micros: None,
         max_concurrent_runs: None,
+        stations: None,
         aliases: vec!["selector-login".into()],
     };
     let stamp = boss_core::publisher::EventStamp::new(
@@ -1383,10 +1634,9 @@ async fn unchanged_actor_owner_conserves_its_observation_and_original_replay() {
                 .collect::<Vec<_>>()
         )
     );
-    assert_eq!(
-        parsed["owner_consumption"]["run_population"]["applicable"],
-        false
-    );
+    // No run population since backlog 3e927996: a robot is bounded by its
+    // robots:<model> pool alone, and the receipt counts nothing else.
+    assert!(parsed["owner_consumption"].get("run_population").is_none());
     let copied = boss_jobs::station_claim::SelectionReceipt::from_json(
         String::from_utf8(first.to_vec()).unwrap(),
     )
@@ -1461,6 +1711,133 @@ async fn fresh_selection_without_an_actor_owner_refuses_without_writing() {
     );
 }
 
+/// One `claim-next` for `request_id` at `station`, as emp-ceo.
+async fn claim_next_status(
+    app: &axum::Router,
+    station: &str,
+    request_id: uuid::Uuid,
+) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::post(format!("/api/stations/{station}/claim-next"))
+                .header("content-type", "application/json")
+                .header("x-boss-user", user_header("emp-ceo", "ceo"))
+                .body(Body::from(
+                    serde_json::json!({"request_id": request_id}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+/// The receipt door's answer for `request_id`, read as `user`.
+async fn receipt_door(
+    app: &axum::Router,
+    request_id: uuid::Uuid,
+    user: &str,
+) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/stations/claims/{request_id}"))
+                .header("x-boss-user", user_header(user, "ceo"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// THE RECEIPT DOOR ANSWERS A REFUSED REQUEST (backlog 614c2bb7). The CLI
+/// journals each pull's request id and replays it until the server
+/// answers for it, because a claim whose answer was lost may have
+/// committed; a refusal alone cannot end it, since the native read can
+/// expire before it reaches the store. The door reads the store for the
+/// id, and its 404 names the id, so it cannot be mistaken for the bare
+/// 404 of a server without the route — the only answer that ends a
+/// journaled request (request ca07ee84 was replayed for two days).
+#[tokio::test]
+async fn the_receipt_door_says_a_refused_request_holds_no_receipt() {
+    let (app, jobs) = app_with_agents(None);
+    post_car(&app, "refused-selector", "standard", "2026-10-04", false).await;
+    let request_id = uuid::Uuid::new_v4();
+    assert_eq!(
+        claim_next_status(&app, "test-dock", request_id).await,
+        StatusCode::CONFLICT
+    );
+    let (status, body) = receipt_door(&app, request_id, "emp-ceo").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["request_id"], request_id.to_string());
+    assert!(body["receipt"].is_null());
+    assert!(
+        jobs.station_claim_receipt(request_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A malformed id is answered after policy is asked: 400 naming it for a
+/// reader, 403 for a caller who may read no packets — the intern, whom
+/// this fixture's policy grants no job read (gate-run 7f7bb6b5).
+#[tokio::test]
+async fn the_receipt_door_asks_policy_before_it_parses_the_id() {
+    let (app, _) = app_with_agents(None);
+    let (status, body) = get_text(&app, "/api/stations/claims/not-a-request").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("not-a-request"), "{body}");
+    let (status, body) = get_json(
+        &app,
+        "/api/stations/claims/not-a-request",
+        "emp-x",
+        "intern",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a caller who may read nothing is refused before the id is read: {body}"
+    );
+}
+
+/// The control: a request that DID commit is answered 200 with its stored
+/// original, byte for byte as claim-next returned it, and only to its own
+/// actor — another caller learns nothing that ends its journal.
+#[tokio::test]
+async fn the_receipt_door_returns_a_committed_original_to_its_own_actor_only() {
+    let (app, jobs) = app_with_agents(Some(Arc::new(boss_jobs::agents::InMemoryAgents::new())));
+    post_car(&app, "held-selector", "standard", "2026-10-04", false).await;
+    let request_id = uuid::Uuid::new_v4();
+    assert_eq!(
+        claim_next_status(&app, "test-dock", request_id).await,
+        StatusCode::CREATED
+    );
+    let stored = jobs
+        .station_claim_receipt(request_id)
+        .await
+        .unwrap()
+        .expect("the claim stored its receipt");
+    let (status, body) = receipt_door(&app, request_id, "emp-ceo").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        stored.json(),
+        "the original is copied, not reserialized"
+    );
+    let (status, body) = receipt_door(&app, request_id, "emp-other").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "another actor is refused, never told 404: {body}"
+    );
+}
+
 /// Both the copied allow and its revocation come from the real policy
 /// repository/evaluator; this wrapper controls only their interleaving.
 struct RevokeAfterPolicyRead {
@@ -1475,13 +1852,16 @@ async fn an_agent_owner_failure_cannot_escape_as_a_durable_selection_effect() {
     let registry = Arc::new(RevokeAfterAgentRead {
         inner: boss_jobs::agents::InMemoryAgents::new(),
         replacement: boss_jobs::agents::AgentInput {
+            factory_rotation: Some(true),
             id: "agent-unused".into(),
             display_name: "Unused".into(),
             default_model: "gpt-6.1-sol".into(),
+            model_class: None,
             role: None,
             department: None,
             hourly_budget_usd_micros: None,
             max_concurrent_runs: None,
+            stations: None,
             aliases: vec![],
         },
         revoked: std::sync::atomic::AtomicBool::new(true),

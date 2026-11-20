@@ -1,5 +1,5 @@
 import { isPageWrite } from './_smokeMocks';
-// /ux/finance — the page's own spec: every control it renders, pinned
+// /finance — the page's own spec: every control it renders, pinned
 // as it behaves on main (page audit 3f964c57, its `test` step; backlog
 // e0732f75, gap 13 of that audit).
 //
@@ -21,9 +21,9 @@ import { isPageWrite } from './_smokeMocks';
 // THE AUDIT'S OPEN GAPS are named on the line that pins the behaviour
 // each one would change, so the car that fixes one finds its line here
 // red and rewrites it:
-//   801b6a7a  the headline, AR aging, gross margin and Invoices read boss-commerce, which
-//             no Algedonic protocol writes (waits on design 72ccb3b2; a7bad6f0, payables,
-//             was folded into it)
+//   801b6a7a  AR aging, gross margin and Invoices read boss-commerce, which no Algedonic
+//             protocol writes (design c2820008 D1 gates them on the manifest; a7bad6f0,
+//             payables, was folded into it). The headline reads the ledger since car 1.
 //   b7263ac5  the nightly ledger recognize / replay runs declare no department, so the
 //             page's department panel cannot show them
 //   e536e91a  Lock and Unlock are one confirm and one POST: no protocol, no reason recorded
@@ -35,11 +35,17 @@ import { expect, test, type Download, type Page, type Request, type Route } from
 import { mountPage } from './_helpers';
 import { installSmokeMocks, servePeopleRows, signInWithPolicy, type PolicyAnswer } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
-import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
-import { parseRoute } from '../../src/router';
+import { ROUTE_CATALOG, type NavItem } from '../../src/shell/nav-catalog';
+import { pagePath } from '../../src/shell/page-address';
+import { ADDRESSES, pageAt } from '../fixtures/station-tree';
+import { parseRoute as parseRouteAt } from '../../src/router';
 import { FINANCE_TABS } from '../../src/finance/financeQuery';
+import { trailingYear } from '../../src/finance/window';
+// The router reads a hosted page's address off the station tree
+// (backlog 0bc2eb68); this spec reads it off the tree the floor serves.
+const parseRoute = (path: string, search = '') => parseRouteAt(path, search, ADDRESSES);
 
-const PATH = ROUTE_CATALOG.finance.path;
+const PATH = pageAt('finance');
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
@@ -301,7 +307,7 @@ const writes = (sent: ReadonlyArray<Sent>): Sent[] =>
 function landing(href: string): Readonly<{ route: string; entry: string | null }> {
   const path = href.split(/[?#]/)[0]!;
   const entry = Object.values(ROUTE_CATALOG)
-    .map((e) => e as { id: string; path: string })
+    .map((e) => ({ id: e.id, path: pagePath(e as NavItem, ADDRESSES) ?? `unplaced:${e.id}` }))
     .filter((e) => path === e.path || path.startsWith(`${e.path}/`))
     .sort((a, b) => b.path.length - a.path.length)[0];
   return { route: parseRoute(path).kind, entry: entry?.id ?? null };
@@ -319,22 +325,42 @@ const csvHeader = (text: string): string => text.replace(/^﻿/, '').split('\r\n
 // The frame: header, the two create links, the close package, the tabs.
 // ---------------------------------------------------------------------------
 
-test.describe('/ux/finance — the frame', () => {
-  test('the header reads the commerce summary, and says when it could not', async ({ page }) => {
-    await install(page);
+test.describe('/finance — the frame', () => {
+  // 801b6a7a (design c2820008 D1): the headline was boss-commerce's
+  // trailing revenue ($12K from SUMMARY), which no Algedonic protocol
+  // writes, beside a ledger income statement that could not agree with
+  // it. It is now the ledger's income statement over the trailing year,
+  // the same window /exec's revenue card reads, and a commerce outage
+  // does not touch it.
+  const HEADLINE_STATEMENT = {
+    ...INCOME_STATEMENT, total_revenue_cents: 4_500_000, total_cogs_cents: 1_500_000,
+    gross_profit_cents: 3_000_000, total_operating_expenses_cents: 2_200_000, net_income_cents: 800_000,
+  };
+
+  test('the header reads the ledger income statement over the trailing year, and says when it could not', async ({ page }) => {
+    const sent = await install(page, { incomeStatement: HEADLINE_STATEMENT });
     await mountPage(page, PATH);
     const header = page.locator('.exec-header');
     await expect(header.locator('.exec-eyebrow')).toHaveText('Finance');
-    // 801b6a7a: this headline is boss-commerce's trailing revenue, which
-    // no Algedonic protocol writes; the ledger's income statement is the
-    // figure a protocol produces, and the two cannot agree.
-    await expect(header.locator('h1')).toHaveText('$12K trailing revenue');
-    await expect(header.locator('p')).toHaveText('$10K gross margin (81.0%) · $420 receivables outstanding');
+    await expect(header.locator('h1')).toHaveText('$45K trailing revenue');
+    await expect(header.locator('p')).toHaveText('$30K gross profit (66.7%) · $8K net income');
+    const windows = reads(sent, ENDPOINTS.incomeStatement).map((u) => {
+      const q = new URL(u).searchParams;
+      return { from: q.get('from') ?? '', to: q.get('to') ?? '' };
+    });
+    // Every headline read is the trailing year ending on its own `to`
+    // (a sim-clock answer that moves the date moves the window with it).
+    expect(windows.length).toBeGreaterThan(0);
+    for (const w of windows) expect(w).toEqual(trailingYear(w.to));
 
-    await install(page, { summary: refuse(503, 'commerce down') });
+    await install(page, { incomeStatement: HEADLINE_STATEMENT, summary: refuse(503, 'commerce down') });
+    await page.reload();
+    await expect(header.locator('h1')).toHaveText('$45K trailing revenue');
+
+    await install(page, { incomeStatement: refuse(503, 'ledger down') });
     await page.reload();
     await expect(header.locator('h1')).toHaveText('Finance');
-    await expect(header.locator('p')).toHaveText('Summary unavailable');
+    await expect(header.locator('p')).toHaveText('Income statement unavailable');
   });
 
   test('eight tabs, the registry of FINANCE_TABS, each opening its own statement', async ({ page }) => {
@@ -366,16 +392,16 @@ test.describe('/ux/finance — the frame', () => {
     await mountPage(page, PATH);
     const newInvoice = page.getByRole('link', { name: '+ New invoice' });
     const newEntry = page.getByRole('link', { name: '+ New journal entry' });
-    await expect(newInvoice).toHaveAttribute('href', '/ux/finance/new');
-    await expect(newEntry).toHaveAttribute('href', '/ux/finance/journal-entries/new');
-    expect(landing('/ux/finance/new')).toEqual({ route: 'newInvoice', entry: 'finance' });
-    expect(landing('/ux/finance/journal-entries/new')).toEqual({ route: 'newJournalEntry', entry: 'finance' });
+    await expect(newInvoice).toHaveAttribute('href', '/finance/invoices/new');
+    await expect(newEntry).toHaveAttribute('href', '/finance/journal-entries/new');
+    expect(landing('/finance/invoices/new')).toEqual({ route: 'newInvoice', entry: 'finance' });
+    expect(landing('/finance/journal-entries/new')).toEqual({ route: 'newJournalEntry', entry: 'finance' });
 
     await newInvoice.click();
-    await expect.poll(() => new URL(page.url()).pathname).toBe('/ux/finance/new');
+    await expect.poll(() => new URL(page.url()).pathname).toBe('/finance/invoices/new');
     await page.goBack();
     await expect.poll(() => new URL(page.url()).pathname).toBe(PATH);
-    await expect(page.locator('.exec-header h1')).toHaveText('$12K trailing revenue');
+    await expect(page.locator('.exec-header h1')).toHaveText('$1 trailing revenue');
   });
 
   test('invoices and the summary re-read every 30 seconds, and nothing else does', async ({ page }) => {
@@ -401,7 +427,7 @@ test.describe('/ux/finance — the frame', () => {
   });
 });
 
-test.describe('/ux/finance — the monthly close package', () => {
+test.describe('/finance — the monthly close package', () => {
   const opener = (page: Page) => page.locator('.mcp-wrap > button');
   const dialog = (page: Page) => page.getByRole('dialog', { name: 'Monthly close package' });
 
@@ -474,7 +500,7 @@ test.describe('/ux/finance — the monthly close package', () => {
 // Overview
 // ---------------------------------------------------------------------------
 
-test.describe('/ux/finance — Overview', () => {
+test.describe('/finance — Overview', () => {
   test('AR aging, AP aging and gross margin render their rows and totals', async ({ page }) => {
     await install(page);
     await mountPage(page, PATH);
@@ -525,7 +551,7 @@ test.describe('/ux/finance — Overview', () => {
 // Invoices
 // ---------------------------------------------------------------------------
 
-test.describe('/ux/finance — Invoices', () => {
+test.describe('/finance — Invoices', () => {
   const rows = (page: Page) => panel(page).locator('tbody tr');
   const ids = (page: Page) => rows(page).locator('td:first-child');
   const filter = (page: Page, name: string) => panel(page).getByRole('button', { name, exact: true });
@@ -605,31 +631,33 @@ test.describe('/ux/finance — Invoices', () => {
     }
   });
 
-  test('a row links its invoice and its account, and back returns to the tab', async ({ page }) => {
+  // The account is named, not linked, since its /ux page went with step 1
+  // of design 01fa5bdf: a link would land on not-found.
+  test('a row links its invoice and names its account, and back returns to the tab', async ({ page }) => {
     await install(page);
     await mountPage(page, `${PATH}?tab=invoices`);
     const row = rows(page).filter({ hasText: 'inv-0001' });
-    await expect(row.getByRole('link', { name: 'inv-0001' })).toHaveAttribute('href', '/ux/finance/inv-0001');
-    await expect(row.getByRole('link', { name: 'Hop Collective' })).toHaveAttribute('href', '/ux/accounts/acct-1');
-    expect(landing('/ux/finance/inv-0001')).toEqual({ route: 'invoice', entry: 'finance' });
-    expect(landing('/ux/accounts/acct-1')).toEqual({ route: 'account', entry: 'accounts' });
+    await expect(row.getByRole('link', { name: 'inv-0001' })).toHaveAttribute('href', '/finance/invoices/inv-0001');
+    await expect(row.locator('[data-pageless="account"]')).toHaveText('Hop Collective');
+    await expect(row.getByRole('link', { name: 'Hop Collective' })).toHaveCount(0);
+    expect(landing('/finance/invoices/inv-0001')).toEqual({ route: 'invoice', entry: 'finance' });
     await expect(row).toContainText('$100');
     await expect(row).toContainText('$8.00');
     await expect(row).toContainText('CA');
     await expect(row).toContainText('Card');
 
     await row.getByRole('link', { name: 'inv-0001' }).click();
-    await expect.poll(() => new URL(page.url()).pathname).toBe('/ux/finance/inv-0001');
+    await expect.poll(() => new URL(page.url()).pathname).toBe('/finance/invoices/inv-0001');
     await page.goBack();
     await expect.poll(() => `${new URL(page.url()).pathname}${new URL(page.url()).search}`).toBe(`${PATH}?tab=invoices`);
     await expect(tab(page, 'Invoices')).toHaveAttribute('aria-selected', 'true');
   });
 
-  test('an account whose name did not load is linked by its id — by design, not a failure', async ({ page }) => {
+  test('an account whose name did not load is named by its id — by design, not a failure', async ({ page }) => {
     await install(page, { accounts: refuse(503, 'people down') });
     await mountPage(page, `${PATH}?tab=invoices`);
-    await expect(rows(page).filter({ hasText: 'inv-0001' }).getByRole('link', { name: 'acct-1' }))
-      .toHaveAttribute('href', '/ux/accounts/acct-1');
+    await expect(rows(page).filter({ hasText: 'inv-0001' }).locator('[data-pageless="account"]'))
+      .toHaveText('acct-1');
     await expect(panel(page).locator(FAILURE_MARKER)).toHaveCount(0);
   });
 
@@ -692,7 +720,7 @@ test.describe('/ux/finance — Invoices', () => {
 // PO Approvals (the Approve write's refusals: finance-po-approvals-refused)
 // ---------------------------------------------------------------------------
 
-test.describe('/ux/finance — PO Approvals', () => {
+test.describe('/finance — PO Approvals', () => {
   test('pending and recently approved POs link the PO and the vendor', async ({ page }) => {
     await install(page);
     await mountPage(page, `${PATH}?tab=approvals`);
@@ -700,13 +728,13 @@ test.describe('/ux/finance — PO Approvals', () => {
     await expect(pending!.locator('tbody tr')).toHaveText([/po-0001\s*vendor-0001\s*HOPS-CASCADE x4\s*\$100\s*2026-09-20\s*Approve/]);
     await expect(recent!.locator('tbody tr')).toHaveText([/po-0002\s*vendor-0001\s*HOPS-CASCADE x4\s*submitted/]);
     for (const s of [pending!, recent!]) {
-      await expect(s.getByRole('link', { name: /^po-000/ })).toHaveAttribute('href', /^\/ux\/purchase-orders\/po-000\d$/);
-      await expect(s.getByRole('link', { name: 'vendor-0001' })).toHaveAttribute('href', '/ux/vendors/vendor-0001');
+      await expect(s.getByRole('link', { name: /^po-000/ })).toHaveAttribute('href', /^\/finance\/purchase-orders\/po-000\d$/);
+      await expect(s.getByRole('link', { name: 'vendor-0001' })).toHaveAttribute('href', '/finance/vendors/vendor-0001');
     }
-    // The PO detail is a route the router serves that NO catalog entry
-    // owns; the vendor lands under Vendors.
-    expect(landing('/ux/purchase-orders/po-0001')).toEqual({ route: 'po', entry: null });
-    expect(landing('/ux/vendors/vendor-0001')).toEqual({ route: 'vendor', entry: 'vendors' });
+    // The PO detail sits under Finance's address since backlog c7ef4728,
+    // so it lands under the Finance entry; the vendor under Vendors.
+    expect(landing('/finance/purchase-orders/po-0001')).toEqual({ route: 'po', entry: 'finance' });
+    expect(landing('/finance/vendors/vendor-0001')).toEqual({ route: 'vendor', entry: 'vendors' });
   });
 
   test('Approve sends the PO to submitted', async ({ page }) => {
@@ -738,7 +766,7 @@ test.describe('/ux/finance — PO Approvals', () => {
 // The four statements
 // ---------------------------------------------------------------------------
 
-test.describe('/ux/finance — Income statement', () => {
+test.describe('/finance — Income statement', () => {
   test('renders the ledger lines, re-reads on a date, downloads and prints', async ({ page }) => {
     const sent = await install(page);
     await mountPage(page, `${PATH}?tab=income-statement`);
@@ -761,7 +789,7 @@ test.describe('/ux/finance — Income statement', () => {
   });
 });
 
-test.describe('/ux/finance — Balance sheet', () => {
+test.describe('/finance — Balance sheet', () => {
   test('renders, says when it does not balance, and the runoff says when it drifts', async ({ page }) => {
     await install(page, { balanceSheet: { ...BALANCE_SHEET, balanced: false, imbalance_cents: 2_500 } });
     await mountPage(page, `${PATH}?tab=balance-sheet`);
@@ -793,7 +821,7 @@ test.describe('/ux/finance — Balance sheet', () => {
   });
 });
 
-test.describe('/ux/finance — Cash flow', () => {
+test.describe('/finance — Cash flow', () => {
   test('Indirect by default, Direct on the toggle, each with its own CSV', async ({ page }) => {
     const sent = await install(page);
     await mountPage(page, `${PATH}?tab=cash-flow`);
@@ -825,7 +853,7 @@ test.describe('/ux/finance — Cash flow', () => {
 // Trial Balance: the drill-down, the periods and the three ledger writes
 // ---------------------------------------------------------------------------
 
-test.describe('/ux/finance — Trial Balance', () => {
+test.describe('/finance — Trial Balance', () => {
   const tbTable = (page: Page) => panel(page).locator('table.tb-table');
   const accountRow = (page: Page, code: string) => tbTable(page).locator('tr.tb-row', { hasText: code });
   const periodRow = (page: Page) => panel(page).locator('table.tb-periods tbody tr');
@@ -865,7 +893,7 @@ test.describe('/ux/finance — Trial Balance', () => {
     await expect(fromPacket.getByRole('link', { name: PACKET_ID })).toHaveAttribute('href', `/ux/jobs/${PACKET_ID}`);
     // An invoice-sourced one links the invoice, under the finance entry.
     const fromInvoice = drill.locator('table.tb-entries tr.tb-row', { hasText: 'Invoice paid' });
-    await expect(fromInvoice.getByRole('link', { name: 'inv-0001' })).toHaveAttribute('href', '/ux/finance/inv-0001');
+    await expect(fromInvoice.getByRole('link', { name: 'inv-0001' })).toHaveAttribute('href', '/finance/invoices/inv-0001');
 
     await fromPacket.click();
     const detail = drill.locator('.tb-entry-detail');
@@ -906,7 +934,7 @@ test.describe('/ux/finance — Trial Balance', () => {
       await expect(page.getByRole('heading', { name: 'Recorded sponsorship packet', exact: true })).toBeVisible();
       expect(await page.evaluate(() => window.history.length)).toBe(before + 1);
       await page.goBack();
-      await expect(page).toHaveURL(new RegExp('/ux/finance\\?tab=trial-balance$'));
+      await expect(page).toHaveURL(new RegExp('/finance\\?tab=trial-balance$'));
       expect(writes(sent)).toEqual([]);
     });
   }
@@ -1016,7 +1044,7 @@ test.describe('/ux/finance — Trial Balance', () => {
     await expect(detail.locator('.tb-reverse-result')).toHaveText('Reversal posted: ent-0009');
     // 2349285d: the reversal's id links to that entry on the Trial Balance.
     const reversal = detail.locator('.tb-reverse-result').getByRole('link', { name: 'ent-0009' });
-    await expect(reversal).toHaveAttribute('href', /\/ux\/finance\?tab=trial-balance&entry=ent-0009$/);
+    await expect(reversal).toHaveAttribute('href', /\/finance\?tab=trial-balance&entry=ent-0009$/);
     const [post] = writes(sent);
     expect([post!.method, new URL(post!.url).pathname]).toEqual(['POST', '/api/ledger/journal-entries']);
     const body = JSON.parse(post!.body!) as { posted_on: string; memo: string; lines: unknown[] };
@@ -1050,7 +1078,7 @@ test.describe('/ux/finance — Trial Balance', () => {
 // Tax liability
 // ---------------------------------------------------------------------------
 
-test.describe('/ux/finance — Tax liability', () => {
+test.describe('/finance — Tax liability', () => {
   test('lists each liability account, the next filing due and the accrued filings', async ({ page }) => {
     await install(page);
     await mountPage(page, `${PATH}?tab=tax-liability`);
@@ -1117,7 +1145,7 @@ test.describe('/ux/finance — Tax liability', () => {
 // no one carries, so it hid them from nobody.
 // ---------------------------------------------------------------------------
 
-test.describe('/ux/finance — an auditor reads, and writes nothing', () => {
+test.describe('/finance — an auditor reads, and writes nothing', () => {
   const AUDITOR = {
     id: 'emp-aud', name: 'Ada Auditor', email: 'ada@demo', role: 'audit-readonly', department: 'finance',
     hire_date: '2024-01-01', status: 'active', location: 'HQ', employment_type: 'full-time', skills: [], certifications: [],
@@ -1147,7 +1175,7 @@ test.describe('/ux/finance — an auditor reads, and writes nothing', () => {
 // (action, resource), asked as the gateway's policy_user.
 // ---------------------------------------------------------------------------
 
-test.describe('/ux/finance — each write is offered only when policy allows it', () => {
+test.describe('/finance — each write is offered only when policy allows it', () => {
   const PERIODS = { periods: [PERIOD_OPEN, { ...PERIOD_LOCKED, id: 'per-2026-08', starts_on: '2026-08-01' }] };
 
   test('Allow on all four: every write shows, and each question is asked once, as the session', async ({ page }) => {

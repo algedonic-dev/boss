@@ -59,6 +59,9 @@ command -v python3 >/dev/null 2>&1 || {
 
 # A ratchet that cannot see the trunk certifies nothing, so an ABSENT
 # trunk refuses (1); a git that could not answer is the machine's (3).
+# The public mirror DECLARES it has none (BOSS_TRUNK=none, lib/trunk-ref.sh;
+# backlog 2d28df78) — that is not an absent trunk: the forge judged each car.
+lint_no_trunk "$LINT" "which rule edits this change made without a version bump" && exit 0
 BASE=$(resolve_trunk_ref "$LINT"); rc=$?
 if [ "$rc" -eq "$LINT_CANNOT_ANSWER" ]; then
     exit "$LINT_CANNOT_ANSWER"

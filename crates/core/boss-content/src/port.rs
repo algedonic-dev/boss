@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use crate::error::ContentError;
 use crate::types::{
-    Bulletin, BulletinDraft, BulletinPatch, ManualPatch, ManualSection, ManualSectionDraft,
-    ManualSectionVersion, UserContext,
+    Bulletin, BulletinDraft, BulletinPatch, ManualIndexEntry, ManualPatch, ManualSection,
+    ManualSectionDraft, ManualSectionVersion, UserContext,
 };
 
 /// Observe already-read audience inputs without changing visibility.
@@ -134,6 +134,17 @@ pub trait ContentRepository: Send + Sync {
     /// order both adapters can hold. Intended for tree rendering —
     /// the client reassembles the hierarchy from `parent_slug` links.
     async fn manual_tree(&self, user: &UserContext) -> Result<Vec<ManualSection>, ContentError>;
+
+    /// Audience-filtered headers include unfinished sections, never their bodies.
+    /// An adapter without this read refuses instead of inventing an empty index.
+    async fn manual_index(
+        &self,
+        _user: &UserContext,
+    ) -> Result<Vec<ManualIndexEntry>, ContentError> {
+        Err(ContentError::Storage(
+            "manual index read unavailable".into(),
+        ))
+    }
 
     async fn get_section(
         &self,

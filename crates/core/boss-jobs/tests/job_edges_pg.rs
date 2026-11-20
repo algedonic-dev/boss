@@ -1,5 +1,5 @@
 //! The job_edges registry — job-to-job links as data
-//! (department-flow-dashboards Q1, decided 2026-08-09: registry).
+//! (department-flow-dashboards Q1, in the decision record, decided 2026-08-09: registry).
 //!
 //! Contracts pinned:
 //! 1. **The registry seeds exactly the declared edges** — instruments

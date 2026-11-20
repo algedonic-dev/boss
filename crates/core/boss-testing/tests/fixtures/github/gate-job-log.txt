@@ -1,0 +1,105 @@
+﻿2026-11-19T00:12:03.4183321Z Current runner version: '2.329.0'
+2026-11-19T00:12:03.4210145Z ##[group]Runner Image Provisioner
+2026-11-19T00:12:03.4211022Z Hosted Compute Agent
+2026-11-19T00:12:03.4211790Z ##[endgroup]
+2026-11-19T00:12:03.4290033Z ##[group]GITHUB_TOKEN Permissions
+2026-11-19T00:12:03.4291504Z Contents: read
+2026-11-19T00:12:03.4291911Z Metadata: read
+2026-11-19T00:12:03.4292286Z ##[endgroup]
+2026-11-19T00:19:41.0021870Z ##[group]Run infra/gate.sh
+2026-11-19T00:19:41.0022411Z infra/gate.sh
+2026-11-19T00:19:41.0057120Z shell: /usr/bin/bash -e {0}
+2026-11-19T00:19:41.0057560Z env:
+2026-11-19T00:19:41.0057866Z   CARGO_NET_RETRY: 10
+2026-11-19T00:19:41.0058291Z ##[endgroup]
+2026-11-19T00:19:41.2210304Z ##[group]gate: fmt
+2026-11-19T00:20:22.6610112Z ##[endgroup]
+2026-11-19T00:20:22.6611034Z gate: fmt ok (41s)
+2026-11-19T00:51:03.1170422Z ##[group]gate: test
+2026-11-19T00:51:03.1171980Z cargo-test-wide: 3 test binaries and the doctests, 1 at a time (RUST_TEST_THREADS=2 each; CARGO_BUILD_JOBS=unset allows 0, max_connections=100 assumed allows 5, cap 4; set by serial)
+2026-11-19T00:51:03.1180443Z      Running unittests src/lib.rs (target/debug/deps/boss_jobs-5d0f41c2a9e8b713)
+2026-11-19T00:51:03.1180901Z
+2026-11-19T00:51:03.1181350Z running 2 tests
+2026-11-19T00:51:03.1181802Z test packet_budget::tests::the_budget_is_three_quarters_of_the_event_bound ... ok
+2026-11-19T00:51:03.1182260Z test probe::tests::reads_git_time_with_an_offset ... ok
+2026-11-19T00:51:03.1182711Z
+2026-11-19T00:51:03.1183170Z test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2026-11-19T00:51:03.1183622Z
+2026-11-19T00:51:41.5520017Z      Running tests/shared_checkout_guard.rs (target/debug/deps/shared_checkout_guard-0f3c2a9b1d4e5f60)
+2026-11-19T00:51:41.5520480Z
+2026-11-19T00:51:41.5520913Z running 3 tests
+2026-11-19T00:51:41.5521361Z test the_door_admits_a_path_inside_the_worktree ... ok
+2026-11-19T00:51:41.5521822Z test the_door_refuses_a_path_it_cannot_resolve ... FAILED
+2026-11-19T00:51:41.5522260Z test the_door_refuses_the_shared_checkout ... ok
+2026-11-19T00:51:41.5522711Z
+2026-11-19T00:51:41.5523170Z failures:
+2026-11-19T00:51:41.5523602Z
+2026-11-19T00:51:41.5524033Z ---- the_door_refuses_a_path_it_cannot_resolve stdout ----
+2026-11-19T00:51:41.5524491Z
+2026-11-19T00:51:41.5524930Z thread 'the_door_refuses_a_path_it_cannot_resolve' panicked at crates/core/boss-testing/tests/shared_checkout_guard.rs:1214:5:
+2026-11-19T00:51:41.5525382Z the door names the path it could not resolve: realpath: /home/runner/work/boss/boss/no-such: No such file or directory
+2026-11-19T00:51:41.5525840Z note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+2026-11-19T00:51:41.5526291Z
+2026-11-19T00:51:41.5526733Z
+2026-11-19T00:51:41.5527170Z failures:
+2026-11-19T00:51:41.5527602Z     the_door_refuses_a_path_it_cannot_resolve
+2026-11-19T00:51:41.5528044Z
+2026-11-19T00:51:41.5528491Z test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+2026-11-19T00:51:41.5528933Z
+2026-11-19T00:51:41.5529380Z error: test failed, to rerun pass `-p boss-testing --test shared_checkout_guard` (exit 101)
+2026-11-19T00:52:10.0040113Z      Running unittests src/main.rs (target/debug/deps/boss-8a1e2f9c3b7d6045)
+2026-11-19T00:52:10.0040562Z
+2026-11-19T00:52:10.0041008Z running 2 tests
+2026-11-19T00:52:10.0041450Z test train::forge::tests::a_job_log_is_read_by_its_job_id ... FAILED
+2026-11-19T00:52:10.0041903Z test train::forge::tests::a_run_without_jobs_reads_nothing ... ok
+2026-11-19T00:52:10.0042361Z
+2026-11-19T00:52:10.0042802Z failures:
+2026-11-19T00:52:10.0043250Z
+2026-11-19T00:52:10.0043691Z ---- train::forge::tests::a_job_log_is_read_by_its_job_id stdout ----
+2026-11-19T00:52:10.0044140Z
+2026-11-19T00:52:10.0044582Z thread 'train::forge::tests::a_job_log_is_read_by_its_job_id' panicked at crates/orchestrators/boss-cli/src/train/forge.rs:512:9:
+2026-11-19T00:52:10.0045031Z assertion `left == right` failed
+2026-11-19T00:52:10.0045480Z
+2026-11-19T00:52:10.0045921Z
+2026-11-19T00:52:10.0046370Z failures:
+2026-11-19T00:52:10.0046811Z     train::forge::tests::a_job_log_is_read_by_its_job_id
+2026-11-19T00:52:10.0047260Z
+2026-11-19T00:52:10.0047702Z test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+2026-11-19T00:52:10.0048150Z
+2026-11-19T00:52:10.0048601Z error: test failed, to rerun pass `-p boss-cli --bin boss` (exit 101)
+2026-11-19T00:52:10.9910233Z    Doc-tests (cargo test --all-features --no-fail-fast --doc)
+2026-11-19T00:52:10.9910690Z
+2026-11-19T00:52:10.9911132Z running 0 tests
+2026-11-19T00:52:10.9911580Z
+2026-11-19T00:52:10.9912021Z test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2026-11-19T00:52:10.9912470Z
+2026-11-19T00:52:10.9920118Z ##[endgroup]
+2026-11-19T00:52:10.9921570Z GATE FAIL: test (exit 101, after 1867s)
+2026-11-19T00:52:10.9932004Z ##[error]GATE FAIL: test: test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s (exit 101, after 1867s)
+2026-11-19T01:03:44.2271190Z gate: FAILED — 1 of 2 check(s) failed: test
+2026-11-19T01:03:44.2510036Z ##[error]Process completed with exit code 1.
+2026-11-19T01:03:44.2601120Z ##[group]Run cat .gate-receipt.json || echo "no receipt — the gate stopped before it could write one"
+2026-11-19T01:03:44.2601630Z [36;1mcat .gate-receipt.json || echo "no receipt — the gate stopped before it could write one"[0m
+2026-11-19T01:03:44.2633012Z shell: /usr/bin/bash -e {0}
+2026-11-19T01:03:44.2633460Z env:
+2026-11-19T01:03:44.2633771Z   CARGO_NET_RETRY: 10
+2026-11-19T01:03:44.2634190Z ##[endgroup]
+2026-11-19T01:03:44.2701180Z {
+2026-11-19T01:03:44.2701590Z
+2026-11-19T01:03:44.2701911Z
+2026-11-19T01:03:44.2702233Z
+2026-11-19T01:03:44.2702550Z   "verdict": "fail",
+2026-11-19T01:03:44.2702871Z   "mode": "full",
+2026-11-19T01:03:44.2703190Z   "scope": "",
+2026-11-19T01:03:44.2703511Z   "data_only": false,
+2026-11-19T01:03:44.2703830Z   "head": "5b0c7e1d9f2a43c6b8e07d1a2f3c4b5d6e7f8091",
+2026-11-19T01:03:44.2704152Z   "dirty": false,
+2026-11-19T01:03:44.2704470Z   "host": "fv-az1120-433",
+2026-11-19T01:03:44.2704791Z   "ci": true,
+2026-11-19T01:03:44.2705110Z   "free_gb": 61,
+2026-11-19T01:03:44.2705430Z   "free_gb_on": "/",
+2026-11-19T01:03:44.2705751Z   "free_volumes": [{"free_gb": 61, "mount": "/", "writes": "target"}],
+2026-11-19T01:03:44.2706070Z   "checks": [{"name":"fmt","result":"pass","seconds":41},{"name":"test","result":"fail","seconds":1867}]
+2026-11-19T01:03:44.2706392Z }
+2026-11-19T01:03:44.2790011Z Post job cleanup.
+2026-11-19T01:03:44.3510022Z Cleaning up orphan processes

@@ -20,11 +20,19 @@
 # schema only. To change this station, bump `version` — the seed
 # refuses a row that differs from the live active row of the same
 # (name, version).
+#
+# Version 3 (T2 of design 4b27a65a, backlog 3f58c823; bumped from the
+# LIVE newest, v2): the station stands in the tree — its stable `id`, its
+# `parent` /algedonic/executive (proposal section 6: the operator's task
+# station is the human's), its mode. Nothing else changed.
 # ---------------------------------------------------------------------------
 
 [[station]]
 name = "q.platform-admin.task"
-version = 1
+version = 4
+id = "21bf19d3-94dc-4fcc-ac7c-4a19923c726f"
+parent = "5f922a2a-31f5-4f07-acf1-41dc140687a4"
+mode = "standing"
 status = "active"
 title = "platform-admin — task"
 kind = "constraint"

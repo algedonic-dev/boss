@@ -61,6 +61,28 @@
             "timeout": 60
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/infra/dev/hooks/shared-checkout-guard.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/infra/dev/hooks/shared-checkout-guard.py",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "SessionEnd": [

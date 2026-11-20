@@ -43,7 +43,7 @@ if [ -r "$SECRET_LIB" ]; then
 fi
 # Only estate registry data is transported on stdin. All Kubernetes and
 # sensitive Talos bytes stay in the bounded container process's pipes.
-registry="$(curl -sS --max-time 15 --max-filesize 1048576 \
+registry="$(curl -q -sS --max-time 15 --max-filesize 1048576 \
     ${MT_HDR:+-H "$MT_HDR"} \
     -H "x-boss-user: $(sor_reader_header 'automation:discover-admission-source')" \
     -w $'\n%{http_code}' "$url" 2>/dev/null)" || unavailable estate_unavailable

@@ -15,15 +15,18 @@
 //! Design + decision history:
 //! `docs/architecture-decisions.md §Step UX & frontend`.
 
+//!
+//! The os-map, flow, fleet and stage views (`/api/views/os-map`,
+//! `/flow`, `/fleet/{kind}`, `/stage-durations/{kind}`,
+//! `/stage-runs/{kind}`) went with the last pages that read them —
+//! Bottlenecks and the Department Map's triage flow — in step 1 of
+//! design 01fa5bdf (2026-11-17).
+
 pub mod error;
 pub mod filter;
-pub mod fleet;
-pub mod flow;
 pub mod in_memory;
-pub mod os_map;
 pub mod port;
 pub mod pushdown;
-pub mod stages;
 pub mod types;
 
 #[cfg(feature = "postgres")]
@@ -36,9 +39,7 @@ pub mod query;
 pub mod rebuild_event_facts;
 
 pub use error::ViewsError;
-pub use flow::{Flow, FlowJob, FlowRepo, FlowStep};
 pub use in_memory::InMemoryViewsRepo;
-pub use os_map::{OsMap, OsMapEdge, OsMapNode, OsMapRepo};
 pub use port::{ViewResolver, ViewsRepo};
 pub use types::{
     ResultScope, View, ViewInput, ViewLayout, ViewResults, ViewSource, ViewSources, Visibility,

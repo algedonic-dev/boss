@@ -1,8 +1,5 @@
 use boss_jobs::{in_memory::InMemoryJobs, port::JobsRepository};
-use std::{
-    process::Command,
-    time::{Duration, Instant},
-};
+use std::time::Duration;
 
 #[test]
 fn a_flow_snapshot_finishes_without_reentering_its_state_lock() {
@@ -33,7 +30,7 @@ fn check_snapshot(startup_delay_ms: u64, blocked: bool) {
             .enable_all()
             .build()
             .unwrap();
-        std::fs::write(std::env::var("BOSS_FLOW_SNAPSHOT_READY").unwrap(), b"ready").unwrap();
+        boss_testing::reexec::ready();
         if std::env::var("BOSS_FLOW_SNAPSHOT_BLOCKED").unwrap() == "true" {
             loop {
                 std::thread::park();
@@ -45,49 +42,31 @@ fn check_snapshot(startup_delay_ms: u64, blocked: bool) {
         assert!(rows.is_empty(), "an empty history has no flow obligations");
         return;
     }
-    let directory = tempfile::tempdir().unwrap();
-    let ready = directory.path().join("snapshot-ready");
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "a_flow_snapshot_finishes_without_reentering_its_state_lock",
-            "--nocapture",
-        ])
+    // The start/work split this test pioneered is boss_testing::reexec's
+    // now, shared by every re-exec in the tree (backlog 7e30ddb0): the
+    // three seconds are the snapshot's, from the child's ready().
+    let mut child = boss_testing::reexec::ReExec::new(
+        "a_flow_snapshot_finishes_without_reentering_its_state_lock",
+    );
+    child
+        .command()
         .env(CHILD, "1")
         .env(
             "BOSS_FLOW_SNAPSHOT_STARTUP_MS",
             startup_delay_ms.to_string(),
         )
-        .env("BOSS_FLOW_SNAPSHOT_READY", &ready)
-        .env("BOSS_FLOW_SNAPSHOT_BLOCKED", blocked.to_string())
-        .spawn()
-        .unwrap();
-    let startup_deadline = Instant::now() + Duration::from_secs(60);
-    let mut snapshot_deadline = None;
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "flow snapshot child failed: {status}");
-            return;
-        }
-        if snapshot_deadline.is_none() && ready.exists() {
-            snapshot_deadline = Some(Instant::now() + Duration::from_secs(3));
-        }
-        let expired = match snapshot_deadline {
-            Some(deadline) => Instant::now() >= deadline,
-            None => Instant::now() >= startup_deadline,
-        };
-        if expired {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!(
-                "flow snapshot child exceeded its {} watchdog",
-                if snapshot_deadline.is_some() {
-                    "operation"
-                } else {
-                    "startup"
-                }
-            );
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+        .env("BOSS_FLOW_SNAPSHOT_BLOCKED", blocked.to_string());
+    let done = child.spawn().finish(Duration::from_secs(3));
+    assert!(
+        !done.overran(),
+        "flow snapshot child exceeded its operation watchdog (start {:?})",
+        done.start
+    );
+    assert!(
+        done.succeeded(),
+        "flow snapshot child failed: {:?}\n{}\n{}",
+        done.status,
+        done.stdout,
+        done.stderr
+    );
 }

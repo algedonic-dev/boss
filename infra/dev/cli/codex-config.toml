@@ -15,7 +15,12 @@ model = "gpt-6.1-sol"
 # Writes confined to the workspace (the checkout the session starts in).
 sandbox_mode = "workspace-write"
 
-# The model asks before anything the sandbox would refuse.
+# The model asks before anything the sandbox would refuse — in the
+# interactive TUI (dev-session.sh option 2), where a person can answer.
+# `codex exec` does not ask: measured offline 2026-10-29, under this
+# "on-request" it printed `approval: never`, and infra/dev/factory-loop.sh
+# (option 6) passes -c approval_policy="never" on every turn so no turn
+# waits on an approval nobody is there to give (backlog 628dc540).
 approval_policy = "on-request"
 
 # The project doc is AGENTS.md — codex's own default name, and in this

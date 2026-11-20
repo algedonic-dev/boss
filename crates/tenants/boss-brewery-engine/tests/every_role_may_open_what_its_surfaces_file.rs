@@ -17,13 +17,17 @@
 //! - `apps/web/src/shop/ShopProductPage.svelte` — `direct-shop-order`;
 //!   the shop is always on (`canSeeRoute` in
 //!   `libs/web-kit/src/session/permissions.ts`), so every role.
-//! - `apps/web/src/parts/PartPage.svelte` — `ingredient-restock`, the
-//!   reorder button, for every role that sees `parts` (a role whose Class
-//!   row declares no surfaces sees every one).
 //!
-//! The generic New Job form (`JobsListPage.svelte`) files whatever kind
-//! the role picks, so it is answered by whatever the role holds, and has
-//! no grant of its own here — a grant for it would be the all-kinds one.
+//! `apps/web/src/parts/PartPage.svelte` filed `ingredient-restock` from
+//! its reorder button for every role that saw `parts`, pinned here by
+//! `every_role_that_sees_parts_may_file_a_restock`, until step 1 of
+//! design 01fa5bdf (2026-11-17) removed the page and the `parts` surface
+//! with it. The shop page went in the same car; its grant is kept above
+//! because the protocol still runs.
+//!
+//! The generic New Job form on the jobs list filed whatever kind the role
+//! picked, so it had no grant of its own here; it went with that list in
+//! the same step (review df7aeb9c).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -133,32 +137,6 @@ async fn every_role_may_file_feedback_and_a_shop_order() {
         missing.is_empty(),
         "roles that cannot open what an always-on surface files — add them to the \
          grant in examples/brewery/seeds/policy_rules.toml: {missing:#?}"
-    );
-}
-
-#[tokio::test]
-async fn every_role_that_sees_parts_may_file_a_restock() {
-    let policy = seeded_policy();
-    let sees_parts: Vec<String> = role_rows()
-        .into_iter()
-        .filter(|(_, surfaces)| {
-            surfaces
-                .as_ref()
-                .is_none_or(|s| s.iter().any(|x| x == "parts"))
-        })
-        .map(|(code, _)| code)
-        .collect();
-    boss_testing::assert_roster_floor!(sees_parts, 10, "roles that see parts (25 on 2026-09-27)");
-    let mut missing = Vec::new();
-    for role in &sees_parts {
-        if !may_open(&policy, role, "ingredient-restock").await {
-            missing.push(role.clone());
-        }
-    }
-    assert!(
-        missing.is_empty(),
-        "roles that see the parts page but cannot open the ingredient-restock its \
-         reorder button files: {missing:?}"
     );
 }
 

@@ -29,6 +29,13 @@
 //! What `Rule::from_raw` does NOT check: handler NAMES. Those pass through
 //! as opaque strings and resolve at dispatch, where an unknown one is a
 //! loud `DispatchError::UnknownHandler` rather than a silent no-op.
+//!
+//! What [`validate`] checks that `Rule::from_raw` does not: a `delay`.
+//! The runtime stores one and never acts on it, so the validator refuses
+//! every rule declaring one (backlog 84a010cb) rather than publish a
+//! timing claim the dispatcher would break on the first matching event —
+//! a malformed or unsupported one with its reason (`delayed.rs`), a
+//! supported one as not executed yet.
 
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
@@ -39,6 +46,8 @@ use super::registry::{Cadence, RawDoStep, RawRule, RawSchedule, RegistryError, R
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleVersion {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_lane: Option<String>,
     pub version: i32,
     pub status: String,
     /// `None` for a schedule-triggered rule (mutually exclusive with
@@ -85,6 +94,7 @@ impl RuleVersion {
     /// nonsense this whole gate exists to refuse.
     pub fn to_raw(&self) -> RawRule {
         RawRule {
+            delivery_lane: self.delivery_lane.clone(),
             name: self.name.clone(),
             on_event: self.on_event.clone(),
             schedule: self.schedule.clone(),
@@ -113,6 +123,10 @@ pub enum AuthoringError {
     Unviable(String),
     #[error("invalid rule: {0}")]
     Invalid(String),
+    /// An HTTP rule write that would cut an edge into a passkey-protected
+    /// protocol (backlog a4b57aca; see `refuse_a_removed_passkey_edge`).
+    #[error("refused: {0}")]
+    PasskeyEdge(String),
     #[error("storage: {0}")]
     Storage(String),
 }
@@ -121,7 +135,7 @@ fn store<E: std::fmt::Display>(e: E) -> AuthoringError {
     AuthoringError::Storage(e.to_string())
 }
 
-const SELECT_COLS: &str = "name, version, status, on_event, when_expr, do_steps, delay, \
+const SELECT_COLS: &str = "name, delivery_lane, version, status, on_event, when_expr, do_steps, delay, \
      schedule_cadence, schedule_anchor, schedule_calendar, source, created_by, published_by, \
      retired_by, created_at";
 
@@ -147,6 +161,27 @@ pub fn validate(raw: &RawRule) -> Result<(), RegistryError> {
         return Err(RegistryError::NotAFamilyMember {
             rule: raw.name.clone(),
             family: RULE_FAMILY.to_string(),
+        });
+    }
+    // Fail closed on timing nothing executes (backlog 84a010cb): the
+    // matcher drops `delay` and the runner fires at once, so any
+    // spelling — well-formed or not — is refused here, the one validator
+    // every write edge and `boss tenant check` share, until design
+    // f1d66249's durable delayed admission exists to keep the claim.
+    // A declaration that contract would refuse anyway is named for
+    // what is wrong with it (car 1 of its finish line, delayed.rs);
+    // only a supported one is refused as not executed yet.
+    if let Some(delay) = &raw.delay {
+        if let Err(reason) = super::delayed::DelayedDeclaration::from_raw(raw) {
+            return Err(RegistryError::MalformedDelay {
+                rule: raw.name.clone(),
+                delay: delay.clone(),
+                reason,
+            });
+        }
+        return Err(RegistryError::UnsupportedDelay {
+            rule: raw.name.clone(),
+            delay: delay.clone(),
         });
     }
     Rule::from_raw(raw.clone()).map(|_| ())
@@ -180,6 +215,7 @@ fn row_to_version(row: &sqlx::postgres::PgRow) -> Result<RuleVersion, AuthoringE
     };
     Ok(RuleVersion {
         name: row.try_get("name").map_err(store)?,
+        delivery_lane: row.try_get("delivery_lane").map_err(store)?,
         version: row.try_get("version").map_err(store)?,
         status: row.try_get("status").map_err(store)?,
         on_event: row.try_get("on_event").map_err(store)?,
@@ -346,8 +382,8 @@ pub async fn create_draft(
     sqlx::query(
         "INSERT INTO dispatcher_rules \
             (name, version, status, on_event, when_expr, do_steps, delay, \
-             schedule_cadence, schedule_anchor, schedule_calendar, source, created_by) \
-         VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+             schedule_cadence, schedule_anchor, schedule_calendar, source, created_by, delivery_lane) \
+         VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(&raw.name)
     .bind(next)
@@ -360,6 +396,7 @@ pub async fn create_draft(
     .bind(sched_calendar)
     .bind(source)
     .bind(author)
+    .bind(&raw.delivery_lane)
     .execute(&mut *tx)
     .await
     .map_err(store)?;
@@ -376,6 +413,26 @@ pub async fn publish(
     pool: &PgPool,
     name: &str,
     publisher: &str,
+) -> Result<RuleVersion, AuthoringError> {
+    publish_with_lane_policy(pool, name, publisher, true).await
+}
+
+/// HTTP cannot enable an independent consumer, even from a pre-existing draft.
+/// The checked row is the same transaction's promoted row; caller-supplied
+/// source/actor text does not grant the reviewed seed/car path.
+pub async fn publish_from_http(
+    pool: &PgPool,
+    name: &str,
+    publisher: &str,
+) -> Result<RuleVersion, AuthoringError> {
+    publish_with_lane_policy(pool, name, publisher, false).await
+}
+
+async fn publish_with_lane_policy(
+    pool: &PgPool,
+    name: &str,
+    publisher: &str,
+    allow_lane: bool,
 ) -> Result<RuleVersion, AuthoringError> {
     let mut tx = pool.begin().await.map_err(store)?;
     // Read the WHOLE draft row, not just its version: the gate below has to
@@ -397,6 +454,12 @@ pub async fn publish(
         )));
     };
     let promoted = row_to_version(&row)?;
+    if !allow_lane && promoted.delivery_lane.is_some() {
+        return Err(AuthoringError::Unviable(
+            "delivery_lane is restricted to reviewed seed/car publication, not HTTP authoring"
+                .into(),
+        ));
+    }
     let v = promoted.version;
 
     // The viability gate. `create_draft` validates what a caller HANDS us,
@@ -409,6 +472,9 @@ pub async fn publish(
     // `?` here rolls the transaction back untouched, so the incumbent keeps
     // serving — a refused publish is not an outage.
     validate(&promoted.to_raw()).map_err(|e| AuthoringError::Unviable(e.to_string()))?;
+    if !allow_lane {
+        refuse_a_removed_passkey_edge(&mut tx, name, Some(&promoted)).await?;
+    }
 
     sqlx::query(
         "UPDATE dispatcher_rules SET status = 'retired', retired_by = $2 \
@@ -434,18 +500,105 @@ pub async fn publish(
 }
 
 /// Retire the active version of `name` (idempotent — no-op if none
-/// active), stamping the signed caller as its `retired_by`.
+/// active), stamping the signed caller as its `retired_by`. The HTTP
+/// retire door's write (the boot seed retires through its own SQL), so
+/// it refuses to cut an edge into a passkey-protected protocol
+/// ([`refuse_a_removed_passkey_edge`]).
 pub async fn retire(pool: &PgPool, name: &str, retirer: &str) -> Result<(), AuthoringError> {
+    let mut tx = pool.begin().await.map_err(store)?;
+    refuse_a_removed_passkey_edge(&mut tx, name, None).await?;
     sqlx::query(
         "UPDATE dispatcher_rules SET status = 'retired', retired_by = $2 \
          WHERE name = $1 AND status = 'active'",
     )
     .bind(name)
     .bind(retirer)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(store)?;
+    tx.commit().await.map_err(store)?;
     Ok(())
+}
+
+/// THE PASSKEY EDGES MOVE ONLY BY CAR (backlog a4b57aca, review R1 of
+/// car 8715776d). A workflow that admits or fulfils packets of a
+/// passkey-protected kind is itself protected, and the workflow publish
+/// judge (`boss_jobs::publish_passkey`) reads those edges off the live
+/// rule registry. These HTTP doors ask registry policy alone, so an
+/// actor holding rule-write policy could cut a parent -> protected-child
+/// edge live — which is the strip itself: the parent's packets stop
+/// passing through the passkey — and then publish the parent unsigned.
+///
+/// So an HTTP publish or retire that would leave any edge into a
+/// protected kind undrawn is refused 409, naming each edge and why its
+/// child is protected. A change that keeps every such edge, or removes
+/// one another rule still draws, or touches only unprotected kinds,
+/// passes. The reviewed road for removing one is a car carrying the
+/// rule's file through the boot seed, which does not come through here.
+///
+/// Judged inside the write's transaction, after an advisory lock every
+/// HTTP rule write takes, so two writes each removing one of two
+/// redundant edges cannot both pass. It is the same lock a guarded
+/// workflow publish holds while it reads this graph
+/// (`boss_jobs::registry::passkey_edges_fence`), so an edge ADDED here
+/// cannot land between that publish's read and its write either. The workflow rows are each kind's
+/// passkey baseline, read by boss-jobs' own reader; a read that fails
+/// refuses the write rather than admitting an edge it could not judge.
+async fn refuse_a_removed_passkey_edge(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    name: &str,
+    replacement: Option<&RuleVersion>,
+) -> Result<(), AuthoringError> {
+    // The fence a guarded workflow publish holds while it reads this
+    // graph (review R3 of car 8715776d), so the two writers serialize.
+    boss_jobs::registry::passkey_edges_fence(tx)
+        .await
+        .map_err(|e| AuthoringError::Storage(e.to_string()))?;
+    let sql = format!("SELECT {SELECT_COLS} FROM dispatcher_rules WHERE status = 'active'");
+    let active = sqlx::query(&sql)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(store)?
+        .iter()
+        .map(row_to_version)
+        .collect::<Result<Vec<_>, _>>()?;
+    // The read surface's shape (`GET /api/dispatcher/rules` serves each
+    // rule as its `RawRule`), so both judges read one edge definition.
+    let view = |r: &RuleVersion| serde_json::to_value(r.to_raw()).map_err(store);
+    let before = active.iter().map(view).collect::<Result<Vec<_>, _>>()?;
+    let after = active
+        .iter()
+        .filter(|r| r.name != name)
+        .chain(replacement)
+        .map(view)
+        .collect::<Result<Vec<_>, _>>()?;
+    let rows = boss_jobs::registry::passkey_baselines(tx)
+        .await
+        .map_err(|e| {
+            AuthoringError::Storage(format!(
+                "the workflow rows the passkey edges are judged over would not read ({e}), \
+                 so this rule change is refused rather than judged blind"
+            ))
+        })?;
+    let removed = boss_jobs::publish_passkey::removed_protected_edges(&before, &after, &rows);
+    if removed.is_empty() {
+        return Ok(());
+    }
+    let named = removed
+        .iter()
+        .map(|(e, why)| {
+            format!(
+                "{} -> {} (drawn by {}; {} is passkey-protected: {why})",
+                e.parent, e.child, e.via, e.child
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(AuthoringError::PasskeyEdge(format!(
+        "this change to dispatcher rule {name} would remove an edge into a passkey-protected \
+         protocol: {named}. Such an edge is removed only by a car carrying the rule's file \
+         through the dispatcher's boot seed, never through this door — nothing changed"
+    )))
 }
 
 #[cfg(test)]
@@ -459,6 +612,7 @@ mod tests {
             version: 3,
             status: "draft".into(),
             on_event: on_event.map(str::to_string),
+            delivery_lane: None,
             schedule: None,
             when: None,
             do_steps: vec![RawDoStep {
@@ -536,6 +690,114 @@ mod tests {
              fails, the check landed and this test should be replaced by its \
              positive form"
         );
+    }
+
+    /// A `delay` is a timing claim nothing executes (backlog 84a010cb):
+    /// `Rule` stores it, `match_event` builds a `MatchedRule` without it,
+    /// and the runner dispatches the handlers on the triggering event —
+    /// so a "seven days after an unanswered inquiry" rule fired at once.
+    /// The decided contract (design f1d66249) is a durable
+    /// `delayed-admission` packet, not built yet, and says any car before
+    /// it fails CLOSED for unsupported timing. So every spelling is
+    /// refused at the one validator the draft, the dry run, the publish,
+    /// the boot seed and `boss tenant check` share — a well-formed
+    /// duration and a malformed one alike, because neither would run.
+    /// The rule shape is the packet's own measured example: the dry run
+    /// answered ok for an inquiry rule carrying `delay = "7d"`.
+    ///
+    /// Car 1 of the finish line (typed declaration, `delayed.rs`) splits
+    /// the refusal in two, both fail-closed: a declaration the contract
+    /// SUPPORTS is refused as not executed yet (`UnsupportedDelay`), and
+    /// one it never will — malformed, zero, periodic — is refused with
+    /// its own reason (`MalformedDelay`), so the author is not told to
+    /// wait for a car that will still refuse the rule.
+    #[test]
+    fn a_declared_delay_is_refused_because_nothing_executes_it() {
+        let inquiry = |delay: &str| {
+            let mut event = version(
+                "follow-up-an-unanswered-inquiry",
+                Some("jobs.job.opened"),
+                "jobs.spawn",
+            );
+            event.delay = Some(delay.into());
+            event
+        };
+        let names_it = |err: &RegistryError, delay: &str| {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("follow-up-an-unanswered-inquiry"),
+                "names the rule: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("{delay:?}")),
+                "names the delay: {msg}"
+            );
+            assert!(msg.contains("84a010cb"), "names where it is tracked: {msg}");
+        };
+        for delay in ["7d", "604800s", "168h", "5m"] {
+            let err = validate(&inquiry(delay).to_raw()).expect_err("a delay must be refused");
+            assert!(
+                matches!(err, RegistryError::UnsupportedDelay { .. }),
+                "well-formed {delay:?} refused as not executed yet: {err}"
+            );
+            names_it(&err, delay);
+        }
+        for delay in ["0", "", "seven days", "0d", "-7d", "1.5d"] {
+            let err = validate(&inquiry(delay).to_raw()).expect_err("a delay must be refused");
+            assert!(
+                matches!(err, RegistryError::MalformedDelay { .. }),
+                "malformed {delay:?} refused with its reason: {err}"
+            );
+            names_it(&err, delay);
+        }
+        for delay in ["7d", "0", "seven days"] {
+            let mut scheduled = version("nightly", None, "jobs.spawn");
+            scheduled.schedule = Some(RawSchedule {
+                cadence: Cadence::parse("daily").unwrap(),
+                anchor_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                business_calendar: None,
+            });
+            scheduled.delay = Some(delay.into());
+            assert!(
+                matches!(
+                    validate(&scheduled.to_raw()),
+                    Err(RegistryError::MalformedDelay {
+                        reason: crate::rules::delayed::DelayRefusal::Periodic,
+                        ..
+                    })
+                ),
+                "a periodic rule with {delay:?} is refused as periodic"
+            );
+        }
+        // Several effects, or an effect other than jobs.spawn, on a
+        // well-formed delay: refused for the shape, not the timing.
+        let mut two = inquiry("7d");
+        two.do_steps.push(two.do_steps[0].clone());
+        assert!(matches!(
+            validate(&two.to_raw()),
+            Err(RegistryError::MalformedDelay {
+                reason: crate::rules::delayed::DelayRefusal::EffectCount { count: 2 },
+                ..
+            })
+        ));
+        let mut other = inquiry("7d");
+        other.do_steps[0].handler = "assign_step".into();
+        assert!(matches!(
+            validate(&other.to_raw()),
+            Err(RegistryError::MalformedDelay {
+                reason: crate::rules::delayed::DelayRefusal::UnsupportedHandler { .. },
+                ..
+            })
+        ));
+
+        // Positive control: the same rule with no delay is an ordinary
+        // immediate rule and still validates.
+        let immediate = version(
+            "follow-up-an-unanswered-inquiry",
+            Some("jobs.job.opened"),
+            "jobs.spawn",
+        );
+        assert!(validate(&immediate.to_raw()).is_ok());
     }
 
     /// Neither trigger set is the XOR violation `from_raw` exists to

@@ -1,0 +1,11 @@
+# publish-a-protocol adds a road to a live registry (backlog f399458f,
+# ask 2): its publish-pool step lets a signed packet put a resource pool
+# row live with no train. The row declares no writer, no executor and no
+# bill, so nothing held it by default, and the drift publish would have
+# put the new road live on the first clean check after its car merged.
+# This file makes it what the build order assumed it was: a row the
+# platform owner publishes on purpose, from the packet the held-kind
+# filer opens for it on the converge after the car lands.
+drift_publish = "held"
+lifts = 'backlog f399458f: never by a car on its own. The hold stands for every edit of this row, because each one changes which registry rows a signed packet can publish; a later car deletes it only if the platform owner decides the row is plain data. Kept by backlog a4b57aca: besides the passkey the server now judges, this file is what makes the held-kind filer (publish-drift --file-held) open the signing packet for an edit of this row.'
+why = '''This row decides which registry doors a passkey-signed packet can drive. Since backlog f399458f its publish-pool step files the publish-pool verb, which publishes a resource pool row from the packet's own bytes through the live pools door, with no gate and no train. A row that widens what an approval can do goes live at the platform owner's deliberate publish, from his queue on the website, never on an unattended drift publish at any hour.'''

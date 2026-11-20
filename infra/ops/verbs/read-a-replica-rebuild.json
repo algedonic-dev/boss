@@ -1,0 +1,19 @@
+{
+  "about": "READ-ONLY: reads ONE Longhorn volume's replica rebuild on to an answer (infra/forge/rebuild-a-failed-replica.sh --read-back <volume>; backlog 090643a1). Filed by a dispatcher rule, never by hand, when rebuild-a-failed-replica (or this read) reached its read-back bound with the rebuild still MOVING: ops-request d326b6c7 answered FAILED at 1200 s on a 73 GB copy that read healthy 21 to 37 minutes after it started, and nothing in the record then proved it. Reads the volume, its replicas and its engine through the forge ops_kubectl door every BOSS_REBUILD_POLL_S (default 15) for up to BOSS_REBUILD_READBACK_S (default 1200). PROVEN, exit 0: the volume holds its declared count N of replicas, each healthy and RW as the volume's one RUNNING engine reports them, on N distinct nodes, robustness healthy — the line the effect below names (a stopped engine's cached modes are no current answer, review run 950a5222). IN PROGRESS, exit 75: not proven at the bound, but the replicas or the engine rebuild progress moved within BOSS_REBUILD_PROGRESS_S (default 600); the line names the volume, and rule read-a-replica-rebuild-in-progress-reads-it-again files the next read. STALLED, exit 1: nothing moved that long; the same rule files an urgent alarm. A read that cannot look at the bound — or sees a replica with no uid, node or disk, or no single running engine — is CANNOT ANSWER, exit 1. A volume that is not there exits 78. Nothing is written, ever. Timeout 1500 covers the default 120 s image pull plus the 1200 s read-back.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/rebuild-a-failed-replica.sh",
+    "--read-back",
+    "{1}"
+  ],
+  "params": [
+    {
+      "name": "volume",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    }
+  ],
+  "timeout": 1500,
+  "effect": "^read-a-replica-rebuild: pvc-[0-9a-f-]{36} has [0-9]+ healthy RW replicas on [0-9]+ distinct nodes \\([a-z0-9-]+(, [a-z0-9-]+)*\\) — spec\\.numberOfReplicas=[0-9]+, robustness healthy: the rebuild is proven"
+}

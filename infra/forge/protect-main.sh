@@ -159,7 +159,11 @@ call() {
     local args=(-sS -m 20 -o "$WORK/out" -w '%{http_code}' -H "@$AUTH" -H 'Content-Type: application/json' -X "$method")
     [ -n "$body" ] && args+=(--data-binary "@$body")
     : >"$WORK/out"
-    CODE="$("$CURL" "${args[@]}" "$url" 2>"$WORK/err")" || rc=$?
+    # -q FIRST (review 3874e4a8 B1, backlog 4f300192): $AUTH is the forge
+    # token header forge-converge.service writes and runs this as root, so
+    # a curlrc in that HOME must not be read; anywhere but first -q is a
+    # no-op. offsite-push.sh's call(), handed the same file, already has it.
+    CODE="$("$CURL" -q "${args[@]}" "$url" 2>"$WORK/err")" || rc=$?
     if [ "$rc" -ne 0 ]; then
         CURL_WORDS="curl exit $rc: $(tr '\n' ' ' <"$WORK/err")"
         return 1

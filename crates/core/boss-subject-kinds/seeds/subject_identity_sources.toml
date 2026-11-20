@@ -54,6 +54,12 @@ id_field = "sku"
 label_field = "name"
 
 [[source]]
+event_kind = "products.sku.version.appended"
+subject_kind = "product"
+id_field = "sku"
+label_field = "name"
+
+[[source]]
 event_kind = "campaigns.campaign.created"
 subject_kind = "campaign"
 id_field = "id"

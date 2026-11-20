@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "method": "Scheduling hints, never runtime bounds or performance proof. Only the five targets named by FULL cac3efb6's canonical slowest receipt have measured overrides. Source paths under tests/groups select the group scheduling default without changing Cargo execution kind.",
+  "kind_defaults": {
+    "bin": 300,
+    "lib": 300,
+    "test": 1,
+    "group": 300
+  },
+  "kind_default_basis": {
+    "group": "kind default, unmeasured"
+  },
+  "targets": {
+    "boss-cli:boss": {
+      "seconds": 388.5,
+      "basis": "Measured whole binary, FULL cac3efb6-9dff-4214-bbe5-e56e15215c3a canonical slowest receipt, head 79816a621ff91f61764f6dbf18d853209bccf8da"
+    },
+    "boss-testing:group_pins_identity": {
+      "seconds": 345,
+      "basis": "Measured whole binary, FULL cac3efb6-9dff-4214-bbe5-e56e15215c3a canonical slowest receipt, head 79816a621ff91f61764f6dbf18d853209bccf8da"
+    },
+    "boss-testing:group_storage": {
+      "seconds": 316.6,
+      "basis": "Measured whole binary, FULL cac3efb6-9dff-4214-bbe5-e56e15215c3a canonical slowest receipt, head 79816a621ff91f61764f6dbf18d853209bccf8da"
+    },
+    "boss-testing:group_storage_2": {
+      "seconds": 378.2,
+      "basis": "Measured whole binary, FULL cac3efb6-9dff-4214-bbe5-e56e15215c3a canonical slowest receipt, head 79816a621ff91f61764f6dbf18d853209bccf8da"
+    },
+    "boss-testing:group_storage_3": {
+      "seconds": 410.7,
+      "basis": "Measured whole binary, FULL cac3efb6-9dff-4214-bbe5-e56e15215c3a canonical slowest receipt, head 79816a621ff91f61764f6dbf18d853209bccf8da"
+    }
+  },
+  "measurement_limits": "The retained canonical receipt exposes only five slowest targets. Every other group uses the declared 300-second kind default, unmeasured. No per-member estimate is represented as a measured whole-target duration."
+}

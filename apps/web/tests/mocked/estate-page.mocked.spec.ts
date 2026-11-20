@@ -1,4 +1,4 @@
-// /it/estate — THE LOOPS (backlog 0d9b2960; page audit 2cff1d6e, GAP 10).
+// /operations/estate — THE LOOPS (backlog 0d9b2960; page audit 2cff1d6e, GAP 10).
 //
 // The page showed none of the estate's own working or finished packets,
 // so "did the loop run" had no answer on it — while the log held ~2,000
@@ -8,7 +8,7 @@
 // one, the newest terminal (outcome and age) and any open packet, each
 // linked to the packet.
 //
-// Before it, /it/estate was reached only by the crawls (route-smoke,
+// Before it, /operations/estate was reached only by the crawls (route-smoke,
 // outage-crawl), under the `[]` catch-all.
 
 import { expect, test, type Page, type Route } from './_test';
@@ -16,7 +16,7 @@ import { mountPage } from './_helpers';
 import { installSmokeMocks } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
 
-const PATH = '/it/estate';
+const PATH = '/operations/estate';
 
 /// The loops as the page renders them TODAY, in order — written out
 /// rather than imported, so a change to the list shows up here as a
@@ -130,7 +130,7 @@ const row = (page: Page, kind: string, nth = 0) => loopsTable(page).locator(`tr[
 const cells = (page: Page, kind: string, nth = 0) => row(page, kind, nth).locator('td');
 const TEXT = { useInnerText: true } as const;
 
-test.describe('/it/estate — the loops', () => {
+test.describe('/operations/estate — the loops', () => {
   test('one row per declared loop, then one ops-request row per host declaring the runner role', async ({ page }) => {
     await install(page, 'fixtures');
     await mountPage(page, PATH);

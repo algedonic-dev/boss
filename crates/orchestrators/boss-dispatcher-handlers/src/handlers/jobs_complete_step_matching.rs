@@ -84,13 +84,34 @@
 //! (rule `rerail-a-car-is-overtaken-when-its-car-closes`). Every rule
 //! written before names a `match_step` and reads exactly as it did.
 //!
+//! ## A path the CANDIDATE names — `{candidate.<path>}` (backlog 96e171bf)
+//!
+//! publish-a-blog-post's `live` step closes on the converge's record of
+//! the post's OWN page: `steps.run.site.pages./blog-<slug>.html` equal
+//! to the packet's `publish.site_hash` (design f89a241f D3). The slug is
+//! each candidate's, so no one value per event can answer it. A
+//! `{candidate.<path>}` placeholder in `event_path` is filled from the
+//! candidate packet (`steps.<slug>.<field…>` or the Job's JSON, as
+//! below) before the path is read, once per candidate:
+//! `event_path = "steps.run.site.pages./blog-{candidate.steps.draft.slug}.html"`.
+//! A candidate whose placeholder finds nothing, or whose filled path
+//! finds no value (the converge did not observe that page, or recorded
+//! WHY in place of a hash), is not matched — the common not-yet case,
+//! so a debug line, not the warning a fixed path that finds nothing
+//! earns. The closing packet is fetched at most once per delivery, and
+//! only when some candidate's recorded value is there to compare. The
+//! same placeholder fills `done_metadata` strings, so the post's `url`
+//! names its own slug; a key whose placeholder finds nothing is not
+//! written. A path with no placeholder reads exactly as before.
+//!
 //! ## What is written
 //!
 //! `done_metadata` is the same shape `jobs.complete_linked_step` takes:
 //! a JSON object on the rule row, filled into keys the step does NOT
 //! already carry (a value a person wrote is their record), with string
 //! values substituting `{event.<key>}` from the marker's top-level
-//! scalars and `{value}` for the matched value. The triggering Job's id
+//! scalars, `{value}` for the matched value and `{candidate.<path>}`
+//! from the packet being completed. The triggering Job's id
 //! (or, for a non-packet event, the event's id) lands under
 //! `evidence_key` (default `matched_from`) as a plain
 //! string — the evidence is WHICH packet made this one true, and a
@@ -157,12 +178,14 @@ impl JobsCompleteStepMatching {
     }
 
     /// The value at `event_path`: the payload first, then the closed Job
-    /// (fetched only when the payload does not answer, and only when
-    /// the trigger IS a Job — an event id is never fetched as one).
+    /// (fetched only when the payload does not answer, only when the
+    /// trigger IS a Job — an event id is never fetched as one — and at
+    /// most once per delivery: `closing` holds it for the next read).
     async fn event_value(
         &self,
         path: &str,
         trigger: &Trigger<'_>,
+        closing: &mut Option<serde_json::Value>,
         ctx: &InvocationContext,
     ) -> Result<Option<String>, HandlerError> {
         let segments: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
@@ -175,13 +198,18 @@ impl JobsCompleteStepMatching {
         let Trigger::Packet(job_id) = trigger else {
             return Ok(None);
         };
-        let job = get_json(
-            &self.client,
-            &format!("{}/api/jobs/{job_id}", self.base()),
-            &ctx.rule_name,
-        )
-        .await?;
-        Ok(value_on_job(&job, &segments))
+        if closing.is_none() {
+            let job = get_json(
+                &self.client,
+                &format!("{}/api/jobs/{job_id}", self.base()),
+                &ctx.rule_name,
+            )
+            .await?;
+            *closing = Some(job);
+        }
+        Ok(closing
+            .as_ref()
+            .and_then(|job| value_on_job(job, &segments)))
     }
 
     /// Complete `step` on `job_id`: the template's vocabulary (keys the
@@ -214,12 +242,36 @@ impl JobsCompleteStepMatching {
     }
 }
 
-/// What a template may name: the marker's scalars as `{event.<key>}`
-/// and the matched value as `{value}`.
+/// What a template may name: the marker's scalars as `{event.<key>}`,
+/// the matched value as `{value}` and the packet being completed as
+/// `{candidate.<path>}`.
 struct Facts<'a> {
     triggering_id: &'a str,
     payload: &'a serde_json::Value,
     value: &'a str,
+    candidate: &'a serde_json::Value,
+}
+
+/// The placeholder that names the candidate packet (backlog 96e171bf).
+const CANDIDATE_OPEN: &str = "{candidate.";
+
+/// PURE: `template` with every `{candidate.<path>}` replaced by the
+/// value at `<path>` on `job` (read as `value_on_job` reads), or `None`
+/// when a placeholder finds no value or is never closed — a path
+/// half-filled names nothing, and must not be read as if it did.
+fn fill_candidate(template: &str, job: &serde_json::Value) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find(CANDIDATE_OPEN) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + CANDIDATE_OPEN.len()..];
+        let end = after.find('}')?;
+        let segments: Vec<&str> = after[..end].split('.').filter(|s| !s.is_empty()).collect();
+        out.push_str(&value_on_job(job, &segments)?);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
 }
 
 /// What made this delivery happen, and so what the evidence names and
@@ -305,7 +357,7 @@ fn render(
     template
         .iter()
         .filter(|(k, _)| is_unset(existing.get(*k)))
-        .map(|(k, v)| {
+        .filter_map(|(k, v)| {
             let v = match v {
                 serde_json::Value::String(s) => {
                     let s = event_scalars
@@ -313,11 +365,15 @@ fn render(
                         .fold(s.replace("{value}", facts.value), |acc, (from, to)| {
                             acc.replace(from, to)
                         });
-                    serde_json::Value::String(s)
+                    // A key whose candidate placeholder finds nothing is
+                    // not written: a half-filled value is a wrong record,
+                    // and a required field left unset is refused loudly
+                    // at completion rather than recorded wrong.
+                    serde_json::Value::String(fill_candidate(&s, facts.candidate)?)
                 }
                 other => other.clone(),
             };
-            (k.clone(), v)
+            Some((k.clone(), v))
         })
         .collect()
 }
@@ -366,26 +422,35 @@ impl Handler for JobsCompleteStepMatching {
         };
         let (Trigger::Packet(triggering_id) | Trigger::Event(triggering_id)) = fired_by;
 
-        let Some(value) = self.event_value(event_path, &fired_by, ctx).await? else {
-            // The rule selected this event and the event carries nothing
-            // at the path the rule named: the two disagree about what
-            // the event records, which is rule authoring worth a line
-            // nobody has to go re-derive. Not an error — a redelivery
-            // would find the same absence.
-            tracing::warn!(
-                rule = %ctx.rule_name,
-                trigger = %triggering_id,
-                event_path = %event_path,
-                "no value at event_path — completing nothing"
-            );
-            return Ok(());
+        // A path with no `{candidate.…}` is one value for every packet:
+        // read it once, and a rule that selected an event carrying
+        // nothing there is told so. A path the candidate fills is read
+        // per packet below (backlog 96e171bf).
+        let per_candidate = event_path.contains(CANDIDATE_OPEN);
+        let mut closing: Option<serde_json::Value> = None;
+        let fixed = if per_candidate {
+            None
+        } else {
+            let Some(value) = self
+                .event_value(event_path, &fired_by, &mut closing, ctx)
+                .await?
+            else {
+                // The rule selected this event and the event carries
+                // nothing at the path the rule named: the two disagree
+                // about what the event records, which is rule authoring
+                // worth a line nobody has to go re-derive. Not an error
+                // — a redelivery would find the same absence.
+                tracing::warn!(
+                    rule = %ctx.rule_name,
+                    trigger = %triggering_id,
+                    event_path = %event_path,
+                    "no value at event_path — completing nothing"
+                );
+                return Ok(());
+            };
+            Some(value)
         };
 
-        let facts = Facts {
-            triggering_id,
-            payload: &ctx.event_payload,
-            value: &value,
-        };
         let candidates = open_jobs_of_kind(&self.client, self.base(), kind, &ctx.rule_name).await?;
         let mut matched = 0usize;
         for job in &candidates {
@@ -397,9 +462,43 @@ impl Handler for JobsCompleteStepMatching {
             }
             .and_then(|m| m.get(match_field))
             .and_then(scalar_text);
-            if recorded.as_deref() != Some(value.as_str()) {
+            let Some(recorded) = recorded else {
+                continue;
+            };
+            let value = match &fixed {
+                Some(v) => v.clone(),
+                None => {
+                    let found = match fill_candidate(event_path, job) {
+                        Some(path) => {
+                            self.event_value(&path, &fired_by, &mut closing, ctx)
+                                .await?
+                        }
+                        None => None,
+                    };
+                    let Some(v) = found else {
+                        // The not-yet case: this packet's page was not
+                        // observed by this converge, or was recorded as a
+                        // reason rather than a hash.
+                        tracing::debug!(
+                            rule = %ctx.rule_name,
+                            packet = %job.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                            event_path = %event_path,
+                            "no value at this packet's event_path — skipping"
+                        );
+                        continue;
+                    };
+                    v
+                }
+            };
+            if recorded != value {
                 continue;
             }
+            let facts = Facts {
+                triggering_id,
+                payload: &ctx.event_payload,
+                value: &value,
+                candidate: job,
+            };
             matched += 1;
             let job_id = job.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let Some(step) = step_by_slug(job, step_slug) else {
@@ -447,7 +546,7 @@ impl Handler for JobsCompleteStepMatching {
             tracing::debug!(
                 rule = %ctx.rule_name,
                 trigger = %triggering_id,
-                "no open {kind} packet records {}.{match_field} = {value:?}",
+                "no open {kind} packet records {}.{match_field} equal to the value at {event_path}",
                 match_step.unwrap_or("metadata")
             );
         }
@@ -889,6 +988,200 @@ mod tests {
         assert_eq!((calls[1].0.as_str(), calls[1].1.as_str()), (SITE_A, LIVE_A));
     }
 
+    // ── A path the CANDIDATE names (backlog 96e171bf) ──────────────
+    //
+    // publish-a-blog-post's `live` step closes on the converge's record
+    // of the POST: `pages["/blog-<slug>.html"]` equal to the packet's
+    // own `publish.site_hash` (design f89a241f D3). The path into the
+    // converge differs per packet, so `event_path` names the candidate's
+    // own slug as `{candidate.steps.draft.slug}`, filled per packet.
+
+    const POST_A: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    const POST_B: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    const POST_C: &str = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+    const POST_LIVE_A: &str = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+    const POST_LIVE_B: &str = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+    const POST_LIVE_C: &str = "12121212-1212-1212-1212-121212121212";
+
+    /// The args the tenant's blog rule (BLOG_RULE_FIXTURE) evaluates to.
+    fn blog_args() -> Vec<(String, Value)> {
+        vec![
+            ("kind".to_string(), Value::String("publish-a-blog-post".into())),
+            ("step".to_string(), Value::String("live".into())),
+            ("match_step".to_string(), Value::String("publish".into())),
+            ("match_field".to_string(), Value::String("site_hash".into())),
+            (
+                "event_path".to_string(),
+                Value::String("steps.run.site.pages./blog-{candidate.steps.draft.slug}.html".into()),
+            ),
+            (
+                "done_metadata".to_string(),
+                Value::String(
+                    r#"{"url": "https://www.algedonic.dev/blog-{candidate.steps.draft.slug}.html"}"#
+                        .into(),
+                ),
+            ),
+            ("evidence_key".to_string(), Value::String("converge".into())),
+        ]
+    }
+
+    /// An open blog-post packet: `draft` recorded the slug, `publish`
+    /// the sha256 of site/blog-<slug>.html at the merge.
+    fn post(id: &str, live_id: &str, slug: &str, site_hash: &str, live: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "kind": "publish-a-blog-post",
+            "status": "open",
+            "metadata": {},
+            "steps": [
+                { "id": format!("{id}-draft"), "spec_slug": "draft", "status": "completed",
+                  "metadata": { "slug": slug } },
+                { "id": format!("{id}-publish"), "spec_slug": "publish", "status": "completed",
+                  "metadata": { "site_hash": site_hash } },
+                { "id": live_id, "spec_slug": "live", "status": live,
+                  "metadata": {} },
+            ],
+        })
+    }
+
+    /// The converge whose run step recorded `/` and each staged page.
+    fn converge_with_pages(pages: serde_json::Value) -> serde_json::Value {
+        converge(json!({ "site": { "hash": "h-index", "pages": pages } }))
+    }
+
+    /// The obligation: the post whose page the converge served with
+    /// the hash it published goes live — and the post whose page was
+    /// served with ANOTHER hash, and the post whose page the converge
+    /// never observed, do not.
+    #[tokio::test]
+    async fn a_blog_post_goes_live_only_on_its_own_pages_matching_hash() {
+        let (base, puts) = mock_jobs(vec![
+            converge_with_pages(json!({
+                "/index.html": "h-index",
+                "/blog-hello.html": "h-hello",
+                "/blog-edited.html": "h-older-text",
+            })),
+            post(POST_A, POST_LIVE_A, "hello", "h-hello", "ready"),
+            post(POST_B, POST_LIVE_B, "edited", "h-edited", "ready"),
+            post(POST_C, POST_LIVE_C, "unserved", "h-unserved", "ready"),
+        ])
+        .await;
+        let h = JobsCompleteStepMatching::with_client(crate::handlers::common::api_client(), base);
+        h.invoke(&blog_args(), &ctx(close_marker()))
+            .await
+            .expect("runs");
+
+        let calls = puts.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            2,
+            "one post, the merge then the flip: {calls:?}"
+        );
+        let (job, step, body) = &calls[0];
+        assert_eq!(job, POST_A, "the post whose own page carries its hash");
+        assert_eq!(step, &format!("{POST_LIVE_A}/metadata"));
+        assert_eq!(
+            body["converge"], CONVERGE,
+            "the evidence is the converge's id"
+        );
+        assert_eq!(
+            body["url"], "https://www.algedonic.dev/blog-hello.html",
+            "the template names the candidate's own slug"
+        );
+        assert_eq!(
+            (calls[1].0.as_str(), calls[1].1.as_str()),
+            (POST_A, POST_LIVE_A)
+        );
+    }
+
+    /// A page the converge could not read is recorded as WHY, not a
+    /// hash (cluster-deploy-lib.sh site_page) — an object, which is
+    /// "no value", so nothing goes live on it. And a post the landing
+    /// page's hash happens to equal is not made live by `/`.
+    #[tokio::test]
+    async fn a_page_recorded_as_a_reason_or_only_the_index_completes_nothing() {
+        let (base, puts) = mock_jobs(vec![
+            converge_with_pages(json!({
+                "/index.html": "h-index",
+                "/blog-hello.html": { "http_status": 404 },
+            })),
+            post(POST_A, POST_LIVE_A, "hello", "h-hello", "ready"),
+            post(POST_B, POST_LIVE_B, "index", "h-other", "ready"),
+            post(POST_C, POST_LIVE_C, "nope", "h-index", "ready"),
+        ])
+        .await;
+        let h = JobsCompleteStepMatching::with_client(crate::handlers::common::api_client(), base);
+        h.invoke(&blog_args(), &ctx(close_marker()))
+            .await
+            .expect("runs");
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "{:?}",
+            puts.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_candidate_placeholder_fills_from_the_candidate_or_names_nothing() {
+        let p = post(POST_A, POST_LIVE_A, "hello", "h", "ready");
+        assert_eq!(
+            fill_candidate(
+                "steps.run.site.pages./blog-{candidate.steps.draft.slug}.html",
+                &p
+            )
+            .as_deref(),
+            Some("steps.run.site.pages./blog-hello.html")
+        );
+        assert_eq!(
+            fill_candidate("steps.run.site.hash", &p).as_deref(),
+            Some("steps.run.site.hash"),
+            "a path with no placeholder is itself"
+        );
+        assert_eq!(
+            fill_candidate("x.{candidate.steps.draft.missing}", &p),
+            None,
+            "a placeholder the candidate cannot answer names no path"
+        );
+        assert_eq!(
+            fill_candidate("x.{candidate.steps.draft.slug", &p),
+            None,
+            "an unclosed placeholder names no path"
+        );
+    }
+
+    /// The rule row the tenant's `seeds/rules.toml` carries beside the
+    /// landing page's — the shape this tree does not ship as a live
+    /// rule (a tenant workflow's rule is the tenant's). It validates
+    /// and evaluates to `blog_args()`.
+    const BLOG_RULE_FIXTURE: &str = r#"
+[[rule]]
+name = "blog-post-goes-live-on-converge"
+why = "a converge whose record of /blog-<slug>.html carries the hash a post published makes that post live"
+version = 1
+on_event = "jobs.job.closed"
+when = "kind = \"maintenance-cluster-converge\""
+[[rule.do]]
+handler = "jobs.complete_step_matching"
+args = { kind = "\"publish-a-blog-post\"", step = "\"live\"", match_step = "\"publish\"", match_field = "\"site_hash\"", event_path = "\"steps.run.site.pages./blog-{candidate.steps.draft.slug}.html\"", done_metadata = '"{\"url\": \"https://www.algedonic.dev/blog-{candidate.steps.draft.slug}.html\"}"', evidence_key = "\"converge\"" }
+"#;
+
+    #[test]
+    fn the_blog_rule_validates_and_evaluates_to_the_args_the_handler_reads() {
+        use boss_dispatcher::rules::authoring::validate;
+        use boss_dispatcher::rules::expr::NoHelpers;
+        use boss_dispatcher::rules::registry::{Registry, match_event, parse_raw};
+
+        let raw = parse_raw(BLOG_RULE_FIXTURE).expect("the fixture is a rule file");
+        validate(&raw.rules[0]).expect("validates as _validate would");
+        let reg = Registry::from_raw(raw).expect("loads as the dispatcher would");
+        let outcome = match_event(&reg, "jobs.job.closed", &close_marker(), &NoHelpers);
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+        let inv = &outcome.matched[0].invocations[0];
+        for (k, v) in &blog_args() {
+            assert_eq!(arg(&inv.args, k), Some(v), "arg {k}");
+        }
+    }
+
     // ── A non-packet event (backlog f4cfb793) ──────────────────────
     //
     // `ledger.period.locked` names a period, not a packet: its payload
@@ -1069,13 +1362,17 @@ mod tests {
     #[test]
     fn render_fills_unset_keys_only_and_substitutes_facts() {
         let payload = close_marker();
+        let candidate = post(POST_A, POST_LIVE_A, "hello", "abc123", "ready");
         let facts = Facts {
             triggering_id: CONVERGE,
             payload: &payload,
             value: "abc123",
+            candidate: &candidate,
         };
         let template: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
-            r#"{"converge": "{event.id}", "site_hash": "{value}", "verdict": "ok", "n": 3}"#,
+            r#"{"converge": "{event.id}", "site_hash": "{value}", "verdict": "ok", "n": 3,
+                "url": "/blog-{candidate.steps.draft.slug}.html",
+                "nothing": "{candidate.steps.draft.missing}"}"#,
         )
         .unwrap();
         let existing: serde_json::Map<String, serde_json::Value> =
@@ -1091,6 +1388,14 @@ mod tests {
         );
         assert_eq!(fields["site_hash"], "abc123");
         assert_eq!(fields["n"], 3, "non-strings are copied as they are");
+        assert_eq!(
+            fields["url"], "/blog-hello.html",
+            "the candidate's own slug"
+        );
+        assert!(
+            !fields.contains_key("nothing"),
+            "a placeholder the candidate cannot answer writes nothing, never a half-filled value"
+        );
     }
 
     #[test]

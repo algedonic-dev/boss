@@ -83,9 +83,15 @@ read, and an open alarm with the same for_request is reused.
 # read at >= 90% already proves a plan of 0 honest. The pattern is
 # anchored at the line's start, so no text another line carries can be
 # read as this verb's verdict (re-review finding 3).
-version = 2
+version = 3
 on_event = "jobs.job.closed"
-when = 'kind = "ops-request" AND (outcome = "answered" OR outcome = "refused")'
+# `failed` and `indeterminate` are how the ops-request row closes a verb
+# that RAN with a nonzero or an unknown exit (design b7bb1625, backlog
+# 50a1578f); before that row it closed `answered` whatever the exit, so
+# this rule hears exactly the runs it heard before, and its judge still
+# reads the exit off the execute record. Pinned by boss-dispatcher's
+# an_ops_request_rule_that_hears_an_answer_hears_a_failure.
+when = 'kind = "ops-request" AND (outcome = "answered" OR outcome = "failed" OR outcome = "indeterminate" OR outcome = "refused")'
 [[rule.do]]
 handler = "ops.judge"
 args = { verb = '"prune-registry-versions-daily"', verdict_pattern = '"^prune-registry-versions: OK . deleted (?P<deleted>[0-9]+) of (?P<planned>[0-9]+) planned .* listed (?P<listed>[0-9]+) of (?P<total>[0-9]+) versions, indexes read [0-9]+ of [0-9]+ tag.s., (?P<read_pct>[0-9]+) percent; (?P<unclassified>[0-9]+) unclassified kept"', when = '"deleted = planned AND listed >= total AND read_pct >= 90"' }

@@ -18,7 +18,7 @@ test('empty plugin registry names the declared delivery and offers a keyboard-re
       writes.push(`${r.method()} ${path}`);
     }
   });
-  await mountPage(page, '/it/registry/step-plugins', {titleMatch: /Step UX plugins/});
+  await mountPage(page, '/engineering/registry/step-plugins', {titleMatch: /Step UX plugins/});
   const empty = page.locator('.catalog p.empty');
   await expect(empty).toContainText('infra/platform/step-plugins/');
   await expect(empty).toContainText('boss-platform-workflow-seed');

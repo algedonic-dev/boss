@@ -35,6 +35,7 @@ pub fn router(state: ContentApiState) -> Router {
         .route("/api/content/bulletins/{id}", put(update).delete(remove))
         .route("/api/content/bulletins/{id}/dismiss", post(dismiss))
         .route("/api/content/manual", get(manual_tree).post(section_create))
+        .route("/api/content/manual-index", get(manual_index))
         .route("/api/content/manual-history/{*slug}", get(section_history))
         .route(
             "/api/content/manual/{*slug}",
@@ -191,6 +192,17 @@ async fn dismiss(
 }
 
 // --- manual ---------------------------------------------------------------
+
+async fn manual_index(State(state): State<Arc<ContentApiState>>, headers: HeaderMap) -> Response {
+    let user = match user_from_headers(&headers) {
+        Ok(u) => u,
+        Err(e) => return e.into_response(),
+    };
+    match state.repo.manual_index(&user).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => err(e),
+    }
+}
 
 async fn manual_tree(State(state): State<Arc<ContentApiState>>, headers: HeaderMap) -> Response {
     let user = match user_from_headers(&headers) {

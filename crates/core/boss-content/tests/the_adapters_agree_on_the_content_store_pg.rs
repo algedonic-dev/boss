@@ -153,6 +153,8 @@ fn section(slug: &str, parent: Option<&str>, title: &str) -> ManualSectionDraft 
         sort_order: 0,
         audience: Audience::all(),
         published: true,
+        owner_station: None,
+        authoring_job_id: None,
     }
 }
 
@@ -722,6 +724,8 @@ async fn a_section_reads_back_as_created_with_its_first_version<C: ContentReposi
         sort_order: 3,
         audience: Audience(json!({ "departments": ["brewing"] })),
         published: true,
+        owner_station: None,
+        authoring_job_id: None,
     };
     let s = write(c, d).await;
     assert_eq!(

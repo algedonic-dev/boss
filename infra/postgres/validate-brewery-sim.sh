@@ -648,16 +648,19 @@ echo "    conservation invariants green (platform 8 + brewery 14; N + P exact)"
 echo "==> [9/10] running audit_log integrity check"
 # `boss-audit-integrity-check` walks audit_log and reports
 # dangling cross-event refs + chain-hash anomalies + created_at
-# regressions. The integrity-check anomalies (chain-hash) are
-# NOT made hard-fail because the chain-hash verification
-# surfaces a known race in the trigger (BIGSERIAL id is allocated
-# before the advisory_xact_lock is acquired, so concurrent
-# multi-service inserts can produce id-order ≠ lock-order, which
-# the verifier reads as a chain break even though the row data is
-# correct). Tracked under "Deployment / infra → audit_log
-# id-ordering race" in TODO.md. The rebuilders (step 8) are the
-# canonical correctness check; they walk by id and reconstruct
-# projections cleanly even with hash-chain anomalies present.
+# regressions. Its anomalies are NOT made hard-fail here. This
+# comment used to justify that by a race in the chain-hash trigger
+# (BIGSERIAL allocating the id before the advisory_xact_lock, so
+# id-order ≠ lock-order), but the trigger in
+# infra/postgres/schema/02-events.sql allocates id and created_at
+# AFTER the lock, so that race is closed, and the roadmap section
+# it was "tracked under" was never written. What stays true: an id
+# gap with an intact chain is a burned sequence value, which the
+# binary itself reports as a warning, and no backlog item tracks
+# making this step hard-fail (2026-11-17). The rebuilders (step 8)
+# are the canonical correctness check; they walk by id and
+# reconstruct projections cleanly even with hash-chain anomalies
+# present.
 #
 # But the binary itself MUST exist — pre-2026-05-05 the `bin`
 # feature was opt-in, so `cargo build --release --workspace`
@@ -671,7 +674,7 @@ if [ ! -x "$INTEGRITY_BIN" ]; then
 fi
 "$INTEGRITY_BIN" \
     --database-url "postgres://boss:boss@127.0.0.1/boss" || \
-    echo "    (integrity check reported anomalies — informational only; see TODO)"
+    echo "    (integrity check reported anomalies — informational only; see the comment above step 9)"
 
 echo
 echo "==> validation complete — all gates green."

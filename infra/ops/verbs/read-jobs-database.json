@@ -1,0 +1,8 @@
+{
+  "about": "READ-ONLY fixed database statistics and passive IO accounting, bound to actual postgres Pod/container, StatefulSet, PVC, PV and Longhorn volume UIDs. Two bounded samples preserve full native stdout/stderr in an attached observation. It also attaches temp_statements (backlog 891e48c9): when pg_stat_statements is installed in the boss database and preloaded, one more fixed read returns the top 10 statements by temp_blks_written, server-wide across every database and role, as normalized pg_stat_statements text (constants already $n) truncated to 240 characters; query text is lexed from its first 2048 characters and masked: single-quoted string bodies (standard, E, U& and B/X forms) and line comments are replaced by ? markers; the first dollar-quote or block-comment opener masks the rest of the text; a backslash inside a standard string masks the rest of the text; line comments end at CR or LF; double-quoted identifiers are kept. The mask runs in the database, so the retained native stdout holds only masked text. Otherwise temp_statements says absent and why. No bind values, arbitrary SQL, new credentials or grants. Pool snapshots are read separately through /api/jobs/database-observation; missing waiter/latency measurements are not zero. This observation does not establish a production stall cause or a latency-window pass.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/read-jobs-database.sh"],
+  "params": [],
+  "capture": "separate-streams",
+  "timeout": 190
+}

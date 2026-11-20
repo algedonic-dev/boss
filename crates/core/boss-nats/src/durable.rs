@@ -17,14 +17,19 @@
 //!
 //! This is **not** a second system of record. The Postgres `audit_log`
 //! remains authoritative; the stream is a bounded, expiring buffer whose
-//! sole job is reliable in-flight delivery. Publishers keep using plain
-//! core NATS (`EventBus::publish`) — JetStream captures any message
-//! published to a subject the stream covers, so no publisher changes.
+//! sole job is reliable in-flight delivery. Publishers call
+//! `EventBus::publish`; the NATS adapter publishes a subject the stream
+//! covers ([`stream_captures`]) through JetStream and answers Ok only on
+//! the stream's PubAck, so a publisher's Ok means the buffer holds the
+//! event (backlog 2e45840a). A core publish to a covered subject is
+//! still captured — it is just never confirmed.
 
+use async_nats::jetstream::consumer::pull::{MessagesError, MessagesErrorKind};
 use async_nats::jetstream::consumer::{AckPolicy, pull};
-use async_nats::jetstream::{AckKind, Context, Message, stream};
+use async_nats::jetstream::context::{GetStreamError, GetStreamErrorKind};
+use async_nats::jetstream::{AckKind, Context, ErrorCode, Message, stream};
 use std::time::Duration;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 /// Canonical durable stream name. One stream buffers every subject the
 /// dispatcher must consume reliably.
@@ -119,6 +124,40 @@ pub fn stream_subjects() -> Vec<String> {
     .collect()
 }
 
+/// Does the [`STREAM_NAME`] stream capture a publish to `subject`? The
+/// NATS adapter asks this of every publish (backlog 2e45840a): a subject
+/// the stream captures is published through JetStream and is Ok only on
+/// the stream's PubAck, because the outbox relay stamps `delivered_at` on
+/// Ok and the stream is the delivery buffer the durable consumers read.
+/// Any other subject has no stream to ack it, so it goes as core NATS. A
+/// subject the client would refuse to send is captured by nothing, so it
+/// takes the core path, whose refusal the relay dead-letters (e4019cbc).
+pub fn stream_captures(subject: &str) -> bool {
+    async_nats::Subject::from(subject).is_valid()
+        && stream_subjects().iter().any(|pattern| {
+            pattern
+                .strip_suffix('>')
+                .is_some_and(|family| subject.starts_with(family) && subject.len() > family.len())
+                || pattern == subject
+        })
+}
+
+/// How long the stream remembers a `Nats-Msg-Id` and drops a second
+/// publish carrying it (backlog 2e45840a). The adapter sends every
+/// stream-captured event with its event id as `Nats-Msg-Id`, and the
+/// relay re-publishes a row whose ack it never saw — so a publish the
+/// stream stored but whose ack was lost in transit comes back within one
+/// ack wait plus one relay pass, and this window drops it instead of
+/// handing every durable consumer the event twice. Two minutes is the
+/// server's own default, which the live stream has had since it was
+/// created without one (the config left the field zero, so the server
+/// chose); naming it makes it this crate's value, held by
+/// [`ensure_stream`], and pinned above [`crate::bus::PUBLISH_ACK_WAIT`].
+/// A retry later than this (a bus dark for longer, with the ack lost
+/// just before) is stored again; consumers already tolerate that — the
+/// standing at-least-once contract — this only makes it rare.
+pub const DUPLICATE_WINDOW: Duration = Duration::from_secs(2 * 60);
+
 /// Per-attempt redelivery spacing. Entry `i` is the delay before delivery
 /// `i+2` (delivery 1 is the original). The schedule widens so a transient
 /// condition has time to clear, and the tail repeats at 30s until
@@ -183,6 +222,7 @@ pub fn stream_config() -> stream::Config {
         // 4 GiB ceiling (server file store is 8 GiB). Comfortably exceeds a
         // full sim-year of job/step/inventory events.
         max_bytes: 4 * 1024 * 1024 * 1024,
+        duplicate_window: DUPLICATE_WINDOW,
         num_replicas: 1,
         ..Default::default()
     }
@@ -208,12 +248,60 @@ pub async fn ensure_stream(ctx: &Context) -> Result<(), DurableError> {
     let mut want = stream_subjects();
     have.sort();
     want.sort();
-    if have != want {
+    // The duplicate window is reconciled the same way: the adapter's
+    // retry-after-a-lost-ack is dropped only inside it (backlog 2e45840a).
+    if have != want || info.config.duplicate_window != DUPLICATE_WINDOW {
         ctx.update_stream(stream_config())
             .await
             .map_err(|e| DurableError::Stream(format!("updating stream subjects: {e}")))?;
     }
     Ok(())
+}
+
+/// The stream a durable consumer is opened on. When it is
+/// [`STREAM_NAME`] and the server says it is not there, it is ensured
+/// first ([`ensures_on_open`]).
+///
+/// Backlog 2e45840a (design ad9519bc part b, the stream half): car 1
+/// ensures the stream on every (re)connect, so a stream deleted while
+/// the client STAYED connected came back only on the next reconnect.
+/// Until then every consumer's reopen met `stream not found` and
+/// waited — and every event the relay published reached no stream,
+/// because a core publish to a subject no stream captures answers Ok.
+/// A consumer's stream ending is what triggers its reopen, so ensuring
+/// here bounds that window to one reopen.
+pub async fn bound_stream(
+    ctx: &Context,
+    stream_name: &str,
+) -> Result<stream::Stream, DurableError> {
+    match ctx.get_stream(stream_name).await {
+        Ok(stream) => Ok(stream),
+        Err(e) if ensures_on_open(stream_name, &e) => {
+            warn!(
+                stream = stream_name,
+                "stream is gone while the bus stayed connected; ensuring it before the open"
+            );
+            ensure_stream(ctx).await?;
+            ctx.get_stream(stream_name)
+                .await
+                .map_err(|e| DurableError::Stream(e.to_string()))
+        }
+        Err(e) => Err(DurableError::Stream(e.to_string())),
+    }
+}
+
+/// Does this failed `get_stream` mean the stream is ensured before the
+/// open? Only when the server
+/// itself answered that [`STREAM_NAME`] does not exist: a dark bus
+/// (a request that timed out) is waited out, never answered with a
+/// create, and a stream whose configuration this crate does not own (a
+/// test's throwaway) is never created by an open.
+pub fn ensures_on_open(stream_name: &str, error: &GetStreamError) -> bool {
+    stream_name == STREAM_NAME
+        && matches!(
+            error.kind(),
+            GetStreamErrorKind::JetStream(e) if e.error_code() == ErrorCode::STREAM_NOT_FOUND
+        )
 }
 
 /// Delete the stream (dropping its messages **and** durable consumers) and
@@ -286,16 +374,17 @@ pub fn consumer_config(durable: &str, filter_subjects: Vec<String>) -> pull::Con
 /// `stream_name` is a parameter (not hardcoded to [`STREAM_NAME`]) only so
 /// tests can exercise the mechanics on a throwaway stream; production
 /// passes [`STREAM_NAME`].
+///
+/// The stream it answers ENDS when its consumer is found to have
+/// vanished ([`UntilVanished`]), so a caller under [`keep_bound`] opens
+/// it again — and this create-or-update recreates the consumer.
 pub async fn open_durable(
     ctx: &Context,
     stream_name: &str,
     durable: &str,
     filter_subjects: Vec<String>,
-) -> Result<pull::Stream, DurableError> {
-    let stream = ctx
-        .get_stream(stream_name)
-        .await
-        .map_err(|e| DurableError::Stream(e.to_string()))?;
+) -> Result<Messages, DurableError> {
+    let stream = bound_stream(ctx, stream_name).await?;
     // create-or-UPDATE (not get_or_create): reconciles a persisted
     // consumer whose config drifted from `consumer_config` — durable
     // consumers outlive binary deploys, so without the update an old
@@ -309,7 +398,185 @@ pub async fn open_durable(
     consumer
         .messages()
         .await
+        .map(until_vanished)
         .map_err(|e| DurableError::Consumer(e.to_string()))
+}
+
+/// A bound durable consumer's message stream, as [`open_durable`]
+/// answers it: the client's pull stream, ended when its consumer has
+/// vanished.
+pub type Messages = UntilVanished<pull::Stream>;
+
+/// End `messages` after the first error saying its consumer is gone.
+pub fn until_vanished<S>(messages: S) -> UntilVanished<S> {
+    UntilVanished {
+        inner: messages,
+        vanished: false,
+    }
+}
+
+/// A pull stream that ENDS once the server has said there is no
+/// consumer to pull from, instead of asking again forever.
+///
+/// Backlog 2e45840a (outage 05fd165a, design ad9519bc part b, the
+/// NoResponders remainder): async-nats 0.49.1 ends a pull stream only
+/// when the server's `Consumer Deleted` status reaches a pull request
+/// that is waiting. A consumer that vanished while nothing was waiting
+/// — removed while the client was disconnected, or lost with the
+/// server's JetStream state — leaves every later pull request with no
+/// subscriber on its `CONSUMER.MSG.NEXT` subject, and the client
+/// yields `NoResponders` for each one and asks again. Every consumer
+/// loop here skips a stream error and keeps reading, so the stream
+/// never ended, [`keep_bound`] never reopened it, and the consumer —
+/// whose `create_consumer` would have brought it back — stayed gone
+/// for the life of the process, logging one warning per pull.
+///
+/// Only `NoResponders` ends it. A missed heartbeat is the dark-bus
+/// case the client already recovers from by itself (it re-asks for
+/// the consumer's info on every reconnect), and ending on it would
+/// turn each reconnect into a reopen.
+pub struct UntilVanished<S> {
+    inner: S,
+    vanished: bool,
+}
+
+impl<T, S> futures::Stream for UntilVanished<S>
+where
+    S: futures::Stream<Item = Result<T, MessagesError>> + Unpin,
+{
+    type Item = Result<T, MessagesError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.vanished {
+            return std::task::Poll::Ready(None);
+        }
+        let polled = std::pin::Pin::new(&mut self.inner).poll_next(cx);
+        if let std::task::Poll::Ready(Some(Err(e))) = &polled
+            && e.kind() == MessagesErrorKind::NoResponders
+        {
+            // Yield this one error, so the loop still logs why its
+            // session ended, and end on the next poll.
+            self.vanished = true;
+        }
+        polled
+    }
+}
+
+/// The first wait between two attempts to open a durable consumer.
+pub const OPEN_RETRY_FIRST: Duration = Duration::from_secs(1);
+
+/// The longest wait between two attempts: a bus dark for an hour costs
+/// one attempt (and one warning) every half minute, not a tight loop.
+pub const OPEN_RETRY_CAP: Duration = Duration::from_secs(30);
+
+/// The wait after the `attempt`-th failed open (1-based): doubling from
+/// [`OPEN_RETRY_FIRST`], stopping at [`OPEN_RETRY_CAP`].
+pub fn open_retry_delay(attempt: u32) -> Duration {
+    let doublings = attempt.saturating_sub(1).min(16);
+    OPEN_RETRY_FIRST
+        .saturating_mul(1u32 << doublings)
+        .min(OPEN_RETRY_CAP)
+}
+
+/// Run `op` until it answers, waiting [`open_retry_delay`] between
+/// failures and naming `what` in a warning on each one.
+///
+/// Backlog 2e45840a (outage 05fd165a, design ad9519bc car 2): since car
+/// 1, [`crate::NatsEventBus::connect`] hands back a bus that is still
+/// reconnecting when NATS is dark, so a ONE-SHOT open after it meets a
+/// JetStream request that times out — and each consumer gave up for the
+/// life of its process: the dispatcher exited, the escalation router
+/// and the assets ingress fell back to at-most-once. A failure to open
+/// is a transport condition, so the answer is to wait for the bus.
+pub async fn retry_capped<T, E, F, Fut>(what: &str, mut op: F) -> T
+where
+    E: std::fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        match op().await {
+            Ok(value) => {
+                if attempt > 0 {
+                    info!(
+                        consumer = what,
+                        attempts = attempt + 1,
+                        "durable consumer opened after waiting for the bus"
+                    );
+                }
+                return value;
+            }
+            Err(e) => {
+                attempt = attempt.saturating_add(1);
+                let wait = open_retry_delay(attempt);
+                // The operation's own error is the cause; the message names
+                // none of its own. It used to say "bus dark or stream not
+                // ensured" for every failure, including a lane consumer
+                // fenced as gone, which is neither (backlog 960fabfc).
+                warn!(
+                    consumer = what,
+                    attempt,
+                    retry_in_secs = wait.as_secs(),
+                    error = %e,
+                    "durable consumer not open yet; retrying"
+                );
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+}
+
+/// Keep a durable consumer bound for the life of the caller: open it
+/// through [`retry_capped`], hand what opened to `run`, and when `run`
+/// returns — the consumer's message stream ENDED — open it again.
+///
+/// Backlog 2e45840a (outage 05fd165a, design ad9519bc car 3): car 2
+/// made the first open wait for the bus, but a bound stream that ends
+/// (the client ends a pull stream whose consumer the server deleted, as
+/// [`reset_stream`] does to a live dispatcher) still returned for good,
+/// and the consumer's rules stayed off until a restart or a registry
+/// reload. An ended stream is a transport condition like a failed
+/// open, so the answer is the same: open it again.
+///
+/// The wait before a reopen climbs [`open_retry_delay`] while bound
+/// sessions keep ending inside [`OPEN_RETRY_CAP`], and starts over after
+/// one that lasted longer — so a stream that ends the moment it opens
+/// costs one warning every half minute, not a tight loop. It never
+/// returns: `Infallible` says so in the type.
+pub async fn keep_bound<T, E, Open, OpenFut, Run, RunFut>(
+    what: &str,
+    mut open: Open,
+    mut run: Run,
+) -> std::convert::Infallible
+where
+    E: std::fmt::Display,
+    Open: FnMut() -> OpenFut,
+    OpenFut: std::future::Future<Output = Result<T, E>>,
+    Run: FnMut(T) -> RunFut,
+    RunFut: std::future::Future<Output = ()>,
+{
+    let mut quick_ends: u32 = 0;
+    loop {
+        let bound = retry_capped(what, &mut open).await;
+        let since = tokio::time::Instant::now();
+        run(bound).await;
+        quick_ends = if since.elapsed() >= OPEN_RETRY_CAP {
+            1
+        } else {
+            quick_ends.saturating_add(1)
+        };
+        let wait = open_retry_delay(quick_ends);
+        warn!(
+            consumer = what,
+            retry_in_secs = wait.as_secs(),
+            "durable consumer's message stream ended; re-opening it"
+        );
+        tokio::time::sleep(wait).await;
+    }
 }
 
 /// Pure policy: has this message exhausted its redelivery budget? The
@@ -328,7 +595,7 @@ pub fn is_dead_letter(delivered: i64) -> bool {
 ///
 /// Generic over the error type so callers can pass their own (`anyhow`,
 /// `&str`, …) without this crate depending on it.
-/// Three-way settle outcome. `Retry` NAKs for redelivery (converges
+/// Handler settlement plus an explicit routing hold. `Retry` NAKs for redelivery (converges
 /// once the transient cause clears, dead-letters after the budget);
 /// `Permanent` skips the budget entirely: a deterministic data error
 /// (a seed typo, a malformed body) fails identically on every
@@ -339,6 +606,9 @@ pub fn is_dead_letter(delivered: i64) -> bool {
 /// fast path.
 pub enum Settle {
     Ack,
+    /// Routing is unknown, not a failed handler. The owning runner rechecks
+    /// while sending progress; it must not NAK, ACK, or exhaust retry budget.
+    Hold(String),
     Retry(String),
     Permanent(String),
 }
@@ -360,6 +630,16 @@ pub async fn settle_classified(msg: &Message, outcome: Settle) {
                 "DEAD-LETTER: deterministic data error; terminating without redelivery (source recoverable from audit_log)"
             );
             let _ = msg.ack_with(AckKind::Term).await;
+        }
+        Settle::Hold(reason) => {
+            // A caller without a recheck loop still cannot discard unknown work.
+            warn!(%reason, "delivery held; caller must recheck authoritative routing");
+            loop {
+                if let Err(error) = msg.ack_with(AckKind::Progress).await {
+                    warn!(%error, "held delivery progress unread; source remains pending");
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         }
         Settle::Retry(err) => settle(msg, Err::<(), _>(err)).await,
     }
@@ -457,6 +737,45 @@ mod tests {
         assert!(!c.max_age.is_zero(), "age cap must expire the buffer");
     }
 
+    /// Backlog 2e45840a: the relay re-publishes a row whose ack it did
+    /// not see, so the stream must still remember the first publish's
+    /// `Nats-Msg-Id` when the retry arrives — at the earliest one ack
+    /// wait later. A window shorter than that wait stores every
+    /// lost-ack retry twice; zero hands the choice back to the server.
+    #[test]
+    fn the_duplicate_window_is_ours_and_outlasts_the_ack_wait() {
+        assert_eq!(stream_config().duplicate_window, DUPLICATE_WINDOW);
+        assert!(
+            DUPLICATE_WINDOW >= crate::bus::PUBLISH_ACK_WAIT * 10,
+            "a lost-ack retry must land inside the window with room for relay passes"
+        );
+        assert!(DUPLICATE_WINDOW < stream_config().max_age);
+    }
+
+    /// The adapter's route: a captured subject waits for the stream's
+    /// ack, anything else does not (there is no stream to give one).
+    #[test]
+    fn the_stream_captures_its_families_and_nothing_else() {
+        for captured in [
+            "jobs.job.created",
+            "step.done.task",
+            "events.outbox.dead_lettered",
+            "asset.event.recorded",
+        ] {
+            assert!(stream_captures(captured), "{captured}");
+        }
+        for live_only in [
+            "jobs",
+            "jobsx.created",
+            "cybernetics.message.enqueued",
+            "actor.login.unresolved",
+            "jobs.a b",
+            "",
+        ] {
+            assert!(!stream_captures(live_only), "{live_only:?}");
+        }
+    }
+
     #[test]
     fn consumer_config_enables_explicit_ack_and_bounded_redelivery() {
         let c = consumer_config("dispatcher-rules", vec!["step.>".to_string()]);
@@ -541,5 +860,270 @@ mod tests {
     #[test]
     fn coarse_filters_empty_input_is_empty() {
         assert!(coarse_filter_subjects(&[]).is_empty());
+    }
+
+    /// Backlog 2e45840a, design ad9519bc car 2: the wait between two
+    /// attempts to open a durable consumer doubles from one second and
+    /// stops at thirty, so a bus dark for an hour costs one quiet
+    /// attempt every half minute rather than a tight loop.
+    #[test]
+    fn the_open_retry_delay_doubles_to_its_cap() {
+        let walked: Vec<u64> = (1..=8).map(|a| open_retry_delay(a).as_secs()).collect();
+        assert_eq!(walked, vec![1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(
+            open_retry_delay(0),
+            OPEN_RETRY_FIRST,
+            "attempt 0 reads as the first"
+        );
+        assert_eq!(
+            open_retry_delay(u32::MAX),
+            OPEN_RETRY_CAP,
+            "no overflow at the tail"
+        );
+    }
+
+    /// The retry hands back what the operation finally answered, after
+    /// as many attempts as it took — a failure is a wait, never the end.
+    #[tokio::test]
+    async fn retry_capped_keeps_trying_until_the_operation_answers() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let got = retry_capped("test-consumer", || {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    Err(format!("dark, attempt {n}"))
+                } else {
+                    Ok(42)
+                }
+            }
+        })
+        .await;
+        assert_eq!(got, 42);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// Longer than one request on a dark bus takes to give up: the
+    /// async-nats client's request timeout, ten seconds by default
+    /// (`ConnectOptions`), not the JetStream context's five — a seven
+    /// second window was measured to elapse before the one-shot open
+    /// answered, which would have let the test below pass on old code.
+    const DARK_WINDOW: Duration = Duration::from_secs(15);
+
+    /// The defect itself. Car 1 made a first connect to a dark bus
+    /// return a bus that keeps reconnecting, so every one-shot open
+    /// that followed it — the dispatcher's two consumers, the
+    /// escalation router's, the assets ingress's — met a request that
+    /// timed out and gave up: the dispatcher exited, the other two fell
+    /// back to at-most-once for the life of the process. Keeping it
+    /// bound through [`keep_bound`] — the one door every durable
+    /// consumer opens through since the dispatcher's assignment consumer
+    /// moved onto it — WAITS for the bus instead: past a request timeout
+    /// it is still opening, and nothing has run on a consumer.
+    #[tokio::test]
+    async fn keeping_a_durable_consumer_bound_on_a_dark_bus_waits_rather_than_failing() {
+        let dark = boss_testing::dark_port();
+        let bus = crate::NatsEventBus::connect(&format!("nats://{}", dark.addr))
+            .await
+            .expect("a dark bus is not a connect error (car 1)");
+        let js = bus.jetstream();
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let kept = tokio::time::timeout(
+            DARK_WINDOW,
+            keep_bound(
+                "dark-bus-test",
+                || open_durable(&js, STREAM_NAME, "dark-bus-test", vec!["jobs.>".into()]),
+                |_messages| {
+                    ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::future::ready(())
+                },
+            ),
+        )
+        .await;
+        assert!(
+            kept.is_err(),
+            "nothing listens at {}; the consumer must still be opening, not answered",
+            dark.addr
+        );
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a dark bus opened no consumer"
+        );
+    }
+
+    /// The control for the test above: inside the same window the
+    /// ONE-SHOT open on a dark bus answers an error. Without this,
+    /// "still pending" could mean only that a dark request hangs past
+    /// the window, and the test above would pass on the old code too.
+    #[tokio::test]
+    async fn a_one_shot_open_on_a_dark_bus_gives_up_inside_the_window() {
+        let dark = boss_testing::dark_port();
+        let bus = crate::NatsEventBus::connect(&format!("nats://{}", dark.addr))
+            .await
+            .expect("a dark bus is not a connect error (car 1)");
+        let js = bus.jetstream();
+        let opened = tokio::time::timeout(
+            DARK_WINDOW,
+            open_durable(&js, STREAM_NAME, "dark-bus-test", vec!["jobs.>".into()]),
+        )
+        .await
+        .expect("a one-shot open answers inside the window");
+        assert!(opened.is_err(), "a dark bus cannot open a consumer");
+    }
+
+    /// Drive [`keep_bound`] on a paused clock for `window`, with a `run`
+    /// that holds each bound session for `session`, and answer the
+    /// instants (seconds from the start) at which it opened.
+    async fn opens_within(window: Duration, session: Duration) -> Vec<u64> {
+        let start = tokio::time::Instant::now();
+        let opened = std::sync::Mutex::new(Vec::new());
+        let ran = std::sync::Mutex::new(Vec::new());
+        let kept = tokio::time::timeout(
+            window,
+            keep_bound(
+                "test-consumer",
+                || {
+                    let mut opened = opened.lock().unwrap();
+                    opened.push(start.elapsed().as_secs());
+                    let n = opened.len();
+                    async move { Ok::<_, String>(n) }
+                },
+                |n| {
+                    ran.lock().unwrap().push(n);
+                    tokio::time::sleep(session)
+                },
+            ),
+        )
+        .await;
+        assert!(kept.is_err(), "keep_bound never answers");
+        let opened = opened.into_inner().unwrap();
+        let ran = ran.into_inner().unwrap();
+        assert_eq!(
+            ran,
+            (1..=opened.len()).collect::<Vec<_>>(),
+            "every session runs on what its own open answered"
+        );
+        opened
+    }
+
+    /// Backlog 2e45840a, design ad9519bc car 3, the defect itself: a
+    /// bound stream that ENDS is opened again, rather than its consumer
+    /// staying off for the life of the process. A stream that ends the
+    /// moment it opens is reopened on the open-retry ladder, so it costs
+    /// one attempt every half minute at worst, never a tight loop.
+    #[tokio::test(start_paused = true)]
+    async fn a_consumer_whose_stream_ends_is_opened_again_on_the_ladder() {
+        let opens = opens_within(Duration::from_secs(100), Duration::ZERO).await;
+        assert_eq!(opens, vec![0, 1, 3, 7, 15, 31, 61, 91]);
+    }
+
+    /// A session that stayed bound longer than the cap starts the ladder
+    /// over: one stream ending after an hour's work waits one second,
+    /// not the thirty a run of instant ends has climbed to.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_that_lasted_starts_the_reopen_ladder_over() {
+        let opens = opens_within(Duration::from_secs(200), Duration::from_secs(60)).await;
+        assert_eq!(opens, vec![0, 61, 122, 183]);
+    }
+
+    /// What a pull stream yields, as kinds: a message's number, or the
+    /// kind of the error the client reported in its place.
+    async fn kinds<S>(messages: S) -> Vec<Result<u32, MessagesErrorKind>>
+    where
+        S: futures::Stream<Item = Result<u32, MessagesError>>,
+    {
+        use futures::StreamExt;
+        messages.map(|m| m.map_err(|e| e.kind())).collect().await
+    }
+
+    /// Backlog 2e45840a (design ad9519bc part b, the NoResponders
+    /// remainder), the defect itself: the client answers a pull stream
+    /// whose consumer vanished with `NoResponders` on every pull, and
+    /// never ends it, so `keep_bound` never opened — and recreated —
+    /// the consumer. Wrapped, the stream yields that error once (the
+    /// consumer loop still logs it) and then ENDS. `take` bounds the
+    /// unwrapped behaviour, which would otherwise never finish.
+    #[tokio::test]
+    async fn a_stream_whose_consumer_vanished_ends_after_its_first_no_responders() {
+        use futures::StreamExt;
+        let forever = futures::stream::iter([Ok(1)]).chain(futures::stream::repeat_with(|| {
+            Err(MessagesError::new(MessagesErrorKind::NoResponders))
+        }));
+        assert_eq!(
+            kinds(until_vanished(forever).take(100)).await,
+            vec![Ok(1), Err(MessagesErrorKind::NoResponders)],
+            "one NoResponders is reported, and then the stream ends"
+        );
+    }
+
+    /// The control: every other error passes through without ending the
+    /// stream. A missed heartbeat is a dark bus the client recovers from
+    /// by itself, and a failed pull is retried by it; neither says the
+    /// consumer is gone.
+    #[tokio::test]
+    async fn other_stream_errors_pass_through_and_the_stream_goes_on() {
+        let mixed = futures::stream::iter([
+            Ok(1),
+            Err(MessagesError::new(MessagesErrorKind::MissingHeartbeat)),
+            Ok(2),
+            Err(MessagesError::new(MessagesErrorKind::Pull)),
+            Ok(3),
+            Err(MessagesError::new(MessagesErrorKind::Other)),
+            Ok(4),
+        ]);
+        assert_eq!(
+            kinds(until_vanished(mixed)).await,
+            vec![
+                Ok(1),
+                Err(MessagesErrorKind::MissingHeartbeat),
+                Ok(2),
+                Err(MessagesErrorKind::Pull),
+                Ok(3),
+                Err(MessagesErrorKind::Other),
+                Ok(4),
+            ]
+        );
+    }
+
+    /// The server's own answer for a stream that is not there, as the
+    /// client parses it off the wire.
+    fn server_error(code: u64) -> async_nats::jetstream::Error {
+        serde_json::from_value(serde_json::json!({
+            "code": 404,
+            "err_code": code,
+            "description": "from the server",
+        }))
+        .unwrap()
+    }
+
+    /// Backlog 2e45840a, design ad9519bc part (b), the stream half: a
+    /// stream deleted while the client stayed connected was ensured
+    /// again only on the next reconnect, so every consumer's reopen met
+    /// `stream not found` and waited — and every event the relay
+    /// published meanwhile reached no stream. An open now ensures
+    /// [`STREAM_NAME`] when the server says it is not there.
+    #[test]
+    fn an_open_ensures_the_events_stream_when_the_server_says_it_is_gone() {
+        let gone = GetStreamError::new(GetStreamErrorKind::JetStream(server_error(
+            async_nats::jetstream::ErrorCode::STREAM_NOT_FOUND.0,
+        )));
+        assert!(ensures_on_open(STREAM_NAME, &gone));
+    }
+
+    /// The controls. A dark bus is waited out, never answered with a
+    /// create; another server refusal is not an absence; and a stream
+    /// whose configuration this crate does not own (a test's throwaway)
+    /// is never created by an open.
+    #[test]
+    fn only_a_missing_events_stream_is_ensured_on_open() {
+        let gone = GetStreamError::new(GetStreamErrorKind::JetStream(server_error(
+            async_nats::jetstream::ErrorCode::STREAM_NOT_FOUND.0,
+        )));
+        assert!(!ensures_on_open("test_throwaway", &gone));
+        let dark = GetStreamError::new(GetStreamErrorKind::Request);
+        assert!(!ensures_on_open(STREAM_NAME, &dark));
+        let unavailable = GetStreamError::new(GetStreamErrorKind::JetStream(server_error(
+            async_nats::jetstream::ErrorCode::JETSTREAM_NOT_ENABLED.0,
+        )));
+        assert!(!ensures_on_open(STREAM_NAME, &unavailable));
     }
 }

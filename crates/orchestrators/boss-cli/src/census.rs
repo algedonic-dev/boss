@@ -1552,7 +1552,7 @@ mod tests {
         let mut s = StationSpec::draft(
             name,
             name,
-            StationKind::Batch,
+            StationKind::Group,
             predicate,
             chrono::Utc::now(),
         );

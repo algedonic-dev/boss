@@ -65,7 +65,10 @@ BOSS authenticates at a single trust boundary: **`boss-gateway`**.
 The gateway establishes identity (signed session cookie today) and
 forwards it to backend services as an `x-boss-user` header, which
 the services trust verbatim. Real per-service auth has not landed
-yet (see the *Integrated IAM* item in [`TODO.md`](TODO.md)).
+yet. The mid-2026 roadmap's related *Integrated IAM* entry (which
+sketched forward-auth through Authelia, not per-service auth) is in
+git history (see [`TODO.md`](TODO.md)); open work is tracked
+inside BOSS, not in this repository.
 
 The gateway strips every inbound `x-boss-*` header at its edge
 before injecting the session-derived identity, so a client cannot

@@ -15,11 +15,13 @@
 //!   expensive place to find out.
 
 use boss_core::actor::ActorId;
+use boss_jobs::agents::AgentsRegistry;
 use boss_jobs::events::{
     STATION_CLAIMED, STATION_DRAFT_SAVED, STATION_PUBLISHED, STATION_QUARANTINED, STATION_RETIRED,
 };
 use boss_jobs::registry::WorkflowStatus;
 use boss_jobs::station_queue::{StationPredicate, StepMatch};
+use boss_jobs::stations::StationError;
 use boss_jobs::{PgStations, StationKind, StationRegistry, StationSpec};
 use boss_testing::TestDb;
 
@@ -27,11 +29,385 @@ fn author() -> ActorId {
     ActorId::Human("emp-cto".into())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn floor_coordinates_survive_pg() {
+    let db = TestDb::new().await;
+    let registry = PgStations::new(db.pool.clone());
+    let mut row = spec("department-roundtrip");
+    row.floor = Some(boss_jobs::stations::FloorPlacement { row: 2, col: 5 });
+    registry
+        .create_draft(row.clone(), &author(), row.created_at)
+        .await
+        .unwrap();
+    let active = registry
+        .publish(&row.name, &author(), row.created_at)
+        .await
+        .unwrap();
+    assert_eq!(registry.get_active(&row.name).await.unwrap(), active);
+    assert_eq!(active.floor, row.floor);
+}
+
+/// Pass item 4 of design ccfe87ff (backlog 1bb8c479): a station's edges
+/// survive both writes — an authored draft published, and the seed's
+/// declared publish — and a row that declares none reads back with none.
+#[tokio::test(flavor = "multi_thread")]
+async fn declared_edges_survive_pg_and_a_row_without_them_reads_none() {
+    let db = TestDb::new().await;
+    let registry = PgStations::new(db.pool.clone());
+    // The declared row first: the authored publish judges its edge
+    // against the active rows (backlog 5b80b9f4), so its target is live
+    // before it publishes. The seed's declared publish judges no edge —
+    // the seed asks that of the whole bundle before any row is written.
+    let mut declared = spec("edges-declared");
+    declared.status = WorkflowStatus::Active;
+    declared.edges = vec!["edges-authored".into(), "edges-none".into()];
+    registry
+        .publish_declared(declared.clone(), &author(), declared.created_at)
+        .await
+        .unwrap();
+    assert_eq!(
+        registry.get_active("edges-declared").await.unwrap().edges,
+        declared.edges
+    );
+
+    let mut authored = spec("edges-authored");
+    authored.edges = vec!["edges-declared".into()];
+    registry
+        .create_draft(authored.clone(), &author(), authored.created_at)
+        .await
+        .unwrap();
+    let active = registry
+        .publish(&authored.name, &author(), authored.created_at)
+        .await
+        .unwrap();
+    assert_eq!(active.edges, authored.edges);
+    assert_eq!(registry.get_active(&authored.name).await.unwrap(), active);
+
+    let none = spec("edges-none");
+    registry
+        .create_draft(none.clone(), &author(), none.created_at)
+        .await
+        .unwrap();
+    let read = registry
+        .publish(&none.name, &author(), none.created_at)
+        .await
+        .unwrap();
+    assert!(read.edges.is_empty(), "{:?}", read.edges);
+}
+
+/// T2 of design 4b27a65a (backlog 3f58c823): the six tree fields survive
+/// both writes and both reads (the typed SELECT and the claim path's
+/// `to_jsonb`), and the ROLLBACK HALF: a row written by the column list a
+/// build before this car INSERTs reads back outside the tree, and the
+/// columns that build's SELECT names read a tree row unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_tree_fields_survive_pg_and_an_old_builds_row_reads_outside_the_tree() {
+    let db = TestDb::new().await;
+    let registry = PgStations::new(db.pool.clone());
+    let mut declared = spec("tree-declared");
+    // Postgres keeps microseconds and the PG `publish_declared` hands back
+    // the row it was given, so the fixture's clock is held to what the
+    // column stores or `read == published` could never hold.
+    declared.created_at = chrono::SubsecRound::trunc_subsecs(declared.created_at, 6);
+    declared.status = WorkflowStatus::Active;
+    declared.id = Some("tree-id-1".into());
+    declared.parent = Some("tree-id-0".into());
+    declared.mode = Some(boss_jobs::StationMode::Standing);
+    declared.capacity = Some(2);
+    // The rail's line (design c4854fd4, backlog 85cb2103): a column of its
+    // own, written by both INSERTs and read by both reads.
+    declared.line = Some("it".into());
+    // Its place on the parent's floor (backlog e3a927c3): a JSONB column
+    // of its own, written by both INSERTs and read by both reads.
+    declared.placement = Some(boss_jobs::stations::StationPlacement {
+        x: 590,
+        y: 120,
+        w: 230,
+        h: 170,
+    });
+    declared.machines = vec!["automation:gate-runner".into()];
+    declared.allocation.insert(
+        "host:w-1".into(),
+        boss_jobs::resources::Quantity::from(8_u64),
+    );
+    let published = registry
+        .publish_declared(declared.clone(), &author(), declared.created_at)
+        .await
+        .unwrap();
+    let read = registry.get_active("tree-declared").await.unwrap();
+    assert_eq!(read, published);
+    assert_eq!(read.line, declared.line, "the line survives the typed read");
+    assert_eq!(
+        read.placement, declared.placement,
+        "the placement survives the typed read"
+    );
+    assert_eq!(
+        (
+            read.id,
+            read.parent,
+            read.mode,
+            read.capacity,
+            read.machines,
+            read.allocation
+        ),
+        (
+            declared.id.clone(),
+            declared.parent.clone(),
+            declared.mode,
+            declared.capacity,
+            declared.machines.clone(),
+            declared.allocation.clone()
+        )
+    );
+    let jsonb: serde_json::Value =
+        sqlx::query_scalar("SELECT to_jsonb(s) FROM stations s WHERE name = 'tree-declared'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let via_jsonb: StationSpec = serde_json::from_value(jsonb).expect("the claim path's read");
+    assert_eq!(via_jsonb.allocation, declared.allocation);
+    assert_eq!(via_jsonb.parent, declared.parent);
+    assert_eq!(via_jsonb.line, declared.line, "and the claim path's read");
+    assert_eq!(
+        via_jsonb.placement, declared.placement,
+        "and the placement through the claim path's read"
+    );
+
+    // The INSERT a build before this car makes, column for column.
+    sqlx::query(
+        "INSERT INTO stations (name, version, status, title, kind, predicate, discipline,
+             created_at, edges)
+         VALUES ('tree-old-build', 1, 'active', 'Old', 'group',
+                 '{\"kind\":\"ship-a-change\"}', '[\"priority\",\"age\"]', now(), '{}')",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("an old build's insert still lands");
+    let old = registry.get_active("tree-old-build").await.unwrap();
+    assert!(
+        old.id.is_none() && old.parent.is_none() && old.mode.is_none() && old.capacity.is_none(),
+        "{old:?}"
+    );
+    assert!(old.machines.is_empty() && old.allocation.is_empty());
+    assert_eq!(old.placement, None, "a NULL placement reads as absent");
+    let jsonb: serde_json::Value =
+        sqlx::query_scalar("SELECT to_jsonb(s) FROM stations s WHERE name = 'tree-old-build'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    serde_json::from_value::<StationSpec>(jsonb).expect("NULL tree columns read as absent");
+
+    // The SELECT a build before this car makes reads the tree row.
+    let old_select: (String, i32, String, String, serde_json::Value, Vec<String>) = sqlx::query_as(
+        "SELECT name, version, status, kind, predicate, edges FROM stations
+             WHERE name = 'tree-declared'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(old_select.3, "group");
+}
+
+/// The seed is the one publish door a platform station row has, and it
+/// refuses a station whose edge names a station no active row of the
+/// bundle declares — naming both stations, before it opens a database
+/// connection. The bundle is the real platform one plus one fixture
+/// station; the URL names a host that cannot resolve, so a lint that let
+/// the row through would fail on the connect instead, and that failure
+/// names neither station.
+#[tokio::test]
+async fn the_seed_refuses_an_edge_to_an_undeclared_station_before_any_publish() {
+    let scratch = boss_testing::scratch_dir("station-edge-seed-refusal");
+    let workflow = scratch.join("workflow.toml");
+    boss_testing::write_file(
+        &workflow,
+        r#"
+[[workflow]]
+kind="station-edge-seed-test"
+label="Station edge seed test"
+category="test"
+subject_kinds=["custom"]
+[[workflow.step]]
+title="start"
+kind="trigger"
+ready_when="true"
+[[workflow.step]]
+title="done"
+kind="outcome"
+ready_when="steps.start.done"
+terminal={outcome="done"}
+"#,
+    );
+    let stations = scratch.join("stations");
+    boss_testing::create_dir(&stations);
+    let real = std::path::Path::new(boss_jobs::station_seed::platform_stations_path());
+    for file in boss_jobs::seed_loader::bundle_files(real).expect("the real station bundle") {
+        let name = file.file_name().expect("a file name");
+        std::fs::copy(&file, stations.join(name)).expect("copy a real station row");
+    }
+    let row = |edges: &str| {
+        format!(
+            "[[station]]\nname='edge-fixture'\nversion=1\nstatus='active'\n\
+             title='Edge fixture'\nkind='group'\nedges=[{edges}]\n\
+             [station.predicate]\nkind='station-edge-seed-test'\n"
+        )
+    };
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_boss-platform-workflow-seed"))
+            .env(
+                "BOSS_POSTGRES_URL",
+                "postgres://boss@unreached.invalid/none",
+            )
+            .arg("--seed-path")
+            .arg(&workflow)
+            .arg("--stations-path")
+            .arg(&stations)
+            // The copied rows are the real tree, and they hold the real
+            // pools: the seed judges the tree across both bundles (T2 of
+            // design 4b27a65a), so it is handed the pool bundle too.
+            .arg("--pools-path")
+            .arg(boss_jobs::pools::platform_pools_path())
+            .output()
+            .expect("actual seed executable")
+    };
+    boss_testing::write_file(
+        &stations.join("edge-fixture.toml"),
+        &row("'no-such-station'"),
+    );
+    let output = run();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        // The station lint's own rendering since backlog 5b80b9f4: one
+        // problem type for the seed and the publish door.
+        stderr.contains("[edge-fixture]") && stderr.contains("`no-such-station`"),
+        "the refusal names both stations: {stderr}"
+    );
+    // Codex R1 P2 on car 3eb6ecca: a KNOWN station named twice used to pass
+    // here and reach the database, and the floor's reader then refused the
+    // whole floor. The seed refuses it, naming the station and the target.
+    boss_testing::write_file(
+        &stations.join("edge-fixture.toml"),
+        &row("'gates', 'gates'"),
+    );
+    let output = run();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("edge-fixture") && stderr.contains("`gates`"),
+        "the refusal names the station and the repeated target: {stderr}"
+    );
+    assert!(!stderr.contains("connecting to Postgres"), "{stderr}");
+    // The control: an edge to a declared station passes the lint and the
+    // run goes on to the connect, which fails without naming an edge.
+    boss_testing::write_file(&stations.join("edge-fixture.toml"), &row("'gates'"));
+    let output = run();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "unreachable database: {stderr}");
+    assert!(!stderr.contains("no-such-station"), "{stderr}");
+    assert!(!stderr.contains("station edge lint"), "{stderr}");
+    assert!(stderr.contains("connecting to Postgres"), "{stderr}");
+}
+
+/// Backlog d0cf2cdc: the seed asks the publish door's question of every
+/// station row — is an equipment station's automaton a REGISTERED
+/// automation? — before it publishes anything. Registered is what
+/// `automation_actors` holds once the run declares the automations
+/// bundle, so the real stations pass against the real automations, and a
+/// fixture station naming `automation:nobody` refuses the whole run,
+/// naming the station and the automaton, with no station and no
+/// automation written.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_seed_refuses_an_equipment_automaton_no_registered_automation_answers_to() {
+    let db = TestDb::new().await;
+    let scratch = boss_testing::scratch_dir("station-automaton-seed-refusal");
+    let workflow = scratch.join("workflow.toml");
+    boss_testing::write_file(
+        &workflow,
+        r#"
+[[workflow]]
+kind="station-automaton-seed-test"
+label="Station automaton seed test"
+category="test"
+subject_kinds=["custom"]
+[[workflow.step]]
+title="start"
+kind="trigger"
+ready_when="true"
+[[workflow.step]]
+title="done"
+kind="outcome"
+ready_when="steps.start.done"
+terminal={outcome="done"}
+"#,
+    );
+    let stations = scratch.join("stations");
+    boss_testing::create_dir(&stations);
+    let real = std::path::Path::new(boss_jobs::station_seed::platform_stations_path());
+    for file in boss_jobs::seed_loader::bundle_files(real).expect("the real station bundle") {
+        let name = file.file_name().expect("a file name");
+        std::fs::copy(&file, stations.join(name)).expect("copy a real station row");
+    }
+    let row = |automaton: &str| {
+        format!(
+            "[[station]]\nname='kettle'\nversion=1\nstatus='active'\n\
+             title='Kettle'\nkind='equipment'\nautomaton='{automaton}'\nbays=1\n\
+             [station.predicate]\nkind='station-automaton-seed-test'\n"
+        )
+    };
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_boss-platform-workflow-seed"))
+            .env("BOSS_POSTGRES_URL", db.url())
+            .arg("--seed-path")
+            .arg(&workflow)
+            .arg("--stations-path")
+            .arg(&stations)
+            .arg("--pools-path")
+            .arg(boss_jobs::pools::platform_pools_path())
+            .arg("--automations-path")
+            .arg(boss_jobs::agents::automations::platform_automations_path())
+            .output()
+            .expect("actual seed executable")
+    };
+    async fn count(pool: &sqlx::PgPool, sql: &str) -> i64 {
+        sqlx::query_scalar(sql)
+            .fetch_one(pool)
+            .await
+            .expect("count rows")
+    }
+    const KETTLES: &str = "SELECT count(*) FROM stations WHERE name = 'kettle'";
+
+    boss_testing::write_file(&stations.join("kettle.toml"), &row("automation:nobody"));
+    let output = run();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("[kettle]") && stderr.contains("`automation:nobody`"),
+        "the refusal names the station and the automaton: {stderr}"
+    );
+    assert_eq!(count(&db.pool, KETTLES).await, 0, "no station written");
+    assert_eq!(
+        count(&db.pool, "SELECT count(*) FROM automation_actors").await,
+        0,
+        "refused before any publish: {stderr}"
+    );
+
+    // The control: a registered automaton seeds, kettle and all.
+    boss_testing::write_file(
+        &stations.join("kettle.toml"),
+        &row("automation:gate-runner"),
+    );
+    let output = run();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(count(&db.pool, KETTLES).await, 1, "{stderr}");
+}
+
 fn spec(name: &str) -> StationSpec {
     StationSpec::draft(
         name,
         format!("Test {name}"),
-        StationKind::Batch,
+        StationKind::Group,
         StationPredicate {
             kind: Some("ship-a-change".into()),
             ..Default::default()
@@ -45,6 +421,137 @@ async fn outbox_kinds(db: &TestDb) -> Vec<String> {
         .fetch_all(&db.pool)
         .await
         .expect("read outbox kinds")
+}
+
+/// An equipment row's automaton and bays survive the Pg adapter, and
+/// the table refuses what the viability lint refuses even to a write
+/// that never passes a door (item 0a78f8f8, register entry
+/// an-equipment-station-declares-its-bays): the deleted `batch` kind,
+/// an equipment row with no bays, a generic row with bays.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_equipment_row_round_trips_and_the_table_refuses_what_the_lint_refuses() {
+    let db = TestDb::new().await;
+    let registry = PgStations::new(db.pool.clone());
+    let mut row = spec("test-equipment");
+    row.kind = StationKind::Equipment;
+    row.automaton = Some("automation:gate-runner".into());
+    row.bays = Some(3);
+
+    // Backlog d0cf2cdc: the door reads `automation_actors`, so an
+    // automaton spelled as an automation id but held by no row is
+    // refused, naming it, and nothing goes active.
+    let mut stray = row.clone();
+    stray.automaton = Some("automation:nobody".into());
+    registry
+        .create_draft(stray.clone(), &author(), stray.created_at)
+        .await
+        .expect("a draft may name any automaton");
+    let refused = registry
+        .publish(&stray.name, &author(), stray.created_at)
+        .await
+        .expect_err("an unregistered automaton is refused");
+    let StationError::Unviable(problems) = &refused else {
+        panic!("refused as unviable, not {refused}");
+    };
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert_eq!(problems[0].field, "automaton");
+    assert!(
+        problems[0].reason.contains("`automation:nobody`"),
+        "{problems:?}"
+    );
+    assert!(
+        registry.get_active(&row.name).await.is_err(),
+        "nothing went active"
+    );
+    assert!(
+        registry
+            .registered_automatons(&stray)
+            .await
+            .expect("the registry reads")
+            .is_empty(),
+        "the dry run's read finds no row either"
+    );
+
+    // Registered, the same row publishes.
+    boss_jobs::agents::PgAgents::new(db.pool.clone())
+        .declare_automations(
+            &[boss_jobs::agents::AutomationActor {
+                id: "automation:gate-runner".into(),
+                role: "platform-admin".into(),
+                description: "Runs the gates".into(),
+                signs_for: None,
+                access_tier: None,
+                station: None,
+            }],
+            &boss_core::publisher::EventStamp::new("jobs", author()),
+        )
+        .await
+        .expect("declare the gate runner");
+    assert_eq!(
+        registry
+            .registered_automatons(&row)
+            .await
+            .expect("the registry reads"),
+        vec!["automation:gate-runner".to_string()]
+    );
+    registry
+        .create_draft(row.clone(), &author(), row.created_at)
+        .await
+        .expect("draft an equipment row");
+    registry
+        .publish(&row.name, &author(), row.created_at)
+        .await
+        .expect("publish an equipment row");
+    let read = registry.get_active(&row.name).await.expect("read it back");
+    assert_eq!(
+        (read.kind, read.automaton.as_deref(), read.bays),
+        (
+            StationKind::Equipment,
+            Some("automation:gate-runner"),
+            Some(3)
+        )
+    );
+
+    for (kind, automaton, bays, why) in [
+        ("batch", None, None, "the deleted kind"),
+        (
+            "equipment",
+            Some("automation:gate-runner"),
+            None,
+            "equipment without bays",
+        ),
+        ("equipment", None, Some(1), "equipment without an automaton"),
+        (
+            "equipment",
+            Some("emp-david"),
+            Some(1),
+            "a person as the automaton",
+        ),
+        (
+            "equipment",
+            Some("automation:gate-runner"),
+            Some(0),
+            "zero bays",
+        ),
+        ("group", None, Some(2), "a generic row with bays"),
+        (
+            "group",
+            Some("automation:gate-runner"),
+            None,
+            "a generic row with an automaton",
+        ),
+    ] {
+        let refused = sqlx::query(
+            "INSERT INTO stations (name, version, status, title, kind, predicate, automaton, bays) \
+             VALUES ('raw-write', 1, 'draft', 'Raw', $1, '{}'::jsonb, $2, $3)",
+        )
+        .bind(kind)
+        .bind(automaton)
+        .bind(bays)
+        .execute(&db.pool)
+        .await;
+        assert!(refused.is_err(), "the table admitted {why}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -90,7 +597,12 @@ async fn platform_seed_ships_the_sdlc_batch_stations() {
     );
 
     let dock = registry.get_active("loading-dock").await.expect("dock row");
-    assert_eq!(dock.kind, StationKind::Batch);
+    // The migrations alone hold the dock as `group`: the one that
+    // deleted `batch` (20261103234537) relabels every stored batch row
+    // by the rule the log's reader uses, and the dock's `equipment` row
+    // is the bundle's v5, published by the seed this database never ran.
+    assert_eq!(dock.kind, StationKind::Group);
+    assert_eq!((&dock.automaton, dock.bays), (&None, None));
     assert_eq!(dock.status, WorkflowStatus::Active);
     // The dockRows predicate, ported to data: parked cars only.
     assert_eq!(dock.predicate.kind.as_deref(), Some("ship-a-change"));
@@ -116,90 +628,11 @@ async fn platform_seed_ships_the_sdlc_batch_stations() {
     assert_eq!(review.predicate.kind.as_deref(), Some("design-doc"));
 }
 
-/// The seeded upstream pointers survive the round trip through the
-/// `stations.upstream` column, and they point at routes that exist
-/// (119-station-upstream.sql).
-///
-/// A seed whose href is a typo is a dead button, and a dead
-/// navigational aid is worse than none — it sends the operator
-/// somewhere blank at exactly the moment they are diagnosing. The
-/// route strings are pinned here; `apps/web/src/shell/nav-catalog.ts`
-/// is where they resolve.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_seeded_upstream_pointers_round_trip() {
-    let db = TestDb::new().await;
-    let registry = PgStations::new(db.pool.clone());
-
-    // The dock holds parked ship-a-change cars; a car names its
-    // motivating user-feedback packet through the `backlog_item` edge,
-    // and the triage board is where those packets are worked.
-    let dock = registry.get_active("loading-dock").await.expect("dock row");
-    let up = dock.upstream.expect("the dock declares its upstream");
-    assert_eq!(up.label, "FEEDBACK");
-    assert_eq!(up.href, "/system/feedback");
-
-    // Not every station has an upstream, and one that doesn't must
-    // read back as "none declared" rather than as an empty pointer.
-    //
-    // `design-review` is one of them since 2026-09-10. Its pointer read
-    // `DESIGN DOCS -> /system/design`, which named the corpus page as
-    // where the packets in this queue come FROM — a human clicking a row
-    // in a table of markdown files. They come from `boss design` now, a
-    // verb rather than a page, and the href had been dead since
-    // `/system/*` folded into `/it/*` on 2026-08-31. This test exists to
-    // catch a pointer at a route that does not resolve; the honest fix
-    // for one was to remove it (202609101900).
-    let review = registry
-        .get_active("design-review")
-        .await
-        .expect("review row");
-    assert_eq!(review.upstream, None);
-
-    let watchlist = registry
-        .get_active("my-watchlist")
-        .await
-        .expect("watchlist row");
-    assert_eq!(watchlist.upstream, None);
-}
-
-/// An authored station carries its upstream through the write path
-/// too — the seed is data, and so is every row an operator publishes
-/// after it.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_authored_upstream_survives_draft_and_publish() {
-    let db = TestDb::new().await;
-    let registry = PgStations::new(db.pool.clone());
-    let now = chrono::Utc::now();
-
-    let mut authored = spec("night-dock");
-    authored.upstream = Some(boss_jobs::StationUpstream {
-        label: "FEEDBACK".into(),
-        href: "/system/feedback".into(),
-    });
-    registry
-        .create_draft(authored, &author(), now)
-        .await
-        .expect("draft");
-    let published = registry
-        .publish("night-dock", &author(), now)
-        .await
-        .expect("publish");
-
-    let expected = boss_jobs::StationUpstream {
-        label: "FEEDBACK".into(),
-        href: "/system/feedback".into(),
-    };
-    assert_eq!(published.upstream.as_ref(), Some(&expected));
-    let read_back = registry.get_active("night-dock").await.expect("active");
-    assert_eq!(read_back.upstream.as_ref(), Some(&expected));
-}
-
 /// The design-review station's page context round-trips through the
 /// `stations.lens` column (138-station-lens.sql).
 ///
-/// Pinned here for the same reason the upstream hrefs are: this row is
-/// what `/it/design` draws its header and panel set from, so a seed
-/// that fails to parse is not a missing button but a page with no
+/// Pinned because this row is what `/it/design` draws its header and
+/// panel set from, so a seed that fails to parse is a page with no
 /// name. The panel keys are the renderers `DesignReviewPage` ships —
 /// a key nothing renders is a declared panel that never appears, which
 /// is exactly what this assertion caught on 2026-09-10: the seed said
@@ -233,8 +666,8 @@ async fn the_design_review_lens_round_trips() {
     assert_eq!(dock.lens, None);
 }
 
-/// An authored lens carries through the write path, like `upstream`:
-/// the seed is data, and so is every row published after it.
+/// An authored lens carries through the write path: the seed is data,
+/// and so is every row published after it.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_authored_lens_survives_draft_and_publish() {
     let db = TestDb::new().await;
@@ -442,7 +875,10 @@ async fn the_dock_brake_migration_lands_on_a_hand_published_row() {
             .unwrap_or_default()
     }
 
-    let db = TestDb::new().await;
+    // This deliberately replays 20260910201453, so retain the schema it
+    // ran against. Normal loads apply it before the later column drop;
+    // migrate.sh's ledger never replays it after that drop (d2cb38af).
+    let db = TestDb::new_without(&["the-station-upstream-column-is-dropped"]).await;
     let registry = PgStations::new(db.pool.clone());
     let now = chrono::Utc::now();
 
@@ -460,10 +896,10 @@ async fn the_dock_brake_migration_lands_on_a_hand_published_row() {
 
     // Now the live cluster's shape: a later version published by hand
     // that knows nothing about the clause.
-    let mut by_hand = StationSpec::draft(
+    let by_hand = StationSpec::draft(
         "loading-dock",
         "Loading dock — parked ship-a-change cars",
-        StationKind::Batch,
+        StationKind::Group,
         StationPredicate {
             kind: Some("ship-a-change".into()),
             status: Some(boss_core::job::JobStatus::Open),
@@ -481,7 +917,6 @@ async fn the_dock_brake_migration_lands_on_a_hand_published_row() {
         },
         now,
     );
-    by_hand.wip_limit = Some(24);
     registry
         .create_draft(by_hand, &author(), now)
         .await
@@ -510,13 +945,6 @@ async fn the_dock_brake_migration_lands_on_a_hand_published_row() {
         healed.version,
         hand_published.version + 1,
         "the new version follows the row it superseded"
-    );
-    assert_eq!(
-        healed.wip_limit,
-        Some(24),
-        "every other column is carried forward — 119's comment: a lost \
-         `upstream` is worse than a broken one, because it disappears \
-         exactly when someone is diagnosing"
     );
 
     sqlx::raw_sql(MIGRATION)
@@ -560,6 +988,7 @@ async fn station_event_kinds_are_registered() {
             STATION_DRAFT_SAVED.to_string(),
             STATION_PUBLISHED.to_string(),
             STATION_QUARANTINED.to_string(),
+            boss_jobs::events::STATION_RESOURCE_REFUSED.to_string(),
             STATION_RETIRED.to_string(),
             boss_jobs::events::STATION_SELECTION_EVIDENCE.to_string(),
         ]

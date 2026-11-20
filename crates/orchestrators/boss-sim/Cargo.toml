@@ -39,10 +39,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 
 [dev-dependencies]
 # Brewery / UDS batch dev-deps retired 2026-05-06 alongside the
-# BatchEngine rip (TODO.md "Strip BatchEngine"). The brewery_e2e
-# integration test that wired `[batch.*]` tenant.toml rows is
-# being rewritten to use the `[periodic.*]` + Workflow path that
-# replaces it.
+# BatchEngine rip, with the brewery_e2e integration test that wired
+# `[batch.*]` tenant.toml rows; boss-sim has no tests/ directory
+# today (measured 2026-11-17).
 # `scratch_dir`: a temp fixture carries the uid and the pid (307df975).
 boss-testing = { path = "../../core/boss-testing" }
 

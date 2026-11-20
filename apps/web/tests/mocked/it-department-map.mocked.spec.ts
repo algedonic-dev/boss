@@ -1,162 +1,76 @@
-// THE DEPARTMENT MAP — design e765b3fc, car N1 (decided by David
-// 2026-09-25, on feedback 84cba7e2).
-//
-// "This is all going towards a design where the operating map sits at
-// the top always and clicking stations or lines pulls up detail below.
-// We can also probably remove the left nav bar items associated with
-// navigating to different areas on the map and consolidate to maybe just
-// Department Map?" (added_2026_09_25_david_3). This pins the car's two
-// claims, as its plan names them:
-//
-//  - the IT sidebar is exactly seven rows, the first "Department Map"
-//    — Receiving Yard, Marshalling Yard, Train Yard and Crew Board gone;
-//  - `/it?at=gates` opens the gates' panel BELOW the map, and the map
-//    stays on top: a click on a station selects it without tearing the
-//    map down, where it used to swap the map for the region's own.
-//
-// The panel was a SHELL on that car: the station's name, its one number
-// and its state, and the door to the floor page that still held its
-// detail. Car N2 filled it; car N3 retired the floor pages, so the door
-// is gone and the panel holds the floor itself (the N3 half of this
-// spec, below).
+// THE ALARMS BOARD — what /it draws since step 1 of design 01fa5bdf
+// (David, 2026-11-17: "IT disappears, the old map is pulled out"). The
+// Department Map's needs-you board (the person's queue moves to /me) and
+// its embedded company station page (it stands at /it/tree) went with
+// it; what stays is the alarms board, and under `?at=` the boards with
+// the release and cancel controls (it-department-map-stations pins
+// those). No flight decides what it draws.
 
 import { expect, test, type Page, type Route } from './_test';
-import { TERRITORIES } from '../../src/it/yard/world';
-import { DEPARTMENT_CLASSES, YARD_BORDERS, YARD_REGIONS, installSmokeMocks, servePeopleRows } from './_smokeMocks';
+import { YARD_REGIONS, installSmokeMocks } from './_smokeMocks';
+import { REGION_NAMES } from '../../src/it/yard/regions';
 
-const json = (r: Route, b: unknown): Promise<void> =>
-  r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(b) });
+const NOW = '2026-11-08T15:00:00Z';
 
-const trend = { metric: 'gate duration', unit: 'minutes', current: 11, previous: 9, samples: 5, previous_samples: 4 };
+const json = (r: Route, b: unknown, status = 200) =>
+  r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(b) });
 
-/** One row per territory, clear and empty — except the gates, full at
- *  3 of 3 bays, and the dock with six cars parked. */
-const REGIONS = {
+/** Every region clear but the given states, as the regions read says. */
+const regionsPayload = (states: Readonly<Record<string, string>>) => ({
   window_hours: 24,
-  now: '2026-09-25T17:21:00Z',
-  regions: TERRITORIES.map(({ name }) =>
-    name === 'gates'
-      ? { name, count: 3, bound: 3, bound_kind: 'capacity', unit: 'bays in use', state: 'clear', why: '3 of 3 bays in use', trend }
-      : name === 'dock'
-        ? { name, count: 6, unit: 'cars parked', state: 'clear', why: '6 cars parked', trend }
-        : { name, count: 0, state: 'clear', why: 'nothing here', trend },
-  ),
-};
+  now: NOW,
+  regions: REGION_NAMES.map((name) => ({
+    name, count: 1, unit: 'things', state: states[name] ?? 'clear',
+    why: name === 'dock' ? 'a car stands gated, then changed' : name === 'receiving' ? '80 packets standing, the oldest 5 days' : 'fine',
+    trend: { metric: 'crossings', unit: 'per day', current: 4, previous: 4, samples: 4, previous_samples: 4 },
+  })),
+});
 
-async function mocks(page: Page): Promise<void> {
+async function mocks(page: Page, states: Readonly<Record<string, string>> = {}): Promise<void> {
   await installSmokeMocks(page);
-  await page.route(YARD_REGIONS, (r) => json(r, REGIONS));
-  await page.route(YARD_BORDERS, (r) => json(r, { window_hours: 24, now: REGIONS.now, borders: [] }));
+  // No flight is on: what /it draws must not depend on one.
+  await page.addInitScript('window.__BOSS_FLIGHTS__ = { flights: [] }');
+  await page.route(YARD_REGIONS, (r) => json(r, regionsPayload(states)));
 }
 
-const MAP = 'section.yard svg';
-const PANEL = 'section[data-map-panel]';
-
-/** Signed in as the live roster's operator: platform-admin, whose Class
- *  row declares no `surfaces`, so every IT row is his to see. The
- *  sidebar paints no group until the session resolves a role. */
-async function signIn(page: Page): Promise<void> {
-  const emp = {
-    id: 'emp-david', name: 'David', email: 'd@a', role: 'platform-admin', department: 'it',
-    hire_date: '2023-01-01', status: 'active', location: 'HQ', employment_type: 'full-time',
-    skills: [], certifications: [],
-  };
-  const roleRow = {
-    subject_kind: 'employee', code: 'platform-admin', display_name: 'platform-admin', parent_code: null,
-    member_attribute: 'role', metadata: {}, sort_order: 1, retired_at: null,
-  };
-  await page.route(/\/api\/people$/, (r) => json(r, [emp]));
-  await servePeopleRows(page, [emp]);
-  await page.route(/\/api\/session$/, (r) => json(r, { username: 'david', employee_id: emp.id, role: emp.role }));
-  await page.route(/\/api\/classes(\?|$)/, (r) => json(r, [roleRow, ...DEPARTMENT_CLASSES]));
-}
-
-// Seven surface rows, then the Jobs row every department's sidebar ends
-// on — IT's included since car 2 of design 8c3e9599 (backlog 64656a46),
-// at /it/jobs.
-test('the IT sidebar is seven rows, and the first is the Department Map — the landing', async ({ page }) => {
-  await mocks(page);
-  await signIn(page);
-  await page.goto('/it');
-  const rows = page.locator('.shell-sidebar .shell-nav-group a.shell-nav-item');
-  await expect(rows).toHaveText([
-    'Department Map',
-    'Operate',
-    'Registry',
-    'Design',
-    'Codebase',
-    'Estate',
-    'Knowledge Base',
-    'Jobs',
-  ]);
-  await expect(rows.last()).toHaveAttribute('href', '/it/jobs');
-  await expect(rows.first()).toHaveAttribute('href', '/it');
-  // The landing lights its own row.
-  await expect(rows.first()).toHaveClass(/shell-nav-item-active/);
-  // And a selection lights the same row: it is the same page.
-  await page.goto('/it?at=gates');
-  await expect(page.locator('.shell-sidebar a.shell-nav-item-active')).toHaveText('Department Map');
-  // The page is named what the row is named.
-  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Department Map');
-});
-
-test('?at=gates opens the gates panel below the map, with its one number and its state', async ({ page }) => {
-  await mocks(page);
-  await page.goto('/it?at=gates');
-  const panel = page.locator(PANEL);
-  await expect(panel).toHaveCount(1);
-  await expect(panel).toHaveAttribute('data-selection', 'gates');
-  // The panel's own title — the floor's cards below it carry headings too (car N2).
-  await expect(panel.locator('.panel-title')).toHaveText('Gates');
-  await expect(panel.locator('[data-figure]')).toHaveText('3 / 3 bays in use');
-  await expect(panel).toHaveAttribute('data-state', 'clear');
-  await expect(panel.locator('.panel-state')).toHaveText('clear');
-  // BELOW the map, which is still drawn whole on top.
-  await expect(page.locator(`${MAP} .territory`)).toHaveCount(TERRITORIES.length);
-  const mapBox = (await page.locator(MAP).boundingBox())!;
-  const panelBox = (await panel.boundingBox())!;
-  expect(panelBox.y).toBeGreaterThanOrEqual(mapBox.y + mapBox.height);
-  // The floor is IN the panel since car N3 — no door to a page of its own.
-  await expect(panel.locator('a[data-floor]')).toHaveCount(0);
-  await expect(panel.locator('[data-contents="gates"] .yard-deck').first()).toBeVisible();
-});
-
-test('a click on a station selects it and keeps the map on top; close deselects', async ({ page }) => {
+test('/it draws the alarms board with no flight set, and neither the needs-you board nor the company station page', async ({ page }) => {
   await mocks(page);
   await page.goto('/it');
-  await expect(page.locator(PANEL)).toHaveCount(0);
-  const node = await page.locator(MAP).elementHandle();
-  expect(node).not.toBeNull();
-
-  await page.locator(`${MAP} .territory[data-region="dock"]`).click();
-  await expect(page).toHaveURL(/\/it\?at=dock$/);
-  await expect(page.locator(PANEL)).toHaveAttribute('data-selection', 'dock');
-  await expect(page.locator(`${PANEL} [data-figure]`)).toHaveText('6 cars parked');
-  // The SAME map node: selected on it, never swapped away from it.
-  expect(await node!.evaluate((el) => el.isConnected)).toBe(true);
-
-  // A second station moves the selection without a new map either.
-  await page.locator(`${MAP} .territory[data-region="gates"]`).click();
-  await expect(page).toHaveURL(/\/it\?at=gates$/);
-  await expect(page.locator(PANEL)).toHaveAttribute('data-selection', 'gates');
-  expect(await node!.evaluate((el) => el.isConnected)).toBe(true);
-
-  // Back returns to the previous selection — it is on the history.
-  await page.goBack();
-  await expect(page).toHaveURL(/\/it\?at=dock$/);
-  await expect(page.locator(PANEL)).toHaveAttribute('data-selection', 'dock');
-
-  await page.locator(`${PANEL} a[data-close]`).click();
-  await expect(page).toHaveURL(/\/it$/);
-  await expect(page.locator(PANEL)).toHaveCount(0);
-  expect(await node!.evaluate((el) => el.isConnected)).toBe(true);
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Alarms');
+  await expect(page.locator('[data-alarms]')).toBeVisible();
+  await expect(page.locator('[data-needs-you]')).toHaveCount(0);
+  await expect(page.locator('[data-station-page]')).toHaveCount(0);
+  await expect(page.locator('[data-tree-floor]')).toHaveCount(0);
+  await expect(page.locator('section.transit')).toHaveCount(0);
+  await expect(page.locator('[data-hud]')).toHaveCount(0);
 });
 
-test('a selection the map does not carry is said, never an empty panel', async ({ page }) => {
+test('the alarms board: every station not clear, troubled first, each a door to its boards', async ({ page }) => {
+  await mocks(page, { dock: 'troubled', receiving: 'attention' });
+  await page.goto('/it');
+  const alarms = page.locator('[data-alarms] [data-alarm]');
+  await expect(alarms).toHaveCount(2);
+  await expect(alarms.nth(0)).toHaveAttribute('data-alarm', 'dock');
+  await expect(alarms.nth(0)).toHaveAttribute('data-state', 'troubled');
+  await expect(alarms.nth(0)).toHaveAttribute('href', '/it?at=dock');
+  await expect(alarms.nth(0)).toContainText('a car stands gated, then changed');
+  await expect(alarms.nth(1)).toHaveAttribute('data-alarm', 'receiving');
+  await alarms.nth(0).click();
+  await expect(page).toHaveURL(/\/it\?at=dock$/);
+  await expect(page.locator('[data-map-panel][data-selection="dock"] [data-contents="dock"]')).toBeVisible();
+});
+
+test('an all-clear board says so', async ({ page }) => {
+  await mocks(page);
+  await page.goto('/it');
+  await expect(page.locator('[data-alarms] [data-alarms-clear]')).toBeVisible();
+  await expect(page.locator('[data-alarms] [data-alarm]')).toHaveCount(0);
+});
+
+test('a selection that names no station is said, never an empty panel', async ({ page }) => {
   await mocks(page);
   await page.goto('/it?at=gatez');
-  const panel = page.locator(PANEL);
-  await expect(panel).toHaveAttribute('data-selection', 'gatez');
-  await expect(panel).toContainText('Nothing on this map is named “gatez”');
-  await expect(panel.locator('a[data-floor]')).toHaveCount(0);
+  const panel = page.locator('[data-map-panel][data-selection="gatez"]');
+  await expect(panel).toContainText('No station here is named');
+  await expect(panel.locator('[data-contents]')).toHaveCount(0);
 });

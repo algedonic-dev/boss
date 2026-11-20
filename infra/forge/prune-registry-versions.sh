@@ -316,7 +316,7 @@ say "credential: docker login for $REG_HOST as $CRED_USER from $DOCKER_CONFIG_FI
 http() { # <cfg> <method> <url> <body-out> [extra curl args] -> stdout: code
     local cfg="$1" method="$2" url="$3" out="$4"
     shift 4
-    curl -sS --max-time 60 -K "$cfg" -X "$method" -o "$out" -w '%{http_code}' "$@" "$url" 2> "$TMP/curl.err"
+    curl -q -sS --max-time 60 -K "$cfg" -X "$method" -o "$out" -w '%{http_code}' "$@" "$url" 2> "$TMP/curl.err"
 }
 # The scope Forgejo's 403 asks for, from its own message — copied, not
 # retyped; the fallback is the scope the method needs.

@@ -1,11 +1,11 @@
-// /ux/finance — the finance department's own packets, as In / Working /
+// /finance — the finance department's own packets, as In / Working /
 // Out, under every tab (backlog 4d4dc204, page audit 3f964c57 gap 2,
 // measured against origin/main 642c0171).
 //
 // GET /api/jobs?department=finance answered one open packet at the
 // audit's measure step — receive-a-payout 931c3bfe, "Payout: 1.00 USD
 // arriving 2026-09-21", its post step ready since 2026-09-21T01:10Z —
-// and /ux/finance made no jobs read and linked nowhere that did, so the
+// and /finance made no jobs read and linked nowhere that did, so the
 // one piece of live work finance held was on no finance surface. The
 // page now makes the department read every department's own view makes
 // (departments/department.ts), keyed by the catalog entry's
@@ -16,9 +16,9 @@ import { expect, test, type Page, type Route } from './_test';
 import { mountPage, settledReads } from './_helpers';
 import { installSmokeMocks } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
-import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
+import { pageAt } from '../fixtures/station-tree';
 
-const PATH = ROUTE_CATALOG.finance.path;
+const PATH = pageAt('finance');
 const DEPT_JOBS = /\/api\/jobs\?(.*&)?department=finance(&|$)/;
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>

@@ -126,14 +126,17 @@ async fn a_batch_registers_new_agents_and_updates_the_migrations_row_to_the_decl
     let db = TestDb::new().await;
     let registry = PgAgents::new(db.pool.clone());
     let declared = |id: &str, name: &str, alias: &str| AgentInput {
+        factory_rotation: Some(true),
         id: id.into(),
         display_name: name.into(),
         default_model: "opus-5[1m]".into(),
+        model_class: None,
         aliases: vec![alias.into()],
         role: None,
         department: None,
         hourly_budget_usd_micros: None,
         max_concurrent_runs: None,
+        stations: None,
     };
 
     // A login an operator added by hand, which the tenant's file does
@@ -292,14 +295,17 @@ async fn an_agent_holds_a_role_and_sits_in_a_department_like_an_employee() {
     );
 
     let placed = AgentInput {
+        factory_rotation: Some(true),
         id: "agent-claude".into(),
         display_name: "Claude (Claude Code sessions on the dev pod)".into(),
         default_model: "opus-5[1m]".into(),
+        model_class: None,
         aliases: vec![],
         role: Some("engineering-agent".into()),
         department: Some("engineering".into()),
         hourly_budget_usd_micros: None,
         max_concurrent_runs: None,
+        stations: None,
     };
     let out = registry
         .publish(std::slice::from_ref(&placed), PublishMode::Take, &stamp())
@@ -353,14 +359,17 @@ async fn a_batch_keeps_a_differing_live_row_by_default_and_overwrites_it_only_un
     let db = TestDb::new().await;
     let registry = PgAgents::new(db.pool.clone());
     let declared = AgentInput {
+        factory_rotation: Some(true),
         id: "agent-claude".into(),
         display_name: "Claude (engineering)".into(),
         default_model: "opus-5[1m]".into(),
+        model_class: None,
         aliases: vec!["claude@algedonic.dev".into()],
         role: None,
         department: None,
         hourly_budget_usd_micros: None,
         max_concurrent_runs: Some(3),
+        stations: None,
     };
 
     // The migration's row, with an operator's edits the file does not
@@ -488,4 +497,118 @@ async fn a_batch_keeps_a_differing_live_row_by_default_and_overwrites_it_only_un
         Some("agent-claude"),
         "take moves the login to the declared id"
     );
+}
+
+/// THE SEAT DOOR AGAINST THE REAL TABLE (backlog cdbebc22; review
+/// 1a49c3a7 finding 1). The reproduced interleaving: the page reads the
+/// row, another writer narrows its role and commits, the page's seat
+/// write arrives — and the role the other writer set survives, because
+/// the seat door writes `stations` alone. A write whose expected seats
+/// moved is refused as stale and writes nothing. Two seat edits racing
+/// on the same read: the row lock makes exactly one land and the other
+/// stale, never both. Each landed change stages one `agent.updated`
+/// naming the seats alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_seat_edit_writes_only_the_seats_and_only_over_the_seats_it_read() {
+    use boss_jobs::agents::SeatOutcome;
+    let db = TestDb::new().await;
+    let registry = std::sync::Arc::new(PgAgents::new(db.pool.clone()));
+    sqlx::query(
+        "UPDATE agents SET role = 'platform-admin', stations = '{}' WHERE id = 'agent-claude'",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("the migration's row takes a role");
+
+    // 1. The page reads the row.
+    let read = registry
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == "agent-claude")
+        .expect("the migration registers agent-claude");
+    // 2. Another writer narrows the role, and commits.
+    sqlx::query("UPDATE agents SET role = 'engineering-agent' WHERE id = 'agent-claude'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    // 3. The page's seat write arrives with the seats it read.
+    let out = registry
+        .seat(
+            "agent-claude",
+            &read.stations,
+            &["algedonic".to_string()],
+            &stamp(),
+        )
+        .await
+        .expect("the registry answers");
+    let SeatOutcome::Seated { changes, after, .. } = out else {
+        panic!("seated over the seats it read: {out:?}");
+    };
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0].field, "stations");
+    assert_eq!(after.stations, ["algedonic"]);
+    assert_eq!(
+        after.role.as_deref(),
+        Some("engineering-agent"),
+        "a seat edit must not restore the role another writer changed"
+    );
+    let updated = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM event_outbox WHERE kind LIKE '%agent.updated'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(updated().await, 1, "one fact for the landed seat edit");
+
+    // A write still carrying the first read is stale, and writes nothing.
+    let stale = registry
+        .seat("agent-claude", &read.stations, &[], &stamp())
+        .await
+        .unwrap();
+    assert_eq!(
+        stale,
+        SeatOutcome::Stale {
+            held: vec!["algedonic".to_string()]
+        }
+    );
+    assert_eq!(updated().await, 1, "a stale seat write records nothing");
+
+    // An agent the registry does not hold is an answer, not an error.
+    assert_eq!(
+        registry
+            .seat("agent-nobody", &[], &[], &stamp())
+            .await
+            .unwrap(),
+        SeatOutcome::NotHeld
+    );
+
+    // Two seat edits racing on one read: exactly one lands.
+    let held = vec!["algedonic".to_string()];
+    let (one, other) = (vec!["build".to_string()], vec!["design-review".to_string()]);
+    let (s1, s2) = (stamp(), stamp());
+    let (a, b) = tokio::join!(
+        registry.seat("agent-claude", &held, &one, &s1),
+        registry.seat("agent-claude", &held, &other, &s2),
+    );
+    let outcomes = [a.unwrap(), b.unwrap()];
+    let landed = outcomes
+        .iter()
+        .filter(|o| matches!(o, SeatOutcome::Seated { .. }))
+        .count();
+    let refused = outcomes
+        .iter()
+        .filter(|o| matches!(o, SeatOutcome::Stale { .. }))
+        .count();
+    assert_eq!((landed, refused), (1, 1), "{outcomes:?}");
+    assert_eq!(updated().await, 2);
+    let role: Option<String> =
+        sqlx::query_scalar("SELECT role FROM agents WHERE id = 'agent-claude'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(role.as_deref(), Some("engineering-agent"));
 }

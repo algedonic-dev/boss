@@ -28,7 +28,7 @@ test('auth-admin fields inherit Enamel without changing credential drafts', asyn
   await installSmokeMocks(page);
   await page.route('**/api/auth/me', r => r.fulfill({ json: {
     email: 'fixture-admin@example.invalid', role: 'platform-admin' } }));
-  await mountPage(page, '/it/auth-admin');
+  await mountPage(page, '/operations/vault/auth-admin');
   const email = page.locator('#onboard-email');
   const password = page.locator('#onboard-password');
   const reset = page.locator('#reset-email');
@@ -63,7 +63,7 @@ test('local login and reset fields inherit Enamel without submitting', async ({ 
 
 test('dispatcher trigger filter inherits Enamel and adds its chip', async ({ page }) => {
   await installSmokeMocks(page);
-  await mountPage(page, '/it/registry/dispatcher');
+  await mountPage(page, '/engineering/registry/dispatcher');
   const filter = page.locator('select.dx-filter-select');
   await fieldLook(filter);
   const value = await filter.locator('option').last().getAttribute('value');
@@ -77,7 +77,7 @@ test('dispatcher trigger filter inherits Enamel and adds its chip', async ({ pag
 
 test('monthly-close month inherits Enamel and retains the draft month', async ({ page }) => {
   await installSmokeMocks(page);
-  await mountPage(page, '/ux/finance');
+  await mountPage(page, '/finance');
   await page.getByRole('button', { name: 'Monthly close package', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: 'Monthly close package' });
   const month = dialog.getByLabel('Month');
@@ -89,7 +89,7 @@ test('monthly-close month inherits Enamel and retains the draft month', async ({
 
 test('audit filters inherit Enamel and preserve filter and checkbox behavior', async ({ page }) => {
   await installSmokeMocks(page);
-  await mountPage(page, '/it/operate/audit');
+  await mountPage(page, '/operations/audit');
   const source = page.getByPlaceholder('e.g. jobs, assets');
   await fieldLook(source);
   await fieldLook(page.locator('.events-filter select').first());
@@ -110,7 +110,7 @@ test('audit filters inherit Enamel and preserve filter and checkbox behavior', a
 
 test('workflow search inherits Enamel and retains its filter draft', async ({ page }) => {
   await installSmokeMocks(page);
-  await mountPage(page, '/it/registry');
+  await mountPage(page, '/engineering/registry');
   const search = page.locator('input.wf-search');
   await fieldLook(search);
   await search.fill('a-kind-that-is-not-in-the-fixture');

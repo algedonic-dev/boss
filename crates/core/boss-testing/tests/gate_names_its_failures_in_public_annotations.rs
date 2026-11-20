@@ -145,7 +145,10 @@ impl Tree {
                 self.dir.join("receipt.json").to_str().expect("utf8"),
             )
             .env("GIT_CEILING_DIRECTORIES", "")
-            .env_remove("BOSS_ESTATE");
+            .env_remove("BOSS_ESTATE")
+            // Nor BOSS_TRUNK=none (backlog 2d28df78): these cases are about
+            // the gate's own annotations, not a declaration's.
+            .env_remove("BOSS_TRUNK");
         match actions {
             Some(v) => cmd.env("GITHUB_ACTIONS", v),
             None => cmd.env_remove("GITHUB_ACTIONS"),
@@ -353,14 +356,18 @@ fn read_back(t: &Tree, gate_annotations: &[serde_json::Value]) -> serde_json::Va
         &root.join("stubs/curl"),
         &format!(
             r#"#!/bin/sh
-url=""; data=""; method=GET; prev=""
+url=""; data=""; method=GET; wfmt=""; prev=""
 for a in "$@"; do
-    case "$prev" in --data-binary) data="$a" ;; -X) method="$a" ;; esac
+    case "$prev" in --data-binary) data="$a" ;; -X) method="$a" ;; -w) wfmt="$a" ;; esac
     case "$a" in http://*|https://*) url="$a" ;; esac
     prev="$a"
 done
 if [ "$method" != GET ]; then
     case "$data" in @*) cat "${{data#@}}" >> '{writes}'; echo >> '{writes}' ;; esac
+    # A `-w '%{{http_code}}'` caller is told the status, as curl tells
+    # it: the reading's write reads it to re-send on a 413 (review
+    # 75bb4029 B1).
+    if [ -n "$wfmt" ]; then printf '200'; fi
     exit 0
 fi
 while IFS='	' read -r needle file; do
@@ -381,6 +388,12 @@ exit 22
         .env("BOSS_JOBS_URL", "http://jobs.invalid")
         .env("BOSS_GITHUB_API", "https://api.github.invalid")
         .env("BOSS_MIRROR_SLUG", "fixture-upstream/mirror")
+        // The failing Gate's job log is read with a token rendered from
+        // the broker's Secret (backlog b7a74610): here no admin
+        // kubeconfig and a scratch slot, so the render finds nothing and
+        // touches nothing of the host's — the log goes unread, said so.
+        .env("BOSS_OPS_DIR", root.join("no-ops"))
+        .env("BOSS_CHECKS_TOKEN_FILE", root.join("checks.token"))
         .output()
         .expect("read-publish-checks runs");
     let text = both(&out);

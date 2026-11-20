@@ -63,6 +63,7 @@ const SOR_URL_FILE: &str = "infra/dev/sor-url";
 const DOORS_DIR_FILE: &str = "infra/dev/machine-token-dir";
 const DEV: &str = "boss-dev.yaml";
 const CRAWL: &str = "boss-playground-crawl.yaml";
+const STANDBY: &str = "boss-dev-standby.yaml";
 
 /// Senders whose address is not in their environment: (file, container,
 /// where it comes from).
@@ -76,6 +77,11 @@ const CHECKOUT_SENDERS: &[(&str, &str, &str)] = &[
         DEV,
         "reclaim",
         "infra/cluster/dev-scratch-reclaim.sh reads infra/dev/sor-url beside its checkout",
+    ),
+    (
+        STANDBY,
+        "standby",
+        "its boss-api is the clone's infra/dev/boss-api, which reads infra/dev/sor-url",
     ),
 ];
 
@@ -93,6 +99,13 @@ const READER_FROM_THE_CHECKOUT: &[(&str, &str, &str)] = &[
         "the sidecar runs the checkout's dev-scratch-reclaim.sh, whose wrap and step source \
          infra/lib/secret-header.sh from beside themselves; the same volume the dev container \
          already holds the token over (David, design-doc c8502e17 `reclaim-sidecar`)",
+    ),
+    (
+        STANDBY,
+        "standby",
+        "its boss-api sources infra/lib/secret-header.sh from the shallow clone of main it \
+         takes at boot, the dev doors' shape; it holds the token by David's decision on design \
+         0491591b (Q1, 2026-11-07)",
     ),
 ];
 

@@ -178,7 +178,7 @@ if [ -r "$SECRET_LIB" ]; then
     . "$SECRET_LIB"
     machine_token_header MT_HDR "$BOSS_JOBS_URL" || MT_HDR=""
 fi
-if ! curl -fsS --max-time 15 -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} \
+if ! curl -q -fsS --max-time 15 -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} \
         "$CONVERGE_URL" > "$TMP/converges.json" 2> "$TMP/curl.err"; then
     say "REFUSED — the system of record did not answer the converge read ($CONVERGE_URL):"
     sed 's/^/    /' "$TMP/curl.err" >&2

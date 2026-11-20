@@ -652,7 +652,29 @@ ssh-keygen -q -t ed25519 -N '' -C machine-token-deposit-key -f "$tmp/deposit-key
 deposit_pub="$(cut -d' ' -f1-2 "$tmp/deposit-key.pub")"
 printf '%s\n' "command=\"exec sudo -n /usr/local/libexec/boss/ops-credential-recv machine-token\",restrict $deposit_pub machine-token-deposit-key" \
     >"$tmp/authorized_keys"
+# The prepare packets the converge reads the deposit keys' public halves
+# from (infra/gcp/prepared-deposit-keys.sh; backlog 77920d6a), as a FILE
+# like the roles registry above: the machine token's packet records the
+# fixture key, so the confined line above is judged by its fingerprint.
+# Without it the converge would read the live record from the gate.
+# The break-glass deposit key has no prepare packet; its record is the
+# line its Job prints on its own maintenance packet (backlog 403d9d7e),
+# so the fixture carries one of those too, over a second real key.
+ssh-keygen -q -t ed25519 -N '' -C break-glass-deposit@boss -f "$tmp/break-glass-key" \
+    || fail "ssh-keygen could not make the fixture break-glass deposit key"
+break_glass_pub="$(cut -d' ' -f1-2 "$tmp/break-glass-key.pub")"
+prepared_json="$tmp/prepared.json"
+jq -n --arg k "$deposit_pub" --arg bg "$break_glass_pub" '{total: 2, data: [{id: "prepare-fixture",
+    kind: "prepare-the-machine-token-deposit-key", status: "closed",
+    subject: {id: "machine-token-deposit-key"},
+    steps: [{spec_slug: "install", status: "completed", metadata: {public_key: $k}}]},
+  {id: "break-glass-fixture", kind: "maintenance-break-glass-deposit", status: "closed",
+    subject: {id: "infra/maintenance-break-glass-deposit"},
+    steps: [{spec_slug: "run", status: "completed", metadata: {result: "ok",
+      output: ("break-glass-deposit: the deposit key, as boss-gcp holds it: command=\"exec sudo -n /usr/local/libexec/boss/ops-credential-recv kubeconfig\",restrict " + $bg + " break-glass-deposit@boss\n")}}]}]}' \
+    >"$prepared_json" || fail "jq could not write the fixture prepare record"
 run_converge() { # <dir> <installer> -> output; returns the script's status
+    BOSS_GCP_PREPARED_KEYS_URL="file://$prepared_json" \
     BOSS_GCP_CONVERGE_AUTHORIZED_KEYS="${CONVERGE_AUTHORIZED_KEYS:-$tmp/authorized_keys}" \
     BOSS_GCP_REPO_DIR="$1" BOSS_GCP_CONVERGE_INSTALLER="$2" \
         BOSS_GCP_CONVERGE_SOR_ENV="$tmp/sor.env.converge" \
@@ -819,6 +841,7 @@ $out"
 # ---------------------------------------------------------------------
 sum_conv="$tmp/summary-converge.json"
 run_converge_sum() { # <dir> <installer>
+    BOSS_GCP_PREPARED_KEYS_URL="file://$prepared_json" \
     BOSS_GCP_CONVERGE_AUTHORIZED_KEYS="${CONVERGE_AUTHORIZED_KEYS:-$tmp/authorized_keys}" \
     BOSS_GCP_REPO_DIR="$1" BOSS_GCP_CONVERGE_INSTALLER="$2" \
         BOSS_GCP_CONVERGE_SOR_ENV="$tmp/sor.env.converge" \
@@ -828,7 +851,7 @@ run_converge_sum() { # <dir> <installer>
         BOSS_RUN_SUMMARY_FILE="$sum_conv" \
         BOSS_NODE_ID=boss-gcp BOSS_ESTATE_NODES_URL="file://$nodes_json" \
         BOSS_NODE_ROLES_CACHE="$tmp/roles.cache.sum" \
-        STUB_CALLS="$tmp/calls.log" bash "$converge" 2>&1
+        STUB_CALLS="$tmp/calls.log" bash "${CONVERGE_SCRIPT:-$converge}" ${CONVERGE_ROOT:+--root-generation} 2>&1
 }
 conv_fail() { echo "FAIL: $*" >&2; echo "--- summary ($sum_conv):" >&2
               cat "$sum_conv" 2>/dev/null >&2; exit 1; }
@@ -858,6 +881,8 @@ case "$(jq -r '.deposit_key_audit // ""' "$sum_conv")" in
     "deposit-key-audit: clean — 1 line(s)"*) ;;
     *) conv_fail "the summary does not carry the deposit key audit's clean verdict over one confined receiver line (backlog dea2236f)" ;;
 esac
+grep -qF "2 prepared deposit key(s) judged by fingerprint" <<<"$(jq -r '.deposit_key_audit // ""' "$sum_conv")" \
+    || conv_fail "the clean verdict was not judged by the two deposit keys the fixture record holds, the machine token's and the break-glass key — the converge must hand the audit each recorded key, before the files (backlogs 77920d6a, 403d9d7e)"
 [ "$(jq -r '.deposit_key_verdict // ""' "$sum_conv")" = clean ] \
     || conv_fail "the summary does not carry deposit_key_verdict=clean, the word the alarm rule reads (backlog dea2236f)"
 [ -z "$(jq -r '.output // ""' "$sum_conv")" ] \
@@ -895,6 +920,18 @@ grep -qF "UNCONFINED $tmp/authorized_keys.bare:2" <<<"$(jq -r '.anomalies // ""'
     || conv_fail "the summary's anomalies do not name the line to remove ($tmp/authorized_keys.bare:2)"
 grep -qF "RED boss-gcp-converge/deposit-key-unconfined refused: deposit-key-audit: UNCONFINED $tmp/authorized_keys.bare:2" <<<"$(jq -r '.output // ""' "$sum_conv")" \
     || conv_fail "the summary's output carries no RED line naming the line to remove, in the shape the chore judge files from"
+# ONE FINDING, ONE RED LINE (backlog 54104a05). The converge took any
+# audit line carrying " UNCONFINED " for a finding, and the audit's own
+# verdict line says "each UNCONFINED line above names the line to act
+# on" — so every unconfined tick carried one more RED line than it had
+# findings, naming no key, which the chore judge keys on its whole text
+# and re-files whenever the count or the file list in it changes.
+n_reds="$(grep -c '^RED ' <<<"$(jq -r '.output // ""' "$sum_conv")")"
+[ "$n_reds" = 1 ] \
+    || conv_fail "one finding in the fixture, but output carries $n_reds RED line(s): only the audit's UNCONFINED finding lines are findings, never its verdict line (backlog 54104a05)"
+if grep -qF "finding(s) in" <<<"$(jq -r '(.output // "") + "\n" + (.anomalies // "")' "$sum_conv")"; then
+    conv_fail "the audit's verdict line was carried as a finding (output or anomalies), so the chore judge would file it as one (backlog 54104a05)"
+fi
 
 # 10d''. AN AUDIT THAT COULD NOT READ IS UNVERIFIED, NOT CLEAN, AND FILES
 # NOTHING: no evidence is not a pass, and it is not a finding either.
@@ -929,5 +966,87 @@ fi
     || conv_fail "a failed converge lost the sha it was installing from — record each fact
     as soon as it is known, not at the end of a run that may not get there"
 
-echo "boss-gcp-converges-itself: ok — $installed timer pairs install from \`install-units.sh units\` (roles.toml is the one roster, the converge's own row among them, nothing restarted, no localhost drop-in), the journal read door on :19531 comes up with it and cannot abort it, the ops-request runner lands with HOST_ID=boss-gcp, this checkout and the CLUSTER as its system of record (never the legacy 127.0.0.1 stack) without being a roles.toml row, the loop converges from the forge and refuses the mirror, refuses a dirty tree, fast-forwards and drives the installer idempotently, prints every line of a failed install, and leaves its packet a counted summary — units installed/skipped with every skip named, the ops runner's and the read door's own verdicts, the sha and remote it converged from, the installer's exit on failure, and nothing at all from a previous run"
+# 10f. THE PROTECTED-ROOT BRANCH REPORTS THE MOVE FROM WHAT IT LAST
+#      CONVERGED (backlog 4870d6a8). The host runs this script out of an
+#      accepted generation the launcher refreshed just before, so there
+#      is no fast-forward to read a `before` off, and until 2026-10-22
+#      the branch wrote converge_from = converge_sha on every tick — the
+#      publish-drift rule keys on the two differing and never fired,
+#      measured on six live runs while the generation moved. Driven here
+#      from two fixture generations (the gcp, lib and estate trees plus
+#      run-summary.sh and the forge's port table, copied; root-tree.sh, adopt-root-tree.sh and
+#      prepare-root-tree.sh stubbed, since what they guard is
+#      gcp_root_tree_sh.rs's subject, not this loop's).
+gcp_tree="$tmp/gcp-tree"
+gcp_prep="$tmp/gcp-root-prepared"
+gcp_record="$tmp/gcp-converged"
+mkdir -p "$gcp_tree/gen" "$gcp_prep/bootstrap/infra/gcp"
+printf '%s\n' '#!/usr/bin/env bash' '[ "$1" = path ] || exit 2' 'cd "$BOSS_GCP_ROOT_TREE/current" && pwd -P' \
+    >"$gcp_prep/bootstrap/infra/gcp/root-tree.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$gcp_prep/bootstrap/infra/gcp/prepare-root-tree.sh"
+gen1=1111111111111111111111111111111111111111
+gen2=2222222222222222222222222222222222222222
+for g in "$gen1" "$gen2"; do
+    mkdir -p "$gcp_tree/gen/$g/infra/forge" || fail "could not make the fixture generation $g"
+    cp -R "$repo/infra/gcp" "$repo/infra/lib" "$repo/infra/estate" "$repo/infra/run-summary.sh" \
+        "$gcp_tree/gen/$g/infra/" || fail "could not copy the converge's tree into the fixture generation $g"
+    # render-sor-env.sh reads its port table from the forge's tree.
+    cp "$repo/infra/forge/sor-ports.env" "$gcp_tree/gen/$g/infra/forge/" \
+        || fail "could not copy the port table into the fixture generation $g"
+    printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$gcp_tree/gen/$g/infra/gcp/adopt-root-tree.sh"
+    git_q init --quiet "$gcp_tree/gen/$g"
+done
+gcp_dep="$(id -un 2>/dev/null || true)"
+case "$gcp_dep" in root|''|*[!a-z0-9_-]*) gcp_dep=nobody ;; esac
+run_root() { # <generation sha> <installer>
+    ln -sfn "gen/$1" "$gcp_tree/current"
+    BOSS_GCP_PREPARED_DIR="$gcp_prep" BOSS_GCP_ROOT_TREE="$gcp_tree" \
+        BOSS_GCP_DEPOSIT_USER="$gcp_dep" BOSS_GCP_CONVERGED_FILE="$gcp_record" \
+        CONVERGE_SCRIPT="$gcp_tree/gen/$1/infra/gcp/boss-gcp-converge.sh" CONVERGE_ROOT=1 \
+        run_converge_sum "$tmp/unused-in-root-mode" "$2"
+}
+from_of() { jq -r 'if has("converge_from") then .converge_from else "ABSENT" end' "$sum_conv"; }
+
+# The first tick with no record: a move from an unknown generation, so
+# the rule asks once rather than say nothing.
+rm -f "$sum_conv" "$gcp_record"
+out=$(run_root "$gen1" "$tmp/bin/installer-ok") \
+    || fail "the protected-root converge failed on a clean fixture generation:
+$out"
+[ "$(jq -r '.converge_remote // ""' "$sum_conv")" = protected-root ] \
+    || conv_fail "the protected-root tick does not say it converged from protected-root"
+[ "$(jq -r '.converge_sha // ""' "$sum_conv")" = "$gen1" ] \
+    || conv_fail "the protected-root tick does not carry the generation it converged ($gen1)"
+[ "$(from_of)" = "" ] \
+    || conv_fail "with no record of a converged generation, converge_from reads '$(from_of)' — it must be empty, which differs from converge_sha, so the drift rule asks once (backlog 4870d6a8)"
+[ "$(cat "$gcp_record" 2>/dev/null)" = "$gen1" ] \
+    || conv_fail "an ok protected-root tick did not record $gen1 as converged at $gcp_record"
+
+# An idle tick: same generation, no move, nothing for the rule.
+rm -f "$sum_conv"
+out=$(run_root "$gen1" "$tmp/bin/installer-ok") || fail "the idle protected-root tick failed:
+$out"
+[ "$(from_of)" = "$gen1" ] \
+    || conv_fail "an idle protected-root tick reads converge_from '$(from_of)', not the generation it already converged ($gen1)"
+
+# The generation moves and that tick FAILS: the record stays, so the
+# move is not used up by a tick whose packet reads result=exit-code.
+rm -f "$sum_conv"
+if out=$(run_root "$gen2" "$tmp/bin/installer-bad"); then
+    fail "the protected-root converge reported success over an installer that exited 3: $out"
+fi
+[ "$(cat "$gcp_record" 2>/dev/null)" = "$gen1" ] \
+    || conv_fail "a FAILED protected-root tick moved the converged record to '$(cat "$gcp_record" 2>/dev/null)' — the next ok tick would then hide the move"
+
+# The next ok tick reports THE MOVE: from the generation last converged,
+# to the one converged now — the two shas the drift rule compares.
+rm -f "$sum_conv"
+out=$(run_root "$gen2" "$tmp/bin/installer-ok") || fail "the protected-root tick after the move failed:
+$out"
+[ "$(from_of)" = "$gen1" ] && [ "$(jq -r '.converge_sha // ""' "$sum_conv")" = "$gen2" ] \
+    || conv_fail "the generation moved $gen1 -> $gen2 and the packet reads converge_from '$(from_of)', converge_sha '$(jq -r '.converge_sha // ""' "$sum_conv")' — check-publish-drift-on-boss-gcp-converge-moved keys on those differing, so the move would file nothing (backlog 4870d6a8)"
+[ "$(cat "$gcp_record" 2>/dev/null)" = "$gen2" ] \
+    || conv_fail "the ok tick on $gen2 did not record it as converged"
+
+echo "boss-gcp-converges-itself: ok — $installed timer pairs install from \`install-units.sh units\` (roles.toml is the one roster, the converge's own row among them, nothing restarted, no localhost drop-in), the journal read door on :19531 comes up with it and cannot abort it, the ops-request runner lands with HOST_ID=boss-gcp, this checkout and the CLUSTER as its system of record (never the legacy 127.0.0.1 stack) without being a roles.toml row, the loop converges from the forge and refuses the mirror, refuses a dirty tree, fast-forwards and drives the installer idempotently, prints every line of a failed install, and leaves its packet a counted summary — units installed/skipped with every skip named, the ops runner's and the read door's own verdicts, the sha and remote it converged from, the installer's exit on failure, and nothing at all from a previous run; out of a protected-root generation it reports the move from the generation its last ok tick converged"
 exit 0

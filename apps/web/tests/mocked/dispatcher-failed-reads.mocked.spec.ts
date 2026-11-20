@@ -1,9 +1,9 @@
 // The dispatcher cascade and the rule editor under a failed read —
 // backlog d7732e88 (2026-09-24).
 //
-// /it/registry/rules learned to mark its failure line (backlog
+// /engineering/registry/rules learned to mark its failure line (backlog
 // cae1a377, car 3071e235): `.load-failed` + role=alert, the one marker
-// outage-crawl asserts. The cascade at /it/registry/dispatcher reads the
+// outage-crawl asserts. The cascade at /engineering/registry/dispatcher reads the
 // SAME /api/dispatcher/rules and painted its failure as a bare
 // `.dx-msg.dx-err`, so it sat in outage-crawl's SILENT map for the same
 // reason the rules page had. And no crawl rendered the rule editor at
@@ -22,20 +22,20 @@ import { mountPage } from './_helpers';
 import { installSmokeMocks } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
 
-const CASCADE = '/it/registry/dispatcher';
+const CASCADE = '/engineering/registry/dispatcher';
 const CASCADE_TITLE = 'Dispatcher rules — reactive cascade';
 /// The cascade's one read — anchored, so an editor's
 /// `/api/dispatcher/rules/<name>/versions` is not it.
 const RULES = /\/api\/dispatcher\/rules$/;
 
 const RULE = 'auto-park-on-gate-green';
-const EDITOR = `/it/registry/rules/${RULE}`;
+const EDITOR = `/engineering/registry/rules/${RULE}`;
 const VERSIONS = new RegExp(`/api/dispatcher/rules/${RULE}/versions$`);
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
 
-test.describe('/it/registry/dispatcher — a failed read is marked, and nothing is counted', () => {
+test.describe('/engineering/registry/dispatcher — a failed read is marked, and nothing is counted', () => {
   test('a refused read paints one marked alert and no rule counts', async ({ page }) => {
     await installSmokeMocks(page);
     await page.route(RULES, (r) => r.fulfill({ status: 503, contentType: 'text/plain', body: 'dispatcher down' }));
@@ -82,7 +82,7 @@ test.describe('/it/registry/dispatcher — a failed read is marked, and nothing 
   });
 });
 
-test.describe('/it/registry/rules/:ruleName — a failed versions read is not a rule with no versions', () => {
+test.describe('/engineering/registry/rules/:ruleName — a failed versions read is not a rule with no versions', () => {
   test('a refused versions read paints one marked alert under the rule name', async ({ page }) => {
     await installSmokeMocks(page);
     await page.route(VERSIONS, (r) => r.fulfill({ status: 503, contentType: 'text/plain', body: 'dispatcher down' }));

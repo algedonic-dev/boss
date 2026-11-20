@@ -27,6 +27,8 @@ fn draft(slug: &str, audience: Audience, published: bool) -> ManualSectionDraft 
         sort_order: 0,
         audience,
         published,
+        owner_station: None,
+        authoring_job_id: None,
     }
 }
 
@@ -112,4 +114,98 @@ async fn the_history_needs_a_caller() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn the_manual_index_names_unwritten_work_without_disclosing_its_draft() {
+    let repo = InMemoryContent::new();
+    let packet = "2c28833a-d0a3-499a-bcf9-2d3a264e26a3";
+    let unwritten: ManualSectionDraft = serde_json::from_value(serde_json::json!({
+        "slug": "expenses", "title": "Expenses", "body": "PRIVATE unfinished draft",
+        "published": false, "owner_station": "finance", "authoring_job_id": packet,
+    }))
+    .unwrap();
+    repo.create_section(unwritten, "hr-01").await.unwrap();
+    repo.create_section(draft("welcome", Audience::all(), true), "hr-01")
+        .await
+        .unwrap();
+    repo.create_section(
+        draft(
+            "sales-only",
+            Audience(serde_json::json!({"departments": ["sales"]})),
+            false,
+        ),
+        "hr-01",
+    )
+    .await
+    .unwrap();
+    let app = router(ContentApiState {
+        repo: Arc::new(repo),
+        publisher: None,
+        clock: Arc::new(boss_clock_client::WallClockClient),
+    });
+    let (status, body) = get(&app, "/api/content/manual-index", &user("it")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the index must expose safe headers: {body}"
+    );
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "the audience still controls section visibility"
+    );
+    let row = rows.iter().find(|row| row["slug"] == "expenses").unwrap();
+    assert_eq!(row["published"], false);
+    assert_eq!(row["owner_station"], "finance");
+    assert_eq!(row["authoring_job_id"], packet);
+    assert!(rows.iter().all(|row| row.get("body").is_none()));
+    assert!(!body.contains("PRIVATE"));
+    assert_eq!(
+        get(&app, "/api/content/manual/expenses", &user("it"))
+            .await
+            .0,
+        StatusCode::NOT_FOUND,
+        "the body remains unpublished",
+    );
+    assert_eq!(
+        get(&app, "/api/content/manual-history/expenses", &user("it"))
+            .await
+            .0,
+        StatusCode::NOT_FOUND,
+        "the index must not open draft history",
+    );
+    assert_eq!(
+        get(&app, "/api/content/manual/welcome", &user("it"))
+            .await
+            .0,
+        StatusCode::OK,
+        "published content remains readable",
+    );
+}
+
+#[tokio::test]
+async fn an_unwritten_starter_survives_the_next_seed_without_being_published() {
+    let repo = InMemoryContent::new();
+    let original = repo
+        .create_section(draft("welcome", Audience::all(), false), "emp-writer")
+        .await
+        .unwrap();
+    let result = boss_content::seed::seed_starter_sections(&repo).await;
+    assert!(
+        result.is_ok(),
+        "a hidden draft still owns its slug: {result:?}"
+    );
+    let user = boss_content::types::UserContext {
+        id: "emp-reader".into(),
+        role: "staff".into(),
+        department: Some("it".into()),
+    };
+    let index = repo.manual_index(&user).await.unwrap();
+    let welcome = index.iter().find(|s| s.slug == "welcome").unwrap();
+    assert_eq!(welcome.id, original.id);
+    assert!(!welcome.published);
+    assert!(repo.get_section("welcome", &user).await.unwrap().is_none());
+    assert_eq!(repo.section_history("welcome").await.unwrap().len(), 1);
 }

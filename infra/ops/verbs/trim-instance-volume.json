@@ -1,0 +1,16 @@
+{
+  "about": "MUTATING — ONE fixed Longhorn trimFilesystem action on ONE instance claim's volume through the forge's trusted Kubernetes service-proxy door (infra/forge/instance-volume-trim.sh <namespace> <pvc> <plan_sha256>; backlog b1520f80 part b). Approved by David 2026-10-29 (drive analysis d9b39685: the PostgreSQL volume held 99.6 GiB actual for 36.7 GB of data) and authorised per run by his passkey on the plan plan-an-instance-volume-trim renders: the script re-renders, refuses bytes that no longer hash to the signed plan, renders a second independent inventory immediately before acting and refuses if it moved — nothing is trimmed on any refusal (exit 78). Longhorn v1.11.3 runs fstrim on the attached node's mount of the volume, so blocks the filesystem already holds free are unmapped from the volume head; it deletes no file, no snapshot and no backup, marks no snapshot removed (refused unless unmapMarkSnapChainRemoved resolves to disabled), and purges nothing — the recurring trim job's purge is the separate purge-instance-snapshots pair. No user-supplied URL, path or action; no attach, resize or setting change. READ-BACK: status.actualSize from the read immediately before the trim, then six reads at 10 s intervals that re-check the claim, PV, volume, engine and replica identities and health; only then the effect line, naming before and after. A trim Longhorn refuses or does not acknowledge for the named volume, a moved identity or an unread size after the request is FAILED (exit 1, 'effect NOT proven'), never a refusal. An unchanged size is reported as read, not as failure: blocks a snapshot still holds are not released by a trim. Per-disk free space and the estate floor are read separately (node-disk-usage). Fresh reads are not a cross-resource lock. Originals are attached to the ops request even on failure. Timeout 1500: the trim's own 900 s call bound inside a 1200 s operation deadline, the 120 s evidence attachment and the door image's first pull.",
+  "hosts": ["forge"],
+  "requires_approval": true,
+  "plan_verb": "plan-an-instance-volume-trim",
+  "approvers": ["emp-david"],
+  "argv": ["infra/forge/instance-volume-trim.sh", "{1}", "{2}", "{3}"],
+  "params": [
+    {"name": "namespace", "pattern": "^[a-z][a-z0-9-]{0,62}$"},
+    {"name": "pvc", "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"},
+    {"name": "plan_sha256", "pattern": "^[0-9a-f]{64}$"}
+  ],
+  "timeout": 1500,
+  "effect": "^instance-volume-trim: Longhorn acknowledged trimFilesystem on [a-z0-9-]+; status[.]actualSize read back [0-9]+ -> [0-9]+ bytes over [0-9]+ s; per-disk free space is not read here$",
+  "capture": "separate-streams"
+}

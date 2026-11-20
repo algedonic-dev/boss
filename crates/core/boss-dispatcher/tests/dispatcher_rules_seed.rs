@@ -722,6 +722,7 @@ async fn a_name_the_seed_retired_is_free_for_a_tenant_to_take_over() {
 
     // The tenant's file, declaring the same version the migration did.
     let file = RawRule {
+        delivery_lane: None,
         name: name.to_string(),
         on_event: Some("jobs.job.closed".into()),
         schedule: None,

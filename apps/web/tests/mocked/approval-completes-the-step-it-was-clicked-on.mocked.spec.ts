@@ -32,7 +32,7 @@ type Seen = { writes: Write[]; begins: unknown[]; finishes: number; release: () 
  *  (the decision's metadata merge), or the passkey begin (7c53b1bf). With
  *  `promptWaits`, the passkey prompt stays up until its signal aborts it,
  *  the way a browser's does. */
-type Hold = { at?: 'metadata' | 'begin'; promptWaits?: boolean };
+type Hold = { at?: 'metadata' | 'begin'; promptWaits?: boolean; metadataRefusal?: boolean };
 
 /** How many times the page asked the passkey, and whether a prompt was aborted. */
 const passkey = (page: Page) =>
@@ -128,6 +128,7 @@ async function twoApprovals(page: Page, presence: boolean, hold: Hold = {}): Pro
     // The gesture's first write is held until the test has switched steps.
     if (holdAt === 'metadata' && id === 's1' && path === '/metadata') await held;
     if (path === '/metadata') {
+      if (hold.metadataRefusal && id === 's1') return json(r, { error: 'budget decision refused' }, 403);
       Object.assign(step.metadata, JSON.parse(r.request().postData() ?? '{}'));
       return json(r, step);
     }
@@ -162,6 +163,43 @@ async function approveThenSwitch(page: Page, seen: Seen): Promise<void> {
   seen.release();
 }
 
+test('a delayed decision refusal stays off the step now shown', async ({ page }) => {
+  const seen = await twoApprovals(page, false, { metadataRefusal: true });
+  const refused = page.waitForResponse((response) => response.url().endsWith('/steps/s1/metadata') && response.status() === 403);
+  await approveThenSwitch(page, seen);
+  await refused;
+  const surface = page.locator('.sg-detail');
+  await expect(surface.getByRole('button', { name: 'Approve', exact: true })).toBeEnabled();
+  await expect(surface.locator('.step-write-error')).toHaveCount(0);
+  expect(seen.writes.filter((write) => write.step === 's2')).toEqual([]);
+});
+
+test('a decision refusal remains visible on the step it belongs to', async ({ page }) => {
+  const seen = await twoApprovals(page, false, { metadataRefusal: true });
+  await page.goto(`/ux/jobs/${JOB_ID}`);
+  const surface = page.locator('.sg-detail');
+  await expect(surface.locator('h3')).toHaveText('Approve the budget');
+  await surface.getByRole('button', { name: 'Approve', exact: true }).click();
+  await expect.poll(() => seen.writes.length).toBe(1);
+  seen.release();
+  await expect(surface.locator('.step-write-error')).toContainText('budget decision refused');
+  expect(seen.writes.map((write) => `${write.method} ${write.step}${write.path}`)).toEqual(['PATCH s1/metadata']);
+});
+
+test('switching approval steps does not carry the typed comment', async ({ page }) => {
+  await twoApprovals(page, false);
+  await page.goto(`/ux/jobs/${JOB_ID}`);
+  const surface = page.locator('.sg-detail');
+  await expect(surface.locator('h3')).toHaveText('Approve the budget');
+  await surface.locator('textarea').fill('budget only');
+  await page.locator('.sg-rail .rail-row', { hasText: 'Approve the hire' }).click();
+  await expect(surface.locator('h3')).toHaveText('Approve the hire');
+  await expect(surface.locator('textarea')).toHaveValue('');
+  await surface.locator('textarea').fill('hire only');
+  await page.locator('.sg-rail .rail-row', { hasText: 'Approve the budget' }).click();
+  await expect(surface.locator('textarea')).toHaveValue('');
+});
+
 test('a step switched mid-gesture: the completion lands on the step clicked, never the one now shown', async ({ page }) => {
   const seen = await twoApprovals(page, false);
   await approveThenSwitch(page, seen);
@@ -187,7 +225,8 @@ test('a presence step switched mid-gesture: nothing is signed, and nothing reach
   await approveThenSwitch(page, seen);
 
   const surface = page.locator('.sg-detail');
-  await expect(surface.locator('.step-write-error')).toContainText('Nothing was signed');
+  await expect(surface.getByRole('button', { name: 'Approve', exact: true })).toBeEnabled();
+  await expect(surface.locator('.step-write-error')).toHaveCount(0);
   expect(seen.writes.filter((w) => w.step === 's2')).toEqual([]);
   // The decision landed on s1 (the write the test held); the stamp that
   // asked for presence was refused, and no ceremony, second stamp or
@@ -238,7 +277,8 @@ test('the rail moves on while the begin is in flight: the passkey is never asked
   await expect(surface.locator('h3')).toHaveText('Approve the hire');
   seen.release();
 
-  await expect(surface.locator('.step-write-error')).toContainText('Nothing was signed');
+  await expect(surface.getByRole('button', { name: 'Approve', exact: true })).toBeEnabled();
+  await expect(surface.locator('.step-write-error')).toHaveCount(0);
   expect((await passkey(page)).asked).toBe(0);
   expect(seen.finishes).toBe(0);
   expect(seen.writes.map((w) => `${w.method} ${w.step}${w.path}`)).toEqual([
@@ -253,7 +293,7 @@ test('the page moves on while the begin is in flight: the passkey is never asked
   // The app's own navigate(): pushState, then popstate — the surface is
   // destroyed while the gesture it started still awaits the begin.
   await page.evaluate(() => {
-    window.history.pushState({}, '', '/ux/jobs');
+    window.history.pushState({}, '', '/me/inbox');
     window.dispatchEvent(new PopStateEvent('popstate'));
   });
   await expect(page.locator('.sg-detail')).toHaveCount(0);
@@ -279,7 +319,8 @@ test('the rail moves on while the passkey prompt is up: the prompt is aborted an
   await expect(surface.locator('h3')).toHaveText('Approve the hire');
 
   await expect.poll(async () => (await passkey(page)).aborted).toBe(true);
-  await expect(surface.locator('.step-write-error')).toContainText('Nothing was signed');
+  await expect(surface.getByRole('button', { name: 'Approve', exact: true })).toBeEnabled();
+  await expect(surface.locator('.step-write-error')).toHaveCount(0);
   expect(seen.finishes).toBe(0);
   expect(seen.writes.map((w) => `${w.method} ${w.step}${w.path}`)).toEqual([
     'PATCH s1/metadata',

@@ -5,7 +5,7 @@
 //! `n=$(grep -c ...)` takes grep's status as the assignment's status.
 //!
 //! MEASURED 2026-09-21 (backlog 4c9733f7). `the-sor-runs-on-control-plane`
-//! runs `set -euo pipefail` and counts its pins that way. So if the boss
+//! originally counted its pins that way under `set -euo pipefail`. If the boss
 //! manifest ever carried ZERO control-plane nodeSelectors — which is
 //! exactly the condition the lint exists to catch, the one that took the
 //! system of record dark for minutes on 2026-09-06 (90932d98) — the
@@ -35,6 +35,7 @@ fn fixture(case: &str, manifest: &str) -> std::path::PathBuf {
     for f in [
         "infra/lint/the-sor-runs-on-control-plane.sh",
         "infra/lint/lib/scanned.sh",
+        "infra/lint/lib/sor-placement.ts",
     ] {
         std::fs::copy(repo.join(f), root.join(f)).unwrap_or_else(|e| panic!("copy {f}: {e}"));
     }
@@ -60,7 +61,7 @@ fn run(root: &Path) -> (i32, String) {
 /// The worst case: workloads present, not one of them pinned.
 #[test]
 fn zero_pins_is_named_rather_than_dying_on_the_count() {
-    let root = fixture("zero-pins", "kind: Deployment\nkind: StatefulSet\n");
+    let root = fixture("zero-pins", "kind: Deployment\n---\nkind: StatefulSet\n");
     let (code, text) = run(&root);
     assert_ne!(code, 0, "two unpinned workloads must not pass: {text}");
     assert!(
@@ -79,8 +80,7 @@ fn zero_pins_is_named_rather_than_dying_on_the_count() {
 fn a_pinned_manifest_still_passes() {
     let root = fixture(
         "pinned",
-        "kind: Deployment\n        node-role.kubernetes.io/control-plane: \"\"\n\
-         kind: StatefulSet\n        node-role.kubernetes.io/control-plane: \"\"\n",
+        "kind: Deployment\nspec:\n  template:\n    spec:\n      nodeSelector:\n        node-role.kubernetes.io/control-plane: \"\"\n---\nkind: StatefulSet\nspec:\n  template:\n    spec:\n      nodeSelector:\n        node-role.kubernetes.io/control-plane: \"\"\n",
     );
     let (code, text) = run(&root);
     assert_eq!(code, 0, "a pinned manifest is clean: {text}");
@@ -99,4 +99,54 @@ fn a_manifest_with_no_workloads_does_not_die_counting_them() {
         "it must say something about having found no workloads, not exit \
          wordlessly on the count: got code {code} and {text:?}"
     );
+}
+
+#[test]
+fn the_approved_database_affinity_is_a_pin_not_an_unpinned_worker() {
+    let root = fixture("database", &database_manifest("postgres", "boss", false));
+    let (code, text) = run(&root);
+    assert_eq!(
+        code, 0,
+        "the approved data-node placement is guarded: {text}"
+    );
+}
+
+#[test]
+fn the_database_exception_does_not_admit_other_workloads_or_optional_affinity() {
+    for (name, namespace, optional) in [
+        ("nats", "boss", false),
+        ("postgres", "boss-playground", false),
+        ("postgres", "boss", true),
+    ] {
+        let root = fixture(
+            "database-refusal",
+            &database_manifest(name, namespace, optional),
+        );
+        let (code, text) = run(&root);
+        assert_ne!(code, 0, "{name}/{namespace} optional={optional}: {text}");
+    }
+    let required = database_manifest("postgres", "boss", false);
+    let extra_term = format!(
+        "{required}              - matchExpressions:\n                  - key: kubernetes.io/hostname\n                    operator: In\n                    values: [w-1]\n"
+    );
+    let wider_values = required.replace("values: [database]", "values: [database, build]");
+    for manifest in [extra_term, wider_values] {
+        let root = fixture("database-fallback", &manifest);
+        let (code, text) = run(&root);
+        assert_ne!(
+            code, 0,
+            "a build-node fallback is not a database pin: {text}"
+        );
+    }
+}
+
+fn database_manifest(name: &str, namespace: &str, optional: bool) -> String {
+    let placement = if optional {
+        "          preferredDuringSchedulingIgnoredDuringExecution:\n            - weight: 100\n              preference:\n                matchExpressions:\n                  - key: boss.dev/purpose\n                    operator: In\n                    values: [database]\n"
+    } else {
+        "          requiredDuringSchedulingIgnoredDuringExecution:\n            nodeSelectorTerms:\n              - matchExpressions:\n                  - key: boss.dev/purpose\n                    operator: In\n                    values: [database]\n"
+    };
+    format!(
+        "kind: Namespace\nmetadata:\n  name: boss\n---\nkind: StatefulSet\nmetadata:\n  name: {name}\n  namespace: {namespace}\nspec:\n  template:\n    spec:\n      affinity:\n        nodeAffinity:\n{placement}"
+    )
 }

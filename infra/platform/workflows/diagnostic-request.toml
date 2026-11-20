@@ -7,7 +7,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "A bounded diagnostic request executed by the registered actor named in its pinned operation contract, retaining complete original evidence without changing the subject's lifecycle."
-metadata = { department = "it", owner_role = "platform-admin", diagnostic_executor = "automation:train-conductor" }
+metadata = { owner = "9660c60f-eb47-4405-ae08-fcbb30c71e5f", department = "it", owner_role = "platform-admin", diagnostic_executor = "automation:train-conductor" }
 
 [[workflow.step]]
 title = "filed"

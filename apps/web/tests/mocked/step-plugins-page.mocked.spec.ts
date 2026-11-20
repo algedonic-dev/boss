@@ -1,5 +1,5 @@
 import { isPageWrite } from './_smokeMocks';
-// /it/registry/step-plugins — every control the page audit counted,
+// /engineering/registry/step-plugins — every control the page audit counted,
 // pinned (page-audit 5ff999f8, step `test`).
 //
 // The audit's inventory (controls_md, measured 2026-09-23 against
@@ -28,11 +28,17 @@ import { expect, test, type Page, type Request, type Route } from './_test';
 import { mountPage, settledReads } from './_helpers';
 import { installSmokeMocks } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
-import { parseRoute } from '../../src/router';
+import { parseRoute as parseRouteAt } from '../../src/router';
+import { ADDRESSES } from '../fixtures/station-tree';
+import { pagePath } from '../../src/shell/page-address';
+import type { NavItem } from '../../src/shell/nav-catalog';
 import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
 import { sectionForRoute } from '../../src/shell/sections';
+// The router reads a hosted page's address off the station tree
+// (backlog 0bc2eb68); this spec reads it off the tree the floor serves.
+const parseRoute = (path: string, search = '') => parseRouteAt(path, search, ADDRESSES);
 
-const PAGE = '/it/registry/step-plugins';
+const PAGE = '/engineering/registry/step-plugins';
 const TITLE = 'Step UX plugins';
 
 /// The page's one read, as StepPluginsPage.svelte spells it — anchored,
@@ -119,7 +125,7 @@ function catalogued(path: string): string | null {
   return section in ROUTE_CATALOG ? section : null;
 }
 
-test.describe('/it/registry/step-plugins — the rows', () => {
+test.describe('/engineering/registry/step-plugins — the rows', () => {
   test('shows recorded creation and genuine authoring job without inventing missing provenance', async ({ page }) => {
     const author = '9ce24f0b-c784-424c-b4eb-197748d04d05';
     await install(page, [{...ROWS[0], authoring_job_id: author}, ROWS[1]]);
@@ -165,7 +171,7 @@ test.describe('/it/registry/step-plugins — the rows', () => {
   });
 });
 
-test.describe('/it/registry/step-plugins — the controls', () => {
+test.describe('/engineering/registry/step-plugins — the controls', () => {
   test('one registry read plus usage reads, no buttons, no forms, no writes', async ({ page }) => {
     const writes = watchWrites(page);
     const reads: string[] = [];
@@ -183,16 +189,16 @@ test.describe('/it/registry/step-plugins — the controls', () => {
     expect(writes.map((w) => `${w.method()} ${w.url()}`)).toEqual([]);
   });
 
-  test('the nine registry tabs land on catalogued routes, and back returns here', async ({ page }) => {
+  test('the eight registry tabs land on catalogued routes, and back returns here', async ({ page }) => {
     const writes = watchWrites(page);
     await install(page);
     await mountPage(page, PAGE, { titleMatch: new RegExp(TITLE) });
 
     // Rules joined the strip beside Dispatcher (backlog 0a98d93f).
     const tabs = page.locator('nav.it-tabs[aria-label="IT registry"] a');
-    await expect(tabs).toHaveText(['Workflows', 'Dispatcher', 'Rules', 'Step plugins', 'Policy', 'Subjects', 'Drift', 'Agents', 'Credentials']);
+    await expect(tabs).toHaveText(['Workflows', 'Dispatcher', 'Rules', 'Step plugins', 'Subjects', 'Drift', 'Agents', 'Credentials']);
     const hrefs = await tabs.evaluateAll((as) => as.map((a) => a.getAttribute('href') ?? ''));
-    const catalogPaths = new Set(Object.values(ROUTE_CATALOG).map((r) => (r as { path: string }).path));
+    const catalogPaths = new Set(Object.values(ROUTE_CATALOG).map((r) => pagePath(r as NavItem, ADDRESSES) ?? `unplaced:${r.id}`));
     for (const h of hrefs) {
       expect(catalogPaths.has(h), `${h} is a ROUTE_CATALOG path`).toBe(true);
       expect(catalogued(h), `${h} lights a catalogued section`).not.toBeNull();
@@ -239,7 +245,7 @@ test.describe('/it/registry/step-plugins — the controls', () => {
   });
 });
 
-test.describe('/it/registry/step-plugins — empty and failed are never the same paint', () => {
+test.describe('/engineering/registry/step-plugins — empty and failed are never the same paint', () => {
   const EMPTY =
     'No plugins installed yet. Declare a row in infra/platform/step-plugins/ and add its JavaScript bundle. ' +
     'Land the car; boss-platform-workflow-seed publishes the row on the next start. ' +
@@ -298,7 +304,7 @@ test('usage binds actual active workflow steps independently of native in-flight
   });
   await mountPage(page, PAGE, { titleMatch: new RegExp(TITLE) });
   const review = page.locator('.catalog tbody tr').filter({has: page.getByRole('link', {name: 'review-design', exact: true})});
-  await expect(review.getByRole('link', {name: 'incident v7 · review-cause', exact: true})).toHaveAttribute('href', '/it/registry/incident');
+  await expect(review.getByRole('link', {name: 'incident v7 · review-cause', exact: true})).toHaveAttribute('href', '/engineering/registry/incident');
   await expect(review.locator('[data-usage="in-flight"]')).toHaveText('0');
   const signoff = page.locator('.catalog tbody tr').filter({has: page.getByRole('link', {name: 'sign-off', exact: true})});
   await expect(signoff.locator('[data-usage="bindings"] a')).toHaveText(['approval v3 · approve', 'approval v3 · confirm']);

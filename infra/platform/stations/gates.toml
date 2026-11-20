@@ -1,0 +1,99 @@
+# ---------------------------------------------------------------------------
+# gates — the cluster gate: every open gate-run packet, waiting for a bay
+# or in one.
+#
+# An EQUIPMENT station (factory taxonomy M2, item 0a78f8f8, 2026-11-03):
+# shared process equipment, operated by one automaton, used by every protocol
+# that gates a branch — a car's gate, a train's gate, main's full gate.
+# The automaton is the gate runner, the cluster Job that judges a branch
+# and leaves its receipt (infra/platform/automations/gate-runner.toml).
+#
+# BAYS ARE THE GATE CAPACITY, AND THIS IS ITS ONE HOME (CLAUDE.md §9a).
+# `boss gate`'s admission bound, the resident supervisor's and the slots
+# the yard draws all read `bays` off this row; trains count inside it
+# (design 1e787fc2). Until this row the number was `gate_max_concurrent`
+# on the train-conductor delivery policy, which drops it in its v12. Two
+# was that policy's v11 value (backlog 9a460e74): the Kingston gate drive
+# on w-1 delivered 2.62 gates/h with two bays and only 2.38 with three
+# occupied throughout. Design 121f44a1 D2 reads "two bays until the drive
+# is replaced, then three, then a measured four", and the drive is
+# replaced: THREE since version 4 (below). `boss_jobs::stations::COMPILED_GATE_BAYS` is the fallback a reader uses
+# when this row cannot be read, held equal to `bays` here by
+# `the_compiled_gate_bays_are_the_gates_rows`.
+#
+# Membership: every OPEN gate-run, queued or running. Discipline `age`:
+# the gate queue launches in acceptance order, and a packet's age is the
+# nearest reading of that the registry can sort by. To change this
+# station, bump `version`.
+#
+# Version 2 (pass item 4 of design ccfe87ff, backlog 1bb8c479; bumped
+# from the LIVE newest, v1): the station declares its edge. A green gate
+# files the car it vouches for, and the car stands on the loading dock —
+# the hand-off `rule:auto-park-on-gate-green`, gate-run@record-verdict to
+# ship-a-change@review, in infra/platform/yard/handoffs.toml. Nothing else
+# changed.
+#
+# Version 3 (T2 of design 4b27a65a, backlog 3f58c823; bumped from the
+# LIVE newest, v2): the station stands in the tree — its stable `id`, its
+# `parent` /algedonic/engineering, its mode, its seats (the same number as
+# its bays; `bays` stays the gate capacity's one home until it retires),
+# its machine, and what it holds of the build node: 8 vCPU of host:w-1,
+# two seats at the 4-CPU request each gate container makes
+# (infra/gate-runner/gate-runner.yaml, `requests: {cpu: "4", ...}`).
+# Nothing else changed.
+#
+# Version 4 (backlog a082371d, design 121f44a1 D2; bumped from the LIVE
+# newest, v3): THREE bays and three seats, holding 12 vCPU of host:w-1.
+# The gate volume moved to a Micron 7400 (nvme2n1) at 2026-11-07 18:50Z,
+# and the receipts on 88b35891 say the I/O bound went with the Kingston:
+# the first full gate on it ran cold in 35m10s (the Kingston's ran 38m
+# WARM), car gates with the other bay busy took 19, 24 and 29 min (46 on
+# the Kingston), and io.some stalled 9 s of a 2081 s gate — CPU-bound,
+# about 8 of w-1's 32 cores busy. Three bays plus the train gate, which
+# launches outside the bound (0f4224bc), still fit w-1 by request: CPU 4
+# x 4.25 (the gate container's 4 beside the postgres sidecar's 250m)
+# plus the dev pod's 4.3 is 21.3 of 32; memory 4 x 11.25 GiB plus the
+# dev pod's 8.6 is 53.6 of the pin's 56.4 (nine tenths of 62.7);
+# ephemeral 4 x 40 GiB plus the dev pod's 154 is 314 of 789. The memory
+# and disk sums are pinned, reading this row's `bays`
+# (the_bays_and_the_train_gate_fit_the_build_nodes_memory,
+# a_gate_requests_what_the_new_layout_uses_and_the_bays_fit). A fourth
+# bay is the next decision, and it is a measurement first: the three-bay
+# receipts (wall, io stall, cpu) land on 121f44a1.
+#
+# Version 5 (backlog a1c0a0ff, design deba3000; bumped from the tree's
+# v4): the hand-typed `[station.upstream]` is gone. It named a /system
+# route the IT consolidation retired on 2026-08-31, so the walk upstream
+# led to a not-found page. A station's upstream is now DERIVED from the
+# tree, as its parent station's page (`upstreamOf` in
+# apps/web/src/it/tree/station-page.ts), and the seed refuses a declared
+# one. The retired department label is removed with its floor reader
+# (backlog aa82eb11); the station's parent places it in the tree.
+#
+# Version 7 (backlog e3a927c3; bumped from the LIVE newest, v6):
+# `placement`, where the gates stand on Engineering's floor, {x, y, w, h}
+# in floor units, as David's Plan artboard draws them (2026-11-19).
+# Nothing else changed.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "gates"
+version = 7
+id = "a426acd5-4c77-4ec9-9686-c96cd59b53d7"
+parent = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5"
+mode = "standing"
+placement = { x = 590, y = 120, w = 230, h = 170 }
+capacity = 3
+machines = ["automation:gate-runner"]
+allocation = { "host:w-1" = 12 }
+status = "active"
+title = "Gates — branches waiting for a bay or in one"
+kind = "equipment"
+automaton = "automation:gate-runner"
+bays = 3
+discipline = ["age"]
+edges = ["loading-dock"]
+
+[station.predicate]
+kind = "gate-run"
+status = "open"

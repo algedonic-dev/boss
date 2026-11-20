@@ -41,10 +41,13 @@ const ROW_ONCLICK_NAVIGATES = /<tr\b[^>]*?\bonclick=\{[^}]*\bnavigate\(/;
 
 describe('a clickable table row is one mechanism', () => {
   test('the pin reads the tree it pins', () => {
-    // Control: the walk must reach the pages this was filed against.
+    // Control: the walk must reach the rowLink pages. It named PartsList
+    // and PeopleList, the pages this was filed against, and then
+    // JobsListPage, until step 1 of design 01fa5bdf removed them;
+    // DepartmentThirds uses rowLink today.
     const names = FILES.map((f) => f.name);
-    expect(names).toContain(join('parts', 'PartsList.svelte'));
-    expect(names).toContain(join('people', 'PeopleList.svelte'));
+    expect(names).toContain(join('departments', 'DepartmentThirds.svelte'));
+    expect(FILES.find((f) => f.name === join('departments', 'DepartmentThirds.svelte'))?.text).toContain('use:rowLink');
     expect(HAND_SET_CLASS.test('<tr class="data-table-row-link">')).toBe(true);
     expect(ROW_ONCLICK_NAVIGATES.test('<tr\n  class="x"\n  onclick={() => navigate(to)}\n>')).toBe(true);
     expect(ROW_ONCLICK_NAVIGATES.test('<tr onclick={() => toggleAccount(code)}>')).toBe(false);

@@ -555,6 +555,7 @@ mod tests {
             sign_offs_required: Vec::new(),
             assurance_required: None,
             duration_hours: None,
+            resources: None,
             labor_hours: None,
             wall_clock_hours: None,
             fields: Vec::new(),

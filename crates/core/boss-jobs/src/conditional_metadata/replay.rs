@@ -184,6 +184,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, event)| ReplayEvent {
+                raw_payload: None,
                 audit_id: index as i64 + 1,
                 event_id: event.id,
                 kind: event.kind,
@@ -305,6 +306,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(n, e)| ReplayEvent {
+                raw_payload: None,
                 audit_id: n as i64 + 1,
                 event_id: e.id,
                 kind: e.kind,

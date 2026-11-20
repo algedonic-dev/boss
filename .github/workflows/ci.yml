@@ -61,7 +61,15 @@ env:
 jobs:
   gate:
     name: Gate (infra/gate.sh, full)
-    runs-on: ubuntu-latest
+    # A NAMED image, never `-latest` (backlog 9b74c84b). restore-shared
+    # reddened here over GNU-only `realpath -e` while the cluster stayed
+    # green (920f4fd5), and about sixty infra scripts still use GNU-only
+    # flags (`readlink -f`, `stat -c`, `date -d`). The forge and the
+    # cluster run GNU coreutils, so the mirror is told to as well, and a
+    # move to a new image is an edit here rather than GitHub's choice.
+    # The tools step prints `realpath --version`, so every run's log says
+    # which coreutils the gate ran under.
+    runs-on: ubuntu-24.04
     # A cold full gate on a 4-vCPU runner: the cluster's warm run is
     # 3-10 minutes and the forge's cold one was ~13 on a Ryzen, so this
     # allows for several times that and still ends a wedged run.
@@ -95,6 +103,18 @@ jobs:
       # under `estate`. Nowhere else sets it — infra/lint/lib/no-estate.sh,
       # pinned by a_declared_no_estate_skips_only_the_live_half.rs.
       BOSS_ESTATE: none
+      # And there is no per-car trunk here (backlog 2d28df78, design
+      # e2710fbc). This checkout's only trunk is the previous publish, so a
+      # lint that judges what "this change" added against the trunk
+      # merge-base judged every forge car since then as one, and a rule
+      # that landed inside the window redded every publish spanning it
+      # (PR 258: factory-vocabulary, 711 files classed as added, 27 red
+      # that every forge car had passed). Each trunk-relative lint says it
+      # did not judge and passes; the receipt names them under `trunk`, and
+      # the forge's per-car receipts are the judgements. Nowhere else sets
+      # it — infra/lint/lib/trunk-ref.sh, pinned by
+      # a_declared_no_trunk_skips_every_trunk_relative_lint.rs.
+      BOSS_TRUNK: none
     services:
       postgres:
         image: postgres:16
@@ -132,10 +152,13 @@ jobs:
       - name: Install the tools the gate invokes by name
         # infra/forge/boss-ci/required-tools.txt is the list the gate's
         # image carries; git, curl, jq, python3 and node are already on
-        # the runner image, psql and tmux may not be.
+        # the runner image, psql and tmux may not be. The coreutils
+        # version is printed, not assumed: GNU or uutils is a fact of the
+        # image, read here on every run (backlog 9b74c84b).
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q postgresql-client tmux
+          realpath --version
 
       - name: Install Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0

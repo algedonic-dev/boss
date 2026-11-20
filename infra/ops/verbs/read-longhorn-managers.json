@@ -1,0 +1,7 @@
+{
+  "about": "READ-ONLY: fixed Longhorn manager observation (1462e441), through the existing forge ops_kubectl authority. No parameters: reads the known longhorn-system Namespace, longhorn-manager DaemonSet, app=longhorn-manager Pods and retained namespace Events. Reports namespace/DaemonSet/pod identities, node, readiness, restart counts, current and last termination states, rollout status, and retained events naming manager pods or the DaemonSet. Cause remains UNKNOWN: simultaneous drops and a last-termination reason are evidence, not an automatic historical diagnosis. Complete generic or typed Lists are accepted; continuation, wrong owner/namespace, malformed fields, failed reads and oversized observations refuse loudly, never healthy empty lists. No logs, exec, Secrets or writes. Each read has20s timeout; input bound1MiB each and complete output bound96KiB. Event retention supplies no guaranteed lookback window. Timeout240s includes first image pull and four fixed reads.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/longhorn-managers.sh"],
+  "params": [],
+  "timeout": 240
+}

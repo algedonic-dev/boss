@@ -74,11 +74,90 @@ parameters:
   staleReplicaTimeout: "30"
   fsType: "ext4"
 ---
+# The class a dev-build worker's volume is cut from (backlog e14a472d,
+# option C, David 2026-10-29 on d9b39685). The class above binds
+# Immediate with no placement rule, so Longhorn placed a worker's one
+# replica the moment its claim existed, before the pod (required off the
+# control planes) was scheduled, on any disk with room under the floor:
+# on 2026-10-27 that could be cp-3, whose system disk also carries etcd
+# and the PostgreSQL replicas, with 150 GB placeable.
+#
+# Two rules, each closing half of that:
+#   - WaitForFirstConsumer: the claim is provisioned only once its pod is
+#     scheduled, so no volume is made for a pod that has nowhere to run.
+#     It does NOT place the replica: Longhorn keeps no topology
+#     constraint from the binding (its strictTopology parameter pins
+#     only the PV's nodeAffinity, per the v1.11.3 parameter reference).
+#   - nodeSelector "dev-build": Longhorn places a replica only on a node
+#     carrying that Longhorn tag. It has no negative selector, so the tag
+#     is positive, declared on every Talos WORKER as the
+#     node.longhorn.io/default-node-tags annotation
+#     (infra/cluster/talos/patches/w-*.yaml) and on no control plane.
+#     Until node-converge has applied it to a node, that node takes no
+#     dev-build replica; with none applied, no worker volume can place.
+#
+# A NEW name, not an edit of the class above: Kubernetes refuses a change
+# to a StorageClass's parameters or binding mode, so an edited class
+# fails the converge's apply, and the dev pod's /work and the gate's disk
+# still hold the old one. crates/core/boss-testing/tests/
+# dev_build_volume_class.rs pins this class, the workers' tag and its
+# absence on every control plane to each other.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: longhorn-dev-build
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  numberOfReplicas: "1"
+  dataLocality: "best-effort"
+  nodeSelector: "dev-build"
+  staleReplicaTimeout: "30"
+  fsType: "ext4"
+---
+# The class a dev-build worker's volume moves to once w-1's Kingston is a
+# Longhorn disk tagged `scratch` (design 3c475a19 D2/D3, section 4 car 2;
+# backlog 46328c3a). The class above places a worker's replica on any
+# disk of a build node, which on w-1 is the 980 PRO's default disk, shared
+# with every durable replica there: on 2026-11-12 two builder runs were
+# refused for want of room on it while the Kingston sat idle. This one
+# adds `diskSelector: scratch`, so a worker volume lands only on a disk
+# carrying that tag (u-scratch, infra/cluster/talos/patches/w-1.yaml) and
+# never again beside the durable replicas.
+#
+# A NEW name beside the class above, for the class above's own reason:
+# StorageClass parameters are immutable, so an edited class fails the
+# converge's apply, and the worker volumes alive today still name it.
+# Declaring it places nothing: until a disk carries the tag, no volume
+# cut from it could place, so dev-build.py keeps cutting from
+# longhorn-dev-build until the live sequence (infra/cluster/talos/
+# README.md) has added and tagged u-scratch, and its WORKER_VOLUME_CLASS
+# moves in the car after that. dev_build_volume_class.rs pins it.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: longhorn-dev-scratch
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  numberOfReplicas: "1"
+  dataLocality: "best-effort"
+  nodeSelector: "dev-build"
+  diskSelector: "scratch"
+  staleReplicaTimeout: "30"
+  fsType: "ext4"
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: boss-dev-work
   namespace: boss-dev
+  annotations:
+    boss.algedonic.dev/storage-declaration: floor
 spec:
   accessModes: [ReadWriteOnce]
   storageClassName: longhorn-dev-disposable
@@ -420,7 +499,7 @@ spec:
                     # Lands on the PVC, so it downloads once, not per
                     # restart. Version matches the cluster line (1.33).
                     if [ ! -x /work/tools/bin/kubectl ]; then
-                      curl -sfL -o /tmp/kubectl https://dl.k8s.io/release/v1.33.3/bin/linux/amd64/kubectl \
+                      curl -q -sfL -o /tmp/kubectl https://dl.k8s.io/release/v1.33.3/bin/linux/amd64/kubectl \
                         && echo "2fcf65c64f352742dc253a25a7c95617c2aba79843d1b74e585c69fe4884afb0  /tmp/kubectl" | sha256sum -c - \
                         && install -m 0755 /tmp/kubectl /work/tools/bin/kubectl || true
                     fi
@@ -461,11 +540,30 @@ spec:
                     # Every keyword below was syntax-checked against
                     # OpenSSH_9.2 - the bookworm package this pod
                     # installs - on 2026-09-20.
+                    #
+                    # KEEPALIVE (backlog 98c6514e, David 2026-11-02: trouble
+                    # keeping SSH to the pod). With ClientAliveInterval unset
+                    # (OpenSSH's default 0) sshd sent nothing on an idle
+                    # session, so it carried no traffic across WireGuard, the
+                    # LB and node NAT, and every one of David's sessions ended
+                    # "disconnected by user" - the client gave up. 30 s x 4
+                    # keeps the session alive and reaps a dead client within
+                    # two minutes. LogLevel stays INFO: measured on the live
+                    # pod (131,495 log lines), INFO already names why each
+                    # session ended; what it lacks is a timestamp, which the
+                    # reader below the sshd start adds. sshd keeps the FIRST
+                    # value of a repeated keyword, so each is spelled once -
+                    # pinned by the_dev_door_is_an_access_ssh_application.rs.
+                    # The interim live edit of 2026-11-02 21:17Z (sshd -t, then
+                    # HUP) read these values back with sshd -T; this is the
+                    # declaration that outlives the next pod start.
                     cat > /work/ssh/sshd_config <<'SD'
                     Port 22
                     HostKey /work/ssh/ssh_host_ed25519_key
                     PidFile /work/ssh/sshd.pid
                     LogLevel INFO
+                    ClientAliveInterval 30
+                    ClientAliveCountMax 4
                     UsePAM no
                     PermitRootLogin yes
                     PasswordAuthentication no
@@ -524,22 +622,30 @@ spec:
                       echo "ssh door: CLOSED - sshd refused to start (exit $?); its log follows"
                       tail -n 20 /work/ssh/sshd.log
                     fi
+                    # WHEN each session ended, beside WHY (backlog 98c6514e).
                     # The pod's fsGroup (1500) re-modes files on the PVC at
                     # every mount, so the bastion key David authorised comes
                     # back 0660 after each roll and ssh refuses it
                     # ("UNPROTECTED PRIVATE KEY FILE", 2026-09-08). The boot
                     # path owns the mode; a human chmod is the last time.
                     chmod 600 /work/.ssh/* 2>/dev/null || true
+                    # -q FIRST on every curl here (backlog eb94c402): this
+                    # script runs as root beside /work/home, which group
+                    # 1500 may write, and what these curls fetch is run as
+                    # root. Only as curl's first argument does -q skip a
+                    # planted .curlrc. EVERY_CURL_PASSES_Q in
+                    # every_shell_identity_sender_presents_the_machine_token.rs
+                    # holds this file to it by name.
                     for i in 1 2 3 4 5 6 7 8 9 10; do
                       [ -x /work/home/.local/bin/claude ] && break
-                      if curl -fsSL -o /tmp/claude-install.sh https://claude.ai/install.sh; then
+                      if curl -q -fsSL -o /tmp/claude-install.sh https://claude.ai/install.sh; then
                         HOME=/work/home bash /tmp/claude-install.sh || echo "claude install: attempt $i: installer failed"
                       else
                         echo "claude install: attempt $i: download failed (curl exit $?)"
                       fi
                       [ -x /work/home/.local/bin/claude ] || sleep 6
                     done
-                    [ -x /work/home/.local/bin/claude ] || echo "claude install: gave up after 10 attempts; install by hand: curl -fsSL https://claude.ai/install.sh | HOME=/work/home bash"
+                    [ -x /work/home/.local/bin/claude ] || echo "claude install: gave up after 10 attempts; install by hand: curl -q -fsSL https://claude.ai/install.sh | HOME=/work/home bash"
                     # THE SESSION STARTS ITSELF. David, 2026-09-15: "restart
                     # the dev pod into the Claude Code session, so we can at
                     # least use remote connect without needing to SSH into
@@ -583,6 +689,31 @@ spec:
                     # capitals and passes a fixed failure notice to the
                     # session (e5cb7c6e). A log alone has no active reader;
                     # the notice is the first task, never a resumed drain.
+                    #
+                    # ONE DRAIN, DECIDED ONCE (review ce8970ce N2, backlog
+                    # b513514c). Whether the drain runs in tmux `dev` or in
+                    # the conductor's supervised seat is decided HERE, once,
+                    # and written to /work/drain-seat, which dev-claude.sh
+                    # and dev-factory.sh both read. They used to read the
+                    # checkout each for itself, minutes apart, and the
+                    # reclaim sidecar's first fast-forward could land
+                    # between the two reads: dev draining on the old path
+                    # while --boot started the conductor's seat, two drains
+                    # on one agent. From the CHECKOUT, not origin/main (N1):
+                    # the seat runs the checkout's dev-session.sh and
+                    # factory-loop.sh, so a decision read off origin/main
+                    # could hand the drain to a seat the checkout cannot
+                    # start. So the first roll after b513514c lands still
+                    # drains in dev (the sidecar fast-forwards 300 s after
+                    # boot, then hourly), and the seats take over on the
+                    # roll after one.
+                    rm -f /work/drain-seat
+                    if [ -e /work/home/.config/boss/drain-on-boot ] \
+                       && grep -q -F -- '= --boot ]' /work/boss/infra/dev/dev-session.sh 2>/dev/null \
+                       && grep -q '^conductor[[:space:]]' /work/boss/infra/dev/seats.tsv 2>/dev/null; then
+                      echo conductor > /work/drain-seat
+                      echo "dev session: the drain runs in the conductor's seat this boot (/work/drain-seat)"
+                    fi
                     cat > /work/dev-claude.sh <<'DC'
                     #!/usr/bin/env bash
                     export HOME=/work/home
@@ -591,6 +722,10 @@ spec:
                     export CARGO_TARGET_DIR=/scratch/target
                     cd /work/boss
                     log=/work/ssh/postStart.log
+                    if [ "$(cat /work/drain-seat 2>/dev/null)" = conductor ]; then
+                      echo "dev session: drain-on-boot is ON and the boot gave the drain to the conductor's seat (/work/drain-seat) - the drain runs supervised in tmux conductor (dev-session.sh --boot); dev starts as the Remote Control door" >> "$log"
+                      exec claude --remote-control boss-dev
+                    fi
                     if [ -e /work/home/.config/boss/drain-on-boot ]; then
                       timeout 60 git fetch -q origin >> "$log" 2>&1 \
                         || echo "dev session: git fetch origin failed (exit $?) - reading the origin/main this checkout last fetched" >> "$log"
@@ -624,6 +759,75 @@ spec:
                     else
                       echo "dev session: not started — claude binary or /work/home/.claude/.credentials.json missing; ssh in, choose Shell (4) at the menu and run claude once to log in, and the next boot starts it"
                     fi
+                    # THE FACTORY STARTS ITSELF TOO (backlog 4e2ec7d2, conductor
+                    # decision 2026-10-29T15:57Z: David delegated the dev pod
+                    # roll to the agents as a protocol trial). The conductor
+                    # comes back from a roll in `dev` above; the factory loop
+                    # (tmux codex-factory, infra/dev/factory-loop.sh) started
+                    # only from the login menu's option 6, so after every roll
+                    # the builders waited for David to log in. The start goes
+                    # through the ONE door that defines option 6,
+                    # `dev-session.sh --detached 6` (car 0dd77a5c), which
+                    # itself refuses when the loop or the interactive codex is
+                    # running, since both sign as one agent. Under the same
+                    # drain switch as the conductor's first prompt, so with
+                    # the switch off the boot is exactly what it was. Needs
+                    # the codex binary and its login, which is codex's own
+                    # answer (`codex login status`): the boot never names or
+                    # places a credential. It runs at the end of the detached
+                    # install block below, after sshd, after `dev`, and after
+                    # a codex install; every outcome is one `factory:` line in
+                    # this log, and none fails the pod.
+                    #
+                    # EVERY SEAT, FROM DATA (backlog b513514c, 2026-11-17).
+                    # Only Codex was supervised, so on 2026-11-17 the
+                    # conductor and Claude B stood idle 7.5 h (5627a4e1).
+                    # When the checkout's door has `--boot`, it starts every
+                    # seat of infra/dev/seats.tsv (Codex's factory, Claude
+                    # B's loop, the conductor's loop) and checks each CLI and
+                    # login itself, one `seat <name>:` line each, so a new
+                    # seat is a row and never another edit here. A checkout
+                    # older than `--boot` gets the codex-only start below.
+                    cat > /work/dev-factory.sh <<'DF'
+                    #!/usr/bin/env bash
+                    log=/work/ssh/postStart.log
+                    door=/work/boss/infra/dev/dev-session.sh
+                    if [ ! -e /work/home/.config/boss/drain-on-boot ]; then
+                      echo "factory: drain-on-boot is off - the factory loop is not started (touch /work/home/.config/boss/drain-on-boot to start it on boot)" >> "$log"
+                      exit 0
+                    fi
+                    if grep -q -F -- '= --boot ]' "$door" 2>/dev/null; then
+                      boot=(--boot)
+                      [ "$(cat /work/drain-seat 2>/dev/null)" = conductor ] || boot+=(--except conductor)
+                      if timeout -k 5 300 "$door" "${boot[@]}" < /dev/null >> "$log" 2>&1; then
+                        echo "factory: dev-session.sh ${boot[*]} started the seats of infra/dev/seats.tsv (one seat line each above)" >> "$log"
+                      else
+                        echo "factory: dev-session.sh ${boot[*]} exited $? - read the seat lines above" >> "$log"
+                      fi
+                      exit 0
+                    fi
+                    if [ ! -x /work/home/.local/bin/codex ]; then
+                      echo "factory: not started - no codex binary at /work/home/.local/bin/codex; choose GPT + Codex (2) at the login menu to install it, and the next boot starts the loop" >> "$log"
+                      exit 0
+                    fi
+                    if HOME=/work/home timeout -k 5 30 /work/home/.local/bin/codex login status > /dev/null 2>&1; then
+                      :
+                    else
+                      echo "factory: not started - codex is not logged in (codex login status exit $?); ssh in, choose GPT + Codex (2) at the menu and log in once, and the next boot starts the loop" >> "$log"
+                      exit 0
+                    fi
+                    if ! grep -q -F -- '= --detached ]' "$door" 2>/dev/null; then
+                      echo "factory: not started - $door has no --detached 6 yet (car 0dd77a5c); start the loop from the login menu (6) or with boss factory restart" >> "$log"
+                      exit 0
+                    fi
+                    if out=$(timeout -k 5 120 "$door" --detached 6 < /dev/null 2>&1); then
+                      echo "factory: started the factory loop through dev-session.sh --detached 6: $out" >> "$log"
+                    else
+                      echo "factory: not started - dev-session.sh --detached 6 refused (exit $?): $out" >> "$log"
+                    fi
+                    exit 0
+                    DF
+                    chmod +x /work/dev-factory.sh
                     # CODEX AND GEMINI, beside claude (backlog e2d63c28): the
                     # login selector's options 2 and 3. npm-installed onto the
                     # PVC prefix /work/home/.local (its bin/ is on the PATH
@@ -649,8 +853,30 @@ spec:
                     setsid bash -c '
                       [ -x /work/home/.local/bin/codex ] || timeout -k 10 300 npm i -g --prefix /work/home/.local @openai/codex || echo "codex install: failed (exit $?) - choose option 2 at login to retry"
                       [ -x /work/home/.local/bin/gemini ] || timeout -k 10 300 npm i -g --prefix /work/home/.local @google/gemini-cli || echo "gemini install: failed (exit $?) - choose option 3 at login to retry"
+                      /work/dev-factory.sh || echo "factory: /work/dev-factory.sh exited $? - the factory loop was not started"
                     ' < /dev/null >> /work/ssh/postStart.log 2>&1 &
-                    echo "codex/gemini: a missing CLI installs detached (pid $!); npm's output and any failure land below, after this hook returns"
+
+                    # sshd -E writes no timestamp, so session lengths could
+                    # not be read from /work/ssh/sshd.log. This reader follows
+                    # that log BY NAME and copies each session-end line to
+                    # /work/ssh/sessions.log with the UTC time it was seen. It
+                    # never sits between sshd and its log: a FIFO reader that
+                    # died would block sshd's next log write, while a dead
+                    # tail costs only the timestamps until the next boot. The
+                    # LoadBalancer health check closes before auth thousands
+                    # of times a day ("[preauth]", 33,103 lines on 2026-11-02),
+                    # and those are not sessions, so they are skipped.
+                    setsid bash -c '
+                      tail -n 0 -F /work/ssh/sshd.log 2>/dev/null | while IFS= read -r line; do
+                        case "$line" in
+                          *"[preauth]"*|*kex_exchange_identification*) ;;
+                          *"Received disconnect"*|*"Disconnected from"*|*"Timeout, client not responding"*|*"Connection closed by"*)
+                            printf "%s %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$line" >> /work/ssh/sessions.log ;;
+                        esac
+                      done
+                    ' < /dev/null > /dev/null 2>&1 &
+                    echo "ssh door: session ends are timestamped in /work/ssh/sessions.log (reader pid $!)"
+                    echo "codex/gemini: a missing CLI installs detached (pid $!); npm's output and any failure land below, after this hook returns, followed by the factory loop's factory: line"
                     } >> /work/ssh/postStart.log 2>&1 || true
           workingDir: /work
           env:
@@ -923,9 +1149,18 @@ spec:
           # across seven eviction messages, and the kubelet's default
           # rotation keeps up to five 10Mi files of a container's log,
           # which count against it too, so 64Mi covers both.
+          # MEMORY (backlog 6279669c, 89f94c28): 256Mi was OOMKilled once on
+          # 2026-11-06 and four times on the next pod by 2026-11-07T04:04Z.
+          # The kill rings (/work/telemetry/dev-memory/kills) read anon up
+          # to 138 MB (a python3 controller or inventory read), file up to
+          # 97 MB and kernel up to 163 MB — the dentry and inode slab its
+          # walks of /work and /scratch charge to this cgroup, which the
+          # limit counts. 1Gi holds their sum with room for the walk to
+          # grow with /scratch; the request stays at what it idles at.
+          # Pinned by the_dev_pod_is_not_the_first_evicted.rs.
           resources:
             requests: {cpu: 50m, memory: 64Mi, ephemeral-storage: 64Mi}
-            limits: {cpu: 500m, memory: 256Mi}
+            limits: {cpu: 500m, memory: 1Gi}
           volumeMounts:
             - {name: work, mountPath: /work}
             - {name: scratch, mountPath: /scratch}

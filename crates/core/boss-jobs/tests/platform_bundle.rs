@@ -36,6 +36,24 @@ fn bundle() -> Vec<WorkflowSpec> {
     load_workflows(platform_bundle_path()).expect("the platform bundle parses")
 }
 
+#[test]
+fn presence_approvals_declare_their_human_completion_requirement() {
+    for workflow in bundle() {
+        for step in workflow.steps {
+            if step.assurance_required == Some(boss_core::job::Assurance::Presence)
+                && !step.sign_offs_required.is_empty()
+            {
+                assert!(
+                    boss_jobs::human_only::declared(&step.metadata_defaults),
+                    "{}.{} requires a person's passkey but is absent from the human-required view",
+                    workflow.kind,
+                    step.title,
+                );
+            }
+        }
+    }
+}
+
 /// One protocol per file, and the file is named for it. The loader
 /// refuses anything else; this pins the rule against the real
 /// directory so the listing IS the kind list — `ls` answers "which

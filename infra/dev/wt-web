@@ -2,10 +2,19 @@
 # Dev isolation (b3071bf4): with a selector, candidate code runs only in
 # the worker; a selector naming no activated generation REFUSES (design
 # a68fc42a D1), never runs it here beside the token.
+# A caller the store is closed to (root-owned 0700; uid 65534 under
+# infra/dev/as-gate-uid.sh) cannot see the selector either way, so that
+# is a refusal too, never the held state (backlog 1fddbe13; the reasoning
+# is in infra/dev/run-while-held.sh).
 dev_control=/work/tools/dev-control
+seen=$dev_control
+until [[ -e $seen || -L $seen ]]; do seen=${seen%/*}; seen=${seen:-/}; done
 if [[ -e $dev_control/enabled || -L $dev_control/enabled ]]; then
     [[ "$(/usr/bin/readlink -- "$dev_control/enabled")" =~ ^"$dev_control"/generations/[0-9a-f]{40}$ ]] && exec "$dev_control/wt-web" "$@"
     echo "wt-web: REFUSED — dev isolation is on and its selector $dev_control/enabled names no activated generation, so candidate code does not run beside this container's credentials (design a68fc42a D1). Why: $dev_control/activation.log. boss-api and boss without --built still run." >&2
+    exit 75
+elif [[ ! -d $seen || ! -x $seen ]]; then
+    echo "wt-web: REFUSED — this caller (uid $EUID) cannot read the dev isolation store $dev_control ($seen is closed to it), so it cannot tell whether isolation is on, and candidate code does not run beside this container's credentials (design a68fc42a D1). Run it as the store's owner." >&2
     exit 75
 fi
 # wt-web — prepare a WORKTREE for web checks by giving it its OWN

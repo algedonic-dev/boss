@@ -1,0 +1,8 @@
+{
+  "about": "READ-ONLY: one Longhorn node's actual spec.tags, boolean allowScheduling and separate per-disk tags (infra/forge/longhorn-node-tags.sh <node>; 90b6c292, e14a472d Option C). One pattern-checked DNS label, fixed namespace longhorn-system, through the forge's existing ops_kubectl authority; no new grant or packet-selected command, resource, namespace or JSONPath. A same-connection native Namespace control and complete typed Longhorn NodeList precede any NOT FOUND answer. Missing, null, malformed, partial, ambiguous or forbidden reads are CANNOT ANSWER/exit1, never empty tags or absence. Explicit empty tags and false scheduling remain their actual values. Node tags are never inferred from the default-node-tags annotation, disk tags or an applied node-converge. No write, retag, converge or placement/capacity proof. Separate original stdout/stderr are retained by the runner. Timeout180 covers the existing bounded120s image preparation and two fixed GETs bounded20s each.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/longhorn-node-tags.sh", "{1}"],
+  "params": [{"name": "node", "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"}],
+  "capture": "separate-streams",
+  "timeout": 180
+}

@@ -1,4 +1,4 @@
-// /it/codebase — the measurement's age, a failed newest run, and the two
+// /engineering/codebase — the measurement's age, a failed newest run, and the two
 // reads' unknown envelopes, rendered (page audit f82b05a9).
 //
 // Until this spec the route was reached only by the crawls, which see
@@ -25,7 +25,7 @@ import { mountPage } from './_helpers';
 import { installSmokeMocks } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
 
-const PAGE = '/it/codebase';
+const PAGE = '/engineering/codebase';
 const TITLE = /Codebase/;
 const MEASURED = 'f955d61b-1dc5-4200-818d-a9b9bc561e59';
 const FAILED = 'a1b2c3d4-0000-4000-8000-000000000928';
@@ -97,7 +97,7 @@ async function install(page: Page, opts: Install = {}): Promise<void> {
 
 const heading = (page: Page) => page.locator('.ct-section').first();
 
-test.describe('/it/codebase — the measurement is dated against now (a91a39a4)', () => {
+test.describe('/engineering/codebase — the measurement is dated against now (a91a39a4)', () => {
   test('inside the daily period the heading names the age, unmarked, and never says NOW', async ({ page }) => {
     await page.clock.setFixedTime(at(11));
     await install(page);
@@ -138,7 +138,7 @@ test.describe('/it/codebase — the measurement is dated against now (a91a39a4)'
   });
 });
 
-test.describe('/it/codebase — an envelope neither read knows is a failed read (b64b3c04)', () => {
+test.describe('/engineering/codebase — an envelope neither read knows is a failed read (b64b3c04)', () => {
   test('the metrics read', async ({ page }) => {
     await install(page, { metrics: { items: [] } });
     await mountPage(page, PAGE, { titleMatch: TITLE });
@@ -160,14 +160,14 @@ test.describe('/it/codebase — an envelope neither read knows is a failed read 
   });
 });
 
-test.describe('/it/codebase — the deletion candidates state their roster (13ded76c part a)', () => {
+test.describe('/engineering/codebase — the deletion candidates state their roster (13ded76c part a)', () => {
   test('names the nav catalog as the roster and lists the opened routes outside it', async ({ page }) => {
     await install(page, {
       rollup: {
         since: '2026-09-20T12:00:00Z',
         until: '2026-09-27T12:00:00Z',
         rows: [
-          { actor_id: 'emp-david', route: '/it/codebase', opens: 3, last_at: '2026-09-27T11:00:00Z' },
+          { actor_id: 'emp-david', route: '/engineering/codebase', opens: 3, last_at: '2026-09-27T11:00:00Z' },
           { actor_id: 'emp-david', route: '/ux/jobs/:jobId', opens: 2, last_at: '2026-09-27T10:00:00Z' },
         ],
       },

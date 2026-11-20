@@ -563,6 +563,7 @@ const KEYGEN_STUB: &str = r#"#!/usr/bin/env bash
 D=@D@
 { printf 'ssh-keygen'; printf ' %q' "$@"; echo; } >> "$D/calls"
 if [ "$1" = -l ]; then echo '256 SHA256:HOSTKEYFINGERPRINTFIXTURE receiver.example.invalid (ED25519)'; exit 0; fi
+if [ "$1" = -y ]; then echo 'ssh-ed25519 AAAAMOUNTEDPUBLIC break-glass-deposit@boss'; exit 0; fi
 prev=""; f=""
 for a in "$@"; do [ "$prev" = -f ] && f="$a"; prev="$a"; done
 printf 'PRIVATE-KEY-SENTINEL-MINTED\n' > "$f"
@@ -824,10 +825,75 @@ fn a_credential_that_can_roll_only_images_is_deposited_and_the_receipt_is_read_b
         "the allowed roll and three must-not writes are each probed"
     );
     assert!(
-        !calls.contains("ssh-keygen"),
+        !calls.contains("ssh-keygen -q -t"),
         "a mounted key must never be re-minted:\n{calls}"
     );
     j.assert_nothing_leaked(&out);
+}
+
+/// EVERY RUN THAT HOLDS A KEY NAMES IT, WHOLE, ON ITS OWN PACKET (backlog
+/// 403d9d7e). The break-glass deposit key has no prepare packet — this Job
+/// mints it — so the boss-gcp converge reads the line this run prints
+/// (infra/gcp/prepared-deposit-keys.sh) to judge the key by its
+/// fingerprint, bound to the kubeconfig receiver, as it judges every
+/// prepared key. Printed before anything is verified, so a refused run
+/// records it too; the public half only — the private half is held by
+/// assert_nothing_leaked.
+#[test]
+fn every_run_holding_a_key_records_the_line_boss_gcp_holds_it_by() {
+    let want = format!(
+        "{} {}",
+        job_forced_line(),
+        MOUNTED_PUBLIC.trim_end_matches('\n')
+    );
+    let ok = Job::new("names-key-ok");
+    let (rc, out) = ok.run();
+    assert_eq!(rc, 0, "{out}");
+    let refused = Job::new("names-key-refused");
+    refused.set("cani-get-secrets", "yes");
+    let (rc_refused, out_refused) = refused.run();
+    assert_eq!(rc_refused, 1, "{out_refused}");
+    for (name, out, job) in [("ok", &out, &ok), ("refused", &out_refused, &refused)] {
+        let lines: Vec<&str> = out.lines().filter(|l| l.contains(&want)).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "{name}: one line carries the deposit key's whole authorized_keys line:\n{out}"
+        );
+        assert!(
+            lines[0].starts_with("break-glass-deposit: ") && lines[0].ends_with(&want),
+            "{name}: a plain record line, ending with the line itself — never a RED line, which would file an item every day: {}",
+            lines[0]
+        );
+        job.assert_nothing_leaked(out);
+    }
+}
+
+#[test]
+fn deposit_record_names_the_private_keys_actual_public_half() {
+    let job = Job::new("actual-public-half");
+    let actual = job.dir.join("actual");
+    let generated = Command::new("/usr/bin/ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&actual)
+        .output()
+        .unwrap();
+    assert!(generated.status.success());
+    let want = read(&actual.with_extension("pub"));
+    std::fs::copy(&actual, job.dir.join("keys/id_ed25519")).unwrap();
+    // The mounted .pub still names the unrelated sentinel key.
+    write_exec(
+        &job.dir.join("bin/ssh-keygen"),
+        "#!/bin/sh\nexec /usr/bin/ssh-keygen \"$@\"\n",
+    );
+    let (rc, out) = job.run();
+    assert_eq!(rc, 0, "{out}");
+    assert!(
+        out.contains(want.trim()),
+        "the record must name the key ssh actually presents: {out}"
+    );
+    assert!(!out.contains("AAAAMOUNTEDPUBLIC"), "{out}");
+    assert!(!out.contains("BEGIN OPENSSH PRIVATE KEY"), "{out}");
 }
 
 #[test]
@@ -1595,16 +1661,25 @@ fn an_unreadable_output_file_never_posts_a_partial_record_or_completes() {
 }
 
 #[test]
-fn only_the_deposit_manifest_requests_full_chore_output() {
+fn only_declared_evidence_obligations_request_full_chore_output() {
     let manifests = repo_root().join("infra/cluster/manifests");
-    let opted: Vec<_> = std::fs::read_dir(manifests)
+    let mut opted: Vec<_> = std::fs::read_dir(manifests)
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| path.is_file())
         .filter(|path| read(path).contains("name: BOSS_CHORE_FULL_OUTPUT"))
         .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(opted, ["boss-break-glass-deposit.yaml"]);
+    opted.sort();
+    // Deposit receipts and optional-schema debt both require durable full
+    // diagnostics through the existing file attachment door. Default stays off.
+    assert_eq!(
+        opted,
+        [
+            "boss-break-glass-deposit.yaml",
+            "boss-post-start-schema.yaml"
+        ]
+    );
     assert!(
         read(&repo_root().join(MANIFEST))
             .contains("name: BOSS_CHORE_FULL_OUTPUT\n                  value: \"1\"")

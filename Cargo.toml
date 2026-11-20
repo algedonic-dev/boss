@@ -93,7 +93,11 @@ inconsistent_digit_grouping = "allow"
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip: every f64 parses back to exactly the value it was written
+# from. Off, about 30 percent of random-bit values came back one ulp off,
+# and a stored membership fold, proved by re-encoding to its stored bytes,
+# refused on load whenever its payload or clock held one (a84cb148).
+serde_json = { version = "1", features = ["float_roundtrip"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
@@ -112,8 +116,8 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 # Build efficiency. The default dev profile emits FULL DWARF debuginfo on
 # every crate and every test binary, which for this ~40-crate workspace is
 # an ~80GB debug target/ — it exhausted the forge CI disk and blocked
-# trains (2026-09-04; docs/design/the-build-plane-manages-itself.md). Full
-# debuginfo is for interactive debugging that CI never does.
+# trains (2026-09-04; docs/architecture-decisions.md, "The build plane
+# manages itself"). Full debuginfo is for interactive debugging that CI never does.
 # `line-tables-only` keeps panic backtraces (file:line, the part that
 # matters) while dropping the bulk of the DWARF — typically halving the
 # debug target/. Applies to `test` too (it inherits dev). Incremental

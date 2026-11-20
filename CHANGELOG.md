@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to BOSS are recorded here. Done work lives here;
-forward-looking work lives in [TODO.md](TODO.md).
+open work is tracked in BOSS itself ([TODO.md](TODO.md) says where).
 
 This is a **preliminary release** — APIs, schemas, and registry
 contracts will move before the first non-preliminary tag, so changes

@@ -502,6 +502,9 @@ mod tests {
             // ...and what produced a finding (9b473d4a), for the same
             // reason: the refusal is the first the analyst would hear.
             "--source",
+            // ...and the defect class a follow-up joins (f4b0ad41 rule
+            // 2): its refusal, too, would be the first the analyst heard.
+            "--defect-class",
             "boss job patch",
             // The evidence rules, in the words the incidents left.
             "total",
@@ -671,6 +674,13 @@ mod tests {
             // The builder's run is in the brief; it is not the
             // reviewer's to close (review 0545d1b1 item 5).
             "never the car's builder run",
+            // A LANDED review compares the proof with the claim and
+            // records which it was (backlog 490acf06): three landed
+            // reviews measured production by hand on 2026-10-19 and the
+            // number reached only their run reports.
+            "`proof_probe` against the claim",
+            "MEASURED: <the read, the number, when>",
+            "NOT OBSERVED: <why it could not be read>",
         ] {
             assert!(text.contains(phrase), "the reviewer rules say `{phrase}`");
         }

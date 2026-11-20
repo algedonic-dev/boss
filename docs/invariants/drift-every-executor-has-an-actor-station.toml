@@ -1,7 +1,7 @@
 [[invariant]]
 id = "drift-every-executor-has-an-actor-station"
 claim = "Every executor has an `actor` station; `group` stations are served by a set of actors; `constraint` stations gate membership by capability predicates."
-source = "docs/design/stations.md; restated in infra/postgres/schema/116-stations.sql"
+source = "the v1 station registry (stations.md, deleted 2026-11-17; folded into docs/architecture-decisions.md, superseded by docs/design/station-tree.md); restated in infra/postgres/schema/116-stations.sql"
 enforcement = "unenforced"
 mechanism = ""
 last_verified = ""

@@ -682,6 +682,83 @@ async fn a_scope_that_reads_every_packet_reads_the_firing_record() {
     }
 }
 
+/// A policy service that cannot be asked, failing the way
+/// `ReqwestPolicyClient` does: its error text is reqwest's, and reqwest
+/// names the URL it was sending to.
+struct DarkPolicy(fn(String) -> boss_policy_client::PolicyClientError);
+
+const DARK_POLICY_URL: &str = "http://10.9.8.7:7400/api/policy/scope";
+
+impl DarkPolicy {
+    fn error(&self) -> boss_policy_client::PolicyClientError {
+        (self.0)(format!(
+            "error sending request for url ({DARK_POLICY_URL}): connection refused"
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl PolicyClient for DarkPolicy {
+    async fn check(
+        &self,
+        _: &User,
+        _: Action,
+        _: Resource,
+    ) -> Result<boss_policy_client::Decision, boss_policy_client::PolicyClientError> {
+        Err(self.error())
+    }
+    async fn scope_predicate(
+        &self,
+        _: &User,
+        _: Resource,
+    ) -> Result<boss_policy_client::Predicate, boss_policy_client::PolicyClientError> {
+        Err(self.error())
+    }
+}
+
+/// A POLICY FAULT IS ANSWERED IN FIXED WORDS (backlog 47b1157f). The
+/// rollup put `policy check failed: {e}` into both reasons, and `{e}` is
+/// the policy client's text, so during an outage a 200 body carried the
+/// policy service's internal address — the leak fe9d212c removed from
+/// every 503 body and left here. Still a fault rather than a refusal:
+/// both halves unread, and no withheld flag.
+#[tokio::test]
+async fn a_dark_policy_service_answers_the_rollup_without_its_address() {
+    for (case, policy, says) in [
+        (
+            "unreachable",
+            DarkPolicy(boss_policy_client::PolicyClientError::Unreachable),
+            "policy-unreachable",
+        ),
+        (
+            "transport",
+            DarkPolicy(boss_policy_client::PolicyClientError::Transport),
+            "policy check failed",
+        ),
+    ] {
+        let record = InMemoryDispatcherFirings::new(vec![firing(
+            "auto-park-on-gate-green",
+            "2026-09-24T11:00:00Z",
+        )]);
+        let (app, _) = app_with_ports(Some(Arc::new(record)), Arc::new(policy));
+        let (status, v) = get(&app, "operator").await;
+        assert_eq!(status, StatusCode::OK, "{case}: {v}");
+        for (half, why) in [
+            ("firings", "firings_error"),
+            ("dead_letters", "dead_letters_error"),
+        ] {
+            assert_eq!(v[half], Value::Null, "{case}: {half}: {v}");
+            let why = v[why].as_str().unwrap_or_default();
+            assert!(why.contains(says), "{case}: {half} names the fault: {v}");
+        }
+        assert!(v.get("withheld").is_none(), "{case}: a fault: {v}");
+        let text = v.to_string();
+        for leak in [DARK_POLICY_URL, "10.9.8.7", "http://", "connection refused"] {
+            assert!(!text.contains(leak), "{case}: {leak} leaked: {text}");
+        }
+    }
+}
+
 /// The request exactly as the anonymous caller arrives: no header of
 /// any kind (what the gateway forwards for a sessionless route).
 async fn get_unsigned(app: &axum::Router) -> (StatusCode, Value) {

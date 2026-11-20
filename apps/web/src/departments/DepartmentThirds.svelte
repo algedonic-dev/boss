@@ -126,8 +126,8 @@
 {/if}
 
 {#snippet table(list: ReadonlyArray<Job>)}
-  <!-- The jobs list's own table, column for column, so a department
-       reads its packets the way All jobs shows them — plus "Waiting
+  <!-- The jobs list's table, column for column (that list went with
+       step 1 of design 01fa5bdf), plus "Waiting
        at", the step a live packet stands at, because "open" alone let
        a payout sit at its post step for 2.6 days unsaid (4d4dc204),
        and "Waiting for", how long it has stood there (66a5d5be). -->
@@ -158,7 +158,12 @@
           <td>{j.kind}</td>
           <td>{j.title}</td>
           <td class="mono">
-            <Link to={href(subjectPath(j.subject))}>{subjectLabel(j.subject)}</Link>
+            <!-- A kind with no page is text (subjectPath, design 01fa5bdf). -->
+            {#if subjectPath(j.subject) !== null}
+              <Link to={href(subjectPath(j.subject)!)}>{subjectLabel(j.subject)}</Link>
+            {:else}
+              <span data-pageless={j.subject.subject_kind}>{subjectLabel(j.subject)}</span>
+            {/if}
           </td>
           <td>{j.status}</td>
           <td class="waiting-at">{waitingAt(j)}</td>

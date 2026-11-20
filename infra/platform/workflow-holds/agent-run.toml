@@ -1,0 +1,7 @@
+# agent-run's building bill names the profiles it waives (backlog
+# db88f6a9; review 71005282 B1). A TIMING hold (backlog a4b57aca kept
+# these when it retired the default holds): the bill turns on a refusal,
+# so it goes live at a deliberate publish, not on a clean drift check.
+drift_publish = "held"
+lifts = 'backlog db88f6a9: after the car that adds workerless_profiles converges, David publishes this row deliberately with a positive control (an analyst claim holds robots:opus alone and names no host, a builder claim still holds 2.5 on host:w-1), then a car deletes this file.'
+why = '''The building bill's workerless_profiles decides which runs the claim door charges 2.5 vCPU of host:w-1 and which it admits on a model slot alone, so it changes who is refused 'host:w-1 is exhausted'. A bill turns on a refusal, so it goes live at David's deliberate publish, with a positive control and the prior version as the rollback, rather than at whatever hour an unattended drift publish after a converge reaches it. Holding the kind is also what makes publish-drift --file-held open the publish-a-protocol packet he signs.'''

@@ -3,8 +3,11 @@
 # that ages, and until this rule nothing read the age.
 #
 # WHAT SILENT MEANS HERE. An `agent-run` whose `building` step is open
-# and whose packet has not MOVED — no step completed, no metadata
-# written — for longer than the bound. The handler reads the newest
+# and whose packet has not MOVED — no step completed — for longer than
+# the bound. A metadata write is NOT movement here: this rule names no
+# `since_key`, so the handler's clock reads completions alone, and a
+# PATCH to the run keeps nothing alive (corrected 2026-10-20, backlog
+# aaf5cafa; it used to say "no metadata written"). The handler reads the newest
 # `completed_at` across the packet's completed steps (the server stamps
 # it at every flip to completed, and `briefed` completes the instant
 # `boss dispatch` prints the prompt, so that stamp IS the moment the
@@ -64,6 +67,23 @@
 # the gate's launch record, not a comparison to the author's tree.
 # An unreadable or partial listing refuses the judgement, so no-data
 # cannot become a death. No bound, privilege or heartbeat is changed.
+# The gate must be BORN linked (aaf5cafa, 2026-10-20): its
+# `jobs.job.created` event must carry the `agent_run` it carries now.
+# A link PATCHed on later — by hand, or onto a reused packet — still
+# lands the run on green but proves no progress here.
+#
+# A PLACE IN LINE IS WORK IN FLIGHT (18ad59b9, 2026-10-21). The resident
+# gate queue completes a gate's `launched` trigger when it ADMITS the
+# place and writes `launched_at` only when the Job starts, so a place
+# waiting its turn has `queued_at` and no launch metadata. Read through
+# the launch arm alone, that was silence: the 00:00Z tick closed runs
+# c59144bd, 856da6b9, 6ac9e5df, 28d555c7 and efb5c230 as `died`, and
+# the 07:00Z tick closed 9dfd3c78 while its re-gate d2ff5542 waited in
+# line — and a place whose source run is closed can never launch.
+# `queued_formats` names what a waiting place carries; it keeps its run
+# alive while the place and its verdict step are open, which is what an
+# open launched gate already does, and once the place closes it speaks
+# only through the launch arm. The link must still be born (above).
 [[rule]]
 name = "agent-run-dies-when-building-is-silent"
 why = """
@@ -77,8 +97,8 @@ existed in a transcript and nowhere a rule could read its age. It adds
 no routing: one firing completes `building` with `result = died` on
 every silent run and the run's own terminal closes it.
 """
-version = 2
+version = 3
 schedule = { cadence = "hourly", anchor_date = "2026-09-18" }
 [[rule.do]]
 handler = "jobs.age_out_step"
-args = { kind = "\"agent-run\"", step = "\"building\"", hours = "\"4\"", done_metadata = '"{\"result\": \"died\"}"', unless_linked_job_proves_progress = '"{\"kind\":\"gate-run\",\"link\":\"agent_run\",\"started_step\":\"launched\",\"live_step\":\"record-verdict\",\"success_step\":\"green\",\"metadata_formats\":{\"branch\":\"nonblank\",\"sha\":\"git-sha\",\"launched_at\":\"timestamp\"}}"' }
+args = { kind = "\"agent-run\"", step = "\"building\"", hours = "\"4\"", done_metadata = '"{\"result\": \"died\"}"', unless_linked_job_proves_progress = '"{\"kind\":\"gate-run\",\"link\":\"agent_run\",\"started_step\":\"launched\",\"live_step\":\"record-verdict\",\"success_step\":\"green\",\"metadata_formats\":{\"branch\":\"nonblank\",\"sha\":\"git-sha\",\"launched_at\":\"timestamp\"},\"queued_formats\":{\"branch\":\"nonblank\",\"sha\":\"git-sha\",\"queued_at\":\"timestamp\"}}"' }

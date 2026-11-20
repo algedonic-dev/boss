@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # The migration IS a copy of the log — the executable form of
-# docs/design/dev-cluster.md §"The migration is a copy of the log".
+# "The migration is a copy of the log", decided in
+# docs/architecture-decisions.md, "The build and the pipeline left the
+# demo's machine".
 #
 # Produces a restore-ready tarball of everything that does NOT
 # regenerate from `git clone` + `migrate.sh` + `boss-rebuild-all`:

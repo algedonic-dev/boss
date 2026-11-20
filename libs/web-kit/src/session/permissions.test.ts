@@ -16,8 +16,8 @@ describe('canSeeRoute — a role with no declared surfaces sees every surface', 
   // the endpoints, so an undeclared role's sidebar is the tenant's
   // modules, not nothing.
   const surfaces: RouteName[] = [
-    'workflows', 'policy', 'system-kb', 'system-design', 'system-step-plugins',
-    'people', 'catalog', 'accounts', 'finance', 'exec', 'auth-admin',
+    'workflows', 'system-kb', 'system-design', 'system-step-plugins',
+    'accounts', 'finance', 'vendors', 'auth-admin',
   ];
   for (const r of surfaces) {
     test(`platform-admin (no surfaces declared) can see "${r}"`, () => {
@@ -25,7 +25,7 @@ describe('canSeeRoute — a role with no declared surfaces sees every surface', 
     });
   }
   test('a role the registry has not answered for yet sees everything, not nothing', () => {
-    expect(canSeeRoute('founder', 'exec', undefined)).toBe(true);
+    expect(canSeeRoute('founder', 'vendors', undefined)).toBe(true);
     expect(canSeeRoute('founder', 'finance', undefined)).toBe(true);
   });
   test('a row with metadata that says nothing about surfaces is the same', () => {
@@ -37,18 +37,18 @@ describe('canSeeRoute — a role whose Class row declares surfaces sees exactly 
   // The brewery's classes.json carries each role's former matrix entry
   // as `metadata.surfaces`, so the playground renders as before — from
   // the tenant's own data.
-  const brewer = row('brewer', { surfaces: ['jobs', 'parts', 'products', 'schedule'] });
+  const brewer = row('brewer', { surfaces: ['vendors', 'schedule'] });
   test('a declared surface is visible', () => {
-    expect(canSeeRoute('brewer', 'parts', brewer)).toBe(true);
+    expect(canSeeRoute('brewer', 'vendors', brewer)).toBe(true);
     expect(canSeeRoute('brewer', 'schedule', brewer)).toBe(true);
   });
   test('an undeclared surface is not', () => {
-    expect(canSeeRoute('brewer', 'exec', brewer)).toBe(false);
+    expect(canSeeRoute('brewer', 'accounts', brewer)).toBe(false);
     expect(canSeeRoute('brewer', 'finance', brewer)).toBe(false);
-    expect(canSeeRoute('brewer', 'policy', brewer)).toBe(false);
+    expect(canSeeRoute('brewer', 'system-design', brewer)).toBe(false);
   });
   test('the always-on routes stay visible regardless — what they READ is policed by the endpoints', () => {
-    for (const r of ['shop', 'inbox', 'workflows', 'system-experiments'] as RouteName[]) {
+    for (const r of ['inbox', 'workflows'] as RouteName[]) {
       expect(canSeeRoute('brewer', r, brewer)).toBe(true);
     }
   });
@@ -63,11 +63,11 @@ describe('declaredSurfaces — reads metadata.surfaces defensively', () => {
   test('absent row, absent key, or a non-list is "nothing declared"', () => {
     expect(declaredSurfaces(undefined)).toBeUndefined();
     expect(declaredSurfaces(row('x', {}))).toBeUndefined();
-    expect(declaredSurfaces(row('x', { surfaces: 'jobs' }))).toBeUndefined();
+    expect(declaredSurfaces(row('x', { surfaces: 'vendors' }))).toBeUndefined();
     expect(declaredSurfaces(row('x', { surfaces: null }))).toBeUndefined();
   });
   test('non-string entries are dropped, not crashed on', () => {
-    expect(declaredSurfaces(row('x', { surfaces: ['jobs', 3, null, 'exec'] }))).toEqual(['jobs', 'exec']);
+    expect(declaredSurfaces(row('x', { surfaces: ['vendors', 3, null, 'exec'] }))).toEqual(['vendors', 'exec']);
   });
   test('ROUTES is every gated RouteName once — the vocabulary a declaration is checked against', () => {
     expect(new Set(ROUTES).size).toBe(ROUTES.length);
@@ -100,8 +100,9 @@ describe('the brewery seed declares its surfaces in the vocabulary the SPA reads
 });
 
 describe('no role row declares a Work list — nothing reads one', () => {
-  // Home's Work group is All jobs for every role (backlog 0f9be7c0,
-  // 2026-09-24). The per-role lists 6a3b93eb moved onto role rows as
+  // Home's Work group was All jobs for every role (backlog 0f9be7c0,
+  // 2026-09-24) until that list went with step 1 of design 01fa5bdf, and
+  // the group with it. The per-role lists 6a3b93eb moved onto role rows as
   // `metadata.work` could never render: the shell's in-perspective
   // filter drops every Home entry whose catalog app is not home, and of
   // the gated routes only `jobs` and `schedule` are (and `schedule`

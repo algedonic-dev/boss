@@ -1,38 +1,23 @@
-// THE STATIONS' PANELS — design e765b3fc, car N3 (decided by David
-// 2026-09-25, on feedback 84cba7e2).
+// THE STATIONS' PANELS THAT STAY — step 1 of design 01fa5bdf (David,
+// 2026-11-17: "IT disappears, the old map is pulled out"; when unsure,
+// remove).
 //
-// "I would be open to revisiting some of the detail pages we have for
-// stations as part of this too" (added_2026_09_25_david_4): each station
-// or region page becomes the below-the-map detail for its selection, is
-// merged, or retires — with no alias and no redirect before 1.0.0. And
-// the newcomer's half (David, on this car): nothing a reader needs may
-// vanish, so each retired page's content was MOVED into the panel of the
-// station it describes before its page went. This pins, as the car's
-// plan names its test, that each retired path renders not-found — with
-// the Department Map as its one door — and, beside that, that the
-// content each page held is in its station's panel:
-//
-//  - the floors (/it/yard/<region>) and the Crew Board (/it/crew) are
-//    their stations' panels — the floor deck, the queue boards;
-//  - yard status (/it/operate/yard-status) is the track's, the dock's and
-//    the garage's, each its own lanes;
-//  - the conductor's feed (/it/operate/conductor) is the track's;
-//  - the feedback board (/it/design/feedback) is receiving's, and the
-//    backlog board (/it/design/backlog) receiving's and marshalling's;
-//  - Operate lost its Receiving Yard, Marshalling Yard, Yard status and
-//    Conductor tabs, and Design its Feedback and Backlog tabs;
-//  - the map is PINNED at the top ("pinned at the top, always visible"),
-//    so the panel scrolls beneath it.
-//
-// The board tests that were pinned on the floor pages (it-region-map,
-// retired with them) are carried here, opened as selections. What those
-// pages drew that no board draws — the region's own second map, its
-// breadcrumb, its "← the world" button — retired with them: the map is
-// already on top.
+// The Department Map's panels (design e765b3fc, car N3) carried every
+// retired page's content under its station. Step 1 pulled the map out
+// and kept, at /it, only the alarms board and the boards that hold a
+// write no other page offers yet: the track's deck, where a troubled
+// train is cancelled, and the yard status board's lanes, where a held
+// car is released (panel.ts `STATION_BOARDS`). The station page takes
+// both in that design's step 4. This pins that the three stations still
+// draw them, that every other station's panel says its boards went, and
+// that every retired path renders not-found with the one door the
+// router names for it.
 
 import { expect, test, type Page, type Route } from './_test';
 import { RETIRED_ROUTES } from './_routes';
 import { YARD_REGIONS, YARD_STATUS, installSmokeMocks } from './_smokeMocks';
+import { notFoundBack } from '../../src/router';
+import { HELD_CARS_HREF } from '../../src/it/yard/human-needs';
 
 const json = (r: Route, b: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(b) });
@@ -58,19 +43,9 @@ const REGIONS = {
   ],
 };
 
-/** Two cars standing on the loading dock. */
-const DOCK_QUEUE = {
-  discipline: ['parked_since'],
-  data: [
-    { id: 'car-1111', kind: 'ship-a-change', title: 'Teach the dock to breathe', status: 'open', metadata: { branch: 'fix/dock-breathes' } },
-    { id: 'car-2222', kind: 'ship-a-change', title: 'Name the failing check', status: 'open', metadata: { branch: 'fix/name-the-check' } },
-  ],
-};
-
 async function mocks(page: Page): Promise<void> {
   await installSmokeMocks(page);
   await page.route(YARD_REGIONS, (r) => json(r, REGIONS));
-  await page.route(/\/api\/stations\/loading-dock\/queue$/, (r) => json(r, DOCK_QUEUE));
 }
 
 const PANEL = 'section[data-map-panel]';
@@ -89,22 +64,21 @@ test('a station retries a transient render failure on the next successful region
     const original = Element.prototype.setAttribute;
     let thrown = false;
     Element.prototype.setAttribute = function (name: string, value: string): void {
-      if (!thrown && name === 'data-station-board' && value === 'feedback') {
+      if (!thrown && name === 'data-station-board' && value === 'yard-status') {
         thrown = true;
         throw new Error('one-shot station render fault');
       }
       original.call(this, name, value);
     };
   });
-  await page.goto('/it?at=receiving');
-  const failure = page.locator(`${PANEL} [data-region="receiving"].load-failed`);
+  await page.goto('/it?at=dock');
+  const failure = page.locator(`${PANEL} [data-region="dock"].load-failed`);
   await expect(failure).toContainText('one-shot station render fault');
-  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Department Map');
-  await expect(page.locator('.yard-empty', { hasText: 'Reading the regions…' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Alarms');
   await expect.poll(() => reads).toBeGreaterThan(1);
   await expect(failure).toHaveCount(0);
-  await expect(board(page, 'feedback')).toBeVisible();
-  await expect(page).toHaveURL(/\/it\?at=receiving$/);
+  await expect(board(page, 'yard-status')).toBeVisible();
+  await expect(page).toHaveURL(/\/it\?at=dock$/);
 });
 
 test('a successful regions poll preserves a healthy station subtree', async ({ page }) => {
@@ -114,13 +88,13 @@ test('a successful regions poll preserves a healthy station subtree', async ({ p
     reads += 1;
     return json(r, REGIONS);
   });
-  await page.goto('/it?at=receiving');
-  const feedback = board(page, 'feedback');
-  await expect(feedback).toBeVisible();
-  const original = await feedback.elementHandle();
+  await page.goto('/it?at=dock');
+  const status = board(page, 'yard-status');
+  await expect(status).toBeVisible();
+  const original = await status.elementHandle();
   expect(original).not.toBeNull();
   await expect.poll(() => reads).toBeGreaterThan(1);
-  await expect(feedback).toBeVisible();
+  await expect(status).toBeVisible();
   expect(await original!.evaluate((node) => node.isConnected)).toBe(true);
 });
 
@@ -134,7 +108,7 @@ test('a persistent station render failure retries once per successful poll', asy
   await page.addInitScript(() => {
     const original = Element.prototype.setAttribute;
     Element.prototype.setAttribute = function (name: string, value: string): void {
-      if (name === 'data-station-board' && value === 'feedback') {
+      if (name === 'data-station-board' && value === 'yard-status') {
         const attempts = Number(document.documentElement.dataset['stationAttempts'] ?? '0') + 1;
         document.documentElement.dataset['stationAttempts'] = String(attempts);
         throw new Error('persistent station render fault');
@@ -142,8 +116,8 @@ test('a persistent station render failure retries once per successful poll', asy
       original.call(this, name, value);
     };
   });
-  await page.goto('/it?at=receiving');
-  const failure = page.locator(`${PANEL} [data-region="receiving"].load-failed`);
+  await page.goto('/it?at=dock');
+  const failure = page.locator(`${PANEL} [data-region="dock"].load-failed`);
   await expect(failure).toContainText('persistent station render fault');
   await expect(page.locator('html')).toHaveAttribute('data-station-attempts', '1');
   await expect.poll(() => reads).toBeGreaterThan(1);
@@ -152,46 +126,40 @@ test('a persistent station render failure retries once per successful poll', asy
 });
 
 // ---------------------------------------------------------------------
-// The retired pages: not found, with the Department Map as the door
+// The retired pages: not found, each with the door the router names
 // ---------------------------------------------------------------------
 
-test.describe('the pages the Department Map replaced', () => {
+test.describe('the retired pages', () => {
   for (const path of RETIRED_ROUTES) {
-    test(`${path} is not found, and its one door is the Department Map`, async ({ page }) => {
+    const door = notFoundBack(path);
+    test(`${path} is not found, and its one door is ${door.href}`, async ({ page }) => {
       await mocks(page);
       await page.goto(path);
       await expect(page.getByRole('heading', { level: 1 })).toHaveText('No page at this address');
       await expect(page.locator('code', { hasText: path })).toHaveCount(1);
-      const door = page.getByRole('link', { name: '← Back to the Department Map' });
-      await expect(door).toHaveAttribute('href', '/it');
-      // In the IT chrome, whose landing the map is.
-      await expect(page.locator('.perspective-tabs [aria-current="page"]')).toContainText('IT');
-      await door.click();
-      await expect(page).toHaveURL(/\/it$/);
-      await expect(page.getByRole('heading', { level: 1 })).toHaveText('Department Map');
+      const link = page.getByRole('link', { name: `← ${door.label}` });
+      await expect(link).toHaveAttribute('href', door.href);
+      if (door.href === '/it') {
+        // In the IT chrome, whose landing the alarms board is.
+        await expect(page.locator('.perspective-tabs [aria-current="page"]')).toContainText('IT');
+        await link.click();
+        await expect(page).toHaveURL(/\/it$/);
+        await expect(page.getByRole('heading', { level: 1 })).toHaveText('Alarms');
+      }
     });
   }
 
   test('Operate keeps its desk work and Design its reviews — the station tabs are gone', async ({ page }) => {
     await mocks(page);
-    await page.goto('/it/operate/perf');
-    await expect(page.locator('nav.it-tabs a')).toHaveText(['Incidents', 'Audit Log', 'Performance', 'Atlas', 'Bottlenecks']);
-    await page.goto('/it/design/experiments');
-    await expect(page.locator('nav.it-tabs a')).toHaveText(['Reviews', 'Experiments']);
-  });
-
-  test('the map says where each retired board lives now, so a reader who knew the tab finds it', async ({ page }) => {
-    await mocks(page);
-    await page.goto('/it');
-    const header = page.locator('.exec-header').first();
-    await expect(header).toContainText('Feedback and the IT backlog are in the Receiving station');
-    await expect(header).toContainText('the Crew Board in the Shop floor');
-    await expect(header).toContainText('yard status and the conductor');
+    await page.goto('/operations/perf');
+    await expect(page.locator('nav.it-tabs a')).toHaveText(['Audit Log', 'Performance']);
+    await page.goto('/engineering/design');
+    await expect(page.locator('nav.it-tabs a')).toHaveText(['Reviews']);
   });
 });
 
 // ---------------------------------------------------------------------
-// The content each retired page held, in its station's panel
+// The release and cancel controls, in the panels that keep them
 // ---------------------------------------------------------------------
 
 const TRAIN = {
@@ -217,23 +185,19 @@ const STATUS = {
   now: '2026-09-19T05:00:00Z',
 };
 
-test.describe('each retired page’s content is in its station’s panel', () => {
-  test('the track carries the trains in flight, the recent trains and the conductor’s activity', async ({ page }) => {
+test.describe('the boards that hold the release and cancel controls', () => {
+  test('the track carries its deck and the trains in flight and the recent trains', async ({ page }) => {
     await mocks(page);
     await page.route(YARD_STATUS, (r) => json(r, STATUS));
     await page.goto('/it?at=track');
+    await expect(board(page, 'deck').locator('.yard-deck').first()).toBeVisible();
     const status = board(page, 'yard-status');
     await expect(status.locator('.ys-section')).toHaveText(['IN FLIGHT', 'RECENT TRAINS']);
     await expect(status).toContainText('PR train 2026-09-19 04:30');
     await expect(status).toContainText('PR train 2026-09-19 03:00');
-    await expect(status.locator('.ys-footnote')).toContainText('a train stalls after 2h without progress');
     // The dock's and the garage's lanes are theirs, not the track's.
     await expect(status).not.toContainText('HELD CARS');
     await expect(status).not.toContainText('STRANDED GREENS');
-    const conductor = board(page, 'conductor');
-    await expect(conductor.locator('h3')).toHaveText('Conductor activity');
-    // Its one read answered the catch-all's empty list: the feed says so.
-    await expect(conductor).toContainText('No recent Conductor activity');
   });
 
   test('the dock carries its cars, its boarding sentence and the held cars', async ({ page }) => {
@@ -246,7 +210,26 @@ test.describe('each retired page’s content is in its station’s panel', () =>
     await expect(status).toContainText('fix/dock-breathes');
     await expect(status).toContainText('fix/held-for-reds');
     await expect(status).toContainText('two red trains');
-    await expect(board(page, 'conductor')).toHaveCount(0);
+    await expect(board(page, 'deck')).toHaveCount(0);
+  });
+
+  // A reserved release on a needs-you board links HELD_CARS_HREF (design
+  // 58c72d95 D5). A bare /it#held-cars opened no panel and showed no held
+  // car (David, 2026-11-20), so this follows the board's own href and
+  // reads the lane with the car in it.
+  test('a needs-you release line opens the dock panel on the HELD CARS lane, with the car', async ({ page }) => {
+    await mocks(page);
+    await page.route(YARD_STATUS, (r) => json(r, STATUS));
+    await page.goto(HELD_CARS_HREF);
+    const status = board(page, 'yard-status');
+    await expect(status.locator('#held-cars')).toHaveText('HELD CARS');
+    await expect(status.locator('#held-cars')).toBeVisible();
+    await expect(status).toContainText('fix/held-for-reds');
+    await expect(page).toHaveURL(/\/it\?at=dock#held-cars$/);
+    // The href the design first named opens no panel: no lane, no car.
+    await page.goto('/it#held-cars');
+    await expect(page.locator('section[data-map-panel]')).toHaveCount(0);
+    await expect(page.locator('#held-cars')).toHaveCount(0);
   });
 
   test('the garage carries the stranded and the held greens', async ({ page }) => {
@@ -259,225 +242,12 @@ test.describe('each retired page’s content is in its station’s panel', () =>
     await expect(status).toContainText('waiting on the migration');
   });
 
-  test('receiving carries the feedback board and the backlog board; marshalling the backlog board', async ({ page }) => {
-    await mocks(page);
-    await page.goto('/it?at=receiving');
-    // Each board heads itself as a section of the panel, not a page.
-    await expect(board(page, 'feedback').locator('h3.tb-title')).toHaveText('Feedback triage');
-    await expect(board(page, 'backlog').locator('h3.tb-title')).toHaveText('IT backlog');
-    await expect(page.getByRole('heading', { level: 1 })).toHaveText('Department Map');
-    // Beside the Receiving Yard's own board, whose page header is dropped.
-    await expect(page.locator(`${PANEL} .ry-root`)).toBeVisible();
-    await expect(page.getByRole('heading', { name: 'Receiving Yard' })).toHaveCount(0);
-
-    await page.goto('/it?at=marshalling');
-    await expect(board(page, 'backlog').locator('h3.tb-title')).toHaveText('IT backlog');
-    await expect(board(page, 'feedback')).toHaveCount(0);
-    await expect(page.locator(`${PANEL} .my-root`)).toBeVisible();
-  });
-
-  test('a station with no board of a retired page carries none', async ({ page }) => {
-    await mocks(page);
-    await page.goto('/it?at=gates');
-    await expect(page.locator(`${PANEL} [data-station-board]`)).toHaveCount(0);
-    await expect(page.locator(`${PANEL} [data-contents="gates"] .yard-deck`).first()).toBeVisible();
-  });
-});
-
-// ---------------------------------------------------------------------
-// The map, pinned
-// ---------------------------------------------------------------------
-
-test.describe('the map scrolls normally even in a tall desktop window', () => {
-  // A window with room for it (MapPage.svelte PIN_QUERY: 900px tall).
-  test.use({ viewport: { width: 1440, height: 1000 } });
-
-  test('scrolling the panel moves the map off the screen', async ({ page }) => {
-    await mocks(page);
-    await page.goto('/it?at=track');
-    const pin = page.locator('[data-map-pin]');
-    await expect(pin).toHaveAttribute('data-map-pin', 'scrolls');
-    expect(await pin.evaluate((el) => getComputedStyle(el).position)).toBe('static');
-    await expect(board(page, 'conductor')).toBeVisible();
-
-    // Down to the foot of the page: the map holds under the 44px bar.
-    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
-    await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
-    const box = (await pin.boundingBox())!;
-    expect(box.y + box.height).toBeLessThanOrEqual(44);
-    // The panel's head has gone up under it; the map is what is on top.
-    expect(await page.evaluate(() => document.documentElement.style.scrollPaddingTop)).toBe('');
-  });
-
-  test('a selection reveals the panel in normal document flow', async ({ page }) => {
-    await mocks(page);
-    await page.goto('/it?at=dock');
-    await expect(page.locator('[data-map-pin]')).toHaveAttribute('data-map-pin', 'scrolls');
-    const pin = (await page.locator('[data-map-pin]').boundingBox())!;
-    const panel = (await page.locator(PANEL).boundingBox())!;
-    expect(panel.y).toBeGreaterThanOrEqual(pin.y + pin.height - 1);
-    expect(panel.y).toBeLessThan(pin.y + pin.height + 40);
-  });
-
-  test('the map never reserves document scroll padding', async ({ page }) => {
-    await mocks(page);
-    await page.goto('/it?at=dock');
-    const padding = () => page.evaluate(() => document.documentElement.style.scrollPaddingTop);
-    // The map's height as the layout rounds it (clientHeight), against the
-    // box's fractional one: within a pixel.
-    await expect.poll(padding).toBe('');
-    await page.goto('/it/estate');
-    await expect(page.getByRole('heading', { level: 1 })).toHaveText('The estate');
-    await expect.poll(padding).toBe('');
-  });
-});
-
-test.describe('where a pinned map would leave the panel no room, it scrolls with the page', () => {
-  test('a laptop-height window (1280×800)', async ({ page }) => {
-    await mocks(page);
-    await page.goto('/it?at=track');
-    const pin = page.locator('[data-map-pin]');
-    await expect(pin).toHaveAttribute('data-map-pin', 'scrolls');
-    expect(await pin.evaluate((el) => getComputedStyle(el).position)).toBe('static');
-    expect(await page.evaluate(() => document.documentElement.style.scrollPaddingTop)).toBe('');
-  });
-
-  test('a phone', async ({ page }) => {
-    await page.setViewportSize({ width: 390, height: 1000 });
-    await mocks(page);
-    await page.goto('/it?at=track');
-    await expect(page.locator('[data-map-pin]')).toHaveAttribute('data-map-pin', 'scrolls');
-  });
-});
-
-// ---------------------------------------------------------------------
-// The floors' boards, carried from the retired floor pages
-// ---------------------------------------------------------------------
-
-test.describe('what the floor pages held, in the panel', () => {
-  test('the dock’s panel opens its floor on the loading dock, headed by the region’s verdict', async ({ page }) => {
-    await mocks(page);
-    await page.goto('/it?at=dock');
-    await expect(page.locator(`${PANEL} .yard-panel-h`, { hasText: 'Entity · loading dock' })).toBeVisible();
-    await expect(page.locator(`${PANEL} .yard-region-head`)).toContainText('dock · clear — 2 cars parked');
-    // The departure board is the dock's, titled for it.
-    const head = page.locator(`${PANEL} .head[data-board="dock"]`);
-    await expect(head).toContainText('Departure board · dock');
-    await expect(head).toContainText('2 in flight · 0 landed');
-  });
-
-  test("a quiet alerts strip under a troubled station does not call the station's machines fine", async ({ page }) => {
-    await mocks(page);
-    const troubled = {
-      ...REGIONS,
-      regions: REGIONS.regions.map((r) =>
-        r.name === 'shed' ? { ...r, state: 'troubled', why: '2 landed cars of ours owe a proof' } : r),
-    };
-    await page.route(YARD_REGIONS, (r) => json(r, troubled));
-    await page.goto('/it?at=shed');
-    const strip = page.locator(`${PANEL} .yard-alerts[data-alerts="shed"]`);
-    await expect(strip).toContainText("No machine alerts in the shed — its troubled state above is the region's own reading");
-    await expect(strip).not.toContainText('every machine here is working');
-  });
-
-  // Stations OVERLAP: on 2026-09-23 the sidings summed to 517 over 303
-  // distinct packets, and nothing on the board said so (backlog 140a2222).
-  test('the marshalling board says its sidings overlap, so the depth column is not read as a count of the work', async ({ page }) => {
-    await mocks(page);
-    await page.route(/\/api\/stations\/load$/, (r) =>
-      json(r, {
-        data: [
-          { station: 'q.platform-admin.task', kind: 'constraint', depth: 297, also_elsewhere: 213 },
-          { station: 'a.platform-admin.opus-5-1m', kind: 'constraint', depth: 213, also_elsewhere: 213 },
-          { station: 'q.platform-admin.sign-off', kind: 'constraint', depth: 6, also_elsewhere: 0 },
-          { station: 'loading-dock', kind: 'batch', depth: 1, also_elsewhere: 0 },
-        ],
-        distinct_packets: 303,
-      }));
-    await page.route(/\/api\/stations\/flow/, (r) => json(r, { window_hours: 24, as_of: '2026-09-19T05:00:00Z', data: [] }));
-    await page.goto('/it?at=marshalling');
-    const overlap = page.locator(`${PANEL} .my-root .my-overlap`);
-    await expect(overlap).toContainText('The depths sum to 517 but hold 303 distinct packets');
-    await expect(overlap).toContainText('a.platform-admin.opus-5-1m 213 of 213');
-  });
-
-  // The waits table cut to 12 of 320 real obligations on 2026-09-23 and
-  // said neither number (backlog 18683a0a, page-audit 7c228914 gap 8).
-  test('the marshalling waits table counts what its cap leaves out, so a limit does not read as a filter', async ({ page }) => {
-    await mocks(page);
-    const wait = (i: number, simulated: boolean) => ({
-      job_id: `wait-${i}`, job_kind: 'backlog-item', job_title: `packet ${i}`, step_title: 'Build the change',
-      status: 'ready', assignee_id: null, simulated, partition: simulated ? 'simulated' : 'real',
-      exact: true, waiting_days: 20 - i,
+  for (const station of ['gates', 'shed', 'arrivals', 'receiving', 'marshalling', 'shop-floor', 'sensors']) {
+    test(`${station}'s boards went with the map, and its panel says so`, async ({ page }) => {
+      await mocks(page);
+      await page.goto(`/it?at=${station}`);
+      await expect(page.locator(`${PANEL} [data-station-board]`)).toHaveCount(0);
+      await expect(page.locator(`${PANEL} [data-no-boards]`)).toBeVisible();
     });
-    await page.route(/\/api\/stations\/load$/, (r) =>
-      json(r, { data: [{ station: 'q.platform-admin.task', kind: 'constraint', depth: 30, wip_limit: 24, over_limit: true, oldest_age_days: 3 }] }));
-    await page.route(/\/api\/stations\/flow/, (r) =>
-      json(r, { window_hours: 24, as_of: '2026-09-19T05:00:00Z', data: [{ station: 'q.platform-admin.task', basis: 'step-events', arrived: 9, served: 4, net: 5 }] }));
-    await page.route(/\/api\/jobs\/queue-age$/, (r) =>
-      json(r, {
-        data: [...Array.from({ length: 14 }, (_, i) => wait(i, false)), wait(99, true)],
-        total: 15,
-        now: '2026-09-19T05:00:00Z',
-      }));
-    await page.goto('/it?at=marshalling');
-    await expect(page.locator(`${PANEL} .my-root .my-waits-count`)).toHaveText(
-      '12 of 14 outstanding obligations, longest first · +2 more not shown · 1 on simulated or shadow packets not ranked',
-    );
-    await expect(page.locator(`${PANEL} .my-root a`, { hasText: /^packet \d+$/ })).toHaveCount(12);
-  });
-
-  test('a queue read that failed is said on the board, never drawn as an empty station', async ({ page }) => {
-    await mocks(page);
-    await page.route(/\/api\/stations\/load$/, (r) => json(r, 'the station registry is down', 500));
-    await page.goto('/it?at=marshalling');
-    await expect(page.locator(`${PANEL} .my-root .load-failed`).first()).toContainText('did not answer');
-    await expect(page.locator(`${PANEL} .my-root`)).not.toContainText('Every watched station is clear.');
-  });
-
-  // The live shape of the shop floor (2026-09-24): every open session is
-  // the SAME actor. The region map keyed its platforms by actor and threw
-  // each_key_duplicate, leaving the page on "Reading the regions…"
-  // (backlog 846ab934). The region map is gone; the station's panel draws
-  // the Crew Board over the same reads, and must stand on that shape.
-  test('the shop floor’s panel stands two sessions of one actor, and draws its Crew Board', async ({ page }) => {
-    await mocks(page);
-    const session = (id: string, started: string) => ({
-      id, kind: 'work-session', title: 'a session', status: 'open',
-      metadata: { actor: 'claude@algedonic.dev', host: 'boss-dev', started_at: started, last_active_at: started, prompt_count: 3 },
-    });
-    await page.route(/\/api\/jobs\?kind=work-session/, (r) =>
-      json(r, { total: 2, data: [
-        session('87b3cf48-f17b-4126-98b4-7673a3c3576b', '2026-09-24T03:00:00Z'),
-        session('7bb6e37d-d168-40b8-9675-70a42229a2bb', '2026-09-24T04:00:00Z'),
-      ] }));
-    await page.goto('/it?at=shop-floor');
-    await expect(page.getByText('Reading the regions…')).toHaveCount(0);
-    await expect(page.locator(`${PANEL} .crew-root`)).toBeVisible();
-    await expect(page.locator(`${PANEL} .crew-section`).first()).toHaveText('00 — THE BUILDER PIPELINE');
-    await expect(page.locator(`${PANEL}`)).not.toContainText('cannot be drawn');
-  });
-
-  // THE PLANT (design 62de32ae, decision 11): the host runners stand along
-  // the map's edge with their names and states written.
-  test('the map draws its plant along the edge, each machine with its name and state', async ({ page }) => {
-    await mocks(page);
-    await page.route(YARD_REGIONS, (r) =>
-      json(r, {
-        ...REGIONS,
-        plant: [
-          { id: 'runner:host:forge', name: 'forge runner', state: 'idle', why: 'last df answered exit 0' },
-          { id: 'runner:host:boss-gcp', name: 'boss-gcp runner', state: 'failed', why: 'the last converge request was refused' },
-        ],
-      }));
-    await page.goto('/it');
-    const plant = page.locator('section[aria-label="the plant — machinery serving every region"]');
-    await expect(plant).toHaveCount(1);
-    await expect(plant).toContainText('Plant · serves every region');
-    const glyphs = plant.locator('.glyph');
-    await expect(glyphs).toHaveCount(2);
-    await expect(glyphs.first()).toHaveAttribute('data-machine', 'runner:host:boss-gcp');
-    await expect(glyphs.first()).toContainText('boss-gcp runner · failed');
-    await expect(plant.locator('[data-machine="runner:host:forge"]')).toContainText('forge runner · idle');
-  });
+  }
 });

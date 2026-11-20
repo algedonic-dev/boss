@@ -2,9 +2,9 @@ import { readFileSync } from 'node:fs';
 import { expect, test } from './_test';
 import { mountPage } from './_helpers';
 import { installSmokeMocks } from './_smokeMocks';
-import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
+import { pageAt } from '../fixtures/station-tree';
 
-const PATH = ROUTE_CATALOG['system-estate'].path;
+const PATH = pageAt('system-estate');
 const declaration = readFileSync(new URL('../../../../infra/estate/dev-door.json', import.meta.url), 'utf8');
 const mount = async (page: import('@playwright/test').Page) => {
   await installSmokeMocks(page);

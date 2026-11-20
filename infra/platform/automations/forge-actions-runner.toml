@@ -1,0 +1,15 @@
+# automation:forge-actions-runner — the forge's CI runner, as the
+# automaton of the forge-ci equipment station (backlog c9b9bacc). An
+# equipment station names a REGISTERED automation
+# (platform_stations_bundle's every_equipment_automaton_is_a_registered_
+# automation), and this runner had no row because it writes nothing:
+# "NO JOB HERE WRITES TO THE SYSTEM OF RECORD" (.forgejo/workflows/ci.yml,
+# backlog 37742794). Nothing signs as this id today. Guest is the
+# anonymous-default authority (as for ml-inference-batch), so the row
+# grants nothing a caller without a header does not already have.
+[[automation]]
+id = "automation:forge-actions-runner"
+role = "guest"
+description = 'The forge CI runner (forgejo-runner.service, an act runner on the forge host) running each .forgejo/workflows job as a container on the system docker daemon; operates the forge-ci station and signs nothing in the system of record.'
+# Host station: forge (backlog 6ecb5480, station-tree.md section 6).
+station = "b8f8a23b-f8da-428f-8df2-731be4ae597a"

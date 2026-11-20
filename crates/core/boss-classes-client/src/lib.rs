@@ -179,7 +179,14 @@ pub struct ReqwestClassesClient {
 
 impl ReqwestClassesClient {
     pub fn new(base_url: impl Into<String>) -> Self {
-        let (base_url, http) = http_client::base(base_url);
+        Self::with_timeout(base_url, http_client::CLIENT_TIMEOUT)
+    }
+
+    /// [`Self::new`] with a per-call timeout the caller owns — the
+    /// gateway's login carries its own, so a test of it holds a timeout
+    /// of its own rather than the drive's (backlog ac3a347c).
+    pub fn with_timeout(base_url: impl Into<String>, timeout: std::time::Duration) -> Self {
+        let (base_url, http) = http_client::base_with_timeout(base_url, timeout);
         Self { base_url, http }
     }
 }

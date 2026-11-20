@@ -1,4 +1,4 @@
-//! Station registry — stations.md (Q1–Q4 ratified 2026-08-13).
+//! Station registry — Q1–Q4 ratified 2026-08-13, folded into docs/architecture-decisions.md; tree: station-tree.md.
 //!
 //! A **station** is an abstract priority queue that routes or holds
 //! job-packet traffic until there is bandwidth or capability to
@@ -14,7 +14,7 @@
 //! per name, and every write recording its event atomically with the
 //! row (the workflow-registry-events posture).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -28,10 +28,23 @@ use crate::station_queue::{DisciplineKey, StationPredicate, default_discipline};
 // Types
 // ---------------------------------------------------------------------------
 
-/// The ratified station taxonomy (stations.md): all rows, one
-/// registry. The variants are the spec's own closed vocabulary —
-/// which flavors of queue exist — not a tenant-extensible taxonomy
-/// (those go through the Class registry).
+/// The ratified station taxonomy (the station registry, and since 2026-11-03
+/// the factory taxonomy's M2; now docs/design/factory-taxonomy-v2.md): all
+/// rows, one registry. The variants are the spec's own closed
+/// vocabulary — which flavors of queue exist — not a tenant-extensible
+/// taxonomy (those go through the Class registry).
+///
+/// TWO FAMILIES. `actor`, `group` and `constraint` are the taxonomy's
+/// GENERIC station, sorted by who serves it; `equipment` is a station
+/// that is shared process equipment, operated by an automaton, whose
+/// capacity is its `bays`. The fourth kind, `batch`, was DELETED (item 0a78f8f8,
+/// design 4348b857 Q1, decided 2026-11-02): a batch station is an
+/// equipment station whose automaton's program is a cadence, so the
+/// loading dock became equipment and the review queues that also said
+/// `batch` were always a group's. A row still spelling `batch` is
+/// refused at every door — the viability lint at every publish, the
+/// stored column's CHECK and its parse — and survives only as
+/// [`StationKind::RetiredBatch`], the log's own spelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StationKind {
@@ -42,10 +55,28 @@ pub enum StationKind {
     /// Membership defined by capability predicates (skills,
     /// authority, sign-off rights), not an enumerated roster.
     Constraint,
-    /// The SDLC's bundling points — packets accumulate for periodic,
-    /// higher-bandwidth handling (loading dock, review queue, board
-    /// windows).
-    Batch,
+    /// Shared process equipment (the gates, the dock): operated by ONE
+    /// automaton the row names, shared by many protocols, and bounded
+    /// by the `bays` the row declares — the non-fungible constraint on
+    /// top of the pools. Both are required on this kind and refused on
+    /// every other ([`crate::station_lint`]).
+    Equipment,
+    /// NOT A KIND A ROW MAY HAVE: the deleted `batch`, as the record
+    /// spelled it before item 0a78f8f8, kept so the record still reads
+    /// and still hashes. Every station publication of the dock, the
+    /// review queues and repair before 2026-11-03 says `batch`, and so
+    /// does every move-diagnosis receipt (its `inputs.stations`), whose
+    /// verification re-serializes the receipt and compares its hash —
+    /// read as any other kind it would re-serialize differently and
+    /// fail, and the registered-agent-handoff-v2 model that produced
+    /// those receipts is pinned byte for byte and may not change to
+    /// translate it. So the spelling round-trips here and nowhere else:
+    /// the viability lint refuses it at every publish (seed bundle,
+    /// authoring door, `publish_declared`), the stored column's CHECK
+    /// refuses it, and [`std::str::FromStr`] — the stored row's parse —
+    /// does not know it.
+    #[serde(rename = "batch")]
+    RetiredBatch,
 }
 
 impl StationKind {
@@ -54,7 +85,8 @@ impl StationKind {
             Self::Actor => "actor",
             Self::Group => "group",
             Self::Constraint => "constraint",
-            Self::Batch => "batch",
+            Self::Equipment => "equipment",
+            Self::RetiredBatch => "batch",
         }
     }
 }
@@ -66,11 +98,34 @@ impl std::str::FromStr for StationKind {
             "actor" => Ok(Self::Actor),
             "group" => Ok(Self::Group),
             "constraint" => Ok(Self::Constraint),
-            "batch" => Ok(Self::Batch),
+            "equipment" => Ok(Self::Equipment),
             other => Err(format!("unknown station kind: {other}")),
         }
     }
 }
+
+/// The equipment station whose bays ARE the gate capacity — `boss
+/// gate`'s bound, the resident supervisor's, and the slots the yard
+/// draws. Declared at `infra/platform/stations/gates.toml`.
+///
+/// ONE HOME FOR THE NUMBER (CLAUDE.md §9a, item 0a78f8f8). Until this
+/// car the capacity was `gate_max_concurrent` on the train-conductor
+/// delivery policy; that column is dropped and every reader takes the
+/// gates row's `bays` instead.
+pub const GATES_STATION: &str = "gates";
+
+/// The gate capacity a reader uses when the gates row cannot be read —
+/// a dark registry must not stop a gate, so `boss gate` and the yard
+/// fall back here. It is a fallback, not a copy: the pin
+/// `the_compiled_gate_bays_are_the_gates_rows` (boss-jobs,
+/// tests/platform_stations_bundle.rs) holds it equal to `gates.toml`'s
+/// `bays`, and it is the ONE compiled fallback — the yard's and the
+/// CLI's were two constants held equal across crates until this car
+/// (`2` from delivery policy v11, backlog 9a460e74: two bays delivered
+/// 2.62 gates/h on the saturated Kingston gate drive, three occupied
+/// throughout 2.38; `3` since gates v4, backlog a082371d, design
+/// 121f44a1 D2: the Micron 7400 that replaced it left a gate CPU-bound).
+pub const COMPILED_GATE_BAYS: i32 = 3;
 
 /// Who may claim a packet FROM this station — role slugs, and since
 /// design c87fb59b car 3 the rate-card models an agent must run.
@@ -143,38 +198,13 @@ impl StationCapability {
     }
 }
 
-/// Where the queue that FEEDS this station is read — the operator's
-/// walk upstream when packets are not materializing as expected.
-///
-/// Registry data, never a code path: a station declares its own
-/// upstream and every lens renders the same affordance for whatever
-/// the row says, so a station published tomorrow gets the button with
-/// no frontend change.
-///
-/// One optional object rather than two optional scalars because it is
-/// one fact with two inseparable halves — a label with no href is a
-/// dead button, an href with no label is an unlabelled one. `Option`
-/// admits exactly the two states that mean something: declared, or
-/// not.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StationUpstream {
-    /// What to call it, in the caller's own vocabulary — the lens
-    /// supplies the "walk upstream" framing around it, so this is
-    /// `FEEDBACK`, not `↑ UPSTREAM: FEEDBACK`.
-    pub label: String,
-    /// Where it goes. An app route (`/system/feedback`), handed to the
-    /// host's navigation helper.
-    pub href: String,
-}
-
 /// The page context a surface needs to render this station whole.
 ///
-/// `upstream` proved the shape one affordance at a time: the row
-/// declares it, the queue envelope echoes it, and the lens renders
-/// whatever the row says with no frontend change. This is the same
-/// move for the rest of a page's identity — its header and which
-/// supplementary panels it carries — so a surface that already holds
-/// the queue holds everything it needs to draw itself.
+/// The row declares it, the queue envelope echoes it, and the lens
+/// renders whatever the row says with no frontend change — a page's
+/// header and which supplementary panels it carries — so a surface
+/// that already holds the queue holds everything it needs to draw
+/// itself.
 ///
 /// What it deliberately is NOT: the panels' *data*. A panel key names
 /// a renderer the surface already has (the `step_plugins` idiom: the
@@ -221,6 +251,111 @@ pub struct StationLens {
     pub with_steps: bool,
 }
 
+/// Optional authored grid cell; coordinates are cells, never hand-set pixels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FloorPlacement {
+    pub row: u16,
+    pub col: u16,
+}
+
+/// The width of every station's floor, in floor units: the floor a
+/// station's children are placed on is this many units wide and
+/// [`FLOOR_HEIGHT`] tall, whatever size the view draws it at (backlog
+/// e3a927c3). One size for every floor, read off the Plan artboard David
+/// chose the station view on (https://claude.ai/artifact/DriP1eEZq8zSxj1oTRuYs8,
+/// 2026-11-19, a 1440 x 900 frame), so a placement copied off that
+/// artboard is a placement here, unscaled.
+pub const FLOOR_WIDTH: u32 = 1440;
+/// The height of every station's floor, in floor units: see [`FLOOR_WIDTH`].
+pub const FLOOR_HEIGHT: u32 = 900;
+
+/// Where a station stands on its PARENT's floor: a box, `x`/`y` its top
+/// left corner and `w`/`h` its size, in that floor's units
+/// ([`FLOOR_WIDTH`] x [`FLOOR_HEIGHT`]) — backlog e3a927c3, David
+/// 2026-11-19: "stations sit in 2D at FIXED positions so operators learn
+/// the floor". Registry data on the row, so moving a station is a version
+/// bump and never a deploy.
+///
+/// Optional: a station with none is laid out by the view on a fallback
+/// grid, never refused. The viability lint refuses a box that is empty,
+/// leaves its parent's floor, or sits on a row with no parent
+/// (`station_lint::check_placement`), and the publish door and the seed
+/// refuse one that overlaps an active sibling's
+/// ([`validate_station_placements`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StationPlacement {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+impl StationPlacement {
+    /// The right and bottom edges, widened so a box near `u32::MAX`
+    /// cannot wrap into one that looks inside the floor.
+    fn far_edges(&self) -> (u64, u64) {
+        (
+            u64::from(self.x) + u64::from(self.w),
+            u64::from(self.y) + u64::from(self.h),
+        )
+    }
+
+    /// Whether the box lies wholly on a floor of [`FLOOR_WIDTH`] x
+    /// [`FLOOR_HEIGHT`] units.
+    pub fn inside_the_floor(&self) -> bool {
+        let (right, bottom) = self.far_edges();
+        right <= u64::from(FLOOR_WIDTH) && bottom <= u64::from(FLOOR_HEIGHT)
+    }
+
+    /// Whether two boxes share any area. Edges are half-open, so two
+    /// boxes that only touch along a side do not overlap.
+    pub fn overlaps(&self, other: &StationPlacement) -> bool {
+        let (right, bottom) = self.far_edges();
+        let (other_right, other_bottom) = other.far_edges();
+        u64::from(self.x) < other_right
+            && u64::from(other.x) < right
+            && u64::from(self.y) < other_bottom
+            && u64::from(other.y) < bottom
+    }
+}
+
+/// Whether a station stands for good or is made for one claim — the two
+/// modes of the ONE station of the station tree (T2 of design 4b27a65a,
+/// backlog 3f58c823; handoff §2). A STANDING station is a row an operator
+/// declares; an AD HOC one is instantiated under a standing parent when a
+/// step needs a workspace and released with it. Nothing instantiates ad
+/// hoc stations yet — resolution is T6 (baac0b65) — so the platform
+/// bundle declares only standing rows; the mode is on the row so the
+/// tree read can say which is which the day both exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StationMode {
+    Standing,
+    AdHoc,
+}
+
+impl StationMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Standing => "standing",
+            Self::AdHoc => "ad-hoc",
+        }
+    }
+}
+
+impl std::str::FromStr for StationMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "standing" => Ok(Self::Standing),
+            "ad-hoc" => Ok(Self::AdHoc),
+            other => Err(format!("unknown station mode: {other}")),
+        }
+    }
+}
+
 /// A full station row. Serializes directly to the `stations` columns
 /// with the same names.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -230,16 +365,24 @@ pub struct StationSpec {
     pub status: WorkflowStatus,
     pub title: String,
     pub kind: StationKind,
+    /// The automaton that operates an `equipment` station, as the actor
+    /// id it signs with (`automation:gate-runner`) — it must parse as
+    /// `ActorId::Automation`, the set an automaton executor is drawn
+    /// from. Required on `equipment`, refused on every other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automaton: Option<String>,
+    /// How many packets an `equipment` station serves at once — its
+    /// bays (at least 1). Required on `equipment`, refused on every
+    /// other kind: a generic station's bandwidth is its capability and
+    /// reservations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bays: Option<i32>,
     /// The queue-membership predicate over packets — see
     /// [`StationPredicate`] for the documented JSON shape.
     pub predicate: StationPredicate,
     /// Queue ordering as data; `priority, then age` default.
     #[serde(default = "default_discipline")]
     pub discipline: Vec<DisciplineKey>,
-    /// Advisory bandwidth declaration; the queue envelope reports
-    /// `over_limit` when the queue exceeds it.
-    #[serde(default)]
-    pub wip_limit: Option<i32>,
     /// How long a *terminal* packet stays in this station's queue,
     /// counted from `closed_on`. `None` (the default, and every
     /// holding/routing station) = in-flight packets only, since a
@@ -262,12 +405,94 @@ pub struct StationSpec {
     /// control, not a data-model claim.
     #[serde(default)]
     pub rollup_parent: Option<String>,
-    /// Optional pointer to the queue that feeds this one. Purely
-    /// navigational: it says nothing about membership or ordering,
-    /// which are the predicate's and the discipline's business. `None`
-    /// = no button renders.
-    #[serde(default)]
-    pub upstream: Option<StationUpstream>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor: Option<FloorPlacement>,
+    /// The stations a packet goes to NEXT from this one — its outbound
+    /// routes, by station name (pass item 4 of design ccfe87ff, backlog
+    /// 1bb8c479). Declared only where the tree shows a packet taking the
+    /// route; the floor lays its stations out along them. Every name is
+    /// a station some active row declares: the seed refuses any other
+    /// ([`validate_station_edges`]) before it publishes a row, and the
+    /// live publish door refuses it too ([`gate_publish`]), and no
+    /// name appears twice: the viability lint refuses that at the seed's
+    /// load and at every publish ([`crate::station_lint`]). Empty (the
+    /// default) is skipped on the wire, so a row declaring none — every
+    /// row before this field — serializes, hashes and reads as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edges: Vec<String>,
+    /// THE STATION TREE (T2 of design 4b27a65a, backlog 3f58c823). Six
+    /// fields, each optional and each skipped on the wire when absent, so
+    /// a row declaring none — every row before this car, and every row a
+    /// protocol projects — serializes, hashes and reads exactly as
+    /// before, and a build that predates them reads a row that has them
+    /// by skipping the keys (StationSpec denies no unknown field; the
+    /// rollback pin in tests/station_tree.rs holds that).
+    ///
+    /// `id` is the station's stable identity: it does not change when the
+    /// row is versioned, re-parented or renamed, and it is what `parent`
+    /// names. A row with no `id` is outside the tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The `id` of the station this one stands in. `None` on a tree row is
+    /// the ROOT, and the platform seed refuses a tree with any number of
+    /// roots but one ([`crate::station_tree::validate_station_tree`]). The
+    /// station's ADDRESS is derived from this chain of parents and never
+    /// stored (handoff §3 rule 9: code never names an address), so
+    /// re-parenting a station is this one field and a version bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Standing or ad hoc ([`StationMode`]). Declared by every tree row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<StationMode>,
+    /// How many claims the station seats at once. On an `equipment` row it
+    /// is the same number as `bays`, and the viability lint refuses a
+    /// difference: `bays` retires in a later car and this takes its place
+    /// (additive only, `bundle_decision_20261106_1944Z` on 4b27a65a).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<i32>,
+    /// The software provisioned into this station, serving it and
+    /// everything beneath it, by the automation id each signs with
+    /// (`automation:gate-runner`). A machine never claims a step.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub machines: Vec<String>,
+    /// What this station holds from its parent, per pool name — reserved
+    /// capacity. A child's allocations, summed per pool, never exceed what
+    /// its parent holds; the root holds every pool whole, so a child of the
+    /// root is judged against the pool's own capacity (handoff §3 rule 2,
+    /// [`crate::station_tree::validate_station_tree`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub allocation: BTreeMap<String, crate::resources::Quantity>,
+    /// The most this station, with everything standing in it, BORROWS of
+    /// a pool from its parent at once, per pool name (backlog 30c1efe8;
+    /// David 2026-11-19: "Stations may also have internal limits on the
+    /// dynamic resources they request for their own reasons"). Its
+    /// `allocation` is what it reserves, used first by its own work; past
+    /// that a claim borrows up the parent chain, and this bounds the
+    /// borrowing at this level. A pool it does not name is borrowed
+    /// without a limit of its own, bounded only by what its parents can
+    /// lend ([`crate::flow_resources::plan`]). The root borrows from
+    /// nothing, so it declares none ([`crate::station_tree`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub borrow_limit: BTreeMap<String, crate::resources::Quantity>,
+    /// The line the station's card rail draws, as a Design token code
+    /// (`it` draws `--map-line-it`): identity, never state. Declared on the
+    /// root and the stations under it; every station below inherits the
+    /// nearest one up its parents (design c4854fd4, backlog 85cb2103).
+    /// Skipped on the wire when absent, like the tree fields above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<String>,
+    /// Where the station stands on its parent's floor ([`StationPlacement`],
+    /// backlog e3a927c3). Skipped on the wire when absent, like the tree
+    /// fields above, so a row declaring none serializes, hashes and reads
+    /// as before, and a build before it reads past the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<StationPlacement>,
+    // No `upstream`: the walk upstream is the parent station's page,
+    // derived from the tree (design deba3000), and the field, its
+    // column and its envelope echo retired together (backlog
+    // d2cb38af). A body or an older event payload that still carries
+    // the key decodes, because this struct does not deny unknown
+    // fields, and the key is never written back.
     /// Optional page context for a surface that renders this station
     /// whole. `None` = no page claims this station, which is the
     /// common case: most stations are queues read by a lens that has
@@ -300,13 +525,24 @@ impl StationSpec {
             status: WorkflowStatus::Draft,
             title: title.into(),
             kind,
+            automaton: None,
+            bays: None,
             predicate,
             discipline: default_discipline(),
-            wip_limit: None,
             terminal_window_days: None,
             capability: None,
             rollup_parent: None,
-            upstream: None,
+            floor: None,
+            edges: Vec::new(),
+            id: None,
+            parent: None,
+            mode: None,
+            capacity: None,
+            machines: Vec::new(),
+            allocation: BTreeMap::new(),
+            borrow_limit: BTreeMap::new(),
+            line: None,
+            placement: None,
             lens: None,
             created_at: now,
         }
@@ -325,6 +561,186 @@ impl StationSpec {
             predicate: self.predicate.bind_self(actor)?,
             ..self.clone()
         })
+    }
+}
+
+/// Every edge of `rows` naming a station no ACTIVE row of `among`
+/// declares, one refusal each, naming the station that declares the edge
+/// and the one it could not find (pass item 4 of design ccfe87ff, backlog
+/// 1bb8c479). The ONE definition of the question, asked at both doors a
+/// station row is published through: the seed on the tree's bundle
+/// against itself (`rows == among`), before any publish — the same place
+/// and the same rows a pool's station is judged against
+/// ([`crate::pools::validate_pool_stations`]) — and the live authoring
+/// door, on the promoted draft against the active rows
+/// ([`gate_publish`]; until backlog 5b80b9f4 that door never asked it).
+/// The tree-wide pin runs it on the platform bundle. An edge named twice
+/// is refused per row by the viability lint (`station_lint::check_edges`).
+pub fn validate_station_edges(
+    rows: &[StationSpec],
+    among: &[StationSpec],
+) -> Vec<crate::station_lint::StationLintError> {
+    rows.iter()
+        .flat_map(|from| from.edges.iter().map(move |to| (from, to)))
+        .filter(|(_, to)| {
+            !among
+                .iter()
+                .any(|s| &s.name == *to && s.status == WorkflowStatus::Active)
+        })
+        .map(|(from, to)| crate::station_lint::StationLintError {
+            station: from.name.clone(),
+            field: "edges".into(),
+            reason: format!("declares an edge to `{to}`, which no active station row declares"),
+        })
+        .collect()
+}
+
+/// Every equipment row of `rows` whose automaton is no REGISTERED
+/// automation — no id of `registered`, the automations registry
+/// (`automation_actors`, published from `infra/platform/automations/`) —
+/// one refusal each, naming the station, the field and the automaton
+/// (backlog d0cf2cdc). The automaton an equipment station names decides
+/// which actor may operate its bays, and the viability lint checks only
+/// that it is SPELLED as an automation id: `automation:anything` parses.
+///
+/// The ONE definition of the question, asked wherever a station row is
+/// published: the live door and the dry run through [`gate_publish`],
+/// the platform seed on the whole bundle before any publish, and the
+/// tree-wide pin on the bundle against the automations bundle. An
+/// automaton the lint already refuses (not spelled as an automation id)
+/// is that lint's to name and is not named twice here.
+pub fn validate_station_automatons(
+    rows: &[StationSpec],
+    registered: &[String],
+) -> Vec<crate::station_lint::StationLintError> {
+    rows.iter()
+        .filter(|s| s.kind == StationKind::Equipment)
+        .filter_map(|s| s.automaton.as_deref().map(|a| (s, a)))
+        .filter(|(_, a)| crate::station_lint::is_automation_id(a))
+        .filter(|(_, a)| !registered.iter().any(|r| r == a))
+        .map(|(s, a)| crate::station_lint::StationLintError {
+            station: s.name.clone(),
+            field: "automaton".into(),
+            reason: format!(
+                "automaton `{a}` is not a registered automation: no row of the \
+                 automations registry (infra/platform/automations/) holds that id, so \
+                 nothing operates this station's bays. Register the automation first, \
+                 or name one that is."
+            ),
+        })
+        .collect()
+}
+
+/// Every placement of `rows` that overlaps the placement of an ACTIVE
+/// sibling in `among` — a row of a different name standing on the same
+/// parent's floor — one refusal each, naming both stations and both boxes
+/// (backlog e3a927c3). Two stations drawn on top of each other is a floor
+/// an operator cannot learn, which is the reason placements are fixed.
+///
+/// The ONE definition of the question, asked where a station row is
+/// published, as [`validate_station_edges`] is: the seed on the bundle
+/// against itself (`rows == among`, so an overlapping pair is named once
+/// from each side), and the live door on the promoted draft against the
+/// active rows ([`gate_publish`]). Whether a box is non-empty, on its
+/// parent's floor at all, and on a row with a parent is provable from the
+/// row alone and is the viability lint's (`station_lint::check_placement`).
+/// A row with no placement is never judged: the view lays it out on its
+/// fallback grid.
+pub fn validate_station_placements(
+    rows: &[StationSpec],
+    among: &[StationSpec],
+) -> Vec<crate::station_lint::StationLintError> {
+    rows.iter()
+        .filter_map(|row| Some((row, row.placement?, row.parent.as_deref()?)))
+        .flat_map(|(row, placed, parent)| {
+            among
+                .iter()
+                .filter(move |other| {
+                    other.status == WorkflowStatus::Active
+                        && other.name != row.name
+                        && other.parent.as_deref() == Some(parent)
+                })
+                .filter_map(move |other| {
+                    other
+                        .placement
+                        .filter(|theirs| theirs.overlaps(&placed))
+                        .map(|theirs| (row, placed, other, theirs))
+                })
+        })
+        .map(
+            |(row, ours, other, theirs)| crate::station_lint::StationLintError {
+                station: row.name.clone(),
+                field: "placement".into(),
+                reason: format!(
+                    "the box at ({}, {}) sized {}x{} overlaps `{}`'s at ({}, {}) sized {}x{} \
+                     on their parent's floor; siblings stand apart so the floor can be read",
+                    ours.x,
+                    ours.y,
+                    ours.w,
+                    ours.h,
+                    other.name,
+                    theirs.x,
+                    theirs.y,
+                    theirs.w,
+                    theirs.h
+                ),
+            },
+        )
+        .collect()
+}
+
+/// The publish door's viability gate: `spec`'s own lint
+/// ([`crate::station_lint::gate_active`]), its edges judged against
+/// `active`, the registry's active rows, with `spec` taking its name's
+/// place among them as the promotion would leave it, and its automaton
+/// judged against `registered`, the automation ids the automations
+/// registry holds ([`validate_station_automatons`]). Both adapters'
+/// `publish` run it on the draft their write actually promotes, and the
+/// dry run (`POST /api/stations/_validate`) runs it on the spec it is
+/// handed, so a clean dry run publishes and a refusal reads the same.
+///
+/// Only `spec`'s OWN edges are judged: another active row's broken edge
+/// (to a station retired since) is not this publish's to answer for.
+/// Backlog 5b80b9f4: the door ran only the row-alone lint, so a row
+/// naming an edge to no active station published by hand at /system
+/// while the seed refused the same row. Backlog d0cf2cdc: the same for
+/// an automaton no registered automation answers to.
+///
+/// `registered` need hold only the ids `spec` names — an adapter reads
+/// the one row ([`StationRegistry::registered_automatons`]).
+pub fn gate_publish(
+    spec: &StationSpec,
+    active: &[StationSpec],
+    registered: &[String],
+) -> Result<(), Vec<crate::station_lint::StationLintError>> {
+    let promoted = StationSpec {
+        status: WorkflowStatus::Active,
+        ..spec.clone()
+    };
+    let after: Vec<StationSpec> = active
+        .iter()
+        .filter(|s| s.name != spec.name)
+        .cloned()
+        .chain(std::iter::once(promoted))
+        .collect();
+    let problems: Vec<_> = crate::station_lint::gate_active(spec)
+        .err()
+        .unwrap_or_default()
+        .into_iter()
+        .chain(validate_station_edges(std::slice::from_ref(spec), &after))
+        .chain(validate_station_placements(
+            std::slice::from_ref(spec),
+            &after,
+        ))
+        .chain(validate_station_automatons(
+            std::slice::from_ref(spec),
+            registered,
+        ))
+        .collect();
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems)
     }
 }
 
@@ -399,6 +815,21 @@ impl StationSelectionRows for LockedStationSelectionRows<'_> {
 
 #[async_trait]
 pub trait StationRegistry: Send + Sync {
+    /// The automation ids `spec` names that the automations registry
+    /// holds — empty when it names none, or names one no row answers
+    /// to. The registered half of [`gate_publish`], which the dry run
+    /// reads here and `publish` reads inside its own write (backlog
+    /// d0cf2cdc). An adapter with no registry to read refuses a spec
+    /// that names an automaton rather than answering empty, which would
+    /// read as "unregistered" for a registry it never asked.
+    async fn registered_automatons(&self, spec: &StationSpec) -> Result<Vec<String>, StationError> {
+        if spec.automaton.is_some() {
+            return Err(StationError::Storage(
+                "automation registry unavailable".into(),
+            ));
+        }
+        Ok(Vec::new())
+    }
     fn try_lock_active_selection_rows(
         &self,
     ) -> Result<Option<Box<dyn StationSelectionRows + '_>>, crate::port::JobsError> {
@@ -427,6 +858,16 @@ pub trait StationRegistry: Send + Sync {
     /// Every version of one name (oldest first). Includes drafts +
     /// retired.
     async fn list_versions(&self, name: &str) -> Result<Vec<StationSpec>, StationError>;
+
+    /// Every name this registry has ever held a row of, any status,
+    /// sorted byte for byte — the recovery export's walk
+    /// (`crate::registry_export`, backlog c26aacaa). Refuses rather
+    /// than answering a short list when the adapter cannot enumerate.
+    async fn lineage_names(&self) -> Result<Vec<String>, StationError> {
+        Err(StationError::Storage(
+            "station adapter cannot enumerate its lineages".into(),
+        ))
+    }
 
     /// Append a new draft row. Version = max(version)+1 or 1.
     ///
@@ -499,6 +940,10 @@ pub trait StationRegistry: Send + Sync {
 
 pub struct InMemoryStations {
     rows: Arc<Mutex<HashMap<(String, i32), StationSpec>>>,
+    /// The automations registry an equipment station's automaton is
+    /// judged against at publish (backlog d0cf2cdc) — the double's
+    /// stand-in for the `automation_actors` table the Pg adapter reads.
+    automations: Option<Arc<dyn crate::agents::AgentsRegistry>>,
     /// What the Pg adapter records into `event_outbox` inside the
     /// row transaction, this adapter collects here — same events at
     /// the same write points, so tests assert the event contract
@@ -516,8 +961,14 @@ impl InMemoryStations {
     pub fn new() -> Self {
         Self {
             rows: Arc::new(Mutex::new(HashMap::new())),
+            automations: None,
             recorded: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub fn with_automations(mut self, automations: Arc<dyn crate::agents::AgentsRegistry>) -> Self {
+        self.automations = Some(automations);
+        self
     }
 
     /// Every event a write method recorded, in write order — the
@@ -543,6 +994,20 @@ impl InMemoryStations {
         Ok(())
     }
 
+    /// Every automation id the wired registry holds, or why it cannot be
+    /// read — never an empty list standing in for a registry not wired.
+    async fn automation_ids(&self) -> Result<Vec<String>, StationError> {
+        let registry = self
+            .automations
+            .as_ref()
+            .ok_or_else(|| StationError::Storage("automation registry unavailable".into()))?;
+        let rows = registry
+            .list_automations()
+            .await
+            .map_err(|e| StationError::Storage(e.to_string()))?;
+        Ok(rows.into_iter().map(|a| a.id).collect())
+    }
+
     fn snapshot(&self) -> Vec<StationSpec> {
         self.rows.lock().unwrap().values().cloned().collect()
     }
@@ -558,6 +1023,17 @@ impl InMemoryStations {
 
 #[async_trait]
 impl StationRegistry for InMemoryStations {
+    async fn registered_automatons(&self, spec: &StationSpec) -> Result<Vec<String>, StationError> {
+        let Some(automaton) = spec.automaton.as_deref() else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .automation_ids()
+            .await?
+            .into_iter()
+            .filter(|id| id == automaton)
+            .collect())
+    }
     fn try_lock_active_selection_rows(
         &self,
     ) -> Result<Option<Box<dyn StationSelectionRows + '_>>, crate::port::JobsError> {
@@ -634,6 +1110,12 @@ impl StationRegistry for InMemoryStations {
         Ok(rows)
     }
 
+    async fn lineage_names(&self) -> Result<Vec<String>, StationError> {
+        let names: std::collections::BTreeSet<String> =
+            self.snapshot().into_iter().map(|r| r.name).collect();
+        Ok(names.into_iter().collect())
+    }
+
     async fn create_draft(
         &self,
         mut spec: StationSpec,
@@ -663,6 +1145,9 @@ impl StationRegistry for InMemoryStations {
         actor: &boss_core::actor::ActorId,
         _now: DateTime<Utc>,
     ) -> Result<StationSpec, StationError> {
+        // Read the automations registry before taking the station writer
+        // mutex; judge the actual promoted draft below (backlog d0cf2cdc).
+        let automations = self.automation_ids().await;
         let mut rows = self.rows.lock().unwrap();
         let latest_draft = rows
             .values()
@@ -676,8 +1161,19 @@ impl StationRegistry for InMemoryStations {
         // The viability gate, against the row this call actually
         // promotes — not a copy re-read by the caller, which could
         // race a concurrent author. Same placement as the Workflow
-        // registry's, for the same reason.
-        crate::station_lint::gate_active(&latest_draft).map_err(StationError::Unviable)?;
+        // registry's, for the same reason. Its edges are judged against
+        // the active rows under the same lock (backlog 5b80b9f4).
+        let active: Vec<StationSpec> = rows
+            .values()
+            .filter(|r| r.status == WorkflowStatus::Active)
+            .cloned()
+            .collect();
+        let registered = if latest_draft.automaton.is_some() {
+            automations?
+        } else {
+            Vec::new()
+        };
+        gate_publish(&latest_draft, &active, &registered).map_err(StationError::Unviable)?;
 
         for ((n, _), row) in rows.iter_mut() {
             if n == name && row.status == WorkflowStatus::Active {
@@ -780,6 +1276,26 @@ mod pg {
     use super::*;
     use sqlx::PgPool;
 
+    /// The automation id `spec` names, if a row of `automation_actors`
+    /// holds it — read FOR SHARE inside the publish,
+    /// so the row it was judged against stands until the flip commits
+    /// (backlog d0cf2cdc).
+    async fn registered_automatons_in(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        spec: &StationSpec,
+    ) -> Result<Vec<String>, StationError> {
+        let Some(automaton) = &spec.automaton else {
+            return Ok(Vec::new());
+        };
+        let held: Option<String> =
+            sqlx::query_scalar("SELECT id FROM automation_actors WHERE id = $1 FOR SHARE")
+                .bind(automaton)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| StationError::Storage(e.to_string()))?;
+        Ok(held.into_iter().collect())
+    }
+
     pub struct PgStations {
         pool: PgPool,
     }
@@ -817,13 +1333,24 @@ mod pg {
         status: String,
         title: String,
         kind: String,
+        automaton: Option<String>,
+        bays: Option<i32>,
         predicate: serde_json::Value,
         discipline: serde_json::Value,
-        wip_limit: Option<i32>,
         terminal_window_days: Option<i32>,
         capability: Option<serde_json::Value>,
         rollup_parent: Option<String>,
-        upstream: Option<serde_json::Value>,
+        floor: Option<serde_json::Value>,
+        edges: Vec<String>,
+        id: Option<String>,
+        parent: Option<String>,
+        mode: Option<String>,
+        capacity: Option<i32>,
+        machines: Vec<String>,
+        allocation: serde_json::Value,
+        borrow_limit: serde_json::Value,
+        line: Option<String>,
+        placement: Option<serde_json::Value>,
         lens: Option<serde_json::Value>,
         created_at: DateTime<Utc>,
     }
@@ -846,11 +1373,6 @@ mod pg {
             .map(serde_json::from_value)
             .transpose()
             .map_err(|e| StationError::Storage(format!("stations.capability: {e}")))?;
-        let upstream: Option<StationUpstream> = r
-            .upstream
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|e| StationError::Storage(format!("stations.upstream: {e}")))?;
         let lens: Option<StationLens> = r
             .lens
             .map(serde_json::from_value)
@@ -862,28 +1384,83 @@ mod pg {
             status,
             title: r.title,
             kind,
+            automaton: r.automaton,
+            bays: r.bays,
             predicate,
             discipline,
-            wip_limit: r.wip_limit,
             // The column is INT (Postgres has no unsigned); a negative
             // value would be a nonsense window, so it reads as "no
             // window" rather than panicking a cast.
             terminal_window_days: r.terminal_window_days.and_then(|d| u32::try_from(d).ok()),
             capability,
             rollup_parent: r.rollup_parent,
-            upstream,
+            floor: r
+                .floor
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| StationError::Storage(format!("stations.floor: {e}")))?,
+            edges: r.edges,
+            id: r.id,
+            parent: r.parent,
+            mode: r
+                .mode
+                .map(|m| m.parse::<StationMode>())
+                .transpose()
+                .map_err(StationError::Storage)?,
+            capacity: r.capacity,
+            machines: r.machines,
+            allocation: serde_json::from_value(r.allocation)
+                .map_err(|e| StationError::Storage(format!("stations.allocation: {e}")))?,
+            borrow_limit: serde_json::from_value(r.borrow_limit)
+                .map_err(|e| StationError::Storage(format!("stations.borrow_limit: {e}")))?,
+            line: r.line,
+            placement: r
+                .placement
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| StationError::Storage(format!("stations.placement: {e}")))?,
             lens,
             created_at: r.created_at,
         })
     }
 
     const SELECT: &str = "SELECT name, version, status, title, kind, predicate, discipline, \
-                          wip_limit, terminal_window_days, capability, rollup_parent, \
-                          upstream, lens, created_at \
-                          FROM stations";
+                          terminal_window_days, capability, rollup_parent, \
+                          lens, created_at, floor, automaton, bays, \
+                          edges, id, parent, mode, capacity, machines, allocation, line, \
+                          placement, borrow_limit FROM stations";
+
+    /// `placement` as its JSONB column holds it: `{x, y, w, h}`, or NULL
+    /// for a row the view lays out on its fallback grid (backlog e3a927c3).
+    fn placement_column(spec: &StationSpec) -> Option<serde_json::Value> {
+        spec.placement
+            .as_ref()
+            .and_then(|p| serde_json::to_value(p).ok())
+    }
+
+    /// `allocation` as its JSONB column holds it: an object of pool name to
+    /// exact decimal string, `{}` for a row that allocates nothing (T2 of
+    /// design 4b27a65a, backlog 3f58c823).
+    fn allocation_column(spec: &StationSpec) -> serde_json::Value {
+        serde_json::to_value(&spec.allocation).unwrap_or_default()
+    }
 
     #[async_trait]
     impl StationRegistry for PgStations {
+        async fn registered_automatons(
+            &self,
+            spec: &StationSpec,
+        ) -> Result<Vec<String>, StationError> {
+            if spec.automaton.is_none() {
+                return Ok(Vec::new());
+            }
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| StationError::Storage(e.to_string()))?;
+            registered_automatons_in(&mut tx, spec).await
+        }
         async fn get_active(&self, name: &str) -> Result<StationSpec, StationError> {
             let row: Option<Row> =
                 sqlx::query_as(&format!("{SELECT} WHERE name = $1 AND status = 'active'"))
@@ -923,6 +1500,15 @@ mod pg {
             rows.into_iter().map(row_to_spec).collect()
         }
 
+        async fn lineage_names(&self) -> Result<Vec<String>, StationError> {
+            sqlx::query_scalar(
+                "SELECT name FROM stations GROUP BY name ORDER BY name COLLATE \"C\"",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StationError::Storage(e.to_string()))
+        }
+
         async fn create_draft(
             &self,
             mut spec: StationSpec,
@@ -949,9 +1535,12 @@ mod pg {
             sqlx::query(
                 "INSERT INTO stations
                     (name, version, status, title, kind, predicate, discipline,
-                     wip_limit, terminal_window_days, capability, rollup_parent,
-                     upstream, lens, created_at)
-                 VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                     terminal_window_days, capability, rollup_parent,
+                     lens, created_at, floor, automaton, bays, edges,
+                     id, parent, mode, capacity, machines, allocation, line, placement,
+                     borrow_limit)
+                 VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                         $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)",
             )
             .bind(&spec.name)
             .bind(spec.version)
@@ -959,7 +1548,6 @@ mod pg {
             .bind(spec.kind.as_str())
             .bind(serde_json::to_value(&spec.predicate).unwrap_or_default())
             .bind(serde_json::to_value(&spec.discipline).unwrap_or_default())
-            .bind(spec.wip_limit)
             .bind(window)
             .bind(
                 spec.capability
@@ -968,16 +1556,28 @@ mod pg {
             )
             .bind(&spec.rollup_parent)
             .bind(
-                spec.upstream
-                    .as_ref()
-                    .map(|u| serde_json::to_value(u).unwrap_or_default()),
-            )
-            .bind(
                 spec.lens
                     .as_ref()
                     .map(|l| serde_json::to_value(l).unwrap_or_default()),
             )
             .bind(spec.created_at)
+            .bind(
+                spec.floor
+                    .as_ref()
+                    .map(|f| serde_json::json!({"row": f.row, "col": f.col})),
+            )
+            .bind(&spec.automaton)
+            .bind(spec.bays)
+            .bind(&spec.edges)
+            .bind(&spec.id)
+            .bind(&spec.parent)
+            .bind(spec.mode.map(|m| m.as_str()))
+            .bind(spec.capacity)
+            .bind(&spec.machines)
+            .bind(allocation_column(&spec))
+            .bind(&spec.line)
+            .bind(placement_column(&spec))
+            .bind(serde_json::to_value(&spec.borrow_limit).unwrap_or_default())
             .execute(&mut *tx)
             .await
             .map_err(|e| StationError::Storage(e.to_string()))?;
@@ -1030,8 +1630,14 @@ mod pg {
             // The viability gate, inside the transaction, against the
             // row the flip below actually promotes. `?` here rolls the
             // tx back untouched — an unviable draft never occupies the
-            // ACTIVE slot even for the length of a transaction.
-            crate::station_lint::gate_active(&promoted).map_err(StationError::Unviable)?;
+            // ACTIVE slot even for the length of a transaction. Its
+            // edges are judged against the active rows this transaction
+            // reads (backlog 5b80b9f4), and its automaton against the
+            // automations registry the same transaction reads (backlog
+            // d0cf2cdc).
+            let active = active_rows_in(&mut *tx).await?;
+            let registered = registered_automatons_in(&mut tx, &promoted).await?;
+            gate_publish(&promoted, &active, &registered).map_err(StationError::Unviable)?;
 
             sqlx::query(
                 "UPDATE stations SET status = 'retired'
@@ -1173,9 +1779,12 @@ mod pg {
             sqlx::query(
                 "INSERT INTO stations
                     (name, version, status, title, kind, predicate, discipline,
-                     wip_limit, terminal_window_days, capability, rollup_parent,
-                     upstream, lens, created_at)
-                 VALUES ($1, $2, 'active', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                     terminal_window_days, capability, rollup_parent,
+                     lens, created_at, floor, automaton, bays, edges,
+                     id, parent, mode, capacity, machines, allocation, line, placement,
+                     borrow_limit)
+                 VALUES ($1, $2, 'active', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                         $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)",
             )
             .bind(&spec.name)
             .bind(spec.version)
@@ -1183,7 +1792,6 @@ mod pg {
             .bind(spec.kind.as_str())
             .bind(serde_json::to_value(&spec.predicate).unwrap_or_default())
             .bind(serde_json::to_value(&spec.discipline).unwrap_or_default())
-            .bind(spec.wip_limit)
             .bind(window)
             .bind(
                 spec.capability
@@ -1192,16 +1800,28 @@ mod pg {
             )
             .bind(&spec.rollup_parent)
             .bind(
-                spec.upstream
-                    .as_ref()
-                    .map(|u| serde_json::to_value(u).unwrap_or_default()),
-            )
-            .bind(
                 spec.lens
                     .as_ref()
                     .map(|l| serde_json::to_value(l).unwrap_or_default()),
             )
             .bind(spec.created_at)
+            .bind(
+                spec.floor
+                    .as_ref()
+                    .map(|f| serde_json::json!({"row": f.row, "col": f.col})),
+            )
+            .bind(&spec.automaton)
+            .bind(spec.bays)
+            .bind(&spec.edges)
+            .bind(&spec.id)
+            .bind(&spec.parent)
+            .bind(spec.mode.map(|m| m.as_str()))
+            .bind(spec.capacity)
+            .bind(&spec.machines)
+            .bind(allocation_column(&spec))
+            .bind(&spec.line)
+            .bind(placement_column(&spec))
+            .bind(serde_json::to_value(&spec.borrow_limit).unwrap_or_default())
             .execute(&mut *tx)
             .await
             .map_err(|e| StationError::Storage(e.to_string()))?;
@@ -1240,13 +1860,62 @@ mod tests {
         StationSpec::draft(
             name,
             format!("Test {name}"),
-            StationKind::Batch,
+            StationKind::Group,
             StationPredicate {
                 kind: Some("ship-a-change".into()),
                 ..Default::default()
             },
             Utc::now(),
         )
+    }
+
+    /// The `batch` kind is gone from the stored row's parse (item
+    /// 0a78f8f8 — the lint refuses it at every publish, pinned in
+    /// station_lint), and an equipment row reads back whole with the two
+    /// columns that make one.
+    #[test]
+    fn batch_is_no_station_kind_and_equipment_is_one() {
+        assert!("batch".parse::<StationKind>().is_err());
+        assert_eq!(
+            "equipment".parse::<StationKind>(),
+            Ok(StationKind::Equipment)
+        );
+        let mut row = serde_json::to_value(sample("dock")).unwrap();
+        row["kind"] = serde_json::json!("equipment");
+        row["automaton"] = serde_json::json!("automation:train-conductor");
+        row["bays"] = serde_json::json!(1);
+        let equipment: StationSpec = serde_json::from_value(row).unwrap();
+        assert_eq!(equipment.kind, StationKind::Equipment);
+        assert_eq!(
+            equipment.automaton.as_deref(),
+            Some("automation:train-conductor")
+        );
+        assert_eq!(equipment.bays, Some(1));
+        let generic = serde_json::to_value(sample("generic")).unwrap();
+        assert!(
+            generic.get("automaton").is_none() && generic.get("bays").is_none(),
+            "a generic row's wire shape is unchanged: {generic}"
+        );
+    }
+
+    /// The record keeps what it recorded, byte for byte. A publication
+    /// or a move-diagnosis receipt from before the kind was deleted
+    /// reads, and re-serializes to the same canonical bytes — so the
+    /// receipt's hash still verifies — as `RetiredBatch`, spelled
+    /// `batch` and nothing else.
+    #[test]
+    fn a_recorded_batch_station_round_trips_byte_for_byte() {
+        let mut payload = serde_json::to_value(sample("loading-dock")).unwrap();
+        payload["kind"] = serde_json::json!("batch");
+        let read: StationSpec = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(read.kind, StationKind::RetiredBatch);
+        assert_eq!(read.kind.as_str(), "batch");
+        let again = serde_json::to_value(&read).unwrap();
+        assert_eq!(
+            boss_core::job::canonical_json_bytes(&again),
+            boss_core::job::canonical_json_bytes(&payload),
+            "a recorded batch station re-serializes to the bytes it was hashed as"
+        );
     }
 
     /// Shared write-path actor: every registry write records an
@@ -1335,57 +2004,30 @@ mod tests {
     }
 
     // -----------------------------------------------------------
-    // Upstream pointer — the navigation affordance as registry data.
+    // Upstream — retired (backlog d2cb38af, design deba3000).
     // -----------------------------------------------------------
 
     #[test]
-    fn a_station_declares_no_upstream_by_default() {
-        assert_eq!(sample("dock").upstream, None);
-    }
-
-    #[test]
-    fn upstream_round_trips_as_one_optional_object() {
-        let mut spec = sample("loading-dock");
-        spec.upstream = Some(StationUpstream {
-            label: "FEEDBACK".into(),
-            href: "/system/feedback".into(),
-        });
-        let json = serde_json::to_value(&spec).unwrap();
-        assert_eq!(json["upstream"]["label"], "FEEDBACK");
-        assert_eq!(json["upstream"]["href"], "/system/feedback");
-        let back: StationSpec = serde_json::from_value(json).unwrap();
-        assert_eq!(back.upstream, spec.upstream);
-    }
-
-    #[test]
-    fn a_row_written_before_the_column_existed_still_parses() {
-        // `upstream` is absent, not null: every station row stored
-        // before this field shipped must keep reading back.
+    fn a_spec_that_still_carries_an_upstream_parses_and_never_writes_it_back() {
+        // The walk upstream is the parent station's page, derived from
+        // the tree (deba3000), so a station row no longer declares one.
+        // Every `jobs.station.published` payload and every older CLI's
+        // body written before backlog d2cb38af still carries the key,
+        // and audit_log is the system of record: such a spec keeps
+        // decoding, and the key it carried is read past, never echoed.
         let json = serde_json::json!({
             "name": "old-station",
             "version": 1,
             "status": "active",
-            "title": "Older than the field",
-            "kind": "batch",
+            "title": "Older than the retirement",
+            "kind": "group",
             "predicate": {},
+            "upstream": { "label": "FEEDBACK", "href": "/system/feedback" },
             "created_at": "2026-08-01T00:00:00Z",
         });
         let spec: StationSpec = serde_json::from_value(json).unwrap();
-        assert_eq!(spec.upstream, None);
-    }
-
-    #[test]
-    fn binding_self_carries_the_upstream_through() {
-        // The read edge binds `@me` and then renders the envelope from
-        // the bound row — dropping `upstream` there would make the
-        // button vanish for exactly the per-actor stations.
-        let mut spec = sample("my-watchlist");
-        spec.upstream = Some(StationUpstream {
-            label: "FEEDBACK".into(),
-            href: "/system/feedback".into(),
-        });
-        let bound = spec.bind_self(Some("emp-r")).expect("binds");
-        assert_eq!(bound.upstream, spec.upstream);
+        let back = serde_json::to_value(&spec).unwrap();
+        assert!(back.get("upstream").is_none(), "{back}");
     }
 
     // -----------------------------------------------------------
@@ -1437,7 +2079,7 @@ mod tests {
             "version": 1,
             "status": "active",
             "title": "Older than the field",
-            "kind": "batch",
+            "kind": "group",
             "predicate": {},
             "created_at": "2026-08-01T00:00:00Z",
         });
@@ -1447,9 +2089,8 @@ mod tests {
 
     #[test]
     fn binding_self_carries_the_lens_through() {
-        // Same reason `upstream` is carried: the read edge renders the
-        // envelope from the BOUND row, so a per-actor station would
-        // lose its whole page context here.
+        // The read edge renders the envelope from the BOUND row, so a
+        // per-actor station would lose its whole page context here.
         let mut spec = sample("my-watchlist");
         spec.lens = Some(StationLens {
             eyebrow: None,
@@ -1627,5 +2268,186 @@ mod tests {
         );
         assert_eq!(retired[0].payload["name"], "loading-dock");
         assert_eq!(retired[0].payload["status"], "retired");
+    }
+
+    #[test]
+    fn a_declared_floor_survives_the_station_record() {
+        let mut declared = serde_json::to_value(sample("department-floor")).unwrap();
+        declared["floor"] = serde_json::json!({"row": 2, "col": 3});
+        let station: StationSpec = serde_json::from_value(declared).unwrap();
+        let recorded = serde_json::to_value(station).unwrap();
+        assert_eq!(recorded["floor"], serde_json::json!({"row": 2, "col": 3}));
+    }
+
+    #[test]
+    fn floor_coordinates_are_bounded_cells_and_legacy_rows_still_parse() {
+        let mut declared = serde_json::to_value(sample("floor-cells")).unwrap();
+        declared["floor"] = serde_json::json!({"row": 65536, "col": 0});
+        assert!(serde_json::from_value::<StationSpec>(declared).is_err());
+        let legacy = serde_json::to_value(sample("legacy-floor")).unwrap();
+        let station: StationSpec = serde_json::from_value(legacy).unwrap();
+        assert_eq!(station.floor, None);
+    }
+
+    /// Pass item 4 of design ccfe87ff (backlog 1bb8c479): a station may
+    /// name the stations a packet goes to next. A row that declares none
+    /// carries no `edges` key at all, so every stored row, published
+    /// event and move-diagnosis receipt that copied one serializes
+    /// exactly as it did before the field existed — and reads back with
+    /// none.
+    #[test]
+    fn declared_edges_survive_the_record_and_a_row_without_them_reads_as_before() {
+        let legacy = serde_json::to_value(sample("legacy-edges")).unwrap();
+        assert!(
+            legacy.get("edges").is_none(),
+            "a row with no edges serializes as before: {legacy}"
+        );
+        let station: StationSpec = serde_json::from_value(legacy).unwrap();
+        assert!(station.edges.is_empty());
+        let mut declared = serde_json::to_value(sample("with-edges")).unwrap();
+        declared["edges"] = serde_json::json!(["loading-dock", "repair"]);
+        let station: StationSpec = serde_json::from_value(declared).unwrap();
+        assert_eq!(station.edges, vec!["loading-dock", "repair"]);
+        assert_eq!(
+            serde_json::to_value(station).unwrap()["edges"],
+            serde_json::json!(["loading-dock", "repair"])
+        );
+    }
+
+    /// Backlog d0cf2cdc: an equipment station's automaton is judged
+    /// against the registered ids by EXACT id, once per row; an
+    /// automaton the row-alone lint already refuses (not spelled as an
+    /// automation id, or on a row that is not equipment) is that lint's
+    /// to name, never named twice.
+    #[test]
+    fn an_equipment_automaton_is_judged_against_the_registered_ids() {
+        let equipment = |name: &str, automaton: &str| StationSpec {
+            kind: StationKind::Equipment,
+            automaton: Some(automaton.into()),
+            bays: Some(1),
+            ..sample(name)
+        };
+        let registered = vec!["automation:gate-runner".to_string()];
+        let rows = vec![
+            equipment("gates", "automation:gate-runner"),
+            equipment("kettle", "automation:anything"),
+            // A family member of a registered signer is no row of its own.
+            equipment("vat", "automation:gate-runner:host"),
+            equipment("misspelt", "emp-david"),
+            StationSpec {
+                automaton: Some("automation:anything".into()),
+                ..sample("generic")
+            },
+        ];
+        let problems = validate_station_automatons(&rows, &registered);
+        assert_eq!(
+            problems
+                .iter()
+                .map(|p| (p.station.as_str(), p.field.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("kettle", "automaton"), ("vat", "automaton")]
+        );
+        assert!(problems[0].to_string().contains("`automation:anything`"));
+
+        let mut spec = equipment("kettle", "automation:anything");
+        assert!(gate_publish(&spec, &[], &[]).is_err());
+        spec.automaton = Some("automation:gate-runner".into());
+        assert_eq!(gate_publish(&spec, &[], &registered), Ok(()));
+    }
+
+    /// Backlog e3a927c3: a placement is `{x, y, w, h}` on the wire and in
+    /// the record, and a row with none carries no `placement` key at all,
+    /// so every row before the field serializes exactly as it did.
+    #[test]
+    fn a_placement_survives_the_record_and_a_row_without_one_reads_as_before() {
+        let legacy = serde_json::to_value(sample("legacy-placement")).unwrap();
+        assert!(legacy.get("placement").is_none(), "{legacy}");
+        let mut declared = legacy.clone();
+        declared["placement"] = serde_json::json!({"x": 300, "y": 270, "w": 230, "h": 300});
+        let station: StationSpec = serde_json::from_value(declared).unwrap();
+        assert_eq!(
+            station.placement,
+            Some(StationPlacement {
+                x: 300,
+                y: 270,
+                w: 230,
+                h: 300
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(station).unwrap()["placement"],
+            serde_json::json!({"x": 300, "y": 270, "w": 230, "h": 300})
+        );
+        let mut misspelt = legacy;
+        misspelt["placement"] = serde_json::json!({"x": 1, "y": 1, "width": 2, "h": 2});
+        assert!(serde_json::from_value::<StationSpec>(misspelt).is_err());
+    }
+
+    /// Backlog e3a927c3: two siblings drawn over each other is refused at
+    /// the seed and at the live publish door, naming both; boxes that only
+    /// touch along an edge, boxes on different parents' floors, a retired
+    /// sibling, the row's own earlier version and a sibling with no
+    /// placement are not overlaps.
+    #[test]
+    fn a_placement_over_an_active_siblings_is_refused_naming_both() {
+        let at = |name: &str, parent: &str, x, y, w, h| StationSpec {
+            status: WorkflowStatus::Active,
+            id: Some(format!("id-{name}")),
+            parent: Some(parent.into()),
+            mode: Some(StationMode::Standing),
+            placement: Some(StationPlacement { x, y, w, h }),
+            ..sample(name)
+        };
+        let rows = vec![
+            at("build", "eng", 300, 270, 230, 300),
+            at("gates", "eng", 590, 120, 230, 170),
+            // Touches build's right edge and gates' left edge: no overlap.
+            at("lane", "eng", 530, 120, 60, 100),
+            // Over build, but on another floor.
+            at("deploy", "ops", 300, 270, 230, 300),
+            StationSpec {
+                placement: None,
+                ..at("garage", "eng", 0, 0, 1, 1)
+            },
+        ];
+        assert_eq!(validate_station_placements(&rows, &rows), Vec::new());
+
+        let over_build = at("design", "eng", 500, 500, 230, 190);
+        let problems = validate_station_placements(std::slice::from_ref(&over_build), &rows);
+        assert_eq!(
+            problems
+                .iter()
+                .map(|p| (p.station.as_str(), p.field.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("design", "placement")]
+        );
+        assert!(problems[0].reason.contains("`build`"), "{problems:?}");
+        assert!(gate_publish(&over_build, &rows, &[]).is_err());
+
+        // The seed judges the bundle against itself: both rows are named.
+        let mut bundle = rows.clone();
+        bundle.push(over_build.clone());
+        let named: Vec<String> = validate_station_placements(&bundle, &bundle)
+            .into_iter()
+            .map(|p| p.station)
+            .collect();
+        assert_eq!(named, vec!["build", "design"]);
+
+        // A retired sibling is no station on the floor.
+        let retired: Vec<StationSpec> = rows
+            .iter()
+            .cloned()
+            .map(|mut s| {
+                if s.name == "build" {
+                    s.status = WorkflowStatus::Retired;
+                }
+                s
+            })
+            .collect();
+        assert_eq!(gate_publish(&over_build, &retired, &[]), Ok(()));
+
+        // Moving a station over its own earlier box is no overlap.
+        let moved = at("build", "eng", 310, 280, 230, 300);
+        assert_eq!(gate_publish(&moved, &rows, &[]), Ok(()));
     }
 }

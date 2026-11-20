@@ -18,7 +18,7 @@ async function install(page: Page, verdict: 'match' | 'drift' | 'legacy'): Promi
 
 test('PVC declared request match is displayed with assignment while filesystem overhead remains independent', async ({ page }) => {
   await install(page, 'match');
-  await mountPage(page, '/it/estate');
+  await mountPage(page, '/operations/estate');
   const row = page.locator('[data-volume="boss/pgdata-postgres-0"]');
   await expect(row).toHaveCount(1);
   await expect(row.locator('[data-capacity-intent="match"]')).toContainText('desired 32212254720 bytes · requested 30Gi');
@@ -28,7 +28,7 @@ test('PVC declared request match is displayed with assignment while filesystem o
 
 test('PVC drift stays explicit and legacy comparison has unknown intent rather than an inferred target', async ({ page }) => {
   await install(page, 'drift');
-  await mountPage(page, '/it/estate');
+  await mountPage(page, '/operations/estate');
   await expect(page.locator('[data-capacity-intent="drift"]')).toContainText('requested 20Gi (21474836480 bytes)');
   await page.unroute(/\/api\/estate\/comparisons\?scope=instance-volumes&/);
   await install(page, 'legacy');

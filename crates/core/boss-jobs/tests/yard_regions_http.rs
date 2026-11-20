@@ -78,7 +78,7 @@ fn dock_station_row() -> boss_jobs::StationSpec {
     let mut s = boss_jobs::StationSpec::draft(
         "loading-dock",
         "Loading dock — parked ship-a-change cars",
-        boss_jobs::StationKind::Batch,
+        boss_jobs::StationKind::Group,
         boss_jobs::station_queue::StationPredicate {
             kind: Some("ship-a-change".into()),
             status: Some(JobStatus::Open),
@@ -132,11 +132,15 @@ fn app_with_intake() -> (axum::Router, Arc<InMemoryJobs>) {
 fn app_with_intake_and(
     agent_budget: Option<Arc<boss_jobs::agent_budget::BudgetDoor>>,
 ) -> (axum::Router, Arc<InMemoryJobs>) {
-    let jobs = Arc::new(InMemoryJobs::new());
-    let kinds = Arc::new(boss_jobs::InMemoryWorkflows::for_fixture());
-    for spec in boss_jobs::registry::seedable_platform_workflows() {
-        kinds.seed(spec).expect("seed platform kind");
-    }
+    app_with_intake_seeding(agent_budget, Vec::new())
+}
+
+/// [`app_with_intake_and`] with further protocol rows in the registry —
+/// a protocol a test's packets are pinned to.
+fn app_with_intake_seeding(
+    agent_budget: Option<Arc<boss_jobs::agent_budget::BudgetDoor>>,
+    extra: Vec<boss_jobs::registry::WorkflowSpec>,
+) -> (axum::Router, Arc<InMemoryJobs>) {
     let policy_client: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
             .allow("operator", Action::Read, Resource::job(), Scope::All)
@@ -144,6 +148,24 @@ fn app_with_intake_and(
             .allow("sales", Action::Read, Resource::job(), Scope::Self_)
             .build(),
     );
+    app_with_intake_under(agent_budget, extra, policy_client)
+}
+
+/// [`app_with_intake_seeding`] judged by a policy the test holds, so a
+/// grant can change between two reads of one caller.
+fn app_with_intake_under(
+    agent_budget: Option<Arc<boss_jobs::agent_budget::BudgetDoor>>,
+    extra: Vec<boss_jobs::registry::WorkflowSpec>,
+    policy_client: Arc<dyn PolicyClient>,
+) -> (axum::Router, Arc<InMemoryJobs>) {
+    let jobs = Arc::new(InMemoryJobs::new());
+    let kinds = Arc::new(boss_jobs::InMemoryWorkflows::for_fixture());
+    for spec in boss_jobs::registry::seedable_platform_workflows()
+        .into_iter()
+        .chain(extra)
+    {
+        kinds.seed(spec).expect("seed platform kind");
+    }
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let stations = Arc::new(boss_jobs::InMemoryStations::new());
@@ -162,20 +184,24 @@ fn app_with_intake_and(
             bus,
             DomainPublisher::new(bus_dyn, "jobs"),
             policy_client,
-            Arc::new(boss_clock_client::FixedClockClient::new(
-                boss_clock_client::ClockNow {
-                    now: t(NOW),
-                    simulated: false,
-                    epoch_start: None,
-                    epoch_end: None,
-                    paused: false,
-                    restart_in_progress: false,
-                    warp_factor: None,
-                },
-            )),
+            fixture_clock(t(NOW)),
         )
     };
     (router(state), jobs)
+}
+
+fn fixture_clock(now: DateTime<Utc>) -> Arc<dyn boss_clock_client::ClockClient> {
+    Arc::new(boss_clock_client::FixedClockClient::new(
+        boss_clock_client::ClockNow {
+            now,
+            simulated: false,
+            epoch_start: None,
+            epoch_end: None,
+            paused: false,
+            restart_in_progress: false,
+            warp_factor: None,
+        },
+    ))
 }
 
 /// An open backlog-item as the protocol admits one: `filed` (its
@@ -269,6 +295,285 @@ async fn a_packet_is_in_receiving_or_marshalling_and_never_both() {
     assert_eq!(waiting("marshalling", "shop-floor"), 1);
 }
 
+/// A CACHED MAP IS NEVER SERVED ACROSS A SCOPE (design 7b8ed079, car 2).
+/// Until the membership replay was retired, the shared map's cache key
+/// also bound the replay's census of the caller's authorized packets —
+/// an authorization guard, not only a projection binding. What replaces
+/// it is the scope the policy grants on THIS read, re-asked on every
+/// call and written into the key. The pair is ONE caller, the same
+/// identity byte for byte, before and after its grant narrows to its own
+/// packets: the second read must be built under the narrowed scope,
+/// never handed the full-scope reading cached a moment earlier, which
+/// still counts a packet the caller may no longer read.
+#[tokio::test]
+async fn a_cached_map_is_never_served_across_a_narrowed_scope() {
+    use boss_policy_client::{InMemoryPolicy, PolicyRepository, PolicyRule, UserOverride};
+    let repo = Arc::new(InMemoryPolicy::new());
+    repo.upsert_rule(
+        &PolicyRule::new("operator", Resource::job(), Action::Read, Scope::All),
+        "fixture",
+    )
+    .await
+    .unwrap();
+    let policy: Arc<dyn PolicyClient> = Arc::new(FakePolicyClient::from_repository(repo.clone()));
+    let (app, jobs) = app_with_intake_under(None, Vec::new(), policy);
+    backlog_item(&jobs, 1, false).await;
+    // The second item is someone else's: a narrowed scope cannot read it.
+    let id = Uuid::from_u128(0xB0B0_0000_0000_0000_0000_0000_0000_0002).to_string();
+    let theirs = Job {
+        owner_id: "emp-other".into(),
+        ..job("backlog-item", &id, "item 2", JobStatus::Open, json!({}))
+    };
+    jobs.create_job_at(&theirs, t(NOW), &[]).await.unwrap();
+    let mut filed = step(
+        &theirs.id,
+        "filed",
+        "filed",
+        StepStatus::Completed,
+        json!({}),
+    );
+    filed.kind = boss_jobs::regions::TRIGGER_STEP_KIND.into();
+    for s in [
+        filed,
+        step(&theirs.id, "triage", "triage", StepStatus::Ready, json!({})),
+    ] {
+        jobs.add_step_at(&s, t(NOW), &[]).await.unwrap();
+    }
+
+    let (status, full) = get(&app, "operator", "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{full}");
+    assert_eq!(
+        region(&full, "receiving")["count"],
+        2,
+        "the control: the full scope counts both items"
+    );
+
+    repo.upsert_user_override(
+        &UserOverride {
+            id: "narrowed".into(),
+            user_id: "emp-david".into(),
+            resource: Resource::job(),
+            action: Action::Read,
+            scope: Scope::Self_,
+            reason: "the grant narrows between two reads".into(),
+            expires_at: None,
+        },
+        "fixture",
+    )
+    .await
+    .unwrap();
+    let (status, narrowed) = get(&app, "operator", "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{narrowed}");
+    assert_eq!(
+        region(&narrowed, "receiving")["count"],
+        1,
+        "the same caller under a narrower scope was served the full scope's cached map: {}",
+        region(&narrowed, "receiving")
+    );
+}
+
+/// A CACHED MAP IS NEVER SERVED ACROSS THE SET ITS SCOPE ADMITS (review
+/// run 94784c1a of car dc7a2a00, F1). The scope in the key is not the
+/// whole authorization binding: a narrowed scope (`OwnerIs`, `OwnerIn`,
+/// `AccountIn`) admits a SET of packets, and the set changes while the
+/// scope stays byte-for-byte the same. One caller, one unchanged
+/// `OwnerIs` scope; a packet it owned is reassigned to someone else
+/// between two reads. The second read must be keyed on the new set and
+/// built afresh — never handed the cached map that still counts, and
+/// describes, a packet the caller may no longer read. Red on bede6e3c,
+/// where the key bound the scope alone and served 2 where 1 is right.
+#[tokio::test]
+async fn a_packet_reassigned_away_is_not_served_from_the_cache() {
+    let (app, jobs) = app_with_intake_seeding(None, Vec::new());
+    backlog_item(&jobs, 1, false).await;
+    let second = backlog_item(&jobs, 2, false).await;
+    let (status, before) = get(&app, "sales", "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert_eq!(
+        region(&before, "receiving")["count"],
+        2,
+        "the control: the caller owns both items"
+    );
+    let mut theirs = jobs.get_job(&second).await.unwrap().unwrap();
+    theirs.owner_id = "emp-other".into();
+    jobs.update_job(&theirs).await.unwrap();
+    let (status, after) = get(&app, "sales", "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(
+        region(&after, "receiving")["count"],
+        1,
+        "the caller was served a cached map counting a packet it no longer owns: {}",
+        region(&after, "receiving")
+    );
+}
+
+/// Backlog 4db21aaf drew every station STALE on the map while the
+/// membership projection's generation was stale — for eight days from
+/// 2026-10-30 each had drawn `unknown`. Design 7b8ed079 car 1 ends the
+/// dependence instead: the map counts each station over the step record
+/// in its own pass, with no generation wired at all, and none is drawn
+/// stale or unjudged (b3572a26).
+#[tokio::test]
+async fn every_station_on_the_map_is_judged_with_no_membership_generation() {
+    let (app, _jobs) = app_with_intake();
+    let (status, body) = get(&app, "operator", "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let stations: Vec<&serde_json::Value> = body["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["name"] == "marshalling")
+        .flat_map(|r| r["machines"].as_array().unwrap())
+        .filter(|m| m["id"].as_str().unwrap().starts_with("station:"))
+        .collect();
+    assert!(
+        !stations.is_empty(),
+        "the premise: stations are drawn: {body}"
+    );
+    for station in &stations {
+        assert!(
+            !matches!(station["state"].as_str(), Some("stale" | "unknown")),
+            "every station is judged on its counted flow: {station}"
+        );
+        let why = station["why"].as_str().unwrap();
+        assert!(!why.contains("membership projection"), "{why}");
+    }
+    assert_eq!(
+        body["machines"]["stale"].as_u64().unwrap_or(0),
+        0,
+        "{}",
+        body["machines"]
+    );
+}
+
+/// A STATION THAT SERVED NOTHING, JUDGED ON WHO OWNS WHAT STANDS THERE,
+/// END TO END (backlog 6254e602). Live on 2026-10-17 the region read
+/// troubled (not draining) on a station whose five steps waited on
+/// emp-david: red, for a wait on its named owner. Through the HTTP read —
+/// the packet's pinned protocol from the registry, the step's recorded
+/// ready flip from the queue-age read — a step an hour into the 24h its
+/// protocol declares is attention naming its owner; the same step two
+/// days old is past its bound and still troubled.
+#[tokio::test]
+async fn a_step_waiting_on_its_named_owner_reads_attention_inside_its_bound_and_troubled_past_it() {
+    let mut bounded = boss_jobs::registry::WorkflowSpec::platform_seed(
+        "bounded-question",
+        "A question with a declared bound",
+        // Not `platform`: a platform kind is inbound, and an inbound
+        // packet nothing has taken in is receiving's, not marshalling's.
+        "operations",
+        vec!["custom".into()],
+        vec![boss_jobs::registry::StepSpec {
+            title: "answer".into(),
+            duration_hours: Some(24.0),
+            ..Default::default()
+        }],
+    );
+    // The version the fixture's packets are pinned to.
+    bounded.version = 16;
+    for (ready_at, state) in [
+        ("2026-09-19T11:00:00Z", "attention"),
+        ("2026-09-17T11:00:00Z", "troubled"),
+    ] {
+        let (app, jobs) = app_with_intake_seeding(None, vec![bounded.clone()]);
+        let id = Uuid::from_u128(0x6254_e602_0000_0000_0000_0000_0000_0001).to_string();
+        let packet = job(
+            "bounded-question",
+            &id,
+            "a question for David",
+            JobStatus::Open,
+            json!({}),
+        );
+        jobs.create_job_at(&packet, t(ready_at), &[]).await.unwrap();
+        let mut answer = step(
+            &packet.id,
+            "answer",
+            "answer",
+            StepStatus::Ready,
+            json!({"authority_role": "platform-admin"}),
+        );
+        answer.assignee_id = Some("emp-david".into());
+        jobs.add_step_at(&answer, t(ready_at), &[]).await.unwrap();
+        let (status, v) = get(&app, "operator", "/api/yard/regions").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let m = region(&v, "marshalling");
+        assert_eq!(m["count"], 1, "{m}");
+        assert_eq!(m["state"], state, "{m}");
+        let why = m["why"].as_str().unwrap_or_default();
+        assert!(
+            why.contains("q.platform-admin.task") && why.contains("emp-david"),
+            "the station and the owner are named: {m}"
+        );
+        if state == "troubled" {
+            assert!(why.contains("past its 24h bound"), "{m}");
+        }
+    }
+}
+
+/// A FAILED ONSET READ NAMES THE READ, NOT THE RECORD (backlog 35d29890,
+/// from landed-review 5e2e42aa of car ba03b95e). The handler read the
+/// queue-age rows with `.ok()`, so when that read failed every standing
+/// step said "its ready instant is not on the record" — the troubled
+/// verdict right, its stated cause wrong (CLAUDE.md, "a verdict must name
+/// what failed"). The same owned step an hour into its 24h bound, with
+/// the queue-age read failing, is troubled for THAT reason, the error
+/// carried through.
+#[tokio::test]
+async fn a_failed_queue_age_read_is_named_as_the_cause_not_the_record() {
+    let mut bounded = boss_jobs::registry::WorkflowSpec::platform_seed(
+        "bounded-question",
+        "A question with a declared bound",
+        "operations",
+        vec!["custom".into()],
+        vec![boss_jobs::registry::StepSpec {
+            title: "answer".into(),
+            duration_hours: Some(24.0),
+            ..Default::default()
+        }],
+    );
+    bounded.version = 16;
+    let ready_at = "2026-09-19T11:00:00Z";
+    let (app, jobs) = app_with_intake_seeding(None, vec![bounded]);
+    let id = Uuid::from_u128(0x35d2_9890_0000_0000_0000_0000_0000_0001).to_string();
+    let packet = job(
+        "bounded-question",
+        &id,
+        "a question for David",
+        JobStatus::Open,
+        json!({}),
+    );
+    jobs.create_job_at(&packet, t(ready_at), &[]).await.unwrap();
+    let mut answer = step(
+        &packet.id,
+        "answer",
+        "answer",
+        StepStatus::Ready,
+        json!({"authority_role": "platform-admin"}),
+    );
+    answer.assignee_id = Some("emp-david".into());
+    jobs.add_step_at(&answer, t(ready_at), &[]).await.unwrap();
+    jobs.fail_queue_age();
+
+    let (status, v) = get(&app, "operator", "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let m = region(&v, "marshalling");
+    assert_eq!(m["state"], "troubled", "{m}");
+    let why = m["why"].as_str().unwrap_or_default();
+    // No membership generation exists, and the map counts its flow
+    // anyway, in its own pass (design 7b8ed079, car 1): the station
+    // served nothing, and is judged on what stands there.
+    assert_eq!(v["flow_as_of"], v["map_as_of"], "{v}");
+    assert!(!why.contains("pending"), "no generation is awaited: {m}");
+    assert!(
+        why.contains("the queue-age read failed") && why.contains("injected by fail_queue_age"),
+        "the failed read and its error are named: {m}"
+    );
+    assert!(
+        !why.contains("not on the record"),
+        "a failed read does not blame the record: {m}"
+    );
+}
+
 /// RECEIVING READS PAST ITS PAGE (design 62de32ae decision 4): the
 /// inbound read took ONE page of the handler's `MAX_LIMIT` (1000) and
 /// counted what came back, so past it the count was a floor that did not
@@ -356,9 +661,8 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>) {
     let cadence: Arc<dyn CadenceRepository> = Arc::new(InMemoryCadence::new(vec![depth_rule()]));
     let delivery: Arc<dyn DeliveryPolicyRepository> = Arc::new(InMemoryDeliveryPolicy::new(vec![]));
     let stations = Arc::new(boss_jobs::InMemoryStations::new());
-    stations
-        .seed(dock_station_row())
-        .expect("seed the dock row");
+    let dock = dock_station_row();
+    stations.seed(dock).expect("seed the dock row");
     let state = JobsApiState {
         stations: Some(stations),
         cadence: Some(cadence),
@@ -1035,6 +1339,7 @@ async fn a_declared_runner_host_stands_on_the_map_with_no_request_of_its_own() {
         memory_gb: None,
         disk_gb: None,
         notes: None,
+        disks: None,
     };
     let stamp = boss_core::publisher::EventStamp::new(
         "jobs",
@@ -1099,6 +1404,7 @@ async fn a_narrowed_scope_is_not_drawn_the_estates_runner_hosts() {
             memory_gb: None,
             disk_gb: None,
             notes: None,
+            disks: None,
         }],
         &stamp,
     )
@@ -1155,6 +1461,7 @@ async fn a_full_packet_scope_without_read_on_the_estate_is_not_drawn_its_hosts()
             memory_gb: None,
             disk_gb: None,
             notes: None,
+            disks: None,
         }],
         &stamp,
     )

@@ -35,6 +35,15 @@
 #                    mirror was 211 commits behind.
 #   D. lib absent    the script run from a tree with no classifier
 #                    refuses (exit 2) rather than measuring without it.
+#   E. filtered      once the source holds the forge-only `internal/`, a
+#                    snapshot carries its PUBLIC tree, which no source
+#                    commit ever held (design f7087b8c D1). That snapshot
+#                    is bookkeeping — found both by the source it names
+#                    and, naming none, by the walk — and a train that
+#                    touched only internal/ is no drift.
+#   F. the filter    public_tree drops the ROOT entry `internal` and
+#                    nothing else (not docs/internal, not internalx), and
+#                    is the commit's own tree when there is none.
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 infra="$here/.."
@@ -168,6 +177,104 @@ rc=$?
 [ "$rc" -eq 2 ] || fail "C: the classifier answered on an unresolvable ref instead of refusing (exit $rc): $out"
 [ -n "$out" ] || fail "C: the refusal said nothing about why"
 
+# --- E. a filtered snapshot is bookkeeping; internal-only is no drift --
+(cd src && git read-tree HEAD) || exit 1
+mkdir -p src/internal/lint
+echo "how Algedonic runs it" >src/internal/operating.md
+echo "exit 0" >src/internal/lint/a.sh
+echo "a public change" >src/PUBLIC.md
+(cd src && git add -A && git commit -qm "publish three, with internal") || exit 1
+WITH_INTERNAL=$(cd src && git rev-parse HEAD)
+# The public tree built BY HAND — the index without internal/ — never by
+# the function under test, so the two can disagree.
+PUBLIC=$(cd src && git rm -r -q --cached internal && git write-tree) || exit 1
+(cd src && git read-tree HEAD) || exit 1
+echo "a later internal-only train" >>src/internal/operating.md
+(cd src && git add -A && git commit -qm "internal only") || exit 1
+
+for named in yes no; do
+    if [ "$named" = yes ]; then
+        body="Snapshot of forge main at $WITH_INTERNAL onto the public mirror."
+    else
+        body="A commit carrying the same tree that names no source."
+    fi
+    SNAP2=$(cd src && git commit-tree "$PUBLIC" -p "$MERGE" -m "publish: three" -m "$body")
+    (cd src && git push -q -f "$tmp/mirror" "$SNAP2:refs/heads/main") || exit 1
+    json=$(measure --json)
+    rc=$?
+    [ "$rc" -eq 0 ] || fail "E($named): our own filtered snapshot blocked the publish (exit $rc): $json"
+    case "$json" in
+        *'"commits_behind_foreign":0'*) ;;
+        *) fail "E($named): the filtered snapshot was read as foreign work: $json" ;;
+    esac
+    case "$json" in
+        *'"has_drift":false'*) ;;
+        *) fail "E($named): an internal-only train must read as no drift: $json" ;;
+    esac
+    case "$json" in
+        *'"internal_excluded":2'*) ;;
+        *) fail "E($named): internal_excluded must count the two internal/ files: $json" ;;
+    esac
+
+    # A filtered snapshot remains bookkeeping only while its public
+    # content agrees. One later foreign file must still stop a publish
+    # on both the named-source and history-walk paths (29dbf02f F2).
+    (cd src && git read-tree "$PUBLIC" &&
+        git update-index --add --cacheinfo "100644,$FOREIGN_BLOB,FILTERED-FOREIGN.md") || exit 1
+    filtered_foreign_tree=$(cd src && git write-tree)
+    filtered_foreign=$(cd src && git commit-tree "$filtered_foreign_tree" -p "$SNAP2" -m "foreign change after a filtered snapshot")
+    (cd src && git push -q -f "$tmp/mirror" "$filtered_foreign:refs/heads/main") || exit 1
+    out=$(measure)
+    rc=$?
+    [ "$rc" -eq 1 ] || fail "E($named): a foreign file after a filtered snapshot did not block (exit $rc): $out"
+    case "$out" in *FILTERED-FOREIGN.md*) ;; *) fail "E($named): the refusal lost the foreign filename: $out" ;; esac
+    json=$(measure --json)
+    rc=$?
+    [ "$rc" -eq 1 ] || fail "E($named): filtered foreign content did not block --json (exit $rc): $json"
+    case "$json" in
+        *'"commits_behind_foreign":1'*) ;;
+        *) fail "E($named): only the foreign content commit must count, not its filtered parent: $json" ;;
+    esac
+    (cd src && git read-tree HEAD) || exit 1
+done
+
+# --- F. the filter drops the root entry and nothing else --------------
+mkdir -p src/docs/internal src/internalx
+echo "public" >src/docs/internal/kept.md
+echo "public" >src/internalx/kept.md
+(cd src && git add -A && git commit -qm "lookalikes") || exit 1
+names=$(cd "$tmp/src" && bash -c '. infra/mirror-drift-lib.sh
+t=$(public_tree HEAD) || exit 2
+git ls-tree -r --name-only "$t"' 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] || fail "F: public_tree failed (exit $rc): $names"
+case "$names" in *internal/operating.md*) fail "F: the public tree still holds internal/: $names" ;; esac
+case "$names" in *docs/internal/kept.md*) ;; *) fail "F: docs/internal/ is public and was dropped: $names" ;; esac
+case "$names" in *internalx/kept.md*) ;; *) fail "F: internalx/ is public and was dropped: $names" ;; esac
+same=$(cd "$tmp/src" && bash -c '. infra/mirror-drift-lib.sh; public_tree "$1"' _ "$MERGE" 2>&1)
+[ "$same" = "$PUBLISHED_TREE" ] || fail "F: a commit with no internal/ must publish its own tree ($PUBLISHED_TREE), got: $same"
+
+# The helpers read a commit's ROOT regardless of the caller's cwd.
+# Compare to an independently built index tree, not another helper
+# invocation which could share the same cwd-dependent defect (F1).
+expected_tree=$(cd src && git rm -r -q --cached internal && git write-tree) || exit 1
+(cd src && git read-tree HEAD) || exit 1
+expected_excluded=$(printf 'internal/lint/a.sh\ninternal/operating.md')
+for sub in docs/internal internal; do
+    tree=$(cd "$tmp/src/$sub" && bash -c '. "$1"; public_tree HEAD' _ "$tmp/src/infra/mirror-drift-lib.sh" 2>&1)
+    rc=$?
+    [ "$rc" -eq 0 ] && [ "$tree" = "$expected_tree" ] \
+        || fail "F($sub): public_tree must exclude internal/ from the repository root (exit $rc): $tree"
+    excluded=$(cd "$tmp/src/$sub" && bash -c '. "$1"; public_tree_excluded HEAD' _ "$tmp/src/infra/mirror-drift-lib.sh" 2>&1)
+    rc=$?
+    [ "$rc" -eq 0 ] && [ "$excluded" = "$expected_excluded" ] \
+        || fail "F($sub): excluded paths must be rooted and counted from any cwd (exit $rc): $excluded"
+    same=$(cd "$tmp/src/$sub" && bash -c '. "$1"; public_tree "$2"' _ "$tmp/src/infra/mirror-drift-lib.sh" "$MERGE" 2>&1)
+    rc=$?
+    [ "$rc" -eq 0 ] && [ "$same" = "$PUBLISHED_TREE" ] \
+        || fail "F($sub): a commit without internal/ must keep its entire root tree (exit $rc): $same"
+done
+
 # --- D. the script refuses when the classifier is absent -------------
 (cd src && rm infra/mirror-drift-lib.sh) || exit 1
 out=$(measure)
@@ -181,5 +288,5 @@ if [ "$fails" -gt 0 ]; then
     echo "the-mirrors-own-merge-is-not-foreign-work: $fails check(s) failed" >&2
     exit 1
 fi
-echo "the-mirrors-own-merge-is-not-foreign-work: self-test ok — the mirror's own snapshot+merge does not block (2 behind, 0 foreign), a commit that changed FOREIGN.md blocks and names it, an unresolvable ref refuses instead of answering, and a tree with no classifier refuses instead of measuring"
+echo "the-mirrors-own-merge-is-not-foreign-work: self-test ok — the mirror's own snapshot+merge does not block (2 behind, 0 foreign), a commit that changed FOREIGN.md blocks and names it, an unresolvable ref refuses instead of answering, a filtered snapshot of a source holding internal/ is bookkeeping by name and by walk with an internal-only train reading no drift, public_tree drops only the root internal entry, and a tree with no classifier refuses instead of measuring"
 exit 0

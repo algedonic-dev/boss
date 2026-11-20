@@ -2,10 +2,9 @@
 //! registry, feeds incoming events through the matcher, and dispatches
 //! matched rules to the handler registry.
 //!
-//! Separate from `dispatcher::run_loop` (which handles role-based
-//! step assignment) so the two concerns stay decoupled. The main
-//! binary starts both; they share the same NATS connection but
-//! subscribe to disjoint topic sets.
+//! It once ran beside a step-assignment consumer on `jobs.step.>`; that
+//! matchmaker was retired (backlog e1eaf72b), and a ready step now
+//! stands at its station until an executor pulls it.
 
 use super::dead_letter::{
     DeadLetterClass, DeadLetterNote, DeadLetterSink, HandlerFailure, annotation_target,
@@ -14,7 +13,7 @@ use super::expr::HelperResolver;
 use super::firings::{Firing, FiringSink, Outcome, dead_letter_id, fired_rules, firing_id};
 use super::handler::{self, HandlerRegistry};
 use super::registry::{self, Registry};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use serde_json::Value;
@@ -48,7 +47,9 @@ fn envelope_timestamp(envelope: &Value) -> Option<DateTime<Utc>> {
 }
 
 /// What the rules runner needs to operate.
+#[derive(Clone)]
 pub struct RulesRunner {
+    pub delivery_routes: Option<Arc<dyn super::delivery::DeliveryRoutes>>,
     pub registry: Registry,
     pub handlers: HandlerRegistry,
     pub helpers: Arc<dyn HelperResolver + Send + Sync>,
@@ -85,8 +86,9 @@ impl RulesRunner {
     }
 
     /// Bind a durable JetStream consumer covering every topic the registry
-    /// references and run the match-then-dispatch loop. Runs until the
-    /// message stream ends (NATS disconnect).
+    /// references and run the match-then-dispatch loop. Runs for the life
+    /// of its task: a stream that ends is opened again
+    /// (`boss_nats::durable::keep_bound`, backlog 2e45840a).
     ///
     /// Durability is the point: each event is ACK'd only after its handlers
     /// succeed. A handler failure NAKs the message, so the server redelivers
@@ -147,7 +149,27 @@ impl RulesRunner {
         js: async_nats::jetstream::Context,
         live: std::sync::Arc<crate::liveness::DispatcherLiveness>,
     ) -> Result<()> {
-        let subjects: Vec<String> = self.subscriptions().into_iter().collect();
+        self.run_delivery(js, live, None).await
+    }
+
+    pub async fn run_delivery(
+        &self,
+        js: async_nats::jetstream::Context,
+        live: std::sync::Arc<crate::liveness::DispatcherLiveness>,
+        lane: Option<super::delivery::Cutover>,
+    ) -> Result<()> {
+        // The default retains ALL rules: old backlog up to the cutover
+        // still belongs to it. The authoritative fence below selects effects.
+        let subjects: Vec<String> = match &lane {
+            None => self.subscriptions().into_iter().collect(),
+            Some(lane) => self
+                .registry
+                .rules()
+                .iter()
+                .filter(|r| r.delivery_lane.as_deref() == Some(lane.lane.as_str()))
+                .filter_map(|r| r.event_pattern().map(|p| p.raw().to_string()))
+                .collect(),
+        };
         if subjects.is_empty() {
             info!("rules runner: no rules registered, nothing to consume");
             return Ok(());
@@ -157,90 +179,280 @@ impl RulesRunner {
         // each event arrives exactly once. `handle` re-matches precisely via
         // `match_event`; the few extra subjects pulled in match no rule and
         // ACK as no-ops.
-        let filters = boss_nats::durable::coarse_filter_subjects(&subjects);
-        info!(
-            ?filters,
-            durable = "dispatcher-rules",
-            "rules runner: opening durable consumer"
-        );
-        let messages = boss_nats::durable::open_durable(
-            &js,
-            boss_nats::durable::STREAM_NAME,
-            "dispatcher-rules",
-            filters,
+        let filters = if lane.is_none() {
+            boss_nats::durable::coarse_filter_subjects(&subjects)
+        } else {
+            subjects
+        };
+        // Which consumer this task keeps bound, named in every warning.
+        let durable = lane
+            .as_ref()
+            .map_or("dispatcher-rules", |lane| lane.consumer.as_str());
+        info!(?filters, durable, "rules runner: opening durable consumer");
+        let created_ns = |stream: &async_nats::jetstream::stream::Stream| {
+            stream
+                .cached_info()
+                .created
+                .unix_timestamp_nanos()
+                .to_string()
+        };
+        let runner = Arc::new(self.clone());
+        // Kept bound for the life of the task (backlog 2e45840a, design
+        // ad9519bc). Car 2 made the default consumer's first open wait
+        // for the bus; car 3 does the same for a lane's one-shot
+        // `get_consumer`, and opens EITHER again when its bound stream
+        // ends — both used to return for good, leaving that consumer's
+        // step-completion side effects off until a restart or a registry
+        // reload. Readiness reads the consumer not running while it
+        // waits: `consume` marks both edges.
+        let never = boss_nats::durable::keep_bound(
+            durable,
+            || async {
+                // Ensured when the server says it is gone, not only on a
+                // reconnect (backlog 2e45840a, the stream half).
+                let stream = boss_nats::durable::bound_stream(&js, boss_nats::durable::STREAM_NAME)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let messages = match &lane {
+                    // A lane's consumer is CREATED only by `bind_lanes`,
+                    // under its cutover fence; here it is only read. Its
+                    // stream ends like the default's when the consumer
+                    // vanishes (backlog 2e45840a), so a lane whose
+                    // consumer is gone reads not-running and names it in
+                    // the open's warning, instead of reading running
+                    // while every pull answers no responders.
+                    //
+                    // It is deliberately NOT recreated here (decided
+                    // 2026-11-11, run b529c357). The cutover receipt pins
+                    // this consumer by its creation instant, and the
+                    // default consumer stops delivering the lane's rules
+                    // above the floor. A recreated lane consumer starts
+                    // new-only, so what was published while it was gone
+                    // would be delivered by neither — a silent loss —
+                    // and `bind_lanes` already refuses that same
+                    // recreate on a reload ("use a new lane, never
+                    // rewrite its cutover"). A vanished lane is an
+                    // operator's act: retire it and bind a new lane.
+                    Some(lane) => {
+                        let consumer: async_nats::jetstream::consumer::Consumer<
+                            async_nats::jetstream::consumer::pull::Config,
+                        > = stream
+                            .get_consumer(&lane.consumer)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        boss_nats::durable::until_vanished(
+                            consumer.messages().await.map_err(|e| e.to_string())?,
+                        )
+                    }
+                    None => boss_nats::durable::open_durable(
+                        &js,
+                        boss_nats::durable::STREAM_NAME,
+                        "dispatcher-rules",
+                        filters.clone(),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?,
+                };
+                Ok::<_, String>((created_ns(&stream), messages))
+            },
+            |(stream_created_ns, messages)| {
+                runner
+                    .clone()
+                    .consume(&js, &live, lane.as_ref(), stream_created_ns, messages)
+            },
         )
-        .await
-        .context("opening durable rules consumer")?;
+        .await;
+        match never {}
+    }
+
+    /// One bound session of the match-then-dispatch loop: mark the
+    /// consumer running, process its messages until the stream ends,
+    /// mark it stopped. [`Self::run_delivery`] opens the next session.
+    async fn consume(
+        self: Arc<Self>,
+        js: &async_nats::jetstream::Context,
+        live: &Arc<crate::liveness::DispatcherLiveness>,
+        lane: Option<&super::delivery::Cutover>,
+        stream_created_ns: String,
+        messages: boss_nats::durable::Messages,
+    ) {
         // Consumer bound — the step-completion side-effect path is live (see
         // crate::liveness::DispatcherLiveness; a process that's health-200 but
         // whose rules consumer died runs zero side-effects and stalls Jobs).
-        live.mark_rules_running();
+        if let Some(lane) = lane {
+            live.mark_delivery_lane(&lane.lane, true);
+        } else {
+            live.mark_rules_running();
+        }
 
         // Process events with bounded concurrency (see MAX_CONCURRENT_EVENTS).
         // `handle` only reads shared state (the rule registry + stateless
         // Arc'd handlers), so distinct events process safely in parallel;
         // a single Job's step chain stays ordered because each event only
         // fires after its predecessor's completion lands.
-        messages
-            .for_each_concurrent(MAX_CONCURRENT_EVENTS, |msg| {
-                let live = live.clone();
-                async move {
-                    let msg = match msg {
-                        Ok(m) => m,
-                        Err(e) => {
-                            warn!(error = %e, "rules runner: message stream error");
-                            return;
+        let runner = self;
+        let processing = messages.for_each_concurrent(MAX_CONCURRENT_EVENTS, |msg| {
+            let live = live.clone();
+            let runner = runner.clone();
+            let lane_name = lane.map(|v| v.lane.clone());
+            let stream_created_ns = stream_created_ns.clone();
+            async move {
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!(error = %e, "rules runner: message stream error");
+                        return;
+                    }
+                };
+                let subject = msg.subject.to_string();
+                let envelope: Value = match serde_json::from_slice(&msg.payload) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Unparseable: redelivery can't help — ACK so it
+                        // doesn't loop, and move on.
+                        debug!(error = %e, subject = %subject, "skip non-JSON event (ACK)");
+                        let _ = msg.ack().await;
+                        return;
+                    }
+                };
+                // events come as {id, timestamp, source, kind, payload}.
+                let event_id = envelope
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let recorded_at = envelope_timestamp(&envelope);
+                let position = msg.info().ok().map(|info| super::delivery::Position {
+                    lane: lane_name,
+                    stream_created_ns,
+                    stream_sequence: info.stream_sequence,
+                });
+                let payload = envelope.get("payload").cloned().unwrap_or(envelope);
+                // The delivery count `settle` will read, read here so
+                // `handle` knows whether a failure now is the last
+                // one the budget allows. Same fallback as `settle`:
+                // an unreadable count counts as the final attempt, so
+                // a broken message records its dead-letter rather
+                // than vanishing into a Term.
+                let attempt = msg
+                    .info()
+                    .map(|i| i.delivered)
+                    .unwrap_or(boss_nats::durable::MAX_DELIVER)
+                    .max(1) as u32;
+                let mut announced_hold = false;
+                let outcome = loop {
+                    let handling = runner.clone().handle_owned(subject.clone(), event_id.clone(), payload.clone(), attempt, recorded_at, position.clone());
+                    tokio::pin!(handling);
+                    let outcome = if announced_hold {
+                        // The pacing sleep already consumed one heartbeat interval.
+                        // Renew before polling a recheck that can itself stay pending.
+                        if let Err(error) = msg.ack_with(async_nats::jetstream::AckKind::Progress).await {
+                            warn!(%error, %event_id, "held delivery progress failed before routing recheck");
                         }
-                    };
-                    let subject = msg.subject.to_string();
-                    let envelope: Value = match serde_json::from_slice(&msg.payload) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            // Unparseable: redelivery can't help — ACK so it
-                            // doesn't loop, and move on.
-                            debug!(error = %e, subject = %subject, "skip non-JSON event (ACK)");
-                            let _ = msg.ack().await;
-                            return;
+                        // Keep the established hold alive even when its next
+                        // authoritative read is itself pending, not only between reads.
+                        loop {
+                            tokio::select! {
+                                value = &mut handling => break value,
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                                    if let Err(error) = msg.ack_with(async_nats::jetstream::AckKind::Progress).await {
+                                        warn!(%error, %event_id, "held delivery progress failed while routing read is pending");
+                                    }
+                                }
+                            }
                         }
-                    };
-                    // events come as {id, timestamp, source, kind, payload}.
-                    let event_id = envelope
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let recorded_at = envelope_timestamp(&envelope);
-                    let payload = envelope.get("payload").cloned().unwrap_or(envelope);
-                    // The delivery count `settle` will read, read here so
-                    // `handle` knows whether a failure now is the last
-                    // one the budget allows. Same fallback as `settle`:
-                    // an unreadable count counts as the final attempt, so
-                    // a broken message records its dead-letter rather
-                    // than vanishing into a Term.
-                    let attempt = msg
-                        .info()
-                        .map(|i| i.delivered)
-                        .unwrap_or(boss_nats::durable::MAX_DELIVER)
-                        .max(1) as u32;
-                    let outcome = self
-                        .handle(&subject, &event_id, &payload, attempt, recorded_at)
-                        .await;
-                    // ACK on success; NAK (→ redeliver) on transient failure —
-                    // dead-letter once the budget is spent; immediate Term on a
-                    // permanent failure (deterministic data error — every
-                    // redelivery fails identically, so the budget is noise).
-                    // `settle_classified` does the failure logging
-                    // (deliberately NOT phrased as the health-gate pattern for
-                    // NAKs — a transient that self-heals is not a defect; only
-                    // a dead-letter is, and permanent failures log as one).
-                    boss_nats::durable::settle_classified(&msg, outcome).await;
-                    live.record_rules();
+                    } else { handling.await };
+                    if let boss_nats::durable::Settle::Hold(reason) = outcome {
+                        if !announced_hold {
+                            warn!(%reason, %event_id, "delivery held without spending handler retry budget");
+                            announced_hold = true;
+                        }
+                        if let Err(error) = msg.ack_with(async_nats::jetstream::AckKind::Progress).await {
+                            warn!(%error, %event_id, "held delivery progress failed; no effect or acknowledgement claimed");
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    } else { break outcome; }
+                };
+                // ACK on success; NAK (→ redeliver) on transient failure —
+                // dead-letter once the budget is spent; immediate Term on a
+                // permanent failure (deterministic data error — every
+                // redelivery fails identically, so the budget is noise).
+                // `settle_classified` does the failure logging
+                // (deliberately NOT phrased as the health-gate pattern for
+                // NAKs — a transient that self-heals is not a defect; only
+                // a dead-letter is, and permanent failures log as one).
+                boss_nats::durable::settle_classified(&msg, outcome).await;
+                live.record_rules();
+            }
+        });
+        let sampling = async {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Some(lane) = lane {
+                    live.record_delivery_lane_lag(
+                        &lane.lane,
+                        super::lag::sample_consumer(js, &lane.consumer).await,
+                    );
+                } else {
+                    live.record_rules_lag(super::lag::sample(js).await);
                 }
-            })
-            .await;
-        live.mark_rules_stopped();
+            }
+        };
+        // The sampler is owned by this consumer loop, not a detached
+        // task surviving a registry reload or a stopped consumer.
+        tokio::select! { _ = processing => {}, _ = sampling => {} }
+        if let Some(lane) = lane {
+            live.mark_delivery_lane(&lane.lane, false);
+        } else {
+            live.mark_rules_stopped();
+        }
         info!("rules runner: message stream ended");
-        Ok(())
+    }
+
+    /// Match and dispatch one event.
+    async fn handle_owned(
+        self: Arc<Self>,
+        topic: String,
+        event_id: String,
+        payload: Value,
+        attempt: u32,
+        recorded_at: Option<DateTime<Utc>>,
+        position: Option<super::delivery::Position>,
+    ) -> boss_nats::durable::Settle {
+        // A sync helper's block_in_place suspends its whole TASK, not
+        // merely one future in for_each_concurrent. Keep each event in
+        // its own task under the existing 12-event cap. JoinSet aborts
+        // it when the owning loop is dropped or the registry reloads.
+        let runner = self.clone();
+        let mut owned = tokio::task::JoinSet::new();
+        owned.spawn(async move {
+            runner
+                .handle_delivery(
+                    &topic,
+                    &event_id,
+                    &payload,
+                    attempt,
+                    recorded_at,
+                    position.as_ref(),
+                )
+                .await
+        });
+        match owned.join_next().await {
+            Some(Ok(outcome)) => outcome,
+            _ => {
+                warn!("rules runner: owned event task ended before settlement; retrying");
+                if boss_nats::durable::is_dead_letter(attempt as i64)
+                    && let Some(live) = &self.live
+                {
+                    live.record_dead_letter(false);
+                }
+                boss_nats::durable::Settle::Retry(
+                    "rules event task failed before settlement".into(),
+                )
+            }
+        }
     }
 
     /// Match and dispatch one event.
@@ -263,9 +475,32 @@ impl RulesRunner {
         attempt: u32,
         recorded_at: Option<DateTime<Utc>>,
     ) -> boss_nats::durable::Settle {
+        self.handle_delivery(topic, event_id, payload, attempt, recorded_at, None)
+            .await
+    }
+
+    pub async fn handle_delivery(
+        &self,
+        topic: &str,
+        event_id: &str,
+        payload: &Value,
+        attempt: u32,
+        recorded_at: Option<DateTime<Utc>>,
+        position: Option<&super::delivery::Position>,
+    ) -> boss_nats::durable::Settle {
         use boss_nats::durable::Settle;
-        let registry::MatchOutcome { matched, skipped } =
-            registry::match_event(&self.registry, topic, payload, self.helpers.as_ref());
+        let matching_started = std::time::Instant::now();
+        let registry::MatchOutcome {
+            mut matched,
+            skipped,
+        } = registry::match_event(&self.registry, topic, payload, self.helpers.as_ref());
+        if let Some(live) = &self.live {
+            live.record_match_cost(matching_started.elapsed());
+        }
+        // A synchronous read already in progress cannot be interrupted.
+        // Re-enter the cancellation boundary before invoking handlers,
+        // so a dropped owner cannot resume into writes after that read.
+        tokio::task::yield_now().await;
         // A rule that cannot be evaluated is skipped, LOUDLY, and its
         // neighbours still fire. It used to abort matching for the whole
         // topic, so one bad arg reference silenced every rule bound to
@@ -291,7 +526,28 @@ impl RulesRunner {
         if matched.is_empty() {
             return Settle::Ack;
         }
-        let results = match handler::dispatch(
+        if let Some(routes) = &self.delivery_routes {
+            let names = matched
+                .iter()
+                .map(|r| r.rule_name.clone())
+                .collect::<Vec<_>>();
+            match routes.permitted(&names, position).await {
+                Ok(permitted) => matched.retain(|r| permitted.contains(&r.rule_name)),
+                Err(error) => return Settle::Hold(error),
+            }
+        } else if matched.iter().any(|r| {
+            self.registry
+                .rules()
+                .iter()
+                .any(|known| known.name == r.rule_name && known.delivery_lane.is_some())
+        }) {
+            return Settle::Hold("delivery lane has no authoritative route reader".into());
+        }
+        if matched.is_empty() {
+            return Settle::Ack;
+        }
+        let handling_started = std::time::Instant::now();
+        let dispatched = handler::dispatch(
             &matched,
             &self.handlers,
             event_id,
@@ -299,8 +555,11 @@ impl RulesRunner {
             payload,
             recorded_at,
         )
-        .await
-        {
+        .await;
+        if let Some(live) = &self.live {
+            live.record_dispatch_cost(handling_started.elapsed());
+        }
+        let results = match dispatched {
             Ok(r) => r,
             Err(e) => {
                 return Settle::Retry(format!("dispatching matched rules for {topic}: {e}"));
@@ -434,7 +693,12 @@ impl RulesRunner {
                 outcome: Outcome::Fired,
             })
             .collect();
-        if let Err(e) = sink.record(&rows).await {
+        let recording_started = std::time::Instant::now();
+        let recorded = sink.record(&rows).await;
+        if let Some(live) = &self.live {
+            live.record_firing_cost(recording_started.elapsed(), rows.len());
+        }
+        if let Err(e) = recorded {
             warn!(
                 error = %e,
                 topic = %topic,
@@ -684,6 +948,7 @@ handler = "h3"
 "#;
         let reg = Registry::from_toml(toml).unwrap();
         let runner = RulesRunner {
+            delivery_routes: None,
             registry: reg,
             handlers: HandlerRegistry::new(),
             helpers: Arc::new(NoHelpers),
@@ -700,6 +965,7 @@ handler = "h3"
     #[test]
     fn empty_registry_has_no_subscriptions() {
         let runner = RulesRunner {
+            delivery_routes: None,
             registry: Registry::empty(),
             handlers: HandlerRegistry::new(),
             helpers: Arc::new(NoHelpers),
@@ -728,6 +994,7 @@ handler = "boom"
         let mut handlers = HandlerRegistry::new();
         handlers.register(handler::FailingHandler::new("boom", "policy unreachable"));
         let runner = RulesRunner {
+            delivery_routes: None,
             registry: reg,
             handlers,
             helpers: Arc::new(NoHelpers),
@@ -756,6 +1023,7 @@ handler = "boom"
         // No matched rule = nothing to do = ACK (not a failure). Keeps the
         // consumer from NAK-looping the many events no rule cares about.
         let runner = RulesRunner {
+            delivery_routes: None,
             registry: Registry::empty(),
             handlers: HandlerRegistry::new(),
             helpers: Arc::new(NoHelpers),
@@ -815,6 +1083,7 @@ handler = "rec"
         let mut handlers = HandlerRegistry::new();
         handlers.register(recorder.clone());
         let runner = RulesRunner {
+            delivery_routes: None,
             registry: Registry::from_toml(toml).unwrap(),
             handlers,
             helpers: Arc::new(NoHelpers),
@@ -838,6 +1107,65 @@ handler = "rec"
         let calls = recorder.calls().await;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].event_timestamp, Some(at));
+    }
+
+    /// A delayed rule never fires at match time (backlog 84a010cb). The
+    /// authoring validator refuses a `delay`, but an ACTIVE row is loaded
+    /// by `load_active_rules` -> `Rule::from_raw`, which never calls it:
+    /// a row written before car 4c706c5d, or by any door that skips the
+    /// validator, used to match and run its handlers on the triggering
+    /// event — a seven-day follow-up admitted the same second. Until the
+    /// durable delayed-admission contract (design f1d66249) executes the
+    /// delay, the runner refuses the rule loudly and fires nothing.
+    #[tokio::test]
+    async fn handle_never_fires_a_delayed_rule_at_match_time() {
+        let toml = r#"
+[[rule]]
+name = "follow-up-after-silence"
+on_event = "jobs.job.created"
+delay = "7d"
+[[rule.do]]
+handler = "rec"
+
+[[rule]]
+name = "immediate-neighbour"
+on_event = "jobs.job.created"
+[[rule.do]]
+handler = "rec"
+"#;
+        let recorder = handler::RecordingHandler::new("rec");
+        let mut handlers = HandlerRegistry::new();
+        handlers.register(recorder.clone());
+        let runner = RulesRunner {
+            delivery_routes: None,
+            registry: Registry::from_toml(toml).unwrap(),
+            handlers,
+            helpers: Arc::new(NoHelpers),
+            dead_letters: None,
+            live: None,
+            firings: None,
+        };
+        let res = runner
+            .handle(
+                "jobs.job.created",
+                "evt-inquiry",
+                &serde_json::json!({"id": "j-1"}),
+                FIRST,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(res, boss_nats::durable::Settle::Ack),
+            "a refused delayed rule is permanent, never a retry: {}",
+            settle_name(&res)
+        );
+        // Positive control: the immediate neighbour on the same topic
+        // still fires, exactly once — and the delayed rule adds nothing.
+        assert_eq!(
+            recorder.calls().await.len(),
+            1,
+            "only the immediate rule's handler ran; the delayed one fired at match time"
+        );
     }
 
     struct FixedHandler {
@@ -870,6 +1198,7 @@ handler = "rec"
             reg.register(std::sync::Arc::new(FixedHandler { name, result }));
         }
         RulesRunner {
+            delivery_routes: None,
             registry: Registry::from_toml(rules_toml).unwrap(),
             handlers: reg,
             helpers: Arc::new(NoHelpers),
@@ -891,6 +1220,291 @@ on_event = "step.done.x"
 [[rule.do]]
 handler = "h.trans"
 "#;
+
+    /// The real matcher invokes a synchronous helper. This in-memory
+    /// port holds the same block_in_place boundary as InventoryHelpers'
+    /// HTTP bridge; the signal proves arrival before any timeout judges
+    /// the unrelated event's progress. No production delay is inferred.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_waiting_match_helper_does_not_stop_other_events_from_being_polled() {
+        struct HeldHelper {
+            entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl HelperResolver for HeldHelper {
+            fn call(
+                &self,
+                _name: &str,
+                _args: &[crate::rules::expr::Value],
+            ) -> Result<crate::rules::expr::Value, crate::rules::expr::EvalError> {
+                tokio::task::block_in_place(|| {
+                    self.entered
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .unwrap()
+                        .send(())
+                        .unwrap();
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(3))
+                        .unwrap();
+                });
+                Ok(crate::rules::expr::Value::Bool(true))
+            }
+        }
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut runner = runner_with(
+            vec![],
+            r#"
+[[rule]]
+name = "slow"
+on_event = "step.done.slow"
+when = "gate()"
+[[rule.do]]
+handler = "h.mark"
+[[rule]]
+name = "fast"
+on_event = "step.done.fast"
+[[rule.do]]
+handler = "h.mark"
+"#,
+        );
+        let recorder = handler::RecordingHandler::new("h.mark");
+        runner.handlers.register(recorder.clone());
+        runner.helpers = Arc::new(HeldHelper {
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let runner = Arc::new(runner);
+        let drive = tokio::spawn(async move {
+            futures::stream::iter(["step.done.slow", "step.done.fast"])
+                .for_each_concurrent(MAX_CONCURRENT_EVENTS, |topic| {
+                    let runner = runner.clone();
+                    async move {
+                        assert!(matches!(
+                            runner
+                                .handle_owned(
+                                    topic.into(),
+                                    topic.into(),
+                                    serde_json::json!({}),
+                                    FIRST,
+                                    None,
+                                    None
+                                )
+                                .await,
+                            boss_nats::durable::Settle::Ack
+                        ));
+                    }
+                })
+                .await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let progressed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !recorder
+                .calls()
+                .await
+                .iter()
+                .any(|call| call.triggering_topic == "step.done.fast")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), drive)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorder.calls().await.len(),
+            2,
+            "both legitimate handlers still fire after release"
+        );
+        assert!(
+            progressed,
+            "a helper suspended the shared stream poller despite its 12-wide limit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_the_event_owner_cannot_resume_from_a_read_into_a_handler() {
+        struct HeldHelper {
+            entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl HelperResolver for HeldHelper {
+            fn call(
+                &self,
+                _name: &str,
+                _args: &[crate::rules::expr::Value],
+            ) -> Result<crate::rules::expr::Value, crate::rules::expr::EvalError> {
+                tokio::task::block_in_place(|| {
+                    self.entered
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .unwrap()
+                        .send(())
+                        .unwrap();
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(3))
+                        .unwrap();
+                });
+                Ok(crate::rules::expr::Value::Bool(true))
+            }
+        }
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut runner = runner_with(
+            vec![],
+            r#"
+[[rule]]
+name = "slow"
+on_event = "step.done.slow"
+when = "gate()"
+[[rule.do]]
+handler = "h.mark"
+"#,
+        );
+        let recorder = handler::RecordingHandler::new("h.mark");
+        runner.handlers.register(recorder.clone());
+        runner.helpers = Arc::new(HeldHelper {
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let runner = Arc::new(runner);
+        let owner = tokio::spawn(runner.clone().handle_owned(
+            "step.done.slow".into(),
+            "cancel".into(),
+            serde_json::json!({}),
+            FIRST,
+            None,
+            None,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        owner.abort();
+        assert!(matches!(owner.await,Err(error) if error.is_cancelled()));
+        release_tx.send(()).unwrap();
+        // The last owned Arc disappearing is completion evidence, not a
+        // sleep standing in for the blocked read's return.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while Arc::strong_count(&runner) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            recorder.calls().await.is_empty(),
+            "no handler after owner cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_owned_task_failure_retries_instead_of_acknowledging_work() {
+        let mut runner = runner_with(
+            vec![
+                ("h.perm", || panic!("fixture owned task panic")),
+                ("h.trans", || Ok(())),
+            ],
+            TWO_HANDLER_RULES,
+        );
+        let live = Arc::new(crate::liveness::DispatcherLiveness::default());
+        runner.live = Some(live.clone());
+        let settle = Arc::new(runner)
+            .handle_owned(
+                "step.done.x".into(),
+                "panic".into(),
+                serde_json::json!({}),
+                FINAL,
+                None,
+                None,
+            )
+            .await;
+        assert!(matches!(settle, boss_nats::durable::Settle::Retry(_)));
+        assert_eq!(live.snapshot()["dead_letters_unrecorded"], 1);
+    }
+
+    /// Measurement, not a model of production SQL latency: the real
+    /// handle path pays its recording sink before settling the event.
+    #[tokio::test]
+    async fn measure_firing_record_cost_on_the_event_settlement_path() {
+        struct DelayedRecord {
+            calls: std::sync::atomic::AtomicUsize,
+            rows: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl FiringSink for DelayedRecord {
+            async fn record(&self, rows: &[Firing]) -> Result<(), String> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.rows
+                    .fetch_add(rows.len(), std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                Ok(())
+            }
+        }
+        let sink = Arc::new(DelayedRecord {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            rows: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut runner = runner_with(
+            vec![("h.perm", || Ok(())), ("h.trans", || Ok(()))],
+            TWO_HANDLER_RULES,
+        );
+        let live = Arc::new(crate::liveness::DispatcherLiveness::default());
+        runner.live = Some(live.clone());
+        runner.firings = Some(sink.clone());
+        let start = std::time::Instant::now();
+        futures::stream::iter(0..24)
+            .for_each_concurrent(MAX_CONCURRENT_EVENTS, |n| {
+                let runner = &runner;
+                async move {
+                    assert!(matches!(
+                        runner
+                            .handle(
+                                "step.done.x",
+                                &format!("measure-{n}"),
+                                &serde_json::json!({}),
+                                FIRST,
+                                None
+                            )
+                            .await,
+                        boss_nats::durable::Settle::Ack
+                    ));
+                }
+            })
+            .await;
+        let elapsed = start.elapsed();
+        assert_eq!(sink.calls.load(std::sync::atomic::Ordering::SeqCst), 24);
+        assert_eq!(sink.rows.load(std::sync::atomic::Ordering::SeqCst), 48);
+        assert!(elapsed >= std::time::Duration::from_millis(240));
+        println!(
+            "MEASURE events=24 matched_rules=48 handler_failures=0 record_calls=24 record_rows=48 injected_record_ms=120 concurrency={} elapsed_ns={} dedup_lookup_calls=0 (source path has no firing-dedup lookup; fixture latency is not production attribution)",
+            MAX_CONCURRENT_EVENTS,
+            elapsed.as_nanos()
+        );
+        assert_eq!(live.observation()["rules_phase_costs"]["events"], 24);
+        let costs = live.observation()["rules_phase_costs"].clone();
+        assert_eq!(costs["dispatch_calls"], 24);
+        assert_eq!(costs["record_calls"], 24);
+        assert_eq!(costs["record_rows_attempted"], 48);
+        assert!(
+            costs["record_nanos"].as_u64().unwrap() >= 24 * 120_000_000,
+            "summed completed recording work, not concurrent wall time: {costs}"
+        );
+    }
 
     /// Queue item 4 (HandlerError::Permanent): all-deterministic
     /// failures Term immediately; ANY transient in the mix NAKs so the
@@ -1429,6 +2043,7 @@ handler = "h.invoice"
     fn settle_name(s: &boss_nats::durable::Settle) -> &'static str {
         match s {
             boss_nats::durable::Settle::Ack => "Ack",
+            boss_nats::durable::Settle::Hold(_) => "Hold",
             boss_nats::durable::Settle::Retry(_) => "Retry",
             boss_nats::durable::Settle::Permanent(_) => "Permanent",
         }
@@ -1512,4 +2127,101 @@ on_event = "step.done.x"
 [[rule.do]]
 handler = "h.ok"
 "#;
+    struct UnknownDeliveryRoutes;
+    #[async_trait::async_trait]
+    impl super::super::delivery::DeliveryRoutes for UnknownDeliveryRoutes {
+        async fn permitted(
+            &self,
+            _names: &[String],
+            _position: Option<&super::super::delivery::Position>,
+        ) -> Result<std::collections::BTreeSet<String>, String> {
+            Err("authoritative cutover temporarily unavailable".into())
+        }
+    }
+    #[tokio::test]
+    async fn unknown_delivery_routes_hold_without_spending_handler_retry_budget() {
+        let mut runner = runner_with(vec![("h.ok", || Ok(()))], ONE_OK_RULE);
+        let ordinary = runner
+            .handle(
+                "step.done.x",
+                "evt-ordinary",
+                &serde_json::json!({}),
+                FIRST,
+                None,
+            )
+            .await;
+        assert_eq!(
+            settle_name(&ordinary),
+            "Ack",
+            "ordinary effects remain admitted"
+        );
+        runner.delivery_routes = Some(Arc::new(UnknownDeliveryRoutes));
+        for attempt in [FIRST, FINAL, FINAL + 1] {
+            let outcome = runner
+                .handle(
+                    "step.done.x",
+                    "evt-held",
+                    &serde_json::json!({}),
+                    attempt,
+                    None,
+                )
+                .await;
+            assert_eq!(
+                settle_name(&outcome),
+                "Hold",
+                "unknown routing is not a handler failure or a spent delivery attempt"
+            );
+        }
+    }
+
+    /// Longer than one request on a dark bus takes to give up: the
+    /// client's ten-second request timeout (the window car 2 measured,
+    /// `boss_nats::durable`'s `DARK_WINDOW`).
+    const DARK_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
+
+    /// Backlog 2e45840a, design ad9519bc car 3: an independent delivery
+    /// lane opened its consumer ONCE — `get_stream` then `get_consumer`
+    /// — and on a dark bus that one-shot read timed out and the lane's
+    /// task returned, so the lane's rules stayed off until a registry
+    /// reload. Car 2 gave the default consumer a capped-backoff open
+    /// and left this one; the control is car 2's
+    /// `a_one_shot_open_on_a_dark_bus_gives_up_inside_the_window`.
+    #[tokio::test]
+    async fn a_delivery_lane_on_a_dark_bus_waits_rather_than_giving_up() {
+        let dark = boss_testing::dark_port();
+        let bus = boss_nats::NatsEventBus::connect(&format!("nats://{}", dark.addr))
+            .await
+            .expect("a dark bus is not a connect error (car 1)");
+        let runner = runner_with(
+            vec![],
+            r#"
+[[rule]]
+name = "watch"
+on_event = "jobs.one"
+delivery_lane = "watch"
+[[rule.do]]
+handler = "h.mark"
+"#,
+        );
+        let lane = super::super::delivery::Cutover {
+            lane: "watch".into(),
+            consumer: "dispatcher-lane-watch".into(),
+            stream_created_ns: "0".into(),
+            consumer_created_ns: "0".into(),
+            created_at: "2026-11-10T00:00:00Z".into(),
+            after_stream_sequence: 0,
+            members: std::collections::BTreeMap::from([("watch".to_string(), 1)]),
+        };
+        let live = Arc::new(crate::liveness::DispatcherLiveness::default());
+        let ran = tokio::time::timeout(
+            DARK_WINDOW,
+            runner.run_delivery(bus.jetstream(), live, Some(lane)),
+        )
+        .await;
+        assert!(
+            ran.is_err(),
+            "nothing listens at {}; the lane must still be waiting for the bus, not answered: {ran:?}",
+            dark.addr
+        );
+    }
 }

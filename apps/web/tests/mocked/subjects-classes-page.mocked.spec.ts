@@ -1,4 +1,4 @@
-// /it/registry/subjects — WHAT EACH READ SAYS, answered or failed (page
+// /engineering/registry/subjects — WHAT EACH READ SAYS, answered or failed (page
 // audit 9f7ba57d, 2026-09-27).
 //
 // The page makes three reads and, until this spec, no spec asserted a
@@ -132,7 +132,7 @@ async function openSubjects(page: Page, reads: Reads = {}): Promise<void> {
           { kind: 'kettle-audit', status: 'retired', subject_kinds: ['asset'] },
         ])),
   );
-  await mountPage(page, '/it/registry/subjects');
+  await mountPage(page, '/engineering/registry/subjects');
 }
 
 const detail = (page: Page) => page.locator('.sc-detail');
@@ -140,7 +140,7 @@ const meta = (page: Page) => page.locator('.sc-meta');
 const pick = (page: Page, k: string) =>
   page.locator('.sc-kind', { has: page.locator('.sc-kind-code', { hasText: new RegExp(`^${k}\\b`) }) });
 
-test.describe('/it/registry/subjects says what each read found, or that it failed', () => {
+test.describe('/engineering/registry/subjects says what each read found, or that it failed', () => {
   test('control: every read answers — an empty kind says so, and no failure line shows', async ({ page }) => {
     await openSubjects(page);
     await expect(detail(page)).toContainText('No classes registered for person');
@@ -178,7 +178,7 @@ test.describe('/it/registry/subjects says what each read found, or that it faile
   });
 });
 
-test.describe('/it/registry/subjects names each kind by its module and the workflows that use it', () => {
+test.describe('/engineering/registry/subjects names each kind by its module and the workflows that use it', () => {
   test(`as live (manifest recorded ${LIVE_MANIFEST_RECORDED_AT}): asset reads its module, off here`, async ({ page }) => {
     expect(MODULES_LIVE['equipment']).toBe(false);
     await openSubjects(page, { modules: MODULES_LIVE });
@@ -233,8 +233,8 @@ test.describe('/it/registry/subjects names each kind by its module and the workf
 // are, and how many, beside those four — so the page cannot be read as
 // "this company has four departments", nor send anyone looking for
 // department Classes that retired.
-test.describe('/it/registry/subjects points the department kind at its registry', () => {
-  test("the department kind counts the registry's rows and links the Department Map", async ({ page }) => {
+test.describe('/engineering/registry/subjects points the department kind at its registry', () => {
+  test("the department kind counts the registry's rows and links the station tree", async ({ page }) => {
     await openSubjects(page);
     await pick(page, 'department').click();
 
@@ -242,9 +242,11 @@ test.describe('/it/registry/subjects points the department kind at its registry'
     await expect(meta(page)).toContainText(
       `${DEPARTMENTS.length} departments in the departments registry`,
     );
-    await expect(meta(page).getByRole('link', { name: 'Department Map' })).toHaveAttribute(
+    // The Department Map at /it drew the departments until design
+    // 01fa5bdf pulled it out; the station tree draws them now.
+    await expect(meta(page).getByRole('link', { name: 'Station tree' })).toHaveAttribute(
       'href',
-      '/it',
+      '/it/tree',
     );
   });
 
@@ -256,7 +258,7 @@ test.describe('/it/registry/subjects points the department kind at its registry'
 
     await expect(meta(page)).toContainText('department count unknown');
     await expect(meta(page)).not.toContainText('0 departments');
-    await expect(meta(page).getByRole('link', { name: 'Department Map' })).toBeVisible();
+    await expect(meta(page).getByRole('link', { name: 'Station tree' })).toBeVisible();
   });
 
   test('another kind carries no departments line', async ({ page }) => {

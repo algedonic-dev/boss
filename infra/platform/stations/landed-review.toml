@@ -16,14 +16,42 @@
 #
 # Declared here only — no migration ever seeded it (migrations declare
 # schema only since 2026-09-18). To change this station, bump `version`.
+#
+# Version 3 (item 0a78f8f8, factory taxonomy M2, 2026-11-03): kind
+# batch -> group, bumped from the LIVE newest (v2). The batch kind is
+# deleted; the reviewers who pay this debt are a set of actors, so the
+# row is a generic station. Nothing else changed.
+#
+# Version 4 (T2 of design 4b27a65a, backlog 3f58c823; bumped from the
+# LIVE newest, v3): the station stands in the tree — its stable `id`, its
+# `parent` /algedonic/executive (proposal section 6: landed-review is a
+# human step), its mode. Nothing else changed.
+#
+# Version 5 (design c0ae096f section 2, car 1, backlog 599fec3e; bumped
+# from the LIVE newest, v4): the queue moves from executive to
+# /algedonic/engineering/review, because agents now pay this debt and it
+# is no longer a human step — one `parent` edit. The retired department
+# label is removed with its floor reader (backlog aa82eb11).
+#
+# Version 6 (backlog a1c0a0ff, design deba3000; bumped from the tree's
+# v5): the hand-typed `[station.upstream]` is gone. It named a /system
+# route the IT consolidation retired on 2026-08-31, so the walk upstream
+# led to a not-found page. A station's upstream is now DERIVED from the
+# tree, as its parent station's page (`upstreamOf` in
+# apps/web/src/it/tree/station-page.ts), and the seed refuses a declared
+# one. The retired department label is removed with its floor reader
+# (backlog aa82eb11); the station's parent places it in the tree.
 # ---------------------------------------------------------------------------
 
 [[station]]
 name = "landed-review"
-version = 1
+version = 7
+id = "f675e19a-7c36-453f-bbac-e206aced63ab"
+parent = "9deb0155-9804-4488-a043-14add3a8c5be"
+mode = "standing"
 status = "active"
 title = "Landed cars that owe their review"
-kind = "batch"
+kind = "group"
 discipline = ["age"]
 
 [station.predicate]
@@ -33,7 +61,3 @@ status = "open"
 [station.predicate.step]
 slug = "landed-review"
 status_in = ["ready", "active"]
-
-[station.upstream]
-label = "THE YARD"
-href = "/system/yard"

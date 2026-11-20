@@ -235,8 +235,15 @@ async fn stats(State(state): State<AuditTailState>, CurrentUser(user): CurrentUs
     }
 }
 
-async fn events_health() -> Response {
-    Json(serde_json::json!({"status": "ok"})).into_response()
+/// The shared health body, so the read names the build that answered
+/// (backlog 56f88ada). The tail reads `audit_log` through its pool, so
+/// its storage is always postgres.
+async fn events_health() -> Json<boss_core::startup::HealthResponse> {
+    Json(boss_core::startup::health_response(
+        "boss-events-api",
+        env!("CARGO_PKG_VERSION"),
+        "postgres",
+    ))
 }
 
 /// Recent rows of ONE exact kind, newest first — the crate-level read
@@ -285,18 +292,19 @@ pub async fn recent_by_kind(
     window: &KindWindow<'_>,
     limit: i64,
 ) -> Result<KindPage, String> {
-    // `$5` is the host (backlog 111996f5): a row's `host` stamp, or, on
-    // a row with none — every estate observation — its first node's id.
-    const WHERE: &str = "WHERE kind = $1 \
+    // `$5` is the host (backlog 111996f5), read as [`ROW_HOST`].
+    let filter = format!(
+        "WHERE kind = $1 \
          AND ($2::text IS NULL OR payload->>'scope' = $2) \
          AND ($3::timestamptz IS NULL OR timestamp >= $3) \
          AND ($4::timestamptz IS NULL OR timestamp < $4) \
-         AND ($5::text IS NULL OR COALESCE(payload->>'host', payload->'nodes'->0->>'id') = $5)";
+         AND ($5::text IS NULL OR {ROW_HOST} = $5)"
+    );
     if let Some(key) = window.latest_per {
-        return newest_per_key(pool, kind, window, key, WHERE, limit).await;
+        return newest_per_key(pool, kind, window, key, &filter, limit).await;
     }
     let rows = sqlx::query_as::<_, AuditEntry>(&format!(
-        "SELECT event_id, timestamp, source, kind, payload FROM audit_log {WHERE} \
+        "SELECT event_id, timestamp, source, kind, payload FROM audit_log {filter} \
          ORDER BY timestamp DESC LIMIT $6"
     ))
     .bind(kind)
@@ -309,7 +317,7 @@ pub async fn recent_by_kind(
     .await
     .map_err(|e| e.to_string())?;
     let (total,): (i64,) =
-        sqlx::query_as(&format!("SELECT COUNT(*)::BIGINT FROM audit_log {WHERE}"))
+        sqlx::query_as(&format!("SELECT COUNT(*)::BIGINT FROM audit_log {filter}"))
             .bind(kind)
             .bind(window.scope)
             .bind(window.since)
@@ -336,6 +344,9 @@ pub async fn recent_by_kind(
 /// `COUNT(*)` over `SELECT DISTINCT` counts a row with no such key as
 /// one group, exactly as `DISTINCT ON` returns one row for it — so
 /// rows == total is a whole answer and rows < total a truncated one.
+///
+/// The group is [`group_by`]'s, so `host` groups by [`ROW_HOST`] and an
+/// observation is its first node's row, not the NULL group's (4579f9b5).
 async fn newest_per_key(
     pool: &PgPool,
     kind: &str,
@@ -344,11 +355,12 @@ async fn newest_per_key(
     filter: &str,
     limit: i64,
 ) -> Result<KindPage, String> {
+    let group = group_by("$7");
     let rows = sqlx::query_as::<_, AuditEntry>(&format!(
         "SELECT event_id, timestamp, source, kind, payload FROM ( \
-           SELECT DISTINCT ON (payload->>$7::text) event_id, timestamp, source, kind, payload \
+           SELECT DISTINCT ON ({group}) event_id, timestamp, source, kind, payload \
            FROM audit_log {filter} \
-           ORDER BY payload->>$7::text, timestamp DESC, event_id DESC \
+           ORDER BY {group}, timestamp DESC, event_id DESC \
          ) newest ORDER BY timestamp DESC, event_id DESC LIMIT $6"
     ))
     .bind(kind)
@@ -362,7 +374,8 @@ async fn newest_per_key(
     .await
     .map_err(|e| e.to_string())?;
     let (total,): (i64,) = sqlx::query_as(&format!(
-        "SELECT COUNT(*)::BIGINT FROM (SELECT DISTINCT payload->>$6::text FROM audit_log {filter}) groups"
+        "SELECT COUNT(*)::BIGINT FROM (SELECT DISTINCT {} FROM audit_log {filter}) groups",
+        group_by("$6")
     ))
     .bind(kind)
     .bind(window.scope)
@@ -376,13 +389,33 @@ async fn newest_per_key(
     Ok(KindPage { rows, total })
 }
 
+/// A row's host, as every read of [`recent_by_kind`] takes it: its
+/// `host` stamp, or, on a row with none — every estate observation —
+/// its first node's id, the identity compare_host stamps a comparison
+/// from (111996f5). ONE expression for the `host` filter and the
+/// `latest_per=host` group, because the two disagreed: the filter fell
+/// back to the node and the group read the bare key, so
+/// `/api/estate/observations?scope=host&latest_per=host` put every
+/// observation in the one NULL group and answered total 1 for a two-host
+/// estate while comparisons answered 2 (backlog 4579f9b5, measured
+/// 2026-09-26 and still so 2026-11-19).
+const ROW_HOST: &str = "COALESCE(payload->>'host', payload->'nodes'->0->>'id')";
+
+/// What `latest_per` groups by, `param` naming the bind that carries the
+/// key: the payload's own top-level key, except `host`, which is
+/// [`ROW_HOST`]. The key stays a bind, never spliced into the SQL.
+fn group_by(param: &str) -> String {
+    format!("(CASE WHEN {param}::text = 'host' THEN {ROW_HOST} ELSE payload->>{param}::text END)")
+}
+
 /// Which rows of one kind [`recent_by_kind`] reads: an exact payload
 /// `scope`, and a half-open `[since, until)` window on `timestamp`.
 /// Every field absent reads the whole kind. `latest_per`, a top-level
 /// payload key, reduces the window to the newest row per distinct
-/// value of that key (backlog 725532ab). `host` selects one host's
-/// series — the payload's `host`, or its first node's `id` on a row
-/// with no `host` stamp, as every estate observation is (111996f5).
+/// value of that key (backlog 725532ab); `latest_per=host` groups by
+/// the row's host as `host` reads it (4579f9b5). `host` selects one
+/// host's series — the payload's `host`, or its first node's `id` on a
+/// row with no `host` stamp, as every estate observation is (111996f5).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KindWindow<'a> {
     pub scope: Option<&'a str>,
@@ -438,16 +471,46 @@ pub struct StepFlowRow {
 /// have to come from the projection. DISTINCT on the step id, because
 /// a step re-promoted to ready records a second event and is still one
 /// obligation.
+///
+/// ITS ONE READER is `GET /api/stations/flow?basis=step-events`. The IT
+/// map counted this cube over two windows in one statement (backlog
+/// 29f7e897) until item ab09f1af's car 2 (2026-10-20) moved it onto the
+/// packet-membership basis; the two-window statement went with it.
 pub async fn step_flow_cube(
     pool: &PgPool,
     since: DateTime<Utc>,
 ) -> Result<Vec<StepFlowRow>, String> {
-    sqlx::query_as::<_, StepFlowRow>(
-        "WITH win AS (
-             SELECT payload->>'step_id' AS sid,
+    sqlx::query_as::<_, StepFlowRow>(STEP_FLOW_CUBE_SQL)
+        .bind(since)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The statement [`step_flow_cube`] runs, `$1` the window's opening
+/// instant — public so its plan can be pinned against a real database
+/// (boss-jobs `station_flow_pg`).
+///
+/// THE WINDOW'S STEP ID IS READ AS A UUID, so `steps` is probed by its
+/// primary key once per window row. It was joined as
+/// `s.id::text = sid` until backlog 17959b76 (2026-10-17), and no index
+/// can answer a cast of the key: every execution read, joined and sorted
+/// every step and job however short the window — measured live at ~25
+/// executions a minute, up to 51.9 s each, beside stalled job reads and
+/// COMMITs. Only the canonical spelling is cast — the one
+/// `s.id::text` produces — and anything else becomes NULL and joins
+/// nothing, so an upper-case or malformed id in the log counts nothing
+/// and refuses nothing, exactly as under the text join (a bare `::uuid`
+/// would fail the whole read on one malformed payload). `CASE` because
+/// it is the one construct that orders the test before the cast.
+pub const STEP_FLOW_CUBE_SQL: &str = "WITH win AS (
+             SELECT CASE WHEN payload->>'step_id'
+                              ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                         THEN (payload->>'step_id')::uuid
+                    END AS sid,
                     kind LIKE 'step.ready.%' AS is_arrival
              FROM audit_log
-             WHERE created_at > $1
+             WHERE created_at > $1::timestamptz
                AND (kind LIKE 'step.ready.%' OR kind LIKE 'step.done.%')
                AND payload->>'step_id' IS NOT NULL
          )
@@ -458,15 +521,9 @@ pub async fn step_flow_cube(
                 COUNT(DISTINCT win.sid) FILTER (WHERE win.is_arrival)::BIGINT AS arrived,
                 COUNT(DISTINCT win.sid) FILTER (WHERE NOT win.is_arrival)::BIGINT AS served
          FROM win
-         JOIN steps s ON s.id::text = win.sid
+         JOIN steps s ON s.id = win.sid
          JOIN jobs j ON j.id = s.job_id
-         GROUP BY 1, 2, 3, 4",
-    )
-    .bind(since)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())
-}
+         GROUP BY 1, 2, 3, 4";
 
 /// The log's head: its highest id, 0 on an empty log. The one read the
 /// yard's mover (boss-jobs `moves`, design e765b3fc §3) takes on a quiet

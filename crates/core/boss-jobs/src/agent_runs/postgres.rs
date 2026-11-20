@@ -159,19 +159,18 @@ pub(super) fn row_to_run(row: &sqlx::postgres::PgRow) -> Result<AgentRun, AgentR
     })
 }
 
-/// The columns of an `agents` row the recorder reads. Both caps are
-/// nullable there (20260915212644: NULL is "no cap declared") and stay
-/// `None` here, which `admit` reads as unbudgeted.
+/// The columns of an `agents` row the recorder reads. The hourly cap is
+/// nullable there (20260915212644: NULL is "no cap declared") and stays
+/// `None` here, which `admit` reads as unbudgeted. `max_concurrent_runs`
+/// is not read: the per-actor run cap is retired (backlog 3e927996).
 fn agent_row(row: &sqlx::postgres::PgRow) -> Result<RegisteredAgent, AgentRunError> {
     let hourly: Option<i64> = row.try_get("hourly_budget_usd_micros").map_err(storage)?;
-    let concurrent: Option<i32> = row.try_get("max_concurrent_runs").map_err(storage)?;
     Ok(RegisteredAgent {
         default_model: row.try_get("default_model").map_err(storage)?,
         caps: AgentCaps {
             // The table's CHECK refuses a negative, so the conversion
             // cannot fail on a row it admitted.
             hourly_budget_usd_micros: hourly.map(|v| u64::try_from(v).unwrap_or(0)),
-            max_concurrent_runs: concurrent.map(|v| u32::try_from(v).unwrap_or(0)),
         },
     })
 }
@@ -284,8 +283,7 @@ impl AgentRunLog for PgAgentRuns {
         // caps, and the lookup is skipped.
         let agent: Option<RegisteredAgent> = match &run.actor_id {
             ActorId::RegisteredAgent(id) => sqlx::query(
-                "SELECT default_model, hourly_budget_usd_micros, max_concurrent_runs \
-                 FROM agents WHERE id = $1",
+                "SELECT default_model, hourly_budget_usd_micros FROM agents WHERE id = $1",
             )
             .bind(id)
             .fetch_optional(&mut *tx)
@@ -453,6 +451,27 @@ impl AgentRunLog for PgAgentRuns {
         .await
         .map_err(storage)?;
         Ok(u64::try_from(n).unwrap_or(0))
+    }
+
+    async fn job_kinds(
+        &self,
+        job_ids: &[uuid::Uuid],
+    ) -> Result<std::collections::HashMap<uuid::Uuid, String>, AgentRunError> {
+        // No ids, no read: `= ANY('{}')` would answer nothing anyway.
+        if job_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        // `jobs` is this service's own table, in the same database the
+        // run log lives in; the read takes one column and never joins,
+        // so a run naming a packet the table does not hold is absent
+        // here and bucketed by the caller, not dropped.
+        let rows: Vec<(uuid::Uuid, String)> =
+            sqlx::query_as("SELECT id, kind FROM jobs WHERE id = ANY($1)")
+                .bind(job_ids)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(storage)?;
+        Ok(rows.into_iter().collect())
     }
 
     async fn rate_card(&self) -> Result<Vec<RateCardRow>, AgentRunError> {

@@ -14,7 +14,7 @@ test.beforeEach(async ({ page }) => {
 
 test.describe('Admin new job kind — name-it entry', () => {
   test('identity fields render and persist input', async ({ page }) => {
-    await mountPage(page, '/it/registry/new');
+    await mountPage(page, '/engineering/registry/new');
 
     const slug = page.getByPlaceholder('seasonal-release', { exact: true });
     await slug.fill(KIND_SLUG);
@@ -33,7 +33,7 @@ test.describe('Admin new job kind — name-it entry', () => {
   });
 
   test('subject-kind checkboxes toggle', async ({ page }) => {
-    await mountPage(page, '/it/registry/new');
+    await mountPage(page, '/engineering/registry/new');
     // Named subject kind rather than `.first()`: the checkboxes are
     // already wrapped in real <label> elements, so the accessible name
     // is a stable handle, and the assertion now says which box it
@@ -45,7 +45,7 @@ test.describe('Admin new job kind — name-it entry', () => {
   });
 
   test('Create & author → creates the design Job and opens the workspace', async ({ page }) => {
-    await mountPage(page, '/it/registry/new');
+    await mountPage(page, '/engineering/registry/new');
 
     await page.getByPlaceholder('seasonal-release', { exact: true }).fill(KIND_SLUG);
     await page
@@ -56,7 +56,7 @@ test.describe('Admin new job kind — name-it entry', () => {
     await expect(create).toBeEnabled();
 
     await Promise.all([
-      page.waitForURL(new RegExp(`/it/registry/authoring/${JOB_ID}`)),
+      page.waitForURL(new RegExp(`/engineering/registry/authoring/${JOB_ID}`)),
       create.click(),
     ]);
     // Landed on the workspace for the new design Job. Its h1 paints only
@@ -79,7 +79,7 @@ test.describe('Admin new job kind — a failed suggestion read says so', () => {
 
   test('a refused /api/workflows names itself and the Category list it empties', async ({ page }) => {
     await page.route('**/api/workflows', refused);
-    await mountPage(page, '/it/registry/new');
+    await mountPage(page, '/engineering/registry/new');
 
     await expect(page.locator(FAILURE_MARKER)).toHaveText([
       "Couldn't load the existing job kinds — /api/workflows: HTTP 500. Category has no suggestions; type one.",
@@ -89,7 +89,7 @@ test.describe('Admin new job kind — a failed suggestion read says so', () => {
 
   test('a refused /api/subject-kinds names itself and says only the built-in kinds are offered', async ({ page }) => {
     await page.route('**/api/subject-kinds', refused);
-    await mountPage(page, '/it/registry/new');
+    await mountPage(page, '/engineering/registry/new');
 
     await expect(page.locator(FAILURE_MARKER)).toHaveText([
       "Couldn't load subject kinds — /api/subject-kinds: HTTP 500. Only the built-in subject kinds are listed below.",
@@ -99,7 +99,7 @@ test.describe('Admin new job kind — a failed suggestion read says so', () => {
 
   test('an unreachable /api/workflows is named too, not swallowed', async ({ page }) => {
     await page.route('**/api/workflows', (r) => r.abort('connectionrefused'));
-    await mountPage(page, '/it/registry/new');
+    await mountPage(page, '/engineering/registry/new');
 
     await expect(page.locator(FAILURE_MARKER)).toHaveText([
       /Couldn't load the existing job kinds — \/api\/workflows: .+\. Category has no suggestions; type one\./,
@@ -107,7 +107,7 @@ test.describe('Admin new job kind — a failed suggestion read says so', () => {
   });
 
   test('both reads answering paint no failure line', async ({ page }) => {
-    await mountPage(page, '/it/registry/new');
+    await mountPage(page, '/engineering/registry/new');
     await expect(page.getByLabel('account', { exact: true })).toBeVisible();
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
   });

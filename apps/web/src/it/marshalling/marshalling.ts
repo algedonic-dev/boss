@@ -11,9 +11,10 @@
 // drain rate — ten role queues each read exactly 48 the day this was
 // written and none was a bottleneck, they were a bug."* Forming is a
 // rate question, so this module joins depth against
-// `GET /api/stations/flow` — arrivals and departures over a wall-clock
-// window, reconstructed from conserved original packet membership.
-// Departures include nonservice causes; served counts completed work.
+// `GET /api/stations/flow` — arrivals and departures over a window,
+// counted from each step's own stamps (`step-window-v1`, design
+// 7b8ed079): an arrival is a step that became ready at the station, a
+// departure a step that completed there, which is what it served.
 // Legacy step-events remain a separately labelled unit. It derives how long this
 // queue would take to clear at the rate it is actually being worked.
 //
@@ -35,20 +36,17 @@ import { partitionOf, type Partition } from '@boss/web-kit/ui/packet-card';
 
 export type StationLoadRow = Readonly<{
   station: string;
-  /** The STATION kind — batch, constraint, actor — not a Workflow kind. */
+  /** The STATION kind — equipment, constraint, actor — not a Workflow kind. */
   kind: string;
   /** The Workflow kind the station's predicate holds; `null` when the
    *  predicate spans kinds, or from a server that predates it. What a
    *  siding links to the per-kind Bottlenecks drill-down (c7c5c1de). */
   workflowKind: string | null;
   depth: number;
-  wipLimit: number | null;
-  overLimit: boolean;
   /** Age of the oldest MEMBER PACKET, from its `opened_on` — packet
    *  age, not time-in-this-queue, which is what the server documents
    *  it to be. Over-reports rather than under-reports. */
   oldestAgeDays: number | null;
-  capabilityRoles: ReadonlyArray<string> | null;
   /** Members that also stand at another station in the same read.
    *  `null` from a server that does not count it — unknown, not none. */
   alsoElsewhere: number | null;
@@ -63,10 +61,14 @@ export type StationLoadEnvelope = Readonly<{
   distinctPackets: number | null;
 }>;
 
+/** The two bases a counted flow row can carry: the step stamps (the
+ *  server's default) and the legacy distinct-step cube. */
+export type FlowBasis = 'step-window-v1' | 'step-events';
+
 /** What the log could be made to say about one station's flow. */
 export type StationFlowRow = Readonly<{
   station: string;
-  basis: 'packet-membership-v1' | 'step-events' | 'unavailable';
+  basis: FlowBasis | 'unavailable';
   arrived: number | null;
   departed: number | null;
   served: number | null;
@@ -103,12 +105,7 @@ export function parseStationLoad(raw: unknown): ReadonlyArray<StationLoadRow> {
       kind: str(r.kind) ?? '',
       workflowKind: str(r.workflow_kind),
       depth: num(r.depth) ?? 0,
-      wipLimit: num(r.wip_limit),
-      overLimit: r.over_limit === true,
       oldestAgeDays: num(r.oldest_age_days),
-      capabilityRoles: Array.isArray(r.capability_roles)
-        ? (r.capability_roles.filter((x) => typeof x === 'string') as ReadonlyArray<string>)
-        : null,
       alsoElsewhere: num(r.also_elsewhere),
     }))
     .filter((r) => r.station !== '');
@@ -162,23 +159,25 @@ export function parseStationFlow(raw: unknown): StationFlowEnvelope {
   return {
     rows: data
       .map((r): StationFlowRow => {
-        const packet = r.basis === 'packet-membership-v1';
-        const legacy = r.basis === 'step-events';
+        // The replay's `packet-membership-v1` retired with design
+        // 7b8ed079 car 1; a row on any basis but these two is not a
+        // count this board knows how to read, so it is not one.
+        const basis: FlowBasis | null =
+          r.basis === 'step-window-v1' ? 'step-window-v1' : r.basis === 'step-events' ? 'step-events' : null;
         const arrived = count(r.arrived);
         const served = count(r.served);
-        const departed = packet ? count(r.departed) : legacy ? served : null;
-        const complete =
-          (packet || legacy) && arrived !== null && served !== null && departed !== null &&
-          (!packet || (Array.isArray(r.unknown) && r.unknown.length === 0));
+        // The legacy cube names no departures: what it served left.
+        const departed = basis === 'step-window-v1' ? count(r.departed) : basis ? served : null;
+        const complete = basis !== null && arrived !== null && served !== null && departed !== null;
         return {
           station: str(r.station) ?? '',
-          basis: complete ? (packet ? 'packet-membership-v1' : 'step-events') : 'unavailable',
+          basis: complete ? basis : 'unavailable',
           arrived,
           departed,
           served,
           net: complete ? arrived - departed : null,
           unavailableReason: str(r.unavailable_reason) ??
-            (complete ? null : 'flow basis, counts or original coverage are incomplete'),
+            (complete ? null : 'the flow basis or its counts are incomplete'),
         };
       })
       .filter((r) => r.station !== ''),
@@ -193,7 +192,7 @@ export function parseStationFlow(raw: unknown): StationFlowEnvelope {
 
 /** A queue's flow, or the honest reason there is none to show. */
 export type SidingFlow =
-  | { readonly kind: 'counted'; readonly basis?: 'packet-membership-v1' | 'step-events'; readonly departed?: number; readonly arrived: number; readonly served: number; readonly net: number }
+  | { readonly kind: 'counted'; readonly basis?: FlowBasis; readonly departed?: number; readonly arrived: number; readonly served: number; readonly net: number }
   | { readonly kind: 'unavailable'; readonly reason: string };
 
 export type Siding = Readonly<{
@@ -201,10 +200,7 @@ export type Siding = Readonly<{
   kind: string;
   workflowKind: string | null;
   depth: number;
-  wipLimit: number | null;
-  overLimit: boolean;
   oldestAgeDays: number | null;
-  capabilityRoles: ReadonlyArray<string> | null;
   flow: SidingFlow;
 }>;
 
@@ -235,14 +231,11 @@ export function joinSidings(
       kind: l.kind,
       workflowKind: l.workflowKind,
       depth: l.depth,
-      wipLimit: l.wipLimit,
-      overLimit: l.overLimit,
       oldestAgeDays: l.oldestAgeDays,
-      capabilityRoles: l.capabilityRoles,
       flow: counted
         ? {
             kind: 'counted',
-            basis: f!.basis as 'packet-membership-v1' | 'step-events',
+            basis: f!.basis as FlowBasis,
             departed: f!.departed!,
             arrived: f!.arrived!,
             served: f!.served!,
@@ -351,10 +344,7 @@ export function constraintOf(
   const arrived = worst.flow.kind === 'counted' ? worst.flow.arrived : 0;
   const hours = drainHours(worst.depth, served, windowHours);
   const because =
-    worst.flow.kind === 'counted' && worst.flow.basis === 'packet-membership-v1'
-      ? `${worst.depth} waiting, ${arrived} arrived, ${worst.flow.departed} departed and ${served} served in the last ${windowHours}h. ` +
-        (hours === null ? 'No completed-work service rate was recorded.' : `${hours.toFixed(0)}h to clear at the recorded service rate.`)
-      : hours === null
+    hours === null
       ? `${worst.depth} waiting, ${arrived} arrived and nothing left in the last ` +
         `${windowHours}h — this queue is not draining, so it clears at no rate at all.`
       : `${worst.depth} waiting against ${served} served in the last ${windowHours}h: ` +
@@ -417,12 +407,6 @@ export function whyNotMoving(s: Siding, windowHours: number): string {
       : `${s.depth} waiting; rate not counted — ${s.flow.reason}.`;
   }
   const { arrived, served, net } = s.flow;
-  if (s.flow.basis === 'packet-membership-v1') {
-    const departed = s.flow.departed!;
-    return `${s.depth} waiting; ${arrived} arrived, ${departed} departed, ${served} served in the last ${windowHours}h. ` +
-      (served === 0 ? 'No completed-work service was recorded; departures can have other causes.' :
-        `At that service rate: ${drainHours(s.depth, served, windowHours)?.toFixed(0)}h to clear.`);
-  }
   if (s.depth === 0) {
     return served > 0
       ? `Clear — ${served} served in the last ${windowHours}h.`

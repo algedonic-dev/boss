@@ -1,0 +1,20 @@
+{
+  "about": "READ-ONLY: one Longhorn setting, named from a fixed allow-list — the value it stands at and Longhorn's own definition of it (infra/forge/longhorn-setting.sh <setting>; backlog e14a472d, review 0e863731). WHY: before node-converge tags w-1 and w-2 dev-build for the dev-build workers' class (option C), allow-empty-node-selector-volume must be READ, because when it is false a tagged node takes no replica of a volume whose class names no selector (/work, the gate disk); the tree never sets it and a default is not a reading. And allow-empty-disk-selector-volume is the same question one level down (backlog 46328c3a, design 3c475a19 D2): when it is false a tagged disk takes no replica of a volume with no disk selector, which is every durable volume today — so it says whether w-1's scratch disk, tagged `scratch`, is closed to durable replicas or only watched for them, and it must read true before any default disk is tagged `durable`. The param is one_of the script's own ALLOWED list (held equal by crates/core/boss-testing/tests/read_longhorn_setting_sh.rs); any other word is refused before a door opens. Through the forge's ops_kubectl door, kubectl get only: the stored settings.longhorn.io object, and Longhorn's definition from its manager API through the API server's service proxy, as check-longhorn-drain-policy reads node-drain-policy's — the default is read, never typed here. Its last line is the verdict `READ — <setting> <value>, default <default>, non_default <0|1>`. A read that could not look, a definition without a default, or a stored value Longhorn's API disagrees with is CANNOT ANSWER (exit 1). Timeout 120: two reads at 20 s each and, the first time, the door image's pull.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/longhorn-setting.sh",
+    "{1}"
+  ],
+  "params": [
+    {
+      "name": "setting",
+      "one_of": [
+        "allow-empty-node-selector-volume",
+        "allow-empty-disk-selector-volume"
+      ]
+    }
+  ],
+  "timeout": 120
+}

@@ -64,8 +64,13 @@ spec:
       backoffLimit: 0
       # The push is bounded at 60 s inside the script (BOSS_PUSH_TIMEOUT_S)
       # and the chore pair's two writes at their own; this ends only what
-      # is wedged, and the pod's memory scratch goes with it.
-      activeDeadlineSeconds: 240
+      # is wedged, and the pod's memory scratch goes with it. It was 240
+      # until the packet open took three attempts, whose worst case is
+      # about 278 s before the push starts (review 0aced427): it must be
+      # that open plus the container's BOSS_ACT_BOUND_S, which
+      # every_maintenance_wrap_caller_retries_its_open.rs holds, and stay
+      # under the ten-minute schedule.
+      activeDeadlineSeconds: 420
       ttlSecondsAfterFinished: 3600
       template:
         metadata:
@@ -106,6 +111,23 @@ spec:
                   value: "1"
                 - name: BOSS_JOBS_URL
                   value: http://boss-jobs-internal.boss.svc.cluster.local:7900
+                # The packet open tries 3 times, not the wrap's default 1
+                # (backlog a2ae9f39: one failed read lost the backup's
+                # packet on 10-26 and 10-27). Pinned by
+                # every_maintenance_wrap_caller_retries_its_open.rs.
+                - name: BOSS_WRAP_OPEN_RETRY
+                  value: "3"
+                # THE ACT'S OWN BOUND, in seconds: how long this container
+                # still runs once the wrap's open returns. A declaration,
+                # read by every_maintenance_wrap_caller_retries_its_open.rs
+                # and by no process: that pin refuses an
+                # activeDeadlineSeconds below the wrap's worst-case open at
+                # three attempts plus this (review 0aced427). The push is
+                # SHIP_TIMEOUT_S (60 s, BOSS_PUSH_TIMEOUT_S) under
+                # `timeout -k 5` in infra/cluster/machine-token-push.sh,
+                # and its greeting wait runs inside that.
+                - name: BOSS_ACT_BOUND_S
+                  value: "65"
                 # The hosts its packet writes may carry the estate machine
                 # token to, besides loopback: this namespace's Services, by
                 # suffix (backlog 2ee29275). boss-gcp is NOT one of them:

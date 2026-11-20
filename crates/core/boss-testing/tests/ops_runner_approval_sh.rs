@@ -114,6 +114,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// value as its `code` — the step race lost once (car 88123ae0).
 /// `STUB_REFUSE_URL` answers 403 to every write whose url ends with it —
 /// the `written_by` refusal (backlog aa816dd4).
+/// `STUB_ASSIGN_REFUSAL` is a person's assignment landing after the
+/// runner's read (review R1 of car 91c8e709): a step PUT asking for an
+/// `automatic_assignment` is answered 409 with that value as its body,
+/// as the server's `assignment_refusal` answers it, and a PUT without
+/// the flag is answered 200, as the server answers it — replacing that
+/// person.
 ///
 /// THE CLAIM DOOR JUDGES THE HOLDER THE WAY THE SERVER DOES (re-review of
 /// 2026-09-25). This stub used to answer every claim 200, so the happy
@@ -158,6 +164,10 @@ if [ -n "${STUB_RACE_ONCE:-}" ] && [ "$m" = PUT ] && [ ! -e "$STUB_DIR/raced" ];
     : > "$STUB_DIR/raced"; code=409
     said=$(jq -cn --arg c "$STUB_RACE_ONCE" '{error: "the stub lost a step race", code: $c}')
 fi
+if [ -n "${STUB_ASSIGN_REFUSAL:-}" ] && [ "$m" = PUT ] \
+    && [ "$(printf '%s' "$b" | jq -r '.automatic_assignment? == true')" = true ]; then
+    code=409; said=$STUB_ASSIGN_REFUSAL
+fi
 case "$url" in
     */claim)
         if [ -n "${STUB_REFUSE_CLAIM:-}" ]; then code=409
@@ -190,6 +200,14 @@ exit 0
 /// refuses when `PLAN_REFUSE` is set, or renders `PLAN_OVERRIDE`'s
 /// bytes instead — the state having moved); `wipe` records the argv it
 /// was given and how many writes the runner had made before it ran.
+/// `plan-wipe` also counts its calls in `plan-calls`, fails its first
+/// `PLAN_FAIL_TIMES` calls with exit 78 and no `plan-sha256:` — 2,500
+/// bytes of stderr and then a line naming the call, the shape of the
+/// transient refusal of 2026-10-28 (backlog 05d7c0b9) — and exits
+/// `PLAN_EXIT` after printing a plan and its hash. Every call first
+/// prints `PLAN_CONTEXT_FILE`'s bytes on stderr when it is set: the
+/// volatile figures a real plan verb keeps out of the signed bytes
+/// (backlog 204e27ba).
 struct Fixture {
     root: PathBuf,
     verbs: PathBuf,
@@ -207,12 +225,20 @@ impl Fixture {
             &plan_sh,
             &format!(
                 "#!/bin/sh\n\
+                 n=$(cat \"{root}/plan-calls\" 2>/dev/null || echo 0); n=$((n + 1)); echo \"$n\" > \"{root}/plan-calls\"\n\
+                 if [ -n \"${{PLAN_CONTEXT_FILE:-}}\" ]; then cat \"$PLAN_CONTEXT_FILE\" >&2; fi\n\
+                 if [ -n \"${{PLAN_FAIL_TIMES:-}}\" ] && [ \"$n\" -le \"$PLAN_FAIL_TIMES\" ]; then\n\
+                     head -c 2500 /dev/zero | tr '\\000' x >&2; echo >&2\n\
+                     echo \"plan-wipe: CANNOT ANSWER — transient read failure $n\" >&2; exit 78\n\
+                 fi\n\
                  if [ -n \"${{PLAN_REFUSE:-}}\" ]; then echo \"plan-wipe: REFUSED — $PLAN_REFUSE\" >&2; exit 78; fi\n\
                  p=\"{plan}\"\n\
                  if [ -n \"${{PLAN_OVERRIDE:-}}\" ]; then p=\"$PLAN_OVERRIDE\"; fi\n\
                  cat \"$p\"\n\
-                 echo \"plan-sha256: $(sha256sum \"$p\" | cut -d' ' -f1)\" >&2\n",
-                plan = root.join("plan.txt").display()
+                 echo \"plan-sha256: $(sha256sum \"$p\" | cut -d' ' -f1)\" >&2\n\
+                 if [ -n \"${{PLAN_EXIT:-}}\" ]; then exit \"$PLAN_EXIT\"; fi\n",
+                plan = root.join("plan.txt").display(),
+                root = root.display()
             ),
         );
         let apply_sh = root.join("apply.sh");
@@ -282,6 +308,7 @@ impl Fixture {
     fn run(&self, env: &[(&str, &str)]) -> (String, Vec<Value>) {
         let _ = std::fs::remove_file(self.root.join("writes.jsonl"));
         let _ = std::fs::remove_file(self.root.join("raced"));
+        let _ = std::fs::remove_file(self.root.join("plan-calls"));
         std::fs::write(self.root.join("writes.jsonl"), "").unwrap();
         let _ = std::fs::remove_file(self.root.join("applied.args"));
         let path = format!(
@@ -313,6 +340,13 @@ impl Fixture {
             .map(|l| serde_json::from_str(l).expect("a logged write is JSON"))
             .collect();
         (text, writes)
+    }
+
+    /// How many times the plan verb ran in the last `run`.
+    fn plan_calls(&self) -> usize {
+        std::fs::read_to_string(self.root.join("plan-calls"))
+            .map(|s| s.trim().parse().expect("plan-calls is a count"))
+            .unwrap_or(0)
     }
 
     /// The argv the write verb ran with, or None when it never ran.
@@ -596,6 +630,223 @@ fn a_ready_approve_step_gets_the_plan_verbs_bytes() {
         out.contains(&sha256_hex(PLAN.as_bytes())),
         "the journal names the hash the passkey will be asked to sign: {out}"
     );
+}
+
+// THE FIGURES BEHIND THE VERDICTS REACH THE APPROVER (backlog 204e27ba,
+// finding N1 of the review of car 7ea1937e). Ten plan verbs print their
+// volatile figures on stderr, off the signed bytes, and the runner kept
+// only the `plan-sha256:` line of it: ops-request 07b03e32's approve step
+// held no stderr, and its chore's last schedule reached the record only at
+// execute, after the decision. Where the request's row reserves
+// `plan_stderr` to this runner, the whole stderr now rides the plan's own
+// patch — inside the shape the passkey signs, outside the plan hash.
+
+/// The approve step as a row declaring `plan_stderr` materialises it: the
+/// field, with the writer `writer` names (None for no writer).
+fn declaring_plan_stderr(mut j: Value, writer: Option<&str>) -> Value {
+    let mut field = json!({"name": "plan_stderr", "field_type": "string", "required": false});
+    if let Some(w) = writer {
+        field["writer"] = json!(w);
+    }
+    j["steps"][1]["fields"] = json!([field]);
+    assert_eq!(j["steps"][1]["spec_slug"], "approve", "{j}");
+    j
+}
+
+/// The PATCH the runner sent onto the approve step.
+fn approve_patch(writes: &[Value], out: &str) -> Value {
+    writes_to(writes, "s-approve")
+        .into_iter()
+        .find(|w| w["method"] == "PATCH")
+        .unwrap_or_else(|| panic!("no plan was written onto the approve step: {writes:?}\n{out}"))
+        .clone()
+}
+
+const FIGURES: &str = "not signed (it moves with every run): last scheduled 2026-11-11T04:07:00Z; active Jobs (0): none\n";
+
+#[test]
+fn a_step_that_reserves_plan_stderr_carries_the_plan_verbs_whole_stderr() {
+    needs_tools!();
+    let f = Fixture::new("plan-stderr");
+    let figures = f.root.join("figures.txt");
+    std::fs::write(&figures, FIGURES).unwrap();
+    f.packet(declaring_plan_stderr(
+        job("ready", approve_meta(None), json!([]), "pending"),
+        Some(boss_jobs::runner_credential::PRINCIPAL),
+    ));
+    let (out, writes) = f.run(&[("PLAN_CONTEXT_FILE", figures.to_str().unwrap())]);
+    let patch = approve_patch(&writes, &out);
+    let sha = sha256_hex(PLAN.as_bytes());
+    assert_eq!(
+        patch["body"]["plan_stderr"],
+        json!(format!("{FIGURES}plan-sha256: {sha}\n")),
+        "the plan verb's stderr, byte for byte, its hash line included: {patch}"
+    );
+    // The figures are BESIDE the plan, never in it: the plan and the hash
+    // the execute-time re-render compares are exactly what they were.
+    assert_eq!(patch["body"]["plan"], PLAN, "{patch}");
+    assert_eq!(patch["body"]["rendered_plan_sha256"], sha, "{patch}");
+    // (The other write to the step is the approver's nomination PUT.)
+    assert_eq!(
+        writes_to(&writes, "s-approve")
+            .into_iter()
+            .filter(|w| w["method"] == "PATCH")
+            .count(),
+        1,
+        "one patch, so the figures land with the plan or not at all: {writes:?}"
+    );
+}
+
+/// A row that does not reserve the key — every request admitted before
+/// the row declaring it is published, or one declaring it with another
+/// writer — gets the patch it always got: figures there would be
+/// writable by anyone with Update on the step, beside a procedure that
+/// does not say what they are.
+#[test]
+fn a_step_that_does_not_reserve_plan_stderr_gets_none() {
+    needs_tools!();
+    for (case, writer) in [
+        ("undeclared", None),
+        ("unreserved", Some(None)),
+        ("other", Some(Some("signer"))),
+    ] {
+        let f = Fixture::new(&format!("plan-stderr-{case}"));
+        let figures = f.root.join("figures.txt");
+        std::fs::write(&figures, FIGURES).unwrap();
+        let j = job("ready", approve_meta(None), json!([]), "pending");
+        f.packet(match writer {
+            None => j,
+            Some(w) => declaring_plan_stderr(j, w),
+        });
+        let (out, writes) = f.run(&[("PLAN_CONTEXT_FILE", figures.to_str().unwrap())]);
+        let patch = approve_patch(&writes, &out);
+        let mut keys: Vec<&str> = patch["body"]
+            .as_object()
+            .map(|m| m.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["args", "host", "plan", "rendered_plan_sha256", "verb"],
+            "{case}: {patch}"
+        );
+    }
+}
+
+/// Bytes a JSON string cannot carry are named, never shown re-encoded:
+/// the approver reads what the verb printed, or is told it is not here.
+#[test]
+fn a_plan_stderr_that_is_not_utf8_is_named_by_its_count_and_hash() {
+    needs_tools!();
+    let f = Fixture::new("plan-stderr-binary");
+    let figures = f.root.join("figures.bin");
+    std::fs::write(&figures, b"ledger \xff\xfe bytes\n").unwrap();
+    f.packet(declaring_plan_stderr(
+        job("ready", approve_meta(None), json!([]), "pending"),
+        Some(boss_jobs::runner_credential::PRINCIPAL),
+    ));
+    let (out, writes) = f.run(&[("PLAN_CONTEXT_FILE", figures.to_str().unwrap())]);
+    let patch = approve_patch(&writes, &out);
+    let mut err = b"ledger \xff\xfe bytes\n".to_vec();
+    err.extend_from_slice(format!("plan-sha256: {}\n", sha256_hex(PLAN.as_bytes())).as_bytes());
+    let said = patch["body"]["plan_stderr"].as_str().unwrap_or_default();
+    assert!(
+        said.contains(&format!("{} bytes", err.len()))
+            && said.contains(&sha256_hex(&err))
+            && said.contains("not UTF-8"),
+        "the stderr is named by its count and hash: {patch}"
+    );
+    assert_eq!(patch["body"]["plan"], PLAN, "{patch}");
+}
+
+/// A refusal is printed LAST (finding F3 of review 43b607db): a 5-disk
+/// replica-move refusal started at byte 3,102 and the runner kept the
+/// first 2,000. The refusal now keeps both ends and names what is
+/// between.
+#[test]
+fn a_refused_plan_keeps_the_end_of_a_long_stderr() {
+    needs_tools!();
+    let f = Fixture::new("plan-refused-long");
+    let figures = f.root.join("figures.txt");
+    std::fs::write(&figures, format!("{}\n", "v".repeat(5000))).unwrap();
+    f.packet(job("ready", approve_meta(None), json!([]), "pending"));
+    let (out, writes) = f.run(&[
+        ("PLAN_CONTEXT_FILE", figures.to_str().unwrap()),
+        ("PLAN_REFUSE", "no disk can take the replica"),
+    ]);
+    let md = step_completion(&writes, "s-refused", &out);
+    let reason = md["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("no disk can take the replica") && reason.contains("bytes not shown"),
+        "the refusal keeps its last words and says what it left out: {reason}"
+    );
+}
+
+#[test]
+fn the_orphan_backend_plan_reaches_the_real_runner_approval_door() {
+    needs_tools!();
+    let f = Fixture::new("orphan-backends-plan");
+    let script = f.root.join("native-plan.py");
+    // Only the native observation/attachment ports are replaced. The shipped
+    // main renders stdout/stderr, and the real runner judges those exact bytes.
+    std::fs::write(
+        &script,
+        format!(
+            r#"import importlib.util,sys
+spec=importlib.util.spec_from_file_location('fixture', {fixture:?})
+t=importlib.util.module_from_spec(spec);spec.loader.exec_module(t)
+m=t.module;db=m.load_database_module();R=db.bounded.Recorder
+def recorder(**kw):
+    kw.pop('execute',None)
+    return R(execute=lambda argv,timeout:(0,b'attachment recorded',b'',True),**kw)
+db.bounded.Recorder=recorder
+m.load_database_module=lambda:db
+n=t.Native()
+n.value['backends']=[dict(n.value['backends'][0],pid=123+i) for i in range(6)]
+m.Native=lambda *args:n
+sys.argv=['orphan-backends.py','--plan']
+sys.exit(m.main())
+"#,
+            fixture = repo_root()
+                .join("infra/forge/tests/orphan-backends-test.py")
+                .display()
+                .to_string()
+        ),
+    )
+    .unwrap();
+    for name in [
+        "plan-orphaned-client-backends",
+        "terminate-orphaned-client-backends",
+    ] {
+        let mut spec: Value = serde_json::from_str(
+            &std::fs::read_to_string(repo_root().join(format!("infra/ops/verbs/{name}.json")))
+                .unwrap(),
+        )
+        .unwrap();
+        if name.starts_with("plan-") {
+            spec["argv"] = json!(["python3", "-B", script.display().to_string()]);
+        }
+        f.verb_file(name, spec);
+    }
+    let mut packet = job("ready", approve_meta(None), json!([]), "pending");
+    packet["metadata"]["verb"] = json!("terminate-orphaned-client-backends");
+    packet["metadata"]["args"] = json!([]);
+    f.packet(packet);
+    let (out, writes) = f.run(&[("ORPHAN_BACKENDS_KUBECTL", "fake")]);
+    let patch = writes_to(&writes, "s-approve")
+        .into_iter()
+        .find(|w| w["method"] == "PATCH")
+        .unwrap_or_else(|| panic!("real orphan plan did not reach approval: {out}\n{writes:?}"));
+    let plan = patch["body"]["plan"].as_str().unwrap();
+    assert_eq!(
+        patch["body"]["rendered_plan_sha256"],
+        sha256_hex(plan.as_bytes())
+    );
+    assert!(plan.contains("123"), "{plan}");
+    let document: Value = serde_json::from_str(plan).unwrap();
+    assert_eq!(document["candidates"].as_array().unwrap().len(), 1);
+    assert_eq!(document["deferred"].as_array().unwrap().len(), 5);
+    assert!(f.applied().is_none(), "a plan never terminates a backend");
 }
 
 /// A plan already on the approve step is the one waiting to be signed —
@@ -1080,6 +1331,31 @@ fn nothing_to_do_plans(verb: &str) -> Option<(Vec<String>, Vec<String>)> {
                 ],
             ))
         }
+        // Prod's plan as the script renders it (backlog 77dc1579);
+        // revoke_logged_calendar_tokens_sh holds the regex to the script.
+        "plan-a-logged-raw-revoke" => {
+            let head = |instance: &str, ns: &str, n: u32| {
+                format!(
+                    "plan: revoke-logged-calendar-tokens\ninstance: {instance}\nnamespace: {ns}\nread: GET /api/scheduling/calendar-tokens/logged-raw on the instance's jobs port 7900, from inside deploy/boss container boss through kubectl exec, as automation:ops-runner at audit-readonly\nlogged_raw: {n}\n\n== the act this plan authorises ==\n"
+                )
+            };
+            let none = "none — nothing to revoke\n";
+            Some((
+                vec![
+                    format!("{}{none}", head("prod", "boss", 0)),
+                    format!("{}{none}", head("playground", "boss-playground", 0)),
+                ],
+                vec![
+                    format!(
+                        "{}POST /api/scheduling/calendar-tokens/logged-raw/revoke on the instance's jobs port 7900, from inside deploy/boss container boss through kubectl exec, ONCE, as automation:ops-runner at platform-admin: it revokes every calendar feed whose token the instance's audit log holds in the clear (3 now), one rotated event each. Then logged_raw is read back; only 0 is the verdict.\n",
+                        head("playground", "boss-playground", 3)
+                    ),
+                    // A non-zero count beside the empty act is not empty.
+                    format!("{}{none}", head("playground", "boss-playground", 3)),
+                    format!("{}{none}{none}", head("prod", "boss", 0)),
+                ],
+            ))
+        }
         _ => None,
     }
 }
@@ -1242,6 +1518,71 @@ fn an_approval_verb_that_cannot_void_a_drifted_plan_is_refused() {
     assert!(reason.contains("plan_verb"), "{reason}");
 }
 
+/// The write takes the plan's complete parameter specifications, then
+/// its signed-plan hash. Comparing names alone loses the constraints.
+fn approval_parameter_specs_match(write: &Value, plan: &Value) -> bool {
+    let Some(write) = write["params"].as_array() else {
+        return false;
+    };
+    let Some(plan) = plan["params"].as_array() else {
+        return false;
+    };
+    let Some((hash, args)) = write.split_last() else {
+        return false;
+    };
+    hash["name"] == "plan_sha256" && args == plan.as_slice()
+}
+
+/// A wider write-only kind domain passed the names-only pin (a4b35b2f).
+/// Use the actual retirement verbs, then mutate constraints while every
+/// parameter keeps its name and position.
+#[test]
+fn approval_parameter_drift_is_refused_even_when_names_still_match() {
+    let read = |name: &str| -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(repo_root().join(format!("infra/ops/verbs/{name}.json")))
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let write = read("retire-access-object");
+    let plan = read("plan-an-access-object-retirement");
+    assert!(
+        approval_parameter_specs_match(&write, &plan),
+        "control: shipped pair matches"
+    );
+    let mut widened = write.clone();
+    widened["params"][0]["one_of"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("Secret"));
+    assert!(
+        !approval_parameter_specs_match(&widened, &plan),
+        "a write-only Secret must fail the approval pin"
+    );
+    let mut pattern = write.clone();
+    pattern["params"][1]["pattern"] = json!(".*");
+    assert!(
+        !approval_parameter_specs_match(&pattern, &plan),
+        "a wider namespace pattern must fail"
+    );
+    let mut option = write.clone();
+    option["params"][1]["optional"] = json!(true);
+    assert!(
+        !approval_parameter_specs_match(&option, &plan),
+        "an extra write-only constraint must fail"
+    );
+    let mut missing = write.clone();
+    missing["params"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("pattern");
+    assert!(
+        !approval_parameter_specs_match(&missing, &plan),
+        "a missing constraint must fail"
+    );
+}
+
 /// The shipped approval verbs, through the real runner and the real
 /// allowlist: every one's script re-renders and compares, so each
 /// passes the contract (its plan verb is named, read-only, on the same
@@ -1264,20 +1605,21 @@ fn the_shipped_approval_verbs_hold_the_contract_and_the_disk_verb_reaches_its_pl
         )
         .unwrap()
     };
-    let names = |v: &Value| -> Vec<String> {
-        v["params"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| p["name"].as_str().unwrap().to_string())
-            .collect()
-    };
     for (write, plan) in [
+        ("suspend-a-chore", "plan-a-chore-suspend"),
         ("set-longhorn-drain-policy", "plan-a-longhorn-drain-policy"),
         ("reap-terminated-pods", "plan-a-pod-reap"),
         ("merge-tenant-main", "plan-a-tenant-merge"),
         ("reclaim-gcp-root", "plan-a-gcp-root-reclaim"),
         ("move-volume-replica", "plan-a-volume-replica-move"),
+        (
+            "move-volume-replica-to-disk",
+            "plan-a-volume-replica-disk-move",
+        ),
+        (
+            "finish-volume-replica-move",
+            "plan-a-volume-replica-move-finish",
+        ),
         ("commission-a-disk", "plan-a-disk-commission"),
         ("shutdown-node", "plan-a-node-shutdown"),
         ("node-converge", "plan-a-node-converge"),
@@ -1288,6 +1630,20 @@ fn the_shipped_approval_verbs_hold_the_contract_and_the_disk_verb_reaches_its_pl
             "plan-an-instance-volume-expansion",
         ),
         ("retire-ops-runner", "plan-retire-ops-runner"),
+        ("retire-volume-claim", "plan-a-volume-claim-retirement"),
+        ("add-longhorn-disk", "plan-a-longhorn-disk"),
+        ("retire-access-object", "plan-an-access-object-retirement"),
+        ("remove-longhorn-disk", "plan-a-longhorn-disk-removal"),
+        (
+            "reregister-longhorn-disk",
+            "plan-a-longhorn-disk-reregistration",
+        ),
+        ("publish-tenant", "plan-a-tenant-publish"),
+        ("rebuild-a-failed-replica", "plan-a-failed-replica-rebuild"),
+        ("retire-a-user-volume", "plan-a-user-volume-retirement"),
+        ("wipe-a-partition", "plan-a-partition-wipe"),
+        ("upgrade-forgejo", "plan-a-forgejo-upgrade"),
+        ("set-longhorn-disk-tags", "plan-a-longhorn-disk-tags"),
     ] {
         let w = read(write);
         let p = read(plan);
@@ -1299,9 +1655,10 @@ fn the_shipped_approval_verbs_hold_the_contract_and_the_disk_verb_reaches_its_pl
         );
         assert_ne!(p["requires_approval"], true, "{plan} is read-only");
         assert_eq!(w["hosts"], p["hosts"], "{write} and {plan} serve one host");
-        let mut wn = names(&w);
-        assert_eq!(wn.pop().as_deref(), Some("plan_sha256"), "{write}");
-        assert_eq!(wn, names(&p), "{plan} renders from exactly {write}'s args");
+        assert!(
+            approval_parameter_specs_match(&w, &p),
+            "{plan} must render from exactly {write}'s parameter specifications, except plan_sha256"
+        );
     }
 
     // The disk verb, through the runner with the shipped allowlist.
@@ -2381,6 +2738,249 @@ fn an_active_execute_held_by_anyone_but_a_runner_pass_is_refused_by_name() {
     }
 }
 
+// ------------------------------------------- the re-render, tried again
+//
+// A TRANSIENT RE-RENDER DOES NOT SPEND THE APPROVAL (backlog 05d7c0b9).
+// On 2026-10-28 David approved expand request 0e64cb59 (plan 63ff2b06);
+// the runner's execute-time re-render answered exit 78 with no plan, so
+// the request closed refused and the single-use passkey approval was
+// gone — and a render two minutes later (2d848539) answered exit 0 with
+// the SAME hash. The runner now tries the re-render again, three
+// attempts in all, but ONLY when the plan verb exits non-zero without
+// naming a plan-sha256; a render that names a hash is judged on that
+// hash at once, and the approval is judged again before every retry, so
+// the window holds. Every attempt rides the execute step's
+// `rerender_attempts`, its stderr as a whole byte record.
+
+/// What a stream record holds, decoded by the same `base64` the runner
+/// encodes with.
+fn decoded(record: &Value) -> String {
+    let mut child = Command::new("base64")
+        .arg("-d")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("base64 runs");
+    feed_stdin(
+        &mut child,
+        record["base64"].as_str().unwrap_or_default().as_bytes(),
+    );
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "base64 -d: {:?} on {record}",
+        out.status
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The execute step's attempts, each held to the record's shape: its
+/// number, when it ran, and a COMPLETE stderr record (backlog 05d7c0b9:
+/// the refusal of 0e64cb59 kept one truncated line).
+fn rerender_attempts(md: &Value) -> Vec<Value> {
+    let attempts = md["rerender_attempts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the execute step records its re-render attempts: {md}"))
+        .clone();
+    for (i, a) in attempts.iter().enumerate() {
+        assert_eq!(a["attempt"], json!(i + 1), "{a}");
+        let at = a["at"].as_str().unwrap_or_default();
+        assert!(
+            at.len() == 20 && at.ends_with('Z') && at.as_bytes()[10] == b'T',
+            "each attempt says when it ran, in UTC: {a}"
+        );
+        assert_eq!(a["stderr"]["complete"], json!(true), "{a}");
+        assert_eq!(a["stderr"]["bytes"], a["stderr"]["retained_bytes"], "{a}");
+    }
+    attempts
+}
+
+/// The transient shape, judged: exit 78, no hash, and the WHOLE stderr —
+/// the 2,500 bytes of noise and the line after them that names the call.
+fn assert_transient(a: &Value, call: usize) {
+    assert_eq!(a["exit_code"], json!(78), "{a}");
+    assert_eq!(a["transient"], json!(true), "{a}");
+    let err = decoded(&a["stderr"]);
+    assert!(
+        err.len() > 2500 && err.ends_with(&format!("transient read failure {call}\n")),
+        "attempt {call} keeps its whole stderr, not a truncated line: {} bytes, last line {:?}",
+        err.len(),
+        err.lines().last()
+    );
+}
+
+#[test]
+fn a_rerender_that_fails_once_then_renders_the_signed_hash_runs_the_write() {
+    needs_tools!();
+    let f = Fixture::new("rerender-once");
+    f.packet(approved_job());
+    let (out, writes) = f.run(&[("PLAN_FAIL_TIMES", "1"), ("OPS_RERENDER_BACKOFF_S", "0")]);
+    let plan_sha = sha256_hex(PLAN.as_bytes());
+    assert_eq!(
+        f.applied(),
+        Some(vec!["target-a".to_string(), plan_sha.clone()]),
+        "a re-render that failed once and then rendered the signed hash runs the write: {out}"
+    );
+    assert_eq!(f.plan_calls(), 2, "{out}");
+    let md = execute_completion(&writes, &out);
+    assert_eq!(md["disposition"], "answered", "{md}\n{out}");
+    assert_eq!(md["approved_plan_sha256"], plan_sha, "{md}");
+    let attempts = rerender_attempts(&md);
+    assert_eq!(attempts.len(), 2, "{md}");
+    assert_transient(&attempts[0], 1);
+    assert_eq!(attempts[1]["exit_code"], json!(0), "{md}");
+    assert_eq!(attempts[1]["transient"], json!(false), "{md}");
+    assert_eq!(attempts[1]["plan_sha256"], json!(plan_sha), "{md}");
+    assert!(
+        attempts.iter().all(|a| a.get("plan").is_none()),
+        "a render that matched is the signed plan, so no copy of it is kept: {md}"
+    );
+    // Still single-use: one claim, through the door, before the write.
+    let claims = writes_to(&writes, "s-execute")
+        .into_iter()
+        .filter(|w| w["url"].as_str().is_some_and(|u| u.ends_with("/claim")))
+        .count();
+    assert_eq!(claims, 1, "{writes:?}");
+}
+
+#[test]
+fn a_rerender_that_keeps_failing_is_refused_after_three_attempts_each_recorded() {
+    needs_tools!();
+    let f = Fixture::new("rerender-dark");
+    f.packet(approved_job());
+    let (out, writes) = f.run(&[("PLAN_FAIL_TIMES", "99"), ("OPS_RERENDER_BACKOFF_S", "0")]);
+    assert_refused(
+        &f,
+        &out,
+        &writes,
+        &[
+            "could not be checked against a fresh render",
+            "exit 78",
+            "3 attempts",
+        ],
+    );
+    assert_eq!(f.plan_calls(), 3, "three attempts and no more: {out}");
+    let md = execute_completion(&writes, &out);
+    let attempts = rerender_attempts(&md);
+    assert_eq!(attempts.len(), 3, "{md}");
+    for (i, a) in attempts.iter().enumerate() {
+        assert_transient(a, i + 1);
+    }
+}
+
+#[test]
+fn a_rerender_that_names_a_hash_is_judged_on_its_first_attempt() {
+    needs_tools!();
+    // Another hash: the state moved, or the plan was forged. Refused at
+    // once, naming both — a retry could only render it again.
+    let f = Fixture::new("rerender-moved");
+    let moved = f.root.join("moved.txt");
+    std::fs::write(&moved, "PLAN wipe target-b instead\n").unwrap();
+    f.packet(approved_job());
+    let (out, writes) = f.run(&[
+        ("PLAN_OVERRIDE", moved.to_str().unwrap()),
+        ("OPS_RERENDER_BACKOFF_S", "0"),
+    ]);
+    let other = sha256_hex(b"PLAN wipe target-b instead\n");
+    assert_refused(&f, &out, &writes, &[&other, &sha256_hex(PLAN.as_bytes())]);
+    assert_eq!(
+        f.plan_calls(),
+        1,
+        "a different hash is never retried: {out}"
+    );
+    let attempts = rerender_attempts(&execute_completion(&writes, &out));
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(attempts[0]["plan_sha256"], json!(other), "{attempts:?}");
+    assert_eq!(attempts[0]["transient"], json!(false), "{attempts:?}");
+    // The fresh bytes ride the refusal (backlog 204e27ba): two hashes
+    // alone could not name the field that moved (830c317a), the plan
+    // diffed against the signed one on the approve step does.
+    assert_eq!(
+        attempts[0]["plan"],
+        json!("PLAN wipe target-b instead\n"),
+        "{attempts:?}"
+    );
+
+    // A non-zero exit that DID name a hash is the verb's own answer, not
+    // a render that never happened: refused at once, too.
+    let f = Fixture::new("rerender-named-and-failed");
+    f.packet(approved_job());
+    let (out, writes) = f.run(&[("PLAN_EXIT", "3"), ("OPS_RERENDER_BACKOFF_S", "0")]);
+    assert_refused(&f, &out, &writes, &["exit 3"]);
+    assert_eq!(
+        f.plan_calls(),
+        1,
+        "a refusal that names a hash is never retried: {out}"
+    );
+    let attempts = rerender_attempts(&execute_completion(&writes, &out));
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(attempts[0]["exit_code"], json!(3), "{attempts:?}");
+    assert_eq!(attempts[0]["transient"], json!(false), "{attempts:?}");
+}
+
+/// The window is not widened by a retry: the approval is judged again
+/// before every further attempt, and one that expired during the wait
+/// stops the retries with its own reason, on the record.
+#[test]
+fn a_rerender_retry_never_outlives_the_approval_window() {
+    needs_tools!();
+    let f = Fixture::new("rerender-window");
+    let meta = approve_meta(Some(PLAN));
+    let shape = shape_of(&meta);
+    // Signed 590 s ago: good for the first attempt, gone after a 12 s wait.
+    f.packet(job(
+        "completed",
+        meta,
+        json!([stamp("platform-admin", "presence", &shape, 590)]),
+        "ready",
+    ));
+    let (out, writes) = f.run(&[("PLAN_FAIL_TIMES", "1"), ("OPS_RERENDER_BACKOFF_S", "12")]);
+    assert_refused(&f, &out, &writes, &["exit 78", "expires after 600s"]);
+    assert_eq!(f.plan_calls(), 1, "no attempt runs after the window: {out}");
+    let attempts = rerender_attempts(&execute_completion(&writes, &out));
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+}
+
+/// Refused after its attempts, the approval is spent like any refused
+/// one: a later pass — this runner's next minute, with the plan verb
+/// answering again — runs nothing on it, whether the refusal's status
+/// landed or only its keys did.
+#[test]
+fn an_approval_refused_after_its_rerenders_is_never_used_again() {
+    needs_tools!();
+    let f = Fixture::new("rerender-spent");
+    f.packet(approved_job());
+    let (out, writes) = f.run(&[("PLAN_FAIL_TIMES", "99"), ("OPS_RERENDER_BACKOFF_S", "0")]);
+    assert_refused(&f, &out, &writes, &["3 attempts"]);
+    let refused = execute_completion(&writes, &out);
+    for status in ["ready", "completed"] {
+        let mut after = approved_job();
+        let exec = &mut after["steps"][2];
+        assert_eq!(exec["spec_slug"], "execute", "{exec}");
+        exec["status"] = json!(status);
+        for (k, v) in refused.as_object().unwrap() {
+            exec["metadata"][k] = v.clone();
+        }
+        f.packet(after);
+        let (out, writes) = f.run(&[("OPS_RERENDER_BACKOFF_S", "0")]);
+        assert!(
+            f.applied().is_none(),
+            "execute {status} after a refusal: the write RAN again: {out}"
+        );
+        assert_eq!(
+            f.plan_calls(),
+            0,
+            "execute {status}: nothing is re-rendered: {out}"
+        );
+        assert!(
+            !writes_to(&writes, "s-execute")
+                .iter()
+                .any(|w| w["url"].as_str().is_some_and(|u| u.ends_with("/claim"))),
+            "execute {status} after a refusal is never claimed: {writes:?}\n{out}"
+        );
+    }
+}
+
 // -------------------------------------------------------------- review
 //
 // A VERB THAT DECLARES `requires_review` IS APPROVED ONLY OVER A CLOSED
@@ -3104,4 +3704,312 @@ fn the_protocol_puts_a_review_between_the_plan_and_the_passkey() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(declaring, ["merge-tenant-main.json"]);
+}
+
+// ------------------------------------------------------- the approver
+//
+// A RENDERED PLAN IS PUT IN FRONT OF THE PERSON WHO MAY SIGN IT (backlog
+// 9f5132dd, David's request, 2026-11-05). David filed
+// rebuild-a-failed-replica (ops-request d326b6c7); the forge runner put
+// the plan on the approve step within a minute and left the step's
+// assignee empty, although the verb names `approvers: ["emp-david"]`.
+// His queue shows the steps assigned to him, so the one act the chain
+// exists to put in front of him was invisible until the conductor
+// nominated him by hand. The runner now does that nomination itself,
+// right after the plan lands, through the step assignment PUT — the
+// `assignee_id` alone, which the jobs API records as STEP_UPDATED and
+// `step.assigned.<kind>` under the runner's own actor — so the render is
+// the one place every filing path (the terminal's `boss ops`, the
+// website's filing door) reaches it. NOT `boss step nominate`'s
+// `nomination_requested` record too: the approve step is human-only, and
+// the jobs API refuses a non-human writing it (boss-jobs'
+// the_runners_nomination_of_a_rendered_approval_lands_on_the_declared_row
+// measures the 403), so a runner that sent it would fail every
+// nomination. The review step keeps its role audience: only the approval
+// goes to the approvers.
+
+/// The runner's nomination of `step`: ONE assignment PUT, after the plan
+/// (so the plan is the first write onto the step, which the render cases
+/// above read), carrying `assignee_id` and no metadata — and no
+/// `nomination_requested` write anywhere, which the live door refuses on
+/// a human-only step. None when the runner made no nomination at all.
+fn nomination<'a>(writes: &'a [Value], step: &str, out: &str) -> Option<&'a Value> {
+    let to = writes_to(writes, step);
+    assert!(
+        !to.iter()
+            .any(|w| w["body"].get("nomination_requested").is_some()),
+        "a machine's nomination_requested write is refused on a human-only step: {writes:?}\n{out}"
+    );
+    let puts: Vec<usize> = to
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| w["method"] == "PUT" && w["body"].get("assignee_id").is_some())
+        .map(|(i, _)| i)
+        .collect();
+    let [p] = puts.as_slice() else {
+        assert!(
+            puts.is_empty(),
+            "one assignment, never several: {writes:?}\n{out}"
+        );
+        return None;
+    };
+    let plan = to
+        .iter()
+        .position(|w| w["method"] == "PATCH" && w["body"].get("plan").is_some());
+    assert!(
+        plan.is_some_and(|pl| pl < *p),
+        "the plan, then the assignment: {writes:?}\n{out}"
+    );
+    assert!(
+        to[*p]["url"]
+            .as_str()
+            .is_some_and(|u| u.ends_with(&format!("/steps/{step}"))),
+        "the assignment goes through the step PUT: {}",
+        to[*p]
+    );
+    Some(to[*p])
+}
+
+/// The nomination made by the runner: `step` assigned to `who` by a PUT
+/// carrying the holder and `automatic_assignment: true` — the jobs API's
+/// fence that refuses to replace a holder or a newer nomination (see
+/// a_person_who_assigns_the_approval_after_the_runners_read_keeps_it) —
+/// and the journal naming the verb file that named them.
+fn assert_nominated(writes: &[Value], step: &str, who: &str, verb: &str, out: &str) {
+    let put = nomination(writes, step, out)
+        .unwrap_or_else(|| panic!("{step} was never nominated to {who}: {writes:?}\n{out}"));
+    assert_eq!(
+        put["body"],
+        json!({"assignee_id": who, "automatic_assignment": true}),
+        "the assignment PUT carries the holder and the server's fence on a newer \
+         nomination, and no metadata: {put}"
+    );
+    assert!(
+        out.contains(&format!(
+            "nominated its approve step to {who}, the one approver infra/ops/verbs/{verb}.json names"
+        )),
+        "the journal says who the approval was put in front of, and which file named them: {out}"
+    );
+}
+
+/// THE DEFECT, REPRODUCED. A ready approve step with nobody on it gets
+/// the plan AND the one approver its verb names.
+#[test]
+fn a_rendered_plan_is_put_in_front_of_the_one_approver_its_verb_names() {
+    needs_tools!();
+    let f = Fixture::new("approver-nominated");
+    f.packet(job("ready", approve_meta(None), json!([]), "pending"));
+    let (out, writes) = f.run(&[]);
+    assert_nominated(&writes, "s-approve", APPROVER, "wipe", &out);
+    assert!(
+        writes_to(&writes, "s-execute").is_empty() && f.applied().is_none(),
+        "a nomination runs nothing and touches execute not at all: {writes:?}\n{out}"
+    );
+}
+
+/// A STEP HOLDS ONE ASSIGNEE, so a verb naming several approvers cannot be
+/// put on all of them by nomination: picking one would take it off every
+/// other approver's role queue (the role arm reads only an unheld step).
+/// It stays on its role audience, and the journal names each approver.
+#[test]
+fn a_verb_naming_several_approvers_leaves_its_approval_on_the_role_queue() {
+    needs_tools!();
+    let f = Fixture::new("approvers-several");
+    let mut wipe: Value =
+        serde_json::from_str(&std::fs::read_to_string(f.verbs.join("wipe.json")).unwrap()).unwrap();
+    wipe["approvers"] = json!([APPROVER, "emp-ada"]);
+    f.verb_file("wipe", wipe);
+    f.packet(job("ready", approve_meta(None), json!([]), "pending"));
+    let (out, writes) = f.run(&[]);
+    assert!(
+        writes_to(&writes, "s-approve")
+            .iter()
+            .any(|w| w["method"] == "PATCH" && w["body"]["plan"] == PLAN),
+        "the plan is still rendered: {writes:?}\n{out}"
+    );
+    assert!(
+        nomination(&writes, "s-approve", &out).is_none(),
+        "{writes:?}\n{out}"
+    );
+    assert!(
+        out.contains(APPROVER) && out.contains("emp-ada") && out.contains("role queue"),
+        "the journal names every approver and where the approval waits: {out}"
+    );
+}
+
+/// AN APPROVE STEP SOMEONE ALREADY HOLDS KEEPS ITS HOLDER: the runner
+/// fills an empty audience, it never moves a nomination a person made.
+#[test]
+fn an_approve_step_already_held_keeps_its_holder() {
+    needs_tools!();
+    let f = Fixture::new("approver-held");
+    let mut j = job("ready", approve_meta(None), json!([]), "pending");
+    j["steps"][1]["assignee_id"] = json!("emp-ada");
+    f.packet(j);
+    let (out, writes) = f.run(&[]);
+    assert!(
+        writes_to(&writes, "s-approve")
+            .iter()
+            .any(|w| w["method"] == "PATCH" && w["body"]["plan"] == PLAN),
+        "the plan is still rendered: {writes:?}\n{out}"
+    );
+    assert!(
+        nomination(&writes, "s-approve", &out).is_none(),
+        "{writes:?}\n{out}"
+    );
+    assert!(out.contains("emp-ada"), "{out}");
+}
+
+/// A PERSON WHO ASSIGNS THE APPROVAL AFTER THE RUNNER READ IT KEEPS IT
+/// (review R1 of car 91c8e709, 2026-11-06). The case above guards only
+/// the runner's own read, taken before the plan renders; a person can
+/// assign the still-ready step after it. The review measured the runner's
+/// bare `{assignee_id}` PUT answering 204 there and replacing emp-ada. So
+/// the runner asks for an `automatic_assignment`, which the jobs API
+/// refuses, 409 `automatic_assignment_superseded`, over a holder or a
+/// newer nomination (boss-jobs measures that on the real router with the
+/// runner's own body). Here the record the runner reads is unheld, the
+/// stub answers as the server does once emp-ada holds the step, and the
+/// runner must say that a person holds it and leave it — not report a
+/// nomination it did not make, and not fail the pass over a refusal that
+/// is the outcome it wants.
+#[test]
+fn a_person_who_assigns_the_approval_after_the_runners_read_keeps_it() {
+    needs_tools!();
+    let f = Fixture::new("approver-raced");
+    f.packet(job("ready", approve_meta(None), json!([]), "pending"));
+    let refusal = json!({
+        "code": boss_jobs::step_release::AUTOMATIC_ASSIGNMENT_SUPERSEDED,
+        "error": "the stub's words for the server's refusal",
+        "step_id": "s-approve",
+        "holder": "emp-ada",
+        "nomination_requested": null,
+    });
+    let (out, writes) = f.run(&[("STUB_ASSIGN_REFUSAL", &refusal.to_string())]);
+    let put = nomination(&writes, "s-approve", &out)
+        .unwrap_or_else(|| panic!("the runner still asked: {writes:?}\n{out}"));
+    assert_eq!(
+        put["body"]["automatic_assignment"],
+        json!(true),
+        "the runner's PUT asks for the fence, so a newer person's nomination wins: {put}\n{out}"
+    );
+    assert!(
+        !out.contains("nominated its approve step to"),
+        "the runner reports no nomination it did not make: {out}"
+    );
+    assert!(
+        out.contains("a person holds its approve step's nomination (emp-ada)")
+            && out.contains(&format!("left it rather than move it to {APPROVER}")),
+        "the journal names who holds it and that the runner left it: {out}"
+    );
+    assert!(
+        out.contains(" failed=0 "),
+        "a nomination a person already made is not a failed pass: {out}"
+    );
+}
+
+/// THE REVIEW STEP KEEPS ITS ROLE AUDIENCE. A `requires_review` verb's
+/// plan goes first to the review step, for a dispatched tenant reviewer —
+/// never to the approvers — and the approval's plan, once the review
+/// released it, goes to the approver.
+#[test]
+fn a_review_stays_on_its_role_and_only_the_released_approval_goes_to_the_approver() {
+    needs_tools!();
+    let f = review_fixture("approver-review");
+    f.packet(with_review(
+        job("pending", approve_meta(None), json!([]), "pending"),
+        "ready",
+        review_meta(None, None),
+    ));
+    let (out, writes) = f.run_review();
+    assert!(
+        writes_to(&writes, "s-review")
+            .iter()
+            .any(|w| w["method"] == "PATCH" && w["body"].get("plan").is_some()),
+        "{writes:?}\n{out}"
+    );
+    assert!(
+        nomination(&writes, "s-review", &out).is_none()
+            && writes_to(&writes, "s-approve").is_empty(),
+        "the review is nominated to nobody: {writes:?}\n{out}"
+    );
+
+    f.packet(released_job());
+    let (out, writes) = f.run_review();
+    assert_nominated(&writes, "s-approve", APPROVER, "wipe", &out);
+    assert!(
+        nomination(&writes, "s-review", &out).is_none(),
+        "{writes:?}\n{out}"
+    );
+}
+
+/// PINNED PER SHIPPED APPROVAL VERB. Every `infra/ops/verbs/*.json` that
+/// declares `requires_approval` ends, after its plan is rendered, with
+/// its approve step in front of the approvers it names: assigned to the
+/// one, or left on its role queue with each named when there are several.
+/// The fixture's plan and write stand in for the shipped scripts, which
+/// read real hosts; what is the verb's own is its `approvers` list and
+/// its `requires_review`, the two facts this behavior turns on — so a
+/// verb whose approval would reach nobody's queue fails here by name.
+#[test]
+fn every_shipped_approval_verb_puts_its_approve_step_in_front_of_its_approvers() {
+    needs_tools!();
+    let mut checked = Vec::new();
+    let mut paths: Vec<_> = std::fs::read_dir(repo_root().join("infra/ops/verbs"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let spec: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        if spec
+            .get("requires_approval")
+            .is_none_or(|r| r == &json!(false))
+        {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let approvers: Vec<String> = spec["approvers"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name} requires approval and names no approvers"))
+            .iter()
+            .map(|a| a.as_str().unwrap().to_string())
+            .collect();
+        let review = spec
+            .get("requires_review")
+            .is_some_and(|r| r != &json!(false));
+        let f = if review {
+            review_fixture(&format!("approver-shipped-{name}"))
+        } else {
+            Fixture::new(&format!("approver-shipped-{name}"))
+        };
+        let mut wipe: Value =
+            serde_json::from_str(&std::fs::read_to_string(f.verbs.join("wipe.json")).unwrap())
+                .unwrap();
+        wipe["approvers"] = json!(approvers);
+        f.verb_file("wipe", wipe);
+        let (out, writes) = if review {
+            f.packet(released_job());
+            f.run_review()
+        } else {
+            f.packet(job("ready", approve_meta(None), json!([]), "pending"));
+            f.run(&[])
+        };
+        if let [one] = approvers.as_slice() {
+            assert_nominated(&writes, "s-approve", one, "wipe", &out);
+        } else {
+            assert!(
+                nomination(&writes, "s-approve", &out).is_none()
+                    && approvers.iter().all(|a| out.contains(a.as_str())),
+                "{name}: several approvers stay on the role queue, each named: {writes:?}\n{out}"
+            );
+        }
+        checked.push(name);
+    }
+    assert!(
+        checked.len() >= 2 && checked.iter().any(|n| n == "rebuild-a-failed-replica"),
+        "the shipped approval verbs were read, among them the one David filed: {checked:?}"
+    );
 }

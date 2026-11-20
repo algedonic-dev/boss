@@ -21,6 +21,8 @@
   import StepSurface from '../steps/StepSurface.svelte';
   import { navigate } from '../router';
   import { stepFocusHref } from './decideHref';
+  import HumanPresentation from './HumanPresentation.svelte';
+  import { humanPresentation } from './humanPresentation';
   import type { StepStatus } from '../jobs/types';
 
   type Step = {
@@ -45,6 +47,8 @@
 
   let job = $state<{ title: string; metadata?: Record<string, unknown> } | null>(null);
   let step = $state<Step | null>(null);
+  const human = $derived(humanPresentation(step?.metadata));
+  const heading = $derived(step?.title ?? 'Loading…');
   let error = $state<string | null>(null);
   // A soft aside ("saved, but the re-read failed"), not an error: the
   // render puts `error` before the step, so an error here would hide a
@@ -138,10 +142,10 @@
     if (e.target === e.currentTarget) onClose();
   }}
 >
-  <div class="dm" role="dialog" aria-modal="true" aria-label={step?.title ?? 'Decide'}>
+  <div class="dm" role="dialog" aria-modal="true" aria-label={heading}>
     <header class="dm-head">
       <div class="dm-head-text">
-        <h2 class="dm-title">{step?.title ?? 'Loading…'}</h2>
+        <h2 class="dm-title">{heading}</h2>
         {#if job}<p class="dm-sub">{job.title}</p>{/if}
       </div>
       <!-- A design review is a document; the modal can be the wrong
@@ -166,6 +170,9 @@
       {#if error}
         <p class="dm-error">{error}</p>
       {:else if step}
+        {#if human.kind === 'ready'}
+          <HumanPresentation metadata={step.metadata} {jobId} {stepId} />
+        {/if}
         <StepSurface step={surfaceStep(step)} {jobId} onUpdate={onSurfaceUpdate} />
       {:else}
         <p class="dm-quiet">Loading the step…</p>

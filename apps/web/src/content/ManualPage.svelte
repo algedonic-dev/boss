@@ -1,11 +1,13 @@
 <script lang="ts">
+  import { safeLinkHref } from '@boss/web-kit/links';
+  import { pageLink } from '../shell/stationAddresses.svelte';
   // /manual — port of apps/web/src/content/ManualPage.tsx.
 
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { formatDate } from '@boss/web-kit/ui/date';
   import RichBody from './RichBody.svelte';
   import { tokenize } from './richBody';
-  import type { ManualSection } from './types';
+  import type { ManualIndexEntry, ManualSection } from './types';
   import { href, navigate } from '../router';
   import { loadOwnerNames, personIdsOf } from '../data/ownerNames';
   import { okRead, type ReadState } from '../data/readState';
@@ -14,11 +16,11 @@
   let { slug }: Props = $props();
 
   type TreeNode = {
-    section: ManualSection;
+    section: ManualIndexEntry;
     children: TreeNode[];
   };
 
-  let sections = $state<ManualSection[]>([]);
+  let sections = $state<ManualIndexEntry[]>([]);
   /// Non-null when the tree load failed — rendered instead of the
   /// empty state, so an outage never reads as "no sections yet"
   /// (packet 3fba9c35, the false-empty sweep).
@@ -53,11 +55,21 @@
     let cancelled = false;
     (async () => {
       try {
-        const r = await fetch('/api/content/manual');
+        const r = await fetch('/api/content/manual-index');
         if (r.ok) {
-          const body = (await r.json()) as ManualSection[];
+          const body: unknown = await r.json();
+          if (!Array.isArray(body) || !body.every((row: unknown) => {
+            if (row === null || typeof row !== 'object') return false;
+            const item = row as Record<string, unknown>;
+            return typeof item['id'] === 'string' && typeof item['slug'] === 'string'
+              && typeof item['title'] === 'string' && typeof item['published'] === 'boolean'
+              && typeof item['sort_order'] === 'number' && Number.isFinite(item['sort_order'])
+              && (item['parent_slug'] === null || typeof item['parent_slug'] === 'string')
+              && (item['owner_station'] == null || typeof item['owner_station'] === 'string')
+              && (item['authoring_job_id'] == null || typeof item['authoring_job_id'] === 'string');
+          })) throw new Error('Manual index response is unreadable');
           if (!cancelled) {
-            sections = body;
+            sections = body as ManualIndexEntry[];
             sectionsFailed = null;
           }
         } else {
@@ -143,8 +155,8 @@
     };
   });
 
-  function buildTree(arr: ReadonlyArray<ManualSection>): TreeNode[] {
-    const childrenOf = new Map<string | null, ManualSection[]>();
+  function buildTree(arr: ReadonlyArray<ManualIndexEntry>): TreeNode[] {
+    const childrenOf = new Map<string | null, ManualIndexEntry[]>();
     for (const s of arr) {
       const key = s.parent_slug ?? null;
       const bucket = childrenOf.get(key) ?? [];
@@ -162,6 +174,7 @@
   }
 
   let tree = $derived(buildTree(sections));
+  let selectedHeader = $derived(sections.find((section) => section.slug === slug));
 
   function saveCollapsed(set: ReadonlySet<string>): void {
     try {
@@ -201,7 +214,7 @@
   <PageHeader
     eyebrow="Know"
     title="Company manual"
-    subtitle="Authored by HR. Every change is versioned."
+    subtitle="Company guidance. Every change is versioned."
   />
   <div class="manual-layout">
     <aside class="manual-tree">
@@ -224,6 +237,20 @@
         <div class="manual-placeholder">
           Select a section from the tree to start reading.
         </div>
+      {:else if selectedHeader?.published === false}
+        <article class="manual-article manual-unwritten">
+          <header><h2>{selectedHeader.title}</h2></header>
+          {#if selectedHeader.owner_station?.trim()}
+            <p>Not yet written, owned by {selectedHeader.owner_station}</p>
+          {:else}
+            <p>Not yet written; owner not recorded.</p>
+          {/if}
+          {#if selectedHeader.authoring_job_id?.trim()}
+            <a href={href(`/ux/jobs/${encodeURIComponent(selectedHeader.authoring_job_id)}`)}>Open authoring packet</a>
+          {:else}
+            <p>Authoring packet not recorded.</p>
+          {/if}
+        </article>
       {:else if activeLoading}
         <div class="manual-placeholder">Loading…</div>
       {:else if activeNotFound}
@@ -285,10 +312,10 @@
     {/if}
     <a
       class="manual-tree-label"
-      href={href(`/ux/manual/${node.section.slug}`)}
+      href={safeLinkHref(pageLink('manual', {}, `/${node.section.slug}`))}
       onclick={(e) => {
         e.preventDefault();
-        navigate(href(`/ux/manual/${node.section.slug}`));
+        navigate(pageLink('manual', {}, `/${node.section.slug}`));
       }}
     >
       {node.section.title}

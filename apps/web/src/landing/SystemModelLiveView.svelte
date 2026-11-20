@@ -732,7 +732,7 @@
     border: 1px solid var(--busy);
     border-radius: 6px;
     padding: 1rem;
-    font-family: -apple-system, system-ui, sans-serif;
+    font-family: var(--font-body);
     font-size: 0.9rem;
     position: sticky;
     top: 1rem;
@@ -844,12 +844,12 @@
     font-size: 13px;
     font-weight: 600;
     fill: var(--fog);
-    font-family: -apple-system, system-ui, sans-serif;
+    font-family: var(--font-body);
   }
   .atlas-node-sub {
     font-size: 11px;
     fill: var(--static);
-    font-family: -apple-system, system-ui, sans-serif;
+    font-family: var(--font-body);
   }
   /* Atlas node pulse — flashes when fresh job lifecycle events
      for that Workflow land in the event tail. The amber stroke
@@ -880,7 +880,7 @@
     background: var(--warn-wash);
     border-left: 3px solid var(--busy);
     padding: 0.5rem 1rem;
-    font-family: -apple-system, system-ui, sans-serif;
+    font-family: var(--font-body);
     font-size: 0.9rem;
     color: var(--fog);
     white-space: pre-line;

@@ -220,11 +220,35 @@ impl Pod {
         git(&self.checkout, &["reset", "-q", "--hard", &self.main]);
     }
 
+    /// Hang a linked worktree off the checkout, on a branch of its own —
+    /// what makes a checkout THE shared one: on the pod every agent's
+    /// worktree under /work/boss/.claude/worktrees is one of these.
+    fn link_a_worktree(&self) -> PathBuf {
+        let wt = self.root.join("agent-wt");
+        git(
+            &self.checkout,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "worktree-agent-wt",
+                wt.to_str().expect("utf8"),
+            ],
+        );
+        wt
+    }
+
     /// Run a door THROUGH THE SYMLINK, from a cwd that is not the
     /// door's checkout (a builder's worktree is another one).
     fn run(&self, door: &str, args: &[&str], env: &[(&str, &str)]) -> Run {
+        self.run_at(&self.bin.join(door), door, args, env)
+    }
+
+    /// `run`, for a door at any path — a linked worktree's own copy.
+    fn run_at(&self, path: &Path, door: &str, args: &[&str], env: &[(&str, &str)]) -> Run {
         let _ = std::fs::remove_file(&self.argv);
-        let mut cmd = Command::new(self.bin.join(door));
+        let mut cmd = Command::new(path);
         // wt-cargo and wt-web answer about the worktree they are RUN
         // in and refuse outside one; the checkout is the only git
         // worktree this fixture has.
@@ -407,6 +431,138 @@ fn a_stale_write_is_refused_before_it_reaches_the_record() {
     }
 }
 
+/// THE CALLER'S ENVIRONMENT CANNOT STEER THE VERDICT (backlog 5b41a869).
+/// The helper ran plain `git`, so an inherited GIT_DIR made it judge some
+/// other repository, and an exported shell function named git answered in
+/// git's place. Measured by builder run c7215c46: a planted GIT_DIR made a
+/// fresh door refuse. Either can also make a stale door read fresh, and
+/// that is the direction that lands a write from a tree that is not main's.
+#[test]
+fn a_planted_git_dir_or_git_function_changes_nothing_about_the_verdict() {
+    let pod = Pod::new("steer");
+    // Another repository, whole, for GIT_DIR to point at.
+    let other = pod.root.join("other");
+    boss_testing::create_dir(&other);
+    git(&other, &["init", "-q", "-b", "main"]);
+    git(
+        &other,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "other",
+        ],
+    );
+    let other_git = other.join(".git");
+    let body = pod.root.join("body.json");
+    write_file(&body, "{}\n");
+    let post = ["POST", "/api/jobs", body.to_str().unwrap()];
+
+    // A STALE door stays refused under either.
+    let planted = pod.run(
+        "boss-api",
+        &post,
+        &[("GIT_DIR", other_git.to_str().unwrap())],
+    );
+    assert_eq!(
+        planted.code, 78,
+        "a planted GIT_DIR let a stale write through: {}",
+        planted.stderr
+    );
+    assert!(!pod.curl_ran(), "{}", planted.stderr);
+    let shadow = pod.run(
+        "boss-api",
+        &post,
+        &[(
+            "BASH_FUNC_git%%",
+            "() { echo 0000000000000000000000000000000000000000; }",
+        )],
+    );
+    assert_eq!(
+        shadow.code, 78,
+        "an exported git function let a stale write through: {}",
+        shadow.stderr
+    );
+    assert!(!pod.curl_ran(), "{}", shadow.stderr);
+
+    // A FRESH door is not refused because of either.
+    pod.fast_forward();
+    let fresh = pod.run(
+        "boss-api",
+        &post,
+        &[("GIT_DIR", other_git.to_str().unwrap())],
+    );
+    assert_eq!(
+        fresh.code, 0,
+        "a planted GIT_DIR refused a current write: {}",
+        fresh.stderr
+    );
+}
+
+/// NOR ANY GIT INPUT A NAME LIST FORGETS (review 860cfe0e of car
+/// 07a1a0c9). The first repair cleared a list of variables, and the list
+/// left out GIT_SHALLOW_FILE: pointed at a file naming origin/main's sha,
+/// it makes main a shallow boundary, the ancestry test fails, and a STALE
+/// door's write went through (reviewer, native exit 0, curl ran). HOME
+/// is the same road by another name: it decides which global config git
+/// reads, and a planted one can install a clean filter that makes the
+/// file on disk hash as "being edited". Both must leave the refusal
+/// standing, and a FRESH door must still write under them.
+#[test]
+fn no_inherited_git_input_makes_a_stale_door_fresh() {
+    let pod = Pod::new("inputs");
+    let body = pod.root.join("body.json");
+    write_file(&body, "{}\n");
+    let post = ["POST", "/api/jobs", body.to_str().unwrap()];
+
+    let shallow = pod.root.join("shallow");
+    write_file(&shallow, &format!("{}\n", pod.main));
+    let home = pod.root.join("planted-home");
+    create_dir(&home);
+    let attrs = pod.root.join("planted-attributes");
+    write_file(&attrs, "* filter=steer\n");
+    write_file(
+        &home.join(".gitconfig"),
+        &format!(
+            "[core]\n\tattributesFile = {}\n[filter \"steer\"]\n\tclean = echo steered\n",
+            attrs.display()
+        ),
+    );
+    let planted: [(&str, &str); 2] = [
+        ("GIT_SHALLOW_FILE", shallow.to_str().unwrap()),
+        ("HOME", home.to_str().unwrap()),
+    ];
+
+    // Every input is judged before any assertion, so one red names all
+    // of them rather than the first.
+    let mut wrong = Vec::new();
+    for (name, value) in planted {
+        let run = pod.run("boss-api", &post, &[(name, value)]);
+        if run.code != 78 || pod.curl_ran() {
+            wrong.push(format!(
+                "a planted {name} let a stale write through (exit {}): {}",
+                run.code, run.stderr
+            ));
+        }
+    }
+    pod.fast_forward();
+    for (name, value) in planted {
+        let run = pod.run("boss-api", &post, &[(name, value)]);
+        if run.code != 0 || !pod.curl_ran() {
+            wrong.push(format!(
+                "a planted {name} refused a current write (exit {}): {}",
+                run.code, run.stderr
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 #[test]
 fn a_checkout_on_origin_main_says_nothing_at_all() {
     let pod = Pod::new("fresh");
@@ -435,6 +591,148 @@ fn a_checkout_on_origin_main_says_nothing_at_all() {
         pod.curl_ran(),
         "the write did not reach curl: {}",
         write.stderr
+    );
+}
+
+/// THE SHARED CHECKOUT OFF MAIN IS A DOOR NOT THE TREE'S (backlog
+/// 88553fea). Measured from the /work/boss reflog on 2026-10-20: reviewer
+/// runs detached it twice (17:40Z at 8a9fdecb, 19:03Z at dcb010de), and
+/// run 2452d6ff switched it to its own branch and left it there from
+/// 19:04 to 19:17Z, while every door on the pod — each a symlink into
+/// its infra/dev — ran that branch's copy. This helper judged only
+/// "behind origin/main", so a checkout DETACHED AT origin/main, or on a
+/// branch with a commit of its own, was silent. The two shapes, each
+/// with origin/main exactly where HEAD is so the old question says
+/// nothing: a read answers under a WARNING naming the shape, and a write
+/// is REFUSED before curl.
+#[test]
+fn a_shared_checkout_moved_off_main_warns_a_read_and_refuses_a_write() {
+    for (shape, says) in [
+        ("detached", "detached at".to_string()),
+        (
+            "branch",
+            "on branch worktree-agent-adc4e55861d5bfd66".to_string(),
+        ),
+    ] {
+        let pod = Pod::new(&format!("off-main-{shape}"));
+        pod.fast_forward();
+        pod.link_a_worktree();
+        if shape == "detached" {
+            git(&pod.checkout, &["checkout", "-q", "--detach", &pod.main]);
+        } else {
+            git(
+                &pod.checkout,
+                &["checkout", "-q", "-b", "worktree-agent-adc4e55861d5bfd66"],
+            );
+        }
+        let read = pod.run("boss-api", &["GET", "/api/jobs"], &[]);
+        assert_eq!(
+            read.code, 0,
+            "an off-main READ still answers: {}",
+            read.stderr
+        );
+        assert!(
+            pod.curl_ran(),
+            "the read did not reach curl: {}",
+            read.stderr
+        );
+        let e = &read.stderr;
+        assert!(
+            e.contains("WARNING") && e.contains("not on main"),
+            "a shared checkout {shape} off main answered without a warning — every door ran \
+             another tree's copy for thirteen minutes this way: {e}"
+        );
+        assert!(
+            e.contains(&says) && e.contains(&pod.main[..8]),
+            "the warning does not say where HEAD stands ({says}, {}): {e}",
+            &pod.main[..8]
+        );
+        assert!(
+            e.contains(&format!("git -C {} switch main", pod.checkout.display()))
+                && e.contains("88553fea"),
+            "the warning does not carry the command that repairs it and its packet: {e}"
+        );
+
+        let body = pod.root.join("body.json");
+        write_file(&body, "{}\n");
+        let write = pod.run(
+            "boss-api",
+            &["POST", "/api/jobs", body.to_str().unwrap()],
+            &[],
+        );
+        assert_eq!(
+            write.code, 78,
+            "an off-main ({shape}) write exited {}: {}",
+            write.code, write.stderr
+        );
+        assert!(
+            !pod.curl_ran(),
+            "the off-main write reached curl before being refused: {}",
+            write.stderr
+        );
+        assert!(
+            write.stderr.contains("REFUSED") && write.stderr.contains("not on main"),
+            "the refusal does not say what it refused and why: {}",
+            write.stderr
+        );
+        // The building doors warn and proceed, as they do for a stale copy.
+        let shim = pod.run("boss", &["--version"], &[]);
+        assert!(
+            shim.stderr.contains("WARNING") && shim.stderr.contains("not on main"),
+            "the shim ran from an off-main shared checkout without saying so: {}",
+            shim.stderr
+        );
+        assert_ne!(shim.code, 78, "{}", shim.stderr);
+    }
+}
+
+/// What "the shared checkout" means, so nothing else warns. A checkout
+/// off main is judged only when it is the PRIMARY worktree and others
+/// hang off it — the pod's shape. Two neighbours stay silent: the gate's
+/// own clone, which runs `git checkout -B <car branch>` and has no linked
+/// worktree (and runs every door pin, so a warning there would be one on
+/// every car); and a builder's LINKED worktree on its own branch, which
+/// is a developer working.
+#[test]
+fn a_clone_on_a_branch_and_a_linked_worktree_are_not_the_shared_checkout() {
+    let pod = Pod::new("gate-clone");
+    pod.fast_forward();
+    git(&pod.checkout, &["checkout", "-q", "-B", "fix/a-car"]);
+    let run = pod.run("boss-api", &["GET", "/api/jobs"], &[]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert!(
+        !run.stderr.contains("WARNING"),
+        "a lone clone on a car branch — the gate's — warned: {}",
+        run.stderr
+    );
+
+    let pod = Pod::new("linked-worktree");
+    pod.fast_forward();
+    let wt = pod.link_a_worktree();
+    let body = pod.root.join("body.json");
+    write_file(&body, "{}\n");
+    let run = pod.run_at(
+        &wt.join("infra/dev/boss-api"),
+        "boss-api",
+        &["POST", "/api/jobs", body.to_str().unwrap()],
+        &[],
+    );
+    assert_eq!(
+        run.code, 0,
+        "a linked worktree's own door, on its own branch, was refused: {}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("WARNING") && !run.stderr.contains("REFUSED"),
+        "a linked worktree's own door spoke about its branch: {}",
+        run.stderr
+    );
+    // …and the shared checkout it hangs off, back on main, is silent.
+    let run = pod.run("boss-api", &["GET", "/api/jobs"], &[]);
+    assert!(
+        !run.stderr.contains("WARNING"),
+        "a shared checkout on main warned: {}",
+        run.stderr
     );
 }
 

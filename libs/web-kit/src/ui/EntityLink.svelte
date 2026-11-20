@@ -5,7 +5,7 @@
   // raw id when one is available; ID-shaped kinds keep mono styling.
 
   import Link from './Link.svelte';
-  import { entityHref, ID_IS_LABEL, type EntityKind } from './entity-href';
+  import { entityHref, hasPage, ID_IS_LABEL, type EntityKind } from './entity-href';
 
   let {
     kind,
@@ -33,6 +33,12 @@
   let tooltip = $derived(title ?? (effectiveLabel !== id ? id : undefined));
 </script>
 
-<Link to={entityHref(kind, id)} className={classes}>
-  <span title={tooltip}>{effectiveLabel}</span>
-</Link>
+<!-- A kind with no page (entity-href.ts PAGELESS_KINDS, design 01fa5bdf)
+     is drawn as text: a link would land on not-found. -->
+{#if hasPage(kind)}
+  <Link to={entityHref(kind, id)} className={classes}>
+    <span title={tooltip}>{effectiveLabel}</span>
+  </Link>
+{:else}
+  <span class={classes} data-pageless={kind} title={tooltip}>{effectiveLabel}</span>
+{/if}

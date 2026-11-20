@@ -4,6 +4,7 @@
 import { formatMoney } from '@boss/web-kit/ui/money';
 import { appToday } from '@boss/web-kit/sim-clock';
 import { failedRead, failedWithReason, okRead, type ReadState } from '../data/readState';
+import { fetchRemote, type Remote } from '../data/remote';
 
 const API_BASE = '/api/ledger';
 
@@ -253,6 +254,60 @@ export function loadIncomeStatement(
   return getJson<IncomeStatement>(`${API_BASE}/income-statement${qs ? `?${qs}` : ''}`);
 }
 
+/// The /finance headline's figures, read from the ledger's income
+/// statement. Until backlog 801b6a7a (page audit 3f964c57 gap 3, design
+/// c2820008 D1) the headline was boss-commerce's trailing revenue, which
+/// no Algedonic protocol writes — revenue reaches the ledger through
+/// receive-a-sponsorship and receive-a-payout packets — so it could not
+/// agree with the Income statement tab on the same page. One source
+/// cannot disagree with itself (design 72ccb3b2).
+export type Headline = Readonly<{
+  revenue: number;
+  grossProfit: number;
+  netIncome: number;
+  currency: string;
+}>;
+
+const isCents = (v: unknown): v is number => Number.isSafeInteger(v);
+
+/// A statement missing a total is a failed read, never a NaN headline.
+function parseHeadline(raw: unknown): Headline {
+  const s = (typeof raw === 'object' && raw !== null ? raw : {}) as Record<string, unknown>;
+  if (!isCents(s.total_revenue_cents) || !isCents(s.gross_profit_cents)
+      || !isCents(s.net_income_cents) || typeof s.currency !== 'string') {
+    throw new Error(`${API_BASE}/income-statement: the statement answered no totals`);
+  }
+  return {
+    revenue: s.total_revenue_cents,
+    grossProfit: s.gross_profit_cents,
+    netIncome: s.net_income_cents,
+    currency: s.currency,
+  };
+}
+
+/// One read, over the window the caller names (the page passes the
+/// trailing year, `trailingYear` in ./window).
+export function loadHeadline(
+  window: Readonly<{ from: string; to: string }>,
+): Promise<Exclude<Remote<Headline>, { kind: 'loading' }>> {
+  const qs = new URLSearchParams({ from: window.from, to: window.to }).toString();
+  return fetchRemote(`${API_BASE}/income-statement?${qs}`, parseHeadline);
+}
+
+/// The header's two lines for each state of the read.
+export function headlineText(read: Remote<Headline>): Readonly<{ title: string; subtitle: string }> {
+  if (read.kind === 'loading') return { title: 'Finance', subtitle: 'Loading…' };
+  if (read.kind === 'failed') return { title: 'Finance', subtitle: 'Income statement unavailable' };
+  const { revenue, grossProfit, netIncome, currency } = read.data;
+  const glance = (amount_cents: number): string =>
+    formatMoney({ amount_cents, currency }, { precision: 'compact' });
+  const marginPct = revenue > 0 ? (grossProfit / revenue) * 100 : 0;
+  return {
+    title: `${glance(revenue)} trailing revenue`,
+    subtitle: `${glance(grossProfit)} gross profit (${marginPct.toFixed(1)}%) · ${glance(netIncome)} net income`,
+  };
+}
+
 export function loadBalanceSheet(asOf: string | null): Promise<BalanceSheet | null> {
   const url = asOf
     ? `${API_BASE}/balance-sheet?as_of=${encodeURIComponent(asOf)}`
@@ -323,7 +378,7 @@ export async function loadPeriods(): Promise<PeriodsRead> {
   return { read, periods: body ?? [] };
 }
 
-/// The journal entry a financial fact posted, for /ux/finance?fact=
+/// The journal entry a financial fact posted, for /finance?fact=
 /// (entity-href's `fact` kind; backlog 2ab44d55). `entryId` null is "this
 /// fact posted no entry" only when `read` is ok.
 export async function loadEntryIdForFact(

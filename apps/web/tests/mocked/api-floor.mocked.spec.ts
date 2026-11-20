@@ -25,9 +25,10 @@ import { mountPage } from './_helpers';
 import { installApiFloor, installSmokeMocks } from './_smokeMocks';
 
 /// Three code paths for the chrome: an AppShell route, an IT surface,
-/// and /login, which renders outside the shell.
+/// and /login, which renders outside the shell. The AppShell route was
+/// /ux/jobs until the jobs list went with step 1 of design 01fa5bdf.
 const SURFACES: ReadonlyArray<{ path: string; root?: string }> = [
-  { path: '/ux/jobs' },
+  { path: '/me/inbox' },
   { path: '/it' },
   { path: '/login', root: '.login-card' },
 ];
@@ -74,7 +75,7 @@ test.describe('the api floor', () => {
   // stays a list, and a persona a spec seeds still wins over the floor.
   test('answers a person nothing seeded with 404, as the server does', async ({ page }) => {
     await installApiFloor(page);
-    await mountPage(page, '/ux/jobs');
+    await mountPage(page, '/me/inbox');
     const status = (path: string): Promise<number> =>
       page.evaluate(async (p) => (await fetch(p)).status, path);
     expect(await status('/api/people/emp-nobody')).toBe(404);
@@ -85,7 +86,7 @@ test.describe('the api floor', () => {
 
   test('a seeded persona still answers over the floor', async ({ page }) => {
     await installSmokeMocks(page);
-    await mountPage(page, '/ux/jobs');
+    await mountPage(page, '/me/inbox');
     const read = await page.evaluate(async () => {
       const r = await fetch('/api/people/emp-001');
       return { status: r.status, body: (await r.json()) as { name?: string } };

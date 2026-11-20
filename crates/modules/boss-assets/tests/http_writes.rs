@@ -1,7 +1,8 @@
 //! HTTP-level write path tests for the assets service.
 //!
 //! Each test verifies one business contract via the actual HTTP router.
-//! Events are captured by a `RecordingEventBus` in place of NATS.
+//! The facts a write stages are read off the in-memory store
+//! (`InMemoryAssets::staged_facts`), the analogue of `event_outbox`.
 
 mod common;
 
@@ -29,7 +30,7 @@ async fn post_event_returns_201_created() {
 }
 
 #[tokio::test]
-async fn post_event_publishes_to_event_bus() {
+async fn post_event_stages_its_fact_and_publishes_nothing_itself() {
     let app = AssetsTestApp::new().await;
     let event = received_event("evt-pub-1", "SN-PUB-1");
 
@@ -39,11 +40,16 @@ async fn post_event_publishes_to_event_bus() {
         .await
         .assert_status(StatusCode::CREATED);
 
-    let published = app.bus.assert_event_emitted("asset.received");
+    let staged = app.assets.staged_facts();
+    assert_eq!(staged.len(), 1, "{staged:?}");
+    assert_eq!(staged[0].kind, "asset.received");
     assert_eq!(
-        published.payload.get("id").and_then(|v| v.as_str()),
+        staged[0].payload.get("id").and_then(|v| v.as_str()),
         Some("evt-pub-1"),
     );
+    // The relay publishes the staged fact; the door publishing it too
+    // would deliver it twice (backlog 2e45840a, design ad9519bc part d).
+    assert!(app.bus.events().is_empty(), "{:?}", app.bus.events());
 }
 
 #[tokio::test]

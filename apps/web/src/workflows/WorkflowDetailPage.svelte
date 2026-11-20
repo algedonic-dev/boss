@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { pageLink } from '../shell/stationAddresses.svelte';
   // /it/registry/:slug — port of
   // apps/web/src/admin/WorkflowDetailPage.tsx.
 
@@ -62,7 +63,7 @@
         appToday(),
         { title: `Edit ${spec.kind}`, previousVersion: spec.version },
       );
-      navigate(href(`/it/registry/authoring/${encodeURIComponent(jobId)}`));
+      navigate(pageLink('workflows', {}, `/authoring/${encodeURIComponent(jobId)}`));
     } catch (e) {
       actionError = e instanceof Error ? e.message : String(e);
       action = null;
@@ -140,10 +141,15 @@
   }
 
   // active = the published, live version → ok; retired → muted;
-  // draft → warn (an unpublished draft is attention, and must read
-  // differently from both the live and the retired rows).
+  // rejected → muted (a lost candidate is settled history, backlog
+  // 50ded63d); draft → warn (an unpublished draft is attention, and
+  // must read differently from both the live and the retired rows).
   function statusTone(status: WorkflowSpec['status']): 'ok' | 'warn' | 'muted' {
-    return status === 'active' ? 'ok' : status === 'retired' ? 'muted' : 'warn';
+    return status === 'active'
+      ? 'ok'
+      : status === 'retired' || status === 'rejected'
+        ? 'muted'
+        : 'warn';
   }
 
   // ------- Diff helpers -------
@@ -226,7 +232,7 @@
     : null}
 
   <div class="catalog theme-exec">
-    <Breadcrumb to={href('/it/registry')}>
+    <Breadcrumb to={pageLink('workflows')}>
       ← All job kinds
     </Breadcrumb>
     <PageHeader
@@ -257,7 +263,7 @@
       <button
         type="button"
         class="btn"
-        onclick={() => navigate(href(`/it/registry/new?fork=${encodeURIComponent(spec.kind)}`))}
+        onclick={() => navigate(pageLink('workflows', {}, `/new?fork=${encodeURIComponent(spec.kind)}`))}
         title="Create a new kind pre-populated from this one"
       >
         Fork…

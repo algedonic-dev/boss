@@ -7,7 +7,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "An operator-copied native call/output pair, its evidenced namespace and collection interval. Completed capture metadata is immutable evidence; the terminal establishes recording only, never work delivery."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { owner = "9660c60f-eb47-4405-ae08-fcbb30c71e5f", department = "it", owner_role = "platform-admin" }
 metadata_schema = { type = "object", required = ["source", "namespace", "call_id", "payload_sha256"], properties = { source = { type = "string" }, namespace = { type = "string" }, call_id = { type = "string" }, payload_sha256 = { type = "string" } } }
 
 [[workflow.step]]

@@ -1,0 +1,37 @@
+# ---------------------------------------------------------------------------
+# review — Engineering's review stage (design c0ae096f section 2, car 1,
+# backlog 599fec3e; David, 2026-11-10): the reviews of landed and held
+# cars, which agents now do. Its address is /algedonic/engineering/review,
+# derived from `parent` and stored nowhere.
+#
+# A STAGE STATION INSIDE ENGINEERING, not a sibling department. The
+# landed-review queue stands here (landed-review.toml v5), moved from
+# executive by the same car: a landed car's review is no longer a human
+# step, so it no longer stands at the human's desk.
+#
+# A CONTAINER, NOT A QUEUE: the tagged predicate holds no packet (see
+# algedonic.toml); its children are the queues. It allocates nothing: a
+# stage reserves capacity only when its allocation is measured to differ
+# from Engineering's float. It names no line, so it draws Engineering's.
+# To change this station, bump `version`; `id` never changes.
+#
+# Version 2 (backlog e3a927c3; bumped from the LIVE newest, v1):
+# `placement`, where Review stands on Engineering's floor, {x, y, w, h} in
+# floor units, as David's Plan artboard draws it (2026-11-19). Nothing
+# else changed.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "review"
+version = 2
+status = "active"
+title = "Review — landed and held cars under review"
+kind = "group"
+discipline = ["priority", "age"]
+id = "9deb0155-9804-4488-a043-14add3a8c5be"
+parent = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5"
+mode = "standing"
+placement = { x = 590, y = 590, w = 230, h = 190 }
+
+[station.predicate]
+tags_any = ["station:review"]

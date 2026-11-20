@@ -74,20 +74,19 @@ test('a department the registry adds gets a tab to /<code>, a Jobs row, and its 
   await expect(page.locator('.shell-sidebar a.shell-nav-item-active')).toHaveText('Jobs');
 });
 
+// Pinned on the Service queue (/ux/service) until it went with step 1 of
+// design 01fa5bdf; the Churn watchlist, owned by Sales, carries it now.
 test('a page owned by a department this instance does not have is not found, with one door Home', async ({ page }) => {
-  // The live roster has no `service` row; the Service queue is owned by
-  // service and gated on the support module, which is on here — so
-  // before this car the page rendered, under a tab nobody could see.
-  await withRoster(page, DEPARTMENTS.filter((d) => d.code !== 'service'));
-  await mountPage(page, '/ux/service');
+  await withRoster(page, DEPARTMENTS.filter((d) => d.code !== 'sales'));
+  await mountPage(page, '/watchlist');
 
-  await expect(page.getByText('Service is not a department on this instance')).toBeVisible();
-  await expect(page.locator('code', { hasText: '/ux/service' })).toBeVisible();
+  await expect(page.getByText('Sales is not a department on this instance')).toBeVisible();
+  await expect(page.locator('code', { hasText: '/watchlist' })).toBeVisible();
   const back = page.getByRole('link', { name: 'Back to Home' });
   await expect(back).toHaveAttribute('href', '/');
-  // Never the module-off notice, and never the Service queue.
+  // Never the module-off notice, and never the watchlist.
   await expect(page.getByText('Not enabled for this tenant')).toHaveCount(0);
-  await expect(page.locator('h1', { hasText: 'Service queue' })).toHaveCount(0);
+  await expect(page.getByText('Churn watchlist')).toHaveCount(0);
   // The chrome is Home's: no department is shown as the reader's place.
   await expect(page.locator('.perspective-tab.active')).toHaveText('Home');
 });
@@ -95,9 +94,9 @@ test('a page owned by a department this instance does not have is not found, wit
 test('a department the instance has renders its page as it always did', async ({ page }) => {
   // The control for the test above: the same path, the full roster.
   await withRoster(page, DEPARTMENTS);
-  await mountPage(page, '/ux/service');
+  await mountPage(page, '/watchlist');
   await expect(page.getByText('is not a department on this instance')).toHaveCount(0);
-  await expect(page.locator('h1', { hasText: 'Service queue' })).toBeVisible();
+  await expect(page.getByText('Churn watchlist').first()).toBeVisible();
 });
 
 test('the retired /ux/departments/<code> is not found, like any path nothing serves', async ({ page }) => {

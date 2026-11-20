@@ -80,6 +80,8 @@ boss-files-gc.yaml instance
 boss-ledger-recognize.yaml instance
 boss-ledger-replay-check.yaml instance
 boss-messages-events-purge.yaml instance
+# Each instance owes its own deferred byte-pinned index and retry receipt.
+boss-post-start-schema.yaml instance
 boss-search-reindex.yaml instance
 boss-views-catchup.yaml instance
 
@@ -90,6 +92,10 @@ boss-views-catchup.yaml instance
 # instances from it — one pipeline, one forge, two converges.
 boss-conductor.yaml pipeline
 boss-dev.yaml pipeline
+# The standby shell beside the dev pod (design 0491591b): the operator's
+# foothold in the pipeline's namespace when the dev pod cannot schedule.
+# It exists once, like the dev pod it stands in for.
+boss-dev-standby.yaml pipeline
 boss-dev-build-egress.yaml pipeline
 boss-dev-access.yaml pipeline
 boss-credential-broker.yaml pipeline
@@ -190,3 +196,15 @@ boss-backup.yaml pipeline
 # more for every instance. Each object names its namespace, so the
 # render copies it as written and substitutes nothing.
 boss-node-maintenance.yaml pipeline
+
+# The durable Longhorn class (design 3c475a19 D2, backlog 46328c3a): one
+# cluster-scoped StorageClass placing three replicas only on disks tagged
+# `durable`. PIPELINE because a StorageClass exists once per CLUSTER:
+# rendered per instance, every instance directory would apply the same
+# name again.
+longhorn-durable.yaml pipeline
+
+# The restore drill's Longhorn class (backlog 156eb6e5): one replica,
+# placed only on a disk tagged `postgres`. PIPELINE for the durable
+# class's reason: a StorageClass exists once per cluster.
+longhorn-restore-drill.yaml pipeline

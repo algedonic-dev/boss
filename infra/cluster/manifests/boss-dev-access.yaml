@@ -42,7 +42,10 @@
 #     verifies what it applied (design Q5)
 #   - see cluster-scoped objects: nodes, StorageClasses, PVs. Note
 #     this means it CANNOT answer the node-capacity question from
-#     design Q1; that measurement needs the admin config.
+#     design Q1; that measurement needs the admin config. (Amended
+#     2026-10-19, backlog a386866e: it may read Longhorn's view of its
+#     own disks — the dev-session-storage-read Role at the bottom of
+#     this file — which is the one capacity the worker budget needs.)
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -226,6 +229,53 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: dev-session-ops-read
+subjects:
+  - kind: ServiceAccount
+    name: dev-session
+    namespace: boss-dev
+---
+# The worker storage budget, read where Longhorn keeps it (backlog
+# a386866e, 2026-10-19). `dev-build start` counted held volumes against
+# a constant six while w-1 could place three: node-disk-usage w-1
+# (ca3c5881) read 603.8 GiB available of 928.9, and Longhorn refuses a
+# replica under its 25% floor, so 371.6 GiB was placeable. The
+# controller in infra/dev/dev-build.py now reads that space before each
+# start, and these are the two reads it makes — nothing more:
+#   - `list` on Longhorn Nodes, whose status names each disk's maximum,
+#     available and scheduled bytes and whether it may take a replica.
+#     It holds disk paths and conditions, no credential. The kubelet's
+#     /stats/summary was the other source, and it is nodes/proxy, the
+#     grant eeac3d56 removed from every in-cluster token and
+#     the_dev_session_writes_no_workload_in_boss refuses.
+#   - `get` on the ONE setting that names the floor, by name. Longhorn
+#     settings also name backup targets and their credential Secrets,
+#     so no list and no other name.
+# Read-only, in longhorn-system alone, and no write of any kind: a
+# Longhorn write here would be a placement decision, which is the
+# operator's through the replica verbs, never the build controller's.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dev-session-storage-read
+  namespace: longhorn-system
+rules:
+  - apiGroups: [longhorn.io]
+    resources: [nodes]
+    verbs: [list]
+  - apiGroups: [longhorn.io]
+    resources: [settings]
+    resourceNames: [storage-minimal-available-percentage]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dev-session-storage-read
+  namespace: longhorn-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: dev-session-storage-read
 subjects:
   - kind: ServiceAccount
     name: dev-session

@@ -1692,6 +1692,147 @@ fn a_new_sha_flips_current_and_keeps_the_previous_generation_on_disk() {
     assert_eq!(c.current().as_deref(), Some(SHA_C));
 }
 
+/// NEVER BACKWARDS, UNDER THE LOCK (review fea0a737 of car a51bb843,
+/// backlog f72c9a8f). With BOSS_CLI_FORWARD_ONLY naming a checkout, a
+/// sha that is an ancestor of the generation `current` already names is
+/// `superseded` (exit 3), judged after the store's lock is taken, and
+/// nothing is pulled or moved; a descendant installs; and an ancestry
+/// read that errors is `unordered` (exit 4), refused closed (review
+/// 5f191039). Without it, an older sha still installs — on boss-gcp and
+/// the forge that is a rollback target, and they never set it.
+#[test]
+fn forward_only_refuses_an_ancestor_of_current_and_a_rollback_without_it_still_flips() {
+    if !tools() {
+        return;
+    }
+    let c = Case::new("forward-only");
+    let repo = c.root.join("repo");
+    create_dir(&repo);
+    let git = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .current_dir(&repo)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@test",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git {args:?}: {}", text(&out));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q"]);
+    let mut shas = Vec::new();
+    for train in ["older", "newer"] {
+        write_file(&repo.join("train"), train);
+        git(&["add", "train"]);
+        git(&["commit", "-q", "-m", train]);
+        shas.push(git(&["rev-parse", "HEAD"]));
+    }
+    let (older, newer) = (&shas[0], &shas[1]);
+    // The registry holds both trains' images, by their short tags.
+    write_file(
+        &c.fix.join("tags"),
+        &format!("{}\n{}\n", &older[..7], &newer[..7]),
+    );
+    let forward = [("BOSS_CLI_FORWARD_ONLY", repo.display().to_string())];
+
+    let (rc, out) = c.run(newer, &forward);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(c.current().as_deref(), Some(newer.as_str()), "{out}");
+
+    c.clear_requests();
+    let (rc, out) = c.run(older, &forward);
+    assert_eq!(rc, 3, "an ancestor of current is superseded: {out}");
+    assert!(out.contains("SUPERSEDED"), "said loudly: {out}");
+    assert!(
+        c.summary("cli_result").starts_with("superseded:"),
+        "and on the packet: {out}"
+    );
+    assert_eq!(
+        c.current().as_deref(),
+        Some(newer.as_str()),
+        "current stays at the later generation: {out}"
+    );
+    assert!(
+        c.requests().is_empty(),
+        "nothing is pulled for a sha that will not be installed: {:?}",
+        c.requests()
+    );
+
+    // An ordering git cannot read is not a pass (review 5f191039): with
+    // the opt-in set, an ancestry read that errors refuses, closed — the
+    // same older sha that installed when this read answered 128 and was
+    // taken as "not proved backwards". Only that read fails here.
+    let real_git = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("locate git")
+            .stdout,
+    )
+    .expect("utf8");
+    write_exec(
+        &c.bin.join("git"),
+        &format!(
+            concat!(
+                "#!/usr/bin/env bash\n",
+                "case \" $* \" in *\" merge-base --is-ancestor \"*)\n",
+                "    echo 'fatal: DISTINCTIVE-INJECTED-ANCESTRY-FAILURE (stub)' >&2; exit 128 ;;\n",
+                "esac\n",
+                "exec '{}' \"$@\"\n",
+            ),
+            real_git.trim()
+        ),
+    );
+    let wrapper = std::fs::read(c.store.join("boss")).expect("the wrapper");
+    c.clear_requests();
+    let (rc, out) = c.run(older, &forward);
+    assert_eq!(rc, 4, "an unreadable order refuses: {out}");
+    assert!(
+        out.contains("UNORDERED") && out.contains("DISTINCTIVE-INJECTED-ANCESTRY-FAILURE"),
+        "said loudly, with git's own words: {out}"
+    );
+    assert!(
+        c.summary("cli_result").starts_with("unordered:"),
+        "and on the packet: {out}"
+    );
+    assert_eq!(
+        c.current().as_deref(),
+        Some(newer.as_str()),
+        "current is untouched: {out}"
+    );
+    assert_eq!(
+        std::fs::read(c.store.join("boss")).expect("the wrapper"),
+        wrapper,
+        "the wrapper is untouched: {out}"
+    );
+    let (_, v) = c.version_through_link();
+    assert!(v.contains(&format!("built from {newer}")), "{v}");
+    assert!(
+        c.requests().is_empty(),
+        "nothing is pulled: {:?}",
+        c.requests()
+    );
+    std::fs::remove_file(c.bin.join("git")).expect("remove the failing git");
+
+    // Unset, the older sha is a rollback target and installs.
+    let (rc, out) = c.run(older, &[]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(c.current().as_deref(), Some(older.as_str()), "{out}");
+
+    // Forward is never refused.
+    let (rc, out) = c.run(newer, &forward);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(c.current().as_deref(), Some(newer.as_str()), "{out}");
+}
+
 /// The image's `boss` is compiled from `unknown` and says only what its
 /// environment tells it; a binary that names ANOTHER commit than the
 /// generation's — a wrapper defect, a wrong image, a copy that is not

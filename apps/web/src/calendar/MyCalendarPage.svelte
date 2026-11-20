@@ -1,5 +1,5 @@
 <script lang="ts">
-  // /calendar/me — global-calendar surface for the currently
+  // /me/calendar — global-calendar surface for the currently
   // logged-in employee. v1 of the design doc's `Step 5`: shows
   // this week's reservations, one column per day. No drag-to-
   // reschedule (v2). No filter pickers yet (v2 — would be
@@ -74,7 +74,7 @@
         || !('job_id' in body) || body.step_id !== stepId || !nativeId(body.job_id)) {
         return { kind: 'unavailable' };
       }
-      const from = new URLSearchParams({ from: '/ux/calendar/me', from_label: 'My schedule' });
+      const from = new URLSearchParams({ from: '/me/calendar', from_label: 'My schedule' });
       return { kind: 'ready', href: `/jobs/${encodeURIComponent(body.job_id)}/steps/${encodeURIComponent(stepId)}?${from}` };
     } catch {
       return { kind: 'unavailable' };

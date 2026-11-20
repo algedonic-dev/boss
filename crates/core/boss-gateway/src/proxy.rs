@@ -183,22 +183,7 @@ pub async fn handle_app(
 ) -> Response {
     let Some(session) = valid_session(req.headers(), &state.session_key) else {
         if is_document_navigation(req.method(), req.headers()) {
-            let next: String = req
-                .uri()
-                .path()
-                .bytes()
-                .map(|b| match b {
-                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                        (b as char).to_string()
-                    }
-                    _ => format!("%{b:02X}"),
-                })
-                .collect();
-            let mut headers = HeaderMap::new();
-            if let Ok(v) = header::HeaderValue::from_str(&format!("/login?next={next}")) {
-                headers.insert(header::LOCATION, v);
-            }
-            return (StatusCode::SEE_OTHER, headers).into_response();
+            return login_redirect(req.uri());
         }
         return unauthorized();
     };
@@ -211,11 +196,47 @@ pub async fn handle_app(
     forward_to_upstream(state, req, config).await
 }
 
+/// The sign-in page, as the SPA's router spells it and as web-kit's
+/// `LOGIN_PATH` (libs/web-kit/src/session/deadSession.ts) spells it.
+/// A Rust constant cannot be imported into the SPA, so the two are one
+/// fact living twice (CLAUDE.md §9a), held equal by
+/// `app_gate_tests::the_gateway_and_the_web_name_one_sign_in_page`.
+pub(crate) const LOGIN_PATH: &str = "/login";
+
+/// Send a signed-out browser to sign in, with the page it asked for —
+/// path AND query — as `?next=`, so signing in returns it there. One
+/// definition for every handler a browser navigates to: the simulator
+/// proxy above and the root SPA (static_files.rs; backlog 7d70cad6,
+/// where a deep link answered a bare 401 and the only way on was `/`).
+/// Everything but unreserved bytes and `/` is percent-encoded, so the
+/// page cannot add a parameter to /login or leave the query; LoginPage
+/// then admits it only if it is an in-app path (`safeSitePath`).
+pub(crate) fn login_redirect(uri: &axum::http::Uri) -> Response {
+    let page = match uri.query() {
+        Some(q) => format!("{}?{q}", uri.path()),
+        None => uri.path().to_string(),
+    };
+    let next: String = page
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    let mut headers = HeaderMap::new();
+    if let Ok(v) = header::HeaderValue::from_str(&format!("{LOGIN_PATH}?next={next}")) {
+        headers.insert(header::LOCATION, v);
+    }
+    (StatusCode::SEE_OTHER, headers).into_response()
+}
+
 /// A browser typing/clicking a URL: GET with an Accept that asks for
 /// HTML. Fetch/XHR sends application/json or */* without text/html
 /// unless explicitly configured — good enough to route people to
 /// login and machines to a status code.
-fn is_document_navigation(method: &axum::http::Method, headers: &HeaderMap) -> bool {
+pub(crate) fn is_document_navigation(method: &axum::http::Method, headers: &HeaderMap) -> bool {
     method == axum::http::Method::GET
         && headers
             .get(header::ACCEPT)
@@ -474,6 +495,90 @@ mod tests {
         assert!(!is_blocked_request_header("cookie"));
         assert!(!is_blocked_request_header("content-type"));
     }
+
+    /// The upstream the forward below reaches: a real listener on
+    /// loopback that answers with the estate-token header it received,
+    /// or `(none)`.
+    async fn recording_upstream() -> String {
+        let app = axum::Router::new().fallback(|headers: HeaderMap| async move {
+            headers
+                .get(machine_token::HEADER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("(none)")
+                .to_string()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        url
+    }
+
+    /// One session-gated `GET /api/things/1` through the gateway as main()
+    /// assembles it — the edge stamp in front, `handle` behind, the
+    /// reverse-proxy client finished as main() finishes it — forwarded
+    /// over a real socket to `upstream`. The inbound request carries a
+    /// FORGED token, which the edge must not let through.
+    async fn forward_through_handle(upstream: &str, token: Option<&str>) -> String {
+        use tower::ServiceExt;
+        const KEY: &[u8] = b"proxy-forward-test-key-0123456789";
+        let config: &'static ProxyConfig = Box::leak(Box::new(ProxyConfig::new("things")));
+        config.upstream.set(upstream.to_string()).unwrap();
+        let state = Arc::new(AppState {
+            session_key: KEY.to_vec(),
+            proxy_client: boss_gateway::machine_client::finish(reqwest::Client::builder()).unwrap(),
+            perf: Arc::new(crate::perf::PerfCollector::new()),
+            machine_token: Arc::new(machine_token::Source::fixed(token.map(String::from))),
+            machine: boss_gateway::machine_client::MachineClient::unstamped(
+                reqwest::Client::builder(),
+            )
+            .unwrap(),
+        });
+        let app = axum::Router::new()
+            .route(
+                "/api/things/{*rest}",
+                axum::routing::any(move |s, r| handle(s, r, config)),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::role_headers::inject_role_headers,
+            ))
+            .with_state(state);
+        let mut session = Session::new("real@example.com", 3600);
+        session.employee_id = Some("emp-001".to_string());
+        let req = axum::http::Request::builder()
+            .uri("/api/things/1")
+            .header(
+                header::COOKIE,
+                format!("{}={}", session::COOKIE_NAME, session.encode(KEY)),
+            )
+            .header(machine_token::HEADER, "forged-by-the-client")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "the forward did not arrive");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Backlog 3107bfb1 (review a2172ed3 of car 01872c8e): the forward
+    /// stamp was pinned only against a test double that re-implements
+    /// [`forward_to_upstream`] (role_headers.rs `gateway_forwarding_to`),
+    /// so a forward that dropped or never set the header — `forward`'s
+    /// header filter, the restamp's place in the order — would pass every
+    /// test while each service's enforcing gate refused the gateway. This
+    /// drives `handle` itself to a real upstream.
+    #[tokio::test]
+    async fn a_real_forward_carries_the_estate_token_to_its_upstream() {
+        const TOKEN: &str = "estate-token-under-test-forward";
+        let upstream = recording_upstream().await;
+        assert_eq!(forward_through_handle(&upstream, Some(TOKEN)).await, TOKEN);
+        // Control: a gateway holding no token forwards none — so the value
+        // above is the gateway's stamp, and the client's forged header
+        // reached the upstream on neither leg.
+        assert_eq!(forward_through_handle(&upstream, None).await, "(none)");
+    }
 }
 
 #[cfg(test)]
@@ -510,5 +615,46 @@ mod app_gate_tests {
         ));
         // No Accept header at all: a machine.
         assert!(!is_document_navigation(&get, &HeaderMap::new()));
+    }
+
+    /// The page rides as `?next=`, query included, and cannot add a
+    /// parameter to /login or end the query (backlog 7d70cad6).
+    #[test]
+    fn the_login_redirect_keeps_the_page_and_its_query() {
+        let at = |uri: &str| {
+            let resp = login_redirect(&uri.parse().unwrap());
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            resp.headers()[header::LOCATION]
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(at("/simulator/config"), "/login?next=/simulator/config");
+        assert_eq!(
+            at("/ux/jobs/abc?tab=steps&x=1"),
+            "/login?next=/ux/jobs/abc%3Ftab%3Dsteps%26x%3D1"
+        );
+    }
+
+    /// The gateway and the SPA send a dead session to ONE sign-in page
+    /// with ONE parameter name: LoginPage reads `next` off `LOGIN_PATH`,
+    /// and both senders must agree with it (§9a).
+    #[test]
+    fn the_gateway_and_the_web_name_one_sign_in_page() {
+        const DEAD_SESSION_TS: &str = "libs/web-kit/src/session/deadSession.ts";
+        let path = boss_testing::repo_root().join(DEAD_SESSION_TS);
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let declared = format!("export const LOGIN_PATH = '{LOGIN_PATH}';");
+        assert!(
+            src.lines().any(|l| l.trim() == declared),
+            "{DEAD_SESSION_TS} must declare `{declared}` — the gateway's \
+             proxy::LOGIN_PATH has drifted from the web's"
+        );
+        assert!(
+            src.contains("`${LOGIN_PATH}?next="),
+            "{DEAD_SESSION_TS} no longer builds `${{LOGIN_PATH}}?next=` — the \
+             gateway's login_redirect names the page with `?next=`"
+        );
     }
 }

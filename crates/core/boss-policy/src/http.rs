@@ -1919,6 +1919,81 @@ mod tests {
         assert_eq!(repo.writes().len(), 1);
     }
 
+    /// Backlog 912da9b7 (re-review of car a8becd52): break-glass retired a
+    /// deny override on anything it held — measured, a suspended
+    /// operator's deny on `job close` came off 204 — while it cannot
+    /// retire a plain grant (that is a Delete, which it never holds). An
+    /// emergency key that widens and cannot narrow is not narrow. Its one
+    /// override power is the lockout lever, a deny on `policy-rule`; every
+    /// other retirement is refused, naming that lever, and the lever still
+    /// lifts.
+    #[tokio::test]
+    async fn break_glass_retires_an_override_only_on_policy_rule() {
+        let repo = repo(vec![]).await;
+        // A suspension: denies on what break-glass itself holds.
+        let suspension = [
+            grant("emp-suspended", Resource::job(), Action::Close, Scope::None),
+            grant(
+                "emp-suspended",
+                Resource::step(),
+                Action::Update,
+                Scope::None,
+            ),
+            grant(
+                "emp-suspended",
+                Resource::new("step-signoff:platform-admin"),
+                Action::SignOff,
+                Scope::None,
+            ),
+            // Narrowed rather than denied: its retirement is a grant too.
+            grant(
+                "emp-suspended",
+                Resource::job(),
+                Action::Create,
+                Scope::Team,
+            ),
+        ];
+        let lockout = grant(
+            "emp-suspended",
+            Resource::policy_rule(),
+            Action::Update,
+            Scope::None,
+        );
+        for ov in suspension.iter().chain([&lockout]) {
+            repo.inner
+                .upsert_user_override(ov, "emp-suspender")
+                .await
+                .expect("seed the suspension");
+        }
+        let key = user("emp-oncall", "break-glass");
+        for ov in &suspension {
+            let (status, text) = guarded(
+                &repo,
+                Fixed::founder_only(),
+                Method::DELETE,
+                &format!("/api/policy/user-overrides/{}", ov.id),
+                None,
+                &key,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{}: {text}", ov.id);
+            assert!(text.contains("policy-rule"), "names the lever: {text}");
+        }
+        assert_eq!(repo.writes(), vec![], "{:?}", repo.writes());
+
+        let (status, text) = guarded(
+            &repo,
+            Fixed::founder_only(),
+            Method::DELETE,
+            &format!("/api/policy/user-overrides/{}", lockout.id),
+            None,
+            &key,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "the lever lifts: {text}");
+        assert_eq!(repo.writes().len(), 1, "{:?}", repo.writes());
+    }
+
     /// H3. Rule 1 read the caller's decision through its own overrides,
     /// so an override expiring in an hour was authority for a permanent
     /// grant — to someone else, as a role rule, or to the caller itself

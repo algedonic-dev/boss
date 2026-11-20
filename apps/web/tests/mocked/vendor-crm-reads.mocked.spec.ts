@@ -1,4 +1,4 @@
-// /ux/vendors/{id} — a refused vendor CRM read is not an empty CRM.
+// /finance/vendors/{id} — a refused vendor CRM read is not an empty CRM.
 //
 // Backlog 865d3d51. `fetchCrmList` in src/vendors/api.ts turned a
 // refusal, a non-list body or a network error of the account-team,
@@ -14,7 +14,7 @@ import { installSmokeMocks } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
 
 const VID = 'vnd-hops-001';
-const PATH = `/ux/vendors/${VID}`;
+const PATH = `/finance/vendors/${VID}`;
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
@@ -49,7 +49,7 @@ async function install(page: Page, refused: string | null): Promise<void> {
 const section = (page: Page, title: RegExp) =>
   page.locator('section', { has: page.getByRole('heading', { name: title }) });
 
-test.describe('/ux/vendors/{id} — the vendor CRM reads', () => {
+test.describe('/finance/vendors/{id} — the vendor CRM reads', () => {
   test('answered and empty, each section says it has none, and nothing says a read failed', async ({ page }) => {
     await install(page, null);
     await mountPage(page, PATH);

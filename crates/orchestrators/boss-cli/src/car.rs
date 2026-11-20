@@ -348,14 +348,7 @@ pub(crate) async fn open(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let branch = check_branch(branch)?;
-    if summary.trim().is_empty() || excludes.trim().is_empty() {
-        bail!(
-            "--summary and --excludes are both required: the `scope` step asks what the \
-             change contains and what it deliberately leaves out, and the registry row \
-             says why it is asked BEFORE the work — that is the only moment the decision \
-             keeps a PR small."
-        );
-    }
+    check_scope(summary, excludes)?;
     // WHICH ITEM — before the actor, the reads and the POST, so a missing
     // answer costs a line of output rather than a half-filled packet. The
     // refusal is the GATE'S OWN (see `ItemAnswer::check`).
@@ -374,12 +367,121 @@ pub(crate) async fn open(
     // rather than resolved by whichever query ran first (381a4872).
     let item = item.resolve_ids(&http).await?;
 
+    let base = crate::sor_client::resolve_jobs_base(None)?;
+    let door = crate::steps::Wire::at(base.clone(), crate::identity::caller())?;
+    let worktree = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let owner = if dry {
+        String::new()
+    } else {
+        crate::owner::for_filing_at(&base).await
+    };
+    let admitted = admit(
+        &door,
+        &Admission {
+            branch,
+            summary,
+            excludes,
+            item: &item,
+            actor: &actor,
+            host: &crate::prove::host(),
+            worktree: &worktree,
+            extra: serde_json::Map::new(),
+        },
+        &owner,
+        dry,
+        now,
+    )
+    .await?;
+
+    // THE CAR IS THE ITEM'S BUILD — and saying so at OPEN rather than at
+    // green is the point: the item's `build` step opens when the build
+    // starts. Last, so a failure here costs the routing and not the car.
+    if let Admitted::Filed(id) = &admitted
+        && let Some(closes) = item.backlog_item.as_deref()
+    {
+        crate::park::route_linked_item(&http, closes, id, branch, "car").await;
+    }
+    Ok(())
+}
+
+/// The scope a car is opened with — both halves required.
+fn check_scope(summary: &str, excludes: &str) -> Result<()> {
+    if summary.trim().is_empty() || excludes.trim().is_empty() {
+        bail!(
+            "--summary and --excludes are both required: the `scope` step asks what the \
+             change contains and what it deliberately leaves out, and the registry row \
+             says why it is asked BEFORE the work — that is the only moment the decision \
+             keeps a PR small."
+        );
+    }
+    Ok(())
+}
+
+/// Everything one admission of a car at build start states.
+pub(crate) struct Admission<'a> {
+    pub(crate) branch: &'a str,
+    pub(crate) summary: &'a str,
+    pub(crate) excludes: &'a str,
+    pub(crate) item: &'a ItemAnswer,
+    /// Who is building: recorded as `built_by`, and the signer whose
+    /// claim takes the `build` step.
+    pub(crate) actor: &'a str,
+    pub(crate) host: &'a str,
+    pub(crate) worktree: &'a str,
+    /// Further car metadata the admitting door records — `boss dispatch
+    /// --started` names its run and itself ([`car::ADMITTED_BY`]).
+    pub(crate) extra: serde_json::Map<String, Value>,
+}
+
+/// What [`admit`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Admitted {
+    /// A new car, at build.
+    Filed(String),
+    /// The branch already had its one live car; nothing was filed.
+    Already(String),
+    /// `--dry-run`: nothing was written.
+    Dry,
+}
+
+/// ADMIT THE CAR AT BUILD START — the one body of `boss car open`, and
+/// the door `boss dispatch --started` admits a dispatched build's car
+/// through (backlog 68a8726e, design 689d1f7f car 1), so the two cannot
+/// disagree about what a car at build is (CLAUDE.md §9a).
+///
+/// Files the packet at `opened`, declares the `scope`, CLAIMS `build`
+/// and reads it back — or, when the branch already has its live car
+/// (`car::open_car_for`: aboard, parked, or building), files nothing and
+/// names it. A landed branch is refused.
+pub(crate) async fn admit(
+    door: &dyn crate::car_retire::Door,
+    a: &Admission<'_>,
+    owner: &str,
+    dry: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Admitted> {
+    let branch = check_branch(a.branch)?;
+    check_scope(a.summary, a.excludes)?;
+
     // EVERY OPEN CAR, PAGED. A limit is not a filter, and the question
     // "does this branch already have a car" must not answer `None`
     // because the car sat past page one — that false negative is what
     // filed three twins (a-limit-is-not-a-filter; 832 ship-a-change
     // packets existed on 2026-09-09).
-    let cars = crate::sor_client::all_open_cars(&http).await?;
+    let cars = crate::train::list_all_pages(|offset| async move {
+        door.send(
+            reqwest::Method::GET,
+            &format!(
+                "/api/jobs?kind=ship-a-change&status=open&full=true&limit={}&offset={offset}",
+                crate::train::PAGE_LIMIT
+            ),
+            None,
+        )
+        .await
+    })
+    .await?;
     match open_action(&cars, branch) {
         OpenAction::Refuse(why) => bail!("boss car: REFUSED — {why}"),
         OpenAction::Already(existing) => {
@@ -407,34 +509,29 @@ pub(crate) async fn open(
                  holds.",
                 &id[..8.min(id.len())]
             );
-            return Ok(());
+            return Ok(Admitted::Already(id.to_string()));
         }
         OpenAction::File => {}
     }
 
-    let host = crate::prove::host();
-    let worktree = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-
     if dry {
         println!(
-            "boss car: DRY would open a car for {branch} as {actor} on {host} \
-             ({worktree}), scope declared and build claimed"
+            "boss car: DRY would open a car for {branch} as {} on {} ({}), scope declared \
+             and build claimed",
+            a.actor, a.host, a.worktree
         );
-        return Ok(());
+        return Ok(Admitted::Dry);
     }
 
-    let owner = crate::owner::for_filing_at(&crate::sor_client::resolve_jobs_base(None)?).await;
-    let created = crate::sor_client::api(
-        &http,
-        reqwest::Method::POST,
-        "/api/jobs",
-        Some(open_body(
-            branch, summary, &item, &actor, &host, &worktree, now, &owner,
-        )),
-    )
-    .await?;
+    let mut body = open_body(
+        branch, a.summary, a.item, a.actor, a.host, a.worktree, now, owner,
+    );
+    if let Some(md) = body.get_mut("metadata").and_then(Value::as_object_mut) {
+        md.extend(a.extra.clone());
+    }
+    let created = door
+        .send(reqwest::Method::POST, "/api/jobs", Some(body))
+        .await?;
     let id = created
         .as_ref()
         .and_then(|c| c.get("data").unwrap_or(c).get("id"))
@@ -445,30 +542,21 @@ pub(crate) async fn open(
     // A 201 IS A CLAIM; THE READ-BACK IS THE FACT — and the read is
     // needed anyway, because the step ids only exist once the packet
     // does (`boss job file` encodes the same rule).
-    let car_json = crate::sor_client::api(
-        &http,
-        reqwest::Method::GET,
-        &format!("/api/jobs/{id}"),
-        None,
-    )
-    .await?
-    .ok_or_else(|| anyhow::anyhow!("filed car {id} and the API will not read it back"))?;
+    let car_json = crate::car_retire::read_via(door, &id).await?;
 
     // DECLARE THE SCOPE. The writes are decided in core, shared with the
     // two finishers, and skip anything already done. Each is the
     // evidence through the step merge door, THEN a status-only PUT — a
     // PUT carrying metadata replaces the step's stored keys wholesale
     // (backlog e39a9d2a; `car::StepWrite` says why the order matters).
-    for w in car::open_writes(&car_json, summary, excludes, now).map_err(anyhow::Error::msg)? {
-        crate::sor_client::api(
-            &http,
+    for w in car::open_writes(&car_json, a.summary, a.excludes, now).map_err(anyhow::Error::msg)? {
+        door.send(
             reqwest::Method::PATCH,
             &w.merge_path(&id),
             Some(w.metadata.clone()),
         )
         .await?;
-        crate::sor_client::api(
-            &http,
+        door.send(
             reqwest::Method::PUT,
             &w.status_path(&id),
             Some(w.status_body),
@@ -482,34 +570,26 @@ pub(crate) async fn open(
     // refusal naming the other one instead of a second car.
     let build_id = car::step_id_for(&car_json, BUILD_SLUG, BUILD)
         .ok_or_else(|| anyhow::anyhow!("car {id} has no `{BUILD_SLUG}` step to claim"))?;
-    let claimed = crate::sor_client::api(
-        &http,
-        reqwest::Method::POST,
-        &format!("/api/jobs/{id}/steps/{build_id}/claim"),
-        None,
-    )
-    .await;
-    match claimed {
-        Ok(_) => {}
-        Err(e) => println!(
+    let claimed = door
+        .send(
+            reqwest::Method::POST,
+            &format!("/api/jobs/{id}/steps/{build_id}/claim"),
+            None,
+        )
+        .await;
+    if let Err(e) = claimed {
+        println!(
             "boss car: car {} is open but its `build` step would not claim ({e}) — \
              the packet exists and records the build; claim it from the step surface, \
              or carry on and gate, which completes it either way.",
             &id[..8.min(id.len())]
-        ),
+        );
     }
 
     // CONFIRM BY READING IT BACK, not by the status codes above: a step
     // PUT carrying an unknown field is a silent 204 no-op, and a claim
     // that lost its race is a 409 we chose not to fail on.
-    let after = crate::sor_client::api(
-        &http,
-        reqwest::Method::GET,
-        &format!("/api/jobs/{id}"),
-        None,
-    )
-    .await?
-    .ok_or_else(|| anyhow::anyhow!("could not read car {id} back to confirm it"))?;
+    let after = crate::car_retire::read_via(door, &id).await?;
     let step_state = |slug: &str, title: &str| {
         car::find_step(&after, slug, title)
             .and_then(|s| s.get("status"))
@@ -525,17 +605,317 @@ pub(crate) async fn open(
         step_state(BUILD_SLUG, BUILD),
     );
     println!(
-        "  built by {actor} on {host} ({worktree}) — the green will FINISH this packet, \
-         not file a second."
+        "  built by {} on {} ({}) — the green will FINISH this packet, not file a second.",
+        a.actor, a.host, a.worktree
     );
+    Ok(Admitted::Filed(id))
+}
 
-    // THE CAR IS THE ITEM'S BUILD — and saying so at OPEN rather than at
-    // green is the point: the item's `build` step opens when the build
-    // starts. Last, so a failure here costs the routing and not the car.
-    if let Some(closes) = item.backlog_item.as_deref() {
-        crate::park::route_linked_item(&http, closes, &id, branch, "car").await;
+/// A GATE LAUNCH MOVES THE BRANCH'S CAR INTO THE GATE (backlog
+/// 68a8726e, design 689d1f7f car 1): `build` handed in, `gate` stamped
+/// with the gate-run and claimed, so the car stands at `gate` while the
+/// gate holds it — the state the engineering station's ship-a-change
+/// line could never show while cars were filed at green.
+///
+/// The car is found by the launching RUN first, then by the branch
+/// (`car::run_car_for`, Codex review of car 0d04ee3e R1): the run's own
+/// building car, re-pointed to this branch when the builder renamed it
+/// (the twin 4547c8bc), else the branch's building car — refused when
+/// another run of another change admitted it, rather than stamping some
+/// other build's gate. A parked or boarded car is past its gate and is
+/// left alone. `None` when there is no car to move.
+///
+/// The caller treats every error as a warning: the gate is the work,
+/// and the car's position is its record.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn into_gate(
+    door: &dyn crate::car_retire::Door,
+    branch: &str,
+    gate_run: &str,
+    head: &str,
+    test: &str,
+    agent_run: Option<&str>,
+    item: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<String>> {
+    let cars = open_cars_via(door).await?;
+    let found = match car::run_car_for(&cars, agent_run, item, branch)
+        .map_err(|why| anyhow::anyhow!("boss gate: the car was not moved — {why}"))?
+    {
+        car::RunCar::Run(c) => {
+            repoint(door, c, branch).await?;
+            c
+        }
+        car::RunCar::Branch(c) => c,
+        car::RunCar::Neither => return Ok(None),
+    };
+    let id = found
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("the car at build has no id"))?
+        .to_string();
+    if car::ending_of(found).is_some() {
+        return Err(ended_under_launch(door, &id).await);
     }
+    let Some(plan) =
+        car::gate_launch(found, gate_run, head, test, now).map_err(anyhow::Error::msg)?
+    else {
+        return Ok(None);
+    };
+    // THE STAMP IS THE FENCE, AND IT GOES FIRST (backlog 366c9fb1, Codex
+    // review of car 0d04ee3e R4b). A car whose run or item ended before
+    // any gate is claimed on this same step, judged on `gate_run` absent;
+    // this stamp is judged on that claim absent. Exactly one lands. Lost,
+    // this launch writes nothing — not the build, not the claim — and
+    // finishes the ending it lost to.
+    if crate::car_retire::patch_step_metadata_expecting(
+        door,
+        &id,
+        &plan.gate_step,
+        plan.gate_merge.clone(),
+        &plan.fence,
+    )
+    .await?
+        == crate::car_retire::Judged::Moved
+    {
+        return Err(ended_under_launch(door, &id).await);
+    }
+    if let Some(w) = &plan.build {
+        door.send(
+            reqwest::Method::PATCH,
+            &w.merge_path(&id),
+            Some(w.metadata.clone()),
+        )
+        .await?;
+        door.send(
+            reqwest::Method::PUT,
+            &w.status_path(&id),
+            Some(w.status_body.clone()),
+        )
+        .await?;
+    }
+    // CLAIM WHEN THE STEP IS NOT ACTIVE NOW, not when it was not active
+    // at the read: an older gate's red may have handed the step back to
+    // READY between that read and the restamp above (its writes are
+    // judged on its own gate-run, which still held the step then), and a
+    // gate that ran in a READY step would be invisible at the station.
+    let claim = plan.claim || {
+        let now_car = crate::car_retire::read_via(door, &id).await?;
+        car::find_step(&now_car, car::GATE_SLUG, car::GATE)
+            .and_then(|s| s.get("status"))
+            .and_then(Value::as_str)
+            != Some("active")
+    };
+    if claim {
+        door.send(
+            reqwest::Method::POST,
+            &format!("/api/jobs/{id}/steps/{}/claim", plan.gate_step),
+            None,
+        )
+        .await?;
+    }
+    Ok(Some(id))
+}
+
+/// The refusal a launch gives when the car's ending holds the fence —
+/// after finishing that ending, so the car does not stand claimed and
+/// open on this launch's account. The gate still runs, and its green
+/// files the branch a fresh car.
+async fn ended_under_launch(door: &dyn crate::car_retire::Door, id: &str) -> anyhow::Error {
+    match finish_ending(door, id).await {
+        Ok(why) => anyhow::anyhow!(
+            "car {id} was ended before this gate reached it ({why}) — nothing of this launch \
+             was written on it; the green files the branch a fresh car"
+        ),
+        Err(e) => anyhow::anyhow!(
+            "car {id} is claimed by an ending, so nothing of this launch was written on it; \
+             finishing that ending failed ({e:#}) and its next reader resumes it"
+        ),
+    }
+}
+
+/// FINISH A CLAIMED ENDING (backlog 366c9fb1, Codex review of car
+/// 0d04ee3e R4a): read the car, send what its claim still owes
+/// (`car::ending_rest`, derived from the claim alone, so any reader sends
+/// the same bytes), and read it back. Every door that finds a claim —
+/// a gate launch whose stamp lost, a repair whose adoption lost — calls
+/// this, so an ending whose own writer died part-way is never left
+/// claimed and open. Returns the recorded why.
+pub(crate) async fn finish_ending(door: &dyn crate::car_retire::Door, id: &str) -> Result<String> {
+    let read = crate::car_retire::read_via(door, id).await?;
+    let read = read.get("data").cloned().unwrap_or(read);
+    for w in car::ending_rest(&read).map_err(anyhow::Error::msg)? {
+        let method = if w.method == "PUT" {
+            reqwest::Method::PUT
+        } else {
+            reqwest::Method::PATCH
+        };
+        door.send(method, &w.path, Some(w.body)).await?;
+    }
+    let back = crate::car_retire::read_via(door, id).await?;
+    let back = back.get("data").cloned().unwrap_or(back);
+    let done = car::find_step(
+        &back,
+        boss_jobs::car_retire::ABANDONED_SLUG,
+        boss_jobs::car_retire::ABANDONED,
+    )
+    .and_then(|s| s.get("status"))
+    .and_then(Value::as_str)
+        == Some("completed");
+    if !done {
+        bail!("car {id}'s `abandoned` terminal did not read back completed");
+    }
+    Ok(back
+        .pointer(&format!("/metadata/{}", car::ABANDONED_WHY))
+        .and_then(Value::as_str)
+        .unwrap_or("its ending is recorded on its gate step")
+        .to_string())
+}
+
+/// Every open car, paged — with each step's metadata (`full=true`), which
+/// the gate binding is read off.
+async fn open_cars_via(door: &dyn crate::car_retire::Door) -> Result<Vec<Value>> {
+    crate::train::list_all_pages(|offset| async move {
+        door.send(
+            reqwest::Method::GET,
+            &format!(
+                "/api/jobs?kind=ship-a-change&status=open&full=true&limit={}&offset={offset}",
+                crate::train::PAGE_LIMIT
+            ),
+            None,
+        )
+        .await
+    })
+    .await
+}
+
+/// Re-point a run's car to the branch its builder renamed it to, saying
+/// where it came from.
+async fn repoint(door: &dyn crate::car_retire::Door, car: &Value, branch: &str) -> Result<()> {
+    let id = car
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("the run's car has no id"))?;
+    let carried = car
+        .pointer("/metadata/branch")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    door.send(
+        reqwest::Method::PATCH,
+        &format!("/api/jobs/{id}/metadata"),
+        Some(serde_json::json!({ "branch": branch, "branch_renamed_from": carried })),
+    )
+    .await?;
     Ok(())
+}
+
+/// Whether `branch`'s live car ([`car::open_car_for`]) is THIS change's:
+/// admitted by `run`, or answering `item`. The record's answer to "is the
+/// forge branch this worktree tracks the build's own car?" — which git's
+/// config cannot give, because a stacked child tracks its parent's car
+/// branch exactly as a renamed repair tracks its own (review dce2840b F1).
+/// `false` when the branch has no live car at all.
+pub(crate) async fn live_car_is_this_change(
+    door: &dyn crate::car_retire::Door,
+    branch: &str,
+    run: &str,
+    item: &str,
+) -> Result<bool> {
+    let cars = open_cars_via(door).await?;
+    Ok(car::open_car_for(&cars, branch).is_some_and(|c| {
+        let md = |k: &str| c.pointer(&format!("/metadata/{k}")).and_then(Value::as_str);
+        md("agent_run") == Some(run) || md("backlog_item") == Some(item)
+    }))
+}
+
+/// R1 (Codex review of car 0d04ee3e): a dispatched run's car resolved by
+/// the RUN before the branch — `Some(message)` when the run or the branch
+/// already has the car (re-pointed to `branch` when the builder renamed
+/// it, and stamped with `run` when an earlier run of the same change
+/// admitted it, so a later rename by THIS run still finds it); `None`
+/// when neither has one and the caller admits through [`admit`]. An
+/// ambiguous or foreign car is an error naming it.
+pub(crate) async fn resolve_run_car(
+    door: &dyn crate::car_retire::Door,
+    run: &str,
+    item: &str,
+    branch: &str,
+) -> Result<Option<String>> {
+    let cars = open_cars_via(door).await?;
+    let id_of = |c: &Value| {
+        c.get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string()
+    };
+    match car::run_car_for(&cars, Some(run), Some(item), branch)
+        .map_err(|why| anyhow::anyhow!("REFUSED — {why}"))?
+    {
+        car::RunCar::Run(c) => {
+            let from = c
+                .pointer("/metadata/branch")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            repoint(door, c, branch).await?;
+            Ok(Some(format!(
+                "run {run}'s car {} re-pointed from {from} to {branch} — adopted, no second car \
+                 filed",
+                id_of(c)
+            )))
+        }
+        car::RunCar::Branch(c) => {
+            if c.pointer("/metadata/agent_run").and_then(Value::as_str) != Some(run) {
+                // THE ADOPTION IS FENCED FIRST, ON THE GATE STEP (backlog
+                // 366c9fb1). The run that admitted this car may be ending
+                // without a gate, and its ending claims the same step
+                // judged on the run binding it read; whichever lands first
+                // wins. An ending that won is FINISHED here rather than
+                // waited on — so an ending whose writer died part-way never
+                // leaves a repair with a car it can neither adopt nor
+                // replace — and this run then admits its own car.
+                let ended = match car::adoption(c, run) {
+                    _ if car::ending_of(c).is_some() => true,
+                    Some((step, body, expect)) => {
+                        crate::car_retire::patch_step_metadata_expecting(
+                            door,
+                            &id_of(c),
+                            &step,
+                            body,
+                            &expect,
+                        )
+                        .await?
+                            == crate::car_retire::Judged::Moved
+                    }
+                    None => bail!(
+                        "car {} has no `{}` step to bind this run on",
+                        id_of(c),
+                        car::GATE_SLUG
+                    ),
+                };
+                if ended {
+                    let why = finish_ending(door, &id_of(c)).await?;
+                    println!(
+                        "boss dispatch --started: car {} was ended before any gate ({why}) — \
+                         this run admits its own",
+                        id_of(c)
+                    );
+                    return Ok(None);
+                }
+                door.send(
+                    reqwest::Method::PATCH,
+                    &format!("/api/jobs/{}/metadata", id_of(c)),
+                    Some(serde_json::json!({ "agent_run": run })),
+                )
+                .await?;
+            }
+            Ok(Some(format!(
+                "{branch} already has its car {} — adopted, no second car filed",
+                id_of(c)
+            )))
+        }
+        car::RunCar::Neither => Ok(None),
+    }
 }
 
 /// `boss car waits-on <car>` — say what an open car's proof waits on
@@ -601,6 +981,21 @@ pub(crate) struct WaitsOnFields {
     pub max_wait_hours: Option<u32>,
     pub next_check_at: Option<String>,
     pub clean_window: Option<CleanWindowFields>,
+    /// The close the probe waits on, as a machine can match it —
+    /// `boss_jobs::car::WAITS_ON_EVENT`. When a packet of that kind
+    /// closes, the dispatcher re-runs the car's probe at once rather
+    /// than at the next hourly recheck (backlog 9e9db2ea).
+    pub event: Option<WaitEventFields>,
+}
+
+/// `waits_on.event`: the kind of packet whose close is the event, and
+/// optionally the start of its title — the fields
+/// `boss_jobs::car::WaitEvent` reads back.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WaitEventFields {
+    pub closes: String,
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -629,8 +1024,8 @@ impl WaitsOnFields {
     pub(crate) fn update(&self) -> Result<Value> {
         if self.is_empty() {
             bail!(
-                "nothing to declare: give --on, --seen, --owner, --max-wait-hours or --next-check-at \
-                 (or --clear to remove the declaration)"
+                "nothing to declare: give --on, --seen, --owner, --max-wait-hours, --next-check-at \
+                 or --event-closes (or --clear to remove the declaration)"
             );
         }
         let blank = |flag: &str, v: &Option<String>| -> Result<Option<String>> {
@@ -655,6 +1050,25 @@ impl WaitsOnFields {
         {
             bail!("--seen is refused under the rules the forge runs it by — {r}");
         }
+        // The recording door admits a car's text without the queue rule,
+        // because a LANDED probe cannot be re-parked — so a `seen` check
+        // that reads the caller's own queue passed here while the forge
+        // runs it as nobody (backlog 5c7ff14f, N2). This is the door
+        // where it is written and rewording is free, as `--park-probe`
+        // is for the probe.
+        if let Some(s) = seen.as_deref()
+            && let Some(marker) = boss_jobs::probe::reads_the_callers_own_queue(s)
+        {
+            bail!(
+                "--seen reads `{marker}` — the queue of whoever runs it, and the forge runs a \
+                 seen check with NO actor (a `boss` read goes out as {unidentified}), so its \
+                 answer depends on who runs it, not on the event.\n\n{evidence}\n\n\
+                 The rule is boss_jobs::probe::reads_the_callers_own_queue (`{rule}`).",
+                unidentified = crate::identity::UNIDENTIFIED,
+                evidence = boss_jobs::probe::CALLERS_OWN_QUEUE_EVIDENCE,
+                rule = boss_jobs::probe::CALLERS_OWN_QUEUE_RULE,
+            );
+        }
         if let Some(o) = owner.as_deref()
             && o.contains(char::is_whitespace)
         {
@@ -678,6 +1092,22 @@ impl WaitsOnFields {
         if self.max_wait_hours == Some(0) {
             bail!("--max-wait-hours 0 is no patience at all: give a positive number of hours");
         }
+        // A blank `closes` keys the car to no close at all while reading
+        // as declared, so it is refused rather than written. A blank
+        // `title` is refused through `blank` like every other flag: it was
+        // dropped in silence, leaving a declaration every close of that
+        // kind fires (backlog 7838df7d, review 4890fdfd N1).
+        let event = match &self.event {
+            None => None,
+            Some(e) if e.closes.trim().is_empty() => bail!(
+                "--event-closes is empty: name the kind of packet whose close the probe waits \
+                 on (gate-run, ops-request, ...)"
+            ),
+            Some(e) => {
+                let title = blank("--event-title", &e.title)?;
+                Some(car::waits_on_event_value(e.closes.trim(), title.as_deref()))
+            }
+        };
         let mut m = serde_json::Map::new();
         let mut put = |k: &str, v: Option<Value>| {
             if let Some(v) = v {
@@ -699,6 +1129,7 @@ impl WaitsOnFields {
             car::WAITS_ON_MAX_WAIT_HOURS,
             self.max_wait_hours.map(Value::from),
         );
+        put(car::WAITS_ON_EVENT, event);
         Ok(Value::Object(m))
     }
 }
@@ -753,6 +1184,52 @@ mod tests {
         );
     }
 
+    /// THE EVENT A PROBE WAITS ON IS DECLARABLE (backlog 9e9db2ea). A
+    /// park file's `[waits_on.event]` table, or `boss car waits-on
+    /// --event-closes`, writes `waits_on.event` in the one shape
+    /// `boss_jobs::car::wait_event` reads — the shape the dispatcher's
+    /// declared-close rule matches a close against. Until then only a hand
+    /// metadata PATCH could write it, and no landed car carried one. A
+    /// blank `closes` is refused: an empty event would key the car to no
+    /// close at all while reading as declared.
+    #[test]
+    fn a_declared_event_is_written_in_the_shape_the_dispatcher_matches() {
+        let fields: WaitsOnFields = toml::from_str(
+            "on = 'a full gate closing after the converge'\nseen = 'true'\n\
+             [event]\ncloses = 'gate-run'\ntitle = 'gate main'\n",
+        )
+        .unwrap();
+        let body = waits_on_body(None, &fields, false).unwrap();
+        assert_eq!(
+            car::wait_event(&body),
+            Some(car::WaitEvent {
+                closes: "gate-run".into(),
+                title: Some("gate main".into())
+            })
+        );
+        let bare = WaitsOnFields {
+            event: Some(WaitEventFields {
+                closes: " ".into(),
+                title: None,
+            }),
+            ..given(Some("x"), Some("true"))
+        };
+        let err = waits_on_body(None, &bare, false).unwrap_err();
+        assert!(err.to_string().contains("closes"), "{err}");
+        // A blank title is refused like every other blank flag (backlog
+        // 7838df7d, review 4890fdfd N1): dropped in silence, it left a
+        // declaration that every close of that kind fires.
+        let blank_title = WaitsOnFields {
+            event: Some(WaitEventFields {
+                closes: "gate-run".into(),
+                title: Some("  ".into()),
+            }),
+            ..given(Some("x"), Some("true"))
+        };
+        let err = waits_on_body(None, &blank_title, false).unwrap_err();
+        assert!(err.to_string().contains("--event-title"), "{err}");
+    }
+
     /// The fields a test hands the verb: `on` and `seen` as given.
     fn given(on: Option<&str>, seen: Option<&str>) -> WaitsOnFields {
         WaitsOnFields {
@@ -772,6 +1249,27 @@ mod tests {
         let err = waits_on_body(None, &given(Some("x"), Some(refused)), false).unwrap_err();
         assert!(err.to_string().contains("--seen is refused"), "{err}");
         assert!(waits_on_body(None, &given(Some("x"), Some("true")), false).is_ok());
+    }
+
+    /// A `seen` CHECK RUNS AS NOBODY TOO (backlog 5c7ff14f, N2). The
+    /// forge runs it beside the car's probe, with no actor, so one that
+    /// greps the caller's own queue rehearses as its author and answers
+    /// as nobody. The recording door admits a car's text without the
+    /// queue rule (a landed probe cannot be re-parked), so the rule is
+    /// asked HERE, where the check is written and rewording is free.
+    #[test]
+    fn a_seen_check_that_reads_the_callers_own_queue_is_refused_at_the_verb() {
+        let mine = "boss orient | grep -A3 'MY WORK' | grep -c ready";
+        let err = waits_on_body(None, &given(Some("x"), Some(mine)), false).unwrap_err();
+        let err = err.to_string();
+        assert!(err.contains("--seen"), "{err}");
+        assert!(err.contains("MY WORK"), "{err}");
+        assert!(
+            err.contains(boss_jobs::probe::CALLERS_OWN_QUEUE_RULE),
+            "{err}"
+        );
+        let every_reader = "boss-sor-read /api/jobs/x | jq -r '.status' | grep -qx closed";
+        assert!(waits_on_body(None, &given(Some("x"), Some(every_reader)), false).is_ok());
     }
 
     /// THE VERB MERGES (backlog e9b164a1 piece 3). It used to PATCH the

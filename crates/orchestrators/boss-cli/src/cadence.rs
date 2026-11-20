@@ -1069,7 +1069,7 @@ async fn api_once(
     })?;
     if !status.is_success() {
         return Err(train::ApiFailure {
-            kind: train::http_failure(status.as_u16(), &text),
+            kind: train::Failure::Http(status.as_u16()),
             cause: anyhow!("{method} {path}: HTTP {status}: {}", text.trim()),
         });
     }
@@ -1806,6 +1806,16 @@ pub async fn run(once: bool, dry: bool) -> Result<()> {
         let outcome = tick(&http, &base, clock.as_ref(), dry, &mut runs).await;
         runs.drain(None).await;
         return outcome.map(|_| ());
+    }
+    // THE GATE-END WATCH, beside the loop (backlog 301d6c3b): a gate's
+    // verdict is recorded when its gate container ends instead of on the
+    // next train-reconcile firing, which cost a median 85 s per gate.
+    // Its own task, never a tick's: it runs for the life of this process,
+    // and nothing it does can stall a tick or fail the loop. Not in a dry
+    // run, which writes nothing, and not for `--once`, which returned
+    // above. Reconcile still records every verdict the watch misses.
+    if !dry {
+        tokio::spawn(train::watch_gate_ends());
     }
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("installing the SIGTERM handler")?;
@@ -2686,8 +2696,12 @@ mod tests {
 
     // -- queue-depth basis: dock pressure --------------------------------
 
+    /// v11 (David, 2026-10-16) removed the fixed cooldown. v12 deliberately
+    /// supersedes that decision (David, 2026-11-02): "Let's move to hourly
+    /// departures for the train, and skip if no cars are ready." Read the
+    /// declared depth and cooldown; the scheduling mechanism does not own them.
     #[test]
-    fn declared_boarding_releases_a_clear_track_on_the_next_minute() {
+    fn declared_boarding_waits_the_declared_cooldown_after_a_working_firing() {
         let specs = boss_jobs::seed_loader::load_cadence_rules(
             boss_jobs::cadence_seed::platform_cadence_path(),
         )
@@ -2697,20 +2711,70 @@ mod tests {
             .find(|s| s.name() == "train-board-on-dock-depth")
             .unwrap();
         let rule = rule_from_row(&spec.row).unwrap();
-        let previous = utc(2026, 10, 16, 12, 0, 0);
-        let next = utc(2026, 10, 16, 12, 1, 0);
+        let Basis::QueueDepth {
+            min_depth,
+            cooldown_minutes,
+        } = &rule.basis
+        else {
+            panic!("declared boarding must use dock depth");
+        };
+        let ready = *min_depth;
+        let cooldown = Duration::minutes(i64::from(*cooldown_minutes));
+        assert!(cooldown > Duration::zero(), "v12 declares a cooldown");
+        let previous = utc(2026, 11, 2, 12, 0, 0);
+        let next = previous + Duration::minutes(1);
+        let boundary = previous + cooldown;
+        let within = boundary - Duration::seconds(1);
         let last = fired(&rule, previous);
         assert_eq!(
-            decide(&rule, next, Some(&last), Some(1), Some(0), &[], None),
-            Decision::Fire(next),
-            "a completed short train must not leave a ready car behind a thirty-minute hold"
+            decide(&rule, within, Some(&last), Some(ready), Some(0), &[], None),
+            Decision::Hold,
+            "a working firing holds until the declared cooldown expires"
         );
         assert_eq!(
-            decide(&rule, next, Some(&last), Some(1), Some(1), &[], None),
+            decide(
+                &rule,
+                boundary,
+                Some(&last),
+                Some(ready),
+                Some(0),
+                &[],
+                None
+            ),
+            Decision::Fire(boundary)
+        );
+        for now in [previous, within, boundary, boundary + cooldown] {
+            assert_eq!(
+                decide(&rule, now, None, Some(0), Some(0), &[], None),
+                Decision::Hold,
+                "an empty dock creates no firing and starts no cooldown"
+            );
+        }
+        assert_eq!(
+            decide(&rule, next, None, Some(ready), Some(0), &[], None),
+            Decision::Fire(next),
+            "a car arriving after an empty tick has no working firing to hold it"
+        );
+        let idle = fired_rc(&rule, previous, Some(IDLE_BOARD_RC));
+        assert_eq!(
+            decide(&rule, next, Some(&idle), Some(ready), Some(0), &[], None),
+            Decision::Fire(next),
+            "a firing that boarded nothing does not hold the cooldown"
+        );
+        assert_eq!(
+            decide(
+                &rule,
+                boundary,
+                Some(&last),
+                Some(ready),
+                Some(1),
+                &[],
+                None
+            ),
             Decision::TrackOccupied(1)
         );
         assert_eq!(
-            decide(&rule, next, Some(&last), Some(1), None, &[], None),
+            decide(&rule, boundary, Some(&last), Some(ready), None, &[], None),
             Decision::TrackUnknown
         );
         assert_eq!(
@@ -2738,9 +2802,9 @@ mod tests {
         assert_eq!(
             decide(
                 &rule,
-                next,
+                boundary,
                 Some(&last),
-                Some(1),
+                Some(ready),
                 Some(0),
                 &[running(&rule.name, 61)],
                 None
@@ -2751,9 +2815,22 @@ mod tests {
         assert_eq!(
             decide(
                 &rule,
-                next,
+                within,
                 Some(&cut_off),
-                Some(1),
+                Some(ready),
+                Some(0),
+                &[],
+                Some(previous)
+            ),
+            Decision::Hold,
+            "a known boarding still holds inside its declared cooldown after restart"
+        );
+        assert_eq!(
+            decide(
+                &rule,
+                boundary,
+                Some(&cut_off),
+                Some(ready),
                 Some(1),
                 &[],
                 Some(previous)
@@ -2764,15 +2841,15 @@ mod tests {
         assert_eq!(
             decide(
                 &rule,
-                next,
+                boundary,
                 Some(&cut_off),
-                Some(1),
+                Some(ready),
                 Some(0),
                 &[],
                 Some(previous)
             ),
-            Decision::Fire(next),
-            "a cut-off claim must not recreate a cooldown after the recorded train clears"
+            Decision::Fire(boundary),
+            "a cut-off claim holds from the recorded boarding, not a new cooldown"
         );
     }
 

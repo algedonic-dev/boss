@@ -1,0 +1,51 @@
+{
+  "verdict": "failed",
+  "head": "fixture",
+  "checks": [
+    {
+      "name": "review-quoted",
+      "result": "fail",
+      "seconds": 111
+    },
+    {
+      "name": "review-plain",
+      "result": "fail",
+      "seconds": 111
+    },
+    {
+      "name": "chain-timeout-last",
+      "result": "fail",
+      "seconds": 111
+    },
+    {
+      "name": "chain-assertion-last",
+      "result": "fail",
+      "seconds": 111
+    },
+    {
+      "name": "review-quoted-chain",
+      "result": "fail",
+      "seconds": 111
+    }
+  ],
+  "fails_excerpt": {
+    "review-quoted": "E\n======================================================================\nERROR: setUpClass (__main__.Review)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/workspace/source/fx-1cac/quoted.py\", line 21, in setUpClass\n    raise AssertionError(\"review child exited %d:%s\" % (child.returncode, said))\nAssertionError: review child exited 1:\nTraceback (most recent call last):\n  File \"<string>\", line 2, in <module>\n  File \"/usr/lib/python3.11/subprocess.py\", line 550, in run\n    stdout, stderr = process.communicate(input, timeout=timeout)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 1207, in communicate\n    stdout, stderr = self._communicate(input, endtime, timeout)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 2085, in _communicate\n    self.wait(timeout=self._remaining_time(endtime))\n  File \"/usr/lib/python3.11/subprocess.py\", line 1262, in wait\n    return self._wait(timeout=timeout)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 1989, in _wait\n    raise TimeoutExpired(self.args, timeout)\nsubprocess.TimeoutExpired: Command '['/usr/bin/python3', '-c', 'import time; time.sleep(30)']' timed out after 0.49999370001023635 seconds\n\n----------------------------------------------------------------------\nRan 0 tests in 0.519s\n\nFAILED (errors=1)",
+    "review-plain": "E\n======================================================================\nERROR: setUpClass (__main__.Review)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/workspace/source/fx-1cac/quoted.py\", line 21, in setUpClass\n    raise AssertionError(\"review child exited %d:%s\" % (child.returncode, said))\nAssertionError: review child exited 1:\n\n----------------------------------------------------------------------\nRan 0 tests in 0.521s\n\nFAILED (errors=1)",
+    "chain-timeout-last": "E\n======================================================================\nERROR: setUpClass (__main__.Chained)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/workspace/source/fx-1cac/chained.py\", line 21, in timeout_last\n    raise ValueError(\"the first reading was wrong\")\nValueError: the first reading was wrong\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"/workspace/source/fx-1cac/chained.py\", line 31, in setUpClass\n    timeout_last()\n  File \"/workspace/source/fx-1cac/chained.py\", line 23, in timeout_last\n    subprocess.run(SLEEP, timeout=0.5)\n  File \"/usr/lib/python3.11/subprocess.py\", line 550, in run\n    stdout, stderr = process.communicate(input, timeout=timeout)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 1207, in communicate\n    stdout, stderr = self._communicate(input, endtime, timeout)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 2085, in _communicate\n    self.wait(timeout=self._remaining_time(endtime))\n  File \"/usr/lib/python3.11/subprocess.py\", line 1262, in wait\n    return self._wait(timeout=timeout)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 1989, in _wait\n    raise TimeoutExpired(self.args, timeout)\nsubprocess.TimeoutExpired: Command '['/usr/bin/python3', '-c', 'import time; time.sleep(30)']' timed out after 0.49998898000922054 seconds\n\n----------------------------------------------------------------------\nRan 0 tests in 0.502s\n\nFAILED (errors=1)",
+    "chain-assertion-last": "E\n======================================================================\nERROR: setUpClass (__main__.Chained)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/workspace/source/fx-1cac/chained.py\", line 34, in setUpClass\n    subprocess.run(SLEEP, timeout=0.5)\n  File \"/usr/lib/python3.11/subprocess.py\", line 550, in run\n    stdout, stderr = process.communicate(input, timeout=timeout)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 1207, in communicate\n    stdout, stderr = self._communicate(input, endtime, timeout)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 2085, in _communicate\n    self.wait(timeout=self._remaining_time(endtime))\n  File \"/usr/lib/python3.11/subprocess.py\", line 1262, in wait\n    return self._wait(timeout=timeout)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 1989, in _wait\n    raise TimeoutExpired(self.args, timeout)\nsubprocess.TimeoutExpired: Command '['/usr/bin/python3', '-c', 'import time; time.sleep(30)']' timed out after 0.4999930600170046 seconds\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/workspace/source/fx-1cac/chained.py\", line 36, in setUpClass\n    raise AssertionError(\"the child should have finished\") from exc\nAssertionError: the child should have finished\n\n----------------------------------------------------------------------\nRan 0 tests in 0.502s\n\nFAILED (errors=1)",
+    "review-quoted-chain": "E\n======================================================================\nERROR: setUpClass (__main__.Chained)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/workspace/source/fx-1cac/chained.py\", line 45, in setUpClass\n    raise AssertionError(\nAssertionError: review child exited 1:\nTraceback (most recent call last):\n  File \"/workspace/source/fx-1cac/chained.py\", line 21, in timeout_last\n    raise ValueError(\"the first reading was wrong\")\nValueError: the first reading was wrong\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"/workspace/source/fx-1cac/chained.py\", line 55, in <module>\n    timeout_last()\n  File \"/workspace/source/fx-1cac/chained.py\", line 23, in timeout_last\n    subprocess.run(SLEEP, timeout=0.5)\n  File \"/usr/lib/python3.11/subprocess.py\", line 550, in run\n    stdout, stderr = process.communicate(input, timeout=timeout)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 1207, in communicate\n    stdout, stderr = self._communicate(input, endtime, timeout)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 2085, in _communicate\n    self.wait(timeout=self._remaining_time(endtime))\n  File \"/usr/lib/python3.11/subprocess.py\", line 1262, in wait\n    return self._wait(timeout=timeout)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 1989, in _wait\n    raise TimeoutExpired(self.args, timeout)\nsubprocess.TimeoutExpired: Command '['/usr/bin/python3', '-c', 'import time; time.sleep(30)']' timed out after 0.4999912299681455 seconds\n\n----------------------------------------------------------------------\nRan 0 tests in 0.538s\n\nFAILED (errors=1)"
+  },
+  "fails_context": {},
+  "fails": [
+    "review-quoted: no cargo test failure in this check's output; 1 error line(s), first 1:",
+    "review-quoted: | ERROR: setUpClass (__main__.Review)",
+    "review-plain: no cargo test failure in this check's output; 1 error line(s), first 1:",
+    "review-plain: | ERROR: setUpClass (__main__.Review)",
+    "chain-timeout-last: no cargo test failure in this check's output; 1 error line(s), first 1:",
+    "chain-timeout-last: | ERROR: setUpClass (__main__.Chained)",
+    "chain-assertion-last: no cargo test failure in this check's output; 1 error line(s), first 1:",
+    "chain-assertion-last: | ERROR: setUpClass (__main__.Chained)",
+    "review-quoted-chain: no cargo test failure in this check's output; 1 error line(s), first 1:",
+    "review-quoted-chain: | ERROR: setUpClass (__main__.Chained)"
+  ]
+}

@@ -538,3 +538,38 @@ async fn the_version_a_publish_supersedes_names_the_publisher_as_its_retirer() {
     .unwrap();
     assert_eq!(retired_by.as_deref(), Some("emp-second"));
 }
+
+#[tokio::test]
+async fn http_publish_cannot_activate_a_lane_draft_created_by_the_seed_path() {
+    let db = TestDb::new().await;
+    let app = router(state(db.pool.clone(), defaults_policy()));
+    let admin = signer("emp-test", "platform-admin");
+    let raw = boss_dispatcher::rules::registry::parse_raw("[[rule]]\nname=\"lane-draft\"\non_event=\"jobs.estate.observed\"\ndelivery_lane=\"estate-watch\"\n[[rule.do]]\nhandler=\"record\"\n").unwrap().rules.remove(0);
+    boss_dispatcher::rules::authoring::create_draft(&db.pool, &raw, Some("platform"), "emp-test")
+        .await
+        .unwrap();
+    let (status, _, text) = post(
+        &app,
+        "/api/dispatcher/rules/lane-draft/publish",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{text}");
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM dispatcher_rules WHERE name='lane-draft'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "draft");
+    // The reviewed seed/car path is still able to publish it explicitly.
+    assert!(
+        boss_dispatcher::rules::authoring::publish(
+            &db.pool,
+            "lane-draft",
+            "automation:tenant-seed"
+        )
+        .await
+        .is_ok()
+    );
+}

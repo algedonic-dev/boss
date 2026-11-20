@@ -637,10 +637,6 @@ mod tests {
                 PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/none").unwrap(),
                 policy,
             )),
-            os_map: None,
-            flow: None,
-            fleet: None,
-            stages: None,
         });
         let who = json!({"id": "emp-1", "role": role, "access_tier": "user"}).to_string();
         let created = app
@@ -753,10 +749,6 @@ mod tests {
                     dark.base.clone(),
                 )),
             )),
-            os_map: None,
-            flow: None,
-            fleet: None,
-            stages: None,
         });
         let who = json!({"id": "emp-1", "role": "operator", "access_tier": "operator"}).to_string();
         let created = app

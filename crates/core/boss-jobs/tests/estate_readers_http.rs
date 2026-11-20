@@ -837,3 +837,49 @@ async fn host_selects_one_hosts_series_before_the_limit_on_both_readers() {
         );
     }
 }
+
+/// THE OBSERVATIONS DOOR, REPRODUCED (backlog 4579f9b5, measured
+/// 2026-09-26 02:50Z and again 2026-11-19 14:45Z):
+/// `/api/estate/observations?scope=host&latest_per=host` answered
+/// total 1 — one row, forge's — while the same read of comparisons
+/// answered 2, because an observation carries no `host` stamp and the
+/// grouping read the bare key, so every observation fell into the one
+/// NULL group. A row's host under `latest_per` is the host `?host=`
+/// already selects by: its stamp, else its first node's id. So both
+/// readers answer one row per host from the same log.
+#[tokio::test]
+async fn latest_per_host_groups_an_observation_by_its_first_node_on_both_readers() {
+    let (app, jobs) = app();
+    let t0: chrono::DateTime<chrono::Utc> = "2026-09-25T00:00:00Z".parse().unwrap();
+    // forge every fifteen minutes until 02:00, boss-gcp once at 10:25.
+    let mut events = Vec::new();
+    for i in 0..8 {
+        events.extend(host_reading(
+            "forge",
+            i,
+            t0 + chrono::Duration::minutes(15 * (i + 1)),
+        ));
+    }
+    events.extend(host_reading(
+        "boss-gcp",
+        0,
+        t0 + chrono::Duration::minutes(10 * 60 + 25),
+    ));
+    events.sort_by_key(|e| e.timestamp);
+    jobs.record_events(&events).await.expect("events record");
+
+    for reader in ["comparisons", "observations"] {
+        let (status, latest) = get_as_reader(
+            &app,
+            &format!("/api/estate/{reader}?scope=host&latest_per=host&limit=50"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reader}: latest_per answers");
+        assert_eq!(
+            markers(&latest),
+            vec!["boss-gcp-0", "forge-7"],
+            "{reader}: one row per host, each its newest, newest first"
+        );
+        assert_eq!(latest["total"], 2, "{reader}: total counts HOSTS");
+    }
+}

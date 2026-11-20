@@ -66,6 +66,17 @@ class LifecycleWire(unittest.TestCase):
                         self.end_headers()
                         self.wfile.write(b"complete invalid API response")
                         return
+                    if behavior["mode"].startswith("absent"):
+                        # The API's own NotFound shape for a Job name.
+                        named = "dev-build-ffffffffffffffff" if behavior["mode"] == "absent-other" else self.path.rsplit("/", 1)[-1]
+                        status = {"kind": "Status", "apiVersion": "v1", "metadata": {}, "status": "Failure",
+                                  "message": "jobs.batch \"%s\" not found" % named, "reason": "NotFound",
+                                  "details": {"name": named, "group": "batch", "kind": "jobs"}, "code": 404}
+                        self.send_response(404)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(b"404 page not found" if behavior["mode"] == "absent-route" else json.dumps(status).encode())
+                        return
                     self.send_response(200 if accepted else 409)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
@@ -111,6 +122,22 @@ class LifecycleWire(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     client.delete_job("dev-build-1234567890abcdef", "known-job-uid", records.append)
                 self.assertEqual(base64.b64decode(records[-1]["response_base64"]), b"complete invalid API response")
+                # Backlog cae3b25b (2026-10-20): the API's NotFound for
+                # exactly this Job name is an observation, handed back for
+                # the controller to judge; whether it retires anything
+                # depends on whether a delete was already attempted, which
+                # only the controller's records know. Any other 404 (another
+                # name, a route the API does not serve) still refuses.
+                behavior["mode"] = "absent"
+                answer = client.delete_job("dev-build-1234567890abcdef", "known-job-uid", records.append)
+                self.assertEqual((answer["kind"], answer["reason"], answer["details"]["name"]),
+                                 ("Status", "NotFound", "dev-build-1234567890abcdef"))
+                self.assertEqual((records[-1]["http_status"], records[-1]["completion"]), (404, "observed"))
+                for mode in ("absent-other", "absent-route"):
+                    behavior["mode"] = mode
+                    with self.assertRaisesRegex(RuntimeError, "refused by API"):
+                        client.delete_job("dev-build-1234567890abcdef", "known-job-uid", records.append)
+                    self.assertEqual(records[-1]["http_status"], 404, mode)
             finally:
                 server.shutdown()
                 server.server_close()

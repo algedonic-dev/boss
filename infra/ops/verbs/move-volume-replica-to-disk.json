@@ -1,0 +1,39 @@
+{
+  "about": "MUTATING — move ONE replica of ONE Longhorn volume to a NAMED disk of the node that already holds it (infra/forge/move-volume-replica.sh --to-disk <volume> <replica> <disk> <plan_sha256>) through the forge's ops_kubectl door (the admin kubeconfig David placed, infra/estate/ops-credentials.sh). Filed as backlog b9789705 on 2026-11-16: the system of record's volume, boss/pgdata-postgres-0 (pvc-93e11a6e-…), had its w-3 replica on w-3's default disk (/var/lib/longhorn), not on u-postgres (/var/mnt/postgres, tagged durable,postgres) where design 3c475a19 puts it, and move-volume-replica only ever puts the new replica on a node holding none. AUTHORISED PER RUN BY DAVID'S PASSKEY in design 17835005's shape, as move-volume-replica is: it declares requires_approval with the read-only plan-a-volume-replica-disk-move (this script's --plan-to-disk) as its plan_verb, so the runner renders the plan onto the request's approve step, runs this only after a passkey on the approvers list signs those bytes, and hands the script sha256 of the SIGNED plan; the script re-renders and changes nothing unless today's plan hashes to it. The count, the replicas, the selector and the anti-affinity before are in the bytes, so a second run of an applied plan is refused: at most once. THE BOUND IS THE SCRIPT'S, NEVER A PARAM: every bound of move-volume-replica but the node rule, and the named disk one of the replica's node's Longhorn disks, with a diskUUID, holding no replica of the volume, tagged, and under a diskSelector of exactly its tags the ONE disk anywhere Longhorn could place on; zone anti-affinity soft; and the diskSelector the volume carries now admitting the disk as Longhorn reads it (allow-empty-disk-selector-volume read), so the new replica is not stranded — or nothing is done (exit 78). Longhorn places by tag, never by disk name, so THE WRITE holds two of the volume's fields only for the move, each step only after the one before read back: (1) one compare-and-set patch that tests spec.numberOfReplicas N, and spec.diskSelector and spec.replicaSoftAntiAffinity as the plan read them where the volume carries them (a key it does not carry has nothing to test, and is added), and sets N+1, the disk's tags, and enabled (with node anti-affinity hard Longhorn will not put a second replica on the node holding the first); (2) a wait of up to 1200 s for a NEW replica healthy on the named disk's diskUUID — a stall, or a replica that lands anywhere else, leaves the count at N+1 and deletes NOTHING; (3) a compare-and-set lowering N+1 -> N that puts the selector and the anti-affinity back exactly as read (a key the volume did not carry is removed), then, after 30 s of reads in which no replica was removed, a delete of the named replica. The count never goes below N, and the delete follows a read of N+1 healthy replicas. ANY failure after Longhorn accepts (1) and before it accepts (3)'s patch — a stall, a replica off the plan, a read that cannot look, a replica that fails, a refused lower, a TERM/INT/HUP — first sends one more compare-and-set that tests the move's selector and anti-affinity and puts back the plan's, leaving the count at N+1 (review cf45a112: left in place, a selector of one disk's tags lets Longhorn place ANY replica of the volume only on that disk, and the plan refuses that state), reads the volume back, and its failure line says what the volume reads, or loudly that the put-back was refused and which fields stand. All three patches are in the signed plan verbatim. No pod, engine or attachment is touched; Longhorn rebuilds the new replica from the attached engine. THE EFFECT IS READ BACK for up to 180 s: the named replica gone, spec.numberOfReplicas N, N healthy replicas on N distinct nodes with the new one on the named disk's diskUUID, spec.diskSelector and spec.replicaSoftAntiAffinity as they were, robustness healthy, and every replica's disk admitting the volume's growth to twice its size on live figures; only then is the effect line printed, and otherwise the run exits 1 naming what it read. Timeout 1800: the script's own waits (1200 + 30 + 180 s) give its verdict before the runner's kill.",
+  "hosts": [
+    "forge"
+  ],
+  "requires_approval": true,
+  "plan_verb": "plan-a-volume-replica-disk-move",
+  "approvers": [
+    "emp-david"
+  ],
+  "argv": [
+    "infra/forge/move-volume-replica.sh",
+    "--to-disk",
+    "{1}",
+    "{2}",
+    "{3}",
+    "{4}"
+  ],
+  "params": [
+    {
+      "name": "volume",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    {
+      "name": "replica",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-r-[0-9a-f]{8}$"
+    },
+    {
+      "name": "disk",
+      "pattern": "^(u-[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?|default-disk-[0-9a-f]+)$"
+    },
+    {
+      "name": "plan_sha256",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  ],
+  "timeout": 1800,
+  "effect": "^move-volume-replica-to-disk: pvc-[0-9a-f-]{36} has [0-9]+ healthy replicas on [0-9]+ distinct nodes \\([a-z0-9-]+(, [a-z0-9-]+)*\\) — [0-9a-z-]+-r-[0-9a-f]{8} is gone, [0-9a-z-]+-r-[0-9a-f]{8} is healthy on [a-z0-9-]+ disk (u-[a-z0-9-]+|default-disk-[0-9a-f]+) \\(diskUUID [0-9a-f-]+, [^)]+\\), and every replica's disk has room for growth to [0-9]+ bytes — read back: spec\\.numberOfReplicas=[0-9]+, spec\\.diskSelector .+, spec\\.replicaSoftAntiAffinity [a-z]+, robustness healthy"
+}

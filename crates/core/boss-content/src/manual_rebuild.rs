@@ -244,13 +244,15 @@ pub(crate) async fn apply_manual(
     let s = &fact.section;
     let v = &fact.version;
     sqlx::query(
-        "INSERT INTO manual_sections (id, slug, parent_slug, title, body, sort_order, audience, current_version, published, created_at, updated_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO UPDATE SET \
+        "INSERT INTO manual_sections (id, slug, parent_slug, title, body, sort_order, audience, current_version, published, created_at, updated_at, owner_station, authoring_job_id) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (id) DO UPDATE SET \
          title=EXCLUDED.title, body=EXCLUDED.body, sort_order=EXCLUDED.sort_order, audience=EXCLUDED.audience, \
-         current_version=EXCLUDED.current_version, published=EXCLUDED.published, updated_at=EXCLUDED.updated_at",
+         current_version=EXCLUDED.current_version, published=EXCLUDED.published, updated_at=EXCLUDED.updated_at, \
+         owner_station=EXCLUDED.owner_station, authoring_job_id=EXCLUDED.authoring_job_id",
     ).bind(s.id).bind(&s.slug).bind(&s.parent_slug).bind(&s.title).bind(&s.body)
         .bind(s.sort_order).bind(&s.audience.0).bind(s.current_version).bind(s.published)
-        .bind(s.created_at).bind(s.updated_at).execute(&mut *conn).await.map_err(|e| e.to_string())?;
+        .bind(s.created_at).bind(s.updated_at).bind(&s.owner_station).bind(s.authoring_job_id)
+        .execute(&mut *conn).await.map_err(|e| e.to_string())?;
     sqlx::query(
         "INSERT INTO manual_section_history (id, section_id, version, title, body, audience, edited_by, edited_at, reason) \
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",

@@ -1,0 +1,58 @@
+# A replica rebuild still moving at its read-back bound files the read
+# that carries it on to an answer (backlog 090643a1).
+#
+# WHY. ops-request d326b6c7 (2026-11-05 22:13-22:33Z) ran the passkey-
+# approved rebuild-a-failed-replica on the system of record's 73 GB
+# volume: it deleted the stalled copy under its uid precondition, watched
+# Longhorn start the replacement, read back for its 1200 s bound and
+# answered exit 1, FAILED, "started but NOT proven after 1202s" — with
+# the write correct and the copy still being written. It read healthy by
+# 22:50Z (21 to 37 minutes end to end, ~35 MB/s worst case). The request
+# had closed `answered`, so no packet watched the rebuild to completion,
+# and the conductor re-measured by hand with read-volume-replica-history:
+# the hand transport CLAUDE.md §Diagnosis forbids.
+#
+# THE THREE ANSWERS. The verb now says apart what it used to say as one
+# exit 1: PROVEN (exit 0, its declared effect); IN PROGRESS (exit 75, the
+# estate's not-yet, when the replicas or the engine's rebuild progress
+# moved within BOSS_REBUILD_PROGRESS_S); STALLED (exit 1, when nothing
+# moved that long). This rule reads the IN PROGRESS line, takes the
+# volume it names as the `{volume}` group, and files the READ-ONLY
+# read-a-replica-rebuild of that volume on the forge, linked back by
+# `for_check`. A run that FAILED — STALLED, or any other failure of this
+# mutating verb, which until now closed `answered` with nobody alarmed —
+# is not chained: ops.judge files an urgent alarm naming the verb's line
+# instead. PROVEN matches no line here, and nothing is filed.
+#
+# The pattern spells the em-dash as `.` and digits as `[0-9]+`: the arg
+# crosses TOML's lexer and then boss-expr's. Its shape is run over the
+# script's REAL output in
+# crates/core/boss-testing/tests/rebuild_a_failed_replica_sh.rs.
+[[rule]]
+name = "rebuild-a-failed-replica-in-progress-files-its-read-back"
+why = """
+A CROSS-PROTOCOL REACTOR: the ops-request protocol closes a request when
+its verb has run, and jobs.job.closed carries neither the exit nor the
+output, so no Workflow consequence can read that a rebuild is still
+under way and file the read that proves it. Measured on ops-request
+d326b6c7 (backlog 090643a1): a correct 73 GB rebuild answered FAILED at
+its 1200 s bound, read healthy about 20 minutes later, and nothing in
+the record proved it until the conductor re-measured by hand. No
+authority widened: the follow-on is read-a-replica-rebuild, READ-ONLY,
+on the volume the verdict names, which the runner validates against
+that verb's own pvc-<uuid> param before anything runs. Redelivery-safe:
+the judged request carries `judged` once read, and an open read linked
+by for_check is found before a twin is filed.
+"""
+version = 2
+on_event = "jobs.job.closed"
+# `failed` and `indeterminate` are how the ops-request row closes a verb
+# that RAN with a nonzero or an unknown exit (design b7bb1625, backlog
+# 50a1578f); before that row it closed `answered` whatever the exit, so
+# this rule hears exactly the runs it heard before, and its judge still
+# reads the exit off the execute record. Pinned by boss-dispatcher's
+# an_ops_request_rule_that_hears_an_answer_hears_a_failure.
+when = 'kind = "ops-request" AND (outcome = "answered" OR outcome = "failed" OR outcome = "indeterminate")'
+[[rule.do]]
+handler = "ops.judge"
+args = { verb = '"rebuild-a-failed-replica"', verdict_pattern = '"^rebuild-a-failed-replica: IN PROGRESS . volume (?P<volume>pvc-[0-9a-f-]+) is still rebuilding after [0-9]+s, last moved (?P<moved>[0-9]+)s ago"', when = '"moved >= 0"', then_verb = '"read-a-replica-rebuild"', then_host = '"forge"', then_args = '"{volume}"' }

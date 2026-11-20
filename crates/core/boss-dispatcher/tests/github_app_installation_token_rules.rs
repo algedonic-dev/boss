@@ -64,6 +64,21 @@ const PER_ACT: &[(&str, &str)] = &[(
 const PER_REQUEST_ONLY: &[&str] =
     &["broker-mints-the-algedonic-dev-publish-token-when-a-publish-request-is-filed"];
 
+/// A STANDING read-only token its reader's own filing keeps alive
+/// (backlog b7a74610): the mirror's job logs answer 403 to an anonymous
+/// reader, so read-publish-checks reads a failing check's log with an
+/// actions:read installation token. One key, no request in it — the
+/// reader is filed every fifteen minutes, and a key per filing would grow
+/// the shared Secret by ninety-six keys a day — re-minted on a filing
+/// that finds it inside the window, and no clock: when nothing files the
+/// reader, nothing needs the token. Judged by the `a_checks_*` pins.
+const ON_ITS_READERS_FILING: &[&str] =
+    &["broker-mints-the-algedonic-dev-checks-token-when-a-checks-read-is-filed"];
+const CHECKS_VERB: &str = "read-publish-checks";
+const CHECKS_SCRIPT: &str = "infra/forge/read-publish-checks.sh";
+/// The clock that files the reader — the cadence the window must outlast.
+const CHECKS_REREAD_RULE: &str = "reread-publish-pr-every-15-minutes";
+
 /// The script every per-act GitHub verb runs (its `argv[0]` in
 /// `infra/ops/verbs/<verb>.json`) — the roster the filing rule must match.
 const GITHUB_ACT: &str = "infra/forge/github-act.sh";
@@ -121,7 +136,8 @@ fn every_installation_token_rule_has_its_twin() {
                 .iter()
                 .chain(PER_ACT)
                 .any(|(a, b)| a == name || b == name)
-                || PER_REQUEST_ONLY.contains(name),
+                || PER_REQUEST_ONLY.contains(name)
+                || ON_ITS_READERS_FILING.contains(name),
             "{name} runs {HANDLER} but is in no (rotation, refresh) pair and no per-act \
              (filing, approval) pair here: a credential with an exposure path and no refresh \
              dies within the hour, one with a refresh and no exposure path cannot be rotated \
@@ -132,9 +148,151 @@ fn every_installation_token_rule_has_its_twin() {
         assert!(firing.contains(a), "{a} runs {HANDLER}");
         assert!(firing.contains(b), "{b} runs {HANDLER}");
     }
-    for a in PER_REQUEST_ONLY {
+    for a in PER_REQUEST_ONLY.iter().chain(ON_ITS_READERS_FILING) {
         assert!(firing.contains(a), "{a} runs {HANDLER}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The checks token (backlog b7a74610)
+// ---------------------------------------------------------------------------
+
+fn checks_step(reg: &RawRegistry) -> &RawDoStep {
+    let r = rule(reg, ON_ITS_READERS_FILING[0]);
+    assert_eq!(r.do_steps.len(), 1, "{}", r.name);
+    assert_eq!(r.do_steps[0].handler, HANDLER, "{}", r.name);
+    &r.do_steps[0]
+}
+
+fn checks_fires(reg: &Registry, topic: &str, payload: &serde_json::Value) -> bool {
+    let outcome = match_event(reg, topic, payload, &NoHelpers);
+    assert!(
+        !outcome
+            .skipped
+            .iter()
+            .any(|s| s.rule == ON_ITS_READERS_FILING[0]),
+        "{} could not be judged on {topic} {payload}",
+        ON_ITS_READERS_FILING[0]
+    );
+    outcome
+        .matched
+        .iter()
+        .any(|m| m.rule_name == ON_ITS_READERS_FILING[0])
+}
+
+/// It fires when a read of the mirror's checks is filed — by the step-ready
+/// rule or the fifteen-minute re-read, neither of which passes args — and
+/// on nothing else: not `--check` (no network, no token), no other verb,
+/// no other kind, no approval. It keys no request, and its window outlasts
+/// the re-read's cadence, so the token a run renders has at least
+/// `window - cadence` minutes left even when the filing's own mint has
+/// not landed yet.
+#[test]
+fn a_checks_token_is_minted_on_its_readers_filing_into_one_standing_key() {
+    let raw = rules();
+    let r = rule(&raw, ON_ITS_READERS_FILING[0]);
+    assert!(
+        r.schedule.is_none(),
+        "the reader's own filing keeps it alive; no clock"
+    );
+    assert_eq!(r.on_event.as_deref(), Some("jobs.job.created"));
+    let step = checks_step(&raw);
+    assert_eq!(arg(step, "phase"), "refresh");
+    assert!(
+        !step.args.contains_key("request_id"),
+        "a key per filing grows the shared Secret by every fifteen-minute re-read"
+    );
+    let reread = rule(&raw, CHECKS_REREAD_RULE);
+    let Cadence::EveryNMinutes(every) = reread
+        .schedule
+        .as_ref()
+        .unwrap_or_else(|| panic!("{CHECKS_REREAD_RULE} declares a schedule"))
+        .cadence
+    else {
+        panic!("{CHECKS_REREAD_RULE} is not sub-hourly");
+    };
+    let w = window(r);
+    assert!(
+        w > every && w < WIDEST_WINDOW,
+        "a {w}-minute window against a reader filed every {every} minutes: wider than the \
+         cadence, or the token a run renders can expire between two filings; narrower than \
+         the widest, or every filing mints"
+    );
+
+    let reg = Registry::from_raw(rules()).expect("the shipped rules parse together");
+    let filed_run = naming(filed(CHECKS_VERB), None);
+    assert!(
+        checks_fires(&reg, "jobs.job.created", &filed_run),
+        "control: the mint fires on a filed `{CHECKS_VERB}` run"
+    );
+    assert!(
+        !checks_fires(
+            &reg,
+            "jobs.job.created",
+            &naming(filed(CHECKS_VERB), Some(json!(["--check"])))
+        ),
+        "`{CHECKS_VERB} --check` holds no token and must not mint one"
+    );
+    for (verb, _, _) in verbs().iter().filter(|(v, _, _)| v != CHECKS_VERB) {
+        assert!(
+            !checks_fires(&reg, "jobs.job.created", &filed(verb)),
+            "the checks mint fired on a filed `{verb}` request"
+        );
+    }
+    let mut other = filed_run;
+    other["kind"] = json!("backlog-item");
+    assert!(!checks_fires(&reg, "jobs.job.created", &other));
+    assert!(!checks_fires(
+        &reg,
+        "step.done.sign-off",
+        &approved(CHECKS_VERB, "approved")
+    ));
+}
+
+/// READ-ONLY, ON THE MIRROR ALONE. Actions: Read is what a job log needs
+/// and metadata: Read is what GitHub requires of every installation token
+/// — nothing that writes. The same installation, Secret and registry id as
+/// the admin and publish mints, under a key of its own that no per-request
+/// key can equal (theirs are `<key>-<request id>`). And the verb renders
+/// it by naming this rule's file.
+#[test]
+fn a_checks_token_reads_actions_on_the_mirror_and_nothing_else() {
+    let raw = rules();
+    let step = checks_step(&raw);
+    let slug = declared_mirror_slug();
+    assert_eq!(arg(step, "verify_repo"), slug);
+    assert_eq!(
+        arg(step, "repositories"),
+        slug.split('/').nth(1).expect("owner/repo")
+    );
+    let permissions: BTreeSet<&str> = arg(step, "permissions").split(',').collect();
+    assert_eq!(
+        permissions,
+        BTreeSet::from(["actions:read", "metadata:read"]),
+        "a job log is read with actions:read; nothing here writes"
+    );
+    let admin = &rule(&raw, PER_ACT[0].0).do_steps[0];
+    let publish = publish_step(&raw);
+    for key in ["secret_namespace", "secret_name", "credential_id"] {
+        assert_eq!(step.args.get(key), admin.args.get(key), "`{key}`");
+    }
+    assert_eq!(
+        step.args.get("installation_id"),
+        admin.args.get("installation_id")
+    );
+    let mine = arg(step, "secret_key");
+    for other in [arg(admin, "secret_key"), arg(publish, "secret_key")] {
+        assert!(
+            mine != other && !mine.starts_with(&format!("{other}-")),
+            "the checks key {mine:?} must not be, or look like, a key of {other:?}'s namespace"
+        );
+    }
+    let script = std::fs::read_to_string(repo_root().join(CHECKS_SCRIPT)).expect("the checks verb");
+    let file = format!("{}.toml", ON_ITS_READERS_FILING[0]);
+    assert!(
+        script.contains(&format!("dispatcher/rules/{file}")),
+        "{CHECKS_SCRIPT} must render its token from {file}"
+    );
 }
 
 // ---------------------------------------------------------------------------

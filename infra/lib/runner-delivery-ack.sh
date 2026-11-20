@@ -42,7 +42,7 @@ runner_delivery_ack() {
         return 0
     }
     CODE=""
-    if ! CODE="$("$API_CURL" -sS -X POST "${HDRS[@]}" -H "$RC_HDR" \
+    if ! CODE="$("$API_CURL" -q -sS -X POST "${HDRS[@]}" -H "$RC_HDR" \
         -H 'content-type: application/json' -d "$identity" -o "$BODY" -w '%{http_code}' \
         "$BOSS_JOBS_URL/api/credentials/$CRED/delivery" 2>/dev/null)"; then CODE=""; fi
     if [ "$CODE" != 202 ] || ! jq_doc_file "$BODY" || ! receipt="$(jq -ec --arg c "$CRED" --arg job "$NEXT_FOR" \
@@ -80,7 +80,7 @@ runner_delivery_ack() {
         return 0
     fi
     CODE=""
-    if ! CODE="$("$API_CURL" -sS -X POST "${HDRS[@]}" -H "$RC_HDR" \
+    if ! CODE="$("$API_CURL" -q -sS -X POST "${HDRS[@]}" -H "$RC_HDR" \
         -H 'content-type: application/json' -d "$body" -o "$BODY" -w '%{http_code}' \
         "$BOSS_JOBS_URL/api/jobs/$NEXT_FOR/steps/$PKT_STEP/complete-if" 2>/dev/null)"; then CODE=""; fi
     if [ "$CODE" != 200 ] || ! jq_doc_file "$BODY" || ! jq -e '.outcome == "completed" or .outcome == "replayed"' "$BODY" >/dev/null 2>&1; then

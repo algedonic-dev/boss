@@ -25,7 +25,7 @@ own `note`, and dated learnings carry their dates the same way.
 
 ## Fields
 
-All seven keys are required on every entry;
+Every key in the table but `owner` is required on every entry;
 `infra/lint/invariant-register.sh` checks the shape, never the claim.
 
 | key | meaning |
@@ -37,6 +37,14 @@ All seven keys are required on every entry;
 | `mechanism` | `enforced` → the lint/test path (must exist on disk). `checked` → the verification method. `unenforced` → empty. |
 | `last_verified` | `YYYY-MM-DD`. Required for `checked`. |
 | `note` | Why unenforced, or what would enforce it. Required for `unenforced`. |
+| `owner` | Optional. The crate whose debt the invariant is when it is not enforced: a workspace member at `crates/<tier>/<owner>` whose `Cargo.toml` declares that package name. A file or directory at that path is not enough. |
+
+`owner` is the one optional key. Design `089dc107` Q2 (David,
+2026-11-18) named `boss-events`, the BossMemory layer, the owner of
+the five correctness properties, so an unenforced property is that
+layer's debt with an address rather than ambient prose:
+`grep -l 'owner = "boss-events"' docs/invariants/*.toml` is its
+scoreboard.
 
 The three enforcement classes:
 

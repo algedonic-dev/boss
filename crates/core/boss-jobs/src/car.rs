@@ -15,6 +15,35 @@
 
 use serde_json::{Value, json};
 
+pub fn select_receipt(job: &serde_json::Value) -> Option<serde_json::Value> {
+    job.pointer("/metadata/regate_receipt")
+        .filter(|v| !v.is_null())
+        .and_then(parse_receipt)
+        .or_else(|| {
+            // Field order is not a contract, so parse the gate step's
+            // receipt rather than scanning for it.
+            job.get("steps")
+                .and_then(|s| s.as_array())
+                .into_iter()
+                .flatten()
+                .find_map(|step| step.pointer("/metadata/receipt").and_then(parse_receipt))
+        })
+}
+
+/// A receipt is stored two ways: as a JSON STRING (the gate step, and a
+/// re-rail that copied that string verbatim into `regate_receipt`) or as
+/// an OBJECT (tooling that parsed before writing). Both are receipts —
+/// the same pair the boarding logic accepts (train.rs). Returns the
+/// receipt object, or None if the value is neither an object nor a string
+/// that parses to one.
+fn parse_receipt(v: &serde_json::Value) -> Option<serde_json::Value> {
+    match v {
+        serde_json::Value::String(s) => serde_json::from_str(s).ok(),
+        obj @ serde_json::Value::Object(_) => Some(obj.clone()),
+        _ => None,
+    }
+}
+
 /// What a green gate-run packet says about a branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Receipt {
@@ -42,6 +71,15 @@ pub struct Receipt {
 /// car or refresh one: the auto-park handler, `boss park` and `boss
 /// rerail --finish` (the last two through `park::receipt_for`).
 ///
+/// THE SECOND DECLARATION (backlog 6665aa97; review 30397e74 of car
+/// 4f1a96ab). `BOSS_TRUNK=none` (infra/lint/lib/trunk-ref.sh) is the
+/// mirror's too, behind the same runtime guard, and gate.sh writes
+/// `trunk` on its receipt naming the lints that judged no car against a
+/// trunk. Until this, a receipt carrying `trunk` without `estate` parked.
+/// Every mirror receipt carries both today, so that is a leak past the
+/// guard and is refused the same way. The function keeps its first name
+/// because its three callers already ask it by that name.
+///
 /// FAILS CLOSED: a receipt that does not parse as a JSON object cannot
 /// say whether it declared, and an unread declaration is not an absent
 /// one, so it is refused too.
@@ -49,16 +87,25 @@ pub fn declared_no_estate(raw: &str) -> Option<String> {
     let Ok(receipt @ Value::Object(_)) = serde_json::from_str::<Value>(raw) else {
         return Some(format!(
             "refusing: the receipt does not parse as a JSON object, so whether its run \
-             declared no estate cannot be read — an unread declaration is not an absent \
-             one (infra/lint/lib/no-estate.sh). receipt: {raw}"
+             declared no estate or no trunk cannot be read — an unread declaration is not \
+             an absent one (infra/lint/lib/no-estate.sh, infra/lint/lib/trunk-ref.sh). \
+             receipt: {raw}"
         ));
     };
-    let estate = receipt.get("estate")?;
+    if let Some(estate) = receipt.get("estate") {
+        return Some(format!(
+            "refusing: this green's receipt declares no estate ({estate}), so the live \
+             comparisons it names were never made. Only the public mirror may declare that, \
+             and it parks nothing; a cluster gate carrying it is a leaked declaration \
+             (infra/lint/lib/no-estate.sh). Find what set it, remove it, and re-gate."
+        ));
+    }
+    let trunk = receipt.get("trunk")?;
     Some(format!(
-        "refusing: this green's receipt declares no estate ({estate}), so the live \
-         comparisons it names were never made. Only the public mirror may declare that, \
-         and it parks nothing; a cluster gate carrying it is a leaked declaration \
-         (infra/lint/lib/no-estate.sh). Find what set it, remove it, and re-gate."
+        "refusing: this green's receipt declares no per-car trunk ({trunk}), so the trunk \
+         comparisons of the lints it names were never made. Only the public mirror \
+         may declare that, and it parks nothing; a cluster gate carrying it is a leaked \
+         declaration (infra/lint/lib/trunk-ref.sh). Find what set it, remove it, and re-gate."
     ))
 }
 
@@ -279,12 +326,150 @@ pub const RELEASE: &str = "release";
 pub fn hold_body(review_md: &Value, reason: &str) -> Value {
     let mut body = json!({ "hold": reason.trim() });
     let lifted = review_md.get(RELEASE).is_some_and(Value::is_object)
-        && crate::stranded::hold_reason(review_md).is_none()
+        && crate::stranded::marked(review_md, "hold").is_none()
         && review_md.get(HOLD_SHA).is_some_and(|h| !h.is_null());
     if lifted {
         body[HOLD_SHA] = Value::Null;
     }
     body
+}
+
+/// PURE: the merge-door body that carries a car's live REVIEW hold to
+/// `head`, the head a refresh just gave the car, or `None` when there is
+/// nothing to carry. A REFRESH THAT MOVES THE CAR'S HEAD MOVES ITS HOLD'S
+/// HEAD (backlog 6b12a70f).
+///
+/// WHY. A review hold says "waits for a review of this head", and
+/// [`HOLD_SHA`] is that head: the release door judges a head-less ask
+/// (the yard, the release rule) at it, and the conductor re-holds at the
+/// head it boards. Both refresh doors — `boss rerail --finish` and the
+/// auto-park handler's `ParkAction::Refresh` — wrote a hold only when
+/// the NEW green brought a reason of its own, so a car already held kept
+/// the old head whenever the refreshed diff was clear. Measured on car
+/// eb86ac0c, 2026-11-05: held by the conductor's re-judge at 29943365,
+/// refreshed in place onto the green at df139b70, the review of df139b70
+/// (run 7cb2438c, RELEASE) was refused by the release rule and by `boss
+/// release --review` — "run 7cb2438c reviewed df139b70, and the car's
+/// head is 29943365" — at a head the forge no longer had, and no
+/// supported door moved it. The conductor's re-judge would have moved it
+/// (`review_hold_write` in boss-cli, afc5147c), but it judges only cars
+/// that are not held, so it never saw this one.
+///
+/// ONE DECIDER, BOTH DOORS: they ask this, so the two refreshes cannot
+/// disagree about it. Only the head is written. The hold's reason stands,
+/// because the car still waits for its review, and rewriting the reason
+/// would put back a hold lifted between the reader's read and this write.
+/// A hold bound to no head (a hand hold, a red-train hold, an unread
+/// diff) binds none here: it is not a review's, and binding it would ask
+/// a reviewer for what a person must answer.
+pub fn hold_follows_head(review_md: &Value, head: &str) -> Option<Value> {
+    let head = head.trim();
+    crate::stranded::marked(review_md, "hold")?;
+    let held_at = review_md
+        .get(HOLD_SHA)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    (!head.is_empty() && held_at != head).then(|| json!({ HOLD_SHA: head }))
+}
+
+/// PURE: what a write [`hold_follows_head`] decided was judged on — the
+/// review step's `hold` and [`HOLD_SHA`], raw, as `review_md` read them
+/// (`null` = absent). Both refresh doors send it as the merge door's
+/// precondition ([`crate::step_metadata_write::EXPECT_HEADER`], backlog
+/// cd1f68c6), so the head moves only while the step still carries the
+/// hold that was read. Each door wrote `{hold_sha: head}` many calls
+/// after its read with no check, so a release landing in that window
+/// left a `hold_sha` beside no hold, and a person's hold or a red-train
+/// hold that replaced the review hold became bound to the new head — a
+/// hold a reviewer's release could then lift, where only a person
+/// should.
+pub fn hold_as_judged(review_md: &Value) -> serde_json::Map<String, Value> {
+    ["hold", HOLD_SHA]
+        .into_iter()
+        .map(|key| {
+            (
+                key.to_string(),
+                review_md.get(key).cloned().unwrap_or(Value::Null),
+            )
+        })
+        .collect()
+}
+
+/// The words the conductor's judged-red hold opens with, before and
+/// after the train it names by its first eight characters.
+const JUDGED_RED_OPENS: &str = "held by the conductor: train ";
+const JUDGED_RED_SAYS: &str = " was judged red";
+
+/// The head of the hold the conductor writes on a car a judged red names
+/// (`judged_red_hold_reason` in boss-cli): "held by the conductor: train
+/// <train_id8> was judged red", the rest of the reason after it. ONE
+/// SPELLING, read back by [`judged_red_hold_train`], so the writer and
+/// the reader cannot drift (CLAUDE.md §9a).
+pub fn judged_red_hold_head(train_id8: &str) -> String {
+    format!("{JUDGED_RED_OPENS}{}{JUDGED_RED_SAYS}", train_id8.trim())
+}
+
+/// PURE: the train (its first eight characters, as the hold spells it)
+/// a hold's text says was judged red, when the text is the conductor's
+/// judged-red hold ([`judged_red_hold_head`]); `None` for any other hold.
+pub fn judged_red_hold_train(hold: &str) -> Option<&str> {
+    let rest = hold.trim().strip_prefix(JUDGED_RED_OPENS)?;
+    let (train, _) = rest.split_once(JUDGED_RED_SAYS)?;
+    (!train.is_empty() && !train.contains(char::is_whitespace)).then_some(train)
+}
+
+/// PURE: the merge-door body that lifts a car's red-train hold when a
+/// strike release (`boss release --diagnosis-file`) has cleared the
+/// strike that hold stands for, or `None` when the hold is not that
+/// release's to lift. A STRIKE RELEASE LIFTS THE HOLD ITS STRIKE PLACED
+/// (backlog 79129752, the strike-release sibling of 6b12a70f).
+///
+/// WHY. A judged red does two things to the car it names: the conductor
+/// strikes it (`red_trains`) and holds its review step with
+/// [`judged_red_hold_head`]'s text, bound to no head. The strike release
+/// cleared the first and left the second. Measured on car 775feba5,
+/// 2026-11-05: train 9b5c1889's gate 3082de78 went red at 06:17Z with
+/// the car the only one aboard; at 07:47Z the look named that gate-run,
+/// cleared `red_trains` and appended `strike_releases`, the car re-gated
+/// green, and the review step still read "held by the conductor: train
+/// 9b5c1889 was judged red ...", so the car never reached the dock.
+///
+/// It lifts ONLY when every one of these holds:
+///
+/// - no strike remains (`remaining_strikes`, read back after the look);
+/// - the live hold is the judged-red hold, for a train in
+///   `cleared_trains` (the full ids of the trains whose gate-runs the
+///   look verified, matched on the eight characters the hold names);
+/// - the hold is bound to no head ([`HOLD_SHA`]): a head-bound hold is a
+///   review's, and only a review lifts it;
+/// - the release is reserved for no one ([`RELEASER`]): a reserved car
+///   waits for that person, whatever its hold says.
+///
+/// A hand hold, a review hold, another train's red, or a strike still
+/// standing keeps its hold. Only `hold` is written; the caller records
+/// what it lifted beside it, as a bare release does.
+pub fn hold_lifted_by_strike_release(
+    review_md: &Value,
+    cleared_trains: &[String],
+    remaining_strikes: i64,
+) -> Option<Value> {
+    if remaining_strikes > 0 || review_md.get(RELEASER).is_some() {
+        return None;
+    }
+    let head_bound = review_md
+        .get(HOLD_SHA)
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty());
+    if head_bound {
+        return None;
+    }
+    let hold = crate::stranded::marked(review_md, "hold")?;
+    let named = judged_red_hold_train(&hold)?;
+    cleared_trains
+        .iter()
+        .any(|t| t.trim().chars().take(8).collect::<String>() == named)
+        .then(|| json!({ "hold": Value::Null }))
 }
 
 /// One step completion a car's filer owes: which step, the evidence to
@@ -458,6 +643,11 @@ pub fn finish_writes(
     Ok(out)
 }
 
+/// The car-metadata key naming the actor that built it: the one the
+/// claim door reads to keep that actor off the car's own review
+/// ([`crate::station_claim::reviews_its_own_build`]).
+pub const BUILT_BY: &str = "built_by";
+
 /// The metadata a car carries about its own BUILD, stamped when the
 /// builder opens it.
 ///
@@ -485,10 +675,922 @@ pub fn build_start(
             m.insert(k.to_string(), json!(v));
         }
     };
-    put("built_by", actor);
+    put(BUILT_BY, actor);
     put("build_host", host);
     put("build_worktree", worktree);
     m
+}
+
+/// The car-metadata key that says which verb ADMITTED a car at build
+/// start, rather than a builder's `boss car open` or a green.
+///
+/// WHY (backlog 68a8726e, design 689d1f7f car 1). Measured 2026-11-08
+/// ~21:5xZ: 299 of the 300 newest ship-a-change packets were opened by
+/// the auto-park rule at GREEN, so no open car stood at `build` or
+/// `gate` while four builders and four gates ran, and the engineering
+/// station's ship-a-change line could not show work it had. `boss
+/// dispatch --started` now admits the car when the build starts; this
+/// marker names that door on the car, so a reader can tell an admitted
+/// car from one a builder opened by hand.
+pub const ADMITTED_BY: &str = "admitted_by";
+
+/// The gate-step key naming the gate-run that HOLDS the car's `gate`
+/// step: written when `boss gate` launches on a car still at build,
+/// read when that gate-run's verdict is not green (see
+/// [`gate_return`]). One spelling for the writer and the reader.
+pub const GATE_RUN: &str = "gate_run";
+
+/// The gate-step key a non-green verdict leaves behind when it hands
+/// the step back: `{gate_run, verdict}` — the receipt stays where it was
+/// earned, on the gate-run, and the car names it.
+pub const LAST_VERDICT: &str = "last_verdict";
+
+/// The writes a gate LAUNCH owes a car still at build: the `gate` step
+/// stamped with the gate-run holding it, judged on no ending having
+/// claimed the car — the one fence it shares with [`ending_claim`] —
+/// then `build` completed (its `test` is required at done), then — when
+/// the gate step is not already held — claimed, which makes it ACTIVE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateLaunch {
+    /// `build` completed, or `None` when it already was.
+    pub build: Option<StepWrite>,
+    /// The `gate` step's id.
+    pub gate_step: String,
+    /// Merged onto the `gate` step FIRST — before `build` is handed in
+    /// and before the claim — judged on [`GateLaunch::fence`], so the
+    /// step is never active without naming the gate-run that holds it,
+    /// and a launch never moves a car an ending has claimed.
+    pub gate_merge: Value,
+    /// What the gate step must still read when [`GateLaunch::gate_merge`]
+    /// lands: no ending claimed the car ([`launch_fence`]). Refused, the
+    /// launch writes nothing more (backlog 366c9fb1, Codex R4b).
+    pub fence: serde_json::Map<String, Value>,
+    /// Claim the `gate` step through the claim door. `false` when it is
+    /// already active — a second launch on a car already in the gate
+    /// only restamps which gate-run holds it.
+    pub claim: bool,
+}
+
+/// PURE: what a gate launch writes on `car` — or `None` when the car is
+/// past its gate (its `gate` step completed or skipped), so a launch has
+/// nothing to move.
+///
+/// WHY THE BUILD COMPLETES AT LAUNCH (backlog 68a8726e). `gate` is
+/// `ready_when = steps.build.done`, and a completed step never moves
+/// backwards — so the only way a car can stand AT its gate while the
+/// gate runs is that the build was handed in when the branch was handed
+/// to the gate, which is exactly what a launch is. A red therefore does
+/// not reopen `build`; it hands `gate` back to READY ([`gate_return`]),
+/// where the next launch claims it again.
+pub fn gate_launch(
+    car: &Value,
+    gate_run: &str,
+    head: &str,
+    test: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<GateLaunch>, String> {
+    let Some(gate) = find_step(car, GATE_SLUG, GATE) else {
+        return Err(no_such_step(GATE_SLUG, GATE));
+    };
+    if already_done(gate) {
+        return Ok(None);
+    }
+    let Some(gate_step) = gate.get("id").and_then(Value::as_str) else {
+        return Err(format!("the `{GATE_SLUG}` step on this car has no id"));
+    };
+    let Some(build) = find_step(car, BUILD_SLUG, BUILD) else {
+        return Err(no_such_step(BUILD_SLUG, BUILD));
+    };
+    let at = stamp(now);
+    let build = if already_done(build) {
+        None
+    } else {
+        let Some(id) = build.get("id").and_then(Value::as_str) else {
+            return Err(format!("the `{BUILD_SLUG}` step on this car has no id"));
+        };
+        Some(StepWrite::completing(
+            id,
+            BUILD,
+            json!({"test": test, "completed_at": at, GATE_RUN: gate_run}),
+        ))
+    };
+    Ok(Some(GateLaunch {
+        build,
+        gate_step: gate_step.to_string(),
+        gate_merge: json!({GATE_RUN: gate_run, "gated_head": head, "launched_at": at}),
+        fence: launch_fence(),
+        claim: gate.get("status").and_then(Value::as_str) != Some("active"),
+    }))
+}
+
+/// The open car whose `gate` step is ACTIVE and held by `gate_run` —
+/// the one car a verdict of that gate-run moves. A car whose gate step
+/// another launch has since restamped is not this gate's to move.
+pub fn car_in_gate_run<'a>(cars: &'a [Value], gate_run: &str) -> Option<&'a Value> {
+    cars.iter().find(|c| {
+        is_open(c)
+            && find_step(c, GATE_SLUG, GATE).is_some_and(|s| {
+                s.get("status").and_then(Value::as_str) == Some("active")
+                    && s.pointer(&format!("/metadata/{GATE_RUN}"))
+                        .and_then(Value::as_str)
+                        == Some(gate_run)
+            })
+    })
+}
+
+/// One judged step write: the body, and the step-metadata keys it was
+/// decided on, as they were read — sent in
+/// [`crate::step_metadata_write::EXPECT_HEADER`] so the jobs API lands it
+/// only on a step that still reads so (409 `step_changed` otherwise,
+/// nothing written).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JudgedWrite {
+    /// `PATCH` for the merge door, `PUT` for the status write.
+    pub method: &'static str,
+    /// The path, without a base.
+    pub path: String,
+    pub body: Value,
+    pub expect: serde_json::Map<String, Value>,
+}
+
+/// PURE: a non-green verdict hands the car's `gate` step back — the
+/// merge recording the verdict, then a PUT to READY, EACH judged on the
+/// gate-run still holding the step. Empty when `gate_run` does not hold
+/// this car's gate step.
+///
+/// READY, NOT BUILD (backlog 68a8726e): `build` completed at launch and
+/// a completed step is immutable, so the car waits at its gate for the
+/// next launch — which a repair run of the same item makes on the same
+/// branch, adopting this car rather than filing a second.
+///
+/// WHY BOTH WRITES CARRY THE HOLDER (Codex review of car 0d04ee3e, R3).
+/// Ownership was judged on the READ alone: a gate launched on the same
+/// branch between that read and either write restamps the step to its
+/// own gate-run and leaves it ACTIVE, and the unconditioned merge and PUT
+/// then set the NEWER gate's step READY with the older gate's verdict. So
+/// the merge lands only while `gate_run` still holds the step, and the
+/// PUT only while it still does AND the step still carries the verdict
+/// the merge wrote — the state that merge produced, judged under the
+/// step row's version compare at the PUT's foot.
+pub fn gate_return(car: &Value, gate_run: &str, verdict: &str) -> Vec<JudgedWrite> {
+    let Some(held) = car_in_gate_run(std::slice::from_ref(car), gate_run) else {
+        return Vec::new();
+    };
+    let (Some(id), Some(car_id)) = (
+        find_step(held, GATE_SLUG, GATE)
+            .and_then(|s| s.get("id"))
+            .and_then(Value::as_str),
+        held.get("id").and_then(Value::as_str),
+    ) else {
+        return Vec::new();
+    };
+    let last = json!({GATE_RUN: gate_run, "verdict": verdict});
+    let holder = serde_json::Map::from_iter([(GATE_RUN.to_string(), json!(gate_run))]);
+    let mut merged = holder.clone();
+    merged.insert(LAST_VERDICT.to_string(), last.clone());
+    vec![
+        JudgedWrite {
+            method: "PATCH",
+            path: format!("/api/jobs/{car_id}/steps/{id}/metadata"),
+            body: json!({ LAST_VERDICT: last }),
+            expect: holder,
+        },
+        JudgedWrite {
+            method: "PUT",
+            path: format!("/api/jobs/{car_id}/steps/{id}"),
+            body: json!({"status": "ready"}),
+            expect: merged,
+        },
+    ]
+}
+
+/// The expectation a green's gate writes carry on a car whose gate step
+/// NO gate-run binds: both binding keys ABSENT (`null` in
+/// [`crate::step_metadata_write::EXPECT_HEADER`] reads as absent).
+///
+/// WHY ABSENCE IS AN EXPECTATION (Codex review of car 0d04ee3e, round 2
+/// R2). An unbound gate was finished with UNJUDGED writes, so the
+/// unbound-to-bound transition escaped the guard: G1's green read a car
+/// still at build, G2 then completed build, stamped its own gate-run and
+/// claimed the gate, and G1's writes completed G2's gate with G1's
+/// receipt — at the same head too, so no head check could catch it. A
+/// binding that APPEARS after the read is a change of hands exactly as a
+/// restamp is, and refuses the write the same way.
+///
+/// And no ending: a car whose run or item ended before any gate is
+/// claimed by its ending on this same step ([`ENDED_BEFORE_GATE`]), and
+/// is the ending's to finish, not a green's (backlog 366c9fb1).
+pub fn unbound_gate() -> serde_json::Map<String, Value> {
+    serde_json::Map::from_iter([
+        (GATE_RUN.to_string(), Value::Null),
+        ("gated_head".to_string(), Value::Null),
+        (ENDED_BEFORE_GATE.to_string(), Value::Null),
+    ])
+}
+
+/// PURE: may a GREEN from `gate_run`, vouching for `head`, finish this
+/// car's `gate` step — and on what must the gate step still read at
+/// write time? [`unbound_gate`] for a car with no gate binding (a car
+/// filed or opened before gate launches stamped one, or one no launch
+/// has stamped yet), so a binding that appears after this read refuses
+/// the write; the holder and its head when `gate_run` holds the step at
+/// `head`; `Err`, naming the holder, when another gate-run holds it or
+/// it was launched at another head. EVERY green gate write is judged.
+///
+/// WHY (Codex review of car 0d04ee3e, R2). A launch restamps an ACTIVE
+/// gate step to its own gate-run, and the green path decided Adopt on
+/// the branch alone: an older gate's green, delivered after a newer one
+/// launched (a re-gate after a repair, or a slow verdict), completed the
+/// step with the OLD receipt while the step said the new gate held it —
+/// and the new gate's red could then hand back nothing. The non-green
+/// path already asked who holds the step; now the green does too.
+///
+/// A LOST GATE'S RELAUNCH SUCCEEDS IT (backlog 64d417ca). `relaunch_of`
+/// is the lost gate-run the green's own gate-run replaces, as the
+/// conductor stamps it on a machine relaunch (`lost_gate::RELAUNCH_OF`);
+/// a green whose run relaunched the HOLDER finishes the step the holder
+/// held, judged on that holder still holding it at its head. Measured
+/// 2026-11-10 on car 88645b17: lost cdd2f3d9's hand-back left the step
+/// READY naming cdd2f3d9, the relaunch fc5d6d2e went green on the same
+/// head, and this answered "held by gate-run cdd2f3d9" — so the car sat
+/// about 20 hours off the dock with a valid green. Read off the record
+/// the relaunch already carries, at the one moment the binding is
+/// consulted, so no extra write sits between the relaunch and its green.
+/// A launch that restamped the step after the loss is a change of hands
+/// the relaunch does not inherit: its holder is not the lost run.
+pub fn green_binding(
+    car: &Value,
+    gate_run: &str,
+    relaunch_of: Option<&str>,
+    head: &str,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let Some(gate) = find_step(car, GATE_SLUG, GATE) else {
+        return Ok(unbound_gate());
+    };
+    if already_done(gate) {
+        return Ok(unbound_gate());
+    }
+    let md = |k: &str| {
+        gate.pointer(&format!("/metadata/{k}"))
+            .and_then(Value::as_str)
+    };
+    let Some(holder) = md(GATE_RUN).filter(|h| !h.trim().is_empty()) else {
+        // Unbound as read: absence of BOTH keys is what the write expects.
+        // A blank `gate_run` left with a `gated_head` beside it is not
+        // absence, so it is expected exactly as it was read.
+        let mut expect = unbound_gate();
+        for k in [GATE_RUN, "gated_head"] {
+            if let Some(v) = gate.pointer(&format!("/metadata/{k}")) {
+                expect.insert(k.to_string(), v.clone());
+            }
+        }
+        return Ok(expect);
+    };
+    let car_id = car.get("id").and_then(Value::as_str).unwrap_or("?");
+    let short = |s: &str| s[..8.min(s.len())].to_string();
+    if holder != gate_run && relaunch_of != Some(holder) {
+        return Err(format!(
+            "car {}'s gate step is held by gate-run {}, not by gate-run {} — this green is \
+             neither that gate's verdict nor its relaunch's, so it finishes nothing (a newer \
+             launch restamped the step; its own verdict moves the car)",
+            short(car_id),
+            short(holder),
+            short(gate_run)
+        ));
+    }
+    let launched = md("gated_head");
+    if let Some(at) = launched
+        && !same_head(at, head)
+    {
+        return Err(format!(
+            "car {}'s gate step was launched at {} by gate-run {}, and this green vouches \
+             for {} — a receipt for another head finishes nothing",
+            short(car_id),
+            short(at),
+            short(holder),
+            short(head)
+        ));
+    }
+    let mut expect = serde_json::Map::from_iter([(GATE_RUN.to_string(), json!(holder))]);
+    expect.insert(
+        "gated_head".to_string(),
+        launched.map_or(Value::Null, |h| json!(h)),
+    );
+    Ok(expect)
+}
+
+/// Two spellings of one commit: equal, or one an abbreviation (at least
+/// seven characters) of the other — a launch may record the sha it
+/// resolved in full while a receipt states it shorter, or the reverse.
+fn same_head(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    short.len() >= 7 && long.starts_with(short)
+}
+
+/// The gate-step key keeping the LOST gate-run a relaunch took the step
+/// over from, beside [`GATE_RUN`] naming the relaunch whose receipt the
+/// step carries (backlog 84e46932).
+pub const LOST_GATE_RUN: &str = "lost_gate_run";
+
+/// PURE: a green's two judged writes on the car's `gate` step — the
+/// evidence merge, then the status PUT — from [`finish_writes`]' gate
+/// entry and the expectation [`green_binding`] returned for `gate_run`.
+///
+/// A RELAUNCH TAKES THE STEP OVER IN THE SAME MERGE (backlog 84e46932).
+/// When the binding accepted the green through `relaunch_of`, the holder
+/// it expects is the lost run, not `gate_run`, and the merge then also
+/// sets [`GATE_RUN`] to the relaunch and keeps the holder under
+/// [`LOST_GATE_RUN`]. Found by review 393c6997 of car 06f1f1bf: the
+/// completed step kept naming the lost run beside the relaunch's
+/// receipt, which names no gate-run — so a reader following the car's
+/// `gate_run` landed on a lost run, and the green one was found only by
+/// searching gate-runs for `relaunch_of`. The merge is still judged on
+/// the lost run holding the step; the PUT on the state the merge made.
+pub fn green_gate_writes(
+    car_id: &str,
+    gate: &StepWrite,
+    expect: &serde_json::Map<String, Value>,
+    gate_run: &str,
+) -> [JudgedWrite; 2] {
+    let mut body = gate.metadata.clone();
+    let mut after = expect.clone();
+    let lost = expect
+        .get(GATE_RUN)
+        .and_then(Value::as_str)
+        .filter(|h| !h.trim().is_empty() && *h != gate_run);
+    if let (Some(lost), Some(m)) = (lost, body.as_object_mut()) {
+        for (k, v) in [(GATE_RUN, gate_run), (LOST_GATE_RUN, lost)] {
+            m.insert(k.to_string(), json!(v));
+            after.insert(k.to_string(), json!(v));
+        }
+    }
+    [
+        JudgedWrite {
+            method: "PATCH",
+            path: gate.merge_path(car_id),
+            body,
+            expect: expect.clone(),
+        },
+        JudgedWrite {
+            method: "PUT",
+            path: gate.status_path(car_id),
+            body: gate.status_body.clone(),
+            expect: after,
+        },
+    ]
+}
+
+/// PURE: the R8 edge a gate LAUNCH writes onto its gate-run — the car
+/// and its `gate` step — read off the car AS IT READS AFTER THE LAUNCH,
+/// or `None` unless that gate step names `gate_run` as its holder
+/// (design 689d1f7f car 2, backlog a3a367e4).
+///
+/// READ BACK, NOT ASSUMED. The launch's stamp is judged on its fence and
+/// can lose to an ending; the edge is written only once the car is seen
+/// to carry the stamp, so a gate-run never points at a step it does not
+/// hold. The stamp stays the authority: every verdict write is judged on
+/// it ([`gate_return`], [`green_binding`]), and the edge only says where
+/// to look.
+pub fn gate_edge(car: &Value, gate_run: &str) -> Option<crate::fulfils::Fulfils> {
+    let gate = find_step(car, GATE_SLUG, GATE)?;
+    let holds = gate
+        .pointer(&format!("/metadata/{GATE_RUN}"))
+        .and_then(Value::as_str)
+        == Some(gate_run);
+    if !is_open(car) || already_done(gate) || !holds {
+        return None;
+    }
+    Some(crate::fulfils::Fulfils {
+        job: car.get("id").and_then(Value::as_str)?.to_string(),
+        step: gate.get("id").and_then(Value::as_str)?.to_string(),
+    })
+}
+
+/// PURE: the step an R8 edge names on `car`, when `car` is the car the
+/// edge names and the step is its `gate` step — whatever the car's
+/// status. `Err` says which of those failed.
+fn edge_named_gate<'a>(
+    car: &'a Value,
+    edge: &crate::fulfils::Fulfils,
+) -> Result<&'a Value, String> {
+    let short = |s: &str| s[..8.min(s.len())].to_string();
+    if car.get("id").and_then(Value::as_str) != Some(edge.job.as_str()) {
+        return Err(format!(
+            "the packet read for car {} is not that car",
+            short(&edge.job)
+        ));
+    }
+    let gate = find_step(car, GATE_SLUG, GATE).ok_or_else(|| no_such_step(GATE_SLUG, GATE))?;
+    if gate.get("id").and_then(Value::as_str) != Some(edge.step.as_str()) {
+        return Err(format!(
+            "step {} is not car {}'s `{GATE_SLUG}` step",
+            short(&edge.step),
+            short(&edge.job)
+        ));
+    }
+    Ok(gate)
+}
+
+/// `Err` unless `car` is still open — an ended car is not finished, or
+/// handed back, by a verdict.
+fn edge_car_open(car: &Value, edge: &crate::fulfils::Fulfils) -> Result<(), String> {
+    if is_open(car) {
+        return Ok(());
+    }
+    Err(format!(
+        "car {} is no longer open — an ended car is not finished by a verdict",
+        &edge.job[..8.min(edge.job.len())]
+    ))
+}
+
+/// PURE: the step an R8 edge names on `car`, when `car` is the open car
+/// the edge names and the step is its `gate` step — the one shape a gate
+/// verdict may act on by edge. `Err` says which of those failed.
+fn edge_gate_step<'a>(car: &'a Value, edge: &crate::fulfils::Fulfils) -> Result<&'a Value, String> {
+    let gate = edge_named_gate(car, edge)?;
+    edge_car_open(car, edge)?;
+    Ok(gate)
+}
+
+/// What a GREEN may do on the car its gate-run's edge names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeGreen {
+    /// Finish the car; the `gate` step's writes carry this expectation
+    /// (the holder and the head, from [`green_binding`]).
+    Finish(serde_json::Map<String, Value>),
+    /// The gate step is already completed or skipped — a redelivered
+    /// verdict, or one whose step another path finished. Nothing to do.
+    Finished,
+}
+
+/// PURE: may a green from `gate_run`, vouching for `head`, finish the
+/// car its R8 edge names — and on what must the gate step still read?
+///
+/// STRICTER THAN THE SCAN, ON PURPOSE. [`green_binding`] accepts an
+/// UNBOUND gate step, because the scan found the car by its branch and a
+/// car filed before launches stamped one is still that branch's car. An
+/// edge carries no branch: the only thing that makes this green the
+/// step's verdict is the step naming this gate-run (or the lost run it
+/// relaunched) as its holder. So an unbound step is refused here, and
+/// the edge can never complete a step its gate-run did not hold — the
+/// trust boundary this car is marked for (a completed gate step boards).
+///
+/// AND THE BRANCH THE SCAN MATCHED ON (review 01fe1c71 of car 3a7ab114,
+/// finding 4). The edge itself carries no branch, but the gate-run does:
+/// `branch` is the one its immutable submission gated, and a car on
+/// another branch is refused, so the edge is never less strict than the
+/// scan it replaces — whose only way to a car was that branch. Without
+/// it, a relaunch naming this car's holder could finish it from another
+/// branch at the same head, and carry that branch's park prose onto it.
+///
+/// A FINISHED STEP IS FINISHED WHATEVER THE CAR DID SINCE (finding 3).
+/// The step is judged before the car's status: a green redelivered after
+/// its car landed and closed is the green that finished it, so it reads
+/// [`EdgeGreen::Finished`] rather than an "ended car" refusal recorded
+/// against the very verdict that ended it.
+pub fn edge_green(
+    car: &Value,
+    edge: &crate::fulfils::Fulfils,
+    branch: &str,
+    gate_run: &str,
+    relaunch_of: Option<&str>,
+    head: &str,
+) -> Result<EdgeGreen, String> {
+    let gate = edge_named_gate(car, edge)?;
+    let carries = car.pointer("/metadata/branch").and_then(Value::as_str);
+    if carries != Some(branch) {
+        return Err(format!(
+            "car {} carries branch {}, and this gate-run gated {branch} — an edge finishes only \
+             the car of the branch its gate-run gated",
+            &edge.job[..8.min(edge.job.len())],
+            carries.unwrap_or("(none)")
+        ));
+    }
+    if already_done(gate) {
+        return Ok(EdgeGreen::Finished);
+    }
+    edge_car_open(car, edge)?;
+    let expect = green_binding(car, gate_run, relaunch_of, head)?;
+    if expect.get(GATE_RUN).is_none_or(Value::is_null) {
+        return Err(format!(
+            "car {}'s gate step names no gate-run — an edge is a locator, not a holder, so this \
+             green finishes nothing",
+            &edge.job[..8.min(edge.job.len())]
+        ));
+    }
+    Ok(EdgeGreen::Finish(expect))
+}
+
+/// PURE: the hand-back a NON-GREEN verdict owes the car its gate-run's
+/// R8 edge names — [`gate_return`]'s two judged writes, or none when
+/// this gate-run does not hold the step (a newer launch restamped it, or
+/// a redelivery finds it already handed back). `Err` when the edge does
+/// not name an open car's gate step.
+///
+/// NEVER A COMPLETION. A red, lost, refused or withdrawn verdict puts the
+/// step back to READY with the verdict beside it; nothing on this path
+/// completes the step, which is what keeps a red off the dock.
+pub fn edge_return(
+    car: &Value,
+    edge: &crate::fulfils::Fulfils,
+    gate_run: &str,
+    verdict: &str,
+) -> Result<Vec<JudgedWrite>, String> {
+    edge_gate_step(car, edge)?;
+    Ok(gate_return(car, gate_run, verdict))
+}
+
+/// Which car a dispatched run's admission or gate launch acts on.
+#[derive(Debug, PartialEq)]
+pub enum RunCar<'a> {
+    /// The run's own car, found by its `agent_run` — on ANOTHER branch
+    /// than the one asked about, so the caller re-points it first.
+    Run(&'a Value),
+    /// The branch's building car — the run's own, a hand-opened one, or
+    /// one an earlier run of the SAME change admitted (a repair).
+    Branch(&'a Value),
+    /// Neither: the run has no building car and the branch has none.
+    Neither,
+}
+
+/// PURE: the car a run acts on, by STABLE IDENTITY FIRST — the building
+/// car whose `agent_run` is `run` — and only then by `branch`; or why
+/// none may be chosen.
+///
+/// WHY IDENTITY BEFORE BRANCH (Codex review of car 0d04ee3e, R1). A
+/// branch is the one thing a builder changes under a run: start on
+/// feat/a, rename to feat/b, run `--started` again, and a branch-first
+/// admission found no car for feat/b and filed a second with the same
+/// run and item, while a gate on feat/b moved that second car and left
+/// the first at build. Asked by the run first, the second start
+/// re-points the one car and the gate moves it.
+///
+/// REFUSED, NEVER GUESSED: two building cars carrying one run (the twin
+/// this exists to stop, already made); the run's car on another branch
+/// while this branch has a live car of its own (re-pointing would make
+/// two); and a building car on this branch that ANOTHER run of ANOTHER
+/// change admitted — stamping its gate would hand some other build's car
+/// to this gate. Another run of the SAME change (`item`) is a repair and
+/// is the branch's car as before.
+pub fn run_car_for<'a>(
+    cars: &'a [Value],
+    run: Option<&str>,
+    item: Option<&str>,
+    branch: &str,
+) -> Result<RunCar<'a>, String> {
+    let id = |c: &Value| {
+        let id = c.get("id").and_then(Value::as_str).unwrap_or("?");
+        id[..8.min(id.len())].to_string()
+    };
+    let md = |c: &'a Value, k: &str| -> Option<&'a str> {
+        c.pointer(&format!("/metadata/{k}"))
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+    };
+    let mine: Vec<&Value> = match run {
+        Some(run) => cars
+            .iter()
+            .filter(|c| is_building(c) && md(c, "agent_run") == Some(run))
+            .collect(),
+        None => Vec::new(),
+    };
+    if mine.len() > 1 {
+        return Err(format!(
+            "run {} already has {} building cars ({}) — one run is one car, so this refuses \
+             to choose; abandon the twin before going on",
+            run.unwrap_or_default(),
+            mine.len(),
+            mine.iter().map(|c| id(c)).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    // THE WHOLE BRANCH CANDIDATE SET, NOT ITS FIRST ROW (Codex review of
+    // car 0d04ee3e, round 2 R1). Two building cars on one branch is the
+    // twin already made, and choosing `find`'s first made the answer
+    // depend on list order: a repair run adopted whichever listed first
+    // and stamped itself on it, leaving the other at build. So the set is
+    // read whole and two is refused by name, for every run — the owner
+    // of one of them included, since "the branch's car" no longer names
+    // one car.
+    let on_branch: Vec<&Value> = cars
+        .iter()
+        .filter(|c| {
+            c.pointer("/metadata/branch").and_then(Value::as_str) == Some(branch) && is_building(c)
+        })
+        .collect();
+    if on_branch.len() > 1 {
+        return Err(format!(
+            "{branch} has {} building cars ({}) — a branch is one car, so this refuses to \
+             choose; abandon the twin before going on",
+            on_branch.len(),
+            on_branch
+                .iter()
+                .map(|c| id(c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    match (mine.first().copied(), on_branch.first().copied()) {
+        (Some(m), Some(b)) if m.get("id") == b.get("id") => Ok(RunCar::Branch(b)),
+        (Some(m), Some(b)) => Err(format!(
+            "run {}'s car {} is on {}, and {branch} has its own building car {} — refusing to \
+             choose between them",
+            run.unwrap_or_default(),
+            id(m),
+            md(m, "branch").unwrap_or("?"),
+            id(b)
+        )),
+        (Some(m), None) => match open_car_for(cars, branch) {
+            Some(other) => Err(format!(
+                "run {}'s car {} is on {}, and {branch} already has live car {} — re-pointing \
+                 the run's car would give the branch two",
+                run.unwrap_or_default(),
+                id(m),
+                md(m, "branch").unwrap_or("?"),
+                id(other)
+            )),
+            None => Ok(RunCar::Run(m)),
+        },
+        (None, Some(b)) => {
+            let owner = md(b, "agent_run");
+            let same_change = item.is_some() && md(b, "backlog_item") == item;
+            match owner {
+                Some(owner) if Some(owner) != run && !same_change => Err(format!(
+                    "{branch}'s building car {} was admitted by run {owner} for {} — another \
+                     run of another change; this one ({}) does not move it",
+                    id(b),
+                    md(b, "backlog_item").unwrap_or("no item"),
+                    run.unwrap_or("no run")
+                )),
+                _ => Ok(RunCar::Branch(b)),
+            }
+        }
+        (None, None) => Ok(RunCar::Neither),
+    }
+}
+
+/// The gate-step key naming the run a REPAIR adopted the car for —
+/// written by `boss dispatch --started` when a later run of the same
+/// change takes a car an earlier run admitted, judged on
+/// [`ENDED_BEFORE_GATE`] being absent ([`adoption`]).
+pub const BUILD_RUN: &str = "build_run";
+
+/// THE ONE FENCE between a car's two ways off `build` (backlog 366c9fb1;
+/// Codex review of car 0d04ee3e, R4b): the gate-step key an ending of an
+/// UNLAUNCHED car claims it under — `{by, id, outcome, at}`, which run or
+/// item ended, how, and when ([`ending_claim`]).
+///
+/// A gate launch's FIRST write stamps `gate_run` on the same step judged
+/// on this key ABSENT ([`launch_fence`]); an ending's first write stamps
+/// this key judged on `gate_run` ABSENT. One step row, two mutually
+/// exclusive expectations: the row's version compare lets exactly one
+/// land, and the loser has written nothing — a launch completes `build`
+/// only after its stamp landed, and an ending touches `abandoned` only
+/// after its claim did.
+pub const ENDED_BEFORE_GATE: &str = "ended_before_gate";
+
+/// The job-metadata key saying why an unlaunched car was abandoned, in
+/// words, beside the `abandoned` marker its terminal waits on.
+pub const ABANDONED_WHY: &str = "abandoned_why";
+
+/// The expectation a gate launch's first write — the gate-step stamp —
+/// carries: no ending has claimed the car ([`ENDED_BEFORE_GATE`]).
+pub fn launch_fence() -> serde_json::Map<String, Value> {
+    serde_json::Map::from_iter([(ENDED_BEFORE_GATE.to_string(), Value::Null)])
+}
+
+/// The ending claim this car's gate step carries, if one landed — the
+/// decided ending any reader that finds it finishes ([`ending_rest`]).
+pub fn ending_of(car: &Value) -> Option<&Value> {
+    find_step(car, GATE_SLUG, GATE)?
+        .pointer(&format!("/metadata/{ENDED_BEFORE_GATE}"))
+        .filter(|v| v.is_object())
+}
+
+/// PURE: the judged write a repair run's adoption of `car` sends FIRST —
+/// `(gate step id, body, expect)`: `{build_run: run}` onto the gate step,
+/// landing only while no ending has claimed the car. `None` when the car
+/// has no gate step id to bind on.
+pub fn adoption(car: &Value, run: &str) -> Option<(String, Value, serde_json::Map<String, Value>)> {
+    Some((
+        step_id_for(car, GATE_SLUG, GATE)?,
+        json!({ BUILD_RUN: run }),
+        launch_fence(),
+    ))
+}
+
+/// What ended, so a car built for it and never gated may end too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended<'a> {
+    /// An `agent-run` closed `outcome` (refused, died) — its admitted car.
+    Run { run: &'a str, outcome: &'a str },
+    /// A `backlog-item` closed `outcome` (declined, stale, duplicate) —
+    /// every car building for it.
+    Item { item: &'a str, outcome: &'a str },
+}
+
+impl Ended<'_> {
+    /// The car-metadata edge that names what ended.
+    pub fn edge(&self) -> (&'static str, &str) {
+        match self {
+            Self::Run { run, .. } => ("agent_run", run),
+            Self::Item { item, .. } => (BACKLOG_ITEM, item),
+        }
+    }
+}
+
+/// One plain write an ending still owes, in the order it is owed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EndingWrite {
+    /// `PATCH` for a merge door, `PUT` for the status write.
+    pub method: &'static str,
+    /// The path, without a base.
+    pub path: String,
+    pub body: Value,
+}
+
+/// PURE: may this car end because `ended` ended — and if so, the judged
+/// CLAIM that decides it, sent first. `Err`, naming why, leaves it alone.
+///
+/// WHY (backlog 366c9fb1; design 689d1f7f car 1). `boss dispatch
+/// --started` admits a car at build. A builder that stops without
+/// building ends its RUN `refused`, one that goes silent is ended `died`,
+/// and an ITEM can close declined, stale or duplicate under its car;
+/// nothing then moved the car, which stood open at `build` for ever. Only
+/// a car no gate ever ran for ends here: a launch stamps `gate_run` FIRST,
+/// and a gated car waits at its gate for the repair that re-gates it (a
+/// red ends its run `refused` too, by design).
+///
+/// LEFT ALONE, NAMED: a closed, boarded or past-its-gate car; one already
+/// claimed by an ending (that ending is FINISHED, by [`ending_rest`], not
+/// claimed twice); a gate step a launch stamped; a completed `build`; a
+/// car whose edge no longer names what ended, or whose gate step a repair
+/// bound to another run; a car pinned to a version with no `abandoned`
+/// terminal, or whose terminal is already taken.
+pub fn ending_claim(
+    car: &Value,
+    ended: Ended<'_>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<JudgedWrite, String> {
+    let id = car.get("id").and_then(Value::as_str).unwrap_or("?");
+    let short = &id[..8.min(id.len())];
+    if !is_building(car) {
+        return Err(format!(
+            "car {short} is not building (closed, aboard a train, or past its gate)"
+        ));
+    }
+    let (edge, named) = ended.edge();
+    if car
+        .pointer(&format!("/metadata/{edge}"))
+        .and_then(Value::as_str)
+        != Some(named)
+    {
+        return Err(format!(
+            "car {short}'s `{edge}` no longer names {named} — another run adopted it, or it \
+             answers another change"
+        ));
+    }
+    if ending_of(car).is_some() {
+        return Err(format!(
+            "car {short} is already claimed by an ending — it is finished, not claimed twice"
+        ));
+    }
+    let Some(gate) = find_step(car, GATE_SLUG, GATE) else {
+        return Err(no_such_step(GATE_SLUG, GATE));
+    };
+    let gate_md = |k: &str| gate.pointer(&format!("/metadata/{k}"));
+    if let Some(holder) = gate_md(GATE_RUN).filter(|v| !v.is_null()) {
+        return Err(format!(
+            "car {short}'s gate was launched (gate-run {}) — a gated car waits at its gate \
+             for the repair that re-gates it",
+            holder.as_str().unwrap_or("?")
+        ));
+    }
+    if find_step(car, BUILD_SLUG, BUILD).is_some_and(already_done) {
+        return Err(format!(
+            "car {short}'s build is already handed in — it is not an unlaunched car"
+        ));
+    }
+    let bound = gate_md(BUILD_RUN).cloned().unwrap_or(Value::Null);
+    if let Ended::Run { run, .. } = ended
+        && bound.as_str().is_some_and(|b| b != run)
+    {
+        return Err(format!(
+            "car {short}'s gate is bound to run {} — a repair adopted it",
+            bound.as_str().unwrap_or("?")
+        ));
+    }
+    let Some(gate_id) = gate.get("id").and_then(Value::as_str) else {
+        return Err(format!("car {short}'s `{GATE_SLUG}` step has no id"));
+    };
+    abandoned_step(car)?;
+    let (by, what, how) = match ended {
+        Ended::Run { run, outcome } => ("run", run, outcome),
+        Ended::Item { item, outcome } => ("item", item, outcome),
+    };
+    Ok(JudgedWrite {
+        method: "PATCH",
+        path: format!("/api/jobs/{id}/steps/{gate_id}/metadata"),
+        body: json!({ ENDED_BEFORE_GATE: {"by": by, "id": what, "outcome": how, "at": stamp(now)} }),
+        expect: serde_json::Map::from_iter([
+            (GATE_RUN.to_string(), Value::Null),
+            (ENDED_BEFORE_GATE.to_string(), Value::Null),
+            (BUILD_RUN.to_string(), bound),
+        ]),
+    })
+}
+
+/// The car's `abandoned` terminal, while it can still be taken.
+fn abandoned_step(car: &Value) -> Result<&Value, String> {
+    let id = car.get("id").and_then(Value::as_str).unwrap_or("?");
+    let short = &id[..8.min(id.len())];
+    let Some(step) = find_step(
+        car,
+        crate::car_retire::ABANDONED_SLUG,
+        crate::car_retire::ABANDONED,
+    ) else {
+        return Err(format!(
+            "car {short} has no `abandoned` terminal on its pinned version"
+        ));
+    };
+    match step.get("status").and_then(Value::as_str) {
+        Some("pending" | "ready" | "completed") => Ok(step),
+        other => Err(format!(
+            "car {short}'s `abandoned` terminal is {} — it cannot be taken",
+            other.unwrap_or("?")
+        )),
+    }
+}
+
+/// PURE: the writes an ending CLAIMED on this car still owes, read off
+/// the claim and the car as they stand — evidence onto `abandoned`, the
+/// marker its `ready_when` waits on, then its status. Empty when the
+/// terminal is already completed.
+///
+/// RESUMABLE BY CONSTRUCTION (Codex review of car 0d04ee3e, R4a). Every
+/// word and stamp is derived from the CLAIM, never from the resumer, so a
+/// retry after any one write — the dispatcher's redelivery, a repair
+/// whose adoption found the claim, a gate launch whose stamp lost to it —
+/// sends the same bytes and skips what already landed. The claim itself
+/// is the only judged write; after it no launch or adoption can land, so
+/// nothing a resumer sends can contend.
+pub fn ending_rest(car: &Value) -> Result<Vec<EndingWrite>, String> {
+    let id = car.get("id").and_then(Value::as_str).unwrap_or("?");
+    let Some(claim) = ending_of(car) else {
+        return Err(format!(
+            "car {} carries no ending claim",
+            &id[..8.min(id.len())]
+        ));
+    };
+    let terminal = abandoned_step(car)?;
+    if terminal.get("status").and_then(Value::as_str) == Some("completed") {
+        return Ok(Vec::new());
+    }
+    let terminal_id = terminal
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("car {id}'s `abandoned` step has no id"))?;
+    let c = |k: &str| claim.get(k).and_then(Value::as_str).unwrap_or("?");
+    let why = format!(
+        "the {} {} that this car was admitted for ended {} before any gate ran for it, so \
+         the car ends with it rather than standing at build for ever",
+        if c("by") == "item" {
+            "backlog item"
+        } else {
+            "agent-run"
+        },
+        c("id"),
+        c("outcome"),
+    );
+    let mut owed = Vec::new();
+    if terminal
+        .pointer("/metadata/evidence")
+        .and_then(Value::as_str)
+        != Some(why.as_str())
+    {
+        owed.push(EndingWrite {
+            method: "PATCH",
+            path: format!("/api/jobs/{id}/steps/{terminal_id}/metadata"),
+            body: json!({ "evidence": why, "completed_at": c("at") }),
+        });
+    }
+    let md = |k: &str| {
+        car.pointer(&format!("/metadata/{k}"))
+            .and_then(Value::as_str)
+    };
+    if md(crate::car_retire::ABANDONED_MARKER) != Some("true") || md(ABANDONED_WHY) != Some(&why) {
+        owed.push(EndingWrite {
+            method: "PATCH",
+            path: format!("/api/jobs/{id}/metadata"),
+            body: json!({ crate::car_retire::ABANDONED_MARKER: "true", ABANDONED_WHY: why }),
+        });
+    }
+    owed.push(EndingWrite {
+        method: "PUT",
+        path: format!("/api/jobs/{id}/steps/{terminal_id}"),
+        body: json!({"status": "completed"}),
+    });
+    Ok(owed)
 }
 
 /// THE CAR CARRIES ITS PROBE. `boss prove` records a proof as a
@@ -513,6 +1615,19 @@ pub const PROOF_EXPECT: &str = "proof_expect";
 /// hand on 2026-09-08 — so the yard can count it as waiting rather
 /// than forgotten, and the arrival rule knows to leave it alone.
 pub const PROOF_EVENT: &str = "proof_event";
+/// THE ATTEMPT RECORD — what every probe door (`boss prove`, the
+/// dispatcher's car-probe sweep, a host's environment refusal) writes
+/// on the car when a run settled nothing. It is replaced by the next
+/// unsettled run and NEVER cleared by a proof, so a closed car carrying
+/// one is a car whose proof did not settle on its first run: a failure,
+/// a not-yet wait, or a run that could not run or was refused — the
+/// caveat the retros count (backlog 78a42b2a: 364 cars carried it on
+/// 2026-10-21, 358 of them closed with `proven` completed). It is NOT a
+/// count of failed proofs: of the 65 IT cars closed that week carrying
+/// one, 38 held a not-yet wait and 27 a failure (review b4bae4e7), so a
+/// reader splits the records by `exit` / `not_yet` before calling any a
+/// failure. One spelling for the writers and that count (CLAUDE.md §9a).
+pub const PROOF_ATTEMPT: &str = "proof_attempt";
 
 /// The proof intent a car carries in its metadata: the probe + expect
 /// pair, or the event that stands in for one. Absent keys are omitted
@@ -548,6 +1663,52 @@ pub fn proof_intent_of_park(
 ) -> serde_json::Map<String, Value> {
     let s = |k: &str| gate_run_md.get(k).and_then(Value::as_str);
     proof_intent(s(PARK_PROBE), s(PARK_EXPECT), s(PARK_PROOF_EVENT))
+}
+
+/// What every park door says when a car would stand at the dock owing a
+/// proof nothing can settle. ONE text for `boss gate`, `boss park`,
+/// `boss rerail --finish` and the auto-park handler (CLAUDE.md §9a), so
+/// the remedy a builder is told to type cannot differ between doors.
+pub const UNPROVEN_PARK: &str = "a car parks carrying neither a probe nor a proof event, so \
+     once it lands nothing can prove it: the shed reads it owed for good and proven-in-prod \
+     means nothing for it. Measured 2026-11-08 (backlog 031a3ca9): 65 of 81 landed cars owed a \
+     proof carried neither, because no park door refused them.\n\n\
+     These are boss gate's flags (boss park and boss rerail take none): re-gate the branch \
+     with the probe the forge runs, boss gate <branch> --park-probe '<shell>' with \
+     --park-expect '<the string it prints>' (park-file keys `probe` and `expect`), or, when \
+     only something that has to happen can prove the car, --park-proof-event '<the event, and \
+     how to prove it when it fires>' (park-file key `proof_event`). A car that already \
+     carries a probe or an event keeps it, so a re-gate of it need not restate either \
+     (backlog 92a51856).";
+
+/// THE CAR AT THE DOCK CARRIES ITS PROOF (backlog 031a3ca9). `Some` with
+/// [`UNPROVEN_PARK`] when a park would leave the car with neither a
+/// probe nor an event: the park itself states none (`proof`, in the
+/// car's keys — [`proof_intent`] / [`proof_intent_of_park`]) AND the car
+/// it lands on, if one exists already, carries none either. A re-gate
+/// that states nothing is fine on a car that already carries its probe
+/// — the dock's own re-gate stamps only a summary, by design — and is
+/// refused on one that does not, because refreshing it would vouch for
+/// a car nothing can prove.
+///
+/// An expect without a probe is not a proof: `boss gate` refuses that
+/// pair, and the arrival rule cannot run a string.
+pub fn unproven_park(
+    car: Option<&Value>,
+    proof: &serde_json::Map<String, Value>,
+) -> Option<String> {
+    let proves = |m: &serde_json::Map<String, Value>| {
+        [PROOF_PROBE, PROOF_EVENT].iter().any(|k| {
+            m.get(*k)
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+        })
+    };
+    let car_proves = car
+        .and_then(|c| c.get("metadata"))
+        .and_then(Value::as_object)
+        .is_some_and(proves);
+    (!proves(proof) && !car_proves).then(|| UNPROVEN_PARK.to_string())
 }
 
 /// THE NOT-YET STREAK (backlog adef5ddf). A car's `proof_attempt` is
@@ -629,7 +1790,7 @@ pub struct NotYetStreak {
 /// probe corrected by a metadata PATCH stops reading as starved at once
 /// rather than at the next hourly write.
 pub fn not_yet_streak(md: &Value) -> Option<NotYetStreak> {
-    let attempt = md.get("proof_attempt")?;
+    let attempt = md.get(PROOF_ATTEMPT)?;
     if !attempt_said_not_yet(attempt) {
         return None;
     }
@@ -882,7 +2043,7 @@ pub fn wait_observation(attempt: &Value) -> WaitObservation {
 /// Declaring a command alone cannot establish that the event is unseen.
 pub fn wait_observer_unread(md: &Value) -> bool {
     waits_on(md).is_some_and(|w| w.seen.is_some())
-        && wait_observation(&md["proof_attempt"]) == WaitObservation::Unread
+        && wait_observation(&md[PROOF_ATTEMPT]) == WaitObservation::Unread
 }
 
 /// Is this car's wait someone else's move? Only when all four hold: it
@@ -909,10 +2070,10 @@ pub fn owned_wait(md: &Value) -> Option<OwnedWait> {
     // refused, could not execute, or lacked a tool. That is unread
     // evidence, not a negative observation of the event.
     if wait_observer_unread(md)
-        || md.get("proof_attempt").and_then(|a| a.get("waits_on_exit")) == Some(&Value::Null)
+        || md.get(PROOF_ATTEMPT).and_then(|a| a.get("waits_on_exit")) == Some(&Value::Null)
         || (w.seen.is_some()
             && md
-                .get("proof_attempt")
+                .get(PROOF_ATTEMPT)
                 .is_some_and(|attempt| wait_observation(attempt) != WaitObservation::Unseen))
     {
         return None;
@@ -951,9 +2112,147 @@ pub fn owned_wait(md: &Value) -> Option<OwnedWait> {
 /// `boss prove --from-car --unattended`); `owes_proof` is false for it.
 pub const PROOF_OWED: &str = "proof_owed";
 
+/// The car metadata key an owed proof is paid under: the same record
+/// `proven` carries when completed (`verified`, `proof`, `completed_at`)
+/// plus `proven_by`, held on the car because its `proven` step was
+/// skipped by the landing close and a closed packet's steps are history.
+/// Here rather than in the CLI that writes it, because the server now
+/// reserves it (backlog 82946cd9): one spelling for the writer and the
+/// door that judges it (CLAUDE.md §9a).
+pub const OWED_PROOF: &str = "owed_proof";
+
 /// Does this car owe its proof? Only under the one marker.
 pub fn owes_proof(md: &Value) -> bool {
     md.get(PROOF_OWED).and_then(Value::as_str) == Some("true")
+}
+
+/// The payment as a door READ it — both keys, `null` for an absent one —
+/// as the precondition its write carries into the store (backlog
+/// 87fe090d, review 7d92ec03 of car 5351793c). [`payment_moves`] judges
+/// a write against the row the door read; the merge lands on the row as
+/// it stands and the PUT saves a whole row, so a payment, a debt or an
+/// erasure committed between the two would be undone by a write judged
+/// harmless. The store refuses the write unless the row still reads so
+/// under its lock ([`crate::step_metadata_write::metadata_still_reads`]).
+/// Only these two keys: any other key written since changes nothing the
+/// judgement rests on, and the conductor's markers land on a car all day.
+pub fn payment_as_read(md: &Value) -> serde_json::Map<String, Value> {
+    [OWED_PROOF, PROOF_OWED]
+        .into_iter()
+        .map(|k| (k.to_owned(), md.get(k).cloned().unwrap_or(Value::Null)))
+        .collect()
+}
+
+/// WHO PAYS AN OWED PROOF (backlog 82946cd9, F3 of reviews 9daaa7a9 and
+/// e7bf6b14 on car c8ecf66a). The payment is one metadata write — the
+/// marker turned to `"paid"` beside the proof under [`OWED_PROOF`] — and
+/// until this rule any caller with Update on job could make it through
+/// either job door, indistinguishable from the forge's except by the
+/// audit actor: the self-asserted `x-boss-user` id every machine-door
+/// caller can type (the reason [`crate::field_writer`] never reads it).
+/// A forged `"paid"` drops the car out of the obligation's reader, so
+/// its probe is never run again, on a record that reads proven.
+///
+/// So the payment is reserved to the credentialed runner — the one
+/// identity the server resolves rather than believes
+/// ([`crate::runner_credential`]). These are the keys a write moves that
+/// only it may move: [`OWED_PROOF`] in any way (set, changed or erased),
+/// and [`PROOF_OWED`] in any way but one. Marking a debt — absent to
+/// `"true"` — stays open to every writer, because the landing that owes
+/// it is not the runner, and a forged mark admits nothing by itself:
+/// the forge door re-reads the car and runs only a closed, landed,
+/// undisproved one (review 9daaa7a9 F2). Erasing a debt, paying it,
+/// un-paying it or re-owing a paid one is the runner's. `null` reads as
+/// absent on both sides, so a merge-door `null` for a key the row does
+/// not hold changes nothing.
+pub fn payment_moves(old: &Value, new: &Value) -> Vec<&'static str> {
+    let at = |md: &Value, key: &str| md.get(key).filter(|v| !v.is_null()).cloned();
+    let mut moved = Vec::new();
+    if at(old, OWED_PROOF) != at(new, OWED_PROOF) {
+        moved.push(OWED_PROOF);
+    }
+    let (was, will) = (at(old, PROOF_OWED), at(new, PROOF_OWED));
+    let marks_a_debt = was.is_none() && will.as_ref().and_then(Value::as_str) == Some("true");
+    if was != will && !marks_a_debt {
+        moved.push(PROOF_OWED);
+    }
+    moved
+}
+
+/// The verb that pays an owed proof, compiled in so the hosts it runs on
+/// are READ rather than copied (CLAUDE.md §9a; backlog 82946cd9).
+const RUN_CAR_PROBE_VERB: &str = include_str!("../../../../infra/ops/verbs/run-car-probe.json");
+
+/// The hosts an owed proof may be paid from: the `hosts` the
+/// run-car-probe verb declares — the only verb that runs a car's probe,
+/// so the only place a payment can honestly come from. A verb file that
+/// does not parse answers no host, which refuses every payment rather
+/// than admitting any; the test beside [`payment_refusal`] pins it.
+pub fn payment_hosts() -> Vec<String> {
+    serde_json::from_str::<Value>(RUN_CAR_PROBE_VERB)
+        .ok()
+        .and_then(|verb| {
+            verb.get("hosts")?.as_array().map(|hosts| {
+                hosts
+                    .iter()
+                    .filter_map(|h| h.as_str().map(str::to_string))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// Why `caller` may not move the payment keys, or `None` when it may:
+/// the [`crate::runner_credential::PRINCIPAL`] credential, presented
+/// from a host in [`payment_hosts`]. A car names no `host`, so the host
+/// binding [`crate::field_writer::admits`] applies to a packet is not
+/// asked of the car; the payment's own binding is asked instead.
+///
+/// HOST-BOUND (backlog 82946cd9, owed after car 5351793c): the runner
+/// credential resolves on every runner host — forge and boss-gcp both
+/// hold one since row E (2026-10-10) — and only the forge runs a car's
+/// probe. Admitting any runner host let a host that never ran the probe
+/// write the payment that says it passed. A credential that names no
+/// host is refused the same way: it names nothing to judge.
+pub fn payment_refusal(caller: Option<&crate::field_writer::CredentialedCaller>) -> Option<String> {
+    let host = caller.and_then(|c| c.host.as_deref());
+    if let Err(why) = crate::field_writer::admits(caller, crate::runner_credential::PRINCIPAL, host)
+    {
+        return Some(why);
+    }
+    let hosts = payment_hosts();
+    if host.is_some_and(|h| hosts.iter().any(|p| p == h)) {
+        return None;
+    }
+    let named = hosts
+        .iter()
+        .map(|h| format!("`{h}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "the presented credential is bound to host {}, and an owed proof is paid only from \
+         a host the run-car-probe verb runs on ({}; infra/ops/verbs/run-car-probe.json \
+         `hosts`)",
+        host.map_or_else(|| "none".to_string(), |h| format!("`{h}`")),
+        if named.is_empty() { "none" } else { &named },
+    ))
+}
+
+/// The `spec_slug` of the step an owed proof is the proof of.
+pub const PROVEN_STEP: &str = "proven";
+
+/// What the packet read hands beside a step for an owed proof's
+/// payment, or `None` (backlog 82946cd9, F4 of reviews 9daaa7a9 and
+/// e7bf6b14). A landing close SKIPS `proven`, and the runner pays the
+/// debt on the car, because a closed packet's steps are history — so a
+/// reader of the step saw it skipped and nothing pointing at the proof
+/// that paid it. The record under [`OWED_PROOF`], as stored, beside the
+/// [`PROVEN_STEP`] step only; every write of it is the credentialed
+/// runner's ([`payment_moves`]), so what is handed is the runner's.
+pub fn owed_proof_beside(md: &Value, step_slug: Option<&str>) -> Option<Value> {
+    (step_slug == Some(PROVEN_STEP))
+        .then(|| md.get(OWED_PROOF).filter(|v| !v.is_null()).cloned())
+        .flatten()
 }
 
 /// Inside `waits_on`: the event that settles the wait, declared so a
@@ -987,6 +2286,18 @@ impl WaitEvent {
                 .as_deref()
                 .is_none_or(|p| title.is_some_and(|t| t.starts_with(p)))
     }
+}
+
+/// A declared wait's event in the one shape [`wait_event`] reads — what
+/// `boss car waits-on --event-closes` and a park file's
+/// `[waits_on.event]` write (backlog 9e9db2ea). The title prefix is
+/// omitted, never nulled, when none is given.
+pub fn waits_on_event_value(closes: &str, title: Option<&str>) -> Value {
+    let mut e = json!({"closes": closes});
+    if let Some(t) = title {
+        e["title"] = json!(t);
+    }
+    e
 }
 
 /// The event a car's `waits_on` declares, or `None` — for no wait, a
@@ -1309,6 +2620,21 @@ pub fn parked_car_for<'a>(cars: &'a [Value], branch: &str) -> Option<&'a Value> 
     })
 }
 
+/// The car a park-flagged green of `branch` LANDS ON: the one parked at
+/// the dock (the auto-park handler's `Refresh`), otherwise the one a
+/// builder opened and is still building (its `Adopt`). `None` means the
+/// green would file a car — or has nothing to land on, for a boarded one.
+///
+/// WHY IT IS SPELLED HERE (backlog 92a51856). [`unproven_park`] is asked
+/// of the car a park lands on, and the handler asked it of this car
+/// while `boss gate` asked it of none: a park-flagged re-gate of a car
+/// that already carried its probe — CLAUDE.md §Doors' own repair — was
+/// refused at launch unless it typed the probe again. One answer to
+/// "which car" for both doors.
+pub fn car_a_park_lands_on<'a>(cars: &'a [Value], branch: &str) -> Option<&'a Value> {
+    parked_car_for(cars, branch).or_else(|| building_car_for(cars, branch))
+}
+
 /// Is this car ABOARD a train — an open car the conductor stamped with
 /// `metadata.train` and has not released?
 ///
@@ -1368,20 +2694,26 @@ pub fn open_car_for<'a>(cars: &'a [Value], branch: &str) -> Option<&'a Value> {
 /// could never ride again.
 pub fn is_landed(car: &Value) -> bool {
     let md = car.get("metadata");
-    let flag = |k: &str| match md.and_then(|m| m.get(k)) {
-        // The conductor writes the marker as the STRING "true"; a bool
-        // is accepted for the same meaning, and an explicit false is
-        // neither.
-        Some(Value::Bool(b)) => *b,
-        Some(Value::String(s)) => s == "true",
-        _ => false,
-    };
-    if flag(crate::car_unland::UNLANDED_MARKER) {
+    if is_marked(car, crate::car_unland::UNLANDED_MARKER) {
         return false;
     }
     let closed_merged = car.get("status").and_then(Value::as_str) == Some("closed")
         && md.and_then(|m| m.get("outcome")).and_then(Value::as_str) == Some("merged");
-    closed_merged || flag("merged")
+    closed_merged || is_marked(car, "merged")
+}
+
+/// Does this car carry the marker `key` in its metadata? The conductor
+/// writes a marker as the STRING "true"; a bool is accepted for the same
+/// meaning, and an explicit false is neither. ONE reading for every
+/// marker (backlog 82946cd9): the owed-proof door read `disproved` and
+/// `abandoned` as the string only while [`is_landed`] read both forms,
+/// so a bool-disproved owed car was run.
+pub fn is_marked(car: &Value, key: &str) -> bool {
+    match car.get("metadata").and_then(|m| m.get(key)) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => s == "true",
+        _ => false,
+    }
 }
 
 /// The car that already landed `branch`, if one has — the question both
@@ -2009,6 +3341,143 @@ mod tests {
         assert_eq!(hold_body(&Value::Null, "x"), json!({ "hold": "x" }));
     }
 
+    /// A REFRESH CARRIES A LIVE REVIEW HOLD TO ITS NEW HEAD, AND ONLY THAT
+    /// (backlog 6b12a70f). The head alone is written; nothing else moves.
+    #[test]
+    fn a_live_review_hold_follows_the_head_a_refresh_moved_the_car_to() {
+        let held = json!({ "hold": "conductor re-judge at 29943365", HOLD_SHA: "29943365",
+                           RELEASE: {"sha": "2b1591c1"} });
+        assert_eq!(
+            hold_follows_head(&held, " df139b70 "),
+            Some(json!({ HOLD_SHA: "df139b70" }))
+        );
+        // Already at that head, or no head to move to: nothing.
+        assert_eq!(hold_follows_head(&held, "29943365"), None);
+        assert_eq!(hold_follows_head(&held, " "), None);
+        // A hold bound to no head is not a review's: none is bound.
+        for unbound in [
+            json!({ "hold": "David only" }),
+            json!({ "hold": "x", HOLD_SHA: null }),
+            json!({ "hold": "x", HOLD_SHA: "" }),
+        ] {
+            assert_eq!(hold_follows_head(&unbound, "df139b70"), None, "{unbound}");
+        }
+        // No live hold — released, or cleared bare — carries nothing: the
+        // conductor re-judges those at the head it boards.
+        for clear in [
+            json!({ HOLD_SHA: "29943365", "hold": null, RELEASE: {"sha": "29943365"} }),
+            json!({ HOLD_SHA: "29943365", "hold": false }),
+            Value::Null,
+        ] {
+            assert_eq!(hold_follows_head(&clear, "df139b70"), None, "{clear}");
+        }
+    }
+
+    /// The judgement a carried hold rests on is the raw hold and head as
+    /// read, nothing else, and it reads back true on the row it came from
+    /// (backlog cd1f68c6).
+    #[test]
+    fn a_carried_hold_is_judged_on_the_hold_and_head_it_read() {
+        let held = json!({ "hold": "conductor re-judge at 29943365", HOLD_SHA: "29943365",
+                           RELEASE: {"sha": "2b1591c1"}, "agent_run": "7cb2438c" });
+        let judged = hold_as_judged(&held);
+        assert_eq!(
+            Value::Object(judged.clone()),
+            json!({ "hold": "conductor re-judge at 29943365", HOLD_SHA: "29943365" })
+        );
+        assert!(crate::step_metadata_write::metadata_still_reads(
+            &held, &judged
+        ));
+        let released = json!({ HOLD_SHA: "29943365", RELEASE: {"sha": "29943365"} });
+        assert!(!crate::step_metadata_write::metadata_still_reads(
+            &released, &judged
+        ));
+        assert_eq!(
+            Value::Object(hold_as_judged(&Value::Null)),
+            json!({ "hold": null, HOLD_SHA: null })
+        );
+    }
+
+    /// A STRIKE RELEASE LIFTS THE HOLD ITS STRIKE PLACED, AND ONLY THAT
+    /// (backlog 79129752). Car 775feba5's review step, its hold verbatim.
+    #[test]
+    fn a_strike_release_lifts_only_the_red_train_hold_for_a_train_it_cleared() {
+        const TRAIN: &str = "9b5c1889-f729-4fda-8546-8802806ec539";
+        let hold = format!(
+            "{} (test) as the only car aboard — first failing line: test: \
+             every_converge_tick_observes_the_site::the_page_phase_stops_at_the_observation_\
+             deadline_and_says_so - panicked at ... — rebuild it on current main, re-gate, then \
+             `boss release` it (a2d4d842, b4a95f47)",
+            judged_red_hold_head("9b5c1889")
+        );
+        assert!(hold.starts_with("held by the conductor: train 9b5c1889 was judged red (test)"));
+        assert_eq!(judged_red_hold_train(&hold), Some("9b5c1889"));
+        let md = json!({ "hold": hold, "authority_role": "platform-admin" });
+        let cleared = vec![TRAIN.to_string()];
+        assert_eq!(
+            hold_lifted_by_strike_release(&md, &cleared, 0),
+            Some(json!({ "hold": null }))
+        );
+        // A null head is no head.
+        let mut unbound = md.clone();
+        unbound[HOLD_SHA] = Value::Null;
+        assert!(hold_lifted_by_strike_release(&unbound, &cleared, 0).is_some());
+
+        // KEPT: a strike still standing, or a train this look did not clear.
+        assert_eq!(hold_lifted_by_strike_release(&md, &cleared, 1), None);
+        assert_eq!(hold_lifted_by_strike_release(&md, &[], 0), None);
+        let other = vec!["0badc0de-0000-4000-8000-000000000000".to_string()];
+        assert_eq!(hold_lifted_by_strike_release(&md, &other, 0), None);
+        // KEPT: the same text bound to a head, or reserved for a person.
+        let mut bound = md.clone();
+        bound[HOLD_SHA] = json!("e76ef0f9");
+        assert_eq!(hold_lifted_by_strike_release(&bound, &cleared, 0), None);
+        let mut reserved = md.clone();
+        reserved[RELEASER] = json!("emp-david");
+        assert_eq!(hold_lifted_by_strike_release(&reserved, &cleared, 0), None);
+        // KEPT: any other hold, and no hold at all.
+        for kept in [
+            json!({ "hold": "held for the restart" }),
+            json!({ "hold": "conductor re-judge at 29943365", HOLD_SHA: "29943365" }),
+            json!({ "hold": "the conductor said train 9b5c1889 was judged red" }),
+            json!({ "hold": null }),
+            Value::Null,
+        ] {
+            assert_eq!(
+                hold_lifted_by_strike_release(&kept, &cleared, 0),
+                None,
+                "{kept}"
+            );
+        }
+        // The recognizer reads only the head's own shape.
+        assert_eq!(
+            judged_red_hold_train("held by the conductor: train  was judged red"),
+            None
+        );
+        assert_eq!(
+            judged_red_hold_train("held by the conductor: train a b was judged red"),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_review_gate_envelope_does_not_delete_a_still_held_review_head() {
+        for poison in [json!({}), json!(null)] {
+            let plain = json!({"hold":"David only", HOLD_SHA:"head", RELEASE:{"sha":"head"}});
+            assert_eq!(
+                hold_body(&plain, "next reason"),
+                json!({"hold":"next reason"})
+            );
+            let mut poisoned = plain;
+            poisoned["gate_submission"] = poison;
+            assert_eq!(
+                hold_body(&poisoned, "next reason"),
+                json!({"hold":"next reason"}),
+                "a raw hold was never lifted, so its head must remain"
+            );
+        }
+    }
+
     /// The proof keys are written only when stated, so a car with no
     /// probe carries no `proof_probe: null` for a reader to trip on.
     #[test]
@@ -2043,6 +3512,108 @@ mod tests {
         let e = proof_intent_of_park(&obj(json!({ PARK_PROOF_EVENT: "event-bound" })));
         assert_eq!(e[PROOF_EVENT], "event-bound");
         assert!(proof_intent_of_park(&obj(json!({ "branch": "fix/x" }))).is_empty());
+    }
+
+    /// A PARK THAT LEAVES THE CAR UNPROVABLE IS REFUSED (backlog
+    /// 031a3ca9: 65 of 81 landed cars owed a proof carried neither a
+    /// probe nor an event, because no door refused them). The car it
+    /// lands on counts: a bare re-gate of a probed car is a refresh, and
+    /// of an unprobed one it is the same gap again.
+    #[test]
+    fn a_park_that_leaves_the_car_with_no_proof_is_refused() {
+        let obj = |v: Value| v.as_object().cloned().unwrap();
+        let none = serde_json::Map::new();
+        let why = unproven_park(None, &none).expect("a bare park files an unprovable car");
+        for named in [
+            "--park-probe",
+            "--park-expect",
+            "--park-proof-event",
+            "`probe`",
+            "`expect`",
+            "`proof_event`",
+            "031a3ca9",
+        ] {
+            assert!(why.contains(named), "the refusal names {named}: {why}");
+        }
+        let probed = proof_intent(Some("git show HEAD:x | grep -c 'y'"), Some("1"), None);
+        assert_eq!(unproven_park(None, &probed), None);
+        let event = proof_intent(None, None, Some("event-bound — the next red train"));
+        assert_eq!(unproven_park(None, &event), None);
+        let expect_only = obj(json!({ PROOF_EXPECT: "1" }));
+        assert!(
+            unproven_park(None, &expect_only).is_some(),
+            "a string with no command is not a proof"
+        );
+
+        let car_probed = json!({"metadata": { PROOF_PROBE: "echo ok", PROOF_EXPECT: "ok" }});
+        let car_event = json!({"metadata": { PROOF_EVENT: "a stalled train" }});
+        let car_bare = json!({"metadata": { "branch": "fix/x" }});
+        let car_blank = json!({"metadata": { PROOF_PROBE: "  " }});
+        assert_eq!(unproven_park(Some(&car_probed), &none), None);
+        assert_eq!(unproven_park(Some(&car_event), &none), None);
+        assert!(unproven_park(Some(&car_bare), &none).is_some());
+        assert!(
+            unproven_park(Some(&car_blank), &none).is_some(),
+            "a blank probe is no probe"
+        );
+        assert_eq!(unproven_park(Some(&car_bare), &probed), None);
+    }
+
+    /// THE REFUSAL NAMES THE VERB ITS FLAGS BELONG TO (backlog 92a51856).
+    /// One text serves four doors, and only `boss gate` takes a probe:
+    /// printed by `boss park`, a bare `--park-probe` read as if that verb
+    /// had the flag. And it says a car already carrying a probe keeps it,
+    /// because the documented repair is a park-flagged re-gate.
+    #[test]
+    fn the_unproven_refusal_names_the_verb_its_flags_belong_to() {
+        assert!(
+            UNPROVEN_PARK.contains("boss gate <branch> --park-probe"),
+            "{UNPROVEN_PARK}"
+        );
+        assert!(
+            UNPROVEN_PARK.contains("boss park and boss rerail take none"),
+            "{UNPROVEN_PARK}"
+        );
+        assert!(
+            UNPROVEN_PARK.contains("keeps it"),
+            "a probed car needs no restatement: {UNPROVEN_PARK}"
+        );
+    }
+
+    /// THE CAR A PARK LANDS ON (backlog 92a51856): the one the auto-park
+    /// handler refreshes (parked) or adopts (opened at build start), and
+    /// none for a boarded car, another branch's, or no car at all.
+    #[test]
+    fn a_park_lands_on_the_parked_or_the_building_car() {
+        let car = |id: &str, branch: &str, gate: &str, review: &str, train: Value| {
+            json!({
+                "id": id, "status": "open",
+                "metadata": { "branch": branch, "train": train },
+                "steps": [
+                    {"spec_slug": GATE_SLUG, "title": GATE, "status": gate},
+                    {"spec_slug": REVIEW_SLUG, "title": REVIEW, "status": review},
+                ]
+            })
+        };
+        let parked = car("parked", "fix/x", "completed", "ready", Value::Null);
+        let building = car("building", "fix/x", "active", "pending", Value::Null);
+        let aboard = car("aboard", "fix/x", "completed", "ready", json!("train-1"));
+        let other = car("other", "fix/y", "completed", "ready", Value::Null);
+        let id = |c: Option<&Value>| c.and_then(|c| c["id"].as_str()).map(str::to_string);
+
+        let docked = [other.clone(), parked.clone()];
+        assert_eq!(
+            id(car_a_park_lands_on(&docked, "fix/x")),
+            Some("parked".into())
+        );
+        let opened = [building.clone()];
+        assert_eq!(
+            id(car_a_park_lands_on(&opened, "fix/x")),
+            Some("building".into())
+        );
+        assert_eq!(car_a_park_lands_on(&[aboard], "fix/x"), None);
+        assert_eq!(car_a_park_lands_on(&[other], "fix/x"), None);
+        assert_eq!(car_a_park_lands_on(&[], "fix/x"), None);
     }
 
     /// THE TIER STAMPS ARE COPIED, NOT REBUILT (ba429e7f): the set rides
@@ -2281,6 +3852,30 @@ mod regate_tests {
             declared_no_estate(r#"{"verdict":"green","head":"abc","checks":[]}"#),
             None,
             "a cluster receipt carries no `estate` and parks as before"
+        );
+    }
+
+    /// THE SECOND DECLARATION (backlog 6665aa97; review 30397e74 of car
+    /// 4f1a96ab). `BOSS_TRUNK=none` is the public mirror's too, behind
+    /// the same runtime guard (infra/lint/lib/public-mirror.sh), and
+    /// gate.sh writes `trunk` on its receipt. Every mirror receipt
+    /// carries both today, so a receipt carrying `trunk` alone is a
+    /// leak past that guard — refused exactly as an `estate` one is,
+    /// naming the declaration and the lints that judged no car.
+    #[test]
+    fn a_receipt_that_declares_no_trunk_is_refused_as_one_that_declares_no_estate_is() {
+        let trunk_only = r#"{"verdict":"green","head":"abc","trunk":{"declared":"none","not_judged":["factory-vocabulary"]}}"#;
+        let why = declared_no_estate(trunk_only).expect("a trunk-declaring receipt is refused");
+        assert!(
+            why.contains("no per-car trunk")
+                && why.contains("trunk-ref.sh")
+                && why.contains("factory-vocabulary"),
+            "the refusal names the declaration and the lints that judged no car: {why}"
+        );
+        let both = r#"{"verdict":"green","head":"abc","estate":{"declared":"none","live_not_run":[]},"trunk":{"declared":"none","not_judged":[]}}"#;
+        assert!(
+            declared_no_estate(both).is_some(),
+            "a mirror receipt, carrying both, is refused"
         );
     }
 
@@ -2900,6 +4495,455 @@ mod building_tests {
                 {"id": "s-review", "spec_slug": "review", "title": REVIEW, "status": "pending"},
             ],
         })
+    }
+
+    /// A GATE LAUNCH HANDS IN THE BUILD AND HOLDS THE GATE (backlog
+    /// 68a8726e): build completed with the test, the gate step stamped
+    /// with the gate-run BEFORE it is claimed — and a second launch on a
+    /// car already in the gate only restamps it.
+    #[test]
+    fn a_gate_launch_completes_build_and_claims_the_gate_for_its_run() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-08T23:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let c = building("b1", BRANCH, BRANCH);
+        let plan = gate_launch(&c, "gr-1", "abc123", "12 tests", now)
+            .unwrap()
+            .expect("a car at build moves");
+        let build = plan.build.expect("build is handed in at launch");
+        assert_eq!(build.step_id, "s-build");
+        assert_eq!(build.metadata["test"], "12 tests");
+        assert_eq!(build.status_body, json!({"status": "completed"}));
+        assert_eq!(plan.gate_step, "s-gate");
+        assert_eq!(plan.gate_merge[GATE_RUN], "gr-1");
+        assert_eq!(plan.gate_merge["gated_head"], "abc123");
+        assert!(plan.claim);
+
+        let mut in_gate = c.clone();
+        in_gate["steps"][2]["status"] = json!("completed");
+        in_gate["steps"][3]["status"] = json!("active");
+        let again = gate_launch(&in_gate, "gr-2", "def456", "t", now)
+            .unwrap()
+            .unwrap();
+        assert!(again.build.is_none(), "a completed build is not resent");
+        assert!(!again.claim, "an active gate is restamped, not reclaimed");
+        assert_eq!(again.gate_merge[GATE_RUN], "gr-2");
+
+        let mut past = in_gate;
+        past["steps"][3]["status"] = json!("completed");
+        assert!(gate_launch(&past, "gr-3", "x", "t", now).unwrap().is_none());
+    }
+
+    /// A NON-GREEN VERDICT HANDS THE GATE BACK, and only the gate-run
+    /// that holds it can: a car another launch restamped is not moved.
+    #[test]
+    fn a_red_hands_back_only_the_gate_its_own_run_holds() {
+        let mut c = building("b1", BRANCH, BRANCH);
+        c["steps"][2]["status"] = json!("completed");
+        c["steps"][3]["status"] = json!("active");
+        c["steps"][3]["metadata"] = json!({GATE_RUN: "gr-1"});
+        let cars = [c.clone()];
+        assert_eq!(car_in_gate_run(&cars, "gr-1").unwrap()["id"], "b1");
+        assert!(car_in_gate_run(&cars, "gr-other").is_none());
+        let writes = gate_return(&c, "gr-1", "failed");
+        assert_eq!(writes.len(), 2, "held by gr-1: {writes:#?}");
+        let (merge, put) = (&writes[0], &writes[1]);
+        assert_eq!(
+            (merge.method, merge.path.as_str()),
+            ("PATCH", "/api/jobs/b1/steps/s-gate/metadata")
+        );
+        assert_eq!(merge.body[LAST_VERDICT]["verdict"], "failed");
+        assert_eq!(merge.body[LAST_VERDICT][GATE_RUN], "gr-1");
+        assert_eq!(
+            (put.method, put.path.as_str()),
+            ("PUT", "/api/jobs/b1/steps/s-gate")
+        );
+        assert_eq!(put.body, json!({"status": "ready"}));
+        // R3: BOTH writes are judged on the holder; the PUT also on the
+        // verdict the merge wrote — the state the judged merge produced.
+        assert_eq!(
+            merge.expect,
+            json!({GATE_RUN: "gr-1"}).as_object().cloned().unwrap()
+        );
+        assert_eq!(
+            Value::Object(put.expect.clone()),
+            json!({GATE_RUN: "gr-1", LAST_VERDICT: {GATE_RUN: "gr-1", "verdict": "failed"}})
+        );
+        assert!(gate_return(&c, "gr-other", "failed").is_empty());
+        c["steps"][3]["status"] = json!("ready");
+        assert!(
+            gate_return(&c, "gr-1", "failed").is_empty(),
+            "already handed back"
+        );
+    }
+
+    /// A car a launch has moved into its gate, held by `gate_run` at HEAD.
+    fn held(gate_run: &str) -> Value {
+        let mut c = building("b1", BRANCH, BRANCH);
+        c["steps"][2]["status"] = json!("completed");
+        c["steps"][3]["status"] = json!("active");
+        c["steps"][3]["metadata"] = json!({GATE_RUN: gate_run, "gated_head": HEAD});
+        c
+    }
+
+    fn edge() -> crate::fulfils::Fulfils {
+        crate::fulfils::Fulfils {
+            job: "b1".into(),
+            step: "s-gate".into(),
+        }
+    }
+
+    /// THE EDGE IS READ BACK OFF THE STAMP (design 689d1f7f car 2,
+    /// backlog a3a367e4): a launch writes it only for a car whose gate
+    /// step names its gate-run, so a lost fence or a newer launch leaves
+    /// the gate-run without one rather than pointing at a step it does
+    /// not hold.
+    #[test]
+    fn a_launch_writes_the_edge_only_onto_the_gate_its_run_holds() {
+        assert_eq!(gate_edge(&held("gr-1"), "gr-1"), Some(edge()));
+        assert_eq!(gate_edge(&held("gr-2"), "gr-1"), None, "restamped");
+        assert_eq!(gate_edge(&building("b1", BRANCH, BRANCH), "gr-1"), None);
+        let mut closed = held("gr-1");
+        closed["status"] = json!("closed");
+        assert_eq!(gate_edge(&closed, "gr-1"), None);
+    }
+
+    /// THE CUTOVER, OLD DISPATCHER (design 689d1f7f car 2). The CLI and
+    /// the dispatcher deploy apart, so a dispatcher that predates the
+    /// edge will read an edged gate-run's verdict. The edge is ADDITIVE:
+    /// the car it names is the one the scan already finds — by its branch
+    /// on a green, by the stamp on a red — so that dispatcher still
+    /// finishes it, or hands it back, as before.
+    #[test]
+    fn an_edged_launch_leaves_the_car_the_scan_still_finds() {
+        let c = held("gr-1");
+        let e = gate_edge(&c, "gr-1").expect("the launch writes its edge");
+        let cars = [c.clone()];
+        assert_eq!(building_car_for(&cars, BRANCH).unwrap()["id"], e.job);
+        assert_eq!(car_in_gate_run(&cars, "gr-1").unwrap()["id"], e.job);
+    }
+
+    /// A GREEN BY EDGE finishes only a gate its run holds — never an
+    /// unbound one, which the scan's binding accepts (the edge carries no
+    /// branch to vouch for it) — and a finished gate is not finished
+    /// twice.
+    #[test]
+    fn a_green_by_edge_finishes_only_a_gate_its_run_holds() {
+        match edge_green(&held("gr-1"), &edge(), BRANCH, "gr-1", None, HEAD) {
+            Ok(EdgeGreen::Finish(expect)) => {
+                assert_eq!(expect[GATE_RUN], "gr-1");
+                assert_eq!(expect["gated_head"], HEAD);
+            }
+            other => panic!("its own gate: {other:?}"),
+        }
+        let stale = edge_green(&held("gr-2"), &edge(), BRANCH, "gr-1", None, HEAD).unwrap_err();
+        assert!(stale.contains("held by gate-run gr-2"), "{stale}");
+        let mut unbound = building("b1", BRANCH, BRANCH);
+        unbound["steps"][3]["status"] = json!("ready");
+        let why = edge_green(&unbound, &edge(), BRANCH, "gr-1", None, HEAD).unwrap_err();
+        assert!(why.contains("names no gate-run"), "{why}");
+        let mut done = held("gr-1");
+        done["steps"][3]["status"] = json!("completed");
+        assert_eq!(
+            edge_green(&done, &edge(), BRANCH, "gr-1", None, HEAD),
+            Ok(EdgeGreen::Finished)
+        );
+    }
+
+    /// AN EDGE THAT DOES NOT NAME AN OPEN CAR'S GATE is refused on both
+    /// verdicts, naming why — never resolved some other way.
+    #[test]
+    fn an_edge_to_anything_but_an_open_cars_gate_is_refused() {
+        let wrong_step = crate::fulfils::Fulfils {
+            job: "b1".into(),
+            step: "s-review".into(),
+        };
+        let other_car = crate::fulfils::Fulfils {
+            job: "b2".into(),
+            step: "s-gate".into(),
+        };
+        let mut closed = held("gr-1");
+        closed["status"] = json!("closed");
+        for (car, e, says) in [
+            (held("gr-1"), &wrong_step, "is not car"),
+            (held("gr-1"), &other_car, "is not that car"),
+            (closed, &edge(), "no longer open"),
+        ] {
+            let green = edge_green(&car, e, BRANCH, "gr-1", None, HEAD).unwrap_err();
+            assert!(green.contains(says), "{green}");
+            let red = edge_return(&car, e, "gr-1", "failed").unwrap_err();
+            assert!(red.contains(says), "{red}");
+        }
+    }
+
+    /// A GREEN REPLAYED AFTER ITS CAR CLOSED reads Finished, not an
+    /// ended-car refusal (review 01fe1c71 of car 3a7ab114, finding 3):
+    /// the step is judged before the car's status, because a landed car's
+    /// gate was completed by the very green being replayed. A car that
+    /// ended with its gate still OPEN is still refused — no verdict
+    /// finishes an ended car.
+    #[test]
+    fn a_green_replayed_after_its_car_closed_reads_finished() {
+        let mut landed = held("gr-1");
+        landed["steps"][3]["status"] = json!("completed");
+        landed["status"] = json!("closed");
+        assert_eq!(
+            edge_green(&landed, &edge(), BRANCH, "gr-1", None, HEAD),
+            Ok(EdgeGreen::Finished)
+        );
+        let mut abandoned = held("gr-1");
+        abandoned["status"] = json!("cancelled");
+        let why = edge_green(&abandoned, &edge(), BRANCH, "gr-1", None, HEAD).unwrap_err();
+        assert!(why.contains("no longer open"), "{why}");
+    }
+
+    /// AN EDGE IS AS STRICT AS THE SCAN ABOUT THE BRANCH (review 01fe1c71
+    /// of car 3a7ab114, finding 4): a green from a gate-run that gated
+    /// another branch finishes nothing, even holding the step at the head
+    /// — including through a relaunch naming this car's holder.
+    #[test]
+    fn a_green_by_edge_finishes_only_the_car_of_the_branch_it_gated() {
+        let why = edge_green(&held("gr-1"), &edge(), "feat/other", "gr-1", None, HEAD).unwrap_err();
+        assert!(why.contains("branch"), "{why}");
+        assert!(why.contains("feat/other"), "{why}");
+        let relaunch = edge_green(
+            &held("gr-1"),
+            &edge(),
+            "feat/other",
+            "gr-9",
+            Some("gr-1"),
+            HEAD,
+        );
+        assert!(relaunch.is_err(), "{relaunch:?}");
+        assert!(matches!(
+            edge_green(&held("gr-1"), &edge(), BRANCH, "gr-9", Some("gr-1"), HEAD),
+            Ok(EdgeGreen::Finish(_))
+        ));
+    }
+
+    /// A RED BY EDGE NEVER COMPLETES THE STEP (the trust boundary of
+    /// backlog a3a367e4): it is the same judged hand-back to READY as the
+    /// scan's, and nothing at all once another launch holds the step.
+    #[test]
+    fn a_red_by_edge_hands_back_and_never_completes() {
+        let writes = edge_return(&held("gr-1"), &edge(), "gr-1", "failed").unwrap();
+        assert_eq!(writes, gate_return(&held("gr-1"), "gr-1", "failed"));
+        assert_eq!(writes.len(), 2);
+        assert!(
+            writes
+                .iter()
+                .all(|w| w.body.get("status") != Some(&json!("completed"))),
+            "{writes:#?}"
+        );
+        assert!(
+            edge_return(&held("gr-2"), &edge(), "gr-1", "failed")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// R2 (Codex review of car 0d04ee3e): a green finishes the gate step
+    /// only for the gate-run that holds it, at the head it was launched
+    /// at — and a car with no binding (filed before launches stamped one)
+    /// is finished exactly as before.
+    #[test]
+    fn a_green_finishes_only_the_gate_its_run_holds_at_its_head() {
+        let mut c = building("b1", BRANCH, BRANCH);
+        assert_eq!(
+            green_binding(&c, "gr-1", None, "abc1234"),
+            Ok(unbound_gate()),
+            "unbound: the write expects the binding still absent"
+        );
+        c["steps"][2]["status"] = json!("completed");
+        c["steps"][3]["status"] = json!("active");
+        c["steps"][3]["metadata"] = json!({GATE_RUN: "gr-2", "gated_head": "def5678aa"});
+        let held = green_binding(&c, "gr-2", None, "def5678aa").expect("the holder at its head");
+        assert_eq!(
+            Value::Object(held),
+            json!({GATE_RUN: "gr-2", "gated_head": "def5678aa"})
+        );
+        assert!(
+            green_binding(&c, "gr-2", None, "def5678").is_ok(),
+            "an abbreviation of the launched head is that head"
+        );
+        let stale = green_binding(&c, "gr-1", None, "abc1234").unwrap_err();
+        assert!(stale.contains("held by gate-run gr-2"), "{stale}");
+        let moved = green_binding(&c, "gr-2", None, "0000000").unwrap_err();
+        assert!(moved.contains("another head"), "{moved}");
+        // Handed back after a red, the step still names its last holder:
+        // an older gate's late green is not that holder's verdict either.
+        c["steps"][3]["status"] = json!("ready");
+        assert!(green_binding(&c, "gr-1", None, "abc1234").is_err());
+        c["steps"][3]["status"] = json!("completed");
+        assert_eq!(
+            green_binding(&c, "gr-1", None, "abc1234"),
+            Ok(unbound_gate()),
+            "past it"
+        );
+    }
+
+    /// A LOST GATE'S RELAUNCH SUCCEEDS IT (backlog 64d417ca): the green
+    /// of the run whose `relaunch_of` names the holder finishes the step
+    /// that holder held, judged on the holder still holding it at its
+    /// head — and nothing wider: a relaunch of another run, a relaunch
+    /// vouching for another head, or a step a newer launch restamped
+    /// after the loss is not the relaunch's to finish.
+    #[test]
+    fn a_lost_gates_relaunch_finishes_the_gate_its_lost_run_held() {
+        let mut c = building("b1", BRANCH, BRANCH);
+        c["steps"][2]["status"] = json!("completed");
+        // The loss handed the step back READY, still naming the lost run
+        // — car 88645b17's shape on 2026-11-10.
+        c["steps"][3]["status"] = json!("ready");
+        c["steps"][3]["metadata"] = json!({
+            GATE_RUN: "gr-lost", "gated_head": "544327d0aa",
+            LAST_VERDICT: {GATE_RUN: "gr-lost", "verdict": "lost"},
+        });
+        assert!(
+            green_binding(&c, "gr-relaunch", None, "544327d0aa").is_err(),
+            "a green that names no predecessor is still held elsewhere"
+        );
+        let took = green_binding(&c, "gr-relaunch", Some("gr-lost"), "544327d0aa")
+            .expect("the relaunch takes over the lost run's binding");
+        assert_eq!(
+            Value::Object(took),
+            json!({GATE_RUN: "gr-lost", "gated_head": "544327d0aa"}),
+            "judged on the lost holder still holding the step at its head"
+        );
+        let stranger =
+            green_binding(&c, "gr-relaunch", Some("gr-other"), "544327d0aa").unwrap_err();
+        assert!(stranger.contains("held by gate-run gr-lost"), "{stranger}");
+        let moved = green_binding(&c, "gr-relaunch", Some("gr-lost"), "0000000").unwrap_err();
+        assert!(moved.contains("another head"), "{moved}");
+        // A launch after the loss restamped the step: its holder is not
+        // the lost run, so the relaunch's green finishes nothing.
+        c["steps"][3]["status"] = json!("active");
+        c["steps"][3]["metadata"] = json!({GATE_RUN: "gr-new", "gated_head": "1234567aa"});
+        assert!(green_binding(&c, "gr-relaunch", Some("gr-lost"), "544327d0aa").is_err());
+    }
+
+    /// THE STEP NAMES THE RUN WHOSE RECEIPT IT CARRIES (backlog
+    /// 84e46932): a relaunch's green renames the gate step's holder to
+    /// itself in the evidence merge, keeping the lost run beside it, and
+    /// the PUT is judged on that renamed state; the holder's own green
+    /// writes exactly the evidence, judged as before.
+    #[test]
+    fn a_relaunchs_green_renames_the_gate_steps_holder_in_its_merge() {
+        let gate = StepWrite::completing("s-gate", GATE, json!({"receipt": "r"}));
+        let held = serde_json::Map::from_iter([
+            (GATE_RUN.to_string(), json!("gr-lost")),
+            ("gated_head".to_string(), json!("544327d0aa")),
+        ]);
+        let [merge, put] = green_gate_writes("car-1", &gate, &held, "gr-relaunch");
+        assert_eq!(merge.path, "/api/jobs/car-1/steps/s-gate/metadata");
+        assert_eq!(
+            merge.body,
+            json!({"receipt": "r", GATE_RUN: "gr-relaunch", LOST_GATE_RUN: "gr-lost"})
+        );
+        assert_eq!(
+            merge.expect, held,
+            "the merge lands only on the lost holder"
+        );
+        assert_eq!(put.path, "/api/jobs/car-1/steps/s-gate");
+        assert_eq!(put.body, json!({"status": "completed"}));
+        assert_eq!(
+            Value::Object(put.expect),
+            json!({GATE_RUN: "gr-relaunch", LOST_GATE_RUN: "gr-lost", "gated_head": "544327d0aa"}),
+            "the PUT lands only on the state the merge made"
+        );
+
+        // The holder's own green, and an unbound car: no rename.
+        for expect in [
+            serde_json::Map::from_iter([(GATE_RUN.to_string(), json!("gr-relaunch"))]),
+            unbound_gate(),
+        ] {
+            let [merge, put] = green_gate_writes("car-1", &gate, &expect, "gr-relaunch");
+            assert_eq!(merge.body, json!({"receipt": "r"}));
+            assert_eq!((merge.expect, put.expect), (expect.clone(), expect));
+        }
+    }
+
+    /// R1 (Codex review of car 0d04ee3e): a run's car is found by the
+    /// run FIRST, whatever branch it now carries; the branch only after.
+    #[test]
+    fn a_run_finds_its_own_car_before_the_branch_and_refuses_to_guess() {
+        let mut c = building("b1", BRANCH, BRANCH);
+        c["metadata"]["agent_run"] = json!("run-1");
+        c["metadata"]["backlog_item"] = json!("item-1");
+        let cars = [c.clone()];
+        // Renamed: the run's car, to be re-pointed.
+        assert!(matches!(
+            run_car_for(&cars, Some("run-1"), Some("item-1"), "feat/renamed"),
+            Ok(RunCar::Run(r)) if r["id"] == "b1"
+        ));
+        // Same branch: the branch's car, nothing to re-point.
+        assert!(matches!(
+            run_car_for(&cars, Some("run-1"), Some("item-1"), BRANCH),
+            Ok(RunCar::Branch(b)) if b["id"] == "b1"
+        ));
+        // A repair — another run of the SAME change — takes the branch's car.
+        assert!(matches!(
+            run_car_for(&cars, Some("run-2"), Some("item-1"), BRANCH),
+            Ok(RunCar::Branch(_))
+        ));
+        // Another run of ANOTHER change is refused, not stamped.
+        let foreign = run_car_for(&cars, Some("run-9"), Some("item-9"), BRANCH).unwrap_err();
+        assert!(foreign.contains("admitted by run run-1"), "{foreign}");
+        assert!(run_car_for(&cars, None, None, BRANCH).is_err());
+        assert_eq!(
+            run_car_for(&cars, Some("run-9"), Some("item-9"), "feat/other"),
+            Ok(RunCar::Neither)
+        );
+        // A hand-opened car names no run: the branch's car, as before.
+        let hand = [building("h1", BRANCH, BRANCH)];
+        assert!(matches!(
+            run_car_for(&hand, Some("run-9"), None, BRANCH),
+            Ok(RunCar::Branch(_))
+        ));
+        // Two building cars for one run: refused, naming both.
+        let mut twin = c.clone();
+        twin["id"] = json!("b2");
+        twin["metadata"]["branch"] = json!("feat/renamed");
+        let twins = [c.clone(), twin];
+        let e = run_car_for(&twins, Some("run-1"), Some("item-1"), BRANCH).unwrap_err();
+        assert!(
+            e.contains("2 building cars") && e.contains("b1") && e.contains("b2"),
+            "{e}"
+        );
+        // The run's car elsewhere while the asked branch has its own car.
+        let mut other = building("o1", "feat/renamed", "feat/renamed");
+        other["metadata"]["backlog_item"] = json!("item-1");
+        let both = [c, other];
+        assert!(run_car_for(&both, Some("run-1"), Some("item-1"), "feat/renamed").is_err());
+    }
+
+    /// R1, round 2 (Codex review of car 0d04ee3e): a branch carrying TWO
+    /// building cars is ambiguous input, and the answer must not depend
+    /// on list order. A repair run that owns neither — both admitted by
+    /// earlier runs of the same change — is refused naming both, in
+    /// either order; and so is the run that owns one of them, because
+    /// "the branch's car" no longer names one car.
+    #[test]
+    fn a_branch_with_two_building_cars_is_refused_whichever_comes_first() {
+        let car = |id: &str, run: &str| {
+            let mut c = building(id, BRANCH, BRANCH);
+            c["metadata"]["agent_run"] = json!(run);
+            c["metadata"]["backlog_item"] = json!("item-1");
+            c
+        };
+        let (a, b) = (car("a1", "run-1"), car("b2", "run-2"));
+        for cars in [[a.clone(), b.clone()], [b.clone(), a.clone()]] {
+            for run in ["run-3", "run-1", "run-2"] {
+                let e = run_car_for(&cars, Some(run), Some("item-1"), BRANCH).unwrap_err();
+                assert!(
+                    e.contains("2 building cars") && e.contains("a1") && e.contains("b2"),
+                    "{run}: {e}"
+                );
+            }
+        }
+        // A hand-opened twin beside an admitted car is the same ambiguity.
+        let hand = building("h1", BRANCH, BRANCH);
+        assert!(run_car_for(&[hand, a], None, None, BRANCH).is_err());
     }
 
     /// THE THIRD STATE A LIVE CAR CAN BE IN. `is_parked` and
@@ -3678,6 +5722,84 @@ mod waits_on_tests {
         assert!(!owes_proof(&json!({ PROOF_OWED: "paid" })));
         assert!(!owes_proof(&json!({})));
     }
+
+    /// THE PAYMENT IS THE RUNNER'S (backlog 82946cd9): every move of the
+    /// two keys but one — marking a debt the row does not hold — is a
+    /// move only the credentialed runner may make; `null` is absent on
+    /// both sides, and an unchanged row moves nothing.
+    #[test]
+    fn every_move_of_the_payment_but_marking_a_debt_is_the_runners() {
+        let owed = json!({ PROOF_OWED: "true" });
+        let paid = json!({ PROOF_OWED: "paid", OWED_PROOF: {"verified": "v"} });
+        assert!(
+            payment_moves(&json!({}), &owed).is_empty(),
+            "marking a debt"
+        );
+        assert!(payment_moves(&json!({ PROOF_OWED: null }), &owed).is_empty());
+        assert!(payment_moves(&paid, &paid).is_empty(), "an unchanged row");
+        assert!(payment_moves(&json!({}), &json!({ OWED_PROOF: null })).is_empty());
+        assert_eq!(payment_moves(&owed, &paid), [OWED_PROOF, PROOF_OWED]);
+        assert_eq!(
+            payment_moves(&owed, &json!({})),
+            [PROOF_OWED],
+            "erasing a debt"
+        );
+        assert_eq!(
+            payment_moves(&json!({}), &json!({ PROOF_OWED: "paid" })),
+            [PROOF_OWED]
+        );
+        assert_eq!(
+            payment_moves(&paid, &owed),
+            [OWED_PROOF, PROOF_OWED],
+            "re-owing"
+        );
+        let other = json!({ PROOF_OWED: "paid", OWED_PROOF: {"verified": "w"} });
+        assert_eq!(
+            payment_moves(&paid, &other),
+            [OWED_PROOF],
+            "a rewritten proof"
+        );
+    }
+
+    /// Only a credential the server resolved for `runner:ops` pays, and
+    /// only from a host the run-car-probe verb runs on (the host binding
+    /// still owed on 82946cd9): the boss-gcp runner holds the same
+    /// principal and runs no probe, and a host-less runner names no host
+    /// to judge. No credential, or another principal's, is refused with
+    /// the reason the refusal carries.
+    #[test]
+    fn only_the_runner_credential_pays_and_only_from_a_probe_host() {
+        use crate::field_writer::CredentialedCaller;
+        let runner = |host: Option<&str>| CredentialedCaller {
+            principal: crate::runner_credential::PRINCIPAL.into(),
+            actor_id: crate::runner_credential::ACTOR.into(),
+            host: host.map(str::to_string),
+        };
+        assert_eq!(payment_refusal(Some(&runner(Some("forge")))), None);
+        for elsewhere in [Some("boss-gcp"), None] {
+            let why = payment_refusal(Some(&runner(elsewhere))).unwrap_or_default();
+            assert!(
+                why.contains("run-car-probe") && why.contains("`forge`"),
+                "{elsewhere:?}: {why}"
+            );
+        }
+        let none = payment_refusal(None).unwrap_or_default();
+        assert!(none.contains("self-asserted"), "{none}");
+        let other = CredentialedCaller {
+            principal: "runner:other".into(),
+            ..runner(Some("forge"))
+        };
+        assert!(payment_refusal(Some(&other)).is_some());
+    }
+
+    /// The hosts a payment may come from are READ from the verb that
+    /// pays — infra/ops/verbs/run-car-probe.json's `hosts` — never a
+    /// copy (CLAUDE.md §9a); a verb file that stopped parsing would
+    /// answer no host and refuse every payment, so it is pinned here.
+    #[test]
+    fn the_payment_hosts_are_the_run_car_probe_verbs_own() {
+        assert_eq!(payment_hosts(), ["forge"]);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4017,5 +6139,194 @@ mod boards_after_tests {
             EdgeOutcome::Hold(h) => assert_eq!(h.behind, "car bbbbbbbb", "no packet, no branch"),
             other => panic!("{other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod ending_tests {
+    //! A car admitted at build whose run or item ends before any gate
+    //! (backlog 366c9fb1; Codex review of car 0d04ee3e, R4a and R4b).
+    use super::*;
+
+    const RUN: &str = "run-1";
+    const ITEM: &str = "item-1";
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-11-09T08:00:00Z")
+            .unwrap()
+            .into()
+    }
+
+    /// An admitted car at build, carrying the `abandoned` terminal its
+    /// pinned version declares.
+    fn admitted() -> Value {
+        json!({
+            "id": "a1",
+            "kind": "ship-a-change",
+            "status": "open",
+            "metadata": {"branch": "fix/x", "agent_run": RUN, BACKLOG_ITEM: ITEM,
+                         ADMITTED_BY: "boss dispatch --started"},
+            "steps": [
+                {"id": "s-opened", "spec_slug": "opened", "title": OPENED, "status": "completed"},
+                {"id": "s-scope", "spec_slug": "scope", "title": SCOPE, "status": "completed"},
+                {"id": "s-build", "spec_slug": "build", "title": BUILD, "status": "active"},
+                {"id": "s-gate", "spec_slug": "gate", "title": GATE, "status": "pending"},
+                {"id": "s-review", "spec_slug": "review", "title": REVIEW, "status": "pending"},
+                {"id": "s-abandoned", "spec_slug": crate::car_retire::ABANDONED_SLUG,
+                 "title": crate::car_retire::ABANDONED, "status": "pending"},
+            ],
+        })
+    }
+
+    fn refused(run: &str) -> Ended<'_> {
+        Ended::Run {
+            run,
+            outcome: "refused",
+        }
+    }
+
+    /// The claim lands on the gate step FIRST, judged on no gate-run, no
+    /// ending and the run binding it read — the same key a launch's own
+    /// first write is fenced on.
+    #[test]
+    fn an_unlaunched_car_is_claimed_on_its_gate_step_first() {
+        let claim = ending_claim(&admitted(), refused(RUN), now()).unwrap();
+        assert_eq!(claim.method, "PATCH");
+        assert_eq!(claim.path, "/api/jobs/a1/steps/s-gate/metadata");
+        assert_eq!(claim.body[ENDED_BEFORE_GATE]["by"], "run");
+        assert_eq!(claim.body[ENDED_BEFORE_GATE]["id"], RUN);
+        assert_eq!(claim.body[ENDED_BEFORE_GATE]["outcome"], "refused");
+        assert_eq!(
+            Value::Object(claim.expect),
+            json!({GATE_RUN: null, ENDED_BEFORE_GATE: null, BUILD_RUN: null})
+        );
+        // A gate launch is fenced on the same key being absent.
+        assert_eq!(
+            Value::Object(launch_fence()),
+            json!({ENDED_BEFORE_GATE: null})
+        );
+        let plan = gate_launch(&admitted(), "gr-1", "abc", "t", now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.fence, launch_fence());
+    }
+
+    /// R4a: what is owed is read off the claim and the car, so a retry
+    /// after ANY write finishes the rest and sends no write twice that
+    /// already landed — and a finished ending owes nothing.
+    #[test]
+    fn an_ending_resumes_from_whatever_write_it_last_landed() {
+        let mut c = admitted();
+        let claim = ending_claim(&c, refused(RUN), now()).unwrap();
+        let claimed = claim.body[ENDED_BEFORE_GATE].clone();
+        c["steps"][3]["metadata"] = claim.body.clone();
+        assert_eq!(ending_of(&c), Some(&claimed));
+        // Claimed, a second claim is refused: the ending is resumed instead.
+        assert!(ending_claim(&c, refused(RUN), now()).is_err());
+
+        let all = ending_rest(&c).unwrap();
+        let paths: Vec<_> = all.iter().map(|w| (w.method, w.path.as_str())).collect();
+        assert_eq!(
+            paths,
+            vec![
+                ("PATCH", "/api/jobs/a1/steps/s-abandoned/metadata"),
+                ("PATCH", "/api/jobs/a1/metadata"),
+                ("PUT", "/api/jobs/a1/steps/s-abandoned"),
+            ]
+        );
+        let why = all[1].body[ABANDONED_WHY].as_str().unwrap().to_string();
+        assert!(why.contains(RUN) && why.contains("refused"), "{why}");
+        assert_eq!(all[0].body["evidence"], why.as_str());
+        assert_eq!(all[0].body["completed_at"], claimed["at"]);
+        assert_eq!(all[1].body[crate::car_retire::ABANDONED_MARKER], "true");
+
+        // After the evidence: the marker and the status are owed.
+        c["steps"][5]["metadata"] = all[0].body.clone();
+        assert_eq!(ending_rest(&c).unwrap(), all[1..]);
+        // After the marker: the status alone.
+        c["metadata"][crate::car_retire::ABANDONED_MARKER] = json!("true");
+        c["metadata"][ABANDONED_WHY] = json!(why);
+        assert_eq!(ending_rest(&c).unwrap(), all[2..]);
+        // Finished: nothing.
+        c["steps"][5]["status"] = json!("completed");
+        assert!(ending_rest(&c).unwrap().is_empty());
+    }
+
+    /// The declined item ends the car building for it.
+    #[test]
+    fn a_declined_item_claims_the_car_building_for_it() {
+        let claim = ending_claim(
+            &admitted(),
+            Ended::Item {
+                item: ITEM,
+                outcome: "declined",
+            },
+            now(),
+        )
+        .unwrap();
+        assert_eq!(claim.body[ENDED_BEFORE_GATE]["by"], "item");
+        let mut c = admitted();
+        c["steps"][3]["metadata"] = claim.body;
+        let why = ending_rest(&c).unwrap()[1].body[ABANDONED_WHY].clone();
+        assert!(
+            why.as_str().unwrap().contains("backlog item item-1"),
+            "{why}"
+        );
+    }
+
+    /// What an ending leaves alone, each named.
+    #[test]
+    fn an_ending_leaves_a_gated_adopted_or_foreign_car_alone() {
+        // A repair adopted it: the car's edge names the repair now.
+        let mut adopted = admitted();
+        adopted["metadata"]["agent_run"] = json!("run-2");
+        let e = ending_claim(&adopted, refused(RUN), now()).unwrap_err();
+        assert!(e.contains("no longer names run-1"), "{e}");
+        // A repair bound the gate step, its job edge not yet written.
+        let mut bound = admitted();
+        bound["steps"][3]["metadata"] = json!({BUILD_RUN: "run-2"});
+        let e = ending_claim(&bound, refused(RUN), now()).unwrap_err();
+        assert!(e.contains("bound to run run-2"), "{e}");
+        // ...but its own binding is no bar, and is expected as read.
+        bound["steps"][3]["metadata"] = json!({BUILD_RUN: RUN});
+        let claim = ending_claim(&bound, refused(RUN), now()).unwrap();
+        assert_eq!(claim.expect[BUILD_RUN], RUN);
+        // A launch's fence landed: the gate-run holds the car.
+        let mut gated = admitted();
+        gated["steps"][3]["metadata"] = json!({GATE_RUN: "gr-1"});
+        let e = ending_claim(&gated, refused(RUN), now()).unwrap_err();
+        assert!(e.contains("gr-1"), "{e}");
+        // Build handed in.
+        let mut handed = admitted();
+        handed["steps"][2]["status"] = json!("completed");
+        assert!(ending_claim(&handed, refused(RUN), now()).is_err());
+        // Another item's car.
+        let other = Ended::Item {
+            item: "item-9",
+            outcome: "declined",
+        };
+        assert!(ending_claim(&admitted(), other, now()).is_err());
+        // No `abandoned` terminal on its pinned version.
+        let mut old = admitted();
+        old["steps"].as_array_mut().unwrap().pop();
+        assert!(ending_claim(&old, refused(RUN), now()).is_err());
+    }
+
+    /// A repair's adoption binds its run on the gate step, landing only
+    /// while no ending has claimed the car.
+    #[test]
+    fn a_repairs_adoption_is_fenced_on_no_ending() {
+        let (step, body, expect) = adoption(&admitted(), "run-2").unwrap();
+        assert_eq!(step, "s-gate");
+        assert_eq!(body, json!({BUILD_RUN: "run-2"}));
+        assert_eq!(Value::Object(expect), json!({ENDED_BEFORE_GATE: null}));
+    }
+
+    /// A green that read an unbound gate is fenced on no ending too: a
+    /// claimed car is the ending's, not the green's to finish.
+    #[test]
+    fn an_unbound_greens_gate_writes_expect_no_ending() {
+        assert!(unbound_gate().contains_key(ENDED_BEFORE_GATE));
+        assert_eq!(unbound_gate()[ENDED_BEFORE_GATE], Value::Null);
     }
 }

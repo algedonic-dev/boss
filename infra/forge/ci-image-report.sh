@@ -180,7 +180,7 @@ if [ -z "$unanswered" ] && [ "$local_absent" -eq 0 ]; then
     accept='application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json'
     AUTH_HDR=""
     # shellcheck disable=SC2086
-    code="$($CURL -sS -m 15 -o "$tmp/ping.body" -D "$tmp/ping.hdr" -w '%{http_code}' "$REGISTRY_URL/v2/" 2>"$tmp/ping.err")"; rc=$?
+    code="$($CURL -q -sS -m 15 -o "$tmp/ping.body" -D "$tmp/ping.hdr" -w '%{http_code}' "$REGISTRY_URL/v2/" 2>"$tmp/ping.err")"; rc=$?
     case "$rc:$code" in
         0:200) say "$REGISTRY_URL/v2/ answered 200 without a token; reading anonymously" ;;
         0:401)
@@ -193,7 +193,7 @@ if [ -z "$unanswered" ] && [ "$local_absent" -eq 0 ]; then
             else
                 turl="$realm?service=$service&scope=repository:$REPO_PATH:pull"
                 # shellcheck disable=SC2086
-                code="$($CURL -sS -m 15 -o "$tmp/token.json" -D "$tmp/token.hdr" -w '%{http_code}' "$turl" 2>"$tmp/token.err")"; rc=$?
+                code="$($CURL -q -sS -m 15 -o "$tmp/token.json" -D "$tmp/token.hdr" -w '%{http_code}' "$turl" 2>"$tmp/token.err")"; rc=$?
                 token=""
                 [ "$rc" -eq 0 ] && [ "$code" = 200 ] && token="$(jq -r '.token // .access_token // empty' "$tmp/token.json" 2>/dev/null)"
                 if [ -n "$token" ] && ! secret_header AUTH_HDR "Authorization: Bearer $token"; then
@@ -212,7 +212,7 @@ if [ -z "$unanswered" ] && [ "$local_absent" -eq 0 ]; then
     if [ -z "$unanswered" ]; then
         murl="$REGISTRY_URL/v2/$REPO_PATH/manifests/$TAG"
         # shellcheck disable=SC2086
-        code="$($CURL -sS -m 15 -I -o "$tmp/tag.body" -D "$tmp/tag.hdr" -w '%{http_code}' -H "Accept: $accept" ${AUTH_HDR:+-H "$AUTH_HDR"} "$murl" 2>"$tmp/tag.err")"; rc=$?
+        code="$($CURL -q -sS -m 15 -I -o "$tmp/tag.body" -D "$tmp/tag.hdr" -w '%{http_code}' -H "Accept: $accept" ${AUTH_HDR:+-H "$AUTH_HDR"} "$murl" 2>"$tmp/tag.err")"; rc=$?
         if [ "$rc" -eq 0 ] && [ "$code" = 200 ]; then
             registry_digest="$(sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' "$tmp/tag.hdr" | tr -d '\r')"
             registry_digest="${registry_digest%%$'\n'*}"

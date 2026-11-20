@@ -68,7 +68,8 @@ pub(super) async fn advance(door: &NativeDoor<'_>) -> Result<Advance> {
     let spec: boss_jobs::registry::WorkflowSpec = serde_json::from_value(protocol.clone())?;
     if spec.kind != kind
         || u64::try_from(spec.version) != Ok(version)
-        || spec.status == boss_jobs::registry::WorkflowStatus::Draft
+        // A rejected row was never published either (50ded63d).
+        || !spec.status.was_published()
     {
         bail!("recovery published protocol differs");
     }
@@ -326,7 +327,7 @@ fn snapshot(path: &std::path::Path) -> Result<Value> {
     lock.lock_shared()?;
     let mut paths = Vec::new();
     let mut bytes = 0u64;
-    let mut account = |name: String, file: PathBuf| -> Result<()> {
+    let mut account = |name: String, file: PathBuf| -> Result<std::fs::Metadata> {
         let m = std::fs::symlink_metadata(&file)?;
         if !m.is_file() || m.uid() != rustix::process::geteuid().as_raw() || m.mode() & 0o077 != 0 {
             bail!("unsafe original journal file");
@@ -336,8 +337,15 @@ fn snapshot(path: &std::path::Path) -> Result<Value> {
             .context("snapshot byte count overflow")?;
         super::super::diagnostic_journal::check_read_bound(paths.len() + 1, bytes)?;
         paths.push((name, file));
-        Ok(())
+        Ok(m)
     };
+    // Published rows first: pending/ is read against them, because a staged
+    // twin an earlier build left (one per row before daab12f4) is a second
+    // name for a published row's inode and was counted twice toward the
+    // complete-read bound, halving it (194cb548). Its bytes are read once,
+    // under the published name; every other pending entry is still read.
+    let mut published = Vec::new();
+    let mut pending = None;
     for item in std::fs::read_dir(path)? {
         let item = item?;
         let name = item
@@ -348,22 +356,30 @@ fn snapshot(path: &std::path::Path) -> Result<Value> {
             continue;
         }
         if name == "pending" {
-            super::super::diagnostic_journal::private_directory(&item.path())?;
-            for entry in std::fs::read_dir(item.path())? {
-                let entry = entry?;
-                account(
-                    format!(
-                        "pending/{}",
-                        entry
-                            .file_name()
-                            .to_str()
-                            .context("non-UTF8 pending original name")?
-                    ),
-                    entry.path(),
-                )?;
-            }
+            pending = Some(item.path());
         } else {
-            account(name, item.path())?;
+            published.push(account(name, item.path())?);
+        }
+    }
+    if let Some(pending) = pending {
+        super::super::diagnostic_journal::private_directory(&pending)?;
+        let inodes = super::super::diagnostic_journal::published_inodes(&published);
+        for entry in std::fs::read_dir(pending)? {
+            let entry = entry?;
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            if super::super::diagnostic_journal::is_published_twin(&inodes, &metadata) {
+                continue;
+            }
+            account(
+                format!(
+                    "pending/{}",
+                    entry
+                        .file_name()
+                        .to_str()
+                        .context("non-UTF8 pending original name")?
+                ),
+                entry.path(),
+            )?;
         }
     }
     paths.sort_by(|a, b| a.0.cmp(&b.0));
@@ -467,7 +483,7 @@ pub(super) async fn covered_original(conductor: &Conductor, selected: &Value) ->
         || job["kind"] != selected["kind"]
         || job["workflow_version"] != selected["workflow_version"]
         || job["status"] != "closed"
-        || job["metadata"]["diagnostic_executor"] != ACTOR
+        || !carries_markers(&job, &queue_markers(true))
         || step["status"] != "completed"
         || step["assignee_id"] != ACTOR
         || step["job_id"] != id.to_string()
@@ -1078,6 +1094,55 @@ mod tests {
         );
         assert!(snapshot(&root.path().join("absent")).is_err());
         assert!(!root.path().join("absent").exists());
+    }
+
+    /// Backlog 194cb548: a journal written before daab12f4 keeps a staged
+    /// twin in pending/ for every published row. Counted, a journal of just
+    /// over half the file bound read as past it. A twin is a second name for
+    /// a published row's inode, so the snapshot reads the row once, under its
+    /// published name, and the read neither copies nor deletes the twin.
+    #[test]
+    fn a_published_rows_twin_is_not_counted_twice_toward_the_read_bound() {
+        use std::os::unix::fs::PermissionsExt;
+        let journal = super::super::super::diagnostic_journal::MAX_READ_FILES / 2 + 1;
+        let root = tempfile::tempdir().unwrap();
+        let path = super::super::super::diagnostic_journal::private_directory(
+            &root.path().join("original"),
+        )
+        .unwrap();
+        // One real append makes the lock and the shape keep() leaves.
+        super::super::super::diagnostic_journal::keep(&path, &json!({"row":0})).unwrap();
+        let staging =
+            super::super::super::diagnostic_journal::private_directory(&path.join("pending"))
+                .unwrap();
+        for sequence in 1..journal {
+            let raw =
+                serde_json::to_vec(&json!({"observation":{"row":sequence},"sequence":sequence}))
+                    .unwrap();
+            let name = format!("{sequence:020}-{}.json", hex::encode(Sha256::digest(&raw)));
+            std::fs::write(path.join(&name), &raw).unwrap();
+            // mode-bits-ok: private original journal fixture, never executable.
+            std::fs::set_permissions(path.join(&name), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        for (index, entry) in std::fs::read_dir(&path).unwrap().enumerate() {
+            let file = entry.unwrap().path();
+            if file.is_file() && file.extension().is_some_and(|ext| ext == "json") {
+                std::fs::hard_link(&file, staging.join(format!("original-twin{index}"))).unwrap();
+            }
+        }
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), journal);
+        let raw = snapshot(&path).expect("a twin was counted toward the read bound");
+        assert_eq!(raw["files"].as_array().unwrap().len(), journal);
+        assert_eq!(
+            parse_snapshot(&raw).unwrap(),
+            super::super::super::diagnostic_journal::originals(&path).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_dir(&staging).unwrap().count(),
+            journal,
+            "a read released a twin"
+        );
     }
 
     #[test]

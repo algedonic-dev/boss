@@ -202,7 +202,12 @@ export function gapsOf(c: Credential): ReadonlyArray<string> {
 // The lifecycle, as packets
 // ---------------------------------------------------------------------
 
-export const REQUESTED_FROM = '/it/registry/credentials';
+/// The marker every packet this page files carries, as the Drift tab's
+/// does (`drift-tab`, ../registry/approve.ts). It was the page's path,
+/// /it/registry/credentials, until a page's path became its host
+/// station's address in the tree (backlog 0bc2eb68), which moves when
+/// the station does; the record names the page, not an address.
+export const REQUESTED_FROM = 'credentials-tab';
 export const ROTATE_KIND = 'rotate-a-credential';
 const ITEM_KIND = 'backlog-item';
 

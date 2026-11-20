@@ -49,6 +49,9 @@
 
 use serde_json::Value;
 
+mod git_objects;
+pub use git_objects::{Refused, git_objects_only, reads_only_git_objects};
+
 /// WHERE A RECORDED PROBE RUNS — the forge host's absence manifest.
 ///
 /// A `--park-probe` is written on the dev pod (kubectl, a kubeconfig,
@@ -277,6 +280,380 @@ pub fn names_an_actor(probe: &str) -> Option<&'static str> {
                 .copied()
         })
 }
+
+/// The words that put a probe's answer in the CALLER'S OWN QUEUE: the
+/// two `boss orient` sections drawn from `assignments?for=me` (MY WORK,
+/// and NEEDS YOU on the top board), the verb that picks the caller's
+/// next step (`boss dispatch --next`), and that inbox read through any
+/// record client (`for=me`).
+pub const CALLERS_OWN_QUEUE: [&str; 4] = ["MY WORK", "NEEDS YOU", "--next", "for=me"];
+
+/// A PROBE'S ANSWER MUST NOT DEPEND ON WHO RUNS IT — and the word that
+/// makes this one's do, if it reads the record and spells one.
+///
+/// THE DEFECT (backlog 371b0443, measured 2026-10-19 00:51Z). Car
+/// f4cdf451 parked `boss orient | grep -A3 MY WORK | grep -c "urgent
+/// first, then oldest"`, expect 1. The builder rehearsed it as
+/// agent-claude, who had steps, and saw 1. The forge runs a recorded
+/// probe with NO actor ([`names_an_actor`] says why), and an actor with
+/// no steps gets the one-line empty MY WORK — so the hourly recheck saw
+/// 0, the proof read FAILING on correct code for a day, and the urgent
+/// item it would have closed stayed open. Nothing about the change was
+/// wrong; the probe measured the person running it.
+///
+/// TWO CONDITIONS, BOTH REQUIRED. The text reads the system of record
+/// ([`record_read_client`]: a `boss` verb, the reader, an HTTP client)
+/// AND names a section of [`CALLERS_OWN_QUEUE`]. A tree read that greps
+/// the same words out of `orient.rs` answers the same for every reader,
+/// and it is the shape this rule points at, so it must stay clean.
+///
+/// BOTH IN ONE FLOW (backlog 5c7ff14f, found reviewing car 7ff9e23e).
+/// The two conditions used to be asked of the whole text, so a tree
+/// grep for MY WORK on one line and a read of one packet by its id on
+/// the next — the pair a car editing MY WORK wants — was refused with
+/// no override. Now a marker counts only in a [`pipelines`] segment the
+/// record read FEEDS: one that runs the read itself, or one that expands
+/// a variable an earlier fed segment assigned (`out=$(boss orient);
+/// printf '%s' "$out" | grep 'MY WORK'`). A line ending in `|` or `\`
+/// continues onto the next, as the shell reads it. Balanced command
+/// captures are followed across lines, including a later capture that
+/// replaces the variable. Once fed output is saved to a file or handed to
+/// `tee`, `read` or `mapfile`, later segments are conservatively fed too:
+/// the scan cannot prove which file or loop variable carries the answer.
+/// This remains a bounded scan, not a shell interpreter; it does not follow
+/// a function-wrapped read through a later call of that function.
+/// A marker must also END where it ends: `--next-check-at` is a flag of
+/// its own, not the dispatch verb's `--next`.
+pub fn reads_the_callers_own_queue(probe: &str) -> Option<&'static str> {
+    record_read_client(probe)?;
+    let joined = probe.replace("|\n", "| ").replace("\\\n", " ");
+    let mut fed: Vec<&str> = Vec::new();
+    let mut later_fed = false;
+    let captures = queue_captures(&joined);
+    let mut completed = captures.iter().peekable();
+    pipelines(&joined).into_iter().find_map(|segment| {
+        let offset = segment.as_ptr() as usize - joined.as_ptr() as usize;
+        while let Some(&&(name, end, reads, saves)) = completed.peek() {
+            if end > offset {
+                break;
+            }
+            fed.retain(|old| *old != name);
+            if reads {
+                fed.push(name);
+                later_fed |= saves;
+            }
+            completed.next();
+        }
+        let reads = later_fed
+            || record_read_client(segment).is_some()
+            || fed.iter().any(|name| expands(segment, name));
+        if !reads {
+            return None;
+        }
+        later_fed |= saves_queue_output(segment);
+        fed.extend(assigned_names(segment));
+        CALLERS_OWN_QUEUE
+            .iter()
+            .find(|marker| names_marker(segment, marker))
+            .copied()
+    })
+}
+
+/// A fed answer can outlive this pipeline without an `x=$(...)`
+/// assignment. Keep the later text fed rather than lose that provenance
+/// at a file or loop boundary (review 5b2c5207). Stderr alone is not the
+/// answer, and quoted operators or command names are not output sinks.
+fn saves_queue_output(segment: &str) -> bool {
+    if commands_invoked(segment)
+        .iter()
+        .any(|command| matches!(*command, "tee" | "read" | "mapfile" | "readarray"))
+    {
+        return true;
+    }
+    let bare = unquoted_bytes(segment);
+    segment.char_indices().any(|(at, c)| {
+        if c != '>' || !bare[at] || segment[..at].ends_with('>') {
+            return false;
+        }
+        let fd = segment[..at]
+            .rsplit(|c: char| c.is_whitespace() || "|;&()".contains(c))
+            .next()
+            .unwrap_or("");
+        fd == "1" || fd.is_empty() || !fd.chars().all(|c| c.is_ascii_digit())
+    })
+}
+
+/// Simple command-position assignments whose balanced capture has finished.
+/// The closing offset keeps a marker inside an unrelated capture separate
+/// from a record read that happens later in the text.
+fn queue_captures(text: &str) -> Vec<(&str, usize, bool, bool)> {
+    let bare = unquoted_bytes(text);
+    let mut captures = Vec::new();
+    for opener in ["=$(", "=\"$("] {
+        for (at, _) in text.match_indices(opener) {
+            let start = text[..at]
+                .char_indices()
+                .rev()
+                .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_')
+                .last()
+                .map_or(at, |(i, _)| i);
+            let name = &text[start..at];
+            if !is_a_name(name) || !bare[start] || !at_command_position(text, &bare, start) {
+                continue;
+            }
+            let after = at + opener.len();
+            if let Some(body) = substitution_body(&text[after..]) {
+                captures.push((
+                    name,
+                    after + body.len() + 1,
+                    record_read_client(body).is_some(),
+                    saves_queue_output(body),
+                ));
+            }
+        }
+    }
+    captures.sort_by_key(|(_, end, _, _)| *end);
+    captures
+}
+
+/// Does `marker` appear in `segment` as itself — not as the front of a
+/// longer word (`--next` inside `--next-check-at`, `for=me` inside
+/// `for=member`)?
+fn names_marker(segment: &str, marker: &str) -> bool {
+    segment.match_indices(marker).any(|(at, _)| {
+        !segment[at + marker.len()..]
+            .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    })
+}
+
+/// The shell variables a segment assigns (`name=...`), wherever the
+/// assignment sits in it — after `if`, `local` or `export` alike.
+fn assigned_names(segment: &str) -> Vec<&str> {
+    segment
+        .split_whitespace()
+        .map(|w| w.trim_start_matches(['(', '{', '!']))
+        .filter_map(|w| w.split_once('=').map(|(name, _)| name))
+        .filter(|name| {
+            name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        .collect()
+}
+
+/// Does `segment` expand `$name` or `${name…}`?
+fn expands(segment: &str, name: &str) -> bool {
+    [format!("${name}"), format!("${{{name}")]
+        .iter()
+        .any(|form| {
+            segment.match_indices(form.as_str()).any(|(at, _)| {
+                !segment[at + form.len()..]
+                    .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            })
+        })
+}
+
+/// The rule id a door records when it refuses
+/// [`reads_the_callers_own_queue`], and an override names.
+pub const CALLERS_OWN_QUEUE_RULE: &str = "reads-the-callers-own-queue";
+
+/// What happened, in one copy, quoted by every door that names the rule
+/// (CLAUDE.md §9a), with the two shapes that answer the same for every
+/// reader.
+pub const CALLERS_OWN_QUEUE_EVIDENCE: &str = "\
+Measured 2026-10-19 (backlog 371b0443): car f4cdf451 parked `boss orient | grep -A3 MY WORK | \
+grep -c \"urgent first, then oldest\"`, expect 1. The builder saw 1 because its own actor had \
+steps; the forge runs a recorded probe with NO actor, saw the empty MY WORK line and 0, and the \
+proof read FAILING on correct code for a day. A probe that reads the caller's own queue measures \
+whoever runs it, not the change. Prove it with a shape every reader answers the same: a section \
+every actor sees (TRAINS, the dock, a packet read by its id), or a tree read (`git show \
+HEAD:<path> | grep -c '<the line>'`) beside the gate's named test, which ran the behaviour.";
+
+/// The commands a probe may run and still read nothing but the
+/// converged TREE: git, the filters that shape its output, and the
+/// shell's own words. `in` is here for the reason written at
+/// [`HOST_FREE_COMMANDS`]. Anything else — the reader, the CLI, an HTTP
+/// client, an interpreter, a script, a tool this list does not know —
+/// makes the probe something this scan cannot call a tree read.
+const TREE_COMMANDS: [&str; 30] = [
+    "git", "grep", "egrep", "fgrep", "sed", "awk", "cat", "printf", "echo", "exit", "set", "true",
+    "false", "in", "test", "[", "[[", "wc", "tr", "head", "tail", "sort", "uniq", "cut", "jq",
+    "diff", "cmp", "mktemp", "rm", "trap",
+];
+
+/// Does this probe read the converged tree and NOTHING live?
+///
+/// FAIL OPEN, the other way from [`reads_only_the_sor`]: true only when
+/// `git` is invoked and every command [`commands_invoked`] finds is in
+/// [`TREE_COMMANDS`], so a probe this scan cannot read whole is never
+/// called a tree read, and the rule built on it never refuses a probe
+/// that might observe something. Single-quoted text is blanked first,
+/// because the shell runs nothing inside single quotes and a grep
+/// pattern's `(` or `|` is not a command; double-quoted text is kept,
+/// because a `$(…)` inside it runs.
+///
+/// Private on purpose: it is a PART of
+/// [`a_tree_read_under_a_production_claim`], not a detector of its own.
+/// A tree read is the honest shape for a source claim, so said alone at
+/// a door it would warn on every such probe (163 of 343 parks, measured
+/// 2026-10-21); it reaches the park and prove doors through that one
+/// function, and `every_probe_detector_reaches_a_door` has nothing to
+/// chain (train 20:05, 2026-10-21, went red when it was public).
+fn reads_only_the_tree(probe: &str) -> bool {
+    let shown = single_quotes_blanked(probe);
+    let commands = commands_invoked(&shown);
+    commands.contains(&"git")
+        && record_read_client(probe).is_none()
+        && commands
+            .iter()
+            .filter(|c| !c.contains([':', '*', '?']) && !c.chars().all(|d| d.is_ascii_digit()))
+            .all(|c| TREE_COMMANDS.contains(c))
+}
+
+/// `text` with every byte inside single quotes (outside double quotes)
+/// replaced by a space, quotes included, one space per character.
+fn single_quotes_blanked(text: &str) -> String {
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    text.chars()
+        .map(|c| {
+            let inside = single || (c == '\'' && !double && !escaped);
+            if escaped {
+                escaped = false;
+            } else if single {
+                single = c != '\'';
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '\'' && !double {
+                single = true;
+            } else if c == '"' {
+                double = !double;
+            }
+            if inside { ' ' } else { c }
+        })
+        .collect()
+}
+
+/// The units a latency is written in, after a number (`20 s`, `790ms`).
+const LATENCY_UNITS: [&str; 8] = [
+    "ms",
+    "s",
+    "sec",
+    "secs",
+    "second",
+    "seconds",
+    "millisecond",
+    "milliseconds",
+];
+
+/// The latency words that claim a speed on their own (`answers in
+/// seconds`). `second` is not one: "a second gate" is a count.
+const LATENCY_WORDS: [&str; 2] = ["seconds", "milliseconds"];
+
+/// The words in a car's `verified` that claim a PRODUCTION behaviour,
+/// if any: an endpoint's answer (an `/api/…` path) or a latency (a
+/// number in ms or seconds, or "in seconds"). Returns the words found,
+/// so a refusal can quote them.
+///
+/// A rendered line ("the page shows …", "orient prints …") is a
+/// production behaviour too, and is NOT detected: the phrasing is the
+/// same as a CLI string a tree read honestly checks, and a refusal
+/// that cannot tell them apart would be wrong as often as right.
+pub fn claims_production_behaviour(verified: &str) -> Option<String> {
+    if let Some(at) = verified.find("/api/")
+        && verified[at + 5..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        let path: String = verified[at..]
+            .chars()
+            .take_while(|c| !c.is_whitespace() && !",;)'\"`".contains(*c))
+            .collect();
+        return Some(path.trim_end_matches('.').to_string());
+    }
+    let words: Vec<&str> = verified
+        .split(|c: char| c.is_whitespace() || "-–/(),;:".contains(c))
+        .map(|w| w.trim_end_matches(['.', '!', '?']))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let is_number = |w: &str| {
+        w.starts_with(|c: char| c.is_ascii_digit())
+            && w.chars().all(|c| c.is_ascii_digit() || c == '.')
+    };
+    words.iter().enumerate().find_map(|(i, w)| {
+        let glued = LATENCY_UNITS
+            .iter()
+            .any(|u| w.strip_suffix(u).is_some_and(is_number));
+        let spaced = is_number(w)
+            && words
+                .get(i + 1)
+                .is_some_and(|next| LATENCY_UNITS.contains(next));
+        if glued {
+            Some((*w).to_string())
+        } else if spaced {
+            Some(format!("{w} {}", words[i + 1]))
+        } else {
+            LATENCY_WORDS.contains(w).then(|| (*w).to_string())
+        }
+    })
+}
+
+/// A PROOF IS THE ARTIFACT THAT OBSERVES THE CLAIM — and the words of a
+/// production claim a tree-only probe is about to be recorded as proof
+/// of, if there are any.
+///
+/// THE DEFECT (backlog 490acf06, raised by three landed reviews on
+/// 2026-10-19). Car c6e89c77's `verified` said the flow endpoint
+/// answers in seconds; its probe read the order of two lines in
+/// history_snapshot.rs. Car 24998929 claimed station-flow reads under
+/// 20 s and f4cdf451 MY WORK ordering, each over a `git show HEAD:`
+/// grep. Each reviewer then measured production by hand (726–1028 ms;
+/// 790 ms), and that measurement sits on a run report, not on the
+/// proof — so the car read PROVEN for a sentence nothing observed.
+///
+/// TWO CONDITIONS, BOTH REQUIRED: the probe reads only the tree
+/// (`reads_only_the_tree`) AND `verified` names a production
+/// behaviour ([`claims_production_behaviour`]). A source claim — a lint
+/// in the roster, a pinned test present — keeps the tree read, because
+/// there the probe reads what the sentence says.
+///
+/// WHAT IT REFUSES, MEASURED 2026-10-21 over the 500 newest gate-runs:
+/// 343 parked a probe and a verified line, 163 of those probes read only
+/// the tree, and 23 of the 163 sat under an endpoint answer or a
+/// latency — c6e89c77's own among them, and 74d80663's "GET
+/// /api/yard/status lists every open pr-train", proven by a grep of
+/// yard.rs. A handful of the 23 mix a source fact into the same
+/// sentence ("keeps the timeout at 10 s"); the refusal names the words
+/// it found, and rewording the line as the source claim it is, is one
+/// of the two answers it gives.
+pub fn a_tree_read_under_a_production_claim(probe: &str, verified: &str) -> Option<String> {
+    if !reads_only_the_tree(probe) {
+        return None;
+    }
+    claims_production_behaviour(verified)
+}
+
+/// The rule id a door records when it refuses
+/// [`a_tree_read_under_a_production_claim`], and an override names.
+pub const PRODUCTION_CLAIM_RULE: &str = "a-tree-read-under-a-production-claim";
+
+/// What happened, in one copy, quoted by every door that names the rule
+/// (CLAUDE.md §9a), with the two honest shapes.
+pub const PRODUCTION_CLAIM_EVIDENCE: &str = "\
+Measured 2026-10-19 (backlog 490acf06), raised by three landed reviews: car c6e89c77's verified \
+said the flow endpoint answers in seconds, and its probe read the order of two lines in \
+history_snapshot.rs; cars 24998929 (station-flow under 20 s) and f4cdf451 (MY WORK ordering) \
+did the same over a `git show HEAD:` grep. Each reviewer then measured production by hand \
+(726-1028 ms; 790 ms), and that number sits on a run report, not on the proof. A tree read \
+proves the tree; a sentence about production needs a probe that observes production. Two \
+honest shapes: (1) OBSERVE IT — read the answer through the forge's reader door, assert the \
+bound INSIDE the probe and print a token only that pass can print, e.g. `t0=$(date +%s%N); \
+b=$(boss-sor-read /api/stations/flow) || exit 75; t1=$(date +%s%N); ms=$(( (t1 - t0) / \
+1000000 )); case ${b:-empty} in empty) echo 'not yet: no answer'; exit 75;; esac; [ $ms -lt \
+20000 ] && echo flow-answered-under-20s` (design 00227628: the forge runs record-reading \
+probes); or, if no probe can see it, record the car as --park-proof-event. (2) SAY WHAT THE \
+PROBE READS — if the claim is about the source (a line present, a test pinned, a lint in the \
+roster), write the verified line as that source claim, without the latency or the endpoint \
+answer the tree read never saw.";
 
 /// HOW A PROBE READS THE SYSTEM OF RECORD — `infra/forge/probe-bin`,
 /// first on the probe's PATH, holding exactly this one reader.
@@ -1271,6 +1648,51 @@ const GATE_MISS_KINDS: [&str; 2] = ["machine_gate.would_refuse", "machine_gate.r
 /// whether or not it says so (review 4ce5ca85 B2, e8f13664 FN5).
 const NO_KIND_NAMED: &str = "machine_gate.would_refuse or .refused (no kind named)";
 
+/// What [`clears_a_caller_from_the_gate_log_alone`] names when the
+/// probe reads NO log and clears a caller from the live tally's rows
+/// without what says the tally watched the whole window (backlog
+/// 002f5f31). The predicate kept its name and its rule id, because the
+/// refusals already recorded on cars carry that id; the doors say which
+/// reading it was through [`gate_log_alone_heading`] and
+/// [`gate_log_alone_reading`].
+pub const LIVE_ROWS_ALONE: &str = "the live tally's rows";
+
+/// The heading every door gives what
+/// [`clears_a_caller_from_the_gate_log_alone`] found — one copy, so the
+/// three doors cannot say three different things (§9a).
+pub fn gate_log_alone_heading(found: &str) -> &'static str {
+    if found == LIVE_ROWS_ALONE {
+        "CLEARS A CALLER FROM A LIVE TALLY IT DOES NOT SHOW WATCHED THE WINDOW"
+    } else {
+        "CLEARS A CALLER FROM THE GATE LOG ALONE"
+    }
+}
+
+/// What the probe read and what it left out, as every door says it
+/// (backlog 002f5f31 item 2). The three doors used to say the probe
+/// "never reads the live tally's `snapshot.rows`", which is false of a
+/// probe that read the rows without their coverage — car 217c2d66's
+/// shape — and says nothing true of one that read only the rows.
+pub fn gate_log_alone_reading(found: &str) -> String {
+    let coverage = "its `recording_since` compared with the cut, its `.mode` and its `.overflow`";
+    if found == LIVE_ROWS_ALONE {
+        format!(
+            "it counts {found} (`.live[].snapshot.rows`, or `/api/machine-gate/misses`) and \
+             never reads what says that tally watched the whole window — {coverage} — so a \
+             tally the service started after the cut, as every train restarts it, is silence \
+             about a stretch it never watched, and a caller that sent nothing but tokenless \
+             requests before that restart passes"
+        )
+    } else {
+        format!(
+            "it counts `{found}` facts in the gate window's `.log.dirty` and never reads the \
+             live tally's `.live[].snapshot.rows` together with what says that tally watched \
+             the whole window — {coverage} — so a caller the running service had already \
+             tallied before the cut passes whatever it sends"
+        )
+    }
+}
+
 /// WHEN A PROBE CLEARS A CALLER FROM THE GATE LOG ALONE — the tenth
 /// shape, and one that fails OPEN.
 ///
@@ -1328,18 +1750,47 @@ const NO_KIND_NAMED: &str = "machine_gate.would_refuse or .refused (no kind name
 /// door refuses the shape a car parked with it can never be machine-
 /// proven — so the warning there only deferred a refusal to the moment
 /// the car could no longer be re-parked. `boss prove` alone still warns.
+///
+/// THE LIVE ROWS ALONE ARE THE SAME SHAPE (backlog 002f5f31, from
+/// builder run 4a89c5cb). A probe that reads no log and clears a caller
+/// from the live tally's rows — without the coverage above — is the
+/// repair with the half that made it a repair left out, and until this
+/// it met no detector at any door, because `log.dirty` was the first
+/// condition here. It is named as [`LIVE_ROWS_ALONE`] when it reads the
+/// tally from the system of record (the gate window, or the gate's own
+/// misses door), takes its rows, and filters them by a caller or by a
+/// tokenless presentation; a tally read for its bounds or its mode,
+/// and a source grep for the words, clear no caller and are left alone.
 pub fn clears_a_caller_from_the_gate_log_alone(probe: &str) -> Option<&'static str> {
-    if !probe.contains("gate-window")
-        || !probe.contains("log.dirty")
-        || reads_the_live_tally_with_its_coverage(probe)
-    {
+    if reads_the_live_tally_with_its_coverage(probe) {
         return None;
     }
-    GATE_MISS_KINDS
-        .iter()
-        .find(|kind| probe.contains(*kind))
-        .copied()
-        .or_else(|| (!probe.contains("machine_gate.")).then_some(NO_KIND_NAMED))
+    let from_the_log = (probe.contains("gate-window") && probe.contains("log.dirty"))
+        .then(|| {
+            GATE_MISS_KINDS
+                .iter()
+                .find(|kind| probe.contains(*kind))
+                .copied()
+                .or_else(|| (!probe.contains("machine_gate.")).then_some(NO_KIND_NAMED))
+        })
+        .flatten();
+    from_the_log.or_else(|| clears_a_caller_from_the_live_rows(probe).then_some(LIVE_ROWS_ALONE))
+}
+
+/// Does this probe read the live tally's ROWS from the system of record
+/// — the gate window's `snapshot.rows`, or the misses door's `.rows`?
+fn reads_the_live_rows(probe: &str) -> bool {
+    (probe.contains("gate-window") && probe.contains("snapshot.rows"))
+        || (probe.contains("machine-gate/misses") && probe.contains(".rows"))
+}
+
+/// Does it read those rows to CLEAR a caller — filtered by who sent
+/// them, or by a tokenless presentation (`"none"`, `"mismatch"`)? A
+/// tally read for the room each kind has (car 1dff2293) filters by
+/// `"asked"` and names no caller.
+fn clears_a_caller_from_the_live_rows(probe: &str) -> bool {
+    reads_the_live_rows(probe)
+        && (probe.contains(".user") || probe.contains("\"none") || probe.contains("\"mismatch"))
 }
 
 /// Does this probe read the machine gate's LIVE tally together with
@@ -1356,20 +1807,567 @@ pub fn clears_a_caller_from_the_gate_log_alone(probe: &str) -> Option<&'static s
 /// whose one log fact predates the cut too. Reading the rows without
 /// the coverage is reading the log alone with extra steps.
 ///
-/// A text check, like every rule in this file: it cannot see that the
-/// probe COMPARES `recording_since` with its cut, only that it reads
-/// all three; [`GATE_LOG_ALONE_EVIDENCE`] carries the comparison that
+/// A text check, like every rule in this file. It used to see only that
+/// `recording_since` was READ, and a probe that type-checks it or checks
+/// it non-empty — car 217c2d66's `(… // "") == ""` — reads it without
+/// ever asking whether the tally began before the cut (backlog 002f5f31
+/// item 4). So the start must also be ORDERED against something:
+/// [`compares_the_recording_start`]. Which side is the cut it still
+/// cannot see; [`GATE_LOG_ALONE_EVIDENCE`] carries the comparison that
 /// answers not-yet, never a pass.
 ///
 /// Private on purpose: it is a PART of the gate-log-alone detector, not
-/// a detector of its own — a probe that reads no log at all is not
-/// judged by it — so it reaches every door through that one function
-/// and `every_probe_detector_reaches_a_door` has nothing to chain.
+/// a detector of its own, so it reaches every door through that one
+/// function and `every_probe_detector_reaches_a_door` has nothing to
+/// chain.
 fn reads_the_live_tally_with_its_coverage(probe: &str) -> bool {
-    (probe.contains("snapshot.rows") || probe.contains("machine-gate/misses"))
+    reads_the_live_rows(probe)
         && LIVE_TALLY_COVERAGE
             .iter()
             .all(|field| probe.contains(field))
+        && compares_the_recording_start(probe)
+}
+
+/// Is some `recording_since` the probe reads ORDERED against another
+/// value — itself an operand of `<`, `>`, `<=` or `>=` in jq
+/// (`($j.snapshot.recording_since | epoch) > $cut`, or `$cut < (…)`), or
+/// read into a shell variable that is itself an operand of an ordering
+/// later (car 59e0d3dd's `rec`, handed to jq and ordered as `$r`)? A type
+/// check, a non-empty check or a bare print orders nothing (backlog
+/// 002f5f31 item 4).
+///
+/// THE OPERAND, NOT THE CLAUSE (backlog c2e6f82e, review e63c8384 of car
+/// 0857dd38). This used to look for an ordering anywhere in a "clause"
+/// cut only at line ends, quotes, commas and six jq words — never at a
+/// pipe, a paren or a `\(…)` interpolation — and said the only error it
+/// could make was the closed one. That was false: car 217c2d66's own jq
+/// with a `.mode` check added, which checks the start only non-empty and
+/// filters its rows by `.last_seen > $cut`, read as ordered and cleared
+/// its caller. Now the ordering must touch the start itself: the
+/// `recording_since` path (indexed, `?`-suffixed or sliced), grown over
+/// the conversions a probe spells a time with ([`START_CONVERSIONS`],
+/// each after a `|`, or a `// <value>` default) and over a paren that
+/// holds nothing else, must stand directly beside the operator. An
+/// ordering of anything else is not this one.
+///
+/// THE VARIABLE, NOT THE LINE (backlog 845463ea, from run 4055c38a). The
+/// shell-variable half kept the coarseness the jq half lost: any later
+/// line that named the variable and held ` -gt ` or `--arg ` anywhere
+/// counted, so `jq --arg r "$rec" '… .last_seen > $cut'` ordered the
+/// start without `$r` ever being compared — the same open direction. Now
+/// the variable must hold the start itself (its jq ends at the operand),
+/// and then the variable — bare, quoted, or inside the `$(date …)` that
+/// makes it an epoch — must stand beside `-gt`/`-ge`/`-lt`/`-le`, or
+/// beside `<`/`>` inside `(( ))` or `[[ ]]`; or be handed to jq as
+/// `--arg`/`--argjson <name>` whose `$name` is an ordered operand of that
+/// command's program; or be copied into another variable that is (three
+/// hops at most).
+///
+/// NOT A REDIRECT, A BOTTOM OR A COMMENT (review 0cc4c0fa of car
+/// 1e80ac97). An ordering operator outside every quote is the shell's —
+/// `jq -r .x.recording_since >&2` redirects — so a jq ordering must be
+/// quoted text and a shell one bare. An ordering against the bottom of
+/// its type (`""`, `0`, `null`, `false`) is a non-empty check spelled
+/// with `>`. A comment orders nothing. Quoted prose that reads like jq
+/// still counts: telling it apart would take knowing which program a
+/// quoted string is handed to.
+///
+/// What it still cannot follow — a conversion not on that list, a jq
+/// `as $x` binding ordered later, arithmetic around the operand
+/// (`(( now - se > 3600 ))`), a variable set by `local` or `read` —
+/// reads as NOT ordered, which names a probe that did order the start:
+/// the closed direction, said at a door that can be answered.
+fn compares_the_recording_start(probe: &str) -> bool {
+    let field = "recording_since";
+    let lexed = lexed_bytes(probe);
+    let bare: Vec<bool> = lexed.iter().map(|b| *b == Lexed::Bare).collect();
+    let comment: Vec<bool> = lexed.iter().map(|b| *b == Lexed::Comment).collect();
+    let text = Shell {
+        probe,
+        bare: &bare,
+        comment: &comment,
+    };
+    probe.match_indices(field).any(|(at, _)| {
+        if comment[at] {
+            return false;
+        }
+        let (start, end) = line_around(probe, at);
+        let line = &probe[start..end];
+        jq_orders(line, &bare[start..end], at - start, field.len())
+            || held_by(line, at - start, field.len())
+                .is_some_and(|name| shell_orders(&text, end, name, 0))
+    })
+}
+
+/// A probe with what each of its bytes is, as [`lexed_bytes`] reads it.
+struct Shell<'a> {
+    probe: &'a str,
+    bare: &'a [bool],
+    comment: &'a [bool],
+}
+
+/// What a byte of shell text is to the shell.
+#[derive(Clone, Copy, PartialEq)]
+enum Lexed {
+    Quoted,
+    Bare,
+    Comment,
+}
+
+/// [`unquoted_bytes`], and a `#` that begins a word outside every quote
+/// starts a comment to the end of its line, whose quotes quote nothing:
+/// a probe's `# the tally's start` must not flip every quote after it.
+fn lexed_bytes(text: &str) -> Vec<Lexed> {
+    let mut out = vec![Lexed::Quoted; text.len()];
+    let (mut single, mut double, mut escaped, mut comment) = (false, false, false, false);
+    let mut prev = '\n';
+    for (i, c) in text.char_indices() {
+        if comment {
+            comment = c != '\n';
+            out[i] = if comment { Lexed::Comment } else { Lexed::Bare };
+        } else if escaped {
+            escaped = false;
+        } else if single {
+            single = c != '\'';
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '\'' && !double {
+            single = true;
+        } else if c == '"' {
+            double = !double;
+        } else if c == '#' && !double && prev.is_whitespace() {
+            comment = true;
+            out[i] = Lexed::Comment;
+        } else if !double {
+            out[i] = Lexed::Bare;
+        }
+        prev = c;
+    }
+    out
+}
+
+/// The jq filters a probe turns `recording_since` into a comparable time
+/// with — `epoch` is the one [`GATE_LOG_ALONE_EVIDENCE`] defines. A
+/// filter not on this list (`length`, `type`, `test(…)`) ends the
+/// operand, so ordering what it returns is not ordering the start
+/// (backlog c2e6f82e). `rtrimstr` since review 0cc4c0fa N3.
+const START_CONVERSIONS: [&str; 12] = [
+    "epoch",
+    "sub",
+    "gsub",
+    "fromdate",
+    "fromdateiso8601",
+    "strptime",
+    "mktime",
+    "todate",
+    "tonumber",
+    "tostring",
+    "ltrimstr",
+    "rtrimstr",
+];
+
+/// The four orderings, longest first so `>=` is never read as `>`.
+const ORDERINGS: [&str; 4] = [">=", "<=", ">", "<"];
+
+/// The shell's orderings in a test (`[`, `[[`, `test`).
+const SHELL_TESTS: [&str; 4] = ["-gt", "-ge", "-lt", "-le"];
+
+/// Values an ordering against is a non-empty check: the bottom of each
+/// type a probe compares (review 0cc4c0fa N2).
+const BOTTOMS: [&str; 7] = ["\"\"", "''", "\"0\"", "'0'", "null", "false", "0"];
+
+/// The byte range of the line holding byte `at`, without its newline.
+fn line_around(text: &str, at: usize) -> (usize, usize) {
+    let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[at..].find('\n').map_or(text.len(), |i| at + i);
+    (start, end)
+}
+
+/// The variable a `name=$(…)` line assigns, when the field at `at..at +
+/// len` is the WHOLE of what its jq hands back — the operand runs to the
+/// program's closing quote, so a `| length` or a `, .mode` after it
+/// leaves the variable holding something else.
+fn held_by(line: &str, at: usize, len: usize) -> Option<&str> {
+    let (name, _) = line.trim_start().split_once("=$(")?;
+    let (_, end) = jq_operand(line, at, len);
+    (is_a_name(name) && line[end..].trim_start().starts_with(['\'', '"'])).then_some(name)
+}
+
+/// A shell (and jq) variable name.
+fn is_a_name(word: &str) -> bool {
+    !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Is the shell variable `name`, assigned on the line ending at byte
+/// `from`, the operand of an ordering on some later line — directly,
+/// through jq's `--arg`, or through a variable it is copied into?
+fn shell_orders(text: &Shell, from: usize, name: &str, hops: usize) -> bool {
+    let Shell { probe, bare, .. } = *text;
+    if hops > 3 || from >= probe.len() {
+        return false;
+    }
+    let mut line_start = from + 1;
+    for line in probe[line_start..].split('\n') {
+        let lb = &bare[line_start..line_start + line.len()];
+        for (s, e, sigil) in occurrences(line, name) {
+            if text.comment[line_start + s] {
+                continue;
+            }
+            let (s, e) = shell_operand(line, s, e);
+            let arithmetic = enclosed(line, lb, s, "((", "))");
+            if !sigil && !arithmetic {
+                continue;
+            }
+            let double_test = enclosed(line, lb, s, "[[", "]]");
+            // In [[ $rs<NBSP>> $cut ]], NBSP is a literal suffix of
+            // the left operand, not a separator. Bash still compares
+            // that word; arithmetic identifiers cannot carry it.
+            let e = if double_test {
+                let end = e + line[e..]
+                    .chars()
+                    .take_while(|c| !c.is_ascii() && c.is_whitespace())
+                    .map(char::len_utf8)
+                    .sum::<usize>();
+                if ORDERINGS.iter().any(|op| line[end..].starts_with(op))
+                    && lb.get(end) == Some(&true)
+                {
+                    end
+                } else {
+                    e
+                }
+            } else {
+                e
+            };
+            let symbols = arithmetic || double_test;
+            if shell_ordering(line, lb, s, e, symbols)
+                || jq_arg_name(line, lb, s)
+                    .is_some_and(|jq| jq_orders_name(probe, bare, line_start + e, jq))
+                || copied_into(line, s, e)
+                    .is_some_and(|next| shell_orders(text, line_start + line.len(), next, hops + 1))
+            {
+                return true;
+            }
+        }
+        line_start += line.len() + 1;
+    }
+    false
+}
+
+/// Where `line` names the variable: `$name` and `${name…}` (sigil), or
+/// a bare `name` word, which only an arithmetic `(( ))` reads as it.
+fn occurrences(line: &str, name: &str) -> Vec<(usize, usize, bool)> {
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = line.as_bytes();
+    line.match_indices(name)
+        .filter_map(|(i, _)| {
+            let end = i + name.len();
+            if bytes.get(end).copied().is_some_and(ident) {
+                None
+            } else if line[..i].ends_with("${") {
+                let close = line[end..].find('}')? + end + 1;
+                Some((i - 2, close, true))
+            } else if line[..i].ends_with('$') {
+                Some((i - 1, end, true))
+            } else if i == 0 || !(ident(bytes[i - 1]) || b"{#.$".contains(&bytes[i - 1])) {
+                Some((i, end, false))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The shell word the variable at `s..e` is the whole of: grown over a
+/// pair of double quotes around it and over a `$(date …)` it is the
+/// input of, as many times as they nest. Any other substitution ends it.
+fn shell_operand(line: &str, s: usize, e: usize) -> (usize, usize) {
+    let bytes = line.as_bytes();
+    let (mut s, mut e) = (s, e);
+    loop {
+        if s > 0 && bytes[s - 1] == b'"' && bytes.get(e) == Some(&b'"') {
+            (s, e) = (s - 1, e + 1);
+            continue;
+        }
+        let around = line[..s].rmatch_indices("$(").find_map(|(p, _)| {
+            let body = substitution_body(&line[p + 2..])?;
+            let close = p + 2 + body.len();
+            (close >= e).then_some((p, close, body))
+        });
+        match around {
+            Some((p, close, body)) if body.trim_start().starts_with("date ") => {
+                (s, e) = (p, close + 1);
+            }
+            _ => return (s, e),
+        }
+    }
+}
+
+/// Is byte `at` between an unquoted `open` before it and a `close`
+/// after it on the line, with no `close` between?
+fn enclosed(line: &str, bare: &[bool], at: usize, open: &str, close: &str) -> bool {
+    line[..at]
+        .rfind(open)
+        .is_some_and(|o| bare[o] && !line[o..at].contains(close))
+        && line[at..].contains(close)
+}
+
+/// Does an unquoted shell ordering stand directly beside `s..e`, with a
+/// real value on its other side? `<`/`>` only where `symbols` says they
+/// compare (`(( ))`, `[[ ]]`) rather than redirect.
+fn shell_ordering(line: &str, bare: &[bool], s: usize, e: usize, symbols: bool) -> bool {
+    let words = SHELL_TESTS.iter().map(|op| (*op, true));
+    let marks = ORDERINGS.iter().filter(|_| symbols).map(|op| (*op, false));
+    let after = line[e..].trim_start_matches([' ', '\t']);
+    let after_at = line.len() - after.len();
+    let before = line[..s].trim_end_matches([' ', '\t']);
+    words.chain(marks).any(|(op, word)| {
+        let ends = |rest: &str| match word {
+            true => rest.is_empty() || rest.starts_with([' ', '\t']),
+            false => !rest.starts_with(['=', '<', '>', '&']),
+        };
+        let begins = |head: &str| match word {
+            true => head.is_empty() || head.ends_with([' ', '\t']),
+            false => !head.ends_with(['=', '!', '<', '>']),
+        };
+        after
+            .strip_prefix(op)
+            .is_some_and(|rest| ends(rest) && bare[after_at] && a_real_operand_after(rest))
+            || before
+                .strip_suffix(op)
+                .is_some_and(|head| begins(head) && bare[head.len()] && a_real_operand_before(head))
+    })
+}
+
+/// The name `--arg <name>` / `--argjson <name>` binds the shell word
+/// starting at `at` to, when it is one.
+fn jq_arg_name<'a>(line: &'a str, bare: &[bool], at: usize) -> Option<&'a str> {
+    let head = line[..at].trim_end_matches([' ', '\t']);
+    // A multibyte space inside a word is not a shell argument boundary.
+    // Every separator advanced over here must occupy exactly one byte.
+    let name_at = head.rfind([' ', '\t'])? + 1;
+    let flag = head[..name_at].trim_end_matches([' ', '\t']);
+    let flag_at = flag.rfind([' ', '\t']).map_or(0, |i| i + 1);
+    let name = &head[name_at..];
+    (is_a_name(name) && matches!(&flag[flag_at..], "--arg" | "--argjson") && bare[flag_at])
+        .then_some(name)
+}
+
+/// Is jq's `$name` an ordered operand anywhere in the rest of the
+/// command from byte `from` — up to the first newline outside every
+/// quote, so a program spread over lines is read whole?
+fn jq_orders_name(probe: &str, bare: &[bool], from: usize, name: &str) -> bool {
+    let bytes = probe.as_bytes();
+    let end = (from..probe.len())
+        .find(|&i| bytes[i] == b'\n' && bare[i])
+        .unwrap_or(probe.len());
+    let var = format!("${name}");
+    probe[from..end].match_indices(&var).any(|(i, _)| {
+        let at = from + i;
+        if bytes
+            .get(at + var.len())
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        {
+            return false;
+        }
+        let (start, stop) = line_around(probe, at);
+        jq_orders(
+            &probe[start..stop],
+            &bare[start..stop],
+            at - start,
+            var.len(),
+        )
+    })
+}
+
+/// The variable a `next=<the shell word at s..e>` line copies it into.
+fn copied_into(line: &str, s: usize, e: usize) -> Option<&str> {
+    let name = line[..s]
+        .trim_start_matches([' ', '\t'])
+        .strip_suffix('=')?;
+    let rest = line[e..].trim_start_matches([' ', '\t']);
+    (is_a_name(name) && (rest.is_empty() || rest.starts_with([';', '|', '&', '#']))).then_some(name)
+}
+
+/// Is what follows an ordering a value — not nothing, not a closing
+/// bracket, not a bottom ([`BOTTOMS`])?
+fn a_real_operand_after(rest: &str) -> bool {
+    let other = rest.trim_start_matches([' ', '\t']);
+    let boundary = |r: &str| {
+        r.is_empty() || r.starts_with(|c: char| matches!(c, ' ' | '\t') || ")]},;|'\"".contains(c))
+    };
+    !other.is_empty()
+        // A Unicode space here belongs to the word, not a valid separator.
+        && !other.starts_with(char::is_whitespace)
+        && !other.starts_with([']', ')', ';'])
+        && !BOTTOMS
+            .iter()
+            .any(|b| other.strip_prefix(b).is_some_and(boundary))
+}
+
+/// [`a_real_operand_after`], for what precedes an ordering.
+fn a_real_operand_before(head: &str) -> bool {
+    let other = head.trim_end_matches([' ', '\t']);
+    let boundary = |h: &str| {
+        h.is_empty() || h.ends_with(|c: char| matches!(c, ' ' | '\t') || "([{,;|'\"".contains(c))
+    };
+    !other.is_empty()
+        && !other.ends_with(char::is_whitespace)
+        && !other.ends_with(['[', '('])
+        && !BOTTOMS
+            .iter()
+            .any(|b| other.strip_suffix(b).is_some_and(boundary))
+}
+
+/// Is the jq operand at `at..at + len` of `line` ordered — a quoted
+/// `<`, `>`, `<=` or `>=` directly beside it, with a real value on the
+/// other side? See [`compares_the_recording_start`] for what the
+/// operand grows over; `bare` is the line's [`unquoted_bytes`].
+fn jq_orders(line: &str, bare: &[bool], at: usize, len: usize) -> bool {
+    let (start, end) = jq_operand(line, at, len);
+    let after = line[end..].trim_start();
+    let after_at = line.len() - after.len();
+    let before = line[..start].trim_end();
+    ORDERINGS.iter().any(|op| {
+        after.strip_prefix(op).is_some_and(|rest| {
+            !rest.starts_with(['=', '>', '<', '&']) && !bare[after_at] && a_real_operand_after(rest)
+        }) || before.strip_suffix(op).is_some_and(|head| {
+            !head.ends_with(['=', '!', '<', '>'])
+                && !bare[head.len()]
+                && a_real_operand_before(head)
+        })
+    })
+}
+
+/// The jq operand around the field at `at..at + len` of `line`. Byte
+/// offsets throughout: every byte it stops on is ASCII, so every slice
+/// falls on a char boundary.
+fn jq_operand(line: &str, at: usize, len: usize) -> (usize, usize) {
+    let bytes = line.as_bytes();
+    let path = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'$';
+    let skip = |mut i: usize| {
+        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        i
+    };
+    // A path, with `?`, `[i]` and `[a:b]` along it (review 0cc4c0fa N3).
+    let forward = |mut i: usize| loop {
+        while bytes.get(i).copied().is_some_and(path) {
+            i += 1;
+        }
+        match bytes.get(i) {
+            Some(b'?') => i += 1,
+            Some(b'[') => match line[i..].find(']') {
+                Some(j) => i += j + 1,
+                None => break i,
+            },
+            _ => break i,
+        }
+    };
+    let backward = |mut i: usize| loop {
+        while i > 0 && path(bytes[i - 1]) {
+            i -= 1;
+        }
+        match i.checked_sub(1).map(|j| bytes[j]) {
+            Some(b'?') => i -= 1,
+            Some(b']') => match line[..i - 1].rfind('[') {
+                Some(j) => i = j,
+                None => break i,
+            },
+            _ => break i,
+        }
+    };
+    let (mut start, mut end) = (backward(at), forward(at + len));
+    loop {
+        // `| <conversion>` and `// <default>`, as many as follow.
+        loop {
+            let next = skip(end);
+            let grown = if line[next..].starts_with("//") {
+                default_end(bytes, skip(next + 2))
+            } else if line[next..].starts_with('|') && !line[next..].starts_with("|=") {
+                conversion_end(bytes, skip(next + 1))
+            } else {
+                None
+            };
+            match grown {
+                Some(to) => end = to,
+                None => break,
+            }
+        }
+        // A paren that holds the operand and nothing else — not a call's
+        // (`select(…)`) and not a string interpolation's (`\(…)`).
+        let open = line[..start].trim_end().len();
+        let close = skip(end);
+        let grouped = open > 0
+            && bytes[open - 1] == b'('
+            && bytes.get(close) == Some(&b')')
+            && !(open > 1 && (path(bytes[open - 2]) || bytes[open - 2] == b'\\'));
+        if !grouped {
+            return (start, end);
+        }
+        (start, end) = (open - 1, close + 1);
+    }
+}
+
+/// The end of a `// <default>` — a string literal, or a run of path
+/// characters (`empty`, `0`, `$fallback`).
+fn default_end(bytes: &[u8], from: usize) -> Option<usize> {
+    if bytes.get(from) == Some(&b'"') {
+        return string_end(bytes, from);
+    }
+    let end = (from..bytes.len())
+        .find(|&i| !(bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'.' | b'$')))
+        .unwrap_or(bytes.len());
+    (end > from).then_some(end)
+}
+
+/// The end of a `<conversion>` or `<conversion>(<args>)` named in
+/// [`START_CONVERSIONS`]; `None` for any other filter.
+fn conversion_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let name_end = (from..bytes.len())
+        .find(|&i| !(bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_'))
+        .unwrap_or(bytes.len());
+    let name = std::str::from_utf8(&bytes[from..name_end]).ok()?;
+    if !START_CONVERSIONS.contains(&name) {
+        return None;
+    }
+    if bytes.get(name_end) != Some(&b'(') {
+        return Some(name_end);
+    }
+    let mut depth = 0usize;
+    let mut i = name_end;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i = string_end(bytes, i)?;
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The end of the jq string literal opening at `from`, past its closing
+/// quote; a backslash escapes the byte after it.
+fn string_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut i = from + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// THE HAND PROOF, AS EVERY DOOR THAT NAMES IT SPELLS IT (review
@@ -2186,6 +3184,269 @@ case "$key" in ecdsa-*|ssh-*) echo "DEV DOOR CA RECORDED";; *) echo "observation
             None
         );
         assert_eq!(names_an_actor("boss-sor-read /api/yard/status"), None);
+    }
+
+    /// A PROBE WHOSE ANSWER DEPENDS ON WHO RUNS IT (backlog 371b0443).
+    /// The measured probe is the first case, verbatim: car f4cdf451's,
+    /// which printed 1 for the builder (agent-claude had steps) and 0 for
+    /// the forge's reader, so the proof read FAILING on correct code for
+    /// a day. Each section that is the caller's own queue is named, and
+    /// so is a read of the caller's inbox through the record reader.
+    #[test]
+    fn a_probe_that_reads_the_callers_own_queue_is_seen() {
+        for (probe, marker) in [
+            (
+                "boss orient | grep -A3 'MY WORK' | grep -c \"urgent first, then oldest\"",
+                "MY WORK",
+            ),
+            (
+                "boss orient 2>&1 | grep -c 'NEEDS YOU — nothing'",
+                "NEEDS YOU",
+            ),
+            (
+                "/usr/local/bin/boss dispatch --next --dry | grep -c ready",
+                "--next",
+            ),
+            (
+                "boss-sor-read '/api/jobs/assignments?for=me' | jq -r '.total'",
+                "for=me",
+            ),
+        ] {
+            assert_eq!(reads_the_callers_own_queue(probe), Some(marker), "{probe}");
+        }
+        // The actor-independent shapes this rule points at are clean:
+        // the same words read out of the TREE answer the same for every
+        // reader, and a section every actor sees is not the caller's.
+        for probe in [
+            "git show HEAD:crates/orchestrators/boss-cli/src/orient.rs | grep -c 'urgent first, then oldest'",
+            "git show HEAD:crates/orchestrators/boss-cli/src/orient.rs | grep -c 'MY WORK —'",
+            "boss orient | grep -c 'TRAINS'",
+            "boss-sor-read '/api/jobs/assignments?assignee_id=agent-claude' | jq -r '.total'",
+        ] {
+            assert_eq!(reads_the_callers_own_queue(probe), None, "{probe}");
+        }
+    }
+
+    /// THE MARKER COUNTS ONLY WHERE THE RECORD READ FLOWS (backlog
+    /// 5c7ff14f, found reviewing car 7ff9e23e). The rule used to ask its
+    /// two questions of the WHOLE text, so a probe that greps MY WORK
+    /// out of the tree and, on another line, reads one packet by its id
+    /// was refused with no override — and every car editing orient's MY
+    /// WORK or a `--next*` flag is one that wants exactly that pair. Each
+    /// clean case below is such a pair; `--next-check-at` is a flag of
+    /// its own, not the dispatch verb's `--next`.
+    #[test]
+    fn a_tree_grep_beside_an_unrelated_record_read_is_clean() {
+        for probe in [
+            "git show HEAD:crates/orchestrators/boss-cli/src/orient.rs | grep -c 'MY WORK —'\n\
+             boss-sor-read /api/jobs/5c7ff14f-f11b-4952-b258-f4ce10b34a45 | jq -r '.status'",
+            "n=$(git show HEAD:crates/orchestrators/boss-cli/src/orient.rs | grep -c 'MY WORK'); \
+             s=$(boss-sor-read /api/jobs/x | jq -r '.status // empty'); echo \"$n $s\"",
+            "git show HEAD:crates/orchestrators/boss-cli/src/main.rs | grep -c -- '--next-check-at' \
+             && boss-sor-read /api/yard/status | jq -r '.trains | length'",
+            "boss-sor-read /api/yard/status | grep -c -- '--next-check-at'",
+        ] {
+            assert_eq!(reads_the_callers_own_queue(probe), None, "{probe}");
+        }
+        // The record read's answer still carries the marker wherever it
+        // FLOWS: captured into a variable and grepped on a later line,
+        // and continued onto the next line after a trailing pipe.
+        for (probe, marker) in [
+            (
+                "out=$(boss orient 2>&1) || exit 75; printf '%s\\n' \"$out\" | grep -A3 'MY WORK' | grep -c ready",
+                "MY WORK",
+            ),
+            (
+                "out=$(boss orient 2>&1)\nprintf '%s\\n' \"${out}\" | grep -c 'NEEDS YOU'",
+                "NEEDS YOU",
+            ),
+            ("boss orient 2>&1 |\n  grep -c 'MY WORK'", "MY WORK"),
+            ("boss orient 2>&1 \\\n  | grep -c 'MY WORK'", "MY WORK"),
+        ] {
+            assert_eq!(reads_the_callers_own_queue(probe), Some(marker), "{probe}");
+        }
+    }
+
+    #[test]
+    fn a_record_saved_to_a_file_still_feeds_its_later_queue_check() {
+        for probe in [
+            "boss orient > \"$f\"\ngrep -c 'MY WORK' \"$f\"",
+            "boss orient >> f && grep -c 'MY WORK' f",
+            "boss orient | tee f\ngrep -c 'MY WORK' f",
+            "out=$(boss orient)\nprintf '%s' \"$out\" > f; grep -c 'MY WORK' f",
+            "out=\"$(boss orient > f)\"; grep -c 'MY WORK' f",
+        ] {
+            assert_eq!(
+                reads_the_callers_own_queue(probe),
+                Some("MY WORK"),
+                "{probe}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_fed_to_a_loop_still_feeds_its_body_queue_check() {
+        let probe = "boss orient | while read -r l; do case \"$l\" in *'MY WORK'*) n=$((n+1));; esac; done; [ \"$n\" -gt 0 ]";
+        assert_eq!(reads_the_callers_own_queue(probe), Some("MY WORK"));
+    }
+
+    #[test]
+    fn a_record_fed_to_read_or_mapfile_still_feeds_its_later_queue_check() {
+        for probe in [
+            "read -r out < <(boss orient); printf '%s' \"$out\" | grep -c 'MY WORK'",
+            "mapfile -t out < <(boss orient)\nprintf '%s' \"${out[@]}\" | grep -c 'MY WORK'",
+            "boss orient | read -r out; printf '%s' \"$out\" | grep -c 'MY WORK'",
+        ] {
+            assert_eq!(
+                reads_the_callers_own_queue(probe),
+                Some("MY WORK"),
+                "{probe}"
+            );
+        }
+    }
+
+    #[test]
+    fn stderr_redirection_and_a_quoted_sink_do_not_feed_a_later_tree_check() {
+        for probe in [
+            "boss-sor-read /api/jobs/x 2>&1; git show HEAD:orient.rs | grep -c 'MY WORK'",
+            "boss-sor-read /api/jobs/x 2>errors; git show HEAD:orient.rs | grep -c 'MY WORK'",
+            "boss-sor-read /api/jobs/x | grep 'tee read mapfile >'; git show HEAD:orient.rs | grep -c 'MY WORK'",
+            "git show HEAD:orient.rs > f; boss-sor-read /api/jobs/x; grep -c 'MY WORK' f",
+        ] {
+            assert_eq!(reads_the_callers_own_queue(probe), None, "{probe}");
+        }
+    }
+
+    #[test]
+    fn a_multiline_record_capture_still_feeds_its_later_queue_check() {
+        for (probe, marker) in [
+            (
+                "out=$(\n  boss orient\n)\nprintf '%s\\n' \"$out\" | grep -c 'MY WORK'",
+                "MY WORK",
+            ),
+            (
+                "out=\"$(\n  boss orient\n)\"\nprintf '%s\\n' \"${out}\" | grep -c 'NEEDS YOU'",
+                "NEEDS YOU",
+            ),
+            (
+                "local out=$(printf 'prefix';\n  boss orient\n)\nprintf '%s\\n' \"$out\" | grep -c 'MY WORK'",
+                "MY WORK",
+            ),
+        ] {
+            assert_eq!(reads_the_callers_own_queue(probe), Some(marker), "{probe}");
+        }
+    }
+
+    #[test]
+    fn a_record_capture_overwritten_by_a_tree_capture_is_not_a_queue_read() {
+        let overwritten = "out=$(boss orient)\nout=$(\n  git show HEAD:orient.rs | grep -c 'MY WORK'\n)\nprintf '%s\\n' \"$out\" | grep -c 'MY WORK'";
+        assert_eq!(reads_the_callers_own_queue(overwritten), None);
+        let unrelated = "tree=$(\n git show HEAD:orient.rs | grep -c 'MY WORK'\n)\nrecord=$(\n boss-sor-read /api/jobs/x\n)\nprintf '%s\\n' \"$tree\"";
+        assert_eq!(reads_the_callers_own_queue(unrelated), None);
+    }
+
+    /// A TREE READ IS NOT AN OBSERVATION OF PRODUCTION (backlog 490acf06).
+    /// The measured pair is the first case, verbatim: car c6e89c77's
+    /// verified said the flow endpoint answers in seconds, and its probe
+    /// read the order of two lines in history_snapshot.rs. Each claim
+    /// shape the item names (a latency in ms or seconds, an /api answer)
+    /// is seen under a probe that only runs git show and text filters.
+    #[test]
+    fn a_tree_only_probe_under_a_production_claim_is_seen() {
+        let c6e89c77 = "f=crates/core/boss-events/src/history_snapshot.rs\n\
+            src=$(git show HEAD:$f) || { echo 'not yet: history_snapshot.rs unreadable at HEAD'; exit 75; }\n\
+            pre=$(printf '%s\\n' \"$src\" | grep -n -m1 'sqlx::query_scalar(RELEVANT_COUNT_SQL)' | cut -d: -f1)\n\
+            sum=$(printf '%s\\n' \"$src\" | grep -n -m1 'let summary = format!' | cut -d: -f1)\n\
+            case ${sum:-empty} in empty|*[!0-9]*) echo 'FAILED: no summary count'; exit 1;; esac\n\
+            case ${pre:-empty} in empty|*[!0-9]*) echo 'FAILED: no pre-check'; exit 1;; esac\n\
+            if [ \"$pre\" -lt \"$sum\" ]; then echo 'relevant-set bound refuses before the full-history count'; exit 0; fi\n\
+            echo 'FAILED: the pre-check runs after the full-history count'\nexit 1";
+        let tree =
+            "git show HEAD:crates/core/boss-jobs/src/http/yard.rs | grep -c 'fn list_every('";
+        for (verified, probe, claim) in [
+            (
+                "After this lands, GET /api/stations/flow with the default basis answers in \
+                 seconds rather than holding a transaction for 16+ minutes.",
+                c6e89c77,
+                "/api/stations/flow",
+            ),
+            (
+                "Station-flow reads come back under 20 s on the yard page.",
+                tree,
+                "20 s",
+            ),
+            ("The regions read answers in 790ms.", tree, "790ms"),
+            (
+                "MY WORK reads in 726-1028 ms for every actor.",
+                tree,
+                "1028 ms",
+            ),
+            ("The flow endpoint answers in seconds.", tree, "seconds"),
+        ] {
+            assert_eq!(
+                a_tree_read_under_a_production_claim(probe, verified).as_deref(),
+                Some(claim),
+                "{verified}"
+            );
+        }
+        // A SOURCE claim keeps the tree read: what the probe reads is
+        // what the sentence says.
+        for verified in [
+            "The lint no-wallclock.sh is in the pre-flight roster.",
+            "the_flow_bound_is_pinned is present beside history_snapshot.rs, a second gate \
+             test reads it.",
+        ] {
+            assert_eq!(a_tree_read_under_a_production_claim(tree, verified), None);
+        }
+        // And a production claim under a probe that OBSERVES it is clean:
+        // the reader door, the CLI, an HTTP client, or anything this scan
+        // cannot name as a tree read.
+        for probe in [
+            "boss-sor-read /api/stations/flow | jq -e '.stations | length > 0' >/dev/null && echo flow:ok",
+            "t0=$(date +%s%N); boss-sor-read /api/stations/flow >/dev/null || exit 75; echo ok",
+            "boss orient | grep -c TRAINS",
+            "python3 infra/forge/probe-flow.py",
+            "echo hi",
+        ] {
+            assert_eq!(
+                a_tree_read_under_a_production_claim(
+                    probe,
+                    "GET /api/stations/flow answers in 20 s."
+                ),
+                None,
+                "{probe}"
+            );
+        }
+    }
+
+    /// The claim words, alone: what counts as a production behaviour and
+    /// what is only a word that looks like one.
+    #[test]
+    fn the_production_claim_words_are_a_latency_or_an_endpoint() {
+        for (verified, claim) in [
+            (
+                "GET /api/yard/status lists every open train",
+                "/api/yard/status",
+            ),
+            ("answers in 0.8 s", "0.8 s"),
+            ("waits at most 65s", "65s"),
+            ("drops to milliseconds", "milliseconds"),
+        ] {
+            assert_eq!(
+                claims_production_behaviour(verified).as_deref(),
+                Some(claim),
+                "{verified}"
+            );
+        }
+        for verified in [
+            "a second gate reads the same line",
+            "the pin api_paths_are_listed is present",
+            "boss orient prints 3 steps",
+            "the timeout_seconds field is declared",
+            "v2s are published",
+        ] {
+            assert_eq!(claims_production_behaviour(verified), None, "{verified}");
+        }
     }
 
     #[test]
@@ -3167,6 +4428,440 @@ n=$(printf '%s' "$w" | jq -r --argjson cut "$cut" 'if (.log.dirty | type) == "ar
         }
     }
 
+    /// THE LIVE ROWS ALONE ARE JUDGED TOO (backlog 002f5f31, from builder
+    /// run 4a89c5cb). A probe that reads no log at all and clears a
+    /// caller from the live tally's rows has the same gap as the log
+    /// count it was meant to repair: a tally a train restarted after
+    /// the cut is silence about the stretch before it. Before this,
+    /// `log.dirty` was the predicate's first condition, so the live leg
+    /// f636c71b's re-gate carried, read on its own, met no detector at
+    /// any door. Each spelling is named — the window's `snapshot.rows`
+    /// and the gate's own misses door — and the covered leg the
+    /// evidence teaches, read on its own, is not.
+    #[test]
+    fn a_live_only_reading_without_its_coverage_is_named() {
+        let misses = "m=$(boss-sor-read '/api/machine-gate/misses'); printf '%s' \"$m\" | jq '[.rows[] | select(.user == \"automation:x\" and .presented == \"none\")] | length'";
+        for probe in [F636_LIVE_LEG, misses] {
+            assert!(!probe.contains("log.dirty"), "{probe}");
+            assert_eq!(
+                clears_a_caller_from_the_gate_log_alone(probe),
+                Some(LIVE_ROWS_ALONE),
+                "{probe}"
+            );
+        }
+        assert_eq!(
+            clears_a_caller_from_the_gate_log_alone(covering_live_leg()),
+            None,
+            "the covered live leg on its own: {}",
+            covering_live_leg()
+        );
+        // A tally read that clears no caller is left alone: car
+        // 1dff2293's bound check counts rows per presented kind against
+        // the room each kind has, which a restart cannot make true; and
+        // car 1c24fc63's probe only greps the source for the words.
+        for clean in [
+            r#"read=$(boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=1' | jq -r 'if (.live | type) == "array" then [.live[] | select(.snapshot != null) | select(([.snapshot.rows[]? | select(.presented == "asked")] | length) > 1024)] | length else empty end')"#,
+            r#"old=$(git show HEAD:crates/core/boss-jobs/src/probe.rs | grep -c 'probe.contains("snapshot.rows")')"#,
+        ] {
+            assert_eq!(
+                clears_a_caller_from_the_gate_log_alone(clean),
+                None,
+                "clean: {clean}"
+            );
+        }
+    }
+
+    /// `recording_since` READ IS NOT `recording_since` COMPARED (backlog
+    /// 002f5f31 item 4). Every coverage field present and the start of
+    /// the tally only type-checked or checked non-empty — car 217c2d66's
+    /// spelling — still clears a caller from a tally that began after
+    /// the cut. Compared with an ordering operator in its jq clause, or
+    /// read into a variable the shell or jq then orders, it covers.
+    #[test]
+    fn a_recording_start_read_but_not_compared_is_not_coverage() {
+        let read_only = [
+            r#"live=$(boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=2' | jq -r '([.live[]? | select(.service == "jobs")] | first) as $j | if $j == null or $j.snapshot.mode == "off" or $j.snapshot.overflow != 0 or ($j.snapshot.recording_since | type) != "string" then "uncovered" else ([$j.snapshot.rows[] | select(.user == "automation:x" and .presented == "none")] | length) end')"#,
+            r#"live=$(boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=2' | jq -r '([.live[]? | select(.service == "jobs")] | first) as $j | if $j.snapshot.mode == "off" or $j.snapshot.overflow != 0 or (($j.snapshot.recording_since // "") == "") then empty else ([$j.snapshot.rows[] | select(.presented == "none")] | length) end')"#,
+        ];
+        for probe in read_only {
+            assert!(!reads_the_live_tally_with_its_coverage(probe), "{probe}");
+            assert_eq!(
+                clears_a_caller_from_the_gate_log_alone(probe),
+                Some(LIVE_ROWS_ALONE),
+                "{probe}"
+            );
+        }
+        let w = r#"w=$(boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=168')
+mode=$(printf '%s' "$w" | jq -r '.live[] | select(.service == "jobs") | .snapshot.mode // empty')
+spill=$(printf '%s' "$w" | jq '.live[] | select(.service == "jobs") | .snapshot.overflow // 0')
+"#;
+        let rows = r#"bad=$(printf '%s' "$w" | jq '[.live[] | select(.service == "jobs") | .snapshot.rows[]? | select(.user == "automation:x" and .presented == "none")] | length')"#;
+        // Car 59e0d3dd's spelling: read into `rec`, ordered by jq as `$r`.
+        let through_jq = format!(
+            "{w}rec=$(printf '%s' \"$w\" | jq -r '.live[] | select(.service == \"jobs\") | .snapshot.recording_since // empty | sub(\"\\\\.[0-9]+\"; \"\") | fromdate')\n\
+             run=$(printf '%s' \"$ops\" | jq -r --argjson r \"$rec\" '[.data[] | select(.t >= $r)] | last | .id // empty')\n{rows}"
+        );
+        // Read into `rs`, ordered by the shell against the cut.
+        let through_shell = format!(
+            "{w}rs=$(printf '%s' \"$w\" | jq -r '.live[] | select(.service == \"jobs\") | .snapshot.recording_since')\n\
+             if [ \"$(date -u -d \"$rs\" +%s)\" -gt \"$cut\" ]; then echo 'not yet: uncovered'; exit 75; fi\n{rows}"
+        );
+        // And the same read never ordered at all is still named.
+        let never = format!(
+            "{w}rs=$(printf '%s' \"$w\" | jq -r '.live[] | select(.service == \"jobs\") | .snapshot.recording_since')\n\
+             echo \"recording since $rs\"\n{rows}"
+        );
+        for covered in [&through_jq, &through_shell] {
+            assert!(reads_the_live_tally_with_its_coverage(covered), "{covered}");
+            assert_eq!(
+                clears_a_caller_from_the_gate_log_alone(covered),
+                None,
+                "{covered}"
+            );
+        }
+        assert_eq!(
+            clears_a_caller_from_the_gate_log_alone(&never),
+            Some(LIVE_ROWS_ALONE),
+            "{never}"
+        );
+    }
+
+    /// AN ORDERING NEAR THE START IS NOT THE START ORDERED (backlog
+    /// c2e6f82e, review e63c8384 of car 0857dd38). The clause used to be
+    /// cut only at line ends, quotes, commas and six jq words, so any
+    /// `>` between those — a row filter on `.last_seen`, read through a
+    /// pipe, a paren or a string interpolation — counted as ordering
+    /// `recording_since`, and a probe that only checked the start
+    /// non-empty cleared its caller: it failed OPEN. Two fixtures, each
+    /// RED on the predicate it replaces. The first is car 217c2d66's own
+    /// jq line, read off the car, with a `.mode` check added — measured
+    /// on 0857dd38's head as covered.
+    #[test]
+    fn an_ordering_beside_the_recording_start_is_not_its_comparison() {
+        let interpolated = r#"read_out=$(boss-sor-read "/api/events/gate-window?gate=machine-gate&hours=$hours" | jq -r --arg cut "$cut" 'def ours: (.user // "") as $u | ($u | startswith("automation:ops-runner")) or $u == "automation:read-publish-checks" or $u == "automation:publish-github-pr"; if (.log_error == null) and ((.input_errors // []) | length) == 0 and ((.log.dirty | type) == "array") and ((.live | type) == "array") then ([.live[] | select(.service == "jobs")] | .[0]) as $j | ([.log.coverage[]? | select(.service == "jobs")] | .[0]) as $c | if $j == null or $j.error != null or $j.snapshot.mode == "off" or (($j.snapshot.rows | type) != "array") or (($j.snapshot.overflow // 0) != 0) or (($j.snapshot.recording_since // "") == "") or ($c != null and $c.gap != null) then empty else "\([.log.dirty[] | select(.kind == "machine_gate.would_refuse" and (.payload.key | ours) and .payload.key.presented == "none" and .at > $cut)] | length) \([$j.snapshot.rows[] | select(ours and .presented == "none" and .last_seen > $cut)] | length) \($j.snapshot.recording_since)" end else empty end')"#;
+        // The same start bound to a jq variable and never ordered, with
+        // the row filter's `>` a pipe and a paren away.
+        let piped = r#"live=$(boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=2' | jq -r --argjson cut "$cut" '([.live[]? | select(.service == "jobs")] | first) as $j | if $j == null or $j.snapshot.mode == "off" or $j.snapshot.overflow != 0 then "uncovered" else $j.snapshot.recording_since as $rs | [ $j.snapshot.rows[] | select(.presented == "none") | select(.last_seen > $cut) ] | length end')"#;
+        // A start turned into something that is not a time before it is
+        // ordered — its length — is a non-empty check spelled with `>`.
+        let measured = r#"live=$(boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=2' | jq -r '([.live[]? | select(.service == "jobs")] | first) as $j | if $j == null or $j.snapshot.mode == "off" or $j.snapshot.overflow != 0 or ($j.snapshot.recording_since | length) > 0 then "uncovered" else ([$j.snapshot.rows[] | select(.presented == "none")] | length) end')"#;
+        assert_eq!(
+            clears_a_caller_from_the_gate_log_alone(interpolated),
+            Some("machine_gate.would_refuse"),
+            "{interpolated}"
+        );
+        for probe in [interpolated, piped, measured] {
+            assert!(!compares_the_recording_start(probe), "{probe}");
+            assert!(!reads_the_live_tally_with_its_coverage(probe), "{probe}");
+            assert!(
+                clears_a_caller_from_the_gate_log_alone(probe).is_some(),
+                "{probe}"
+            );
+        }
+        // The start as the operand, on either side of the ordering, and
+        // through the conversions a probe spells it with, still covers.
+        let ordered = [
+            "($j.snapshot.recording_since | epoch) > $cut",
+            "$cut < ($j.snapshot.recording_since | epoch)",
+            "$j.snapshot.recording_since >= $cut",
+            "(($j.snapshot.recording_since // \"\") | sub(\"\\\\.[0-9]+\"; \"\") | fromdateiso8601) <= $cut",
+            "$j.snapshot.recording_since | fromdate > $cut",
+        ];
+        // Inside the jq program they are: a jq ordering is quoted text,
+        // and a bare `>` is the shell's redirect (review 0cc4c0fa N2).
+        for clause in ordered {
+            let probe = format!("t=$(jq -r '{clause}')");
+            assert!(compares_the_recording_start(&probe), "{probe}");
+        }
+    }
+
+    /// The defining line of car 59e0d3dd's shape, reused below: the start
+    /// read into `rs`, exactly as the jq hands it back.
+    const START_INTO_RS: &str = r#"rs=$(printf '%s' "$w" | jq -r '.live[] | select(.service == "jobs") | .snapshot.recording_since // empty')"#;
+
+    // Review 8e097eb9: Unicode spaces are part of a shell word, so
+    // these malformed commands never compare the recording start.
+    fn unicode_separated_orderings() -> Vec<String> {
+        ['\u{a0}', '\u{2003}']
+            .into_iter()
+            .flat_map(|space| {
+                [
+                    format!("if [ \"$(date -u -d \"$rs\" +%s)\"{space}-gt \"$cut\" ]; then exit 75; fi"),
+                    format!("if [ \"$(date -u -d \"$rs\" +%s)\" -gt{space}\"$cut\" ]; then exit 75; fi"),
+                    format!("[ \"$cut\" -lt{space}\"$(date -u -d \"$rs\" +%s)\" ] && exit 75"),
+                    format!("se=$(date -u -d \"$rs\" +%s) || exit 75\nif (( se{space}> cut )); then exit 75; fi"),
+                    format!("ok=$(jq -n --arg r{space}\"$rs\" --argjson c \"$cut\" '($r | fromdate) > $c')"),
+                ]
+                .map(|command| format!("{START_INTO_RS}\n{command}"))
+            })
+            .collect()
+    }
+
+    // Review a8c5d106: neither a copy hop nor the other operand may
+    // turn a Unicode character inside a shell word into a separator.
+    fn unicode_copy_and_other_operands() -> Vec<String> {
+        ['\u{a0}', '\u{2003}']
+            .into_iter()
+            .flat_map(|space| {
+                [
+                    format!("{space}x=$rs\nif [ \"$(date -u -d \"$x\" +%s)\" -gt \"$cut\" ]; then exit 75; fi"),
+                    format!("x=$rs{space}\nif [ \"$(date -u -d \"$x\" +%s)\" -gt \"$cut\" ]; then exit 75; fi"),
+                    format!("se=$(date -u -d \"$rs\" +%s) || exit 75\n{space}t=$se\nif (( t > cut )); then exit 75; fi"),
+                    format!("se=$(date -u -d \"$rs\" +%s) || exit 75\nif (( se >{space}cut )); then exit 75; fi"),
+                ]
+                .map(|command| format!("{START_INTO_RS}\n{command}"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unicode_copy_and_other_operand_boundaries_do_not_compare_the_start() {
+        let probes = unicode_copy_and_other_operands();
+        let actual: Vec<_> = probes
+            .iter()
+            .map(|probe| compares_the_recording_start(probe))
+            .collect();
+        assert_eq!(actual, vec![false; probes.len()], "{probes:#?}");
+    }
+
+    #[test]
+    fn unicode_copy_and_other_operand_boundaries_leave_the_public_guard_closed() {
+        let live = r#"w=$(boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=24')
+bounds=$(printf '%s' "$w" | jq '.live[].snapshot | [.mode, .overflow]')
+rows=$(printf '%s' "$w" | jq '[.live[].snapshot.rows[] | select(.user == "automation:x" and .presented == "none")] | length')"#;
+        let probes: Vec<_> = unicode_copy_and_other_operands()
+            .into_iter()
+            .map(|probe| format!("{live}\n{probe}"))
+            .collect();
+        let actual: Vec<_> = probes
+            .iter()
+            .map(|probe| clears_a_caller_from_the_gate_log_alone(probe))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![Some(LIVE_ROWS_ALONE); probes.len()],
+            "{probes:#?}"
+        );
+    }
+
+    #[test]
+    fn unicode_separated_orderings_do_not_compare_the_start() {
+        let probes = unicode_separated_orderings();
+        let actual: Vec<_> = probes
+            .iter()
+            .map(|probe| compares_the_recording_start(probe))
+            .collect();
+        assert_eq!(actual, vec![false; probes.len()], "{probes:#?}");
+    }
+
+    #[test]
+    fn a_double_test_elsewhere_does_not_change_unicode_argument_boundaries() {
+        for space in ['\u{a0}', '\u{2003}'] {
+            for prefix in ["[[ x == x ]];", "echo '[[ not a comparison';"] {
+                let probe = format!(
+                    "{START_INTO_RS}\n{prefix} if [ \"$(date -u -d \"$rs\" +%s)\"{space}-gt \"$cut\" ]; then exit 75; fi"
+                );
+                assert!(!compares_the_recording_start(&probe), "{probe}");
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_separated_orderings_leave_the_public_guard_closed() {
+        let live = r#"w=$(boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=24')
+bounds=$(printf '%s' "$w" | jq '.live[].snapshot | [.mode, .overflow]')
+rows=$(printf '%s' "$w" | jq '[.live[].snapshot.rows[] | select(.user == "automation:x" and .presented == "none")] | length')"#;
+        let probes: Vec<_> = unicode_separated_orderings()
+            .into_iter()
+            .map(|probe| format!("{live}\n{probe}"))
+            .collect();
+        let actual: Vec<_> = probes
+            .iter()
+            .map(|probe| clears_a_caller_from_the_gate_log_alone(probe))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![Some(LIVE_ROWS_ALONE); probes.len()],
+            "{probes:#?}"
+        );
+        // Unlike test and arithmetic words, this remains a real bash
+        // comparison: the Unicode space belongs to its left operand.
+        for space in ['\u{a0}', '\u{2003}'] {
+            let ordered =
+                format!("{live}\n{START_INTO_RS}\nif [[ $rs{space}> $cut ]]; then exit 75; fi");
+            assert!(compares_the_recording_start(&ordered), "{ordered}");
+            assert_eq!(clears_a_caller_from_the_gate_log_alone(&ordered), None);
+        }
+    }
+
+    /// Review 19d0ad2d reached a byte slice inside Unicode whitespace
+    /// while merely printing the start. Such prose orders nothing.
+    #[test]
+    fn unicode_space_in_prose_does_not_panic_or_order_the_start() {
+        for space in ['\u{a0}', '\u{2003}'] {
+            let probe = format!("{START_INTO_RS}\necho not{space}yet \"$rs\"");
+            assert!(!compares_the_recording_start(&probe), "{probe}");
+        }
+    }
+
+    #[test]
+    fn unicode_space_is_not_a_shell_argument_separator() {
+        for space in ['\u{a0}', '\u{2003}'] {
+            for command in [
+                format!("jq{space}--arg r \"$rs\" '$r > $cut'"),
+                format!("jq --arg{space}r \"$rs\" '$r > $cut'"),
+            ] {
+                let probe = format!("{START_INTO_RS}\nok=$({command})");
+                assert!(!compares_the_recording_start(&probe), "{probe}");
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_space_in_prose_leaves_the_public_caller_guard_closed() {
+        let live = r#"w=$(boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=24')
+bounds=$(printf '%s' "$w" | jq '.live[].snapshot | [.mode, .overflow]')
+rows=$(printf '%s' "$w" | jq '[.live[].snapshot.rows[] | select(.user == "automation:x" and .presented == "none")] | length')"#;
+        for space in ['\u{a0}', '\u{2003}'] {
+            let probe = format!("{live}\n{START_INTO_RS}\necho \"tally{space}start:\" \"$rs\"");
+            assert_eq!(
+                clears_a_caller_from_the_gate_log_alone(&probe),
+                Some(LIVE_ROWS_ALONE),
+                "{probe}"
+            );
+            let ordered = format!(
+                "{probe}\nif [ \"$(date -u -d \"$rs\" +%s)\" -gt \"$cut\" ]; then exit 75; fi"
+            );
+            assert_eq!(clears_a_caller_from_the_gate_log_alone(&ordered), None);
+        }
+    }
+
+    /// A VARIABLE NAMED ON A LINE THAT ORDERS SOMETHING IS NOT THE
+    /// VARIABLE ORDERED (backlog 845463ea, from run 4055c38a). The
+    /// shell-variable half counted any later line that named the variable
+    /// and held ` -gt `, `--arg ` and the rest ANYWHERE — so handing the
+    /// start to jq as `$r` and ordering only `.last_seen` against the cut
+    /// read as ordering the start, and a probe that never compared it
+    /// cleared its caller: the open direction c2e6f82e closed for the jq
+    /// half. Each fixture is RED on the predicate it replaces.
+    #[test]
+    fn a_shell_variable_is_ordered_only_as_the_operand() {
+        let unordered = [
+            // The packet's own shape: `$r` passed, never ordered.
+            format!(
+                "{START_INTO_RS}\nbad=$(printf '%s' \"$w\" | jq --arg r \"$rs\" '[.live[].snapshot.rows[] | select(.presented == \"none\" and .last_seen > $cut)] | length')"
+            ),
+            // Passed, then only measured: `$r | length` is not the start.
+            format!("{START_INTO_RS}\nn=$(jq -n --arg r \"$rs\" '$r | length > 0')"),
+            // Checked non-empty, with an ordering of something else beside it.
+            format!(
+                "{START_INTO_RS}\nif [ -n \"$rs\" ] && [ \"$n\" -gt \"$cut\" ]; then echo ok; fi"
+            ),
+            // Ordered against the bottom of its type: a non-empty check.
+            format!(
+                "{START_INTO_RS}\nif [ \"$(date -u -d \"$rs\" +%s)\" -gt 0 ]; then echo ok; fi"
+            ),
+            // Prose and comments, which order nothing.
+            format!("{START_INTO_RS}\necho \"the start $rs -gt the cut\""),
+            format!("{START_INTO_RS}\n# compare $rs -gt $cut before trusting the rows"),
+            // A `>` outside every quote is the shell's redirect.
+            format!("{START_INTO_RS}\nprintf '%s' $rs > /dev/null"),
+            // The jq turned the start into something else before the
+            // variable got it.
+            r#"rs=$(printf '%s' "$w" | jq -r '.live[0].snapshot.recording_since | length')
+if [ "$rs" -gt "$cut" ]; then echo ok; fi"#
+                .to_string(),
+        ];
+        for probe in &unordered {
+            assert!(!compares_the_recording_start(probe), "{probe}");
+        }
+        let ordered = [
+            // The variable as the test's operand, through `date`, both sides.
+            format!(
+                "{START_INTO_RS}\nif [ \"$(date -u -d \"$rs\" +%s)\" -gt \"$cut\" ]; then exit 75; fi"
+            ),
+            format!("{START_INTO_RS}\n[ \"$cut\" -lt \"$(date -u -d \"$rs\" +%s)\" ] && exit 75"),
+            // Through a variable of its own, compared arithmetically.
+            format!(
+                "{START_INTO_RS}\nse=$(date -u -d \"$rs\" +%s) || exit 75\nif (( se > cut )); then exit 75; fi"
+            ),
+            format!("{START_INTO_RS}\nif [[ $rs > $cut_iso ]]; then exit 75; fi"),
+            // Handed to jq, whose `$name` is then the ordered operand.
+            format!(
+                "{START_INTO_RS}\nok=$(jq -n --arg r \"$rs\" --argjson c \"$cut\" '($r | fromdate) > $c')"
+            ),
+            format!(
+                "{START_INTO_RS}\nok=$(jq -n --arg r \"$rs\" --argjson c \"$cut\" '\n  $c < ($r | fromdate)')"
+            ),
+            // A comment's apostrophe quotes nothing after it.
+            format!(
+                "# the tally's start, against the cut\n{START_INTO_RS}\nok=$(jq -n --arg r \"$rs\" --argjson c \"$cut\" '($r | fromdate) > $c')"
+            ),
+        ];
+        for probe in &ordered {
+            assert!(compares_the_recording_start(probe), "{probe}");
+        }
+    }
+
+    /// WHAT THE JQ HALF STILL READ WRONG (review 0cc4c0fa of car
+    /// 1e80ac97). N1 and N2 failed open: a redirect (`>&2`, `> file`)
+    /// after an unquoted read, and a non-empty check spelled as an
+    /// ordering against `""`, `0` or `null`. N3 failed closed: an indexed
+    /// path, a trailing `?`, a slice and `rtrimstr` ended the operand.
+    #[test]
+    fn a_redirect_or_a_bottom_is_not_an_ordering_and_an_index_is_a_path() {
+        let unordered = [
+            "jq -r .live[0].snapshot.recording_since >&2",
+            "jq -r .live[0].snapshot.recording_since > \"$out\"",
+            "x=$(jq -r '($j.snapshot.recording_since // \"\") > \"\"')",
+            "x=$(jq -r '($j.snapshot.recording_since | tostring) > \"\"')",
+            "x=$(jq -r '($j.snapshot.recording_since // 0) > 0')",
+            "x=$(jq -r 'null < $j.snapshot.recording_since')",
+        ];
+        for probe in unordered {
+            assert!(!compares_the_recording_start(probe), "{probe}");
+        }
+        let ordered = [
+            "x=$(jq -r '(.live[0].snapshot.recording_since | epoch) > $cut')",
+            "x=$(jq -r '(.live[]?.snapshot.recording_since? | rtrimstr(\"Z\") | strptime(\"%Y-%m-%dT%H:%M:%S\") | mktime) > $cut')",
+            "x=$(jq -r '(.live[0].snapshot.recording_since[0:19] | strptime(\"%Y-%m-%dT%H:%M:%S\") | mktime) > $cut')",
+        ];
+        for probe in ordered {
+            assert!(compares_the_recording_start(probe), "{probe}");
+        }
+    }
+
+    /// THE DOORS SAY WHAT WAS READ (backlog 002f5f31 item 2). They said
+    /// the probe "never reads the live tally's `snapshot.rows`", which
+    /// is false of a probe that read the rows without their coverage —
+    /// 217c2d66's shape. One wording, said by all three doors: the log
+    /// count names what the rows needed beside them, and the live-only
+    /// reading names no log it never read.
+    #[test]
+    fn the_reading_a_door_names_is_true_of_both_shapes() {
+        let log = gate_log_alone_reading("machine_gate.would_refuse");
+        assert!(log.contains("`machine_gate.would_refuse`"), "{log}");
+        assert!(log.contains(".log.dirty"), "{log}");
+        assert!(log.contains("`.live[].snapshot.rows`"), "{log}");
+        assert!(
+            log.contains("`.live[].snapshot.rows` together with what says that tally watched"),
+            "{log}"
+        );
+        let live = gate_log_alone_reading(LIVE_ROWS_ALONE);
+        assert!(!live.contains(".log.dirty"), "{live}");
+        for field in LIVE_TALLY_COVERAGE {
+            assert!(log.contains(field) && live.contains(field), "{field}");
+        }
+        assert_ne!(
+            gate_log_alone_heading("machine_gate.would_refuse"),
+            gate_log_alone_heading(LIVE_ROWS_ALONE)
+        );
+        assert_eq!(
+            gate_log_alone_heading(NO_KIND_NAMED),
+            "CLEARS A CALLER FROM THE GATE LOG ALONE"
+        );
+    }
+
     /// And a window read for ANOTHER purpose is left alone: the roster
     /// generation (car 35baf5b0), the actor-role watch (22e6e8de), the
     /// `asked` facts with no miss kind named, a schema grep for the kind
@@ -3194,8 +4889,15 @@ n=$(printf '%s' "$w" | jq -r --argjson cut "$cut" 'if (.log.dirty | type) == "ar
     /// it.
     #[test]
     fn the_gate_log_evidence_does_not_teach_the_shape_it_warns_about() {
+        // The probe it teaches, from its first line: the prose before it
+        // is not shell, and its apostrophes ("caller's") would open
+        // quotes no shell would see (backlog 845463ea).
+        let taught = GATE_LOG_ALONE_EVIDENCE
+            .find("live=$(")
+            .map(|at| &GATE_LOG_ALONE_EVIDENCE[at..]);
+        assert!(taught.is_some());
         assert_eq!(
-            clears_a_caller_from_the_gate_log_alone(GATE_LOG_ALONE_EVIDENCE),
+            taught.and_then(clears_a_caller_from_the_gate_log_alone),
             None
         );
         assert!(GATE_LOG_ALONE_EVIDENCE.contains("snapshot.rows"));

@@ -1,5 +1,5 @@
 import { isPageWrite } from './_smokeMocks';
-// /it/registry/rules — every control the page audit counted, pinned
+// /engineering/registry/rules — every control the page audit counted, pinned
 // (page-audit 08a444bc, step `test`).
 //
 // The audit's inventory (controls_md, measured 2026-09-23 against
@@ -41,7 +41,7 @@ import { isPageWrite } from './_smokeMocks';
 //                    the registry tabs, with a Rules tab of its own;
 //   gap 7 (3071e235) the editor the row links and "+ New rule" land on
 //                    had no ROUTE_CATALOG path of its own — FIXED: it is
-//                    catalogued as /it/registry/rules/:ruleName, the
+//                    catalogued as /engineering/registry/rules/:ruleName, the
 //                    pattern surface-opens records it under.
 // Gap 8 (a9c4ad40) asked for both throw branches of the page's one read
 // to be pinned; the two failure tests at the bottom pin both, as the
@@ -60,19 +60,25 @@ import { expect, test, type Page, type Request, type Route } from './_test';
 import { mountPage, settledReads } from './_helpers';
 import { installSmokeMocks } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
-import { parseRoute } from '../../src/router';
+import { parseRoute as parseRouteAt } from '../../src/router';
+import { ADDRESSES } from '../fixtures/station-tree';
+import { pagePath } from '../../src/shell/page-address';
+import type { NavItem } from '../../src/shell/nav-catalog';
 import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
 import { sectionForRoute } from '../../src/shell/sections';
 import { routePattern } from '../../src/shell/surface-opens';
+// The router reads a hosted page's address off the station tree
+// (backlog 0bc2eb68); this spec reads it off the tree the floor serves.
+const parseRoute = (path: string, search = '') => parseRouteAt(path, search, ADDRESSES);
 
-const PAGE = '/it/registry/rules';
+const PAGE = '/engineering/registry/rules';
 const TITLE = 'Rule authoring';
-const NEW_RULE = '/it/registry/rules/new';
+const NEW_RULE = '/engineering/registry/rules/new';
 /// The editor's catalog path: a pattern, spelled the way surface-opens
 /// records every open of it (routePattern), so the usage read and the
 /// page march name the same surface.
-const EDITOR = '/it/registry/rules/:ruleName';
-const CASCADE = '/it/registry/dispatcher';
+const EDITOR = '/engineering/registry/rules/:ruleName';
+const CASCADE = '/engineering/registry/dispatcher';
 
 /// The page's one read, as ruleAuthoring.ts's listActiveRules spells it —
 /// anchored, so the editor's `/api/dispatcher/rules/<name>/versions` is
@@ -202,7 +208,7 @@ function watchWrites(page: Page): Request[] {
 }
 
 const catalogPaths = (): Set<string> =>
-  new Set(Object.values(ROUTE_CATALOG).map((r) => (r as { path: string }).path));
+  new Set(Object.values(ROUTE_CATALOG).map((r) => pagePath(r as NavItem, ADDRESSES) ?? `unplaced:${r.id}`));
 
 /// The section a path lights, when that section is a ROUTE_CATALOG key.
 /// Read from nav-catalog.ts and sections.ts, never from a second list.
@@ -226,7 +232,7 @@ async function backHere(page: Page, rows: number): Promise<void> {
   await expect(page.locator('.catalog tbody tr')).toHaveCount(rows);
 }
 
-test.describe('/it/registry/rules — the rows', () => {
+test.describe('/engineering/registry/rules — the rows', () => {
   test('authoring has its own heading and catalog name, distinct from the cascade', async ({ page }) => {
     await install(page);
     await mountPage(page, PAGE);
@@ -339,7 +345,7 @@ test.describe('/it/registry/rules — the rows', () => {
   });
 });
 
-test.describe('/it/registry/rules — a stalled rule and an idle one are two rows (gap 5)', () => {
+test.describe('/engineering/registry/rules — a stalled rule and an idle one are two rows (gap 5)', () => {
   test('the stalled rule says failing and links the packet holding its newest dead-letter', async ({ page }) => {
     const reads: string[] = [];
     page.on('request', (r) => {
@@ -402,7 +408,7 @@ test.describe('/it/registry/rules — a stalled rule and an idle one are two row
   });
 });
 
-test.describe('/it/registry/rules — the controls', () => {
+test.describe('/engineering/registry/rules — the controls', () => {
   test('one unfiltered read, no buttons, no forms, no writes, and one link per rule plus three', async ({ page }) => {
     const writes = watchWrites(page);
     const reads: string[] = [];
@@ -434,7 +440,7 @@ test.describe('/it/registry/rules — the controls', () => {
     await mountPage(page, PAGE, { titleMatch: new RegExp(TITLE) });
 
     const tabs = page.locator('nav.it-tabs[aria-label="IT registry"] a');
-    await expect(tabs).toHaveText(['Workflows', 'Dispatcher', 'Rules', 'Step plugins', 'Policy', 'Subjects', 'Drift', 'Agents', 'Credentials']);
+    await expect(tabs).toHaveText(['Workflows', 'Dispatcher', 'Rules', 'Step plugins', 'Subjects', 'Drift', 'Agents', 'Credentials']);
     await expect(tabs.nth(2)).toHaveAttribute('aria-current', 'page');
     await expect(tabs.nth(2)).toHaveAttribute('href', PAGE);
     await expect(page.locator('nav.it-tabs button')).toHaveCount(0);
@@ -525,7 +531,7 @@ test.describe('/it/registry/rules — the controls', () => {
   });
 });
 
-test.describe('/it/registry/rules — empty and failed are never the same paint', () => {
+test.describe('/engineering/registry/rules — empty and failed are never the same paint', () => {
   test('an empty registry says so, links to the guidance, and shows no failure line', async ({ page }) => {
     await install(page, []);
     await mountPage(page, PAGE, { titleMatch: new RegExp(TITLE) });

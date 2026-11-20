@@ -2,7 +2,9 @@
 //! (`infra/dispatcher/rules/`): a boss-gcp converge whose `run` step
 //! records `deposit_key_verdict = "unconfined"` hands that step to the
 //! chore judge, which files ONE backlog-item per `RED <route> …` line the
-//! converge left in `output` while one is open (backlog dea2236f).
+//! converge left in `output` while one is open (backlog dea2236f). A
+//! `clean` verdict reaches the judge too, so it can close the items a
+//! tick no longer prints (backlog 52534a15).
 //!
 //! WHY THE TICK DOES NOT RED (review 1fa0d093 of car 3cd92f7a, B2). The
 //! car's first shape exited the converge non-zero on a finding, so its
@@ -81,13 +83,50 @@ fn an_unconfined_verdict_on_the_run_step_fires_the_chore_judge_once() {
     // A tick with no RED line files nothing; the fallback route stays the
     // break-glass deposit's alone (chore_file_reds.rs, e4a9a9b3).
     assert_eq!(arg(&inv[0].args, "no_red_failure_route"), None);
+    // Every finding prints under one route, so the judge keys each item
+    // on its RED line: a second line while the first is open is named
+    // (backlog d1b03874).
+    assert_eq!(
+        arg(&inv[0].args, "one_item_per"),
+        Some(&Value::String("finding".into()))
+    );
+    // The word that says a tick found nothing, so it closes what it no
+    // longer prints (backlog 52534a15).
+    assert_eq!(
+        arg(&inv[0].args, "clean_field"),
+        Some(&Value::String("deposit_key_verdict".into()))
+    );
+    assert_eq!(
+        arg(&inv[0].args, "clean_value"),
+        Some(&Value::String("clean".into()))
+    );
+}
+
+/// A CLEAN TICK REACHES THE JUDGE (backlog 52534a15): it is the reading
+/// that closes a finding item nobody closed by hand. The judge writes
+/// nothing when there is nothing to close.
+#[test]
+fn a_clean_tick_fires_the_chore_judge_so_it_can_close_what_cleared() {
+    let mut clean = finding_tick();
+    clean["deposit_key_verdict"] = serde_json::json!("clean");
+    clean.as_object_mut().expect("an object").remove("output");
+    let hits = match_event(
+        &common::authored_rule(RULE),
+        "step.done.task",
+        &run_done("maintenance-boss-gcp-converge", "run", clean),
+        &NoHelpers,
+    )
+    .matched;
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(
+        hits[0].invocations[0].handler,
+        "maintenance.chore.file_reds"
+    );
 }
 
 #[test]
-fn a_clean_or_unverified_tick_and_every_other_step_stay_silent() {
+fn an_unverified_tick_and_every_other_step_stay_silent() {
     let reg = common::authored_rule(RULE);
-    let mut clean = finding_tick();
-    clean["deposit_key_verdict"] = serde_json::json!("clean");
     let mut unverified = finding_tick();
     unverified["deposit_key_verdict"] = serde_json::json!("unverified");
     let mut before = finding_tick();
@@ -96,12 +135,6 @@ fn a_clean_or_unverified_tick_and_every_other_step_stay_silent() {
         .expect("an object")
         .remove("deposit_key_verdict");
     for (why, kind, slug, meta) in [
-        (
-            "a clean audit",
-            "maintenance-boss-gcp-converge",
-            "run",
-            clean,
-        ),
         (
             "an UNVERIFIED audit — no evidence is not a finding either",
             "maintenance-boss-gcp-converge",

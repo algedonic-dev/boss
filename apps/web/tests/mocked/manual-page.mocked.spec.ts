@@ -32,14 +32,17 @@ import { expect, test, type Page, type Route } from './_test';
 import { mountPage } from './_helpers';
 import { FAILURE_MARKER } from './_routes';
 import { installSmokeMocks } from './_smokeMocks';
-import { parseRoute } from '../../src/router';
-import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
+import { parseRoute as parseRouteAt } from '../../src/router';
+import { ADDRESSES, pageAt } from '../fixtures/station-tree';
+// The router reads a hosted page's address off the station tree
+// (backlog 0bc2eb68); this spec reads it off the tree the floor serves.
+const parseRoute = (path: string, search = '') => parseRouteAt(path, search, ADDRESSES);
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
 
 /// The page's three reads, as ManualPage.svelte spells them.
-const TREE = /\/api\/content\/manual$/;
+const TREE = /\/api\/content\/manual-index$/;
 const SECTION = /\/api\/content\/manual\/(.+)$/;
 const PERSON = /\/api\/people\/([^/]+)$/;
 
@@ -99,6 +102,46 @@ const TREE_ORDER: ReadonlyArray<readonly [string, number]> = [
 const PARENTS = ['policies', 'benefits', 'benefits/time-off'];
 const LEAVES = ['welcome', 'policies/security', 'policies/conduct', 'benefits/time-off/sick'];
 
+test('unwritten sections name their owner and authoring packet without rendering draft prose', async ({ page }) => {
+  await installSmokeMocks(page);
+  const packet = '2c28833a-d0a3-499a-bcf9-2d3a264e26a3';
+  const header = {
+    id: 'ms-expenses', slug: 'expenses', parent_slug: null, title: 'Expenses',
+    sort_order: 1, published: false, owner_station: 'finance', authoring_job_id: packet,
+  };
+  // Both old and new read shapes return the same safe fixture. The failure
+  // must be the page's missing placeholder, not an unmocked endpoint.
+  await page.route(/\/api\/content\/manual$/, (r) => json(r, [header]));
+  await page.route(/\/api\/content\/manual-index$/, (r) => json(r, [header]));
+  await page.route(/\/api\/content\/manual\/expenses$/, (r) => json(r, { error: 'unpublished' }, 404));
+  await mountPage(page, '/engineering/manual/expenses', { titleMatch: /Company manual/ });
+  await expect(page.getByText('Not yet written, owned by finance', { exact: true })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Open authoring packet' })).toHaveAttribute('href', `/ux/jobs/${packet}`);
+  await expect(page.locator('.manual-article-body')).toHaveCount(0);
+  await expect(page.getByText('PRIVATE unfinished work')).toHaveCount(0);
+});
+
+test('an old section with no recorded ownership says unknown instead of inventing a packet', async ({ page }) => {
+  await installSmokeMocks(page);
+  await page.route(TREE, (r) => json(r, [{
+    id: 'ms-legacy', slug: 'legacy', parent_slug: null, title: 'Legacy',
+    sort_order: 1, published: false, owner_station: null, authoring_job_id: null,
+  }]));
+  await page.route(/\/api\/content\/manual\/legacy$/, (r) => json(r, {}, 404));
+  await mountPage(page, '/engineering/manual/legacy', { titleMatch: /Company manual/ });
+  await expect(page.getByText('Not yet written; owner not recorded.', { exact: true })).toBeVisible();
+  await expect(page.getByText('Authoring packet not recorded.', { exact: true })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Open authoring packet' })).toHaveCount(0);
+});
+
+test('an unreadable index is a read failure rather than an empty manual', async ({ page }) => {
+  await installSmokeMocks(page);
+  await page.route(TREE, (r) => json(r, { unavailable: true }));
+  await mountPage(page, '/engineering/manual', { titleMatch: /Company manual/ });
+  await expect(page.getByRole('alert')).toContainText('Manual index response is unreadable');
+  await expect(page.getByText('No sections yet.', { exact: true })).toHaveCount(0);
+});
+
 async function installManualReads(page: Page): Promise<void> {
   await installSmokeMocks(page);
   await page.route(TREE, (r) => json(r, SECTIONS));
@@ -130,15 +173,18 @@ function route(path: string): ReturnType<typeof parseRoute> {
   return parseRoute(path);
 }
 
-test.describe('/manual — the page chrome and its two spellings', () => {
-  for (const path of ['/ux/manual', ROUTE_CATALOG.manual.path]) {
+// One spelling since backlog 0bc2eb68: the manual is hosted at
+// Engineering, and /ux/manual and /manual answer nothing
+// (src/router.test.ts holds both to not-found).
+test.describe('/engineering/manual — the page chrome', () => {
+  for (const path of [pageAt('manual')]) {
     test(`${path} renders the header and the no-section prompt`, async ({ page }) => {
       await installManualReads(page);
       await mountPage(page, path, { titleMatch: /Company manual/ });
 
       await expect(page.locator('.exec-eyebrow')).toHaveText('Know');
       await expect(page.locator('h1').first()).toHaveText('Company manual');
-      await expect(page.getByText('Authored by HR. Every change is versioned.')).toBeVisible();
+      await expect(page.getByText('Company guidance. Every change is versioned.')).toBeVisible();
       await expect(page.locator('.manual-content')).toHaveText(
         'Select a section from the tree to start reading.',
       );
@@ -151,7 +197,7 @@ test.describe('/manual — the page chrome and its two spellings', () => {
     let release: () => void = () => {};
     const held = new Promise<void>((r) => { release = r; });
     await page.route(TREE, async (r) => { await held; await json(r, SECTIONS); });
-    await mountPage(page, '/ux/manual');
+    await mountPage(page, '/engineering/manual');
 
     await expect(page.locator('.manual-tree')).toHaveText('Loading tree…');
     release();
@@ -170,22 +216,22 @@ test.describe('/manual — the page chrome and its two spellings', () => {
     // b4f68a65), so that row carries the role the sidebar reads.
     await page.route(/\/api\/people\/emp-001$/, (r) =>
       json(r, { ...EMP_001, role: 'platform-admin', department: 'it' }));
-    await mountPage(page, '/ux/manual', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual', { titleMatch: /Company manual/ });
 
     await expect(page.locator('.shell-nav').getByRole('link', { name: 'My Day', exact: true }).first()).toBeVisible();
     const manual = page.locator('.shell-nav').getByRole('link', { name: 'Manual', exact: true });
     await expect(manual).toBeVisible();
-    await expect(manual).toHaveAttribute('href', '/manual');
+    await expect(manual).toHaveAttribute('href', '/engineering/manual');
     await manual.click();
     await expect(page).toHaveURL(/\/manual$/);
     await expect(page.locator('.manual-tree-label')).toHaveCount(SECTIONS.length);
   });
 });
 
-test.describe('/manual — tree links', () => {
+test.describe('/engineering/manual — tree links', () => {
   test('every section is one link, in sort order, indented by depth', async ({ page }) => {
     await installManualReads(page);
-    await mountPage(page, '/ux/manual', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual', { titleMatch: /Company manual/ });
 
     await expect.poll(() => treeTitles(page)).toEqual(TREE_ORDER.map(([t]) => t));
     for (const [title, depth] of TREE_ORDER) {
@@ -206,10 +252,10 @@ test.describe('/manual — tree links', () => {
       await new Promise((ok) => setTimeout(ok, 750));
       await json(r, SECTIONS);
     });
-    await mountPage(page, '/ux/manual', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual', { titleMatch: /Company manual/ });
 
     // The surface the links belong to is the catalog's `manual` row.
-    expect(route(ROUTE_CATALOG.manual.path)).toEqual({ kind: 'manual' });
+    expect(route(pageAt('manual'))).toEqual({ kind: 'manual' });
     // evaluateAll is a snapshot and does not wait; the count assertion
     // does, so the snapshot below reads the drawn tree.
     const labels = page.locator('.manual-tree-label');
@@ -219,7 +265,7 @@ test.describe('/manual — tree links', () => {
     );
     expect(hrefs.length).toBe(SECTIONS.length);
     for (const s of SECTIONS) {
-      const link = `/ux${ROUTE_CATALOG.manual.path}/${s.slug}`;
+      const link = `${pageAt('manual')}/${s.slug}`;
       expect(hrefs).toContain(link);
       expect(route(link)).toEqual({ kind: 'manualSection', slug: s.slug });
     }
@@ -227,10 +273,10 @@ test.describe('/manual — tree links', () => {
 
   test('a link opens its section, marks it active, and back returns to the page it came from', async ({ page }) => {
     await installManualReads(page);
-    await mountPage(page, '/ux/manual', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual', { titleMatch: /Company manual/ });
 
     await page.getByRole('link', { name: 'Welcome', exact: true }).click();
-    await expect(page).toHaveURL(/\/ux\/manual\/welcome$/);
+    await expect(page).toHaveURL(/\/engineering\/manual\/welcome$/);
     const article = page.locator('article.manual-article');
     await expect(article.locator('.manual-article-eyebrow')).toHaveText('welcome');
     await expect(article.locator('h2')).toHaveText('Welcome');
@@ -238,7 +284,7 @@ test.describe('/manual — tree links', () => {
     await expect(node(page, 'Welcome')).toHaveClass(/manual-tree-active/);
 
     await page.getByRole('link', { name: 'Sick leave', exact: true }).click();
-    await expect(page).toHaveURL(/\/ux\/manual\/benefits\/time-off\/sick$/);
+    await expect(page).toHaveURL(/\/engineering\/manual\/benefits\/time-off\/sick$/);
     await expect(article.locator('h2')).toHaveText('Sick leave');
     await expect(article.locator('.manual-article-eyebrow')).toHaveText('benefits/time-off/sick');
     await expect(article.locator('.manual-article-meta')).toHaveText('Version 1 · updated Sep 16, 2026');
@@ -246,11 +292,11 @@ test.describe('/manual — tree links', () => {
     await expect(node(page, 'Welcome')).not.toHaveClass(/manual-tree-active/);
 
     await page.goBack();
-    await expect(page).toHaveURL(/\/ux\/manual\/welcome$/);
+    await expect(page).toHaveURL(/\/engineering\/manual\/welcome$/);
     await expect(article.locator('h2')).toHaveText('Welcome');
 
     await page.goBack();
-    await expect(page).toHaveURL(/\/ux\/manual$/);
+    await expect(page).toHaveURL(/\/engineering\/manual$/);
     await expect(page.locator('.manual-content')).toHaveText(
       'Select a section from the tree to start reading.',
     );
@@ -261,7 +307,7 @@ test.describe('/manual — tree links', () => {
     let release: () => void = () => {};
     const held = new Promise<void>((r) => { release = r; });
     await page.route(SECTION, async (r) => { await held; await json(r, SECTIONS[1]); });
-    await mountPage(page, '/ux/manual/welcome', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual/welcome', { titleMatch: /Company manual/ });
 
     await expect(page.locator('.manual-content')).toHaveText('Loading…');
     release();
@@ -270,7 +316,7 @@ test.describe('/manual — tree links', () => {
 
   test('a section the server does not have says so, naming the slug', async ({ page }) => {
     await installManualReads(page);
-    await mountPage(page, '/ux/manual/policies/missing', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual/policies/missing', { titleMatch: /Company manual/ });
 
     await expect(page.locator('.manual-content')).toHaveText(
       "Section policies/missing not found, or you don't have access to it.",
@@ -279,10 +325,10 @@ test.describe('/manual — tree links', () => {
   });
 });
 
-test.describe('/manual — tree toggles', () => {
+test.describe('/engineering/manual — tree toggles', () => {
   test('a parent toggle collapses and expands its children, and says which it will do', async ({ page }) => {
     await installManualReads(page);
-    await mountPage(page, '/ux/manual', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual', { titleMatch: /Company manual/ });
 
     const toggle = node(page, 'Policies').locator('button.manual-tree-toggle');
     await expect(toggle).toHaveAttribute('aria-label', 'Collapse');
@@ -293,7 +339,7 @@ test.describe('/manual — tree toggles', () => {
     await expect(toggle).toHaveText('▸');
     await expect.poll(() => treeTitles(page)).toEqual(['Welcome', 'Policies', 'Benefits', 'Time off', 'Sick leave']);
     // The toggle is not a link: collapsing moves nobody.
-    await expect(page).toHaveURL(/\/ux\/manual$/);
+    await expect(page).toHaveURL(/\/engineering\/manual$/);
 
     await toggle.click();
     await expect(toggle).toHaveAttribute('aria-label', 'Collapse');
@@ -302,7 +348,7 @@ test.describe('/manual — tree toggles', () => {
 
   test('collapsing a parent hides its whole subtree, not only its children', async ({ page }) => {
     await installManualReads(page);
-    await mountPage(page, '/ux/manual', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual', { titleMatch: /Company manual/ });
 
     await node(page, 'Benefits').locator('button.manual-tree-toggle').click();
     await expect.poll(() => treeTitles(page)).toEqual(['Welcome', 'Policies', 'Security', 'Conduct', 'Benefits']);
@@ -310,7 +356,7 @@ test.describe('/manual — tree toggles', () => {
 
   test('the collapse set survives a reload, in this viewer’s browser', async ({ page }) => {
     await installManualReads(page);
-    await mountPage(page, '/ux/manual', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual', { titleMatch: /Company manual/ });
 
     await node(page, 'Policies').locator('button.manual-tree-toggle').click();
     await expect.poll(() => storedCollapsed(page)).toBe('["policies"]');
@@ -326,7 +372,7 @@ test.describe('/manual — tree toggles', () => {
       localStorage.setItem(k, JSON.stringify(['benefits', 'benefits/time-off', 'policies']));
     }, COLLAPSED_KEY);
     await installManualReads(page);
-    await mountPage(page, '/ux/manual/benefits/time-off/sick', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual/benefits/time-off/sick', { titleMatch: /Company manual/ });
 
     await expect(node(page, 'Sick leave')).toHaveClass(/manual-tree-active/);
     await expect.poll(() => treeTitles(page)).toEqual(['Welcome', 'Policies', 'Benefits', 'Time off', 'Sick leave']);
@@ -336,7 +382,7 @@ test.describe('/manual — tree toggles', () => {
   // Gap 8 (e703e1af): leaves have a section link, never a no-op tab stop.
   test('leaf links remain navigable without empty toggle buttons', async ({ page }) => {
     await installManualReads(page);
-    await mountPage(page, '/ux/manual', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual', { titleMatch: /Company manual/ });
 
     await expect(page.locator('button.manual-tree-toggle')).toHaveCount(PARENTS.length);
     for (const s of PARENTS) {
@@ -350,46 +396,42 @@ test.describe('/manual — tree toggles', () => {
       await link.focus();
       await expect(link).toBeFocused();
       await page.keyboard.press('Enter');
-      await expect(page).toHaveURL(new RegExp(`/ux/manual/${s}$`));
+      await expect(page).toHaveURL(new RegExp(`/engineering/manual/${s}$`));
     }
     expect(await storedCollapsed(page)).toBeNull();
     await expect.poll(() => treeTitles(page)).toEqual(TREE_ORDER.map(([t]) => t));
   });
 });
 
-test.describe('/manual — the section body', () => {
-  test('an employee shortcode is a link to that employee, labelled by name, and back returns', async ({ page }) => {
+test.describe('/engineering/manual — the section body', () => {
+  // A link to the employee until the people page went with step 1 of
+  // design 01fa5bdf: its address is not found now, so the name is text.
+  test('an employee shortcode names that employee, as text — the people page is gone', async ({ page }) => {
     await installManualReads(page);
-    await mountPage(page, '/ux/manual/welcome', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual/welcome', { titleMatch: /Company manual/ });
 
-    const link = page.locator('.manual-article-body a');
-    await expect(link).toHaveCount(1);
-    await expect(link).toHaveText(EMP_001.name);
-    await expect(link).toHaveAttribute('href', '/ux/people/emp-001');
-    expect(route('/ux/people/emp-001')).toEqual({ kind: 'employee', empId: 'emp-001' });
-
-    await link.click();
-    await expect(page).toHaveURL(/\/ux\/people\/emp-001$/);
-    await page.goBack();
-    await expect(page).toHaveURL(/\/ux\/manual\/welcome$/);
-    await expect(page.locator('article.manual-article h2')).toHaveText('Welcome');
+    await expect(page.locator('.manual-article-body a')).toHaveCount(0);
+    const name = page.locator('.manual-article-body span.entity-link');
+    await expect(name).toHaveText(EMP_001.name);
+    await expect(name).toHaveAttribute('title', 'emp-001');
+    expect(route('/ux/people/emp-001').kind).toBe('notFound');
   });
 
   // Authored seed markdown is rendered, not shown as literal delimiters (d1b6cfef).
   test('a markdown body renders the seed owner annotation as emphasis', async ({ page }) => {
     await installManualReads(page);
-    await mountPage(page, '/ux/manual/policies/security', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual/policies/security', { titleMatch: /Company manual/ });
 
     await expect(page.locator('.manual-article-body')).toHaveText('TBD, owner: Operations lead.');
     await expect(page.locator('.manual-article-body em')).toHaveText('TBD, owner: Operations lead.');
   });
 });
 
-test.describe('/manual — empty and failed reads are never the same paint', () => {
+test.describe('/engineering/manual — empty and failed reads are never the same paint', () => {
   test('an empty tree says "No sections yet." and is not a failure', async ({ page }) => {
     await installManualReads(page);
     await page.route(TREE, (r) => json(r, []));
-    await mountPage(page, '/ux/manual', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual', { titleMatch: /Company manual/ });
 
     await expect(page.locator('.manual-tree')).toHaveText('No sections yet.');
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
@@ -398,7 +440,7 @@ test.describe('/manual — empty and failed reads are never the same paint', () 
   test('a failed tree read is said with its status, never drawn as an empty tree', async ({ page }) => {
     await installManualReads(page);
     await page.route(TREE, (r) => json(r, { error: 'content down' }, 503));
-    await mountPage(page, '/ux/manual', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual', { titleMatch: /Company manual/ });
 
     const failed = page.locator(`.manual-tree ${FAILURE_MARKER}`);
     await expect(failed).toHaveText("Couldn't load the manual — HTTP 503");
@@ -409,7 +451,7 @@ test.describe('/manual — empty and failed reads are never the same paint', () 
   test('an unreachable tree read is said too, with the error', async ({ page }) => {
     await installManualReads(page);
     await page.route(TREE, (r) => r.abort('connectionrefused'));
-    await mountPage(page, '/ux/manual', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual', { titleMatch: /Company manual/ });
 
     await expect(page.locator(`.manual-tree ${FAILURE_MARKER}`)).toContainText("Couldn't load the manual — ");
     await expect(page.getByText('No sections yet.')).toHaveCount(0);
@@ -420,7 +462,7 @@ test.describe('/manual — empty and failed reads are never the same paint', () 
   test('a failed section read on first load names its status', async ({ page }) => {
     await installManualReads(page);
     await page.route(SECTION, (r) => json(r, { error: 'content down' }, 500));
-    await mountPage(page, '/ux/manual/welcome', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual/welcome', { titleMatch: /Company manual/ });
 
     const failed = page.locator(`.manual-content ${FAILURE_MARKER}`);
     await expect(failed).toHaveText("Couldn't load section — HTTP 500");
@@ -432,11 +474,11 @@ test.describe('/manual — empty and failed reads are never the same paint', () 
   test('a failed section read after navigating clears the previous section', async ({ page }) => {
     await installManualReads(page);
     await page.route(/\/api\/content\/manual\/policies\/security$/, (r) => json(r, { error: 'content down' }, 500));
-    await mountPage(page, '/ux/manual/welcome', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual/welcome', { titleMatch: /Company manual/ });
     await expect(page.locator('article.manual-article h2')).toHaveText('Welcome');
 
     await page.getByRole('link', { name: 'Security', exact: true }).click();
-    await expect(page).toHaveURL(/\/ux\/manual\/policies\/security$/);
+    await expect(page).toHaveURL(/\/engineering\/manual\/policies\/security$/);
     await expect(node(page, 'Security')).toHaveClass(/manual-tree-active/);
     await expect(page.locator(`.manual-content ${FAILURE_MARKER}`)).toHaveText("Couldn't load section — HTTP 500");
     await expect(page.locator('article.manual-article')).toHaveCount(0);
@@ -449,7 +491,7 @@ test.describe('/manual — empty and failed reads are never the same paint', () 
     test(`a section read that throws ${navigating ? 'after navigating' : 'on first load'} says so without an old article`, async ({ page }) => {
       await installManualReads(page);
       await page.route(/\/api\/content\/manual\/policies\/security$/, (r) => r.abort('connectionrefused'));
-      await mountPage(page, navigating ? '/ux/manual/welcome' : '/ux/manual/policies/security', { titleMatch: /Company manual/ });
+      await mountPage(page, navigating ? '/engineering/manual/welcome' : '/engineering/manual/policies/security', { titleMatch: /Company manual/ });
       if (navigating) {
         await expect(page.locator('article.manual-article h2')).toHaveText('Welcome');
         await page.getByRole('link', { name: 'Security', exact: true }).click();
@@ -481,7 +523,7 @@ test.describe('/manual — empty and failed reads are never the same paint', () 
           };
           Object.defineProperty(window, 'fetch', { value: read });
         }, failureAt);
-        await mountPage(page, navigating ? '/ux/manual/welcome' : '/ux/manual/policies/security', { titleMatch: /Company manual/ });
+        await mountPage(page, navigating ? '/engineering/manual/welcome' : '/engineering/manual/policies/security', { titleMatch: /Company manual/ });
         if (navigating) {
           await expect(page.locator('article.manual-article h2')).toHaveText('Welcome');
           await page.getByRole('link', { name: 'Security', exact: true }).click();
@@ -504,7 +546,7 @@ test.describe('/manual — empty and failed reads are never the same paint', () 
     const held = new Promise<void>((resolve) => { release = resolve; });
     await page.route(/\/api\/content\/manual\/welcome$/, async (r) => { await held; await json(r, SECTIONS[1]); });
     await page.route(/\/api\/content\/manual\/policies\/security$/, (r) => json(r, { error: 'content down' }, 500));
-    await mountPage(page, '/ux/manual/welcome', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual/welcome', { titleMatch: /Company manual/ });
     await expect(page.locator('.manual-content')).toHaveText('Loading…');
     await page.getByRole('link', { name: 'Security', exact: true }).click();
     const failed = page.locator(`.manual-content ${FAILURE_MARKER}`);
@@ -512,7 +554,7 @@ test.describe('/manual — empty and failed reads are never the same paint', () 
     const response = page.waitForResponse(/\/api\/content\/manual\/welcome$/);
     release();
     await (await response).finished();
-    await expect(page).toHaveURL(/\/ux\/manual\/policies\/security$/);
+    await expect(page).toHaveURL(/\/engineering\/manual\/policies\/security$/);
     await expect(failed).toHaveText("Couldn't load section — HTTP 500");
     await expect(page.locator('article.manual-article')).toHaveCount(0);
   });
@@ -525,10 +567,10 @@ test.describe('/manual — empty and failed reads are never the same paint', () 
   test('a failed name read keeps the raw employee id and says so, naming the read', async ({ page }) => {
     await installManualReads(page);
     await page.route(PERSON, (r) => json(r, { error: 'people down' }, 503));
-    await mountPage(page, '/ux/manual/welcome', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual/welcome', { titleMatch: /Company manual/ });
 
     await expect(page.locator('article.manual-article h2')).toHaveText('Welcome');
-    await expect(page.locator('.manual-article-body a')).toHaveText('emp-001');
+    await expect(page.locator('.manual-article-body span.entity-link')).toHaveText('emp-001');
     const failed = page.locator(`article.manual-article ${FAILURE_MARKER}`);
     await expect(failed).toHaveAttribute('role', 'alert');
     await expect(failed).toHaveText(
@@ -549,17 +591,17 @@ test.describe('/manual — empty and failed reads are never the same paint', () 
       if (PERSON.test(path)) personReads.push(path);
     });
     await installManualReads(page);
-    await mountPage(page, '/ux/manual/policies/security', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual/policies/security', { titleMatch: /Company manual/ });
     await expect(page.locator('article.manual-article h2')).toHaveText('Security');
     expect(personReads).toEqual([]);
 
     await page.getByRole('link', { name: 'Welcome', exact: true }).click();
-    await expect(page.locator('.manual-article-body a')).toHaveText(EMP_001.name);
+    await expect(page.locator('.manual-article-body span.entity-link')).toHaveText(EMP_001.name);
     expect([...new Set(personReads)]).toEqual(['/api/people/emp-001']);
   });
 });
 
-test.describe('/manual — writes', () => {
+test.describe('/engineering/manual — writes', () => {
   // The inventory counts 0 writes, so there is no refusal to show: the
   // refused-write leg has nothing to refuse. What IS pinned is the zero
   // — a write added to this page without a refusal leg fails here
@@ -574,7 +616,7 @@ test.describe('/manual — writes', () => {
       }
     });
     await installManualReads(page);
-    await mountPage(page, '/ux/manual', { titleMatch: /Company manual/ });
+    await mountPage(page, '/engineering/manual', { titleMatch: /Company manual/ });
 
     await page.getByRole('link', { name: 'Welcome', exact: true }).click();
     await expect(page.locator('article.manual-article h2')).toHaveText('Welcome');

@@ -131,6 +131,8 @@
     let stamps = Array.isArray(step.sign_offs) ? step.sign_offs.slice() : [];
     const isDone = step.status === 'completed' || step.status === 'skipped';
     let busy = false;
+    // A moved step needs a fresh mount before this surface can act again.
+    let moved = false;
     let error = null;
     // Roles whose recorded stamp no longer matches the step's shape —
     // the server's rule (a stamp pins step_shape_hash; a completion-
@@ -436,7 +438,7 @@
           (!stamp || isStale) && !isDone
             ? h(
                 'button',
-                { className: 'step-btn', disabled: busy, onClick: () => sign(role) },
+                { className: 'step-btn', disabled: busy || moved, onClick: () => sign(role) },
                 `Sign off as ${role}`,
               )
             : null,
@@ -468,7 +470,7 @@
           ),
         );
       }
-      const disabled = busy || missing.length > 0;
+      const disabled = busy || moved || missing.length > 0;
       actionsDiv.appendChild(
         h(
           'button',
@@ -490,7 +492,7 @@
             className: 'step-btn',
             // A Request changes that completes meets the same
             // required-at-done contract as Approve, so it waits too.
-            disabled: changesRequestedCompletes ? disabled : busy,
+            disabled: changesRequestedCompletes ? disabled : busy || moved,
             onClick: () => decide('changes-requested'),
           },
           'Request changes',
@@ -560,11 +562,13 @@
     // approver is told to reopen the step rather than sign a copy this
     // mount can no longer vouch for.
     function stepMovedUnderUs() {
+      moved = true;
       progress = ['The step changed since it was shown, so nothing was signed — reopen it to read it as it stands'];
       if (typeof onUpdate === 'function') onUpdate();
     }
 
     async function sign(role) {
+      if (moved) return false;
       const wasBusy = busy;
       busy = true;
       error = null;
@@ -617,6 +621,7 @@
     }
 
     async function decide(d) {
+      if (moved) return;
       busy = true;
       error = null;
       progress = [];

@@ -24,7 +24,7 @@ pub struct ExpectedStep {
     pub version: Option<String>,
 }
 
-fn present_holder<'de, D: serde::Deserializer<'de>>(
+pub(crate) fn present_holder<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error> {
     Option::<String>::deserialize(deserializer)

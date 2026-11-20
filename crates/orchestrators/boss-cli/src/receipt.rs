@@ -52,6 +52,11 @@ pub struct ReceiptFacts {
     /// gone" from "I could not ask", which look identical otherwise and
     /// must not.
     pub remote_readable: bool,
+    /// When the lookup could NOT be made: the command, where it ran, and
+    /// what git said. "Could not read" without the reason sent its
+    /// reader to re-derive it with `git ls-remote` by hand (backlog
+    /// 2770eba8, secondary).
+    pub remote_said: Option<String>,
     /// `receipt.verdict`.
     pub verdict: Option<String>,
     /// `receipt.mode` — full, auto, or a crate-scoped run.
@@ -71,12 +76,14 @@ pub fn standing(f: &ReceiptFacts) -> Standing {
         );
     };
     if !f.remote_readable {
-        return Standing::Unknown(
-            "could not read the branch from the forge. An unreadable ref is not \
-             a missing one, and a receipt cannot be called current against a \
-             head nobody looked up"
-                .into(),
-        );
+        return Standing::Unknown(format!(
+            "could not read the branch from the forge ({}). An unreadable ref is \
+             not a missing one, and a receipt cannot be called current against a \
+             head nobody looked up",
+            f.remote_said
+                .as_deref()
+                .unwrap_or("the lookup gave no reason")
+        ));
     }
     let Some(now) = &f.branch_head else {
         return Standing::BranchGone;
@@ -110,18 +117,6 @@ pub fn coverage(mode: Option<&str>) -> &'static str {
     }
 }
 
-fn sh(args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(args[0])
-        .args(&args[1..])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!v.is_empty()).then_some(v)
-}
-
 pub async fn run(branch: &str, clone: Option<String>, remote: Option<String>) -> Result<()> {
     let clone = clone.unwrap_or_else(|| ".".to_string());
     let remote = remote.unwrap_or_else(|| "origin".to_string());
@@ -151,9 +146,15 @@ pub async fn run(branch: &str, clone: Option<String>, remote: Option<String>) ->
         "  gated    {}",
         facts.gated_head.as_deref().unwrap_or("none")
     );
+    // "absent" is a reading; a lookup that failed read nothing, and
+    // printing "absent" for it is the line 2770eba8 measured.
     println!(
         "  now      {}",
-        facts.branch_head.as_deref().unwrap_or("absent")
+        match (&facts.branch_head, facts.remote_readable) {
+            (Some(head), _) => head.as_str(),
+            (None, true) => "absent",
+            (None, false) => "unread — the lookup failed (see below)",
+        }
     );
     println!("  covers   {}", coverage(facts.mode.as_deref()));
     match standing(&facts) {
@@ -177,23 +178,11 @@ pub async fn run(branch: &str, clone: Option<String>, remote: Option<String>) ->
 /// FULLY-GATHERED open cars (see `crate::sor_client::all_open_cars`), not one page, so
 /// a car past the first page is not silently missed.
 fn facts_from(cars: &[serde_json::Value], branch: &str, clone: &str, remote: &str) -> ReceiptFacts {
-    let ls = sh(&[
-        "git",
-        "-C",
-        clone,
-        "ls-remote",
-        remote,
-        &format!("refs/heads/{branch}"),
-    ]);
-    let remote_readable = ls.is_some();
-    let branch_head = ls
-        .as_deref()
-        .and_then(|s| s.split_whitespace().next())
-        .map(str::to_string);
-
+    let ls = look_up_branch(clone, remote, branch);
     let mut out = ReceiptFacts {
-        remote_readable,
-        branch_head,
+        remote_readable: ls.readable,
+        branch_head: ls.head,
+        remote_said: ls.said,
         ..Default::default()
     };
     if let Some(r) = receipt_for_branch(cars, branch) {
@@ -205,6 +194,92 @@ fn facts_from(cars: &[serde_json::Value], branch: &str, clone: &str, remote: &st
         out.mode = r.get("mode").and_then(|x| x.as_str()).map(str::to_string);
     }
     out
+}
+
+/// What one `git ls-remote` answered about the car's branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BranchLookup {
+    /// The command ran and answered — a head, or a clean absence.
+    pub readable: bool,
+    /// The branch's head, when the remote carries it.
+    pub head: Option<String>,
+    /// Why the lookup could not be made, when it could not.
+    pub said: Option<String>,
+}
+
+/// Look the branch up, reading git's EXIT STATUS rather than its output.
+///
+/// Two defects in one line, both measured 2026-10-17 (backlog 2770eba8,
+/// secondary). `sh` answers `None` for a failed command AND for empty
+/// output, and `git ls-remote` answers a ref the remote lacks with exit
+/// 0 and nothing printed — so a deleted branch read as an unreadable
+/// one, and `BranchGone` could never come out of a real lookup. And a
+/// lookup that did fail dropped git's own reason: run outside the forge
+/// checkout (`--clone` defaults to the working directory, and remote
+/// names are per-clone) the verb printed `now absent` for a branch
+/// `git ls-remote origin` showed at its head, with nothing saying the
+/// clone it asked had no `origin`.
+pub(crate) fn look_up_branch(clone: &str, remote: &str, branch: &str) -> BranchLookup {
+    let refname = format!("refs/heads/{branch}");
+    let command = format!("git -C {clone} ls-remote {remote} {refname}");
+    let ran = std::process::Command::new("git")
+        .args(["-C", clone, "ls-remote", remote, &refname])
+        .output();
+    read_lookup(&command, &refname, ran)
+}
+
+/// Select the head for one exact full ref (backlog ecb690e9).
+/// Transport, credentials and failure policy remain with each caller;
+/// their head-selection rule lives here once.
+pub(crate) fn exact_ref_head(stdout: &str, refname: &str) -> Option<String> {
+    stdout
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .find(|(_, name)| name.trim() == refname)
+        .map(|(head, _)| head.trim().to_string())
+}
+
+/// What one `git ls-remote <remote> refs/heads/<branch>` run answered,
+/// read off its exit status — the one reading, shared by `boss receipt`
+/// and `boss gate`'s launch (backlog ec0ca63d), so the two cannot
+/// disagree about what an empty answer means. `command` is the command
+/// as the operator would type it, quoted in the reason when it failed.
+///
+/// THE HEAD IS THE LINE WHOSE REF IS `refname`, not the first line
+/// (backlog 78d7a0c1). `git ls-remote` matches its pattern as a glob and
+/// against the TAIL of a ref, so `refs/heads/fix/real-*` and
+/// `refs/heads/ghost` both exit 0 with a head on a forge holding
+/// `fix/real-one` and `other/refs/heads/ghost` (reviewer run db548695).
+/// The runner fetches `refs/heads/<branch>` exactly, so only that ref is
+/// the branch; a near match is a clean absence.
+pub(crate) fn read_lookup(
+    command: &str,
+    refname: &str,
+    ran: std::io::Result<std::process::Output>,
+) -> BranchLookup {
+    match ran {
+        Ok(out) if out.status.success() => BranchLookup {
+            readable: true,
+            head: exact_ref_head(&String::from_utf8_lossy(&out.stdout), refname),
+            said: None,
+        },
+        Ok(out) => BranchLookup {
+            readable: false,
+            head: None,
+            said: Some(format!(
+                "`{command}` exited {}: {}",
+                out.status
+                    .code()
+                    .map_or_else(|| "on a signal".to_string(), |c| c.to_string()),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+        },
+        Err(e) => BranchLookup {
+            readable: false,
+            head: None,
+            said: Some(format!("`{command}` could not start: {e}")),
+        },
+    }
 }
 
 /// The receipt the car on `branch` carries, chosen from the gathered
@@ -240,47 +315,490 @@ fn receipt_for_branch(cars: &[serde_json::Value], branch: &str) -> Option<serde_
 /// describing the OLD head. Reading only the step made `boss receipt`
 /// call a correctly re-gated car STALE and disagree with the head the
 /// conductor would board (7f20fb19 — the mirror of 64cae7e9's repair).
-pub(crate) fn select_receipt(job: &serde_json::Value) -> Option<serde_json::Value> {
-    job.pointer("/metadata/regate_receipt")
-        .filter(|v| !v.is_null())
-        .and_then(parse_receipt)
-        .or_else(|| {
-            // Field order is not a contract, so parse the gate step's
-            // receipt rather than scanning for it.
-            job.get("steps")
-                .and_then(|s| s.as_array())
-                .into_iter()
-                .flatten()
-                .find_map(|step| step.pointer("/metadata/receipt").and_then(parse_receipt))
-        })
-}
-
-/// A receipt is stored two ways: as a JSON STRING (the gate step, and a
-/// re-rail that copied that string verbatim into `regate_receipt`) or as
-/// an OBJECT (tooling that parsed before writing). Both are receipts —
-/// the same pair the boarding logic accepts (train.rs). Returns the
-/// receipt object, or None if the value is neither an object nor a string
-/// that parses to one.
-fn parse_receipt(v: &serde_json::Value) -> Option<serde_json::Value> {
-    match v {
-        serde_json::Value::String(s) => serde_json::from_str(s).ok(),
-        obj @ serde_json::Value::Object(_) => Some(obj.clone()),
-        _ => None,
-    }
-}
+pub(crate) use boss_jobs::car::select_receipt;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) struct TailMatchFixture {
+        pub dir: std::path::PathBuf,
+        pub exact: String,
+        pub main: String,
+    }
+
+    impl TailMatchFixture {
+        pub fn new(name: &str) -> Self {
+            let mut fixture = Self {
+                dir: boss_testing::scratch_dir(name),
+                exact: String::new(),
+                main: String::new(),
+            };
+            fixture.git(&["init", "-q", "-b", "main"]);
+            fixture.git(&["commit", "-q", "--allow-empty", "-m", "exact"]);
+            fixture.exact = fixture.git(&["rev-parse", "HEAD"]);
+            fixture.git(&["branch", "b"]);
+            fixture.git(&["commit", "-q", "--allow-empty", "-m", "tail"]);
+            fixture.main = fixture.git(&["rev-parse", "HEAD"]);
+            fixture.git(&["branch", "a/refs/heads/b"]);
+            fixture.git(&["branch", "a/refs/heads/main", &fixture.exact]);
+            fixture.git(&["update-ref", "refs/tmp/b", &fixture.main]);
+            fixture.git(&["remote", "add", "origin", fixture.dir.to_str().unwrap()]);
+            let raw = fixture.git(&["ls-remote", "origin", "refs/heads/b"]);
+            assert_eq!(
+                raw.lines().count(),
+                2,
+                "the real git answers both refs: {raw}"
+            );
+            assert_eq!(
+                raw.split_whitespace().next(),
+                Some(fixture.main.as_str()),
+                "the tail sorts before the exact ref: {raw}"
+            );
+            assert!(
+                raw.contains(&format!("{}\trefs/heads/b", fixture.exact)),
+                "{raw}"
+            );
+            assert_ne!(fixture.exact, fixture.main);
+            fixture
+        }
+
+        pub fn git(&self, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.dir)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_COUNT", "0")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        }
+
+        pub fn child(
+            &self,
+            mode: &str,
+            configure: impl FnOnce(&mut std::process::Command),
+        ) -> std::process::Output {
+            let empty = crate::door_env::NoTokenInReach::new().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "receipt::tests::exact_ref_reader_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .current_dir(&self.dir)
+                .env("BOSS_EXACT_REF_MODE", mode)
+                .env("BOSS_EXACT_REF_HEAD", &self.exact)
+                .env("BOSS_EXACT_REF_MAIN", &self.main)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_COUNT", "0");
+            empty.apply(&mut command);
+            boss_testing::without_proxy(&mut command);
+            configure(&mut command);
+            command.output().unwrap()
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "invoked in a credential-free subprocess by the exact-ref fixture parents"]
+    async fn exact_ref_reader_child() {
+        let mode = std::env::var("BOSS_EXACT_REF_MODE").unwrap();
+        let exact = std::env::var("BOSS_EXACT_REF_HEAD").unwrap();
+        let main = std::env::var("BOSS_EXACT_REF_MAIN").unwrap();
+        let delete = |reference: &str| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(["update-ref", "-d", reference])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        match mode.as_str() {
+            "review" => {
+                assert_eq!(
+                    crate::review_verdict::forge_sha("refs/heads/b").unwrap(),
+                    exact
+                );
+                delete("refs/heads/b");
+                assert!(crate::review_verdict::forge_sha("refs/heads/b").is_err());
+            }
+            "rerail" => {
+                assert_eq!(
+                    crate::rerail::tests::head_for_exact_ref_test("b").unwrap(),
+                    Some(exact)
+                );
+                delete("refs/heads/b");
+                assert_eq!(
+                    crate::rerail::tests::head_for_exact_ref_test("b").unwrap(),
+                    None
+                );
+            }
+            "retire-main" => {
+                assert_eq!(
+                    crate::car_retire::forge_main(std::path::Path::new(".")).unwrap(),
+                    main
+                );
+                delete("refs/heads/main");
+                assert!(crate::car_retire::forge_main(std::path::Path::new(".")).is_err());
+            }
+            "retire-car" => {
+                assert_eq!(
+                    crate::car_retire::tests::head_for_exact_ref_test("b").unwrap(),
+                    exact
+                );
+                delete("refs/heads/b");
+                assert!(crate::car_retire::tests::head_for_exact_ref_test("b").is_err());
+            }
+            "publish-request" => {
+                assert_eq!(
+                    crate::publish_requests::tests::head_for_exact_ref_test("b").unwrap(),
+                    Some(exact)
+                );
+                delete("refs/heads/b");
+                assert_eq!(
+                    crate::publish_requests::tests::head_for_exact_ref_test("b").unwrap(),
+                    None
+                );
+            }
+            "unland" => {
+                let reading = crate::car_unland::read_main(
+                    std::path::Path::new("."),
+                    &exact,
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+                assert_eq!(reading.main, main);
+                delete("refs/heads/main");
+                assert!(
+                    crate::car_unland::read_main(
+                        std::path::Path::new("."),
+                        &exact,
+                        chrono::Utc::now()
+                    )
+                    .is_err()
+                );
+            }
+            "built" => {
+                assert_eq!(crate::built_from::origin_main_head(), Some(main));
+                delete("refs/heads/main");
+                assert_eq!(crate::built_from::origin_main_head(), None);
+            }
+            "merged" => {
+                let reading = crate::merged::observe(".", "origin", "b");
+                assert_eq!(reading.main_sha, Some(main));
+                assert_eq!(reading.branch_sha, Some(exact));
+                delete("refs/heads/b");
+                assert_eq!(crate::merged::observe(".", "origin", "b").branch_sha, None);
+            }
+            "running" => crate::running::run(
+                Some(".".into()),
+                Some("origin".into()),
+                Some("http://127.0.0.1:9".into()),
+            )
+            .await
+            .unwrap(),
+            "publish" => crate::publish::run("b", "conductor", false).await.unwrap(),
+            "publish-failed-read" => {
+                let error = crate::publish::run("b", "conductor", false)
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains("exited 128")
+                        && error.contains("fixture remote disconnected after data"),
+                    "{error}"
+                );
+            }
+            other => panic!("unknown fixture case {other}"),
+        }
+    }
+
+    #[test]
+    fn exact_ref_readers_ignore_an_earlier_tail_match_and_tail_only_answers() {
+        let mut failures = Vec::new();
+        for mode in [
+            "review",
+            "rerail",
+            "retire-main",
+            "retire-car",
+            "publish-request",
+            "unland",
+            "built",
+            "merged",
+            "running",
+        ] {
+            let fixture = TailMatchFixture::new(&format!("exact-ref-{mode}"));
+            let out = fixture.child(mode, |_| {});
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let display_correct = mode != "running"
+                || text.lines().any(|line| {
+                    line.contains("merged   main(origin)") && line.contains(&fixture.main[..8])
+                });
+            if !out.status.success() || !display_correct {
+                failures.push(format!(
+                    "{mode}: expected branch {}, main {}; native child exit {:?}\n{text}",
+                    fixture.exact,
+                    fixture.main,
+                    out.status.code()
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn exact_ref_readers_share_one_predicate() {
+        fn sources(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    sources(&entry.path(), files);
+                } else if entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "rs")
+                {
+                    files.push(entry.path());
+                }
+            }
+        }
+        let root = boss_testing::repo_root().join("crates/orchestrators/boss-cli/src");
+        let mut files = Vec::new();
+        sources(&root, &mut files);
+        files.sort();
+        let test_module = regex::Regex::new(
+            r"(?m)^#\[cfg\(test\)\]\n(?:#\[[^\n]+\]\n)*(?:pub\(crate\)\s+)?mod\s",
+        )
+        .unwrap();
+        let function = regex::Regex::new(
+            r"(?m)^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([a-zA-Z_][a-zA-Z_0-9]*)\s*\(",
+        )
+        .unwrap();
+        let first = regex::Regex::new(r"\.(?:split_whitespace|lines)\(\)\s*\.next\(\)").unwrap();
+        let mut failures = Vec::new();
+        for path in files {
+            let source = std::fs::read_to_string(&path).unwrap();
+            let code = &source[..test_module
+                .find(&source)
+                .map_or(source.len(), |found| found.start())];
+            let calls = code
+                .match_indices("\"ls-remote\"")
+                .map(|(at, _)| at)
+                .collect::<Vec<_>>();
+            if calls.is_empty() {
+                continue;
+            }
+            let relative = path.strip_prefix(&root).unwrap().to_str().unwrap();
+            // These read a complete inventory or a stronger frozen-source proof,
+            // not one selected head. Keep their distinct evidence contracts.
+            let special = match relative {
+                "orient.rs" => Some("orphans_and_published("),
+                "gate/reservation/supervisor.rs" => Some("branch_answer(text, &reference, head)"),
+                "train/diagnostic_adapter.rs" => Some("remote.trim() != expected"),
+                _ => None,
+            };
+            if let Some(predicate) = special {
+                assert_eq!(
+                    calls.len(),
+                    1,
+                    "a new raw reader in {relative} needs its own exact-ref contract"
+                );
+                assert!(
+                    code.contains(predicate),
+                    "{relative} lost its complete-reading predicate"
+                );
+                continue;
+            }
+            for at in calls {
+                let header = function
+                    .captures_iter(&code[..at])
+                    .last()
+                    .unwrap_or_else(|| panic!("unplaced raw ref reader in {relative}"));
+                let start = header.get(0).unwrap().start();
+                let end = code[start..]
+                    .find("\n}\n")
+                    .map_or(code.len(), |end| start + end + 3);
+                let body = &code[start..end];
+                if at >= end
+                    || !(body.contains("exact_ref_head(") || body.contains("read_lookup("))
+                    || first.is_match(body)
+                {
+                    failures.push(format!(
+                        "{relative}::{} still has an unshared or first-line ref reader",
+                        &header[1]
+                    ));
+                }
+            }
+        }
+        let source = std::fs::read_to_string(root.join("publish.rs")).unwrap();
+        let start = source.find("pub(crate) async fn run(").unwrap();
+        let end = source[start..].find("\n}\n").unwrap() + start + 3;
+        let body = &source[start..end];
+        if !body.contains("read_lookup(") || first.is_match(body) {
+            failures.push("publish::run SSH output still bypasses the exact-ref predicate".into());
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
 
     fn f() -> ReceiptFacts {
         ReceiptFacts {
             gated_head: Some("c8ccb133770f6507422a7d2438261213e9e897ce".into()),
             branch_head: Some("c8ccb133770f6507422a7d2438261213e9e897ce".into()),
             remote_readable: true,
+            remote_said: None,
             verdict: Some("green".into()),
             mode: Some("full".into()),
         }
+    }
+
+    /// A fresh repository with one commit on `main`, so a lookup has a
+    /// real answer to give — the ref, or a clean absence. No network:
+    /// the "remote" is the repository's own path.
+    fn repo_with_main(name: &str) -> (std::path::PathBuf, String) {
+        let dir = boss_testing::scratch::scratch_dir(name);
+        let d = dir.to_str().unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "t",
+            ][..],
+        ] {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(d)
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} in {d}");
+        }
+        let out = std::process::Command::new("git")
+            .args(["-C", d, "rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git rev-parse HEAD in {d}");
+        let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (dir, head)
+    }
+
+    /// THE CONTROL: a branch the remote carries is read at its head.
+    #[test]
+    fn a_branch_the_remote_carries_is_read_at_its_head() {
+        let (dir, head) = repo_with_main("receipt-lookup-found");
+        let d = dir.to_str().unwrap();
+        let found = look_up_branch(d, d, "main");
+        assert!(found.readable, "{found:?}");
+        assert_eq!(found.head.as_deref(), Some(head.as_str()));
+        assert_eq!(found.said, None);
+    }
+
+    /// A BRANCH THE REMOTE LACKS IS GONE, NOT UNREADABLE (backlog
+    /// 2770eba8, secondary). `git ls-remote` answers a missing ref with
+    /// exit 0 and NO output; the old lookup read empty output as a
+    /// failed command, so `BranchGone` was unreachable from a real read
+    /// and every arrived car printed "could not read the branch".
+    #[test]
+    fn a_branch_the_remote_lacks_is_gone_not_unreadable() {
+        let (dir, _) = repo_with_main("receipt-lookup-gone");
+        let d = dir.to_str().unwrap();
+        let gone = look_up_branch(d, d, "fix/never-pushed");
+        assert!(gone.readable, "a clean absence is a read: {gone:?}");
+        assert_eq!(gone.head, None);
+        let facts = ReceiptFacts {
+            branch_head: gone.head,
+            remote_readable: gone.readable,
+            remote_said: gone.said,
+            ..f()
+        };
+        assert_eq!(standing(&facts), Standing::BranchGone);
+    }
+
+    /// ONLY THE EXACT REF IS THE BRANCH (backlog 78d7a0c1). `git
+    /// ls-remote` matches its pattern as a glob and against the TAIL of
+    /// a ref, so a remote holding `fix/real-one` and
+    /// `other/refs/heads/ghost` answers `fix/real-*` and `ghost` with
+    /// exit 0 and a head — and the first line was taken as the branch.
+    /// The runner fetches `refs/heads/<name>` exactly and fails, so
+    /// neither name has a head; the exact name still does.
+    #[test]
+    fn only_the_exact_ref_is_the_branch() {
+        let (dir, head) = repo_with_main("receipt-lookup-exact");
+        let d = dir.to_str().unwrap();
+        for branch in ["fix/real-one", "other/refs/heads/ghost"] {
+            let ok = std::process::Command::new("git")
+                .args(["-C", d, "branch", branch])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git branch {branch}");
+        }
+        for name in ["fix/real-*", "ghost"] {
+            let near = look_up_branch(d, d, name);
+            assert!(near.readable, "the remote answered: {near:?}");
+            assert_eq!(near.head, None, "{name} is not a branch here");
+        }
+        let exact = look_up_branch(d, d, "fix/real-one");
+        assert_eq!(exact.head.as_deref(), Some(head.as_str()));
+        let beside = TailMatchFixture::new("receipt-exact-beside-tail");
+        let found = look_up_branch(beside.dir.to_str().unwrap(), "origin", "b");
+        assert_eq!(found.head.as_deref(), Some(beside.exact.as_str()));
+    }
+
+    /// A LOOKUP THAT CANNOT RUN SAYS WHAT GIT SAID (backlog 2770eba8,
+    /// secondary). Measured 2026-10-17: `boss receipt` run outside the
+    /// forge checkout printed `now absent` for a branch `git ls-remote
+    /// origin` showed at its head, because `--clone` defaults to the
+    /// working directory and the clone there has no such remote — and
+    /// the verb dropped git's own sentence saying so. Remote names are
+    /// per-clone, so this is the shape: a clone without the remote.
+    #[test]
+    fn a_lookup_that_cannot_run_says_what_git_said() {
+        let (dir, _) = repo_with_main("receipt-lookup-blind");
+        let d = dir.to_str().unwrap();
+        let blind = look_up_branch(d, "no-such-remote", "main");
+        assert!(!blind.readable, "{blind:?}");
+        assert_eq!(blind.head, None);
+        let said = blind.said.clone().expect("the refusal is carried");
+        assert!(said.contains("ls-remote no-such-remote"), "{said}");
+        assert!(said.contains(d), "names the clone it ran in: {said}");
+        assert!(said.contains("no-such-remote' does not appear"), "{said}");
+        let facts = ReceiptFacts {
+            branch_head: blind.head,
+            remote_readable: blind.readable,
+            remote_said: blind.said,
+            ..f()
+        };
+        let Standing::Unknown(why) = standing(&facts) else {
+            panic!("an unreadable ref is Unknown");
+        };
+        assert!(why.contains(&said), "{why}");
     }
 
     #[test]

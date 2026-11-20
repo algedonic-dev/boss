@@ -47,8 +47,14 @@ pub fn router(state: SearchApiState) -> Router {
         .with_state(Arc::new(state))
 }
 
-async fn health() -> Response {
-    Json(serde_json::json!({ "status": "ok", "service": "search" })).into_response()
+/// The shared health body, so the read names the build that answered
+/// (backlog 56f88ada); search reads postgres through its pool.
+async fn health() -> Json<boss_core::startup::HealthResponse> {
+    Json(boss_core::startup::health_response(
+        "boss-search-api",
+        env!("CARGO_PKG_VERSION"),
+        "postgres",
+    ))
 }
 
 async fn search_handler(

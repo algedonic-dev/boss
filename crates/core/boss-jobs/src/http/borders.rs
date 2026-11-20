@@ -49,11 +49,20 @@ pub(super) async fn yard_borders<R: JobsRepository + 'static, B: EventBus + 'sta
         Ok(h) => h,
         Err(why) => return (StatusCode::BAD_REQUEST, why).into_response(),
     };
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let rows = match super::regions::read_map(&state, &user, now, window_hours).await {
-        Ok(rows) => rows,
-        Err(resp) => return resp,
-    };
+    match super::regions::shared_map(&state, &user, window_hours).await {
+        Ok((reading, failure)) => {
+            Json(super::regions::border_value(&reading, failure)).into_response()
+        }
+        Err(resp) => resp,
+    }
+}
+
+pub(super) async fn render_borders<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: Arc<JobsApiState<R, B>>,
+    rows: &super::regions::MapRows,
+    now: chrono::DateTime<chrono::Utc>,
+    window_hours: i64,
+) -> serde_json::Value {
     // The machine records are not scoped by packet, so they ride the
     // map's own gate: a caller whose scope reads no packets — a request
     // with no identity is one — gets them withheld, as it gets the empty
@@ -93,8 +102,11 @@ pub(super) async fn yard_borders<R: JobsRepository + 'static, B: EventBus + 'sta
         // The server's clock, so a client ages a last-fired time against
         // it rather than against the browser's.
         obj.insert("now".to_string(), serde_json::json!(now));
+        // When the stations' flow reading was taken, which a map read
+        // may be served from an earlier one (backlog b852ec37).
+        obj.insert("flow_as_of".to_string(), serde_json::json!(rows.flow_as_of));
     }
-    Json(v).into_response()
+    v
 }
 
 /// The declared cadence machines' firing records — the ONE place a

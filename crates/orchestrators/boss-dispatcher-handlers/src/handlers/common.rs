@@ -389,6 +389,110 @@ pub(crate) async fn post_json_minted_id(
         .ok_or_else(|| HandlerError::Downstream(format!("POST {url} answered no id: {created}")))
 }
 
+/// The `direct` inbox message that carries a machine-filed alarm to the
+/// person it is owned by (backlog 35dabc3d). Measured 2026-11-17: the
+/// unheld-review watch (fd20fb6c, 07:01Z) and the silent-session watch
+/// (a79f9097, 08:01Z) fired inside a seven-hour stall, urgent, owned by
+/// the platform owner and ASSIGNED TO NOBODY — and `messages.notify`
+/// pages nobody for a role-only ready step, so their only reader was the
+/// coordinator session that had stopped. A `direct` message is the kind
+/// the inbox's needs-you filter is built on, sent by the dispatcher,
+/// which owes nothing to any agent session.
+///
+/// The id is `<scope>:<key>:<recipient>`, and a watch that re-sends on
+/// every tick while its alarm stays open is collapsed by the messages
+/// store's `ON CONFLICT (id) DO NOTHING`: a send that failed after the
+/// filing is repaired next tick, and a successful one is never doubled.
+/// The key is the EPISODE. A watch that holds one open alarm per episode
+/// (closing it re-arms the next) passes the alarm id, through
+/// [`tell_owner`]; the factory-idle watch, whose one open alarm carries
+/// several episodes (`factory_idle_since`, appended by `alarm_item`),
+/// passes its episode stamp, so each new episode tells the owner once
+/// (backlog f53b2df3). The shape is car f94d6d92's factory-idle message.
+pub(crate) fn owner_message(
+    scope: &str,
+    key: &str,
+    alarm_id: &str,
+    alarm: &Value,
+    owner: &str,
+) -> Value {
+    let field = |pointer: &str| alarm.pointer(pointer).and_then(Value::as_str).unwrap_or("");
+    serde_json::json!({
+        "id": format!("{scope}:{key}:{owner}"),
+        "sender_id": "automation:dispatcher",
+        "recipient_id": owner,
+        "subject": field("/title"),
+        "body": format!(
+            "{} Opening this message goes straight to the alarm.",
+            field("/metadata/detail")
+        ),
+        "kind": "direct",
+        "entity_ref": {
+            "entity_type": "job",
+            "entity_id": alarm_id,
+            "entity_path": format!("/jobs/{alarm_id}"),
+        },
+    })
+}
+
+/// Send [`owner_message`] through the messages service. An alarm with
+/// no owner (the port refused at filing) or no id reaches the backlog
+/// only, and the journal says so under the rule's name — there is no
+/// one to tell, and failing the tick would also stop the filing.
+pub(crate) async fn tell_owner(
+    client: &boss_core::machine_token::Client,
+    messages_base: &str,
+    scope: &str,
+    alarm_id: &str,
+    alarm: &Value,
+    owner: &str,
+    rule_name: &str,
+) -> Result<(), HandlerError> {
+    tell_owner_keyed(
+        client,
+        messages_base,
+        scope,
+        alarm_id,
+        alarm_id,
+        alarm,
+        owner,
+        rule_name,
+    )
+    .await
+}
+
+/// [`tell_owner`] under the collapsing `key` [`owner_message`]
+/// names. An empty key is refused like an empty alarm id: it would
+/// collapse every episode's message into one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn tell_owner_keyed(
+    client: &boss_core::machine_token::Client,
+    messages_base: &str,
+    scope: &str,
+    key: &str,
+    alarm_id: &str,
+    alarm: &Value,
+    owner: &str,
+    rule_name: &str,
+) -> Result<(), HandlerError> {
+    if owner.trim().is_empty() || alarm_id.trim().is_empty() || key.trim().is_empty() {
+        tracing::warn!(
+            rule = rule_name,
+            alarm_id,
+            scope,
+            "no owner or alarm id to tell — the alarm reaches the backlog only"
+        );
+        return Ok(());
+    }
+    post_json(
+        client,
+        &format!("{}/api/messages/send", messages_base.trim_end_matches('/')),
+        &owner_message(scope, key, alarm_id, alarm, owner),
+        rule_name,
+    )
+    .await
+}
+
 /// GET a JSON document from a downstream service, stamping the same
 /// rule-as-actor `x-boss-user` header as [`post_json`], mapping
 /// transport failures and non-2xx responses into
@@ -603,13 +707,39 @@ pub(crate) async fn jobs_where(
     filter: &str,
     rule_name: &str,
 ) -> Result<Vec<Value>, HandlerError> {
+    walk_jobs(client, jobs_base, filter, true, rule_name).await
+}
+
+/// The same paged walk with every listed step SLIM — no step
+/// `metadata` or `fields` — for a caller that reads only the packet's
+/// own keys and its steps' status, assignee and stamps. The open
+/// backlog was 672 packets on 2026-10-18, and 200 of them weighed
+/// 3.6 MB whole (9b473d4a); `jobs.urgent_item_watch` reads all of them
+/// hourly to find the few urgent ones, and reads a step's metadata only
+/// off the one packet it is about to write (backlog 9788e22d).
+pub(crate) async fn jobs_where_slim(
+    client: &boss_core::machine_token::Client,
+    jobs_base: &str,
+    filter: &str,
+    rule_name: &str,
+) -> Result<Vec<Value>, HandlerError> {
+    walk_jobs(client, jobs_base, filter, false, rule_name).await
+}
+
+async fn walk_jobs(
+    client: &boss_core::machine_token::Client,
+    jobs_base: &str,
+    filter: &str,
+    full: bool,
+    rule_name: &str,
+) -> Result<Vec<Value>, HandlerError> {
     const PAGE: usize = 500;
     let mut rows: Vec<Value> = Vec::new();
     loop {
         let body = get_json(
             client,
             &format!(
-                "{}/api/jobs?{filter}&full=true&limit={PAGE}&offset={}",
+                "{}/api/jobs?{filter}&full={full}&limit={PAGE}&offset={}",
                 jobs_base.trim_end_matches('/'),
                 rows.len()
             ),
@@ -645,12 +775,57 @@ pub(crate) async fn write_json(
     body: &Value,
     rule_name: &str,
 ) -> Result<(), HandlerError> {
+    send_json(client, method, url, body, rule_name, None)
+        .await
+        .map(|_| ())
+}
+
+/// What a judged write came to: it landed, or the step no longer read as
+/// judged and NOTHING was written (409 `step_changed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Judged {
+    Written,
+    Moved,
+}
+
+/// [`write_json`] carrying the keys the write JUDGED, as it read them, in
+/// `boss_jobs::step_metadata_write::EXPECT_HEADER` (backlog cd1f68c6):
+/// the step merge door lands it only on a row that still reads so. The
+/// step race is answered as [`Judged::Moved`] for the caller to say in
+/// its own words; every other answer maps as [`write_json`]'s.
+pub(crate) async fn write_json_expecting(
+    client: &boss_core::machine_token::Client,
+    method: reqwest::Method,
+    url: &str,
+    body: &Value,
+    expect: &serde_json::Map<String, Value>,
+    rule_name: &str,
+) -> Result<Judged, HandlerError> {
+    send_json(client, method, url, body, rule_name, Some(expect)).await
+}
+
+async fn send_json(
+    client: &boss_core::machine_token::Client,
+    method: reqwest::Method,
+    url: &str,
+    body: &Value,
+    rule_name: &str,
+    expect: Option<&serde_json::Map<String, Value>>,
+) -> Result<Judged, HandlerError> {
     let verb = method.to_string();
-    let resp = client
+    let request = client
         .request(method, url)
         .header("content-type", "application/json")
         .header("x-boss-user", dispatcher_actor_header(rule_name))
-        .header("x-sim-origin", sim_origin_value())
+        .header("x-sim-origin", sim_origin_value());
+    let request = match expect {
+        Some(expect) => request.header(
+            boss_jobs::step_metadata_write::EXPECT_HEADER,
+            boss_jobs::step_metadata_write::expectation_header(expect),
+        ),
+        None => request,
+    };
+    let resp = request
         .json(body)
         .send()
         .await
@@ -658,13 +833,22 @@ pub(crate) async fn write_json(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        // Only a judged write reads the race as an answer: an unjudged
+        // one keeps the retryable refusal it always was.
+        if expect.is_some()
+            && status == reqwest::StatusCode::CONFLICT
+            && serde_json::from_str::<Value>(&text)
+                .is_ok_and(|b| boss_jobs::step_metadata_write::is_step_race(&b))
+        {
+            return Ok(Judged::Moved);
+        }
         return Err(if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
             HandlerError::Permanent(format!("{verb} {url} returned {status}: {text}"))
         } else {
             HandlerError::Downstream(format!("{verb} {url} returned {status}: {text}"))
         });
     }
-    Ok(())
+    Ok(Judged::Written)
 }
 
 /// The writes that complete step `sid` on packet `jid` carrying
@@ -725,6 +909,31 @@ pub(crate) async fn complete_step(
     rule_name: &str,
 ) -> Result<(), HandlerError> {
     for (method, path, body) in step_completion_writes(jid, sid, fields) {
+        write_json(client, method, &format!("{base}{path}"), &body, rule_name).await?;
+    }
+    Ok(())
+}
+
+/// [`complete_step`] for a step the handler READ (`step`, whose id is
+/// `sid`): the status PUT names the resource claim the step held as
+/// read, so completing a claimed step frees its slot (backlog 7b5195ea,
+/// [`boss_jobs::flow_resources::exiting`]). A run's `building` holds a
+/// robots-pool claim since agent-run v11, and the landings that end it
+/// sent a bare status the PUT refuses.
+pub(crate) async fn complete_read_step(
+    client: &boss_core::machine_token::Client,
+    base: &str,
+    jid: &str,
+    sid: &str,
+    step: &Value,
+    fields: serde_json::Map<String, Value>,
+    rule_name: &str,
+) -> Result<(), HandlerError> {
+    for (method, path, body) in step_completion_writes(jid, sid, fields) {
+        let body = match method {
+            reqwest::Method::PUT => boss_jobs::flow_resources::exiting(step, body),
+            _ => body,
+        };
         write_json(client, method, &format!("{base}{path}"), &body, rule_name).await?;
     }
     Ok(())
@@ -910,6 +1119,11 @@ pub(crate) fn withdrawal_fields(
 /// ef421cd3, so a reader asks one question of every alarm.
 pub const RECOVERED_AT: &str = "recovered_at";
 
+/// The recovery's window and recorded ending (595e32f6). Neither is
+/// inferred from prose: old plain recovery notes remain readable.
+pub(crate) const HELD_DAYS: &str = "held_days";
+pub(crate) const HOLD_ENDED: &str = "hold_ended";
+
 /// The merge that tells a person the condition is over when the machine
 /// may not close the packet itself ([`Retraction::Annotate`]).
 pub fn recovery_note(
@@ -919,6 +1133,8 @@ pub fn recovery_note(
     why_open: &str,
 ) -> serde_json::Map<String, Value> {
     let mut m = serde_json::Map::new();
+    m.insert(HELD_DAYS.into(), Value::Null);
+    m.insert(HOLD_ENDED.into(), Value::Null);
     m.insert(RECOVERED_AT.into(), Value::String(recovered_at.into()));
     m.insert("recovered_by".into(), Value::String(cleared_by.into()));
     m.insert(
@@ -936,13 +1152,464 @@ pub fn recovery_note(
 /// back: `null` deletes a key on `PATCH /api/jobs/{id}/metadata`, and a
 /// packet whose condition returned must not go on saying RECOVERED.
 pub(crate) fn relapse_patch() -> Value {
-    serde_json::json!({RECOVERED_AT: null, "recovered_by": null, "recovery": null})
+    serde_json::json!({RECOVERED_AT: null, "recovered_by": null, "recovery": null,
+        HELD_DAYS: null, HOLD_ENDED: null})
+}
+
+/// A positively marked window, not a legacy recovery note (595e32f6).
+pub(crate) fn held_recovery(alarm: &Value) -> bool {
+    told_recovered(alarm)
+        && alarm
+            .pointer(&format!("/metadata/{HELD_DAYS}"))
+            .and_then(Value::as_i64)
+            .is_some_and(|days| days > 0)
+}
+
+/// End only the hold. Preserve its original recovery stamps and every
+/// step, holder and priority; the metadata merge records this decision.
+pub(crate) fn hold_end_note(evidence: &str, why_open: &str) -> serde_json::Map<String, Value> {
+    serde_json::Map::from_iter([
+        (HELD_DAYS.into(), Value::Null),
+        (HOLD_ENDED.into(), Value::String(why_open.into())),
+        (
+            "recovery".into(),
+            Value::String(format!(
+                "RECOVERED — {evidence} HOLD ENDED because {why_open}. The item stays on its \
+             chosen route; the machine does not complete its step (595e32f6)."
+            )),
+        ),
+    ])
+}
+
+/// PURE: has a machine told this alarm its condition cleared — does it
+/// carry a [`RECOVERED_AT`] the relapse patch has not withdrawn?
+pub(crate) fn told_recovered(alarm: &Value) -> bool {
+    alarm
+        .pointer(&format!("/metadata/{RECOVERED_AT}"))
+        .is_some_and(|v| !v.is_null())
+}
+
+/// THE HOLD (backlog f4b0ad41; decided by David 2026-11-17 on design
+/// 25511015 Q4, superseding a seven-day REOPEN, which a closed packet
+/// cannot take — backlog 36352452). A machine that reads an alarm it
+/// raised as clear does not withdraw it at once. It keeps the item OPEN
+/// with the RECOVERED note ([`hold_note`]) for a declared window, so a
+/// relapse inside the window is appended to THIS item through
+/// `alarm_item` — the occurrence counted, the note withdrawn — instead
+/// of filed as a new item beside a closed twin. Only a window that
+/// passes with no relapse withdraws the item, at the step
+/// [`retraction`] names. Measured by run 3f4ed839 over the record on
+/// 2026-11-17: closing on clear had filed 62 silent-session and 55
+/// estate items that the hold would have appended instead.
+///
+/// The window is the rule's to declare: its `hold_days` arg, in whole
+/// days, [`HOLD_DAYS_DEFAULT`] when the rule names none.
+pub(crate) const HOLD_DAYS: &str = "hold_days";
+
+/// The window a rule that declares none holds a recovered alarm open
+/// for — the seven days of David's decision.
+pub(crate) const HOLD_DAYS_DEFAULT: i64 = 7;
+
+/// Parse the rule's `hold_days`. Absent is the default; anything but a
+/// positive whole number of days is refused by name — a window nobody
+/// can read is a hold that never ends, or never starts.
+pub(crate) fn hold_window(
+    args: &[(String, boss_dispatcher::rules::expr::Value)],
+) -> Result<chrono::Duration, String> {
+    use boss_dispatcher::rules::expr::Value as Arg;
+    let days = match boss_dispatcher::rules::handler::arg(args, HOLD_DAYS) {
+        None => HOLD_DAYS_DEFAULT,
+        Some(Arg::Int(n)) if *n > 0 => *n,
+        Some(other) => {
+            return Err(format!(
+                "`{HOLD_DAYS}` must be a positive whole number of days, got a {} ({other:?})",
+                other.kind()
+            ));
+        }
+    };
+    chrono::Duration::try_days(days)
+        .ok_or_else(|| format!("`{HOLD_DAYS}` {days} reaches outside the calendar"))
+}
+
+/// What a machine that read its alarm clear writes this pass ([`hold`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Hold {
+    /// Newly clear, and the machine may withdraw it: write the
+    /// [`hold_note`]. The item stays open for the window.
+    Note,
+    /// Newly clear, and no step the machine may complete (a2d8bad3):
+    /// write the [`recovery_note`] with this reason. There is nothing to
+    /// hold — a person closes it.
+    Annotate { why_open: String },
+    /// An executor or design route has taken this marked hold. Record
+    /// its end once; even a later READY step is no quiet-window exit.
+    End { why_open: String },
+    /// Already told: the window is still running, or the machine may not
+    /// withdraw it. Nothing is written — a pass that fires every few
+    /// minutes tells a packet once.
+    Holding,
+    /// Told at `recovered_at`, and the window passed with no relapse
+    /// (a relapse withdraws the note, so a told item has had none):
+    /// complete this step `stale`.
+    Withdraw {
+        slug: String,
+        step_id: String,
+        recovered_at: String,
+    },
+}
+
+/// PURE: the hold, for an alarm its machine reads clear on this pass.
+/// `retraction` is the alarm's own ([`retraction`]); `now` is the
+/// firing's instant, and with none — or a `recovered_at` that does not
+/// parse — a told alarm holds: an elapsed window is never assumed.
+pub(crate) fn hold(
+    alarm: &Value,
+    retraction: Retraction,
+    now: Option<chrono::DateTime<chrono::Utc>>,
+    window: chrono::Duration,
+) -> Hold {
+    if !told_recovered(alarm) {
+        return match retraction {
+            Retraction::Complete { .. } => Hold::Note,
+            Retraction::Annotate { why_open } => Hold::Annotate { why_open },
+        };
+    }
+    if alarm
+        .pointer(&format!("/metadata/{HOLD_ENDED}"))
+        .and_then(Value::as_str)
+        .is_some_and(|why| !why.trim().is_empty())
+    {
+        return Hold::Holding;
+    }
+    // The older retraction judgement permits an open triage, even when
+    // active. A marked hold must yield to its executor before that
+    // judgement can age it out (595e32f6).
+    if held_recovery(alarm)
+        && let Some(step) = alarm
+            .get("steps")
+            .and_then(Value::as_array)
+            .and_then(|steps| {
+                steps
+                    .iter()
+                    .find(|step| step.get("status").and_then(Value::as_str) == Some("active"))
+            })
+    {
+        let slug = step
+            .get("spec_slug")
+            .and_then(Value::as_str)
+            .unwrap_or("a step");
+        return Hold::End {
+            why_open: format!("`{slug}` is active — an executor holds it"),
+        };
+    }
+    if held_recovery(alarm)
+        && let Retraction::Annotate { why_open } = &retraction
+    {
+        return Hold::End {
+            why_open: why_open.clone(),
+        };
+    }
+    let told = alarm
+        .pointer(&format!("/metadata/{RECOVERED_AT}"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let at = chrono::DateTime::parse_from_rfc3339(told)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc));
+    match (retraction, at, now) {
+        (Retraction::Complete { slug, step_id }, Some(at), Some(now)) if now - at >= window => {
+            Hold::Withdraw {
+                slug,
+                step_id,
+                recovered_at: told.to_string(),
+            }
+        }
+        _ => Hold::Holding,
+    }
+}
+
+/// The RECOVERED note a held alarm carries — the same keys as
+/// [`recovery_note`], so [`relapse_patch`] withdraws it and `alarm_item`
+/// reads it as told, with the hold said in words.
+pub(crate) fn hold_note(
+    evidence: &str,
+    cleared_by: &str,
+    recovered_at: &str,
+    window: chrono::Duration,
+) -> serde_json::Map<String, Value> {
+    let mut m = recovery_note(
+        evidence,
+        cleared_by,
+        recovered_at,
+        "the recovery window is running",
+    );
+    m.insert(HELD_DAYS.into(), Value::from(window.num_days()));
+    m.insert(
+        "recovery".into(),
+        Value::String(format!(
+            "RECOVERED — {evidence} HELD OPEN for {days} day(s) from `recovered_at` (backlog \
+             f4b0ad41): a relapse inside that window is appended to this item and withdraws this \
+             note, and a window that passes with no relapse is withdrawn by the machine as \
+             `stale`. Nothing to do: a hand close before then files the next relapse as a new \
+             item, which the hold exists to prevent. While held it waits at `scheduled`, out of \
+             the pull, and a relapse or work taking it restores its priority (595e32f6).",
+            days = window.num_days(),
+        )),
+    );
+    m
+}
+
+/// What a withdrawal at the end of a quiet window says: who held it,
+/// from when, for how long, and the note it held.
+pub(crate) fn held_evidence(
+    alarm: &Value,
+    cleared_by: &str,
+    window: chrono::Duration,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let meta = |k: &str| {
+        alarm
+            .pointer(&format!("/metadata/{k}"))
+            .and_then(Value::as_str)
+            .unwrap_or("(unrecorded)")
+            .to_string()
+    };
+    format!(
+        "{cleared_by} held this item open {days} day(s) from its recovery at {at} (backlog \
+         f4b0ad41), and read it again at {now} with no relapse appended inside the window. The \
+         note it held: {note}",
+        days = window.num_days(),
+        at = meta(RECOVERED_AT),
+        now = now.to_rfc3339(),
+        note = meta("recovery"),
+    )
+}
+
+/// A HELD ITEM LEAVES THE PULL (595e32f6 part 3; David's decision on
+/// f4b0ad41, 2026-11-17). An alarm held open RECOVERED still sat in
+/// every pull at the priority it was raised with — urgent, mostly — so
+/// an agent took it, read the note, and hand-closed it inside its
+/// window: 221 idle-actor items went that way, and the hand close is
+/// exactly what the hold exists to prevent (the next relapse files a
+/// new item beside a closed twin). So while an item is held its
+/// priority drops to `scheduled`, through the priority door
+/// (`PUT /api/jobs/{id}/priority`, eb26059d), which records the move in
+/// the packet's own `priority_changes`; when the hold stops — a relapse
+/// withdraws the note, or work takes the item (`Hold::End`) — the
+/// priority the hold lowered from comes back.
+///
+/// The lowering's `why` starts with this marker and names the
+/// recovery it was for, so the record says which move was the hold's
+/// and restoration never needs a clock: a lowering is made once per
+/// recovery (an item an operator raises again inside the window stays
+/// raised), and only the hold's OWN lowering, while it is still the
+/// newest move, is ever undone (a station-row exclusion could not reach
+/// the tree pull, which is why this is the priority and not a filter).
+pub(crate) const HOLD_LOWERING: &str = "recovery hold (595e32f6)";
+
+/// The `why` prefix that names the recovery a lowering was for.
+fn hold_lowering_for(recovered_at: &str) -> String {
+    format!("{HOLD_LOWERING}: held RECOVERED from {recovered_at}")
+}
+
+/// PURE: the priority move, if any, that makes `alarm` — as it stands
+/// after this pass's note — agree with its hold: the body for
+/// `PUT /api/jobs/{id}/priority`, each move guarded on the row as read
+/// (`expected`), so a move anyone made meanwhile turns this one into a
+/// 409 that writes nothing. Idempotent: a pass over an item that
+/// already agrees moves nothing, and a pass that failed is repaired by
+/// the next one.
+pub(crate) fn hold_priority_move(alarm: &Value) -> Option<Value> {
+    use boss_jobs::priority::PRIORITY_CHANGES_KEY;
+    let priority = alarm.get("priority").and_then(Value::as_str)?;
+    let stored = alarm
+        .pointer(&format!("/metadata/{PRIORITY_CHANGES_KEY}"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let changes: &[Value] = match &stored {
+        Value::Null => &[],
+        Value::Array(list) => list,
+        // Not the door's record: nothing is judged from it.
+        _ => return None,
+    };
+    let why_of = |entry: &Value| {
+        entry
+            .get("why")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let ended = alarm
+        .pointer(&format!("/metadata/{HOLD_ENDED}"))
+        .and_then(Value::as_str)
+        .is_some_and(|why| !why.trim().is_empty());
+    if held_recovery(alarm) && !ended {
+        let recovered_at = alarm
+            .pointer(&format!("/metadata/{RECOVERED_AT}"))
+            .and_then(Value::as_str)?;
+        let marker = hold_lowering_for(recovered_at);
+        if priority == "scheduled" || changes.iter().any(|e| why_of(e).starts_with(&marker)) {
+            return None;
+        }
+        return Some(serde_json::json!({
+            "priority": "scheduled",
+            "why": format!(
+                "{marker}: out of the pull while its window runs, so nobody hand-closes it; \
+                 a relapse or work taking it restores {priority}."
+            ),
+            "expected": {
+                "priority": priority,
+                "metadata": {
+                    RECOVERED_AT: recovered_at,
+                    HELD_DAYS: alarm.pointer(&format!("/metadata/{HELD_DAYS}")).cloned(),
+                    HOLD_ENDED: null,
+                    PRIORITY_CHANGES_KEY: stored,
+                },
+            },
+        }));
+    }
+    // Not held: undo only the hold's own lowering, and only while it is
+    // still the newest move and the item still reads as it left it.
+    let last = changes.last()?;
+    let from = last.get("from").and_then(Value::as_str)?;
+    if priority != "scheduled"
+        || last.get("to").and_then(Value::as_str) != Some("scheduled")
+        || !why_of(last).starts_with(HOLD_LOWERING)
+        || !matches!(from, "emergency" | "urgent" | "standard")
+    {
+        return None;
+    }
+    let because = if ended {
+        "work took the item, which ended the hold"
+    } else {
+        "the hold stopped — the condition came back, or its note was withdrawn"
+    };
+    Some(serde_json::json!({
+        "priority": from,
+        "why": format!("{HOLD_LOWERING}: restored to {from}: {because}."),
+        "expected": {
+            "priority": "scheduled",
+            "metadata": {PRIORITY_CHANGES_KEY: stored},
+        },
+    }))
+}
+
+/// PURE: `alarm` as it reads once `note` has merged into its metadata —
+/// what [`hold_priority_move`] judges after a note is written. A `null`
+/// in the note deletes the key, as the merge door does.
+pub(crate) fn with_note(alarm: &Value, note: &Value) -> Value {
+    let mut merged = alarm.clone();
+    if let (Some(metadata), Some(note)) = (
+        merged
+            .as_object_mut()
+            .map(|m| {
+                m.entry("metadata")
+                    .or_insert_with(|| Value::Object(Default::default()))
+            })
+            .and_then(Value::as_object_mut),
+        note.as_object(),
+    ) {
+        for (k, v) in note {
+            if v.is_null() {
+                metadata.remove(k);
+            } else {
+                metadata.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    merged
+}
+
+/// Make `alarm`'s priority agree with its hold ([`hold_priority_move`]).
+/// A 409 — the row moved since it was read, or the packet finished — is
+/// an answer, not a failure: nothing was written, and the next pass
+/// judges the row as it then stands.
+pub(crate) async fn hold_priority(
+    client: &boss_core::machine_token::Client,
+    jobs_base: &str,
+    alarm: &Value,
+    rule_name: &str,
+) -> Result<(), HandlerError> {
+    let Some(body) = hold_priority_move(alarm) else {
+        return Ok(());
+    };
+    let Some(id) = alarm
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(());
+    };
+    let url = format!("{}/api/jobs/{id}/priority", jobs_base.trim_end_matches('/'));
+    let resp = client
+        .request(reqwest::Method::PUT, &url)
+        .header("content-type", "application/json")
+        .header("x-boss-user", dispatcher_actor_header(rule_name))
+        .header("x-sim-origin", sim_origin_value())
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| HandlerError::Downstream(format!("PUT {url}: {e}")))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::CONFLICT {
+        let text = resp.text().await.unwrap_or_default();
+        tracing::info!(rule = rule_name, packet = id, %text, "the recovery hold's priority move found the row moved; nothing written");
+        return Ok(());
+    }
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(HandlerError::Downstream(format!(
+            "PUT {url} returned {status}: {text}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The owner's message is a `direct` one, addressed to the owner,
+    /// pointing at the alarm, under an id fixed by (scope, alarm,
+    /// recipient) so a re-send collapses (backlog 35dabc3d).
+    #[test]
+    fn an_alarm_reaches_its_owner_as_a_direct_message_with_a_collapsing_id() {
+        let alarm = json!({"title": "SILENT SESSION: agent-claude",
+            "metadata": {"detail": "agent-claude has written nothing for 53m."}});
+        let m = owner_message(
+            "silent-factory-session",
+            "a79f9097",
+            "a79f9097",
+            &alarm,
+            "emp-owner",
+        );
+        assert_eq!(m["id"], "silent-factory-session:a79f9097:emp-owner");
+        assert_eq!(m["kind"], "direct");
+        assert_eq!(m["recipient_id"], "emp-owner");
+        assert_eq!(m["sender_id"], "automation:dispatcher");
+        assert_eq!(m["subject"], "SILENT SESSION: agent-claude");
+        assert!(
+            m["body"]
+                .as_str()
+                .unwrap()
+                .starts_with("agent-claude has written nothing for 53m."),
+            "{m}"
+        );
+        assert_eq!(m["entity_ref"]["entity_id"], "a79f9097");
+        assert_eq!(m["entity_ref"]["entity_path"], "/jobs/a79f9097");
+        assert_eq!(
+            owner_message(
+                "silent-factory-session",
+                "a79f9097",
+                "a79f9097",
+                &json!({}),
+                "emp-owner"
+            )["id"],
+            m["id"],
+            "the id is the episode and the recipient, never the text"
+        );
+    }
 
     /// The handlers that speak to a party OUTSIDE the estate, and whom.
     /// Each holds a `reqwest::Client` of its own and must never reach
@@ -1319,6 +1986,352 @@ mod tests {
             relapse.values().all(Value::is_null),
             "null deletes on PATCH"
         );
+        // The hold's note is the same note in other words: a relapse
+        // withdraws it, and `alarm_item` reads it as told (f4b0ad41).
+        let held = hold_note(
+            "the actor wrote again",
+            "jobs.silent_session_watch",
+            "2026-11-17T21:00:00+00:00",
+            chrono::Duration::days(7),
+        );
+        assert_eq!(
+            relapse.keys().collect::<Vec<_>>(),
+            held.keys().collect::<Vec<_>>()
+        );
+        let text = held["recovery"].as_str().expect("a sentence");
+        assert!(
+            text.starts_with("RECOVERED — the actor wrote again"),
+            "{text}"
+        );
+        assert!(text.contains("HELD OPEN for 7 day(s)"), "{text}");
+    }
+
+    #[test]
+    fn a_recovery_hold_marks_its_window_and_a_relapse_withdraws_the_marker() {
+        let note = hold_note(
+            "clear",
+            "machine",
+            "2026-11-17T21:00:00Z",
+            chrono::Duration::days(7),
+        );
+        assert_eq!(note.get("held_days"), Some(&json!(7)));
+        assert_eq!(relapse_patch().get("held_days"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn a_recovery_hold_ends_when_work_has_taken_the_item() {
+        let mut a = alarm(vec![step("triage", "active", json!({}))]);
+        a["metadata"] = json!({RECOVERED_AT:"2026-11-17T21:00:00Z", "held_days":7});
+        let decide = |a: &Value| {
+            hold(
+                a,
+                Retraction::Annotate {
+                    why_open: "`build` is active".into(),
+                },
+                Some(instant("2026-11-18T00:00:00Z")),
+                chrono::Duration::days(7),
+            )
+        };
+        assert!(
+            format!("{:?}", decide(&a)).starts_with("End"),
+            "{:?}",
+            decide(&a)
+        );
+        a["metadata"]["held_days"] = Value::Null;
+        assert_eq!(
+            decide(&a),
+            Hold::Holding,
+            "a plain recovery note is not a hold"
+        );
+    }
+
+    #[test]
+    fn a_recovery_hold_that_ended_never_withdraws_work_returned_to_ready() {
+        let mut a = alarm(vec![step("triage", "ready", json!({}))]);
+        a["metadata"] =
+            json!({RECOVERED_AT:"2026-11-17T21:00:00Z", "hold_ended":"an executor claimed build"});
+        assert_eq!(
+            hold(
+                &a,
+                Retraction::Complete {
+                    slug: "triage".into(),
+                    step_id: "s".into()
+                },
+                Some(instant("2026-12-01T00:00:00Z")),
+                chrono::Duration::days(7)
+            ),
+            Hold::Holding,
+            "ending the hold is permanent for this recovery, even if work later returns ready"
+        );
+    }
+
+    /// A held alarm as the idle watch reads it: urgent, told RECOVERED
+    /// with a seven-day window, nobody's priority move on it yet.
+    fn held_urgent() -> Value {
+        json!({"id": "alarm-1", "status": "open", "priority": "urgent",
+               "metadata": {RECOVERED_AT: "2026-11-17T21:00:00+00:00", "held_days": 7}})
+    }
+
+    /// The row after the hold's lowering landed: what the priority door
+    /// records for the body [`hold_priority_move`] sent.
+    fn lowered(mut alarm: Value) -> Value {
+        let body = hold_priority_move(&alarm).expect("a held urgent alarm is lowered");
+        let entry = json!({"from": alarm["priority"], "to": "scheduled",
+                           "by": "automation:dispatcher", "why": body["why"],
+                           "at": "2026-11-17T21:00:01+00:00"});
+        alarm["priority"] = json!("scheduled");
+        alarm["metadata"]["priority_changes"] = json!([entry]);
+        alarm
+    }
+
+    /// 595e32f6 part 3: a held item leaves the pull. Its priority drops
+    /// to `scheduled` through the door, guarded on every key the
+    /// judgement read, and once per recovery — never again after the
+    /// lowering landed, nor for an item already scheduled.
+    #[test]
+    fn a_held_alarm_is_lowered_to_scheduled_once_guarded_on_what_it_read() {
+        let body = hold_priority_move(&held_urgent()).expect("lowered");
+        assert_eq!(body["priority"], "scheduled");
+        assert!(
+            body["why"]
+                .as_str()
+                .unwrap()
+                .starts_with("recovery hold (595e32f6): held RECOVERED from 2026-11-17T21:00:00"),
+            "{body}"
+        );
+        assert_eq!(
+            body["expected"],
+            json!({"priority": "urgent", "metadata": {
+                RECOVERED_AT: "2026-11-17T21:00:00+00:00", "held_days": 7,
+                "hold_ended": null, "priority_changes": null}})
+        );
+        assert_eq!(hold_priority_move(&lowered(held_urgent())), None);
+
+        let mut scheduled = held_urgent();
+        scheduled["priority"] = json!("scheduled");
+        assert_eq!(hold_priority_move(&scheduled), None);
+
+        // An operator raised it again inside the window: that stands.
+        let mut raised = lowered(held_urgent());
+        raised["priority"] = json!("urgent");
+        let mut changes = raised["metadata"]["priority_changes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        changes.push(
+            json!({"from": "scheduled", "to": "urgent", "by": "emp-owner",
+                            "why": "I want it seen", "at": "2026-11-18T09:00:00+00:00"}),
+        );
+        raised["metadata"]["priority_changes"] = json!(changes);
+        assert_eq!(hold_priority_move(&raised), None);
+
+        // A plain recovery note (no window) is not a hold.
+        let mut told = held_urgent();
+        told["metadata"]["held_days"] = Value::Null;
+        assert_eq!(hold_priority_move(&told), None);
+    }
+
+    /// A relapse withdraws the note and the priority the hold lowered
+    /// from comes back, guarded on the record it read; so does work
+    /// taking the item (`Hold::End`). Only the hold's own lowering, only
+    /// while it is the newest move.
+    #[test]
+    fn the_hold_restores_only_its_own_lowering_when_it_stops() {
+        let relapsed = with_note(&lowered(held_urgent()), &relapse_patch());
+        let body = hold_priority_move(&relapsed).expect("restored on relapse");
+        assert_eq!(body["priority"], "urgent");
+        assert_eq!(body["expected"]["priority"], "scheduled");
+        assert_eq!(
+            body["expected"]["metadata"]["priority_changes"],
+            relapsed["metadata"]["priority_changes"]
+        );
+
+        let ended = with_note(
+            &lowered(held_urgent()),
+            &Value::Object(hold_end_note("x", "`build` is active")),
+        );
+        let body = hold_priority_move(&ended).expect("restored when work took it");
+        assert_eq!(body["priority"], "urgent");
+        assert!(
+            body["why"].as_str().unwrap().contains("work took"),
+            "{body}"
+        );
+
+        // Restored already: the newest move is no longer the hold's.
+        let mut restored = relapsed.clone();
+        restored["priority"] = json!("urgent");
+        assert_eq!(hold_priority_move(&restored), None);
+
+        // Someone scheduled it on purpose: not the hold's to undo.
+        let mut theirs = relapsed.clone();
+        theirs["metadata"]["priority_changes"] = json!([{"from": "urgent", "to": "scheduled",
+            "by": "emp-owner", "why": "parked for next week", "at": "2026-11-18T00:00:00Z"}]);
+        assert_eq!(hold_priority_move(&theirs), None);
+
+        // A row that never carried the hold's move, or not the door's list.
+        let mut plain = held_urgent();
+        plain["metadata"] = json!({});
+        assert_eq!(hold_priority_move(&plain), None);
+        plain["metadata"]["priority_changes"] = json!("garbled");
+        assert_eq!(hold_priority_move(&plain), None);
+    }
+
+    fn instant(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// THE HOLD, pure (backlog f4b0ad41). A clear the machine may
+    /// withdraw is a NOTE, never a close; a told item inside its window
+    /// is left alone; the first pass at or past the window withdraws it
+    /// at the step `retraction` names, carrying the instant it was told.
+    #[test]
+    fn a_clear_is_held_open_for_its_window_and_a_quiet_window_withdraws() {
+        let week = chrono::Duration::days(7);
+        let triage = || Retraction::Complete {
+            slug: TRIAGE_SLUG.into(),
+            step_id: "s-triage".into(),
+        };
+        let fresh = alarm(vec![step("triage", "ready", json!({}))]);
+        assert_eq!(
+            hold(
+                &fresh,
+                triage(),
+                Some(instant("2026-11-17T21:00:00Z")),
+                week
+            ),
+            Hold::Note,
+            "a clear keeps the item open and RECOVERED"
+        );
+
+        let mut told = fresh.clone();
+        told["metadata"] = json!({RECOVERED_AT: "2026-11-10T21:00:00+00:00"});
+        assert_eq!(
+            hold(&told, triage(), Some(instant("2026-11-17T20:59:59Z")), week),
+            Hold::Holding,
+            "a second short of the window holds"
+        );
+        assert_eq!(
+            hold(&told, triage(), Some(instant("2026-11-17T21:00:00Z")), week),
+            Hold::Withdraw {
+                slug: TRIAGE_SLUG.into(),
+                step_id: "s-triage".into(),
+                recovered_at: "2026-11-10T21:00:00+00:00".into(),
+            },
+            "a quiet window withdraws, stamped with the instant it was told"
+        );
+        assert_eq!(
+            hold(&told, triage(), None, week),
+            Hold::Holding,
+            "with no instant to judge by, the window is never assumed to have passed"
+        );
+        let mut garbled = told.clone();
+        garbled["metadata"][RECOVERED_AT] = json!("last tuesday");
+        assert_eq!(
+            hold(
+                &garbled,
+                triage(),
+                Some(instant("2027-01-01T00:00:00Z")),
+                week
+            ),
+            Hold::Holding,
+            "a told instant that does not parse is no evidence the window passed"
+        );
+
+        // No step the machine may complete: the a2d8bad3 note, once.
+        let annotate = || Retraction::Annotate {
+            why_open: "`build` is active".into(),
+        };
+        assert_eq!(
+            hold(
+                &fresh,
+                annotate(),
+                Some(instant("2026-11-17T21:00:00Z")),
+                week
+            ),
+            Hold::Annotate {
+                why_open: "`build` is active".into()
+            }
+        );
+        assert_eq!(
+            hold(
+                &told,
+                annotate(),
+                Some(instant("2027-01-01T00:00:00Z")),
+                week
+            ),
+            Hold::Holding,
+            "the machine never completes a step from under its executor, window or not"
+        );
+    }
+
+    /// The window is the rule's: absent is seven days, and anything but a
+    /// positive whole number of days is refused by name.
+    #[test]
+    fn the_hold_window_is_a_rule_arg_defaulting_to_seven_days() {
+        use boss_dispatcher::rules::expr::Value as Arg;
+        assert_eq!(hold_window(&[]), Ok(chrono::Duration::days(7)));
+        assert_eq!(
+            hold_window(&[(HOLD_DAYS.into(), Arg::Int(3))]),
+            Ok(chrono::Duration::days(3))
+        );
+        for bad in [Arg::Int(0), Arg::Int(-1), Arg::String("7".into())] {
+            let refused = hold_window(&[(HOLD_DAYS.into(), bad)]).unwrap_err();
+            assert!(refused.contains(HOLD_DAYS), "{refused}");
+        }
+    }
+
+    /// THE SHIPPED ROWS, through the REAL loader. A rule arg is an
+    /// expression source, so `hold_days = "7"` reaches the handler as
+    /// whatever `Registry::from_toml` compiles and `eval` makes of it —
+    /// and `hold_window` refuses anything but an integer. Read by hand,
+    /// the file says `"7"`; only the loader says whether that is Int(7)
+    /// or the string a refusal would leave every firing on. Each rule
+    /// file that drives a held class is loaded, evaluated as the runner
+    /// evaluates it, and must declare exactly the seven days.
+    #[test]
+    fn the_shipped_hold_rules_load_to_a_seven_day_window() {
+        use boss_dispatcher::rules::expr::{Context, NoHelpers, Value as Arg, eval};
+        use boss_dispatcher::rules::registry::Registry;
+        let root = boss_testing::repo_root();
+        for (file, handler) in [
+            (
+                "infra/dispatcher/rules/a-silent-factory-holding-claimed-work-is-alarmed.toml",
+                "jobs.silent_session_watch",
+            ),
+            (
+                "infra/dispatcher/rules/estate-recover-on-comparison.toml",
+                "estate.recover",
+            ),
+        ] {
+            let src = std::fs::read_to_string(root.join(file)).unwrap();
+            let registry = Registry::from_toml(&src).unwrap();
+            let step = registry
+                .rules()
+                .iter()
+                .flat_map(|r| r.do_steps.iter())
+                .find(|d| d.handler == handler)
+                .unwrap_or_else(|| panic!("{file} invokes {handler}"));
+            let payload = json!({"_at": "2026-11-17T22:00:00Z"});
+            let args: Vec<(String, Arg)> = step
+                .args
+                .iter()
+                .map(|(key, expression)| {
+                    let ctx = Context {
+                        payload: &payload,
+                        helpers: &NoHelpers,
+                    };
+                    (key.clone(), eval(expression, &ctx).unwrap())
+                })
+                .collect();
+            let declared = args.iter().find(|(k, _)| k == HOLD_DAYS).map(|(_, v)| v);
+            assert!(
+                matches!(declared, Some(Arg::Int(7))),
+                "{file}: `{HOLD_DAYS}` loads as {declared:?}"
+            );
+            assert_eq!(hold_window(&args), Ok(chrono::Duration::days(7)), "{file}");
+        }
     }
 
     #[test]
@@ -1350,6 +2363,8 @@ mod lane_pin {
     /// The `mod tests` truncation is what keeps fixtures out — a test
     /// packet standing in for what the jobs API lists back is not a
     /// filing, and there are five of those.
+    // crate pin — it counts this crate's own filing sites, so a car that
+    // adds one learns it in `infra/gate.sh --lint` (backlog e2d091f7)
     #[test]
     fn every_backlog_item_this_crate_files_stamps_an_input_lane() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/handlers");
@@ -1425,9 +2440,30 @@ mod lane_pin {
         // reaches its owner, stamped `PipelineFailure` by the fallback;
         // twenty-one since `machine.gate.asked.alarm` (backlog d653e090),
         // an ask from a caller nobody expects read off the machine gate's
-        // durable window, stamped `Telemetry` like the two beside it.
+        // durable window, stamped `Telemetry` like the two beside it;
+        // twenty-two since `maintenance.verdict.streak` (backlog
+        // ada4d019), a chore verdict held on N consecutive runs — boss-gcp's
+        // deposit-key audit reading unverified — stamped `Telemetry`, a
+        // reading integrated over time like the estate alarms;
+        // twenty-three since `jobs.urgent_item_watch` (backlog 9788e22d),
+        // an urgent item past its age bound with landed cars or many runs
+        // asked for a finish line, stamped `Telemetry` — a reading of the
+        // record, like the agent-step overdue alarm beside it;
+        // twenty-four since `jobs.idle_actor_watch` (backlog 861360bc),
+        // an actor holding ready urgent nominations with no run for its
+        // bound, stamped `Telemetry` — a reading of the record, like the
+        // urgent-item watch beside it; twenty-five since
+        // `jobs.silent_session_watch` (backlog 628dc540), an actor holding
+        // claimed work whose open session has had no write of its own for
+        // its bound, stamped `Telemetry` like the idle-actor watch;
+        // twenty-six since `jobs.unheld_review_watch` (backlog f0e604dc),
+        // a station whose ready reviews nobody holds passed their pinned
+        // bound, stamped `Telemetry` like the agent-step overdue alarm;
+        // twenty-seven since `jobs.factory_idle_watch` (backlog 5627a4e1),
+        // no car gate for its bound while declared ready work waits,
+        // stamped `Telemetry` like the unheld-review watch beside it.
         assert_eq!(
-            filings, 21,
+            filings, 27,
             "the number of machine filing sites changed. That is fine — but check the new \
              one stamps a lane, then update this count, which exists so a filing that \
              DISAPPEARS from the scan (a renamed key, a reshaped body) cannot read as \

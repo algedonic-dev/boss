@@ -34,12 +34,12 @@ const metric = (page: Page, label: string) => page.locator('.detail-meta-item')
 for (const failed of [false, true]) {
   test(`both vendor surfaces preserve ${failed ? 'unknown reads' : 'tenant-added statuses and native terminals'}`, async ({ page }) => {
     await install(page, failed);
-    await mountPage(page, '/ux/vendors', { titleMatch: /1 vendors/ });
+    await mountPage(page, '/finance/vendors', { titleMatch: /1 vendors/ });
     const cells = page.locator('table tbody tr td');
     await expect(cells.nth(5)).toHaveText(failed ? '?' : '1/ 3');
     await expect(cells.nth(6)).toHaveText(failed ? '?' : '1');
     await expect(cells.nth(7)).toHaveText(failed ? '?' : '$12.00');
-    await mountPage(page, '/ux/vendors/vnd-status-contract');
+    await mountPage(page, '/finance/vendors/vnd-status-contract');
     await expect(metric(page, 'Open POs')).toHaveText(failed ? '?' : '1');
     await expect(metric(page, 'Unpaid bills')).toHaveText(failed ? '?' : '1');
     await expect(metric(page, 'Outstanding')).toHaveText(failed ? '?' : '$12.00');

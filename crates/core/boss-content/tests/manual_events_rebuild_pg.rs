@@ -50,6 +50,8 @@ fn draft(slug: &str, parent: Option<&str>) -> ManualSectionDraft {
         sort_order: 3,
         audience: Audience::all(),
         published: false,
+        owner_station: None,
+        authoring_job_id: None,
     }
 }
 
@@ -184,6 +186,74 @@ async fn rebuild_reproduces_all_manual_fields_and_history_twice() {
         ids.windows(2).all(|pair| pair[0] < pair[1]),
         "next ordinary write has a fresh stored identity"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_index_authorship_replays_without_opening_unpublished_bodies() {
+    let db = TestDb::new().await;
+    let repo = PgContent::new(db.pool.clone());
+    let packet = uuid::Uuid::new_v4();
+    let mut initial = draft("unwritten", None);
+    initial.owner_station = Some("people".into());
+    initial.authoring_job_id = Some(packet);
+    repo.create_section(initial, "emp-writer").await.unwrap();
+    repo.update_section(
+        "unwritten",
+        ManualPatch {
+            owner_station: Some("finance".into()),
+            body: Some("PRIVATE unfinished work".into()),
+            ..Default::default()
+        },
+        "emp-editor",
+    )
+    .await
+    .unwrap();
+    repo.create_section(draft("legacy-context", None), "emp-editor")
+        .await
+        .unwrap();
+    let mut hidden = draft("sales-only", None);
+    hidden.audience = Audience(serde_json::json!({"departments": ["sales"]}));
+    hidden.owner_station = Some("sales".into());
+    repo.create_section(hidden, "emp-editor").await.unwrap();
+    let mut published = draft("published", None);
+    published.published = true;
+    repo.create_section(published, "emp-editor").await.unwrap();
+    let user = boss_content::types::UserContext {
+        id: "emp-reader".into(),
+        role: "staff".into(),
+        department: Some("it".into()),
+    };
+    let index = repo.manual_index(&user).await.unwrap();
+    assert_eq!(
+        index.len(),
+        3,
+        "published and unpublished headers retain the audience boundary"
+    );
+    assert!(!index.iter().any(|s| s.slug == "sales-only"));
+    assert!(index.iter().any(|s| s.slug == "published" && s.published));
+    let entry = index.iter().find(|s| s.slug == "unwritten").unwrap();
+    assert_eq!(entry.owner_station.as_deref(), Some("finance"));
+    assert_eq!(entry.authoring_job_id, Some(packet));
+    let legacy = index.iter().find(|s| s.slug == "legacy-context").unwrap();
+    assert_eq!(legacy.owner_station, None);
+    assert_eq!(legacy.authoring_job_id, None);
+    assert!(
+        repo.get_section("unwritten", &user)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let before = snapshot(&db.pool).await;
+    drain(&db.pool).await;
+    sqlx::query("UPDATE manual_sections SET owner_station='wrong', authoring_job_id=NULL")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        boss_content::rebuild_content(&db.pool).await.unwrap();
+        assert_eq!(snapshot(&db.pool).await, before);
+        assert_eq!(repo.manual_index(&user).await.unwrap(), index);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -445,6 +515,8 @@ async fn manual_write_ports_record_the_committed_section_and_version() {
                 sort_order: 7,
                 audience: Audience::all(),
                 published: false,
+                owner_station: None,
+                authoring_job_id: None,
             },
             "emp-first",
         )

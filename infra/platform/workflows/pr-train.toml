@@ -43,7 +43,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "The twice-daily release train: collects branches whose ship-a-change Jobs are ready for review, assembles them into one batched PR, and closes each step on evidence — the CI verdict, the observed merge, the deploys that carried it out. Driven by infra/train/conductor.sh from a systemd timer."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { owner = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5", department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "scheduled"
@@ -58,6 +58,7 @@ kind = "task"
 ready_when = "steps.scheduled.done"
 title_template = "Collect what is ready to board"
 audience = { individual = "automation:train-conductor" }
+metadata_defaults = { at = "22b829b6-30d0-42b4-acf4-85617326aa89" }
 [[workflow.step.fields]]
 name = "boarded"
 field_type = "string"
@@ -69,6 +70,7 @@ kind = "task"
 ready_when = "steps.collect.done"
 title_template = "Assemble the train branch"
 audience = { individual = "automation:train-conductor" }
+metadata_defaults = { at = "22b829b6-30d0-42b4-acf4-85617326aa89" }
 [[workflow.step.fields]]
 name = "train_ref"
 field_type = "string"
@@ -80,6 +82,7 @@ kind = "task"
 ready_when = "steps.assemble.done"
 title_template = "Open the batched PR"
 audience = { individual = "automation:train-conductor" }
+metadata_defaults = { at = "b8f8a23b-f8da-428f-8df2-731be4ae597a" }
 [[workflow.step.fields]]
 name = "pr_url"
 field_type = "string"
@@ -91,7 +94,7 @@ kind = "task"
 ready_when = "steps.pr.done"
 title_template = "Yard inspection — CI verdict"
 audience = { individual = "automation:train-conductor" }
-metadata_defaults = { notify_on_done = true }
+metadata_defaults = { at = "210c9b9c-e485-4751-af65-5d8429a130e9", notify_on_done = true }
 [[workflow.step.fields]]
 name = "result"
 field_type = "string"
@@ -103,7 +106,7 @@ kind = "task"
 ready_when = "steps.pr.done"
 title_template = "DEPARTED — merged into main"
 audience = { individual = "automation:train-conductor" }
-metadata_defaults = { notify_on_done = true }
+metadata_defaults = { at = "b8f8a23b-f8da-428f-8df2-731be4ae597a", notify_on_done = true }
 [[workflow.step.fields]]
 name = "merge_ref"
 field_type = "string"
@@ -127,6 +130,17 @@ kind = "task"
 ready_when = "steps.deployed.done"
 title_template = "In transit — delivery converged"
 audience = { individual = "automation:train-conductor" }
+# EXECUTED BY EQUIPMENT: THE CONVERGE (design ccfe87ff, questions
+# first-executors and converge-stations, decided by David 2026-11-05;
+# backlog 364b27a3). The `converge` station's automaton is the conductor
+# this step is already born assigned to, so the declaration and the
+# audience name one actor. Measured 2026-11-05: 15 of the 20 newest
+# closed trains completed this step through the conductor's own
+# image-basis completion (rule complete-train-converged-on-runner-rolled)
+# from READY, never through a claim, and 5 skipped it — nothing strands.
+# Held from the unattended drift publish until the station reads back
+# live: infra/platform/workflow-holds/pr-train.toml.
+executor = "equipment:converge"
 [[workflow.step.fields]]
 name = "cluster_commit"
 field_type = "string"

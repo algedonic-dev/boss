@@ -1,0 +1,8 @@
+{
+  "about": "READ-ONLY fixed Longhorn v1.11.3 API inventory: every volume's claim, declared and actual bytes, replica nodes/disks, snapshot CRD count/sizes/creation times, and separate engine snapshot cache with volume-head excluded from its count. No parameters, arbitrary API paths, cleanup, purge, trimming, grants or approval. Complete paginated lists are required; missing, truncated, changed-version or repeated-cursor reads fail explicitly and retain independent channels. Engine caches can be unavailable or stale, especially detached volumes; this is not an atomic on-disk census, proof of cause, reclaimable-byte estimate or authorization to delete. Existing ops Kubernetes door only. Native output is retained and attached in one-MiB chunks with verified native receipts and a manifest. Bounds: each call20s/128KiB, collection150s/8MiB/128calls, each list64pages/4096rows, collection plus attachment180s. Timeout310 also allows the existing ops image's bounded120s first pull.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/read-volume-snapshots.sh"],
+  "params": [],
+  "capture": "separate-streams",
+  "timeout": 310
+}

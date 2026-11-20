@@ -139,6 +139,8 @@ unset GIT_ASKPASS SSH_ASKPASS
 # own git later. `runuser -u` keeps the environment (HOME and USER
 # become the owner's) and takes an argv, so nothing is re-parsed by a
 # shell. An empty owner runs inline — the harness, whose files it owns.
+#
+# git-owner.sh not used: this as_owner takes an ARGV, never a command string, so a token path or value is never re-parsed by a shell; its OWNER is a named deposit account that may be empty (the harness), not the owner read off a checkout; and it acts on the owner's files and git config, reading no declaration set (backlog 5ff118da).
 as_owner() {
     if [ -n "$OWNER" ]; then runuser -u "$OWNER" -- "$@"; else "$@"; fi
 }

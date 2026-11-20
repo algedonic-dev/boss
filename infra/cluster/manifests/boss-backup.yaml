@@ -1,7 +1,8 @@
 # Nightly pg_dump of the cluster BOSS database — the system of
 # record gets backups on day one (David, 2026-08-12).
 #
-# Dump to a Longhorn PVC (the three newest kept), then upload the fresh
+# Dump to a Longhorn PVC (at most three: protect the last verified dump
+# and one newer candidate before writing the next), then upload the fresh
 # dump offsite to a GCS bucket. A failed upload fails the Job loudly —
 # an offsite copy that silently stops is worse than none.
 #
@@ -68,7 +69,13 @@ spec:
   accessModes: ["ReadWriteOnce"]
   resources:
     requests:
-      storage: 20Gi
+      # 80Gi since the approved expansion a6bb0366 (2026-11-06): estate
+      # alarm cddc5a07 read 7.0 GiB free of 39.2 against a 7.8 floor.
+      # The policy is exact, so this line must equal the live claim or
+      # every instance-volumes comparison reads drift; it never shrinks,
+      # which Kubernetes refuses and which stops the converge. Pinned by
+      # the_file_store_rides_a_declared_volume.rs.
+      storage: 80Gi
 ---
 apiVersion: batch/v1
 kind: CronJob
@@ -77,6 +84,7 @@ metadata:
   namespace: boss
 spec:
   schedule: "10 9 * * *"   # 09:10 UTC — after the household's day starts, before the US one
+  timeZone: Etc/UTC        # 723c0828: the lower plan can fence this schedule without guessing the controller's zone.
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
@@ -156,6 +164,12 @@ spec:
                   valueFrom: {fieldRef: {fieldPath: "metadata.labels['batch.kubernetes.io/controller-uid']"}}
                 - name: BOSS_JOBS_URL
                   value: http://boss-jobs-internal.boss.svc.cluster.local:7900
+                # The packet open tries 3 times, not the wrap's default 1
+                # (backlog a2ae9f39: one failed read lost the backup's
+                # packet on 10-26 and 10-27). Pinned by
+                # every_maintenance_wrap_caller_retries_its_open.rs.
+                - name: BOSS_WRAP_OPEN_RETRY
+                  value: "3"
                 # The hosts its packet writes may carry the estate machine
                 # token to, besides loopback: this namespace's Services, by
                 # suffix (backlog 2ee29275; the car-4 checklist on 2710c8fc
@@ -174,7 +188,49 @@ spec:
                 - |
                   set -e
                   STAMP=$(date -u +%Y%m%d-%H%M%S)
-                  OUT=/backup/boss-${STAMP}.sql.gz
+                  FINAL=/backup/boss-${STAMP}.sql.gz
+                  if [ -e "$FINAL" ] || [ -L "$FINAL" ]; then
+                    echo "REFUSED: this dump name already exists: $FINAL" >&2; exit 1
+                  fi
+                  # Keep two existing dumps BEFORE creating the third.
+                  # Age is not count: retries can fill this volume in a
+                  # day, and pruning after a full-volume failure never
+                  # runs (06fea058). Names carry UTC order; mtimes can
+                  # change during a restore. Only regular dump files in
+                  # this mount are eligible, never archives or symlinks.
+                  PRUNE=$(mktemp "${TMPDIR:-/tmp}/pg-retention.XXXXXX")
+                  PENDING=
+                  trap 'rm -f "$PRUNE"; if [ -n "$PENDING" ]; then rm -f -- "$PENDING"; fi' EXIT
+                  find /backup -maxdepth 1 -type f -name 'boss-*.sql.gz' > "$PRUNE"
+                  LC_ALL=C sort -r -o "$PRUNE" "$PRUNE"
+                  GOOD=
+                  if [ -s "$PRUNE" ]; then
+                    # Failed older versions wrote final-looking names.
+                    # The durable last verified marker, not recency,
+                    # protects our recovery copy until publication.
+                    if [ ! -f /backup/.latest ] || [ -L /backup/.latest ] || [ "$(wc -l < /backup/.latest)" -ne 1 ]; then
+                      echo 'REFUSED: existing dumps have no single last verified marker' >&2; exit 1
+                    fi
+                    IFS= read -r GOOD < /backup/.latest
+                    case "$GOOD" in /backup/boss-*.sql.gz) ;; *) echo 'REFUSED: invalid verified dump path' >&2; exit 1 ;; esac
+                    case "${GOOD#/backup/}" in */*) echo 'REFUSED: verified dump escapes this directory' >&2; exit 1 ;; esac
+                    if [ ! -f "$GOOD" ] || [ -L "$GOOD" ]; then
+                      echo 'REFUSED: verified dump is absent or not a regular nonsymlink file' >&2; exit 1
+                    fi
+                    gzip -t "$GOOD"
+                    gzip -dc "$GOOD" | tail -5 | grep -q 'PostgreSQL database dump complete'
+                    kept=0
+                    while IFS= read -r old; do
+                      if [ "$old" = "$GOOD" ]; then continue; fi
+                      if [ "$kept" -lt 1 ]; then kept=$((kept + 1)); continue; fi
+                      echo "pruning $old before next dump; protected $GOOD"
+                      rm -- "$old"
+                    done < "$PRUNE"
+                  fi
+                  # An unfinished new dump never becomes a retention
+                  # candidate. EXIT removes only this attempt's file.
+                  PENDING=$(mktemp "/backup/.boss-${STAMP}.partial.XXXXXX")
+                  OUT=$PENDING
                   pg_dump "$DATABASE_URL" | gzip > "$OUT"
                   # VERIFY THE ARTEFACT, NOT THE EXIT CODE. `set -e` does
                   # not fire for the LEFT side of a pipe, so a pg_dump that
@@ -192,17 +248,12 @@ spec:
                   gzip -dc "$OUT" | tail -5 | grep -q 'PostgreSQL database dump complete'
                   SIZE=$(du -h "$OUT" | cut -f1)
                   echo "dumped $OUT ($SIZE), verified complete"
+                  mv -- "$OUT" "$FINAL"
+                  OUT=$FINAL
                   # Name the file this run produced, so the upload leg
                   # cannot quietly ship yesterday's dump if today's is
                   # missing.
                   echo "$OUT" > /backup/.latest
-                  # Retention: the three newest, as the archives below.
-                  # It was 14 days until the volume fell under its floor
-                  # (estate alarm 3be7e44e, 2026-10-09): the dump grew
-                  # from 105M to 1.6G in nineteen nights, so fifteen of
-                  # them outgrew 20Gi, and the bucket keeps 21 anyway.
-                  # Prune loudly, never silently.
-                  find /backup -name 'boss-*.sql.gz' -mtime +2 -print -delete
                   echo "backups on volume:"; ls -lh /backup | tail -8
               env:
                 - name: DATABASE_URL

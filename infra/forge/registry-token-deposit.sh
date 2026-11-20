@@ -245,7 +245,7 @@ login_accepted() {
         return 1
     fi
     login=""
-    if ! code="$(curl -sS --max-time "$VERIFY_BOUND_S" -H "$REG_HDR" -o "$body" -w '%{http_code}' \
+    if ! code="$(curl -q -sS --max-time "$VERIFY_BOUND_S" -H "$REG_HDR" -o "$body" -w '%{http_code}' \
         "$REG_URL/v2/token?service=container_registry" 2>/dev/null)"; then
         code=""
     fi

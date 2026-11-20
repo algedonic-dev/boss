@@ -1,0 +1,48 @@
+# A train converges on the cluster-deploy-runner's own report that its
+# rollout finished, not on the conductor's next poll (backlog 090720c3).
+#
+# MEASURED (run 73832267, 2026-10-18, 51 trains joined to the converge
+# run that built their head): merge -> converged p50 484 s, of which
+# 72 s (p90 138 s) came AFTER the rollout had finished — the cluster was
+# serving the merge and the train still held the track, waiting for the
+# conductor's two-minute train-reconcile pass to read it.
+#
+# THE EVENT. cluster-deploy-runner.sh (report_rolled, in
+# cluster-deploy-lib.sh) writes `rolled` (the full sha) and `rolled_at`
+# onto its own maintenance packet's `run` step the moment `rollout
+# status` of the source instance succeeds, through boss-step.sh's
+# metadata-only door — mid-run, not at the end of the run. That merge
+# emits jobs.step.updated with the step as its payload; the `when` below
+# selects it, and the handler re-reads the packet before believing it.
+#
+# WHAT THE HANDLER JUDGES (jobs_converge_trains_on_rolled.rs says why
+# each): the packet is a maintenance-cluster-converge whose `run` step
+# records a full commit; the running cluster jobs API self-reports that
+# commit (the conductor's own proof — the runner's word is the trigger,
+# not the verdict); and per open pr-train, `merged` names that commit,
+# `converged` is open, and no data delivery plan was frozen. Anything
+# else is left to reconcile, which is unchanged and stays the safety
+# net.
+[[rule]]
+name = "complete-train-converged-on-runner-rolled"
+why = """
+A CROSS-PROTOCOL REACTOR between maintenance-cluster-converge and
+pr-train: the converge packet's `run` step recording the rollout of a
+commit makes `converged` true on the train that merged that commit. No
+Workflow consequence can express it — the converge cannot know which
+train it delivers (a run builds forge main, whatever merged), and a
+train's `ready_when` cannot read another packet. The conductor, which
+completed this step alone until now, is a cadence loop with no event
+channel, so it saw each rollout only on its next two-minute pass: 72 s
+p50, 138 s p90 of every train's time on the track (run 73832267). No
+authority widened: the only write is the conductor's own image-basis
+completion of `converged`, made only when the running jobs API
+self-reports the commit the runner reported, and the reconcile pass
+remains the floor for every train this leaves alone.
+"""
+version = 1
+on_event = "jobs.step.updated"
+when = 'spec_slug = "run" AND metadata.rolled > ""'
+[[rule.do]]
+handler = "jobs.converge_trains_on_rolled"
+args = { train_kind = "\"pr-train\"", converge_kind = "\"maintenance-cluster-converge\"" }

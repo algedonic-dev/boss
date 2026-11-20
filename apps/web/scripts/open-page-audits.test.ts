@@ -2,7 +2,10 @@
 // door's contract — against a stubbed API, never the system of record.
 
 import { describe, expect, it } from 'bun:test';
-import { ROUTE_CATALOG } from '../src/shell/nav-catalog';
+import { ROUTE_CATALOG, type NavItem } from '../src/shell/nav-catalog';
+import { addressesOf, pagePath } from '../src/shell/page-address';
+import { parseTree } from '../src/it/tree/station-tree';
+import { stationList, treeRead } from '../tests/fixtures/station-tree';
 import {
   type Api,
   type ExistingAudit,
@@ -15,15 +18,23 @@ import {
   openAll,
   packetFor,
   plan,
+  resolvedCatalog,
   routeByName,
+  treeAddresses,
 } from './open-page-audits';
+
+// The catalog as the shipped tree places it (backlog 0bc2eb68: a hosted
+// page's route is its host station's address plus its slug).
+const AT = addressesOf(parseTree(treeRead()));
+const CATALOG = resolvedCatalog(AT);
+const IT_ROUTES = new Set(Object.values(ROUTE_CATALOG).filter((e) => e.owner === 'it').map((e) => pagePath(e as NavItem, AT) ?? `unplaced:${e.id}`));
 
 describe('the roster is the catalog', () => {
   it('one audit per catalogued path, once, and nothing the catalog does not list', () => {
-    const routes = catalogRoutes();
+    const routes = catalogRoutes(CATALOG);
     const paths = routes.map((r) => r.route);
     expect(new Set(paths).size).toBe(paths.length);
-    const catalogued = new Set(Object.values(ROUTE_CATALOG).map((e) => e.path));
+    const catalogued = new Set(Object.values(ROUTE_CATALOG).map((e) => pagePath(e as NavItem, AT) ?? `unplaced:${e.id}`));
     expect(new Set(paths)).toEqual(catalogued);
     // The equality above holds the complete roster. A second literal
     // count drifted when two served tabs joined it (e52e3017).
@@ -46,27 +57,33 @@ describe('the roster is the catalog', () => {
     // 66+ links, and the roster dropped every path with a `:` in it —
     // so giving it a catalog path alone would still leave it unaudited
     // (backlog 3071e235). Its path is the pattern surface-opens records.
-    const editor = '/it/registry/rules/:ruleName';
-    expect(catalogRoutes().filter((r) => r.route === editor)).toEqual([
+    const editor = '/engineering/registry/rules/:ruleName';
+    expect(catalogRoutes(CATALOG).filter((r) => r.route === editor)).toEqual([
       { route: editor, department: 'it', label: 'Dispatcher rule — editor' },
     ]);
-    expect(routeByName(editor)?.route).toBe(editor);
-    expect(marchOrder().map((r) => r.route)).toContain(editor);
+    expect(routeByName(editor, CATALOG)?.route).toBe(editor);
+    expect(marchOrder(CATALOG).map((r) => r.route)).toContain(editor);
   });
 
   it('the department is the owner the catalog assigns, and Home is IT', () => {
-    const by = new Map(catalogRoutes().map((r) => [r.route, r.department]));
-    expect(by.get('/ux/support')).toBe('support');
-    expect(by.get('/ux/sales')).toBe('sales');
-    expect(by.get('/ux/vendors')).toBe('finance');
-    expect(by.get('/it/design')).toBe('it');
+    const by = new Map(catalogRoutes(CATALOG).map((r) => [r.route, r.department]));
+    // /ux/support and /ux/sales went with step 1 of design 01fa5bdf;
+    // Sales owns the watchlist now.
+    expect(by.has('/ux/support')).toBe(false);
+    expect(by.get('/watchlist')).toBe('sales');
+    expect(by.get('/finance/vendors')).toBe('finance');
+    expect(by.get('/engineering/design')).toBe('it');
+    // The /it spelling of a hosted page is no route at all now.
+    expect(by.has('/it/design')).toBe(false);
     // f7f515ee: retiring Views removes it from the audit march too;
     // it is neither a relocated Home page nor an alias.
     expect(by.has('/ux/views')).toBe(false);
     expect(by.has('/views')).toBe(false);
-    for (const home of ['/ux/jobs', '/ux/inbox', '/ux/calendar/me', '/manual']) {
+    for (const home of ['/me', '/me/inbox', '/me/calendar', '/engineering/manual']) {
       expect(by.get(home), home).toBe(HOME_DEPARTMENT);
     }
+    // The jobs list went with step 1 of design 01fa5bdf: no audit marches to it.
+    expect(by.has('/ux/jobs')).toBe(false);
     // Every department is a code the catalog's `owner` names, so the
     // readiness read has something to answer for — never `home`.
     expect([...new Set(by.values())]).not.toContain('home');
@@ -75,36 +92,37 @@ describe('the roster is the catalog', () => {
 
 describe('the march order', () => {
   it('walks the departments whose first protocols land first, others next, Home, then IT', () => {
-    const order = marchOrder();
+    const order = marchOrder(CATALOG);
     const depts = order.map((r) => r.department);
     // The decided head, in the decided order, each department's routes
     // contiguous.
     const firstSeen = (d: string) => depts.indexOf(d);
     const present = FIRST_DEPARTMENTS.filter((d) => depts.includes(d));
-    expect(present).toEqual(['support', 'sales', 'finance', 'marketing']);
+    // Support and Marketing own no page since step 1 of design 01fa5bdf.
+    expect(present).toEqual(['sales', 'finance']);
     for (let i = 1; i < present.length; i += 1) {
       expect(firstSeen(present[i]!)).toBeGreaterThan(firstSeen(present[i - 1]!));
     }
-    expect(order[0]!.route).toBe('/ux/support');
+    expect(order[0]!.route).toBe('/watchlist');
     // Nothing from the head appears after a department outside it.
     const lastHead = Math.max(...present.map((d) => depts.lastIndexOf(d)));
     const firstOther = depts.findIndex((d) => !FIRST_DEPARTMENTS.includes(d));
     expect(firstOther).toBeGreaterThan(lastHead);
     // IT's own surfaces are the tail, and Home's sit just before them.
-    const its = order.filter((r) => r.route.startsWith('/it'));
+    const its = order.filter((r) => IT_ROUTES.has(r.route));
     expect(order.slice(-its.length)).toEqual(its);
-    const homes = order.filter((r) => r.department === HOME_DEPARTMENT && !r.route.startsWith('/it'));
+    const homes = order.filter((r) => r.department === HOME_DEPARTMENT && !IT_ROUTES.has(r.route));
     expect(order.slice(-its.length - homes.length, -its.length)).toEqual(homes);
-    expect(homes.map((h) => h.route)).toContain('/ux/inbox');
+    expect(homes.map((h) => h.route)).toContain('/me/inbox');
   });
 
   it('is stable within a department: catalog order', () => {
-    const sales = marchOrder()
+    const sales = marchOrder(CATALOG)
       .filter((r) => r.department === 'sales')
       .map((r) => r.route);
     const catalogSales = Object.values(ROUTE_CATALOG)
       .filter((e) => e.owner === 'sales')
-      .map((e) => e.path);
+      .map((e) => pagePath(e as NavItem, AT) ?? `unplaced:${e.id}`);
     expect(sales).toEqual(catalogSales);
   });
 });
@@ -172,21 +190,23 @@ describe('idempotence', () => {
 
 describe('one route by name', () => {
   it('answers a catalogued path, and a department jobs view by its code', () => {
-    expect(routeByName('/ux/support')).toEqual({
-      route: '/ux/support',
-      department: 'support',
-      label: 'Support',
+    expect(routeByName('/finance/vendors', CATALOG)).toEqual({
+      route: '/finance/vendors',
+      department: 'finance',
+      label: 'Vendors',
     });
-    expect(routeByName('/sales/jobs')).toEqual({
+    // Removed with step 1 of design 01fa5bdf: not a page to audit.
+    expect(routeByName('/ux/support', CATALOG)).toBeUndefined();
+    expect(routeByName('/sales/jobs', CATALOG)).toEqual({
       route: '/sales/jobs',
       department: 'sales',
       label: 'sales jobs view',
     });
-    expect(routeByName('/front%20of%20house/jobs')?.department).toBe('front of house');
+    expect(routeByName('/front%20of%20house/jobs', CATALOG)?.department).toBe('front of house');
     // Retired with car 2 of design 8c3e9599, no alias: not a page to audit.
-    expect(routeByName('/ux/departments/sales')).toBeUndefined();
-    expect(routeByName('//jobs')).toBeUndefined();
-    expect(routeByName('/ux/nowhere')).toBeUndefined();
+    expect(routeByName('/ux/departments/sales', CATALOG)).toBeUndefined();
+    expect(routeByName('//jobs', CATALOG)).toBeUndefined();
+    expect(routeByName('/ux/nowhere', CATALOG)).toBeUndefined();
   });
 });
 
@@ -240,5 +260,36 @@ describe('the packet and the door', () => {
     expect(actorId({ HOME: '/h' }, () => undefined)).toBeUndefined();
     expect(actorId({ HOME: '/h' }, () => '\n')).toBeUndefined();
     expect(actorId({ BOSS_ACTOR_FILE: '/f' }, (p) => (p === '/f' ? 'emp-a' : undefined))).toBe('emp-a');
+  });
+});
+
+describe('the routes are read against the live tree', () => {
+  it('reads the rows, then the tree under the root, through the door', async () => {
+    const asked: string[] = [];
+    const api: Api = {
+      get: async (path) => {
+        asked.push(path);
+        return path === '/api/stations' ? stationList() : treeRead();
+      },
+      post: async () => null,
+    };
+    expect(await treeAddresses(api)).toEqual(AT);
+    expect(asked[0]).toBe('/api/stations');
+    expect(asked[1]).toStartWith('/api/stations?under=');
+  });
+
+  it('a refused read plans nothing: the failed arm, naming why', async () => {
+    const api: Api = {
+      get: async () => {
+        throw new Error('boss-api GET /api/stations failed (exit 1): HTTP:403');
+      },
+      post: async () => null,
+    };
+    expect(await treeAddresses(api)).toEqual({ kind: 'failed', why: 'boss-api GET /api/stations failed (exit 1): HTTP:403' });
+  });
+
+  it('a page whose host the tree does not hold has no route to audit', () => {
+    const without = resolvedCatalog({ kind: 'ready', stations: [] });
+    expect(Object.values(without).map((e) => e.path).sort()).toEqual(['/me', '/me/calendar', '/me/inbox']);
   });
 });

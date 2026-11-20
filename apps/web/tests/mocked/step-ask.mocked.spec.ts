@@ -181,8 +181,11 @@ test('the button names the route and the missing field, and completes from ready
   expect(merged['evidence']).toBe('option b');
   // A key the surface does not own is not re-sent: the merge leaves it
   // on the row as stored, where a wholesale PUT had to carry it back.
-  // (`context_md` IS a declared field, so the form owns it and sends
-  // its value, unchanged.)
+  // `context_md` IS a declared field, and the form used to send its value
+  // back unchanged — which, from a page left open, reverted any newer
+  // brief under the operator's name (backlog ec1e1980). A declared field
+  // the operator did not edit is not sent either; the row keeps it.
   expect('authority_role' in merged).toBe(false);
-  expect(merged['context_md']).toBe(BRIEF);
+  expect('context_md' in merged).toBe(false);
+  expect(Object.keys(merged).sort()).toEqual(['disposition', 'evidence']);
 });

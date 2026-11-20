@@ -34,10 +34,14 @@
 /// its reads as `okRead` claims an answer it does not have, and its
 /// empty state then speaks for the loading window (backlog 20410830,
 /// the /ux/warehouse audit).
+///
+/// `refused` is fetchRemote's mark on a 401/403 (backlog 7abb184f): the
+/// server is up and said no to this session. It rides through to the
+/// empty line so a refusal is not worded like an outage.
 export type ReadState =
   | { kind: 'loading' }
   | { kind: 'ok' }
-  | { kind: 'failed'; error: string };
+  | { kind: 'failed'; error: string; refused?: true };
 
 export const loadingRead: ReadState = { kind: 'loading' };
 
@@ -83,11 +87,12 @@ export function failedWithReason(status: number, body: string): ReadState {
 /// `Remote` — collapsed to that arm alone. `loading` is not a failure:
 /// a read still in flight has not said anything yet.
 export type Fallible =
-  | { readonly kind: 'failed'; readonly error: string }
+  | { readonly kind: 'failed'; readonly error: string; readonly refused?: true }
   | { readonly kind: 'ready' | 'loading' | 'ok' };
 
 export function readStateOf(result: Fallible): ReadState {
-  return result.kind === 'failed' ? failedRead(result.error) : okRead;
+  if (result.kind !== 'failed') return okRead;
+  return result.refused ? { kind: 'failed', error: result.error, refused: true } : failedRead(result.error);
 }
 
 /// A read named by what it fetched, so a banner can say which one
@@ -96,7 +101,7 @@ export type NamedRead = Readonly<{ source: string; state: ReadState }>;
 
 /// What a list surface renders.
 export type ListView =
-  | { kind: 'failed'; source: string; error: string }
+  | { kind: 'failed'; source: string; error: string; refused?: true }
   | { kind: 'loading'; source: string }
   | { kind: 'empty' }
   | { kind: 'rows' };
@@ -120,6 +125,7 @@ export function listView(
       kind: 'failed',
       source: failure.source,
       error: failure.state.error,
+      ...(failure.state.refused ? { refused: true as const } : {}),
     };
   }
   const pending = reads.find((r) => r.state.kind === 'loading');
@@ -164,7 +170,7 @@ export function blankMeaning(read: ReadState): 'absent' | 'unknown' {
 /// with no empty line: there is something to show.
 export type EmptyState =
   | { kind: 'loading' }
-  | { kind: 'failed'; error: string }
+  | { kind: 'failed'; error: string; refused?: true }
   | { kind: 'none' }
   | { kind: 'filtered' }
   | { kind: 'rows' };
@@ -190,7 +196,11 @@ export function emptyState(
   const view = listView(reads, sourceCount);
   switch (view.kind) {
     case 'failed':
-      return { kind: 'failed', error: naming(view.source, view.error) };
+      return {
+        kind: 'failed',
+        error: naming(view.source, view.error),
+        ...(view.refused ? { refused: true as const } : {}),
+      };
     case 'loading':
       return { kind: 'loading' };
     case 'empty':
@@ -213,7 +223,12 @@ export function emptyLine(
 ): Readonly<{ text: string; alert: boolean }> | null {
   switch (view.kind) {
     case 'failed':
-      return { text: `Couldn't load ${words.what} — ${view.error}`, alert: true };
+      // A refusal keeps "Couldn't load" (the list did not load) and says
+      // the server refused, so the reader chases a grant, not an outage
+      // (backlog 7abb184f); the error carries the server's reason.
+      return view.refused
+        ? { text: `Couldn't load ${words.what} — the server refused this session: ${view.error}`, alert: true }
+        : { text: `Couldn't load ${words.what} — ${view.error}`, alert: true };
     case 'loading':
       return { text: 'Loading…', alert: false };
     case 'none':

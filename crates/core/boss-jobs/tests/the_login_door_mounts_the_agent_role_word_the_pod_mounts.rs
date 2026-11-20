@@ -76,14 +76,17 @@ async fn the_binarys_door() -> axum::Router {
     registry
         .publish(
             &[AgentInput {
+                factory_rotation: Some(true),
                 id: "agent-claude".to_string(),
                 display_name: "agent-claude".to_string(),
                 default_model: "opus-5".to_string(),
+                model_class: None,
                 aliases: vec!["claude@algedonic.dev".to_string()],
                 role: Some("engineering-agent".to_string()),
                 department: None,
                 hourly_budget_usd_micros: None,
                 max_concurrent_runs: None,
+                stations: None,
             }],
             PublishMode::InsertIfAbsent,
             &stamp,

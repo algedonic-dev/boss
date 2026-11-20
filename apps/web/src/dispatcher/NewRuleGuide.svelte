@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { pageLink } from '../shell/stationAddresses.svelte';
   // /it/registry/rules/new — where "+ New rule" lands. It explains how
   // to author a rule that lasts, and it creates nothing (backlog
   // 7d9df2fe, design ff1c3615: David chose option b, 2026-09-23).
@@ -23,7 +24,7 @@
 </script>
 
 <div class="catalog theme-exec">
-  <Breadcrumb to={href('/it/registry/rules')}>← All dispatcher rules</Breadcrumb>
+  <Breadcrumb to={pageLink('system-dispatcher-rules')}>← All dispatcher rules</Breadcrumb>
   <PageHeader
     eyebrow="Platform · Dispatcher rule"
     title="New dispatcher rule"

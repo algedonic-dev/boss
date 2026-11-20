@@ -299,8 +299,15 @@ fn simulator_http_router(sim: Router, inventory: Router) -> Router {
         .layer(TraceLayer::new_for_http())
 }
 
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "status": "ok", "service": "boss-simulator" }))
+/// The shared health body, so the read names the build that answered
+/// (backlog 56f88ada). `none`: the simulator holds no store of its own;
+/// it proxies the sim daemon's control port.
+async fn health() -> Json<boss_core::startup::HealthResponse> {
+    Json(boss_core::startup::health_response(
+        "boss-simulator",
+        env!("CARGO_PKG_VERSION"),
+        "none",
+    ))
 }
 
 async fn stub() -> Html<&'static str> {

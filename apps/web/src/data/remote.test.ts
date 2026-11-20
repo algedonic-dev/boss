@@ -6,7 +6,7 @@
 // outage without choosing to.
 
 import { afterEach, describe, expect, test } from 'bun:test';
-import { fetchRemote, type Remote } from './remote';
+import { fetchRemote, readFailed, type Remote } from './remote';
 
 const realFetch = globalThis.fetch;
 afterEach(() => {
@@ -34,6 +34,40 @@ describe('fetchRemote', () => {
       expect(res.error).toContain('503');
       expect(res.error).toContain('/api/things');
     }
+  });
+
+  // A REFUSAL IS NOT AN OUTAGE (backlog 7abb184f). /api/stations/load
+  // answers a caller who may read no packets 403 with a sentence naming
+  // the caller and why; this reader used to keep only the status, so
+  // every page said the read failed and the reason was lost.
+  test('a 403 is a refusal, and keeps the reason the server gave', async () => {
+    const why = 'emp-x (role intern) may read no packets, so no station can be evaluated for them';
+    stubFetch(async () => new Response(`${why}\n`, { status: 403 }));
+    const res = await fetchRemote('/api/stations/load', (raw) => raw);
+    expect(res).toEqual({ kind: 'failed', error: `/api/stations/load: HTTP 403: ${why}`, refused: true });
+  });
+
+  test('a 401 is a refusal too; one with no body says only its status', async () => {
+    stubFetch(async () => new Response('', { status: 401 }));
+    expect(await fetchRemote('/api/things', (raw) => raw)).toEqual({
+      kind: 'failed', error: '/api/things: HTTP 401', refused: true,
+    });
+  });
+
+  test('a long refusal body is cut, and says it was cut', async () => {
+    stubFetch(async () => new Response('x'.repeat(1000), { status: 403 }));
+    const res = await fetchRemote('/api/things', (raw) => raw);
+    if (res.kind !== 'failed') throw new Error('expected failed');
+    expect(res.error).toBe(`/api/things: HTTP 403: ${'x'.repeat(400)}… (600 more characters)`);
+  });
+
+  test('a 5xx is not a refusal', async () => {
+    stubFetch(async () => new Response('upstream down', { status: 502 }));
+    const res = await fetchRemote('/api/things', (raw) => raw);
+    expect(res).toEqual({ kind: 'failed', error: '/api/things: HTTP 502' });
+    if (res.kind !== 'failed') throw new Error('expected failed');
+    expect(readFailed(res)).toBe('failed');
+    expect(readFailed({ kind: 'failed', error: 'x', refused: true })).toBe('was refused');
   });
 
   test('a thrown fetch (network down) is failed, not an exception', async () => {

@@ -62,7 +62,7 @@ use crate::cadence::{CadenceRuleRow, CadenceRuleSpec};
 use crate::delivery::{DeliveryPolicyRow, DeliveryPolicySpec};
 use crate::registry::{StepSpec, Terminal, WorkflowSpec, WorkflowStatus};
 use crate::station_queue::{DisciplineKey, StationPredicate, default_discipline};
-use crate::stations::{StationCapability, StationKind, StationLens, StationSpec, StationUpstream};
+use crate::stations::{StationCapability, StationKind, StationLens, StationSpec};
 use crate::step_plugins::StepPluginSpec;
 
 #[derive(Debug, thiserror::Error)]
@@ -168,6 +168,8 @@ struct StepToml {
     /// "the kind's typical duration". See `StepSpec::duration_hours`.
     #[serde(default)]
     duration_hours: Option<f64>,
+    #[serde(default)]
+    resources: Option<crate::resources::ResourceBill>,
     /// The labor / wall-clock split — see `StepSpec::labor_hours`.
     #[serde(default)]
     labor_hours: Option<f64>,
@@ -321,7 +323,7 @@ pub fn bundle_files(dir: &Path) -> Result<Vec<PathBuf>, SeedLoaderError> {
 /// (workflows, stations, step plugins, cadence rules and the delivery
 /// policy all read it) rather than once per registry, which is how car
 /// 3 of 393d3234 found it living three times.
-fn load_bundle_dir<T>(
+pub(crate) fn load_bundle_dir<T>(
     dir: &Path,
     header: &str,
     key: &str,
@@ -378,8 +380,33 @@ pub fn parse_workflows(
     default_owner: &str,
     source: &str,
 ) -> Result<Vec<WorkflowSpec>, SeedLoaderError> {
-    let file: WorkflowsFile = toml::from_str(text)
+    let mut value: toml::Value = toml::from_str(text)
         .map_err(|e| SeedLoaderError::Parse(source.to_string(), e.to_string()))?;
+    if let Some(workflows) = value
+        .get_mut("workflow")
+        .and_then(toml::Value::as_array_mut)
+    {
+        for (w, workflow) in workflows.iter_mut().enumerate() {
+            if let Some(steps) = workflow.get_mut("step").and_then(toml::Value::as_array_mut) {
+                for (s, step) in steps.iter_mut().enumerate() {
+                    if let Some(resources) = step.get_mut("resources") {
+                        for key in ["vcpu", "ram_gb", "disk_gb"] {
+                            if let Some(amount) = resources.get_mut(key) {
+                                crate::resources::toml_amount(
+                                    amount,
+                                    &format!("workflow[{w}].step[{s}].resources.{key}"),
+                                )
+                                .map_err(|e| SeedLoaderError::Parse(source.into(), e))?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let file: WorkflowsFile = value
+        .try_into()
+        .map_err(|e: toml::de::Error| SeedLoaderError::Parse(source.to_string(), e.to_string()))?;
     let specs: Vec<WorkflowSpec> = file
         .workflows
         .into_iter()
@@ -426,6 +453,7 @@ fn workflow_toml_to_spec(
                 kind: s.kind,
                 assurance_required: s.assurance_required,
                 duration_hours: s.duration_hours,
+                resources: s.resources,
                 labor_hours: s.labor_hours,
                 wall_clock_hours: s.wall_clock_hours,
                 ready_when: s.ready_when,
@@ -511,11 +539,15 @@ struct StationToml {
     status: WorkflowStatus,
     title: String,
     kind: StationKind,
+    /// An `equipment` row's automaton and bays (factory taxonomy M2);
+    /// the viability gate below refuses either on any other kind.
+    #[serde(default)]
+    automaton: Option<String>,
+    #[serde(default)]
+    bays: Option<i32>,
     predicate: StationPredicate,
     #[serde(default = "default_discipline")]
     discipline: Vec<DisciplineKey>,
-    #[serde(default)]
-    wip_limit: Option<i32>,
     #[serde(default)]
     terminal_window_days: Option<u32>,
     #[serde(default)]
@@ -523,7 +555,48 @@ struct StationToml {
     #[serde(default)]
     rollup_parent: Option<String>,
     #[serde(default)]
-    upstream: Option<StationUpstream>,
+    floor: Option<crate::stations::FloorPlacement>,
+    /// The stations a packet goes to next (pass item 4 of design
+    /// ccfe87ff); the seed judges each against the bundle's active rows.
+    #[serde(default)]
+    edges: Vec<String>,
+    /// The station tree (T2 of design 4b27a65a, backlog 3f58c823): the
+    /// row's stable id, the id of the station it stands in, its mode,
+    /// seats, machines and what it holds from its parent. The seed judges
+    /// the tree they make across the bundle before any publish
+    /// ([`crate::station_tree::validate_station_tree`]).
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    parent: Option<String>,
+    #[serde(default)]
+    mode: Option<crate::stations::StationMode>,
+    #[serde(default)]
+    capacity: Option<i32>,
+    #[serde(default)]
+    machines: Vec<String>,
+    #[serde(default)]
+    allocation: std::collections::BTreeMap<String, crate::resources::Quantity>,
+    /// The most it borrows of each pool from its parent (backlog 30c1efe8),
+    /// read by the same exact-amount rule as `allocation`.
+    #[serde(default)]
+    borrow_limit: std::collections::BTreeMap<String, crate::resources::Quantity>,
+    /// The Design token code the station's rail draws, declared on the
+    /// root and its departments and inherited below (design c4854fd4).
+    #[serde(default)]
+    line: Option<String>,
+    /// Where the station stands on its parent's floor, `{x, y, w, h}` in
+    /// floor units (backlog e3a927c3); the seed refuses a box that
+    /// overlaps a sibling's before any publish.
+    #[serde(default)]
+    placement: Option<crate::stations::StationPlacement>,
+    /// Read only to be REFUSED by name (backlog a1c0a0ff, design
+    /// deba3000): the walk upstream is the parent station's page, derived
+    /// from the tree, and a hand-typed route went dead when /system
+    /// retired. `deny_unknown_fields` would refuse it too, but without
+    /// saying where the link comes from instead.
+    #[serde(default)]
+    upstream: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     lens: Option<StationLens>,
 }
@@ -569,8 +642,30 @@ fn load_station_file(path: &Path) -> Result<Vec<StationSpec>, SeedLoaderError> {
 
 /// Parse TOML text directly — the file loader is a thin wrapper.
 pub fn parse_stations(text: &str, source: &str) -> Result<Vec<StationSpec>, SeedLoaderError> {
-    let file: StationsFile = toml::from_str(text)
+    let mut value: toml::Value = toml::from_str(text)
         .map_err(|e| SeedLoaderError::Parse(source.to_string(), e.to_string()))?;
+    // An allocation is an exact amount, and the TOML authoring boundary
+    // alone accepts an integer literal for one — the same rule a pool's
+    // capacity is read by (`crate::resources::toml_amount`); a float is
+    // refused before anything can round it.
+    if let Some(rows) = value.get_mut("station").and_then(toml::Value::as_array_mut) {
+        for (i, row) in rows.iter_mut().enumerate() {
+            for key in ["allocation", "borrow_limit"] {
+                if let Some(table) = row.get_mut(key).and_then(toml::Value::as_table_mut) {
+                    for (pool, amount) in table.iter_mut() {
+                        crate::resources::toml_amount(
+                            amount,
+                            &format!("station[{i}].{key}.{pool}"),
+                        )
+                        .map_err(|e| SeedLoaderError::Parse(source.to_string(), e))?;
+                    }
+                }
+            }
+        }
+    }
+    let file: StationsFile = value
+        .try_into()
+        .map_err(|e: toml::de::Error| SeedLoaderError::Parse(source.to_string(), e.to_string()))?;
     let specs: Vec<StationSpec> = file
         .stations
         .into_iter()
@@ -620,19 +715,41 @@ fn station_toml_to_spec(toml: StationToml, source: &str) -> Result<StationSpec, 
             ),
         ));
     }
+    if toml.upstream.is_some() {
+        return Err(SeedLoaderError::Parse(
+            source.to_string(),
+            format!(
+                "station `{}` declares an upstream; a station's walk upstream is its \
+                 parent station's page, derived from the tree, so drop [station.upstream] \
+                 and set `parent` (backlog a1c0a0ff)",
+                toml.name
+            ),
+        ));
+    }
     Ok(StationSpec {
         name: toml.name,
         version: toml.version,
         status: toml.status,
         title: toml.title,
         kind: toml.kind,
+        automaton: toml.automaton,
+        bays: toml.bays,
         predicate: toml.predicate,
         discipline: toml.discipline,
-        wip_limit: toml.wip_limit,
         terminal_window_days: toml.terminal_window_days,
         capability: toml.capability,
         rollup_parent: toml.rollup_parent,
-        upstream: toml.upstream,
+        floor: toml.floor,
+        edges: toml.edges,
+        id: toml.id,
+        parent: toml.parent,
+        mode: toml.mode,
+        capacity: toml.capacity,
+        machines: toml.machines,
+        allocation: toml.allocation,
+        borrow_limit: toml.borrow_limit,
+        line: toml.line,
+        placement: toml.placement,
         lens: toml.lens,
         // Not a declaration: the seed stamps its own clock reading on
         // the row it writes, and the equality pin excludes the column.
@@ -928,7 +1045,6 @@ struct DeliveryPolicyToml {
     ci_host_floor_gb: i32,
     #[serde(default = "crate::delivery::legacy_gate_queue_owner")]
     gate_queue_owner: String,
-    gate_max_concurrent: i32,
     #[serde(default)]
     channels: serde_json::Value,
 }
@@ -1027,7 +1143,6 @@ fn delivery_policy_toml_to_spec(
             blip_cause_budget: toml.blip_cause_budget,
             ci_host_floor_gb: toml.ci_host_floor_gb,
             gate_queue_owner: toml.gate_queue_owner,
-            gate_max_concurrent: toml.gate_max_concurrent,
             channels: toml.channels,
         },
         // Not a declaration — see `station_toml_to_spec`.
@@ -1890,6 +2005,98 @@ ready_when = "true"
         );
         assert_eq!(window["properties"]["begin_at"]["format"], "date-time");
         assert_eq!(window["properties"]["duration_seconds"]["minimum"], 1);
+    }
+
+    #[test]
+    fn a_released_car_review_accepts_the_existing_unmarked_hold_shapes() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../infra/platform/workflows");
+        let rows = load_workflows(root.join("ship-a-change.toml")).unwrap();
+        let review = rows[0]
+            .steps
+            .iter()
+            .find(|step| step.title == crate::car::REVIEW_SLUG)
+            .unwrap();
+        for hold in [
+            serde_json::json!(false),
+            serde_json::Value::Null,
+            serde_json::json!(""),
+        ] {
+            let metadata =
+                serde_json::json!({"pr_url": "https://forge.invalid/pulls/1", "hold": hold});
+            assert!(crate::stranded::marked(&metadata, "hold").is_none());
+            assert!(
+                crate::step_registry::StepRegistry::validate_authored_fields(
+                    &review.fields,
+                    &metadata
+                )
+                .is_ok(),
+                "a boardable released car must complete review with its existing hold marker: {metadata}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_review_completion_keeps_person_releaser_marks_as_context() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../infra/platform/workflows");
+        let rows = load_workflows(root.join("ship-a-change.toml")).unwrap();
+        let review = rows[0]
+            .steps
+            .iter()
+            .find(|step| step.title == crate::car::REVIEW_SLUG)
+            .unwrap();
+        for releaser in [
+            serde_json::json!(true),
+            serde_json::json!(false),
+            serde_json::json!(7),
+            serde_json::json!(["operator"]),
+            serde_json::json!({"operator": "person"}),
+        ] {
+            let metadata = serde_json::json!({"pr_url": "https://forge.invalid/pulls/1", "releaser": releaser});
+            assert!(
+                crate::step_registry::StepRegistry::validate_authored_fields(
+                    &review.fields,
+                    &metadata
+                )
+                .is_ok(),
+                "door-owned reservation context must not wedge a person's completed release: {metadata}"
+            );
+        }
+    }
+
+    /// The wait is door-owned context, not an executor answer (5101e080).
+    /// Declaring these heterogeneous markers as strings rejects a released
+    /// hold:false when the conductor closes the car and invites a generic
+    /// field editor to bypass the hold door's head-binding cleanup.
+    #[test]
+    fn the_car_review_step_keeps_door_written_waits_out_of_executor_fields() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../infra/platform/workflows");
+        let rows = load_workflows(root.join("ship-a-change.toml")).unwrap();
+        let review = rows[0]
+            .steps
+            .iter()
+            .find(|step| step.title == crate::car::REVIEW_SLUG)
+            .expect("ship-a-change has a review step");
+        let hold_body = crate::car::hold_body(&serde_json::json!({}), "why");
+        assert_eq!(hold_body, serde_json::json!({"hold": "why"}));
+        for name in hold_body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .chain([
+                crate::car::RELEASER,
+                crate::car::HOLD_SHA,
+                crate::car::RELEASE,
+            ])
+        {
+            assert!(
+                !review.fields.iter().any(|field| field.name == name),
+                "door-written `{name}` must remain context rather than an editable executor field"
+            );
+        }
     }
 
     #[test]

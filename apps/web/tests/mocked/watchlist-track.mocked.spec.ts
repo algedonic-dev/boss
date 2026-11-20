@@ -21,7 +21,7 @@ const DATA = [
   J('w1', '/it', 'open'),
   J('w2', '/ux/jobs', 'open'),
   J('w3', '/shop', 'open'),
-  J('w4', '/it/design', 'closed', { outcome: 'completed' }),
+  J('w4', '/engineering/design', 'closed', { outcome: 'completed' }),
   J('w5', '/', 'closed', { outcome: 'declined' }),
 ];
 const STEPS: Record<string, unknown[]> = {
@@ -43,8 +43,7 @@ async function mocks(page: Page) {
   await page.route(/\/api\/jobs\/live$/, (r) => json(r, { counts: {}, open_total: 0, recent: [], sim_clock: {} }));
   await page.route(/\/api\/jobs\/assignments/, (r) => json(r, { mine: [], group: [], data: [] }));
   await page.route(/\/api\/stations\/my-watchlist\/queue/, (r) => json(r, {
-    station: 'my-watchlist', kind: 'actor', discipline: ['recency'], over_limit: false,
-    terminal_window_days: 14, total: DATA.length, data: DATA, steps: STEPS,
+    station: 'my-watchlist', kind: 'actor', discipline: ['recency'], terminal_window_days: 14, total: DATA.length, data: DATA, steps: STEPS,
     lens: { title: 'My watchlist', subtitle: 'What you sent, and where it got to', with_steps: true },
   }));
 }
@@ -61,7 +60,7 @@ test('packets stand at the stop their steps say they reached', async ({ page }) 
   await expect(stop('Being read')).toContainText('/it');
   await expect(stop('Being worked out')).toContainText('/ux/jobs');
   await expect(stop('Being built')).toContainText('/shop');
-  await expect(stop('Done')).toContainText('/it/design');
+  await expect(stop('Done')).toContainText('/engineering/design');
   // Nothing has arrived un-triaged, and the stop says so rather than
   // borrowing a packet from further along.
   await expect(stop('Received')).toContainText('—');
@@ -79,8 +78,7 @@ test('an envelope without steps falls back to the list rather than blanking', as
   await mocks(page);
   // A deployment whose registry predates 139: no `steps` key at all.
   await page.route(/\/api\/stations\/my-watchlist\/queue/, (r) => json(r, {
-    station: 'my-watchlist', kind: 'actor', discipline: ['recency'], over_limit: false,
-    terminal_window_days: 14, total: DATA.length, data: DATA,
+    station: 'my-watchlist', kind: 'actor', discipline: ['recency'], terminal_window_days: 14, total: DATA.length, data: DATA,
   }));
   await page.goto('/');
 

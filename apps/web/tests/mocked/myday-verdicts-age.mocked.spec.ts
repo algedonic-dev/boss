@@ -1,7 +1,7 @@
 // The founder's watch list is "Yours to decide", and it ages
 // (backlog 3bc896be, design 5877860d, decided 2026-09-21).
 //
-// David routed a drive purchase to design review because /it/design
+// David routed a drive purchase to design review because /engineering/design
 // was the one surface that showed him what was waiting on him; it sat
 // there two days looking handled. The design chose the per-actor queue
 // that already exists — these verdicts on My Day, which is `/` — and

@@ -22,6 +22,8 @@
     type NavItem,
     type NavGroup,
   } from './nav-catalog';
+  import { pagePath } from './page-address';
+  import { stationAddresses } from './stationAddresses.svelte';
   import { classesFor } from '@boss/web-kit/session/classes.svelte';
   import { safeLinkHref } from '@boss/web-kit/links';
 
@@ -123,37 +125,28 @@
     return app === 'home' || app === 'simulator' ? '' : departmentLabel(app, departments());
   }
 
-  // Work group is All jobs, for every role (backlog 0f9be7c0,
-  // 2026-09-24). It was role-keyed — a closed map until 6a3b93eb, then
-  // each role row's `metadata.work` — but visible() drops every entry
-  // whose catalog owner is not home, so of any list only `jobs` could
-  // render and a list without it left Work empty. Each department app
-  // has its own sidebar; a role's surfaces are gated there, by the
-  // row's `surfaces`, and Work here is the same filter over one row.
-  const WORK: NavGroup = {
-    label: 'Work',
-    items: [ROUTE_CATALOG.jobs],
-  };
-
+  // Home had a Work group above Mine, holding All jobs for every role
+  // (backlog 0f9be7c0, 2026-09-24); it went with the jobs list in step 1
+  // of design 01fa5bdf (review df7aeb9c).
+  //
   // Home — personal work, whichever domain it belongs to: "what am I
-  // meant to be doing" is one question, and its answer (All jobs, My
-  // Day) crosses every department freely.
+  // meant to be doing" is one question, and its answer (My Day, the
+  // inbox) crosses every department freely.
   //
   // Mine lists Home surfaces only. It carried Exec until backlog
   // e8fe5e5a (2026-09-24), a row visible() dropped for every role —
   // Exec's catalog owner is executive — so it never rendered here; it is
   // the Executive department's row, under a tab every role is offered.
   const HOME_GROUPS: ReadonlyArray<NavGroup> = [
-    WORK,
     {
       label: 'Mine',
       items: [
-        // Permkey-less: /` is App.svelte's `me` route, which has no
-        // catalog entry (it is everyone's, ungated).
-        { id: 'my-day', label: 'My Day', path: '/' },
+        // Permkey-less: My Day is everyone's. Its catalog entry places it
+        // at the person's own station, /me (backlog 5cb56bb3); the row
+        // linked / until then, which renders it in place.
+        ROUTE_CATALOG.me,
         ROUTE_CATALOG.inbox,
         ROUTE_CATALOG.schedule,
-        ROUTE_CATALOG['company-map'],
         ROUTE_CATALOG.manual,
       ],
     },
@@ -197,16 +190,16 @@
       {#if perspective === 'user'}
         <div class="shell-nav-personal">
           <a
-            href="/ux/me"
+            href="/me"
             class="shell-nav-item shell-nav-home {activeSection === 'me' ? 'shell-nav-item-active' : ''}"
-            onclick={(e) => onLinkClick(e, '/ux/me')}
+            onclick={(e) => onLinkClick(e, '/me')}
           >
             My Day
           </a>
           <a
-            href="/ux/inbox"
+            href="/me/inbox"
             class="shell-nav-item {activeSection === 'inbox' ? 'shell-nav-item-active' : ''}"
-            onclick={(e) => onLinkClick(e, '/ux/inbox')}
+            onclick={(e) => onLinkClick(e, '/me/inbox')}
           >
             Inbox
             {#if unreadDirect > 0}
@@ -217,13 +210,7 @@
               >{unreadDirect}</span>
             {/if}
           </a>
-          <a
-            href="/ux/shop"
-            class="shell-nav-item {activeSection === 'shop' ? 'shell-nav-item-active' : ''}"
-            onclick={(e) => onLinkClick(e, '/ux/shop')}
-          >
-            Shop
-          </a>
+          <!-- The Shop row went with the /ux/shop page (design 01fa5bdf). -->
         </div>
       {/if}
 
@@ -236,13 +223,21 @@
               {group.label}
             </div>
             {#each items as item (item.id)}
-              <a
-                href={safeLinkHref(item.path)}
-                class="shell-nav-item {activeSection === item.id ? 'shell-nav-item-active' : ''}"
-                onclick={(e) => onLinkClick(e, item.path)}
-              >
-                {getLabel(`nav.${item.id}_label`, item.label)}
-              </a>
+              <!-- A hosted page's path is its host station's address in
+                   the tree plus its slug (backlog 0bc2eb68): until the
+                   tree answers, the row names the page and links nowhere. -->
+              {@const to = pagePath(item, stationAddresses())}
+              {#if to === null}
+                <span class="shell-nav-item" data-unplaced>{getLabel(`nav.${item.id}_label`, item.label)}</span>
+              {:else}
+                <a
+                  href={safeLinkHref(to)}
+                  class="shell-nav-item {activeSection === item.id ? 'shell-nav-item-active' : ''}"
+                  onclick={(e) => onLinkClick(e, to)}
+                >
+                  {getLabel(`nav.${item.id}_label`, item.label)}
+                </a>
+              {/if}
             {/each}
           </div>
         {/if}
@@ -257,11 +252,11 @@
              user's name in the bottom right click into the profile"). -->
         <a
           class="shell-user"
-          href={href('/ux/me')}
+          href={href('/me')}
           title="Your profile and passkeys"
           onclick={(e) => {
             e.preventDefault();
-            navigate('/ux/me');
+            navigate('/me');
           }}
         >
           <div class="shell-user-name">{user.name}</div>

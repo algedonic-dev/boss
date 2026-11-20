@@ -1,0 +1,40 @@
+# ---------------------------------------------------------------------------
+# operations — runs the software and the servers (T2 of design 4b27a65a,
+# backlog 3f58c823; handoff section 1): the deploy and the converge that
+# judges it delivered, the estate and its observers, the vault, the
+# public edge, and repair. Operations keeps every box; it does not own
+# the capacity Engineering reserves on one (handoff section 4).
+#
+# It allocates nothing yet: its footprint on the cluster boxes is a
+# measurement no row holds, and an allocation is read off a manifest or a
+# measurement, never estimated (handoff section 5: "measure").
+#
+# A CONTAINER, NOT A QUEUE: the tagged predicate holds no packet (see
+# algedonic.toml). To change this station, bump `version`.
+#
+# Version 2 (backlog 85cb2103, design c4854fd4; bumped from the LIVE
+# newest, v1): `line = "hosting"`, so its card rail and every station under
+# it draw Hosting's line (#3B5BB5) until Design names one of its own.
+# Nothing else changed.
+#
+# Version 3 (backlog e3a927c3; bumped from the LIVE newest, v2):
+# `placement`, where Operations stands on the company's floor, {x, y, w,
+# h} in floor units: right of Engineering, whose outbound it receives.
+# Nothing else changed.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "operations"
+version = 3
+status = "active"
+title = "Operations — runs the software and the servers"
+kind = "group"
+discipline = ["priority", "age"]
+id = "9660c60f-eb47-4405-ae08-fcbb30c71e5f"
+parent = "00b04483-90c6-46b9-b911-8e19d2a0b410"
+mode = "standing"
+placement = { x = 780, y = 120, w = 540, h = 420 }
+line = "hosting"
+
+[station.predicate]
+tags_any = ["station:operations"]

@@ -36,17 +36,14 @@ const OWN_FILTERS_LINE = /match(?:es)? those filters/i;
 
 /** The pages backlog 0ef5e008 named (WatchlistPage was already fixed and
  *  joined anyway), plus the three that had hand-grown the branch. */
+// AccountsList, PeopleList, PartsList, ShippingPage, CatalogBrowser and
+// MarketingAssetsList were list pages here until step 1 of design
+// 01fa5bdf removed them; these four are every ListEmpty page left.
 const LIST_PAGES: ReadonlyArray<string> = [
-  join('accounts', 'AccountsList.svelte'),
-  join('people', 'PeopleList.svelte'),
-  join('parts', 'PartsList.svelte'),
   join('finance', 'InvoicesTab.svelte'),
-  join('shipping', 'ShippingPage.svelte'),
   join('inbox', 'InboxPage.svelte'),
-  join('catalog', 'CatalogBrowser.svelte'),
   join('accounts', 'WatchlistPage.svelte'),
   join('vendors', 'VendorsList.svelte'),
-  join('marketing-assets', 'MarketingAssetsList.svelte'),
 ];
 
 describe('an empty list says why, through one helper', () => {

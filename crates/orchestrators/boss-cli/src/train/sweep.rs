@@ -468,6 +468,31 @@ pub(crate) fn sweep_complete(
     branch_failures == 0 && claim_deferred == 0 && sweep_settled(boarded_cars)
 }
 
+/// The metadata this pass owes the train, or nothing. The report is
+/// written whenever it differs from the one the train already holds,
+/// and always beside the stamp; a pending train whose report reads
+/// exactly as stored is left alone. A re-statement of unchanged state
+/// is not an event: until this, every pass merged the same report
+/// onto every pending train, and on 2026-11-15 that was 440 of the
+/// newest 500 `jobs.job.updated` rows, 349 of 349 consecutive payloads
+/// identical, ~62k audit rows a day (backlog ea4012e2).
+pub(crate) fn sweep_metadata_write(
+    train: &Value,
+    report: Vec<Value>,
+    complete: bool,
+) -> Option<Vec<(&'static str, Value)>> {
+    let report = Value::Array(report);
+    let unchanged = train.pointer("/metadata/sweep_report") == Some(&report);
+    match (complete, unchanged) {
+        (false, true) => None,
+        (false, false) => Some(vec![("sweep_report", report)]),
+        (true, _) => Some(vec![
+            ("sweep_report", report),
+            ("branches_swept", json!("true")),
+        ]),
+    }
+}
+
 /// A branch held back for a still-open car's claim says so: without a
 /// line, an operator sees the same train re-swept every ten minutes
 /// with nothing to show for it and no reason named.
@@ -610,6 +635,35 @@ mod tests {
 
     fn no_open() -> BTreeSet<String> {
         BTreeSet::new()
+    }
+
+    /// Backlog ea4012e2: a pending train whose report reads as stored
+    /// gets no write; a changed report, or the stamp, always does.
+    #[test]
+    fn an_unchanged_report_on_a_pending_train_is_not_rewritten() {
+        let row =
+            json!({"branch": "fix/w", "car": "car-w", "rerail_origin": false, "outcome": "kept"});
+        let held = json!({"metadata": {"sweep_report": [row.clone()]}});
+        assert_eq!(sweep_metadata_write(&held, vec![row.clone()], false), None);
+
+        let other = json!({"branch": "fix/w", "car": "car-w", "rerail_origin": false, "outcome": "deleted"});
+        assert_eq!(
+            sweep_metadata_write(&held, vec![other.clone()], false),
+            Some(vec![("sweep_report", json!([other]))])
+        );
+        assert_eq!(
+            sweep_metadata_write(&json!({"metadata": {}}), vec![row.clone()], false),
+            Some(vec![("sweep_report", json!([row.clone()]))])
+        );
+        // The stamp drops the train off the list, so it is never withheld,
+        // even when the report beside it is unchanged.
+        assert_eq!(
+            sweep_metadata_write(&held, vec![row.clone()], true),
+            Some(vec![
+                ("sweep_report", json!([row])),
+                ("branches_swept", json!("true")),
+            ])
+        );
     }
 
     /// The branch names a sweep decision offers, in order.

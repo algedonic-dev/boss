@@ -118,44 +118,15 @@ pub(crate) const COMPILED_BLIP_CAUSE_BUDGET: usize = 80;
 /// headroom for exactly that growth.
 pub(crate) const COMPILED_CI_HOST_FLOOR_GB: i64 = 40;
 
-/// How many gates `boss gate` admits at once before it refuses. Unlike
-/// most of its siblings this constant DID have a pre-registry ancestor —
-/// `gate.rs`'s `DEFAULT_MAX_CONCURRENT`, kept there now only as the
-/// ultimate fallback when neither the env override nor a policy row can
-/// be read. Three was the comfort zone on the build node (w-1); FIVE is
-/// the measured cliff — I/O pressure hit 65% and a ~35-minute gate took
-/// ~93, so per-verdict latency degraded past two gates' worth of
-/// queueing (2026-08-26). Four is the next step between them, taken as
-/// policy v3 on 2026-09-28 (backlog 366c2ed5, David: 'Go to 4') after a
-/// day of three saturated bays, and measured for a day on that packet
-/// before five is considered. Raising it was a policy edit plus this
-/// fallback's pin, not a deploy — which is the point of moving it here.
-///
-/// THREE AGAIN since policy v4 (backlog 461159e7, 2026-09-30): the gate
-/// now requests the 160Gi its workspace may fill, so w-1's disk admits
-/// three gates beside the dev pod (634 of ~790 GiB; a fourth needs 794)
-/// and a fourth bay would only sit Pending, read as a running slot, and
-/// take the dev pod's room when it rolls. Four returns with w-1's second
-/// NVMe (52ea56ac). `gate.rs`'s `DEFAULT_MAX_CONCURRENT` is this constant.
-///
-/// FOUR since policy v5 (backlog e6dc7331, 2026-09-30): the workspace is
-/// on w-1's second NVMe, a new-layout gate was measured keeping roughly
-/// ~8 GB on EPHEMERAL, and its request is 40Gi (review be559bda) — five
-/// gate pods (four bays and the train gate) beside the dev pod ask 354
-/// of w-1's 789 GiB,
-/// pinned by boss-testing's
-/// `a_gate_requests_what_the_new_layout_uses_and_the_bays_fit`. Four
-/// itself has never been measured with the I/O split across two disks,
-/// so a day of gate duration at four comes before five is considered.
-///
-/// THREE since policy v7 (backlog 17f6170c, 2026-10-07): that
-/// measurement came back. Four car gates plus the train gate took 75+
-/// minutes against a 42-minute median, one gate was IO-stalled 43
-/// percent of its wall time, and gate-run bd136c2e failed on loopback
-/// deadline tests its car does not touch — on a gate drive that had
-/// never been trimmed. Four returns when a loaded measurement after
-/// the trim says so.
-pub(crate) const COMPILED_GATE_MAX_CONCURRENT: i64 = 3;
+// THE GATE CAPACITY IS NOT POLICY ANY MORE. It was, from 2026-09-03 to
+// 2026-11-03 (`gate_max_concurrent` on the row, `COMPILED_GATE_MAX_
+// CONCURRENT` here, moved 3 -> 4 -> 3 -> 4 -> 3 -> 2 by policy v3-v11;
+// the bundle file's header keeps each reason). Since item 0a78f8f8
+// (factory taxonomy M2) it is the `bays` of the `gates` equipment
+// station, read by `crate::gate::max_concurrent`, and its one compiled
+// fallback is `boss_jobs::stations::COMPILED_GATE_BAYS` — so the yard's
+// copy and this crate's, held equal across crates by a pin, collapsed
+// into one constant (CLAUDE.md §9a).
 
 // WHICH LINTS THE CONSIST CHECK LEAVES OUT IS NOT POLICY ANY MORE. It
 // was, from 2026-08-24 to 2026-09-18 (`consist_excluded_lints` on the
@@ -187,9 +158,6 @@ pub(crate) struct DeliveryPolicy {
     pub(crate) blip_cause_budget: usize,
     pub(crate) ci_host_floor_gb: i64,
     pub(crate) gate_queue_resident: bool,
-    /// The concurrency bound `boss gate` enforces. Read here so the
-    /// number the CLI obeys and the number the yard draws are one.
-    pub(crate) gate_max_concurrent: i64,
     /// A registry version may authorize a lighter evidence path. Fallbacks
     /// deliberately carry no such authority.
     pub(crate) channels: Value,
@@ -208,8 +176,11 @@ impl DeliveryPolicy {
             skip_reason_file_budget: COMPILED_SKIP_REASON_FILE_BUDGET,
             blip_cause_budget: COMPILED_BLIP_CAUSE_BUDGET,
             ci_host_floor_gb: COMPILED_CI_HOST_FLOOR_GB,
-            gate_queue_resident: false,
-            gate_max_concurrent: COMPILED_GATE_MAX_CONCURRENT,
+            // The bundle's owner since v10 (backlog e1943ef0), held equal
+            // by `the_bundle_equals_the_compiled_fallback`. Informational
+            // here: `boss gate` reads the owner from the registry only and
+            // refuses rather than fall back (gate/reservation/staging.rs).
+            gate_queue_resident: true,
             channels: Value::Null,
         }
     }
@@ -256,7 +227,6 @@ pub(crate) fn parse(row: DeliveryPolicyRow) -> Result<DeliveryPolicy> {
         ci_host_floor_gb: positive_i64("ci_host_floor_gb", row.ci_host_floor_gb)?,
         gate_queue_resident: boss_jobs::delivery::resident_gate_queue(&row.gate_queue_owner)
             .map_err(anyhow::Error::msg)?,
-        gate_max_concurrent: positive_i64("gate_max_concurrent", row.gate_max_concurrent)?,
         channels: row.channels,
     })
 }
@@ -331,6 +301,42 @@ pub(crate) fn version_to_fetch(train: &Value, active: &DeliveryPolicy) -> Option
 mod tests {
     use super::*;
 
+    /// The gate bound, read where it lives: the `gates` equipment
+    /// station's bays (item 0a78f8f8), and the one compiled fallback a
+    /// dark registry leaves a gate on.
+    #[test]
+    fn the_micron_gate_drive_bays_admit_a_third_gate_and_refuse_a_fourth() {
+        let declared = boss_jobs::seed_loader::load_stations(
+            boss_jobs::station_seed::platform_stations_path(),
+        )
+        .unwrap()
+        .into_iter()
+        .find(|row| row.name == boss_jobs::stations::GATES_STATION)
+        .unwrap()
+        .bays
+        .unwrap();
+        // 121f44a1 D2: two until the drive is replaced, then three, then
+        // a measured four. The Kingston delivered 2.62 gates/h with two
+        // and 2.38 with three occupied; the Micron 7400 that replaced it
+        // on 2026-11-07 left a gate CPU-bound (io.some 9 s of 2081 s,
+        // backlog a082371d), so the bound is three and a fourth waits
+        // for its own measurement. Exercise the actual admission
+        // predicate, including trains, on declared and dark reads.
+        for bays in [declared, boss_jobs::stations::COMPILED_GATE_BAYS] {
+            let bound = usize::try_from(bays).unwrap();
+            for who in [crate::gate::Requester::Car, crate::gate::Requester::Train] {
+                assert!(
+                    crate::gate::admits(2, 0, bound, who),
+                    "a third gate runs on the Micron drive; bound={bound}"
+                );
+                assert!(
+                    !crate::gate::admits(3, 0, bound, who),
+                    "a fourth gate waits for its own measurement; bound={bound}"
+                );
+            }
+        }
+    }
+
     // -- the equality that makes this car a no-op -----------------------
 
     #[test]
@@ -356,13 +362,6 @@ mod tests {
              a FULL gate build that now runs in-cluster"
         );
         assert_eq!(
-            p.gate_max_concurrent, 3,
-            "gate.rs DEFAULT_MAX_CONCURRENT — policy v7 (backlog 17f6170c, \
-             2026-10-07): three bays until the untrimmed gate drive is fixed; \
-             four car gates plus the train gate took 75+ minutes against a \
-             42-minute median"
-        );
-        assert_eq!(
             p.version, NO_VERSION,
             "the compiled fallback is not a registry version and must never \
              be pinned on a train as if it were"
@@ -384,7 +383,6 @@ mod tests {
             blip_cause_budget: 40,
             ci_host_floor_gb: 120,
             gate_queue_owner: boss_jobs::delivery::legacy_gate_queue_owner(),
-            gate_max_concurrent: 4,
             channels: serde_json::Value::Null,
         }
     }
@@ -412,7 +410,6 @@ mod tests {
         assert_eq!(p.skip_reason_file_budget, 50);
         assert_eq!(p.blip_cause_budget, 40);
         assert_eq!(p.ci_host_floor_gb, 120);
-        assert_eq!(p.gate_max_concurrent, 4);
     }
 
     #[test]
@@ -438,20 +435,6 @@ mod tests {
         let e = parse(r).expect_err("zero is not a floor");
         assert!(
             format!("{e}").contains("ci_host_floor_gb"),
-            "the complaint names the field: {e}"
-        );
-    }
-
-    #[test]
-    fn a_non_positive_gate_max_concurrent_is_refused() {
-        // Zero would refuse every gate forever, which is a
-        // misconfiguration, not a policy — the parse rejects it the same
-        // way the CLI's env-var parser rejects BOSS_GATE_MAX_CONCURRENT=0.
-        let mut r = row();
-        r.gate_max_concurrent = 0;
-        let e = parse(r).expect_err("zero admits no gates");
-        assert!(
-            format!("{e}").contains("gate_max_concurrent"),
             "the complaint names the field: {e}"
         );
     }
@@ -515,23 +498,6 @@ mod tests {
     }
 
     // -- pinning -------------------------------------------------------
-
-    /// §9a pin across crates: the yard read-model draws its gate slots
-    /// at `boss_jobs::yard::COMPILED_GATE_MAX_CONCURRENT` when no policy
-    /// answers, and `boss gate` refuses at THIS crate's
-    /// `COMPILED_GATE_MAX_CONCURRENT` on the same no-policy path. If the
-    /// two drifted the page would draw a different number of slots than a
-    /// gate would honour — the exact folklore this car retires. They
-    /// cannot be one constant (different crates), so equality is the
-    /// mechanism.
-    #[test]
-    fn the_yard_no_policy_capacity_equals_the_cli_compiled_bound() {
-        assert_eq!(
-            i64::from(boss_jobs::yard::COMPILED_GATE_MAX_CONCURRENT),
-            COMPILED_GATE_MAX_CONCURRENT,
-            "the yard's no-policy slot count drifted from the gate CLI's compiled bound"
-        );
-    }
 
     /// §9a pin, the half that needs no database: the bundle row
     /// `infra/platform/delivery-policy/train-conductor.toml` — the

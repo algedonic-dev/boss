@@ -383,12 +383,11 @@
     padding: 1px 4px;
     border-radius: 3px;
   }
+  /* The field is Enamel's shared one (styles.css :where(textarea)): 14px,
+     a 2px ink frame squared to 3px, the amber halo on focus. Its own 1px
+     frame stood only while the simulator did not load that stylesheet;
+     it has since car 4 (backlog 6f471ff6, 2026-11-15). */
   .fb-panel textarea {
-    font: inherit;
-    font-size: 13px;
-    padding: 6px;
-    border: 1px solid var(--border);
-    border-radius: 4px;
     resize: vertical;
   }
   .fb-actions {

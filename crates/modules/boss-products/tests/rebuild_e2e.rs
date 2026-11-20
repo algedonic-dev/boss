@@ -95,6 +95,166 @@ fn product(sku: &str, name: &str) -> Product {
     }
 }
 
+#[tokio::test]
+async fn rebuilding_sku_versions_restores_complete_history_twice() {
+    use boss_products::ProductsRepository;
+    let db = TestDb::new().await;
+    let repo = PgProducts::new(db.pool.clone());
+    let first = sku_fixture("fixture-replay", "First name", 1);
+    let event_stamp = boss_core::publisher::EventStamp::new(
+        "products",
+        boss_core::actor::ActorId::Automation("fixture".into()),
+    );
+    repo.append_sku_version(&first, &event_stamp).await.unwrap();
+    let mut second = first.clone();
+    second.version = 2;
+    second.name = "Retired name".into();
+    second.active = false;
+    second.price.amount_cents = 25000;
+    repo.append_sku_version(&second, &event_stamp)
+        .await
+        .unwrap();
+    let expected = repo.sku_versions().await.unwrap();
+    let expected_storage: Vec<(String, i64, serde_json::Value, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT sku, version, data, created_at FROM product_sku_versions ORDER BY sku COLLATE \"C\", version",
+    ).fetch_all(&db.pool).await.unwrap();
+    assert_eq!(expected, vec![first, second]);
+    assert_eq!(drain_outbox(&db.pool).await, 2);
+    // Corrupt the projection, never its immutable source facts. A
+    // rebuilder that merely leaves the new table alone must fail.
+    sqlx::query("DELETE FROM product_sku_versions")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        rebuild_products(&db.pool).await.unwrap();
+        assert_eq!(repo.sku_versions().await.unwrap(), expected);
+        let storage: Vec<(String, i64, serde_json::Value, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT sku, version, data, created_at FROM product_sku_versions ORDER BY sku COLLATE \"C\", version",
+        ).fetch_all(&db.pool).await.unwrap();
+        assert_eq!(storage, expected_storage);
+    }
+    boss_subject_kinds::subjects::rebuild_subjects(&db.pool)
+        .await
+        .unwrap();
+    let label = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT label FROM subjects WHERE kind = 'product' AND id = 'fixture-replay'",
+    )
+    .fetch_optional(&db.pool)
+    .await
+    .unwrap()
+    .flatten();
+    assert_eq!(label.as_deref(), Some("Retired name"));
+}
+
+#[tokio::test]
+async fn sku_fact_label_must_match_its_complete_row_on_replay() {
+    let db = TestDb::new().await;
+    let row = sku_fixture("fixture-label-refusal", "The complete row's label", 1);
+    // A deliberately malformed fixture fact, not a rewrite of a recorded event.
+    let fact = boss_core::publisher::EventStamp::new(
+        "products",
+        boss_core::actor::ActorId::Automation("fixture".into()),
+    )
+    .event(
+        boss_products::events::SKU_VERSION_APPENDED,
+        serde_json::json!({
+            "sku": row.sku, "version": row.version,
+            "name": "A disagreeing identity label", "data": row,
+        }),
+    );
+    let mut tx = db.pool.begin().await.unwrap();
+    boss_events::outbox::record_event_in_tx(&mut tx, &fact)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(drain_outbox(&db.pool).await, 1);
+    let error = rebuild_products(&db.pool).await.unwrap_err();
+    assert!(error.to_string().contains("label"), "{error}");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_sku_versions")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+fn sku_fixture(sku: &str, name: &str, version: i64) -> boss_products::sku::SkuVersion {
+    serde_json::from_value(serde_json::json!({
+        "sku": sku, "name": name, "kind": "fixture-class",
+        "description": "First promise", "price": {"amount_cents": 10100, "currency": "USD", "basis": "prepaid-min"},
+        "includes": [{"code": "fixture", "text": "First entitlement", "ref": {"subject_kind": "product", "code": "fixture-class"}}],
+        "active": true, "version": version
+    })).unwrap()
+}
+
+async fn alternating_identity_history(last_legacy: bool) -> (Option<String>, Option<String>) {
+    use boss_products::ProductsRepository;
+    let db = TestDb::new().await;
+    let repo = PgProducts::new(db.pool.clone());
+    let sku = "fixture-shared-identity";
+    let stamp = boss_core::publisher::EventStamp::new(
+        "products",
+        boss_core::actor::ActorId::Automation("fixture".into()),
+    );
+    repo.upsert_product(&product(sku, "Legacy one"), &stamp)
+        .await
+        .unwrap();
+    repo.append_sku_version(&sku_fixture(sku, "SKU one", 1), &stamp)
+        .await
+        .unwrap();
+    repo.upsert_product(&product(sku, "Legacy two"), &stamp)
+        .await
+        .unwrap();
+    repo.append_sku_version(&sku_fixture(sku, "SKU two", 2), &stamp)
+        .await
+        .unwrap();
+    if last_legacy {
+        repo.upsert_product(&product(sku, "Legacy three"), &stamp)
+            .await
+            .unwrap();
+    }
+    let live: Option<String> =
+        sqlx::query_scalar("SELECT label FROM subjects WHERE kind = 'product' AND id = $1")
+            .bind(sku)
+            .fetch_optional(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        live.as_deref(),
+        Some(if last_legacy {
+            "Legacy three"
+        } else {
+            "SKU two"
+        })
+    );
+    assert_eq!(
+        drain_outbox(&db.pool).await,
+        if last_legacy { 5 } else { 4 }
+    );
+    boss_subject_kinds::subjects::rebuild_subjects(&db.pool)
+        .await
+        .unwrap();
+    let rebuilt: Option<String> =
+        sqlx::query_scalar("SELECT label FROM subjects WHERE kind = 'product' AND id = $1")
+            .bind(sku)
+            .fetch_optional(&db.pool)
+            .await
+            .unwrap();
+    (live, rebuilt)
+}
+
+#[tokio::test]
+async fn alternating_history_keeps_a_newer_sku_subject_label() {
+    let (live, rebuilt) = alternating_identity_history(false).await;
+    assert_eq!(rebuilt, live);
+}
+
+#[tokio::test]
+async fn alternating_history_keeps_a_newer_legacy_goods_subject_label() {
+    let (live, rebuilt) = alternating_identity_history(true).await;
+    assert_eq!(rebuilt, live);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rebuild_reproduces_products_and_inventory_byte_identical() {
     let db = TestDb::new().await;

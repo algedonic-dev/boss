@@ -14,7 +14,7 @@ use boss_core::publish::PublishMode;
 use boss_core::publisher::EventStamp;
 
 use super::automations::{AUTOMATION_DECLARED, AutomationActor, AutomationsSeedOutcome};
-use super::types::{AgentInput, AgentRow, AgentsBatchOutcome, FieldChange};
+use super::types::{AgentInput, AgentRow, AgentsBatchOutcome, FieldChange, SeatOutcome};
 
 /// The fact a tenant's declaration leaves: one per agent row the
 /// batch INSERTED (backlog d9409039, 2026-09-17). Never per batch:
@@ -143,6 +143,33 @@ pub trait AgentsRegistry: Send + Sync {
         stamp: &EventStamp,
     ) -> Result<AgentsBatchOutcome, AgentsError>;
 
+    /// Seat agent `id` at `stations`, in order, writing that column and
+    /// NO other, and only while the row's held seats equal `expected` —
+    /// the seats the caller read (backlog cdbebc22; review 1a49c3a7
+    /// finding 1: the page's first cut took the whole row back through
+    /// [`Self::publish`], so a role another writer narrowed between its
+    /// read and its write was restored). The compare and the write are
+    /// one transaction holding the row, so two seat edits cannot lose
+    /// each other either. A change records one [`AGENT_UPDATED`] naming
+    /// the seats alone; seats already as asked write and record
+    /// nothing. Seats arrive validated (`validate_seats`, the station
+    /// registry); the registry checks only what it holds.
+    ///
+    /// A registry with no seat door (the tests' hand-rolled doubles)
+    /// answers `Err`: it never answers a seat it did not write.
+    async fn seat(
+        &self,
+        id: &str,
+        expected: &[String],
+        stations: &[String],
+        stamp: &EventStamp,
+    ) -> Result<SeatOutcome, AgentsError> {
+        let _ = (expected, stations, stamp);
+        Err(AgentsError::Storage(format!(
+            "this agents registry has no seat door; {id} was not seated"
+        )))
+    }
+
     /// Every writing automation's row, ordered by id (byte order) — the
     /// automation half of the registry (backlog ddf0773e, design
     /// abf9eeae car 1; `super::automations` says why it is a table of
@@ -165,6 +192,26 @@ pub trait AgentsRegistry: Send + Sync {
         rows: &[AutomationActor],
         stamp: &EventStamp,
     ) -> Result<AutomationsSeedOutcome, AgentsError>;
+
+    /// Stage the login door's count — one
+    /// [`super::door::UNRESOLVED_LOGIN`] event, built by the door — on
+    /// the transactional outbox, in a transaction of its own. The count
+    /// IS the fact: the door changes no row, so there is no domain write
+    /// for it to join, and the request's own write commits in the
+    /// handler's transaction after it. Until 2026-11-10 the door
+    /// published it straight to the bus, so on a dark bus the count was
+    /// logged and DROPPED (backlog 2e45840a, design ad9519bc part d);
+    /// staged here, the relay delivers it when the bus returns.
+    ///
+    /// A registry that stages no facts (the tests' hand-rolled doubles)
+    /// answers `Err`, and the door logs that at ERROR: it never answers
+    /// `Ok` for a count it did not keep.
+    async fn count_unresolved_login(&self, event: &Event) -> Result<(), AgentsError> {
+        Err(AgentsError::Storage(format!(
+            "this agents registry stages no facts; {} {} was not counted",
+            event.kind, event.id
+        )))
+    }
 }
 
 /// Complete rows observed while the actual owner writer guard remains held.

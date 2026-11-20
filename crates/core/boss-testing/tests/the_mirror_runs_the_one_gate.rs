@@ -177,6 +177,41 @@ fn the_mirror_ci_pins_every_action_to_a_sha() {
     }
 }
 
+/// The runner image is NAMED, and every run prints the coreutils it
+/// carries (backlog 9b74c84b). restore-shared reddened on the mirror over
+/// GNU-only `realpath -e` while the cluster gate stayed green (920f4fd5),
+/// and about sixty infra scripts still use GNU-only flags (`readlink -f`,
+/// `stat -c`, `date -d`). Porting them for a runner image we choose is
+/// cost without a consumer, so the choice is made here: a `-latest` label
+/// moves to a new image under us, a named one moves only by an edit to
+/// this file. The printed version is the instrument that measures whether
+/// a runner ships GNU or uutils, which no reader on the pod can see.
+#[test]
+fn the_mirror_ci_names_its_runner_image_and_prints_its_coreutils() {
+    let yml = mirror_ci();
+    let images: Vec<String> = yml
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("runs-on:"))
+        .map(|v| v.split('#').next().unwrap_or("").trim().to_owned())
+        .collect();
+    assert!(!images.is_empty(), "{MIRROR_CI} declares no `runs-on:`");
+    for image in &images {
+        assert!(
+            !image.is_empty() && !image.ends_with("-latest"),
+            "{MIRROR_CI} runs on `{image}` — a moving label swaps the runner's \
+             coreutils under the gate without an edit here; name the image \
+             (backlog 9b74c84b)"
+        );
+    }
+    assert!(
+        run_lines(&yml)
+            .iter()
+            .any(|l| l.contains("realpath --version")),
+        "{MIRROR_CI} does not print `realpath --version` — without it no record \
+         says which coreutils a mirror run's gate ran under (backlog 9b74c84b)"
+    );
+}
+
 #[test]
 fn run_lines_reads_both_forms_and_drops_comments() {
     let yml = "steps:\n  - run: infra/gate.sh\n  - name: x\n    run: |\n      # cargo test is prose here\n      set -eu\n      echo hi\n  - name: y\n    run: echo bye\n";

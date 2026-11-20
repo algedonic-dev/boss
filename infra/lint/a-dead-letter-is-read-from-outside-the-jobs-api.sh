@@ -102,7 +102,7 @@ jq -cn --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{ total: 1, data: [ { payload:
     >"$tmp/nodefs-page.json"
 # /api/dispatcher/readyz as DispatcherLiveness::snapshot renders it.
 cat >"$tmp/readyz.json" <<'JSON'
-{"ready":true,"assigning":true,"assignment_events":412,"rules_running":true,"rules_events":9031,
+{"ready":true,"rules_running":true,"rules_events":9031,
  "schedule_running":true,"schedule_events":3,"last_event_unix":1789300000,
  "dead_letters":5,"dead_letters_unrecorded":2,"last_dead_letter_unix":1789299000,
  "last_unrecorded_dead_letter_unix":1789298000}
@@ -132,9 +132,18 @@ for a in "$@"; do
 done
 printf '%s\t%s\n' "$method" "$url" >>"$LOG"
 case "$method $url" in
+    "GET "*/api/dispatcher/health)
+        if [[ "$READYZ_MODE" == malformed-health ]]; then
+            printf '%s\n' '{"dispatcher":'; exit 0
+        fi
+        if [[ "$READYZ_MODE" == ok ]]; then
+            printf '%s\n' '{"dispatcher":{"rules_consumer_lag":{"status":"observed","observed_at_unix":1789300000,"pending":1234,"ack_pending":12,"oldest_unacked_published_unix":1789299000},"rules_phase_costs":{"events":99},"rules_delivery_lanes":{"capability_version":1,"lanes":{"estate-watch":{"cutover":{"after_stream_sequence":10},"lag":{"status":"unobserved"}}}}}}'
+            exit 0
+        fi
+        echo 'health unavailable' >&2; exit 7 ;;
     "GET "*/api/dispatcher/readyz)
         case "$READYZ_MODE" in
-            ok) cat "$FIXTURES/readyz.json"; exit 0 ;;
+            ok|malformed-health) cat "$FIXTURES/readyz.json"; exit 0 ;;
             refused) echo "curl: (7) Failed to connect to $url port 7950: Connection refused" >&2; exit 7 ;;
             wrong-surface) printf '{"recorded":true}\n'; exit 0 ;;
             *) echo "curl stub: READYZ_MODE unset" >&2; exit 98 ;;
@@ -167,6 +176,11 @@ for field in dead_letters dead_letters_unrecorded last_unrecorded_dead_letter_un
     [[ "$t" == "number" ]] || { cat "$tmp/out-ok" >&2; fail "the posted observation's dispatcher.$field is $t, not a number (observation: $(jq -c .dispatcher "$posted"))"; }
 done
 unrec=$(jq -r '.dispatcher.dead_letters_unrecorded' "$posted")
+lag_pending=$(jq -r '.dispatcher.rules_consumer_lag.pending' "$posted")
+[[ "$lag_pending" == 1234 ]] || fail "dispatcher lag was not copied from health: $lag_pending"
+[[ $(jq -r '.dispatcher.rules_phase_costs.events' "$posted") == 99 ]] || fail 'dispatcher phase costs were not copied from health'
+[[ $(jq -r '.dispatcher.rules_delivery_lanes.capability_version' "$posted") == 1 ]] || fail 'delivery lane capability was dropped from the independent observation'
+[[ $(jq -r '.dispatcher.rules_delivery_lanes.lanes["estate-watch"].cutover.after_stream_sequence' "$posted") == 10 ]] || fail 'the recorded lane cutover was not conserved'
 [[ "$unrec" == "2" ]] || fail "dispatcher.dead_letters_unrecorded=$unrec, expected 2 as readyz reported it — a reading copied, not retyped"
 [[ "$(jq -r '.dispatcher_unread // empty' "$posted")" == "" ]] \
     || fail "a successful read still carried dispatcher_unread: $(jq -c .dispatcher_unread "$posted")"
@@ -198,5 +212,14 @@ posted="$tmp/posted-wrong-surface.json"
 [[ -n "$(jq -r '.dispatcher_unread // empty' "$posted")" ]] \
     || fail "a counter-less readyz body left no dispatcher_unread"
 
-echo "$name: ok — the observer carries the dispatcher's dead-letter counters off $svc:$port as numbers (unrecorded=2 in the fixture), an unreachable dispatcher degrades to dispatcher:null with curl's reason on the observation and the nodes intact, and a counter-less 200 is unread rather than zero"
+# ----- 4: malformed health cannot take the node observation down ----
+run_observer malformed-health; rc=$?
+[[ $rc -eq 0 ]] || { cat "$tmp/out-malformed-health" >&2; fail "malformed lag JSON aborted the observation (exit $rc)"; }
+posted="$tmp/posted-malformed-health.json"
+[[ $(jq -r '.nodes | length' "$posted") == 1 ]] || fail 'malformed health lost the node observation'
+[[ $(jq -r '.dispatcher.dead_letters_unrecorded' "$posted") == 2 ]] || fail 'malformed health lost the valid independent readyz counters'
+[[ $(jq -r '.dispatcher.rules_consumer_lag // null' "$posted") == null ]] || fail 'malformed health fabricated a lag observation'
+grep -q 'invalid health JSON' "$tmp/out-malformed-health" || fail 'malformed health was not diagnosed'
+
+echo "$name: ok — readyz counters and health lag are copied, unread or malformed health never aborts node reporting or fabricates zero lag"
 exit 0

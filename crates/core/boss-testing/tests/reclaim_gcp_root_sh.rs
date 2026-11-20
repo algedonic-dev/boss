@@ -1691,6 +1691,52 @@ fn refuses_a_backup_a_symlink_elsewhere_resolves_into() {
     c.refused(&["--dry-run"], &[], &["still linked to"]);
 }
 
+/// The shape review 5e3eb6f3 measured on d718cd0e: a reference spelled
+/// with a missing directory that `..` cancels, then a link that leads
+/// into the backup. GNU `realpath -m` follows that link; the first
+/// `kernel_path` folded the missing prefix and appended `indirect`
+/// unresolved, so the answer lay outside the backup and the guard
+/// passed it. `indirect` sits outside every link directory, so only the
+/// reference through it can be what refuses.
+fn indirect_into_a_backup(c: &Case) -> PathBuf {
+    let elsewhere = c.root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(
+        c.opt.join("boss-binbak-pre-latest-194355/bin"),
+        elsewhere.join("indirect"),
+    )
+    .unwrap();
+    elsewhere.join("missing/../indirect/boss-jobs-api")
+}
+
+#[test]
+fn refuses_a_backup_a_symlink_reaches_past_a_cancelled_missing_prefix() {
+    let c = Case::new("link-cancelled");
+    let target = indirect_into_a_backup(&c);
+    std::os::unix::fs::symlink(&target, c.links.join("boss-jobs-api")).unwrap();
+    c.refused(&["--dry-run"], &[], &["still linked to"]);
+}
+
+#[test]
+fn refuses_a_backup_a_loaded_unit_reaches_past_a_cancelled_missing_prefix() {
+    let c = Case::new("unit-cancelled");
+    let exec = indirect_into_a_backup(&c).display().to_string();
+    c.refused(
+        &["--dry-run"],
+        &[("STUB_EXEC", exec)],
+        &["boss-ops-runner.service", "LIVE"],
+    );
+}
+
+/// A link whose answer cannot be established is a refusal, not a skip:
+/// the guard used to `continue` past it, passing on no evidence.
+#[test]
+fn a_symlink_loop_in_a_link_directory_is_a_refusal() {
+    let c = Case::new("link-loop");
+    std::os::unix::fs::symlink("loop", c.links.join("loop")).unwrap();
+    c.refused(&["--dry-run"], &[], &["loop", "does not resolve"]);
+}
+
 #[test]
 fn refuses_a_backup_a_running_process_executes_from() {
     let c = Case::new("proc");

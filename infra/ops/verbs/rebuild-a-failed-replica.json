@@ -1,0 +1,33 @@
+{
+  "about": "MUTATING — delete ONE stuck, non-RW replica of ONE Longhorn volume through the forge ops_kubectl door so Longhorn rebuilds it at the SAME count (infra/forge/rebuild-a-failed-replica.sh <volume> <replica> <plan_sha256>). David directed it on 2026-11-04 (backlog 776bcb59) for the system of record's database volume, whose cp-2 copy sat in mode WO with its rebuild complete and never turned RW for five days while the other two served RW — a state no other volume door admits, and one Longhorn does not leave by itself while the engine counts that WO copy as a rebuild in progress. AUTHORISED PER RUN BY DAVID'S PASSKEY, design 17835005: the read-only plan-a-failed-replica-rebuild renders bytes onto the approve step, an allowed passkey signs them, and the runner hands this write sha256 of that SIGNED plan. The script re-renders current state and refuses a different hash before any write. THE BOUND IS THE SCRIPT'S: one attached pvc-<uuid> volume with exactly one running engine; N replicas with declared count N, N at least 3, none deleting; every other replica healthy and RW on N-1 distinct nodes; the named replica the sole copy not RW and not healthy; no rebuild in progress; robustness degraded; the named copy stalled at least BOSS_REBUILD_STALL_S (default 3600) by its own history marks. The declared count is never changed. THE WRITE: immediately before the delete, re-read the volume, engine and replicas and require the signed state exactly (volume uid, count, every replica's uid, node and disk, the modes, the named copy's signed history marks with its stall bound still met); then kubectl delete --raw of the named replica with preconditions.uid the signed uid, so a same-named replacement is never the object deleted. THE EFFECT: within BOSS_REBUILD_START_S (default 300) the named copy is gone and one new replica is listed, the retained copies still RW and healthy; within BOSS_REBUILD_READBACK_S (default 1200) N replicas, each healthy and RW, on N distinct nodes, the retained ones the same objects, spec.numberOfReplicas still N, robustness healthy. Only that complete read-back prints the declared effect. A rebuild that started and did not finish in the bound is one of two answers, the delete standing in both (backlog 090643a1: ops-request d326b6c7 answered FAILED at 1200 s on a 73 GB copy still being written, which read healthy 21 to 37 minutes after it started): IN PROGRESS, exit 75, when the replicas or the engine rebuild progress moved within BOSS_REBUILD_PROGRESS_S (default 600), naming the volume so rule rebuild-a-failed-replica-in-progress-files-its-read-back files the read-only read-a-replica-rebuild of it; STALLED, exit 1, when nothing moved that long, which the same rule files as an urgent alarm with every other failure of this verb. Initial refusals exit 78 without writes. Timeout 1800 is the runner's bound over the pull, the reads, the start watch and the read-back.",
+  "hosts": [
+    "forge"
+  ],
+  "requires_approval": true,
+  "plan_verb": "plan-a-failed-replica-rebuild",
+  "approvers": [
+    "emp-david"
+  ],
+  "argv": [
+    "infra/forge/rebuild-a-failed-replica.sh",
+    "{1}",
+    "{2}",
+    "{3}"
+  ],
+  "params": [
+    {
+      "name": "volume",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    {
+      "name": "replica",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-r-[0-9a-f]{8}$"
+    },
+    {
+      "name": "plan_sha256",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  ],
+  "timeout": 1800,
+  "effect": "^rebuild-a-failed-replica: pvc-[0-9a-f-]{36} has [0-9]+ healthy RW replicas on [0-9]+ distinct nodes \\([a-z0-9-]+(, [a-z0-9-]+)*\\) — [0-9a-z-]+-r-[0-9a-f]{8} is gone, rebuilt as [0-9a-z-]+-r-[0-9a-f]{8} on [a-z0-9-]+ — read back: spec\\.numberOfReplicas=[0-9]+ unchanged, robustness healthy"
+}

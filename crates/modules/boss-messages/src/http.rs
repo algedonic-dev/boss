@@ -35,6 +35,8 @@ fn is_trusted(user: &User) -> bool {
     user.access_tier == AccessTier::Operator
 }
 
+const UNREAD_ROUTE: &str = "/api/messages/unread/{employee_id}";
+
 pub struct MessageApiState<R: MessageRepository> {
     pub messages: Arc<R>,
     pub publisher: Option<DomainPublisher>,
@@ -49,12 +51,20 @@ pub struct MessageApiState<R: MessageRepository> {
     pub classes_client: Option<Arc<dyn ClassesClient>>,
 }
 
+pub fn latency_classify(
+    method: &str,
+    matched_path: &str,
+) -> Option<boss_core::request_latency::Class> {
+    (method == "GET" && matched_path == UNREAD_ROUTE)
+        .then_some(boss_core::request_latency::Class::SmallRead)
+}
+
 pub fn router<R: MessageRepository + 'static>(state: MessageApiState<R>) -> Router {
     let shared = Arc::new(state);
     Router::new()
         .route("/api/messages/health", get(health))
         .route("/api/messages/inbox/{employee_id}", get(inbox::<R>))
-        .route("/api/messages/unread/{employee_id}", get(unread::<R>))
+        .route(UNREAD_ROUTE, get(unread::<R>))
         .route(
             "/api/messages/{id}",
             get(get_message::<R>).delete(delete_message::<R>),
@@ -572,6 +582,70 @@ fn send_refused(e: MessageError) -> Response {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn unread_timing_is_recorded_at_its_backend_once_without_changing_authorization() {
+        use boss_core::request_latency::{Recorder, RecorderError, Sample, Timing, mount};
+        struct Sink(std::sync::Mutex<Vec<Sample>>);
+        #[async_trait::async_trait]
+        impl Recorder for Sink {
+            async fn record(&self, samples: &[Sample]) -> Result<(), RecorderError> {
+                self.0.lock().unwrap().extend_from_slice(samples);
+                Ok(())
+            }
+        }
+        let sink = std::sync::Arc::new(Sink(std::sync::Mutex::new(Vec::new())));
+        let (timing, worker) = Timing::start(
+            sink.clone(),
+            "messages".into(),
+            "fixture".into(),
+            std::sync::Arc::new(boss_clock_client::wall_now),
+            super::latency_classify,
+        );
+        let app = mount(test_app(), timing);
+        for (actor, expected) in [
+            ("emp-001", StatusCode::OK),
+            ("other", StatusCode::FORBIDDEN),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/messages/unread/emp-001")
+                        .header("x-boss-user", as_user(actor, AccessTier::User))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/messages/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        worker.shutdown().await;
+        let rows = sink.0.lock().unwrap();
+        let rows = rows
+            .iter()
+            .filter(|s| s.class != boss_core::request_latency::Class::Recording)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.len(),
+            2,
+            "one backend sample per unread request, including refusal; none for health"
+        );
+        assert!(
+            rows.iter().all(|r| r.service == "messages"
+                && r.class == boss_core::request_latency::Class::SmallRead)
+        );
+    }
     use super::*;
     use axum::body::Body;
     use axum::http::Request;

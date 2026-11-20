@@ -120,6 +120,47 @@ deposit_config_apply() {
     bash "$(dirname "${BASH_SOURCE[0]}")/../cluster/apply-deposit-config.sh" "$@"
 }
 
+# Isolate claims before ordinary apply. Existing claims are audit-only;
+# the caller creates absent claims individually and never resizes a PVC.
+standalone_pvc_preserve() {
+    local k="$1" directory="$2" receipt="$3"
+    local roster=()
+    if [ -n "${RENDER_DIR:-}" ]; then
+        roster=(--rendered "$RENDER_DIR")
+    fi
+    python3 -B "$REPO/infra/forge/standalone-pvc.py" "$directory" --stage "$k" \
+        --originals "$REPO/infra/cluster/manifests" "${roster[@]}" --receipt "$receipt"
+    if declare -F run_summary_note >/dev/null; then
+        local refusal
+        while IFS= read -r refusal; do
+            run_summary_note "$refusal"
+        done < <(jq -r --arg instance "${directory##*/}" '.[] |
+            select(.apply_state == "held_back_stage_refusal" or .apply_state == "stage_refusal") |
+            "standalone PVC stage refused: instance \($instance), \(.namespace // "unknown")/\(.claim // "unknown"): \(.reason)"' "$receipt")
+    fi
+    local writeback
+    writeback="${receipt%.receipt.json}.writeback.json"
+    if ! bash "$REPO/infra/forge/pvc-tree-writeback.sh" "$receipt" converge "$writeback"; then
+        jq -n --slurpfile observations "$receipt" \
+            '{outcomes:[{state:"recording_debt",reason:"writeback helper failed; no recording claimed",observations:$observations[0]}],transport_records:[]}' > "$writeback"
+        echo 'standalone-pvc: write-back recording debt remains; staged claim preservation is independent' >&2
+    fi
+    if declare -F run_summary_json_file >/dev/null; then
+        local all="$APPLY_DIR/standalone-pvc-all.json"
+        if jq -s 'add' "$APPLY_DIR"/standalone-pvc-*.receipt.json > "$all"; then
+            run_summary_json_file standalone_pvc "$all"
+        else
+            echo 'standalone-pvc: combined receipt unread; per-instance receipts retained' >&2
+        fi
+        if jq -s '{outcomes:[.[].outcomes[]],transport_records:[.[].transport_records[]]}' \
+            "$APPLY_DIR"/standalone-pvc-*.writeback.json > "$APPLY_DIR/standalone-pvc-writebacks.json"; then
+            run_summary_json_file pvc_tree_writeback "$APPLY_DIR/standalone-pvc-writebacks.json"
+        else
+            echo 'standalone-pvc: combined writeback unread; recording debt receipts retained' >&2
+        fi
+    fi
+}
+
 # kubectl create --dry-run=client -o json emits one document per input
 # YAML object, not a List. Count the COMPLETE producer sequence against
 # the source before making one canonical typed envelope (877ad378).
@@ -199,10 +240,16 @@ roll_deployment() {
     local k="$1" registry="$2" head="$3" last_good="$4" failed_file="$5" ns="${6:-boss}"
     local pre_image
     pre_image=$($k get deploy boss -n "$ns" -o jsonpath='{.spec.template.spec.containers[0].image}')
+    outgoing_follow "$k" "$ns"
     _patch_boss_image "$k" "$registry:$head" "$ns"
     if $k rollout status deploy/boss -n "$ns" --timeout=420s; then
+        outgoing_last_words "$ns"
         return 0
     fi
+    # `Recreate`: the outgoing pod is gone by now whether or not HEAD
+    # came up, so what it said is complete — and a bricked head is
+    # exactly when it is wanted.
+    outgoing_last_words "$ns"
     echo "$head" > "$failed_file"
     local target
     if [ -n "$last_good" ] && [ "$last_good" != "none" ]; then
@@ -218,6 +265,97 @@ roll_deployment() {
         echo "cluster-deploy-runner: ROLLBACK OF $ns TO $target ALSO FAILED — the instance needs hands NOW" >&2
     fi
     return 1
+}
+
+# THE OUTGOING POD'S LAST WORDS (backlog d44ac67f). A `Recreate` roll
+# deletes the old pod and its log with it, and that log is the ONLY
+# place a dying process can say why it could not state its end: the
+# ERROR line `Evidence::end` writes (every attempt, how it ended, after
+# how long), the SIGTERM watcher's "did not state its end within 10s",
+# and the launcher's own "launcher SIGTERM" line, which says the signal
+# arrived at all. It cannot write any of that to the log it is failing
+# to reach, and the next process cannot know it. On 2026-10-22 the rolls
+# at 16:31Z and 17:11Z stated 2 of 21 and 0 of 21 machine-gate ends,
+# took 75 and 76 s against ~41 s for the eleven around them, and reset
+# the clean window that gates the machine token's enforce (6805c764) —
+# and the cause died with the pod, both times. This runner holds the
+# admin credential, owes nothing to the pod it rolls and is already
+# watching the roll, so it is the reader that outlives the pod.
+#
+# outgoing_follow K NAMESPACE
+#   Before the patch, while the pod still exists: follow the Running
+#   boss pod's log from now (`--since-time`, so only what it says while
+#   it is rolled) into a file under the converge's state directory, in
+#   the background, bounded by BOSS_OUTGOING_FOLLOW_S. Sets the
+#   _OUTGOING_* globals outgoing_last_words reads — a background job's
+#   pid can only be waited on by the shell that started it, so this
+#   cannot answer through a command substitution. Never fails the roll.
+outgoing_follow() {
+    local k="$1" ns="$2" dir
+    _OUTGOING_POD="" _OUTGOING_PID="" _OUTGOING_LOG="" _OUTGOING_WHY=""
+    _OUTGOING_SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    _OUTGOING_POD=$($k get pods -n "$ns" -l app=boss --field-selector=status.phase=Running \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || _OUTGOING_POD=""
+    if [ -z "$_OUTGOING_POD" ]; then
+        _OUTGOING_WHY="no Running boss pod in $ns before the patch — nothing was rolled out from under, or the read was refused"
+        return 0
+    fi
+    dir="${BOSS_OUTGOING_DIR:-${CONVERGE_STATE:-/var/lib/boss/converge}/outgoing}"
+    if ! mkdir -p "$dir" 2>/dev/null; then
+        _OUTGOING_WHY="$dir could not be created, so $_OUTGOING_POD's log was not followed"
+        _OUTGOING_POD=""
+        return 0
+    fi
+    # Kept two weeks: long enough for the next reader of a dropped roll.
+    find "$dir" -maxdepth 1 -name '*.log' -mtime +14 -delete 2>/dev/null || true
+    _OUTGOING_LOG="$dir/$ns-$(date -u +%Y%m%dT%H%M%SZ)-$_OUTGOING_POD.log"
+    # shellcheck disable=SC2086 # $k is a command line (docker run … kubectl)
+    timeout "${BOSS_OUTGOING_FOLLOW_S:-600}" $k logs -n "$ns" "pod/$_OUTGOING_POD" -c boss \
+        -f --timestamps --since-time="$_OUTGOING_SINCE" </dev/null >"$_OUTGOING_LOG" 2>&1 &
+    _OUTGOING_PID=$!
+    # Let the stream attach before the patch starts the termination.
+    sleep "${BOSS_OUTGOING_CONNECT_S:-2}"
+}
+
+# outgoing_last_words NAMESPACE
+#   After the rollout returns (the old pod is gone under `Recreate`):
+#   wait for the follower, keep its whole capture where it is, and
+#   record `outgoing_pod_<NAMESPACE>` on the run summary — the pod, the
+#   follower's exit, whether the launcher saw SIGTERM, the first and
+#   last instants it said anything, and every `gate evidence` line (up
+#   to 20, each up to 500 characters, colour codes stripped). The
+#   journal gets the same lines. Never fails the roll.
+outgoing_last_words() {
+    local ns="$1" rc=0 said
+    if [ -z "${_OUTGOING_POD:-}" ]; then
+        echo "cluster-deploy-runner: outgoing pod in $ns not followed: ${_OUTGOING_WHY:-unknown}" >&2
+        command -v run_summary_json >/dev/null 2>&1 || return 0
+        said=$(jq -nc --arg why "${_OUTGOING_WHY:-unknown}" '{followed: false, why: $why}' 2>/dev/null) || return 0
+        run_summary_json "outgoing_pod_$ns" "$said"
+        return 0
+    fi
+    wait "$_OUTGOING_PID" || rc=$?
+    said=$(jq -Rn --arg pod "$_OUTGOING_POD" --arg since "$_OUTGOING_SINCE" \
+        --arg capture "$_OUTGOING_LOG" --argjson rc "$rc" '
+        [inputs | gsub("\u001b\\[[0-9;]*m"; "")] as $l
+        | [$l[] | select(test("gate evidence"))] as $g
+        | {followed: true, pod: $pod, since: $since, follow_rc: $rc,
+           lines: ($l | length),
+           sigterm_seen: any($l[]; test("launcher SIGTERM")),
+           first_at: (($l[0] // "") | split(" ")[0]),
+           last_at: (($l[-1] // "") | split(" ")[0]),
+           gate_evidence_lines: ($g | length),
+           gate_evidence: [$g[:20][] | .[0:500]],
+           capture: $capture}' <"$_OUTGOING_LOG" 2>/dev/null) || said=""
+    if [ -z "$said" ]; then
+        echo "cluster-deploy-runner: outgoing pod $_OUTGOING_POD in $ns: its capture at $_OUTGOING_LOG could not be read back (follow rc $rc)" >&2
+        return 0
+    fi
+    echo "cluster-deploy-runner: outgoing pod $_OUTGOING_POD in $ns: $(jq -r '"follow rc \(.follow_rc), \(.lines) line(s), launcher SIGTERM seen: \(.sigterm_seen), \(.gate_evidence_lines) gate evidence line(s)"' <<<"$said"); capture kept at $_OUTGOING_LOG" >&2
+    jq -r '.gate_evidence[] | "  " + .' <<<"$said" >&2 || true
+    command -v run_summary_json >/dev/null 2>&1 || return 0
+    run_summary_json "outgoing_pod_$ns" "$said"
+    return 0
 }
 
 _patch_boss_image() {
@@ -1145,14 +1283,40 @@ observe_connector() {
 # instance the secret gate skipped has no gateway running and is
 # recorded unreachable for the reason the packet already names.
 #
+# NOR DOES IT HOLD THE TICK (review b843ec40 R1). Every cluster read
+# here is bounded twice — kubectl's own --request-timeout, and a
+# `timeout` around the whole command, because `$K` is a `docker run`
+# and a client that never connects never reaches a request timeout —
+# by BOSS_SITE_READ_TIMEOUT, 10 s, the bound each curl already carries.
+# The reviewer sourced this lib under set -euo pipefail with a kubectl
+# that slept on the ConfigMap read: the call never returned, and the
+# summary was never written. A read that hits the bound is recorded as
+# one that "did not answer within N s" and the observation goes on.
+# The page phase also stops at an overall deadline,
+# BOSS_SITE_OBSERVE_SECONDS (60 s from the start of observe_sites,
+# checked before every ConfigMap and page read), recording
+# `pages_unread` with how far it got — a serial bound per page is not
+# a bound on a site with many pages.
+#
+# site_bounded — the seconds one cluster read may take.
+site_bounded() { printf '%s\n' "${BOSS_SITE_READ_TIMEOUT:-10}"; }
+
 # site_reach K NS — `ip:port` of Service boss-gateway in NS, or nothing
 #   and rc 1 when the Service has no LoadBalancer address (not yet
 #   assigned, not created, or a read the credential could not make —
-#   none of which is an address the runner may guess).
+#   none of which is an address the runner may guess), rc 2 when the
+#   read did not answer within its bound.
 site_reach() {
-    local k="$1" ns="$2" addr
-    addr=$($k get svc boss-gateway -n "$ns" \
-        -o 'jsonpath={.status.loadBalancer.ingress[0].ip}:{.spec.ports[0].port}' 2>/dev/null) || addr=""
+    local k="$1" ns="$2" addr rc=0 bound
+    bound=$(site_bounded)
+    # shellcheck disable=SC2086 # $k is a command line, split on purpose
+    addr=$(timeout -k 5 "$bound" $k get svc boss-gateway -n "$ns" --request-timeout="${bound}s" \
+        -o 'jsonpath={.status.loadBalancer.ingress[0].ip}:{.spec.ports[0].port}' 2>/dev/null) || rc=$?
+    case "$rc" in
+        0) ;;
+        124 | 137) return 2 ;;
+        *) addr="" ;;
+    esac
     case "$addr" in
         '' | :*) return 1 ;;
     esac
@@ -1168,7 +1332,7 @@ site_read() {
     local addr="$1" site="$2" ns="$3" body code why rc=0 observed_at
     body=$(mktemp -t site-body.XXXXXX)
     observed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    code=$(curl -sS --max-time 10 -o "$body" -w '%{http_code}' \
+    code=$(curl -q -sS --max-time 10 -o "$body" -w '%{http_code}' \
         -H "Host: $site" "http://$addr/" 2>"$body.err") || rc=$?
     if [ "$rc" -ne 0 ]; then
         why=$(tr '\n' ' ' <"$body.err" | sed 's/[[:space:]]*$//')
@@ -1180,6 +1344,103 @@ site_read() {
             '{host: $h, namespace: $n, http_status: ($s | tonumber), bytes: ($b | tonumber), hash: $x, observed_at: $t}'
     fi
     rm -f "$body" "$body.err"
+}
+
+# EVERY STAGED PAGE, NOT ONLY `/` (backlog 96e171bf; design f89a241f
+# D3). The tenant workflow publish-a-blog-post closes its `live` step on
+# the converge's record of the POST, not of the landing page: the
+# publish step records `site_hash` = sha256 of site/blog-<slug>.html at
+# the merge, and the rule matches it against
+# `steps.run.site.pages./blog-<slug>.html`. So beside `hash` (which
+# stays the hash of `/`, and so publish-the-landing-page reads exactly
+# what it did) the site object carries `pages` — `/<file>` to the
+# sha256 of the body served for it — for every `.html` key of the
+# `boss-site` ConfigMap: the pages the converge DELIVERED, read off the
+# cluster, never a list re-derived from a checkout the unchanged tick
+# does not hold. Each read is the visitor's: GET /<file> with the site
+# Host, the body to a file, the same ten-second bound as `/`.
+#
+# A page that cannot be read records WHY in its place — `{unreachable:
+# <curl's words>}` or `{http_status: N}` for any answer but 200 —
+# never a hash, because the hash of a 404 body is not the hash of a
+# page and a reader comparing hashes must not be handed one. A
+# ConfigMap that cannot be read records `pages_unread` in kubectl's
+# words. And nothing here is fatal: when `/` did not answer, no page is
+# asked at all, so a dark gateway costs the tick one bound, not one per
+# page.
+#
+# site_page ADDR SITE PATH — one GET of PATH at ADDR with `Host: SITE`.
+#   Prints the JSON value `pages` records for PATH: the sha256 string
+#   for a 200, `{http_status}` for any other answer, `{unreachable}` for
+#   none.
+site_page() {
+    local addr="$1" site="$2" path="$3" body code why rc=0 out
+    body=$(mktemp -t site-page.XXXXXX) || {
+        jq -nc '{unreachable: "mktemp refused: no body file to read the page into"}'
+        return 0
+    }
+    code=$(curl -q -sS --max-time 10 -o "$body" -w '%{http_code}' \
+        -H "Host: $site" "http://$addr$path" 2>"$body.err") || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        why=$(tr '\n' ' ' <"$body.err" | sed 's/[[:space:]]*$//')
+        out=$(jq -nc --arg u "${why:-curl exited $rc}" '{unreachable: $u}')
+    elif [ "$code" = 200 ]; then
+        out=$(jq -nc --arg x "$(sha256sum <"$body" | cut -d' ' -f1)" '$x')
+    else
+        out=$(jq -nc --arg s "$code" '{http_status: ($s | tonumber)}')
+    fi
+    rm -f "$body" "$body.err"
+    printf '%s\n' "$out"
+}
+
+# site_pages K ADDR SITE NS DEADLINE — every `.html` key of ConfigMap
+#   boss-site in NS, read through site_page while `date +%s` is before
+#   DEADLINE. Prints ONE JSON object to merge into the site object:
+#   `{pages: {"/<file>": <site_page value>, …}}`; `{pages_unread: <why>}`
+#   when the ConfigMap could not be read in its bound or the deadline
+#   had already passed; both, when the deadline passed part way.
+site_pages() {
+    local k="$1" addr="$2" site="$3" ns="$4" deadline="$5"
+    local err files why f rc=0 pages='{}' bound total got=0
+    local late="the site observation's ${BOSS_SITE_OBSERVE_SECONDS:-60} s deadline passed"
+    bound=$(site_bounded)
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+        jq -nc --arg u "$late before ConfigMap boss-site in $ns was read" '{pages_unread: $u}'
+        return 0
+    fi
+    err=$(mktemp -t site-pages.XXXXXX) || {
+        jq -nc --arg u "cannot read ConfigMap boss-site in $ns: mktemp refused" '{pages_unread: $u}'
+        return 0
+    }
+    # shellcheck disable=SC2016,SC2086 # a go-template, not a shell expansion; $k is a command line
+    files=$(timeout -k 5 "$bound" $k get configmap boss-site -n "$ns" --request-timeout="${bound}s" \
+        -o 'go-template={{range $key, $v := .data}}{{$key}}{{"\n"}}{{end}}' 2>"$err") || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        case "$rc" in
+            124 | 137) why="did not answer within $bound s" ;;
+            *) why=$(tr '\n' ' ' <"$err" | sed 's/[[:space:]]*$//') ;;
+        esac
+        rm -f "$err"
+        jq -nc --arg u "cannot read ConfigMap boss-site in $ns: ${why:-kubectl exited $rc}" '{pages_unread: $u}'
+        return 0
+    fi
+    rm -f "$err"
+    total=0
+    while IFS= read -r f; do
+        case "$f" in *.html) total=$((total + 1)) ;; esac
+    done <<< "$files"
+    while IFS= read -r f; do
+        case "$f" in *.html) ;; *) continue ;; esac
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            jq -nc --argjson p "$pages" --arg u "$late with $got of $total pages read" \
+                '{pages: $p, pages_unread: $u}'
+            return 0
+        fi
+        pages=$(printf '%s' "$pages" | jq -c --arg p "/$f" \
+            --argjson v "$(site_page "$addr" "$site" "/$f")" '. + {($p): $v}')
+        got=$((got + 1))
+    done <<< "$files"
+    jq -nc --argjson p "$pages" '{pages: $p}'
 }
 
 # site_unreachable SITE NS WHY — the same object for an instance that
@@ -1195,7 +1456,8 @@ site_unreachable() {
 #   summary:
 #     site        the object above, for the SOURCE instance's site —
 #                 the one the tenant rule reads as steps.run.site.* —
-#                 or the first declared when the source declares none
+#                 or the first declared when the source declares none;
+#                 an answered site also carries `pages` (site_pages)
 #     sites       every declared site's object, keyed by host — only
 #                 when more than one instance declares one
 #     site_line   one line per instance, `; `-joined, in row order:
@@ -1206,18 +1468,28 @@ site_unreachable() {
 #   parsed by the one parser (instances-skipped.lib.sh).
 observe_sites() {
     local k="$1" instances="$2" source_ns="$3" skipped="$4"
-    local iname ins_ns _t _s _h _share _r _f site addr obj reason
+    local iname ins_ns _t _s _h _share _r _f site addr obj reason rc deadline
     local line="" sites='{}' first="" source_obj="" n=0
+    deadline=$(($(date +%s) + ${BOSS_SITE_OBSERVE_SECONDS:-60}))
     # shellcheck source=infra/cluster/instances-skipped.lib.sh
     . "$(dirname "${BASH_SOURCE[0]}")/../cluster/instances-skipped.lib.sh"
     while IFS="$IFS_ROW" read -r iname ins_ns _t _s _h _share _r _f site; do
         [ -n "$site" ] || continue
         n=$((n + 1))
         reason=$(BOSS_INSTANCES_SKIPPED="$skipped" skip_reason "$ins_ns")
+        rc=0
         if [ -n "$reason" ]; then
             obj=$(site_unreachable "$site" "$ins_ns" "$ins_ns skipped ($reason)")
-        elif addr=$(site_reach "$k" "$ins_ns"); then
+        elif addr=$(site_reach "$k" "$ins_ns") || { rc=$?; false; }; then
             obj=$(site_read "$addr" "$site" "$ins_ns")
+            # `false` asked for by name: silence from jq is not an
+            # answered site, and no page is read on it (d96e38ab).
+            if [ "$(printf '%s' "$obj" | jq -r 'has("unreachable")')" = false ]; then
+                obj=$(printf '%s' "$obj" | jq -c \
+                    --argjson p "$(site_pages "$k" "$addr" "$site" "$ins_ns" "$deadline")" '. + $p')
+            fi
+        elif [ "$rc" -eq 2 ]; then
+            obj=$(site_unreachable "$site" "$ins_ns" "the read of Service boss-gateway in $ins_ns did not answer within $(site_bounded) s")
         else
             obj=$(site_unreachable "$site" "$ins_ns" "no LoadBalancer address on Service boss-gateway in $ins_ns")
         fi
@@ -1508,13 +1780,66 @@ converge_hold_report() {
 # never-waits-on-its-visibility), and the maintenance packet's
 # ExecStopPost verdict is the record either way.
 
-# take_converge_requests STATE — move every id in STATE's inbox into
+# take_converge_requests STATE INBOX — move every id in the named inbox into
 # this run's file. Idempotent (the run that the first one hands over to
 # runs it again and finds the inbox already taken).
 take_converge_requests() {
-    local inbox="$1/requests" mine="$1/requests.run"
+    local inbox="${2:?take_converge_requests needs its configured inbox}" mine="$1/requests.run"
     [ -f "$inbox" ] || return 0
     cat "$inbox" >> "$mine" && rm -f "$inbox"
+}
+
+# report_rolled STEP_SCRIPT SHA — say THAT THE ROLL HAPPENED the moment
+# it did (backlog 090720c3). Writes `rolled` (the full sha) and
+# `rolled_at` onto this run's own maintenance packet, on its still-open
+# `run` step, through boss-step.sh's metadata-only door; the dispatcher
+# rule complete-train-converged-on-runner-rolled reacts to that write
+# and converges the train that merged SHA.
+#
+# WHY NOW AND NOT AT THE END. Everything else this run knows reaches its
+# packet through the run summary, which ExecStopPost hands boss-step when
+# the WHOLE run ends — after the other instances, the verification and
+# the orphan sweep. A train waited for that, and then for the conductor's
+# next two-minute reconcile: measured 2026-10-18 over 51 trains, 72 s p50
+# and 138 s p90 of track time after the cluster already served the merge.
+#
+# BOSS_RUN_SUMMARY_FILE IS NOT HANDED OVER. boss-step reads and deletes
+# the summary it is given; mid-run that would take the run's facts so
+# far and leave ExecStopPost a summary without them. The same two keys
+# are put in the summary as well, so a write the record refused now is
+# recovered when the run ends (a later write of the same step re-fires
+# the rule; it is idempotent).
+#
+# Visibility, never a precondition (the unit's `ExecStartPre=-`, said
+# again here): the roll is real whatever the record answers, so a refused
+# write is one line and the run goes on.
+#
+# BOUNDED, because this runs inside ExecStart (review ffb8efa0, B1).
+# boss-step.sh sends through boss-api-curl.sh, which sets no --max-time
+# and re-sends a refused connect for 150 s, so a jobs API that accepts
+# the connection and never answers held the converge until
+# TimeoutStartSec=90min: the later stages never ran, the run was
+# recorded failed, and the converge carrying the fix could not start.
+# Every other mid-run read here is bounded (5, 10, 15 s). So the whole
+# write gets BOSS_REPORT_ROLLED_TIMEOUT seconds (default 20) and its
+# refused-connect window ends inside that, at a third of it; the source
+# instance has just answered its rollout, so the window is for a blip,
+# and anything the bound cuts is still carried by the summary.
+report_rolled() {
+    local step_script="$1" sha="$2" at
+    local bound="${BOSS_REPORT_ROLLED_TIMEOUT:-20}"
+    case "$bound" in '' | *[!0-9]* | 0) bound=20 ;; esac
+    at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    run_summary_field rolled "$sha"
+    run_summary_field rolled_at "$at"
+    if timeout -k 5 "$bound" env -u BOSS_RUN_SUMMARY_FILE BOSS_STEP_METADATA_ONLY=1 \
+        BOSS_API_RETRY_DEADLINE=$((bound / 3)) \
+        "$step_script" maintenance-cluster-converge run "rolled=$sha" "rolled_at=$at"; then
+        echo "cluster-deploy-runner: reported rolled=$sha at $at on this run's packet"
+    else
+        echo "cluster-deploy-runner: could not record rolled=$sha on this run's packet now (refused, or no answer within ${bound}s) — the run summary carries it to the end of the run, and the conductor's reconcile converges the train meanwhile" >&2
+    fi
+    return 0
 }
 
 # answer_converge_requests STATE KEY VALUE — PATCH {KEY: VALUE} onto the
@@ -1551,7 +1876,7 @@ answer_converge_requests() {
             *[!0-9a-fA-F-]*)
                 echo "cluster-deploy-runner: ignoring a malformed request id in $mine" >&2; continue ;;
         esac
-        code=$(printf '%s' "$body" | curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
+        code=$(printf '%s' "$body" | curl -q -s -o /dev/null -w '%{http_code}' --max-time 15 \
             -X PATCH -H 'content-type: application/json' \
             ${CDL_MT_HDR:+-H "$CDL_MT_HDR"} \
             -H 'x-boss-user: {"id":"automation:cluster-deploy-runner","role":"platform-admin","access_tier":"operator"}' \

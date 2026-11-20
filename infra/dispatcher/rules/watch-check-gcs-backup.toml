@@ -6,8 +6,15 @@ jobs.job.closed carries neither output nor exit. Backlog 3a68ab36 requires
 failed readback to be recorded and read. ops.judge alarms on a failed or
 refused run or absent verdict; a successful archive check needs no follow-on.
 """
+version = 2
 on_event = "jobs.job.closed"
-when = 'kind = "ops-request" AND (outcome = "answered" OR outcome = "refused")'
+# `failed` and `indeterminate` are how the ops-request row closes a verb
+# that RAN with a nonzero or an unknown exit (design b7bb1625, backlog
+# 50a1578f); before that row it closed `answered` whatever the exit, so
+# this rule hears exactly the runs it heard before, and its judge still
+# reads the exit off the execute record. Pinned by boss-dispatcher's
+# an_ops_request_rule_that_hears_an_answer_hears_a_failure.
+when = 'kind = "ops-request" AND (outcome = "answered" OR outcome = "failed" OR outcome = "indeterminate" OR outcome = "refused")'
 [[rule.do]]
 handler = "ops.judge"
 args = { verb = '"check-gcs-backup"', verdict_pattern = '"^check-gcs-backup: READ . remote archive integrity verified$"', when = '"true"' }

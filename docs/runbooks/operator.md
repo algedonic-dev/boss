@@ -98,7 +98,9 @@ of record: take a manual backup first (above) so you can compare.
 ### The procedure
 
 The shape is the migration-as-log-copy sequence
-(`docs/design/dev-cluster.md` §The migration is a copy of the log;
+("The migration is a copy of the log", in
+`docs/architecture-decisions.md` §Deployment, the forge, and the
+cluster;
 `infra/cluster/restore-log-copy.sh` is its executable form for a
 log-copy tarball):
 
@@ -280,8 +282,9 @@ After any break-glass intervention:
 
 - [`infra/forge/OPERATIONS.md`](../../infra/forge/OPERATIONS.md) —
   the forge host: units, failure modes in the order they happened.
-- [`docs/design/dev-cluster.md`](../design/dev-cluster.md) — topology,
-  bring-up, the migration-as-log-copy restore shape.
+- [`docs/architecture-decisions.md`](../architecture-decisions.md)
+  §Deployment, the forge, and the cluster — the topology decisions and
+  the migration-as-log-copy restore shape.
 - [`docs/runbooks/playground-baseline.md`](playground-baseline.md) —
   re-cutting a demo tenant's frozen baseline.
 - [`infra/postgres/validate-brewery-sim.sh`](../../infra/postgres/validate-brewery-sim.sh)

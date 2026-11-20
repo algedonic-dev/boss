@@ -9,10 +9,10 @@ async function readBody(page: Page, body: string): Promise<void> {
     title: 'Welcome', body, audience: { all: true }, current_version: 1,
     published: true, created_at: '2026-09-16T12:00:00Z', updated_at: '2026-09-16T12:00:00Z',
   };
-  await page.route(/\/api\/content\/manual$/, (r) => r.fulfill({ json: [section] }));
+  await page.route(/\/api\/content\/manual-index$/, (r) => r.fulfill({ json: [section] }));
   await page.route(/\/api\/content\/manual\/welcome$/, (r) => r.fulfill({ json: section }));
   await page.route(/\/api\/people\/emp-001$/, (r) => r.fulfill({ json: { id: 'emp-001', name: 'Rhea <HR>' } }));
-  await mountPage(page, '/ux/manual/welcome', { titleMatch: /Company manual/ });
+  await mountPage(page, '/engineering/manual/welcome', { titleMatch: /Company manual/ });
 }
 
 test('the authored seed shape and ordinary markdown render as semantic content', async ({ page }) => {
@@ -24,27 +24,28 @@ test('the authored seed shape and ordinary markdown render as semantic content',
   await expect(body.locator('li')).toHaveCount(2);
   await expect(body.locator('blockquote')).toHaveText('Remember');
   await expect(body.locator('code')).toHaveText('literal_underscore');
-  await expect(body.getByRole('link', { name: 'Rhea <HR>' })).toHaveAttribute('href', '/ux/people/emp-001');
+  // An employee is named, not linked: the people page went with step 1
+  // of design 01fa5bdf, and a link would land on not-found.
+  await expect(body.locator('span.entity-link', { hasText: 'Rhea <HR>' })).toHaveAttribute('title', 'emp-001');
+  await expect(body.getByRole('link', { name: 'Rhea <HR>' })).toHaveCount(0);
 });
 
 test('hostile prose and labels stay text; code and authored links do not become nested entity links', async ({ page }) => {
-  await readBody(page, '<img src=x onerror="window.manualInjected=true">\n\n[x](javascript:alert(1))\n\n`emp-001`\n\n[emp-001](/ux/people/emp-001)\n\nAsk emp-001.');
+  await readBody(page, '<img src=x onerror="window.manualInjected=true">\n\n[x](javascript:alert(1))\n\n`emp-001`\n\n[emp-001](/ux/jobs)\n\nAsk emp-001.');
   const body = page.locator('.manual-article-body');
   await expect(body.locator('img, script')).toHaveCount(0);
   await expect(body.locator('a[href^="javascript:"]')).toHaveCount(0);
   await expect(body.locator('code')).toHaveText('emp-001');
-  await expect(body.locator('code a, a a')).toHaveCount(0);
-  await expect(body.locator('a')).toHaveCount(2);
-  await expect(body.getByRole('link', { name: 'Rhea <HR>' })).toBeVisible();
+  await expect(body.locator('code a, a a, code span.entity-link, a span.entity-link')).toHaveCount(0);
+  // The authored link only: the shortcode is named as text.
+  await expect(body.locator('a')).toHaveCount(1);
+  await expect(body.locator('span.entity-link', { hasText: 'Rhea <HR>' })).toBeVisible();
   expect(await page.evaluate(() => Reflect.get(window, 'manualInjected'))).toBeUndefined();
 });
 
-test('plain bodies retain readable text and shortcode navigation', async ({ page }) => {
+test('plain bodies retain readable text and name a shortcode by its employee', async ({ page }) => {
   await readBody(page, 'Questions go to emp-001.');
-  const link = page.locator('.manual-article-body').getByRole('link', { name: 'Rhea <HR>' });
-  await link.click();
-  await expect(page).toHaveURL(/\/ux\/people\/emp-001$/);
-  await page.goBack();
-  await expect(page.locator('.manual-article-body')).toContainText('Questions go to');
-  await expect(page.locator('.manual-article-body').getByRole('link', { name: 'Rhea <HR>' })).toBeVisible();
+  const body = page.locator('.manual-article-body');
+  await expect(body).toContainText('Questions go to Rhea <HR>.');
+  await expect(body.getByRole('link')).toHaveCount(0);
 });

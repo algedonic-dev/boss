@@ -23,7 +23,8 @@ test('Home navigation retains Inbox and schedule while retiring Views', async ({
   await expect(page.getByRole('link', { name: 'My schedule', exact: true }).first()).toBeVisible();
 });
 
-for (const path of ['/ux/jobs', '/ux/inbox', '/', '/ux/calendar/me']) {
+// /ux/jobs left this list with the jobs list (step 1 of design 01fa5bdf).
+for (const path of ['/me/inbox', '/', '/me/calendar']) {
   test(`remaining Home page ${path} keeps rendering`, async ({ page }) => {
     await installSmokeMocks(page);
     await signInWithPolicy(page);
@@ -34,21 +35,5 @@ for (const path of ['/ux/jobs', '/ux/inbox', '/', '/ux/calendar/me']) {
   });
 }
 
-test('independent Bottlenecks query consumer still reads fleet and stage results', async ({ page }) => {
-  await installSmokeMocks(page);
-  await signInWithPolicy(page);
-  let fleetReads = 0;
-  let stageReads = 0;
-  await page.route(/\/api\/views\/fleet\/seasonal-release$/, (route) => {
-    fleetReads += 1;
-    return route.fulfill({ json: { workflow_kind: 'seasonal-release', open_jobs: 0, nodes: [], as_of: '2026-10-12T00:00:00Z' } });
-  });
-  await page.route(/\/api\/views\/stage-durations\/seasonal-release\?days=7$/, (route) => {
-    stageReads += 1;
-    return route.fulfill({ json: { stages: [] } });
-  });
-  await mountPage(page, '/it/operate/bottlenecks?kind=seasonal-release', { titleMatch: /Bottlenecks/ });
-  await expect.poll(() => fleetReads).toBeGreaterThan(0);
-  await expect.poll(() => stageReads).toBeGreaterThan(0);
-  await expect(page.locator('.fleet-scope')).toContainText('0 open');
-});
+// The Bottlenecks tab, the views API's last reader of fleet and stage
+// results, went with step 1 of design 01fa5bdf; its reads went with it.

@@ -4,7 +4,16 @@
 # deposit key one of boss-gcp's root doors, and says which of them give
 # that key more than its receiver.
 #
-#   audit-deposit-keys.sh <authorized_keys file>...
+#   audit-deposit-keys.sh [--prepared-key <key>]... [--permit-user-environment <value>] [--accept-env <patterns>] [--authorized-keys-command <command>] [--permit-tunnel <value>] <authorized_keys file>...
+#   audit-deposit-keys.sh --keys-files-of <account>     (as root)
+#
+# The second form prints, one per line, the arguments the converge then
+# hands to the first: `--permit-user-environment <value>`, sshd's setting
+# for <account>, then `--accept-env` and its patterns (an empty line for
+# none), then `--authorized-keys-command` and sshd's command (`none` for
+# none), then `--permit-tunnel` and sshd's setting, then the files sshd
+# reads <account>'s keys from (below, NOR DOES ~/.ssh/environment,
+# ACCEPTENV, A KEYS COMMAND, restrict IS NO PROOF and WHICH FILES).
 #
 # WHY IT EXISTS (backlog dea2236f; N5 of car c1cdb202's review). On the
 # first live enrolment of the machine token deposit key (packet
@@ -38,16 +47,174 @@
 # install-runner-credential-receiver.sh; audit_deposit_keys_sh.rs holds
 # the three equal), however the path is spelled — `//` and `/./` and
 # `..` are read as the kernel reads them (review dd8f18e0, N6; see
-# names_root_door). No other key line is judged for what it allows: the
-# account's own login keys are its owner's business, and a key this
-# cannot tie to a receiver line is one it cannot tell from his.
+# names_root_door) — and every line carrying a PREPARED key (below). No
+# other key line is judged for what it allows: the account's own login
+# keys are its owner's business, and a key this cannot tie to a receiver
+# line or a prepare packet is one it cannot tell from his.
+#
+# A PREPARED KEY IS A RECEIVER KEY, WHATEVER ITS LINE SAYS (backlog
+# 77920d6a; review 728c6f76 of car 3cd92f7a). `--prepared-key <public
+# key>`, once per key and before the files, names a key a prepare packet
+# recorded on its install step (public_key): a deposit key, never a
+# login. Recognising a receiver line by its text alone missed the shell:
+# sshd hands the forced command to the account's shell, which reads
+# `lib'exec'`, `bo\ss`, `$L` and `libexe?` as the root door while the
+# text match read no door at all, so such a line with no restrict was
+# clean while sshd granted a pty, forwarding and ~/.ssh/rc — and the
+# prepared key on a bare line with no confined twin read as one of the
+# owner's own keys. A line carrying a prepared key is judged by that key,
+# compared by fingerprint like every key here: with no forced command it
+# is a shell, with one this audit does not read as a root door it is a
+# command the account's shell runs, and each is a finding; with one it
+# does, it is judged as every receiver line is. A prepared key the key
+# parser reads no key from is UNVERIFIED: the lines it was to find
+# cannot be found.
+#
+# A PREPARED KEY IS BOUND TO ITS OWN RECEIVER (backlog c422cf68). Judged
+# only for forcing SOME root door, the runner's deposit key forced to
+# the machine-token receiver — or the other way round — read clean,
+# confined and restricted, while it reached a door it was never prepared
+# or enrolled for; ops-credential-recv serves two keys by its argument,
+# so not even the door alone tells them apart. So a --prepared-key value
+# may be the whole line the key was prepared with, as the broker joins it
+# onto the enroll step (`authorized_keys_line`: `command="<the rule's
+# forced_command>",restrict <key>`), read by this audit's own split: then
+# every line carrying that key must force exactly that command, and one
+# forcing any other is a finding naming both. A key given alone is judged
+# as above and bound to nothing. A value whose options force no command
+# binds its key to nothing, and one key given two different commands
+# cannot be judged against either: each is UNVERIFIED (exit 2), never a
+# key judged by fingerprint alone.
 #
 # A receiver line runs that receiver AND NOTHING ELSE: sshd hands a
 # forced command to the account's shell, so a command that merely names
 # a root door (`echo …; : /usr/local/libexec/boss/x`) runs whatever is
-# around it. `[exec ][sudo -<flags> ]<ROOT_DOORS><name>[ <word>…]` is
-# the shape every installer prints; any other command naming a root door
-# is a finding (review 1fa0d093, N1).
+# around it. `[exec ][sudo -n ]<ROOT_DOORS><name>[ <word>…]` is the
+# shape every installer prints; any other command naming a root door is
+# a finding (review 1fa0d093, N1). The one sudo flag is `-n`, the one
+# every installer prints: the shape used to take sudo with ANY run of
+# flags and leave sudoers alone to bound them, and `-E` hands the
+# receiver the caller's environment while `-s` and `-i` run it through a
+# shell (backlog e85c4dbd; review 1fa0d093, N5).
+#
+# A receiver line sets no environment. With PermitUserEnvironment an
+# `environment=` option sets what the account's shell runs the forced
+# command with — BASH_ENV alone has bash source a file of the line
+# author's choosing before the receiver starts — and no installer
+# prints one, so on a receiver line it is a finding, whatever sshd's
+# config says today (backlog e85c4dbd; review 1fa0d093, N4).
+#
+# A receiver line is no cert-authority (backlog 8311a8b4). With it sshd
+# takes the line's key as a CA: every certificate that key signs
+# authenticates to the receiver, so whoever holds the one deposit key
+# mints keys of their own that reach it, none on any line, prepare
+# packet or fingerprint this audit compares. A finding. from= is not:
+# it narrows the addresses the key is accepted from, and grants less
+# than the line without it.
+#
+# restrict IS NO PROOF A DEPOSIT KEY CANNOT TUNNEL (review 4525ba34 of
+# car 532547eb). This audit once read a receiver line carrying restrict
+# and tunnel= as clean, on the claim that restrict refuses tunnelling
+# whatever tunnel= says. That is a property of the sshd that runs, not
+# of the line: upstream 9.2's server_request_tun checks PermitTunnel and
+# the line's tunnel= device and not restrict, and Debian lists the
+# 1:9.2p1-2+deb12u10 the review measured installed as affected
+# (CVE-2026-73283). Which sshd boss-gcp runs, with which backport, this
+# audit does not read. So restrict is not relied on, and tunnel= — which
+# only names the device — is judged through the setting, not alone:
+# --keys-files-of reads PermitTunnel from the same `sshd -T -C
+# user=<account>` and hands it on as `--permit-tunnel <value>` ahead of
+# the files, and beside a line reaching a root door any value but `no`
+# is a finding, with or without tunnel= on any line. `no` sshd applies
+# before any key option, so it is clean and said; a set with no root
+# door names the value and does not judge it; an audit not handed it
+# says it was not read; and a read that names none is UNVERIFIED.
+#
+# NOR DOES ~/.ssh/environment (backlog f5ff8170; review 6b8e7e51 of car
+# d7cfae5f). The same sshd setting has a second door: when
+# PermitUserEnvironment is anything but `no` for the deposit account
+# (`yes`, or a pattern list), sshd reads that account's
+# ~/.ssh/environment for EVERY session, forced command and restrict
+# included — restrict closes a pty, forwarding and ~/.ssh/rc, not that
+# file — so a BASH_ENV line there runs a file before every receiver
+# exactly as environment= does, and every line here still read clean. A
+# file sshd may or may not read is not judged line by line; the setting
+# is, read from the one place that says what sshd will do:
+# --keys-files-of takes it from the same `sshd -T -C user=<account>` it
+# names the files from and hands it on as `--permit-user-environment
+# <value>` ahead of them, and in a file set where a deposit key reaches a
+# root door any value but `no` is a finding. Where no line reaches one
+# the value is named and not judged, as the owner's own keys are; and an
+# audit not handed it says in its verdict that it was not read.
+#
+# ACCEPTENV IS THE SAME ROUTE FROM THE OTHER END (backlog 54104a05). A
+# client asks sshd to set variables, and sshd sets each one its
+# AcceptEnv admits — `restrict` closes no part of it — before it hands
+# the forced command to the account's shell, so an AcceptEnv admitting
+# BASH_ENV lets whoever holds a deposit key choose what bash runs ahead
+# of the receiver, no line of the file required. `--keys-files-of`
+# reads it from the same `sshd -T -C user=<account>` the files come
+# from and prints it as `--accept-env <patterns>` ahead of them; beside
+# a line reaching a root door, a pattern admitting any name in
+# SHELL_READS (below) is a finding, matched as sshd matches it. Without
+# the option the verdict says AcceptEnv was not read.
+#
+# A KEYS COMMAND SERVES KEYS NO FILE HOLDS (backlog 8311a8b4). With an
+# AuthorizedKeysCommand sshd asks a command for the account's keys as
+# well as reading the files — GCE's OS Login sets
+# /usr/bin/google_authorized_keys — and the verdict read clean over the
+# files while a deposit key the command served, with whatever options,
+# was never seen. What a command prints is not this audit's to read: it
+# may ask a metadata server, and it answers per connection. So
+# --keys-files-of hands sshd's value on as `--authorized-keys-command
+# <command>` ahead of the files, and any value but `none` leaves the
+# account UNVERIFIED (exit 2), never clean: the files are still read and
+# a finding in them still stands (exit 1), the command named beside it.
+# A set command is judged whatever AuthorizedKeysCommandUser says: sshd
+# skips a command with no user, and a config naming a command is one
+# meant to serve keys. Without the option the verdict says it was not
+# read.
+#
+# WHICH FILES. The ones sshd reads for the deposit account, which the
+# converge asks sshd for (`--keys-files-of`, as root: `sshd -T` loads the
+# host keys) rather than assuming the default pair under the home — a
+# host whose sshd reads another AuthorizedKeysFile was audited on files
+# sshd never opens, and read clean (backlog e85c4dbd; review dd8f18e0,
+# N7). `-C user=<account>` applies a Match User block. Each pattern is
+# expanded as sshd expands it (%h, %u, %U, %%; a relative path under the
+# home), and a list that cannot be read — sshd refusing, no line,
+# `none`, a token sshd would refuse — is UNVERIFIED, never the default
+# pair.
+#
+# A MATCH ON WHERE A SENDER CONNECTS FROM IS NOT "NOT MATCHING" (backlog
+# 8311a8b4). `-C user=<account>` names no host and no address, and
+# `sshd -T` reads a Match Host or Match Address block as not matching
+# for want of one — so a block that moved the AuthorizedKeysFile, or
+# any setting here, for a sender from some address was invisible, and
+# the files it names were never audited. Which address a sender comes
+# from is not this host's to know, so such a block is UNVERIFIED. The
+# blocks are read from sshd's own debug record of the same read
+# (`-ddd`: `checking syntax for 'Match …'` as it loads the config,
+# `checking match for '…' user …` as it applies -C), and a block on any
+# criterion but User, Group, All or Invalid-User is UNVERIFIED, whether
+# or not its User part names this account: a criterion this list does
+# not know is one -C may not have judged. A read whose record carries no
+# debug3 line at all cannot say there were no blocks, and is UNVERIFIED
+# too. (LocalAddress and LocalPort sshd -T already refuses, naming the
+# missing laddr or lport.)
+#
+# A PATH sshd -T PRINTS AMBIGUOUSLY (backlog 8311a8b4). sshd prints the
+# AuthorizedKeysFile values joined by one space, unquoted, so the
+# quoted path `".ssh/authorized keys"` prints exactly as the two paths
+# `.ssh/authorized` and `keys`. The values are split at each single
+# space, the split sshd's printing makes; a run of spaces is only ever
+# inside a quoted path, and is UNVERIFIED. And every run of adjacent
+# words is also read as the one path it would be quoted: where that
+# path exists, which files sshd reads cannot be said, and that is
+# UNVERIFIED, never a guess. Where none exists the joined reading names
+# no file, so it grants nothing, and the words are audited as the
+# paths they also spell. The existence test is root's (this form runs
+# as root), which no permission bars.
 #
 # A KEY IS WHAT ssh-keygen READS, COMPARED BY FINGERPRINT. sshd decodes
 # a line's key and compares KEYS, and one key has several spellings it
@@ -104,21 +271,206 @@
 # named by its type and fingerprint — never a byte of the line beyond
 # its comment and forced command.
 #
-# EXIT 0 clean (an absent file is clean, and named); 1 at least one
-# finding; 2 nothing can be said — no file given, a path that is not a
-# readable file, a NUL byte, or no key parser. Never 0 for a file it did
-# not read.
+# EXIT 0 clean (confirmed absent files grant no key access and are
+# named); 1 at least one finding; 2 nothing can be said — no file given,
+# a file argument that is not an absolute path (an option placed after a
+# file is one, below), an unsearchable parent, a path that is not
+# a readable file, a NUL byte, no key parser, a --prepared-key it reads
+# no single key from, or no finding beside an AuthorizedKeysCommand that
+# serves keys it cannot read. Never 0 for a file it did not read.
+#
+# OPTIONS COME BEFORE THE FILES, AND A FILE IS AN ABSOLUTE PATH (backlog
+# 26173f40; review c403f23e of car 5cc2731a). The options are read up to
+# the first word that is not one, and every word after it was taken as a
+# file: `<file> --prepared-key <key>` read as two more files, both
+# absent, and an absent file was clean — measured, a file holding the
+# prepared key bare (a shell to whoever holds it) read "clean — 0
+# line(s)" with the key never judged. Every caller hands absolute paths
+# (--keys-files-of prints them so), so a word after the first file that
+# is not one — an option in the wrong place, its value, a relative path
+# — is UNVERIFIED and named, before any file is read. And a set in which
+# every file is confirmed absent grants no key access through them:
+# clean with an explicit note, not a claim that receiver lines were read
+# (backlog 9e2187bf). A denied lookup is not proof of absence.
 set +x
 set -uo pipefail
 export LC_ALL=C
 
 ME=deposit-key-audit
+# One copy of the usage every refusal names.
+USAGE='[--prepared-key <public key>]... [--permit-user-environment <value>] [--accept-env <patterns>] [--authorized-keys-command <command>] [--permit-tunnel <value>] <file>...'
 ROOT_DOORS='/usr/local/libexec/boss/'
 # What `restrict` closes and a later option may re-open (sshd(8),
 # AUTHORIZED_KEYS FILE FORMAT).
 REOPENS='pty port-forwarding agent-forwarding x11-forwarding user-rc'
+# What the account's shell reads from its environment before a forced
+# command runs, or reads to find what it runs (ACCEPTENV above): a file
+# — with bash, a command substitution — run first (BASH_ENV, ENV);
+# xtrace and the prompt it expands (SHELLOPTS, BASHOPTS, PS4); a
+# function run in place of the receiver line's `exec` or `sudo`
+# (BASH_FUNC_<name>%%); where `sudo` is looked up (PATH); what the
+# loader maps into the shell (LD_*).
+SHELL_READS=(BASH_ENV ENV SHELLOPTS BASHOPTS PS4 'BASH_FUNC_exec%%' 'BASH_FUNC_sudo%%' PATH LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT)
 
-[ "$#" -ge 1 ] || { echo "$ME: UNVERIFIED — no authorized_keys file was named; usage: $(basename "$0") <file>..." >&2; exit 2; }
+# sshd_glob <pattern> -> the bash pattern that matches what sshd's
+# match_pattern matches: `*` and `?` are wildcards and every other byte
+# is itself, so `[B]ASH_ENV` is a literal name to sshd and stays one here.
+sshd_glob() {
+    local p="$1" g="" i
+    for ((i = 0; i < ${#p}; i++)); do
+        case "${p:i:1}" in
+            '*' | '?') g+="${p:i:1}" ;;
+            *) g+="\\${p:i:1}" ;;
+        esac
+    done
+    printf '%s' "$g"
+}
+
+# --keys-files-of <account> (WHICH FILES, ACCEPTENV, A KEYS COMMAND,
+# restrict IS NO PROOF and the two sections after WHICH FILES above).
+# stdout is the audit's arguments — PermitUserEnvironment first,
+# AcceptEnv next, then AuthorizedKeysCommand, then PermitTunnel, then
+# the files — or
+# one UNVERIFIED line and exit 2, so the converge carries either whole.
+if [ "${1:-}" = --keys-files-of ]; then
+    unverified() {
+        echo "$ME: UNVERIFIED — $1, so the files sshd reads the deposit key from cannot be named and none is audited"
+        exit 2
+    }
+    shown() { printf '%s' "$1" | tr -d '\r' | tr -c '[:print:]' '?' | cut -c1-200; }
+    [ "$#" -eq 2 ] || unverified "usage: --keys-files-of <account>"
+    acct="$2"
+    # A comma would end the -C spec; no account name carries one.
+    case "$acct" in '' | -* | *[!A-Za-z0-9._-]*) unverified "'$acct' is not an account name" ;; esac
+    pw="$(getent passwd "$acct")" || unverified "$acct has no passwd entry"
+    IFS=: read -r _ _ uid _ _ home _ <<< "$pw"
+    SSHD="${BOSS_DEPOSIT_AUDIT_SSHD:-$(command -v sshd || echo /usr/sbin/sshd)}"
+    # One read: the dump on stdout, sshd's debug record (A MATCH ON WHERE
+    # A SENDER CONNECTS FROM above) on stderr, kept apart so no debug
+    # line can land inside a dump line.
+    dbgf="$(mktemp)" || unverified "no temporary file could hold sshd's debug record"
+    src=0
+    cfg="$("$SSHD" -ddd -T -C "user=$acct" 2>"$dbgf")" || src=$?
+    dbg="$(cat "$dbgf")"
+    rm -f "$dbgf"
+    if [ "$src" -ne 0 ]; then
+        why="$(printf '%s\n' "$dbg" | grep -v '^debug[0-9]: ' | tail -n 1)"
+        [ -n "$why" ] || why="${cfg##*$'\n'}"
+        unverified "$SSHD -T -C user=$acct refused: $(shown "$why")"
+    fi
+    debug3=0
+    while IFS= read -r l; do
+        case "$l" in 'debug3: '*) debug3=1 ;; *) continue ;; esac
+        case "$l" in
+            "debug3: checking syntax for 'Match "*"'")
+                crit="${l#"debug3: checking syntax for 'Match "}"
+                crit="${crit%\'}"
+                ;;
+            "debug3: checking match for '"*"' user "*)
+                crit="${l#"debug3: checking match for '"}"
+                crit="${crit%\' user *}"
+                ;;
+            *) continue ;;
+        esac
+        read -r -a mw <<< "$crit"
+        w=0
+        while [ "$w" -lt "${#mw[@]}" ]; do
+            case "${mw[w],,}" in
+                all | invalid-user) w=$((w + 1)) ;;
+                user | group) w=$((w + 2)) ;;
+                *) unverified "sshd reads a Match block on '$(shown "$crit")', and -C user=$acct cannot say where a sender connects from, so sshd -T reads it as not matching whatever it applies to a sender that does match" ;;
+            esac
+        done
+    done <<< "$dbg"
+    [ "$debug3" = 1 ] || unverified "$SSHD -ddd -T -C user=$acct wrote no debug3 line, the record that names every Match block sshd read for $acct"
+    pats="" seen=0 accept=()
+    while IFS= read -r l; do
+        case "$l" in
+            "authorizedkeysfile "*) pats="${l#authorizedkeysfile }" seen=1 ;;
+            # One line per pattern or all on one: either spelling reads
+            # alike (ACCEPTENV above).
+            "acceptenv "*)
+                read -r -a ae <<< "${l#acceptenv }"
+                accept+=("${ae[@]}")
+                ;;
+        esac
+    done <<< "$cfg"
+    [ "$seen" = 1 ] || unverified "$SSHD -T -C user=$acct names no authorizedkeysfile"
+    [ "$pats" != none ] || unverified "sshd reads no AuthorizedKeysFile for $acct (none)"
+    [ -n "$pats" ] || unverified "sshd's authorizedkeysfile for $acct is empty"
+    # expand_authorized_keys: percent_expand with h, u, U, then a path
+    # that is not absolute is taken under the home. A token sshd's
+    # percent_expand refuses, it refuses here. -> E
+    expand() {
+        local p="$1" i
+        E=""
+        for ((i = 0; i < ${#p}; i++)); do
+            if [ "${p:i:1}" != % ]; then
+                E+="${p:i:1}"
+                continue
+            fi
+            i=$((i + 1))
+            case "${p:i:1}" in
+                %) E+=% ;;
+                h) E+="$home" ;;
+                u) E+="$acct" ;;
+                U) E+="$uid" ;;
+                *) unverified "the AuthorizedKeysFile pattern '$(shown "$p")' carries a token sshd does not expand" ;;
+            esac
+        done
+        [ "${E:0:1}" = / ] || E="$home/$E"
+    }
+    # A PATH sshd -T PRINTS AMBIGUOUSLY above: split at each single space,
+    # the join sshd prints, so a run of spaces is an empty word.
+    words=() rest="$pats"
+    while [[ $rest == *' '* ]]; do
+        words+=("${rest%% *}")
+        rest="${rest#* }"
+    done
+    words+=("$rest")
+    out=()
+    for p in "${words[@]}"; do
+        [ -n "$p" ] || unverified "sshd prints the AuthorizedKeysFile for $acct as '$(shown "$pats")', whose run of spaces only a quoted path holds, and sshd -T prints a quoted path exactly as it prints several"
+        expand "$p"
+        out+=("$E")
+    done
+    for ((a = 0; a < ${#words[@]}; a++)); do
+        joined="${words[a]}"
+        for ((b = a + 1; b < ${#words[@]}; b++)); do
+            joined+=" ${words[b]}"
+            expand "$joined"
+            if [ -e "$E" ] || [ -L "$E" ]; then
+                unverified "sshd prints the AuthorizedKeysFile for $acct as '$(shown "$pats")', and '$(shown "$E")', those words read as one quoted path, is a file, and sshd -T prints a quoted path with a space exactly as it prints several paths"
+            fi
+        done
+    done
+    # NOR DOES ~/.ssh/environment above: the setting rides ahead of the
+    # files, from this same read, or no list is handed on at all.
+    pue=""
+    while IFS= read -r l; do
+        case "$l" in "permituserenvironment "*) pue="${l#permituserenvironment }" ;; esac
+    done <<< "$cfg"
+    [ -n "$pue" ] || unverified "$SSHD -T -C user=$acct names no permituserenvironment, so whether sshd reads $acct's ~/.ssh/environment for every receiver session cannot be said"
+    # A KEYS COMMAND above: from this same read, `none` when sshd has none.
+    akc=""
+    while IFS= read -r l; do
+        case "$l" in "authorizedkeyscommand "*) akc="${l#authorizedkeyscommand }" ;; esac
+    done <<< "$cfg"
+    [ -n "$akc" ] || unverified "$SSHD -T -C user=$acct names no authorizedkeyscommand, so whether sshd also serves $acct keys no file holds cannot be said"
+    # restrict IS NO PROOF above: from this same read.
+    ptun=""
+    while IFS= read -r l; do
+        case "$l" in "permittunnel "*) ptun="${l#permittunnel }" ;; esac
+    done <<< "$cfg"
+    [ -n "$ptun" ] || unverified "$SSHD -T -C user=$acct names no permittunnel, so whether sshd opens a tunnel for a deposit key cannot be said"
+    # The patterns ride AHEAD of the files as the audit's own option, so
+    # the converge hands the list on whole: an empty line is "sshd admits
+    # none", which the audit can say; no option at all is "not read".
+    printf '%s\n' --permit-user-environment "$pue" --accept-env "${accept[*]}" --authorized-keys-command "$akc" --permit-tunnel "$ptun" "${out[@]}"
+    exit 0
+fi
+
+[ "$#" -ge 1 ] || { echo "$ME: UNVERIFIED — no authorized_keys file was named; usage: $(basename "$0") $USAGE" >&2; exit 2; }
 
 # sshd's key parser. Overridable for the tests alone, which stand a
 # parser in for one that disagrees with the option split.
@@ -129,7 +481,10 @@ command -v "$SSH_KEYGEN" >/dev/null 2>&1 \
 # A CRLF file's blank line is only bytes sshd reads no key from.
 SKIPPED=$'\r\v\f'
 # The one shape a receiver line's forced command may have (N1 above).
-RECEIVER_RE='^(exec )?(sudo( -[A-Za-z]+)* )?'"$ROOT_DOORS"'[A-Za-z0-9_][A-Za-z0-9._/-]*( [A-Za-z0-9._-]+)*$'
+RECEIVER_RE='^(exec )?(sudo -n )?'"$ROOT_DOORS"'[A-Za-z0-9_][A-Za-z0-9._/-]*( [A-Za-z0-9._-]+)*$'
+# sshd's PermitUserEnvironment for the account, as --keys-files-of hands
+# it (NOR DOES ~/.ssh/environment above); empty, it was not handed.
+PUE=""
 
 # keyfp <text> -> K_FP K_TYPE; 1 when sshd's key parser reads no key
 # from it. Fed on stdin, so a line naming a PRIVATE KEY is never taken
@@ -142,6 +497,83 @@ keyfp() {
     K_TYPE="${K_TYPE%)}"
     [ -n "$K_FP" ]
 }
+
+# --prepared-key <public key>... (A PREPARED KEY above) -> PREPARED, the
+# fingerprints, space-delimited; NPREPARED, how many distinct. One key
+# per value: a value of two lines would be read as its first key alone.
+# PREPARED_VALUES keeps each value whole, so a prepared LINE is bound to
+# its receiver once the line parser below is defined (A PREPARED KEY IS
+# BOUND TO ITS OWN RECEIVER above).
+# Converge supplies --require-recorded only after reading the complete
+# prepared set. A standalone subset audit keeps its original semantics.
+PREPARED=" " NPREPARED=0 PREPARED_VALUES=() REQUIRE_RECORDED=0
+# --accept-env <patterns> (ACCEPTENV above): sshd's AcceptEnv for the
+# account, space-separated, as --keys-files-of prints it. ACCEPT_READ
+# says whether it was given at all; an empty value is a read of none.
+ACCEPT_ENV=() ACCEPT_READ=0
+# --authorized-keys-command <command> (A KEYS COMMAND above): sshd's
+# value for the account; empty, it was not handed.
+AKC=""
+# --permit-tunnel <value> (restrict IS NO PROOF above): sshd's
+# PermitTunnel for the account; empty, it was not handed.
+PTUN=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --require-recorded) REQUIRE_RECORDED=1; shift ;;
+        --permit-tunnel)
+            [ "$#" -ge 2 ] && [ -n "$2" ] && [ -z "$PTUN" ] \
+                || { echo "$ME: UNVERIFIED — --permit-tunnel is given no value, an empty one, or twice, so whether sshd opens a tunnel for a deposit key cannot be said" >&2; exit 2; }
+            PTUN="$2"
+            shift 2
+            ;;
+        --authorized-keys-command)
+            [ "$#" -ge 2 ] && [ -n "$2" ] && [ -z "$AKC" ] \
+                || { echo "$ME: UNVERIFIED — --authorized-keys-command is given no value, an empty one, or twice, so whether sshd serves keys no file holds cannot be said" >&2; exit 2; }
+            AKC="$2"
+            shift 2
+            ;;
+        --permit-user-environment)
+            [ "$#" -ge 2 ] && [ -n "$2" ] && [ -z "$PUE" ] \
+                || { echo "$ME: UNVERIFIED — --permit-user-environment is given no value, an empty one, or twice, so what sshd reads ~/.ssh/environment under cannot be said" >&2; exit 2; }
+            PUE="$2"
+            shift 2
+            ;;
+        --accept-env)
+            [ "$#" -ge 2 ] || { echo "$ME: UNVERIFIED — --accept-env names no patterns (an empty argument is sshd admitting none)" >&2; exit 2; }
+            read -r -a ae <<< "$2"
+            ACCEPT_ENV+=("${ae[@]}")
+            ACCEPT_READ=1
+            shift 2
+            ;;
+        --prepared-key)
+            [ "$#" -ge 2 ] || { echo "$ME: UNVERIFIED — --prepared-key names no key" >&2; exit 2; }
+            [[ $2 != *$'\n'* ]] && keyfp "$2" \
+                || { echo "$ME: UNVERIFIED — sshd's key parser (ssh-keygen) reads no single key from a --prepared-key value, so the lines carrying the keys this audit was told to judge cannot be found" >&2; exit 2; }
+            if [[ $PREPARED != *" $K_FP "* ]]; then
+                PREPARED+="$K_FP "
+                NPREPARED=$((NPREPARED + 1))
+            fi
+            PREPARED_VALUES+=("$2")
+            shift 2
+            ;;
+        --*) echo "$ME: UNVERIFIED — '$(printf '%s' "$1" | tr -c '[:print:]' '?')' is not an option this audit knows; usage: $(basename "$0") $USAGE" >&2; exit 2 ;;
+        *) break ;;
+    esac
+done
+[ "$REQUIRE_RECORDED" = 0 ] || [ "$NPREPARED" -gt 0 ] \
+    || { echo "$ME: UNVERIFIED — no recorded key set was supplied for --require-recorded" >&2; exit 2; }
+[ "$#" -ge 1 ] || { echo "$ME: UNVERIFIED — no authorized_keys file was named after the prepared keys" >&2; exit 2; }
+# Every word left is a file, and a file is an absolute path (OPTIONS COME
+# BEFORE THE FILES above): one that is not was read as an absent file,
+# and the set as clean.
+for f in "$@"; do
+    case "$f" in
+        /*) ;;
+        -*) echo "$ME: UNVERIFIED — '$(printf '%s' "$f" | tr -c '[:print:]' '?' | cut -c1-120)' stands among the files, where it would be read as an absent file and the set called clean; options go before the first file: $(basename "$0") $USAGE" >&2; exit 2 ;;
+        *) echo "$ME: UNVERIFIED — '$(printf '%s' "$f" | tr -c '[:print:]' '?' | cut -c1-120)' is not an absolute path, so it is no file sshd reads keys from and would be read as an absent one; options go before the first file: $(basename "$0") $USAGE" >&2; exit 2 ;;
+    esac
+done
+prepared() { [[ $PREPARED == *" $1 "* ]]; }
 
 # parse_line <line, leading blanks removed> -> P_OPTS P_FP P_TYPE
 # P_COMMENT. 1 when sshd's key parser reads no key from the line, whole
@@ -280,11 +712,44 @@ finding() { # <where> <why>
 # Printable bytes, bounded: a comment is the file owner's free text.
 shown() { printf '%s' "$1" | tr -c '[:print:]' '?' | cut -c1-120; }
 
+# BOUND: fingerprint -> the forced command its prepared line names (A
+# PREPARED KEY IS BOUND TO ITS OWN RECEIVER above), read by the same
+# split every line of the files is read by, so the two commands compared
+# are decoded alike.
+declare -A BOUND=()
+for v in "${PREPARED_VALUES[@]}"; do
+    prc=0
+    parse_line "${v#"${v%%[![:blank:]]*}"}" || prc=$?
+    [ "$prc" -eq 0 ] \
+        || { echo "$ME: UNVERIFIED — this audit's option split does not reach the key sshd's key parser reads from a --prepared-key value, so which receiver that key was prepared for cannot be said" >&2; exit 2; }
+    [ -n "$P_OPTS" ] || continue
+    split_opts
+    [ "$HAS_CMD" = 1 ] && [ -n "$OPT_CMD" ] \
+        || { echo "$ME: UNVERIFIED — the --prepared-key line for $P_TYPE $P_FP carries options and forces no command, so it binds that key to no receiver; hand the audit the key alone, or the authorized_keys_line its prepare packet recorded" >&2; exit 2; }
+    if [ -n "${BOUND[$P_FP]+set}" ] && [ "${BOUND[$P_FP]}" != "$OPT_CMD" ]; then
+        echo "$ME: UNVERIFIED — $P_TYPE $P_FP is given as prepared for both '$(shown "${BOUND[$P_FP]}")' and '$(shown "$OPT_CMD")', so no line carrying it can be judged against the receiver it was prepared for" >&2
+        exit 2
+    fi
+    BOUND[$P_FP]="$OPT_CMD"
+done
+
 declare -a L_WHERE=() L_FP=() L_CMD=() L_HASCMD=() L_RECV=() L_ID=() UNPARSED_AT=()
 RECEIVERS=0 READ="" ABSENT=""
 
 for f in "$@"; do
     if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+        # test -e also fails when a parent cannot be searched. Prove
+        # absence from an accessible directory, never from that silence.
+        parent="${f%/*}"
+        [ -n "$parent" ] || parent=/
+        while [ ! -e "$parent" ] && [ ! -L "$parent" ]; do
+            parent="${parent%/*}"
+            [ -n "$parent" ] || parent=/
+        done
+        if [ ! -d "$parent" ] || [ ! -x "$parent" ]; then
+            echo "$ME: UNVERIFIED — $(shown "$f") has no searchable parent, so its absence cannot be verified" >&2
+            exit 2
+        fi
         ABSENT+=" $f"
         continue
     fi
@@ -315,6 +780,34 @@ for f in "$@"; do
             continue
         fi
         split_opts
+        if [ "$REQUIRE_RECORDED" = 1 ] && [ "$HAS_CMD" = 1 ] && names_root_door "$OPT_CMD" && ! prepared "$P_FP"; then
+            RECEIVERS=$((RECEIVERS + 1))
+            finding "$f:$n" "the receiver key $P_TYPE $P_FP has no record in the complete prepared-key set. Remove this line or enrol the key through its own recorded preparation."
+            continue
+        fi
+        # A prepared key on a line this audit would not read as a
+        # receiver's (A PREPARED KEY above): one finding, and not also a
+        # twin of a receiver line, since the chore judge files one item
+        # per finding line (backlog d1b03874).
+        if prepared "$P_FP" && { [ "$HAS_CMD" != 1 ] || ! names_root_door "$OPT_CMD"; }; then
+            RECEIVERS=$((RECEIVERS + 1))
+            pid="$P_TYPE $P_FP${P_COMMENT:+ ($(shown "$P_COMMENT"))}"
+            if [ "$HAS_CMD" != 1 ]; then
+                finding "$f:$n" "the key $pid is a prepared deposit key on a line with NO forced command, so whoever holds it gets this account's shell. Remove this line and place the authorized_keys_line on its enroll step whole."
+            else
+                finding "$f:$n" "the key $pid is a prepared deposit key forced to '$(shown "$OPT_CMD")', which is no root door under $ROOT_DOORS as the installers spell one: sshd hands a forced command to the account's shell, which runs a door spelled through quotes, escapes, variables or globs, or anything else, with whatever this line's options leave open. Remove this line and place the authorized_keys_line on its enroll step whole."
+            fi
+            continue
+        fi
+        # A prepared key behind a root door, but not the one it was
+        # prepared for (A PREPARED KEY IS BOUND TO ITS OWN RECEIVER
+        # above): one finding, and the line is no receiver line of that
+        # key's, so the key's own line beside it is not taken for its twin.
+        if [ -n "${BOUND[$P_FP]+set}" ] && [ "$OPT_CMD" != "${BOUND[$P_FP]}" ]; then
+            RECEIVERS=$((RECEIVERS + 1))
+            finding "$f:$n" "the key $P_TYPE $P_FP${P_COMMENT:+ ($(shown "$P_COMMENT"))} is a prepared deposit key forced to '$(shown "$OPT_CMD")', but it was prepared for '$(shown "${BOUND[$P_FP]}")': it reaches a root door it was never prepared or enrolled for. Remove this line and place the authorized_keys_line on its own enroll step whole."
+            continue
+        fi
         i=${#L_WHERE[@]}
         L_WHERE[i]="$f:$n"
         L_FP[i]="$P_FP"
@@ -326,7 +819,11 @@ for f in "$@"; do
             L_RECV[i]=1
             RECEIVERS=$((RECEIVERS + 1))
             if ! [[ $OPT_CMD =~ $RECEIVER_RE ]] || [[ $OPT_CMD == *..* ]]; then
-                finding "$f:$n" "the key ${L_ID[i]} is forced to '$(shown "$OPT_CMD")', which names a root door under $ROOT_DOORS but is not that receiver alone, spelled as the installers print it: sshd hands a forced command to the account's shell, so whatever else it says runs too. Remove this line and place the authorized_keys_line on its enroll step whole."
+                finding "$f:$n" "the key ${L_ID[i]} is forced to '$(shown "$OPT_CMD")', which names a root door under $ROOT_DOORS but is not that receiver alone, spelled as the installers print it (sudo takes -n and no other flag): sshd hands a forced command to the account's shell, so whatever else it says runs too. Remove this line and place the authorized_keys_line on its enroll step whole."
+            elif [[ $OPT_NAMES == *" cert-authority "* ]]; then
+                finding "$f:$n" "the key ${L_ID[i]} is forced to '$(shown "$OPT_CMD")' as a cert-authority, which no installer prints: sshd lets every certificate this key signs authenticate to the receiver, so whoever holds the deposit key mints keys of their own that reach it, on no line this audit reads. Remove this line and place the authorized_keys_line on its enroll step whole."
+            elif [[ $OPT_NAMES == *" environment "* ]]; then
+                finding "$f:$n" "the key ${L_ID[i]} is forced to '$(shown "$OPT_CMD")' and sets environment=, which no installer prints: with PermitUserEnvironment it sets what the account's shell runs the receiver with (BASH_ENV alone runs a file first). Remove this line and place the authorized_keys_line on its enroll step whole."
             elif [[ $OPT_NAMES != *" restrict "* ]]; then
                 finding "$f:$n" "the key ${L_ID[i]} is forced to '$(shown "$OPT_CMD")' WITHOUT restrict, so sshd also gives it a pty, forwarding and the account's ~/.ssh/rc. Remove this line and place the authorized_keys_line on its enroll step whole: command=\"...\",restrict <key>."
             else
@@ -341,6 +838,19 @@ for f in "$@"; do
     done < "$f"
     READ+=" $f"
 done
+# The configured files grant no access when none exists; keep that fact
+# separate from a verdict reached by reading receiver lines (9e2187bf).
+# A KEYS COMMAND above: what sshd serves from one, no file here shows.
+akc_serves() { [ -n "$AKC" ] && [ "$AKC" != none ]; }
+AKC_WHY="sshd also serves this account's keys from AuthorizedKeysCommand '$(shown "$AKC")', and a key a command serves is in no file this audit reads: a deposit key it serves, with whatever options, is unaudited"
+if [ -z "$READ" ]; then
+    if akc_serves; then
+        echo "$ME: UNVERIFIED — none of the files named is present (absent:$(shown "$ABSENT")), but $AKC_WHY, so the account is not called clean"
+        exit 2
+    fi
+    echo "$ME: clean — none of the files named is present (absent:$(shown "$ABSENT")); these files grant no key access"
+    exit 0
+fi
 
 # A RECEIVER'S KEY ON ANY OTHER LINE. The receiver line it belongs to is
 # the first one carrying that key; a second receiver line with the same
@@ -361,12 +871,59 @@ for ((j = 0; j < ${#L_WHERE[@]}; j++)); do
     done
 done
 
+# WHAT THE CLIENT MAY SET (ACCEPTENV above). Judged only beside a line
+# that reaches a root door, as every option here is: the owner's logins
+# are his business. One finding per pattern that admits a name in
+# SHELL_READS, its text carrying no key and no count — the chore judge
+# keys a finding that names no key on its whole text (chore_file_reds.rs,
+# finding_key), so a count in it would re-file the item each time a
+# receiver line came or went, the defect backlog 54104a05 found in the
+# converge's reading of this audit's verdict line.
+ACCEPT_FOUND=0
+if [ "$RECEIVERS" -gt 0 ]; then
+    for pat in "${ACCEPT_ENV[@]}"; do
+        g="$(sshd_glob "$pat")"
+        admitted=""
+        for name in "${SHELL_READS[@]}"; do
+            [[ $name != $g ]] || admitted+=" $name"
+        done
+        [ -n "$admitted" ] || continue
+        ACCEPT_FOUND=1
+        finding "sshd AcceptEnv $(shown "$pat")" "sshd sets$admitted from whatever the client sends — restrict does not close it — before it hands a forced command to the account's shell, so a deposit key forced to a root door also chooses what that shell runs first (BASH_ENV alone has bash run a command of the sender's choosing). Remove $(shown "$pat") from the AcceptEnv sshd reads for this account, or narrow it to names the shell does not read."
+    done
+fi
+
 # A LINE NO KEY WAS READ FROM, BESIDE A ROOT DOOR (review ee6589a9,
 # N2). It grants nothing to the sshd whose parser read it; but a file set
 # that grants a root door is judged whole or not called clean, so each is
 # a finding there — the first ten named, the count of the rest given.
 UNPARSED=${#UNPARSED_AT[@]}
-tail_note="${ABSENT:+; absent:$ABSENT}"
+tail_note=""
+[ -z "$ABSENT" ] || tail_note="; absent:$(shown "$ABSENT")"
+# sshd's PermitUserEnvironment (NOR DOES ~/.ssh/environment above): a
+# finding beside a root door unless it is `no`, named either way, and an
+# audit not handed it says so rather than reading as though it judged it.
+if [ -z "$PUE" ]; then
+    tail_note+="; sshd's PermitUserEnvironment was not read (no --permit-user-environment), so whether sshd also reads ~/.ssh/environment for every receiver session is not judged"
+elif [ "$PUE" != no ] && [ "$RECEIVERS" -gt 0 ]; then
+    finding "sshd:PermitUserEnvironment" "sshd applies PermitUserEnvironment $(shown "$PUE") to this account, so it reads the account's ~/.ssh/environment for EVERY session, forced command and restrict included: a BASH_ENV line there runs a file before every receiver above, which no line of these files shows. Set PermitUserEnvironment no for this account (sshd's default) and reload sshd."
+elif [ "$PUE" = no ]; then
+    tail_note+="; sshd applies PermitUserEnvironment no, so it reads no ~/.ssh/environment"
+else
+    tail_note+="; sshd applies PermitUserEnvironment $(shown "$PUE"), not judged: no line here reaches a root door"
+fi
+# sshd's PermitTunnel (restrict IS NO PROOF above), judged the same way:
+# a finding beside a root door unless it is `no`, whatever tunnel= the
+# lines carry, since restrict is not relied on to refuse it.
+if [ -z "$PTUN" ]; then
+    tail_note+="; sshd's PermitTunnel was not read (no --permit-tunnel), so whether a deposit key may also open a tunnel is not judged"
+elif [ "$PTUN" != no ] && [ "$RECEIVERS" -gt 0 ]; then
+    finding "sshd:PermitTunnel" "sshd applies PermitTunnel $(shown "$PTUN") to this account, and restrict on a line is no proof it refuses a tunnel: OpenSSH 9.2's server_request_tun checks PermitTunnel and the line's tunnel= device, not restrict (CVE-2026-73283), so a deposit key forced to a root door may also open a tun device to this host, which no line of these files shows. Set PermitTunnel no for this account (sshd's default) and reload sshd."
+elif [ "$PTUN" = no ]; then
+    tail_note+="; sshd applies PermitTunnel no, so it opens no tunnel for any key"
+else
+    tail_note+="; sshd applies PermitTunnel $(shown "$PTUN"), not judged: no line here reaches a root door"
+fi
 if [ "$UNPARSED" -gt 0 ] && [ "$RECEIVERS" -gt 0 ]; then
     for where in "${UNPARSED_AT[@]:0:10}"; do
         finding "$where" "sshd's key parser (ssh-keygen) reads no key from this line, in a file set where a deposit key reaches a root door: what a line nobody can read grants cannot be said, so the files are not called clean. Remove it or make it a # comment."
@@ -376,10 +933,28 @@ elif [ "$UNPARSED" -gt 0 ]; then
     tail_note+="; $UNPARSED line(s) sshd's key parser reads no key from, not judged:${UNPARSED_AT[*]:0:10}"
     [ "$UNPARSED" -le 10 ] || tail_note+=" and $((UNPARSED - 10)) more"
 fi
-[ -n "$READ" ] || READ=" (none present)"
+[ "$NPREPARED" -eq 0 ] || tail_note+="; $NPREPARED prepared deposit key(s) judged by fingerprint on every line that carries one"
+[ "${#BOUND[@]}" -eq 0 ] || tail_note+=", ${#BOUND[@]} of them against the receiver each was prepared for"
+if [ "$ACCEPT_READ" -eq 0 ]; then
+    tail_note+="; sshd's AcceptEnv was not read"
+elif [ "$RECEIVERS" -gt 0 ] && [ "$ACCEPT_FOUND" -eq 0 ]; then
+    shown_ae="${ACCEPT_ENV[*]}"
+    tail_note+="; sshd's AcceptEnv ($(shown "${shown_ae:-none}")) admits no name the account's shell reads before a receiver"
+fi
+if [ -z "$AKC" ]; then
+    tail_note+="; sshd's AuthorizedKeysCommand was not read"
+elif ! akc_serves; then
+    tail_note+="; sshd serves no keys from an AuthorizedKeysCommand"
+fi
 if [ "$FINDINGS" -gt 0 ]; then
+    akc_serves && tail_note+="; and $AKC_WHY"
     echo "$ME: $FINDINGS finding(s) in$READ — a deposit key reaches more than its receiver, or a line beside one cannot be judged; each UNCONFINED line above names the line to act on (backlog dea2236f)$tail_note"
     exit 1
 fi
-echo "$ME: clean — $RECEIVERS line(s) in$READ force a root door under $ROOT_DOORS, each with restrict and nothing re-opened, and no key of theirs is on another line$tail_note"
+over="$RECEIVERS line(s) in$READ force a root door under $ROOT_DOORS, each with restrict and nothing re-opened, and no key of theirs is on another line$tail_note"
+if akc_serves; then
+    echo "$ME: UNVERIFIED — $AKC_WHY, so the account is not called clean; over the files alone: $over"
+    exit 2
+fi
+echo "$ME: clean — $over"
 exit 0

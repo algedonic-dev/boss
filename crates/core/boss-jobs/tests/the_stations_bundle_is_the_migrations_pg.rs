@@ -288,6 +288,11 @@ async fn a_present_registry_is_left_untouched() {
 async fn a_bundle_row_that_differs_from_the_live_row_is_refused_by_field() {
     let db = TestDb::new().await;
     let registry = PgStations::new(db.pool.clone());
+    // A declaration can lead migration history. Test same-version drift
+    // against that actual declaration, not the superseded schema seed.
+    seed_stations(&registry, &bundle(), &actor(), chrono::Utc::now(), false)
+        .await
+        .expect("the bundle seeds over the migrations");
     let before = declarations(&registry.list_active().await.expect("list_active"));
 
     let mut specs = bundle();
@@ -296,7 +301,7 @@ async fn a_bundle_row_that_differs_from_the_live_row_is_refused_by_field() {
         .find(|s| s.name == "repair")
         .expect("the bundle declares the repair station");
     edited.title = "Repair — edited without a version bump".into();
-    edited.wip_limit = Some(3);
+    let edited_version = edited.version;
 
     let err = seed_stations(&registry, &specs, &actor(), chrono::Utc::now(), false)
         .await
@@ -305,10 +310,10 @@ async fn a_bundle_row_that_differs_from_the_live_row_is_refused_by_field() {
         StationSeedError::Refused { rows: refusals, .. } => {
             assert_eq!(refusals.len(), 1, "{err}");
             assert_eq!(refusals[0].name, "repair");
-            assert_eq!(refusals[0].version, 1);
+            assert_eq!(refusals[0].version, edited_version);
             assert_eq!(
                 refusals[0].fields,
-                vec!["title".to_string(), "wip_limit".to_string()],
+                vec!["title".to_string()],
                 "the refusal names every differing column"
             );
         }
@@ -350,7 +355,6 @@ async fn a_version_bump_publishes_and_retires_the_live_row() {
         .find(|s| s.name == "repair")
         .expect("the bundle declares the repair station");
     bumped.version = live.version + 1;
-    bumped.wip_limit = Some(3);
 
     let report = seed_stations(&registry, &specs, &actor(), chrono::Utc::now(), false)
         .await
@@ -366,7 +370,6 @@ async fn a_version_bump_publishes_and_retires_the_live_row() {
         .await
         .expect("repair is active");
     assert_eq!(now_active.version, live.version + 1);
-    assert_eq!(now_active.wip_limit, Some(3));
     let old = registry
         .get_version("repair", live.version)
         .await

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Restore side of migration-as-log-copy — the counterpart of
-# export-log-copy.sh, and the executable form of dev-cluster.md's
-# restore sequence:
+# export-log-copy.sh, and the executable form of the restore sequence
+# docs/architecture-decisions.md records under "The build and the
+# pipeline left the demo's machine":
 #
 #   migrate.sh from empty → restore the copy-set → boss-rebuild-all →
 #   boss-audit-integrity-check green → converge the instance onto it

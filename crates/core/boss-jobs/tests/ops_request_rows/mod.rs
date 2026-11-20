@@ -20,14 +20,17 @@ pub const RUNNER: &str = boss_jobs::runner_credential::PRINCIPAL;
 
 /// The keys the runner renders onto `approve` in one patch
 /// (ops-runner.sh `render_plan`), the five onto `review`, and the seven
-/// onto `nothing-to-do` (`close_nothing_to_do`).
-pub const APPROVE_RUNNER_KEYS: [&str; 6] = [
+/// onto `nothing-to-do` (`close_nothing_to_do`). `plan_stderr` (backlog
+/// 204e27ba) is the plan verb's unsigned-by-the-plan-hash figures: inside
+/// the shape the passkey signs, so reserved to the runner like the rest.
+pub const APPROVE_RUNNER_KEYS: [&str; 7] = [
     "plan",
     "verb",
     "host",
     "args",
     "rendered_plan_sha256",
     "review_run",
+    "plan_stderr",
 ];
 pub const REVIEW_RUNNER_KEYS: [&str; 5] = ["plan", "verb", "host", "args", "rendered_plan_sha256"];
 pub const NOTHING_TO_DO_RUNNER_KEYS: [&str; 7] = [
@@ -61,6 +64,13 @@ pub fn declared_row() -> WorkflowSpec {
 pub fn without_the_runner_half() -> WorkflowSpec {
     let mut spec = declared_row();
     for step in spec.steps.iter_mut() {
+        // Historical v12 (retired registry row captured 2026-10-31)
+        // predates the human-only presentation declaration too. Do not
+        // back-project the latest guard into the signer-only protocol.
+        if let Some(defaults) = step.metadata_defaults.as_object_mut() {
+            defaults.remove(boss_jobs::human_only::KEY);
+            defaults.remove("human_presentation");
+        }
         for field in step.fields.iter_mut() {
             if field.writer.as_deref() == Some(RUNNER) {
                 field.writer = None;

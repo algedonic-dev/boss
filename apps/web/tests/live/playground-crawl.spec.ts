@@ -67,7 +67,7 @@ const GUEST_REFUSED = 'a guest hitting an operator route is the product refusing
 const EXPECTED_CONSOLE_ERRORS: ReadonlyArray<{ route: string; status: number; reason: string }> = [
   { route: '/ux/marketing-assets/ma-1', status: 404, reason: GUEST_REFUSED },
   { route: '/it', status: 404, reason: GUEST_REFUSED },
-  { route: '/it/codebase', status: 403, reason: GUEST_REFUSED },
+  { route: '/engineering/codebase', status: 403, reason: GUEST_REFUSED },
   // /it/design/codebase's 403 entry (packet 304960d9) left on 2026-09-27
   // (818cd10c): the route was retired with no alias by car N3 of design
   // e765b3fc and now renders not-found, so the entry could only hide a

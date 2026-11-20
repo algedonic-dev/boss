@@ -195,21 +195,28 @@ mod pg {
             let Some(first) = firings.first() else {
                 return Ok(());
             };
-            for f in firings {
-                sqlx::query(
+            // The event already supplies its successful rules together.
+            // Bound the bind count, without paying a round trip per rule.
+            for batch in firings.chunks(1000) {
+                let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
                     "INSERT INTO dispatcher_firings \
                      (firing_id, rule_name, fired_on, fired_at, detail, outcome) \
-                     VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (firing_id) DO NOTHING",
-                )
-                .bind(&f.firing_id)
-                .bind(&f.rule)
-                .bind(&f.fired_on)
-                .bind(f.fired_at)
-                .bind(&f.detail)
-                .bind(f.outcome.as_str())
-                .execute(&self.pool)
-                .await
-                .map_err(|e| format!("recording firing {}: {e}", f.firing_id))?;
+                     ",
+                );
+                query.push_values(batch, |mut row, f| {
+                    row.push_bind(&f.firing_id)
+                        .push_bind(&f.rule)
+                        .push_bind(&f.fired_on)
+                        .push_bind(f.fired_at)
+                        .push_bind(&f.detail)
+                        .push_bind(f.outcome.as_str());
+                });
+                query.push(" ON CONFLICT (firing_id) DO NOTHING");
+                query
+                    .build()
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| format!("recording firing batch: {e}"))?;
             }
             self.maybe_prune(first.fired_at).await;
             Ok(())

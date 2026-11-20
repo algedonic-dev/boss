@@ -39,7 +39,10 @@
 //!     refuses by name when neither says;
 //!   * every systemd unit under infra/ that speaks to the record reads
 //!     the file with `EnvironmentFile=` — optional (`-`) only on the two
-//!     converges that render it — and carries no inline pin;
+//!     converges that render it — and carries no inline pin (the
+//!     ops-runner waker, which this test does not walk, reads it
+//!     optionally too so its script's named 78 can run, backlog 0e9a446a;
+//!     `ops_runner_wake_sh.rs` pins that);
 //!   * the lint `infra/lint/the-estate-address-lives-once.sh` is red on
 //!     a planted literal, red on a stale allowance, green on the tree.
 //!

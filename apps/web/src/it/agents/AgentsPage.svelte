@@ -15,22 +15,52 @@
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import Link from '@boss/web-kit/ui/Link.svelte';
   import { href } from '../../router';
-  import { costText } from '../crew/crew';
   import {
     budgetText,
-    capText,
+    changeText,
+    costText,
     effortsRun,
     fetchAgentDetail,
     fetchAgents,
     heldText,
+    parseSeats,
     RUN_WINDOW,
+    seatAgent,
+    seatsText,
     type Agent,
     type AgentDetail,
+    type SeatOutcome,
   } from './agents';
   import type { Remote } from '../../data/remote';
 
   let roster = $state<Remote<ReadonlyArray<Agent>>>({ kind: 'loading' });
   let details = $state<Readonly<Record<string, AgentDetail>>>({});
+  // The seats typed per agent, and each card's last write (backlog
+  // cdbebc22). What the write does and who may make it is agents.ts's
+  // header; this page sends what was typed and draws what came back.
+  let drafts = $state<Readonly<Record<string, string>>>({});
+  let seating = $state<Readonly<Record<string, SeatOutcome | 'sending'>>>({});
+
+  // The card's row becomes the registry's answer, so the seats it shows —
+  // which the next write sends as `expected` — are never this page's memory.
+  function show(row: Agent): void {
+    if (roster.kind !== 'ready') return;
+    roster = { kind: 'ready', data: roster.data.map((x) => (x.id === row.id ? row : x)) };
+  }
+
+  async function seat(a: Agent): Promise<void> {
+    seating = { ...seating, [a.id]: 'sending' };
+    // `expected` is the seats this card SHOWS: the door writes only while
+    // the registry still holds them (review 1a49c3a7 finding 1).
+    const out = await seatAgent(a.id, a.stations, parseSeats(drafts[a.id] ?? a.stations.join(', ')));
+    seating = { ...seating, [a.id]: out };
+    if (out.kind === 'applied') {
+      show(out.after);
+      drafts = { ...drafts, [a.id]: out.after.stations.join(', ') };
+    } else if ((out.kind === 'stale' || out.kind === 'unknown') && out.held.kind === 'ready') {
+      show(out.held.data);
+    }
+  }
 
   onMount(() => {
     void (async () => {
@@ -52,7 +82,7 @@
   <PageHeader
     eyebrow="IT · Registry · who runs work besides people"
     title="Agents"
-    subtitle="The agents registry: every agent that can hold a step, as the registry declares it. Agents are never People rows and never headcount. Read-only here; the registry is written by boss tenant publish."
+    subtitle="The agents registry: every agent that can hold a step, as the registry declares it. Agents are never People rows and never headcount. An agent's seats are changed here, through the registry's own door, by an operator-tier session; every other field is written by boss tenant publish."
   />
 
   {#if roster.kind === 'loading'}
@@ -67,6 +97,7 @@
   {:else}
     {#each roster.data as a (a.id)}
       {@const d = details[a.id]}
+      {@const sent = seating[a.id]}
       <section class="ag-card" aria-label={a.name}>
         <h2>{a.name} <span class="mono ag-id">{a.id}</span></h2>
         <dl class="ag-facts">
@@ -78,10 +109,12 @@
           <dd class="mono">{a.department ?? 'not declared'}</dd>
           <dt>Default model</dt>
           <dd class="mono">{a.defaultModel ?? 'not declared'}</dd>
+          <dt>Model class</dt>
+          <dd class="mono">{a.modelClass ?? 'records none'}</dd>
           <dt>Hourly budget</dt>
           <dd class="mono">{budgetText(a.hourlyBudgetUsdMicros)}</dd>
-          <dt>Concurrent runs, at most</dt>
-          <dd class="mono">{capText(a.maxConcurrentRuns)}</dd>
+          <dt>Seats</dt>
+          <dd class="mono">{seatsText(a.stations)}</dd>
           <dt>Open steps held</dt>
           <dd class="mono">
             {#if !d}
@@ -97,6 +130,72 @@
             <dd class="mono">{effortsRun(d.runs.data)}</dd>
           {/if}
         </dl>
+
+        <form
+          class="ag-seat"
+          onsubmit={(e) => {
+            e.preventDefault();
+            void seat(a);
+          }}
+        >
+          <label>
+            Seat at these stations, in the order it serves them
+            <input
+              name="stations"
+              class="mono"
+              value={drafts[a.id] ?? a.stations.join(', ')}
+              oninput={(e) => (drafts = { ...drafts, [a.id]: e.currentTarget.value })}
+              placeholder="e.g. algedonic"
+            />
+          </label>
+          <button type="submit" disabled={sent === 'sending'}>Seat {a.id}</button>
+          <p class="ag-quiet">
+            Changes this row's seats and nothing else, through the agents registry's seat door, and only
+            while the registry still holds the seats shown above; signed by your session. The door admits
+            an operator-tier session only: yours after Operator access with your passkey. An empty list
+            unseats it.
+          </p>
+        </form>
+        {#if sent === 'sending'}
+          <p class="ag-quiet">Sending to the agents registry…</p>
+        {:else if sent?.kind === 'applied'}
+          <div class="ag-seat-result">
+            <p class="mono">Before: {seatsText(sent.before.stations)}</p>
+            <p class="mono">After: {seatsText(sent.after.stations)}</p>
+            {#if sent.changes.length === 0}
+              <p>The registry already held these seats; the door changed nothing.</p>
+            {:else}
+              <p>The door changed, recorded as jobs.agent.updated naming you:</p>
+              <ul class="mono">
+                {#each sent.changes as c (c.field)}
+                  <li>{changeText(c)}</li>
+                {/each}
+              </ul>
+            {/if}
+          </div>
+        {:else if sent?.kind === 'refused'}
+          <p class="ag-fail load-failed ag-seat-refused">
+            The agents registry refused this (HTTP {sent.status}): {sent.why}. Nothing changed.
+          </p>
+        {:else if sent?.kind === 'stale'}
+          <p class="ag-fail load-failed ag-seat-refused">
+            Nothing changed: the seats moved since this page read them — {sent.why}.
+            {#if sent.held.kind === 'ready'}
+              The card now shows what the registry holds; decide again on that.
+            {:else}
+              The registry could not be read again ({sent.held.error}); reload before trying again.
+            {/if}
+          </p>
+        {:else if sent?.kind === 'unknown'}
+          <p class="ag-fail load-failed ag-seat-refused">
+            Whether this landed is unknown — {sent.why}.
+            {#if sent.held.kind === 'ready'}
+              Read again after it, the registry holds: {seatsText(sent.held.data.stations)}.
+            {:else}
+              The registry could not be read again ({sent.held.error}); reload before trying again.
+            {/if}
+          </p>
+        {/if}
 
         {#if !d}
           <p class="ag-quiet">Reading this agent's runs…</p>
@@ -170,6 +269,12 @@
   }
   .ag-facts dt { color: var(--static); }
   .ag-facts dd { margin: 0; overflow-wrap: anywhere; }
+  .ag-seat { margin-top: 12px; font-size: 13px; }
+  .ag-seat label { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; color: var(--static); }
+  .ag-seat input { min-width: 16ch; flex: 1 1 24ch; max-width: 60ch; }
+  .ag-seat button { margin-top: 6px; }
+  .ag-seat-result { border: 1px solid var(--hairline); padding: 8px 12px; margin-top: 8px; font-size: 13px; }
+  .ag-seat-result p, .ag-seat-result ul { margin: 2px 0; }
   .ag-tbl { overflow-x: auto; }
   .ag-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   .ag-table th { text-align: left; font-weight: 500; color: var(--static); padding: 4px 8px; border-bottom: 1px solid var(--hairline); }

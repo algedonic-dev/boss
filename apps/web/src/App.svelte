@@ -8,8 +8,7 @@
   import { onMount } from 'svelte';
   import { href, notFoundBack, parseRoute, type Route } from './router';
   import NotFound from '@boss/web-kit/ui/NotFound.svelte';
-  import { JOBS_DEFAULT_STATUS } from './jobs/filterQuery';
-  import { goToLogin } from '@boss/web-kit/session/deadSession';
+  import { guardFetch } from '@boss/web-kit/session/deadSession';
   import { loadSession } from '@boss/web-kit/session/session.svelte';
   import { loadManifest, manifest, reflectTenantOnDocument } from '@boss/web-kit/session/manifest.svelte';
   import { loadStepTypeRegistry } from './steps/surfaceRegistry.svelte';
@@ -20,40 +19,23 @@
   import UpdateBar from './shell/UpdateBar.svelte';
   import { appsFor, APP_SUBJECT_KINDS, ROUTE_CATALOG, type AppId } from './shell/nav-catalog';
   import { appForRoute, moduleForRoute, sectionForRoute, withManifest, withRoster } from './shell/sections';
-  import { makeSurfaceOpenRecorder, postSurfaceOpen, routePattern } from './shell/surface-opens';
+  import { makeSurfaceOpenRecorder, openedPattern, postSurfaceOpen } from './shell/surface-opens';
+  import { loadStationAddresses, stationAddresses } from './shell/stationAddresses.svelte';
   import StepFocusPage from './steps/StepFocusPage.svelte';
   import PerspectiveTabs from '@boss/web-kit/PerspectiveTabs.svelte';
   import DebugGear from './debug/DebugGear.svelte';
   import MePage from './me/MePage.svelte';
-  import JobsListPage from './jobs/JobsListPage.svelte';
   import JobDetailPage from './jobs/JobDetailPage.svelte';
-  import MarketingAssetsList from './marketing-assets/MarketingAssetsList.svelte';
-  import MarketingAssetPage from './marketing-assets/MarketingAssetPage.svelte';
-  import AccountsList from './accounts/AccountsList.svelte';
-  import AccountPage from './accounts/AccountPage.svelte';
   import VendorsList from './vendors/VendorsList.svelte';
   import VendorPage from './vendors/VendorPage.svelte';
-  import PeopleList from './people/PeopleList.svelte';
-  import EmployeePage from './people/EmployeePage.svelte';
-  import PartsList from './parts/PartsList.svelte';
-  import PartPage from './parts/PartPage.svelte';
-  import ProductsList from './products/ProductsList.svelte';
-  import ProductPage from './products/ProductPage.svelte';
-  import ShippingPage from './shipping/ShippingPage.svelte';
-  import ShipmentPage from './shipping/ShipmentPage.svelte';
-  import SupportPage from './support/SupportPage.svelte';
   import FinancePage from './finance/FinancePage.svelte';
   import InvoicePage from './finance/InvoicePage.svelte';
   import NewInvoicePage from './finance/NewInvoicePage.svelte';
   import NewJournalEntryPage from './finance/NewJournalEntryPage.svelte';
-  import HrPage from './hr/HrPage.svelte';
-  import QaPage from './qa/QaPage.svelte';
   import DepartmentJobsPage from './departments/DepartmentJobsPage.svelte';
   // SimPage retired 2026-05-03 — boss-sim-api is gone (HumanWorker
   // generator retirement step 9b). Tenant runners are CLI tools now.
   import ItKnowledgeBasePage from './it/ItKnowledgeBasePage.svelte';
-  import AtlasPage from './it/monitoring/AtlasPage.svelte';
-  import PolicyPage from './policy/PolicyPage.svelte';
   import WorkflowNewPage from './workflows/WorkflowNewPage.svelte';
   import WorkflowDesignWorkspace from './workflows/WorkflowDesignWorkspace.svelte';
   import WorkflowDetailPage from './workflows/WorkflowDetailPage.svelte';
@@ -64,21 +46,15 @@
   import DispatcherRuleEditPage from './dispatcher/DispatcherRuleEditPage.svelte';
   import SubjectsClassesPage from './it/subjects/SubjectsClassesPage.svelte';
   import MapPage from './it/yard/MapPage.svelte';
-  import CompanyMap from './it/yard/CompanyMap.svelte';
+  import TreeFloor from './it/tree/TreeFloor.svelte';
+  import StationPage from './it/tree/StationPage.svelte';
+  import ResourcesPage from './it/tree/resources/ResourcesPage.svelte';
+  import { DEFAULT_DEPTH } from './it/tree/station-tree';
   import EstatePage from './it/estate/EstatePage.svelte';
-  import FleetPage from './it/monitoring/FleetPage.svelte';
   import ItTabs from './it/ItTabs.svelte';
   import DesignReviewPage from './it/design/DesignReviewPage.svelte';
-  import ExperimentsPage from './it/experiments/ExperimentsPage.svelte';
   import InboxPage from './inbox/InboxPage.svelte';
   import MyCalendarPage from './calendar/MyCalendarPage.svelte';
-  import SchedulePage from './schedule/SchedulePage.svelte';
-  import ExecPage from './exec/ExecPage.svelte';
-  import WarehousePage from './warehouse/WarehousePage.svelte';
-  import CatalogBrowser from './catalog/CatalogBrowser.svelte';
-  import DevicePage from './catalog/DevicePage.svelte';
-  import AssetsList from './assets/AssetsList.svelte';
-  import AssetPage from './assets/AssetPage.svelte';
   import ManualPage from './content/ManualPage.svelte';
   import WorkflowsPage from './it/registry/WorkflowsPage.svelte';
   import PerfPage from './it/monitoring/PerfPage.svelte';
@@ -86,21 +62,40 @@
   import PoPage from './po/PoPage.svelte';
   import VendorInvoicePage from './po/VendorInvoicePage.svelte';
   import WatchlistPage from './accounts/WatchlistPage.svelte';
-  import ShopHome from './shop/ShopHome.svelte';
-  import ShopProductPage from './shop/ShopProductPage.svelte';
   import LandingPage from './landing/LandingPage.svelte';
   import SearchResultsPage from './search/SearchResultsPage.svelte';
   import CodebaseTrendPage from './it/metrics/CodebaseTrendPage.svelte';
   import ProtocolDriftPage from './it/registry/ProtocolDriftPage.svelte';
   import AgentsPage from './it/agents/AgentsPage.svelte';
   import CredentialsPage from './it/credentials/CredentialsPage.svelte';
-  import IncidentsPage from './it/incidents/IncidentsPage.svelte';
   import LoginPage from './auth/LoginPage.svelte';
   import AuthAdminPage from './auth/AuthAdminPage.svelte';
   import ModuleDisabled from './shell/ModuleDisabled.svelte';
   import { moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
 
-  let parsed = $state<Route>(parseRoute(window.location.pathname, window.location.search));
+  // The location, and the route parsed from it against the station tree
+  // (backlog 0bc2eb68): a hosted page's address is its host station's in
+  // the tree, so a path only the tree can place is `resolving` until the
+  // tree's read answers, and re-parses by itself when it does.
+  //
+  // The SAME route keeps its identity when the tree lands: a page the
+  // router placed without the tree (/finance, a packet's page) must not
+  // remount because the read answered — the Finance page is keyed on its
+  // route, and a remount re-reads every panel (measured: two mounts, four
+  // department reads instead of two).
+  let loc = $state({ pathname: window.location.pathname, search: window.location.search });
+  // A NAVIGATION is always a new route, though, even to an equal one: the
+  // sidebar's Finance link must remount a page whose tabs replaceState'd.
+  let lastParsed: { at: typeof loc; route: Route } | null = null;
+  let parsed = $derived.by<Route>(() => {
+    const at = loc;
+    const next = parseRoute(at.pathname, at.search, stationAddresses());
+    if (lastParsed !== null && lastParsed.at === at && JSON.stringify(lastParsed.route) === JSON.stringify(next)) {
+      return lastParsed.route;
+    }
+    lastParsed = { at, route: next };
+    return next;
+  });
 
   // The route as this instance can render it (backlog 64656a46, car 2
   // of design 8c3e9599): a page whose owning department is not a live
@@ -112,8 +107,8 @@
   // and no page. The pathname is read when `parsed` changes, which is
   // when the location already holds the new path.
   let route = $derived(withManifest(
-    withRoster(parsed, window.location.pathname, departmentRoster()),
-    window.location.pathname,
+    withRoster(parsed, loc.pathname, departmentRoster(), stationAddresses()),
+    loc.pathname,
     manifest.value,
   ));
 
@@ -125,8 +120,14 @@
   const recordSurfaceOpen = makeSurfaceOpenRecorder(postSurfaceOpen);
   // The route AS PARSED: the pattern is the address asked for, which
   // the registry check does not change.
+  // A path the tree has not placed yet opened no surface: it is counted
+  // when it resolves.
+  // A department address that renders its landing records the landing
+  // page's own address (`openedPattern`: /it opens the board at /alarms).
   $effect(() => {
-    recordSurfaceOpen(routePattern(parsed, window.location.pathname));
+    if (parsed.kind === 'resolving') return;
+    const pattern = openedPattern(parsed, loc.pathname, stationAddresses());
+    if (pattern !== null) recordSurfaceOpen(pattern);
   });
 
   // Routes whose tenant module is not listed `true` in tenant.toml
@@ -169,50 +170,43 @@
   // ("reload to log in") described a loop, not a way in. Data reads
   // and writes still redirect — that is the interceptor's real job.
   //
-  // Still only /api/* here: a non-API 401 belongs to the call that
-  // made it, which knows whether the status means a dead session
+  // Still only /api/* for a 401: a non-API 401 belongs to the call
+  // that made it, which knows whether the status means a dead session
   // (a step-plugin bundle) or something else. Those callers reach
   // `goToLogin` directly — web-kit's session/deadSession.ts holds the
   // target, the ?next= encoding and the on-/login guard ONCE, so this
-  // interceptor, steps/pluginHost.ts and WriteGate's sign-in link
-  // cannot drift (§9a).
-  {
-    const isIdentityProbe = (url: string): boolean =>
-      url.startsWith('/api/session') || url.startsWith('/api/auth/');
-    const _origFetch = window.fetch;
-    window.fetch = (async (
-      input: RequestInfo | URL,
-      init?: RequestInit,
-    ): Promise<Response> => {
-      const resp = await _origFetch(input, init);
-      if (resp.status === 401) {
-        const url = typeof input === 'string'
-          ? input
-          : input instanceof URL ? input.href : input.url;
-        if (url.startsWith('/api/') && !isIdentityProbe(url)) {
-          goToLogin();
-        }
-      }
-      return resp;
-    }) as typeof window.fetch;
-  }
+  // guard, steps/pluginHost.ts and WriteGate's sign-in link cannot
+  // drift (§9a).
+  //
+  // The guard ALSO answers Cloudflare Access expiring at the edge
+  // (backlog 7d70cad6, David 2026-11-16): a lapsed Access session
+  // makes a read THROW, not 401, and the page used to render that as
+  // its error with the root page as the only way back. The guard
+  // reloads this page instead, so Access signs him in and returns him
+  // here. The decision and its tests live in deadSession.ts.
+  window.fetch = guardFetch(window.fetch);
 
   onMount(() => {
     loadSession();
     loadManifest();
     // THE VIEWER'S FLIGHTS (design c4c2a607). The gateway inlines them
     // into index.html, so a page it served already knows; a page it did
-    // not (the dev server, a gateway whose flights read failed) asks the
-    // same endpoint once. A failed read leaves every flight off.
-    if (flights.on === null) void loadFlights();
+    // not (the dev server, a gateway whose flights read failed) retries
+    // the same endpoint. Unknown stays OFF until an answer is readable.
+    const flightsRead = new AbortController();
+    if (flights.on === null) void loadFlights(flightsRead.signal);
     loadStepTypeRegistry();
     loadClasses('employee');
     loadDepartments();
+    void loadStationAddresses();
     const onPop = () => {
-      parsed = parseRoute(window.location.pathname, window.location.search);
+      loc = { pathname: window.location.pathname, search: window.location.search };
     };
     window.addEventListener('popstate', onPop);
-    return () => window.removeEventListener('popstate', onPop);
+    return () => {
+      flightsRead.abort();
+      window.removeEventListener('popstate', onPop);
+    };
   });
 
   // Which sidebar section highlights. The route->section map lives in
@@ -286,6 +280,11 @@
     </section>
   {:else if blockedModule}
     <ModuleDisabled module={blockedModule.id} label={blockedModule.label} />
+  {:else if route.kind === 'resolving'}
+      <!-- A path only the station tree can place, asked before its read
+           answered (backlog 0bc2eb68). Never a guessed page: it re-parses
+           when the tree lands. -->
+      <p role="status" data-resolving>Finding the station that hosts <code>{route.path}</code>…</p>
   {:else if route.kind === 'home'}
       <LandingPage />
     {:else if route.kind === 'notFound'}
@@ -305,6 +304,10 @@
                  not hold, so the code is the name. -->
             {departmentName(route.department)} is not a department on this instance, so nothing here answers
             <code>{route.path}</code>.
+          {:else if route.why !== undefined}
+            <!-- The tree could not be read, so no station could place
+                 this path (backlog 0bc2eb68): said, never read as a typo. -->
+            Nothing could place <code>{route.path}</code>: <span data-not-found-why>{route.why}</span>.
           {:else}
             Nothing in this app answers <code>{route.path}</code>. The link that brought you here is out of date or
             mistyped.
@@ -321,94 +324,16 @@
       <AuthAdminPage />
     {:else if route.kind === 'me'}
       <MePage />
-    {:else if route.kind === 'jobs'}
-      <!-- Keyed on the route, as Finance is: the page takes its filters
-           from these props once, at mount, so a navigation to /ux/jobs?…
-           while it is up (a custom Subject's own packets, a sidebar link)
-           changed the URL and left the page on the filters it had — no
-           read, an empty Subject id box, every row (backlog d0b93b80).
-           The page's own filter writes replaceState and never re-parse
-           the route, so typing does not remount it. -->
-      {#key route}
-        <JobsListPage
-          initialKind={route.workflow ?? ''}
-          initialKindPrefix={route.workflowPrefix ?? ''}
-          initialKindGroup={route.jobKindGroup ?? ''}
-          initialOrder={route.jobOrder ?? 'newest'}
-          initialDepartmentFilter={route.jobDepartment ?? ''}
-          initialStatus={route.jobStatus ?? JOBS_DEFAULT_STATUS}
-          initialOwnerId={route.jobOwnerId ?? ''}
-          initialSubjectId={route.jobSubjectId ?? ''}
-          initialNewJobOpen={route.newJobOpen ?? false}
-          initialNewJobKind={route.newJobKind ?? ''}
-          initialNewJobSubjectKind={route.newJobSubjectKind ?? ''}
-          initialNewJobSubjectId={route.newJobSubjectId ?? ''}
-          writesFiltersToUrl
-        />
-      {/key}
     {:else if route.kind === 'jobDetail'}
       <JobDetailPage jobId={route.jobId} />
-    {:else if route.kind === 'service'}
-      <!-- Both queues filter by DEPARTMENT, and the code is the
-           owner of the route's own catalog entry — the department whose
-           tab it renders under (car 2 of design 8c3e9599, which
-           dissolved the Service queue's second, `support`, answer). They
-           filtered on a hardcoded
-           workflow kind until 2026-09-22 — `field-service` and `sale`,
-           both authored only in a tenant's seed bundle — so each
-           rendered its title and then, correctly and permanently, "No
-           jobs match" (backlog 423a531d). A department runs several
-           protocols (Sales: receive-a-sponsorship AND
-           receive-an-inquiry), so no single kind could have been right
-           either; the server resolves the department to the kinds
-           whose workflow row declares it. -->
-      <JobsListPage
-        initialDepartment={ROUTE_CATALOG.service.owner ?? ''}
-        initialStatus="open"
-        pageTitle="Service queue"
-      />
-    {:else if route.kind === 'sales'}
-      <JobsListPage
-        initialDepartment={ROUTE_CATALOG.sales.owner ?? ''}
-        initialStatus="open"
-        pageTitle="Sales pipeline"
-      />
     {:else if route.kind === 'department'}
       <DepartmentJobsPage code={route.code} />
-    {:else if route.kind === 'assets'}
-      <AssetsList />
-    {:else if route.kind === 'asset'}
-      <AssetPage assetId={route.assetId} />
-    {:else if route.kind === 'accounts'}
-      <AccountsList />
-    {:else if route.kind === 'account'}
-      <AccountPage accountId={route.accountId} />
     {:else if route.kind === 'vendors'}
       <VendorsList />
     {:else if route.kind === 'vendor'}
       <VendorPage vendorLookup={route.vendorLookup} />
-    {:else if route.kind === 'people'}
-      <PeopleList />
-    {:else if route.kind === 'employee'}
-      <EmployeePage empId={route.empId} />
-    {:else if route.kind === 'parts'}
-      <!-- The warehouse's packets beside its stock, by the catalog
-           entry's owner like the two queues above (044dffa1). -->
-      <PartsList department={ROUTE_CATALOG.parts.owner ?? ''} />
-    {:else if route.kind === 'part'}
-      <PartPage partSku={route.partSku} />
-    {:else if route.kind === 'products'}
-      <ProductsList initialQuery={route.q} />
-    {:else if route.kind === 'product'}
-      <ProductPage sku={route.productSku} />
-    {:else if route.kind === 'shipping'}
-      <ShippingPage />
-    {:else if route.kind === 'shipmentDetail'}
-      <ShipmentPage shipmentId={route.shipmentId} />
-    {:else if route.kind === 'support'}
-      <SupportPage />
     {:else if route.kind === 'finance'}
-      <!-- Keyed on the route, so a navigation to /ux/finance?… while the
+      <!-- Keyed on the route, so a navigation to /finance?… while the
            page is up (the sidebar's Finance link, a ledger-entry link)
            mounts what the link names; the page's own tab clicks
            replaceState and never re-parse the route (2ab44d55). -->
@@ -421,15 +346,8 @@
       <NewJournalEntryPage />
     {:else if route.kind === 'invoice'}
       <InvoicePage invoiceId={route.invoiceId} />
-    {:else if route.kind === 'hr'}
-      <HrPage />
-    {:else if route.kind === 'qa'}
-      <QaPage />
     {:else if route.kind === 'systemKb'}
       <ItKnowledgeBasePage />
-    {:else if route.kind === 'policy'}
-      <ItTabs group="registry" active="/it/registry/policy" />
-      <PolicyPage />
     {:else if route.kind === 'workflowNew'}
       <WorkflowNewPage />
     {:else if route.kind === 'workflowDesign'}
@@ -437,97 +355,76 @@
     {:else if route.kind === 'workflowDetail'}
       <WorkflowDetailPage kindSlug={route.kindSlug} />
     {:else if route.kind === 'systemStepPlugins'}
-      <ItTabs group="registry" active="/it/registry/step-plugins" />
+      <ItTabs group="registry" active="system-step-plugins" />
       <StepPluginsPage />
     {:else if route.kind === 'systemStepPluginDetail'}
       <StepPluginDetailPage pluginSlug={route.pluginSlug} />
     {:else if route.kind === 'systemDesign'}
-      <ItTabs group="design" active="/it/design" />
+      <ItTabs group="design" active="system-design" />
       <DesignReviewPage />
-    {:else if route.kind === 'companyMap'}
-      <CompanyMap />
     {:else if route.kind === 'systemYard'}
-      <!-- THE DEPARTMENT MAP (design e765b3fc): the map on top and the
-           selection's panel below it. A selection is a query on this one
-           route, so the map is mounted once and never torn down by a
-           click — the floor pages that were a second route here retired
-           with car N3, their content in the panels. -->
-      <MapPage at={route.at} overview={route.overview === true} detail={route.detail === true} />
+      {#if flights.on === null}
+        <p role="status" data-flights-unread data-retrying={flights.retrying}>Flights unread, retrying</p>
+      {/if}
+      <!-- What stays of the Department Map after step 1 of design
+           01fa5bdf: the alarms board, and the board holding the release
+           and cancel controls under a selection, until the station page
+           takes them (that design's step 4). -->
+      <MapPage at={route.at} />
+    {:else if route.kind === 'systemTree'}
+      <TreeFloor under={route.under ?? null} depth={route.depth ?? DEFAULT_DEPTH} />
+    {:else if route.kind === 'systemStation'}
+      <StationPage station={route.station} />
+    {:else if route.kind === 'systemStationResources'}
+      <!-- Keyed: another station's Resources view reads its own floor afresh. -->
+      {#key route.station}
+        <ResourcesPage station={route.station} />
+      {/key}
     {:else if route.kind === 'systemEstate'}
       <EstatePage />
-    {:else if route.kind === 'systemFleet'}
-      <ItTabs group="operate" active="/it/operate/bottlenecks" />
-      <FleetPage />
-    {:else if route.kind === 'experiments'}
-      <ItTabs group="design" active="/it/design/experiments" />
-      <ExperimentsPage />
     {:else if route.kind === 'dispatcherRules'}
-      <ItTabs group="registry" active="/it/registry/dispatcher" />
+      <ItTabs group="registry" active="system-dispatcher" />
       <DispatcherCascadePage />
     {:else if route.kind === 'dispatcherRulesList'}
-      <ItTabs group="registry" active="/it/registry/rules" />
+      <ItTabs group="registry" active="system-dispatcher-rules" />
       <DispatcherRulesPage />
     {:else if route.kind === 'dispatcherRuleEdit'}
       <DispatcherRuleEditPage ruleName={route.ruleName} />
     {:else if route.kind === 'systemSubjects'}
-      <ItTabs group="registry" active="/it/registry/subjects" />
+      <ItTabs group="registry" active="system-subjects" />
       <SubjectsClassesPage />
     {:else if route.kind === 'systemRegistryDrift'}
-      <ItTabs group="registry" active="/it/registry/drift" />
+      <ItTabs group="registry" active="system-registry-drift" />
       <ProtocolDriftPage />
     {:else if route.kind === 'systemAgents'}
-      <ItTabs group="registry" active="/it/registry/agents" />
+      <ItTabs group="registry" active="system-agents" />
       <AgentsPage />
     {:else if route.kind === 'systemCredentials'}
-      <ItTabs group="registry" active="/it/registry/credentials" />
+      <ItTabs group="registry" active="system-credentials" />
       <CredentialsPage />
     {:else if route.kind === 'inbox'}
       <InboxPage />
     {:else if route.kind === 'myCalendar'}
       <MyCalendarPage />
-    {:else if route.kind === 'schedule'}
-      <SchedulePage />
-    {:else if route.kind === 'exec'}
-      <ExecPage department={ROUTE_CATALOG.exec.owner ?? ''} />
-    {:else if route.kind === 'warehouse'}
-      <WarehousePage />
-    {:else if route.kind === 'catalog'}
-      <CatalogBrowser />
-    {:else if route.kind === 'device'}
-      <DevicePage sku={route.sku} />
-    {:else if route.kind === 'marketingAssets'}
-      <MarketingAssetsList />
-    {:else if route.kind === 'marketingAsset'}
-      <MarketingAssetPage assetId={route.assetId} />
     {:else if route.kind === 'manual'}
       <ManualPage slug={null} />
     {:else if route.kind === 'manualSection'}
       <ManualPage slug={route.slug} />
     {:else if route.kind === 'workflows'}
-      <ItTabs group="registry" active="/it/registry" />
+      <ItTabs group="registry" active="workflows" />
       <WorkflowsPage />
     {:else if route.kind === 'systemMonitoringPerf'}
-      <ItTabs group="operate" active="/it/operate/perf" />
+      <ItTabs group="operate" active="system-performance" />
       <PerfPage />
     {:else if route.kind === 'systemMonitoringEvents'}
-      <ItTabs group="operate" active="/it/operate/audit" />
+      <ItTabs group="operate" active="system-monitoring" />
       <EventsPage />
-    {:else if route.kind === 'systemMonitoringAtlas'}
-      <ItTabs group="operate" active="/it/operate/atlas" />
-      <AtlasPage />
     {:else if route.kind === 'po'}
       <PoPage poId={route.poId} />
     {:else if route.kind === 'vendorInvoice'}
       <VendorInvoicePage vendorInvoiceId={route.vendorInvoiceId} />
     {:else if route.kind === 'watchlist'}
       <WatchlistPage />
-    {:else if route.kind === 'incidents'}
-      <ItTabs group="operate" active="/it/operate" />
-      <IncidentsPage />
-    {:else if route.kind === 'shop'}
-      <ShopHome />
-    {:else if route.kind === 'shopProduct'}
-      <ShopProductPage sku={route.sku} />
     {:else}
       <MePage />
     {/if}

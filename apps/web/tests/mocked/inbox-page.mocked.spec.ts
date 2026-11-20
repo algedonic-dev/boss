@@ -1,9 +1,9 @@
 import { isPageWrite } from './_smokeMocks';
-// /ux/inbox — "Inbox" (home), every control and render state pinned as
+// /me/inbox — "Inbox" (home), every control and render state pinned as
 // the page behaves TODAY (page audit 5477d9eb, step `test`).
 //
 // Four narrower specs already pin one piece each: false-empty's inbox
-// pair (the failure line and Retry, at the legacy /inbox path),
+// pair (the failure line and Retry, at /me/inbox too since 5cb56bb3),
 // readonly-session (Compose disabled for a guest), inbox-write-refusals
 // (gaps 4 and 5, 2a6fab80 and 129da587) and inbox-archive-and-bulk
 // (gaps 2 and 8, 8578b91e and 5963a322). None of them presses a filter
@@ -61,9 +61,13 @@ import { mountPage, settledReads } from './_helpers';
 import { inboxPage, installApiFloor } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
 import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
-import { parseRoute } from '../../src/router';
+import { ADDRESSES, pageAt } from '../fixtures/station-tree';
+import { parseRoute as parseRouteAt } from '../../src/router';
+// The router reads a hosted page's address off the station tree
+// (backlog 0bc2eb68); this spec reads it off the tree the floor serves.
+const parseRoute = (path: string, search = '') => parseRouteAt(path, search, ADDRESSES);
 
-const PATH = '/ux/inbox';
+const PATH = '/me/inbox';
 const NOW = new Date('2026-09-25T12:00:00Z');
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
@@ -237,7 +241,7 @@ const row = (page: Page, subject: string) => rows(page).filter({ hasText: subjec
 const bulk = (page: Page) => page.locator('.inbox-bulk');
 const modal = (page: Page) => page.locator('.compose-modal');
 
-test.describe('/ux/inbox — the inbox, read', () => {
+test.describe('/me/inbox — the inbox, read', () => {
   test('the page renders every heading, count, row and word, from two reads and no writes', async ({ page }) => {
     const seen = watch(page);
     const backend = await open(page);
@@ -421,7 +425,7 @@ test.describe('/ux/inbox — the inbox, read', () => {
   });
 });
 
-test.describe('/ux/inbox — rows: Mark read, Archive, and the bulk bar', () => {
+test.describe('/me/inbox — rows: Mark read, Archive, and the bulk bar', () => {
   test('Mark read marks the row read, and a refused one says why on the row', async ({ page }) => {
     const backend = await open(page, { refuse: [JOB.id] });
 
@@ -498,20 +502,19 @@ test.describe('/ux/inbox — rows: Mark read, Archive, and the bulk bar', () => 
   });
 });
 
-test.describe('/ux/inbox — links and back', () => {
+test.describe('/me/inbox — links and back', () => {
   test('the step link marks the message read, opens the step, and back returns to the inbox', async ({ page }) => {
     const backend = await open(page);
 
     // The producers write /jobs/{id} and /jobs/{id}/steps/{step}: the
     // router's job and step routes, reached through its unprefixed-path
-    // fallback. The catalog lists the jobs surface they sit under and
-    // no detail entry for either (the same shape as /ux/people/:id).
-    expect(ROUTE_CATALOG.inbox.path).toBe(PATH);
+    // fallback. The catalog lists no entry for either; the jobs list
+    // they once sat under went with step 1 of design 01fa5bdf.
+    expect(pageAt('inbox')).toBe(PATH);
     expect(ROUTE_CATALOG.inbox.label).toBe('Inbox');
     expect(ROUTE_CATALOG.inbox.owner).toBe('home');
     expect(parseRoute('/jobs/job-1/steps/step-9')).toMatchObject({ kind: 'stepFocus', jobId: 'job-1', stepId: 'step-9' });
     expect(parseRoute('/jobs/job-2')).toMatchObject({ kind: 'jobDetail', jobId: 'job-2' });
-    expect(parseRoute(ROUTE_CATALOG.jobs.path)).toMatchObject({ kind: 'jobs' });
 
     const link = list(page).getByRole('link', { name: 'step: step-9' });
     await expect(link).toHaveAttribute('href', '/jobs/job-1/steps/step-9');
@@ -556,7 +559,7 @@ test.describe('/ux/inbox — links and back', () => {
   });
 });
 
-test.describe('/ux/inbox — the composer', () => {
+test.describe('/me/inbox — the composer', () => {
   test('Compose opens the form; ✕, Cancel and the backdrop each close it, and what was typed stays', async ({ page }) => {
     await open(page);
     const compose = page.getByRole('button', { name: 'Compose', exact: true });
@@ -738,7 +741,7 @@ test.describe('/ux/inbox — the composer', () => {
   }
 });
 
-test.describe('/ux/inbox — empty, loading and failed reads never paint alike', () => {
+test.describe('/me/inbox — empty, loading and failed reads never paint alike', () => {
   test('an empty inbox says nothing is waiting, and counts zeros it read', async ({ page }) => {
     await install(page, { inbox: [] });
     await mountPage(page, PATH, { titleMatch: /Nothing is waiting on you/ });
@@ -781,8 +784,11 @@ test.describe('/ux/inbox — empty, loading and failed reads never paint alike',
   const FAILURES: ReadonlyArray<readonly [string, (r: Route) => Promise<void>, string | RegExp]> = [
     ['refused (500)', (r) => json(r, 'message store down', 500),
       `Couldn't load your inbox — ${READ}: HTTP 500`],
-    ['forbidden (403)', (r) => json(r, 'forbidden', 403),
-      `Couldn't load your inbox — ${READ}: HTTP 403`],
+    // A 403 is the server refusing this session, not a store that is
+    // down: the line says so and keeps the server's reason after the
+    // status (backlog 7abb184f).
+    ['forbidden (403)', (r) => r.fulfill({ status: 403, contentType: 'text/plain', body: 'emp-001 may not read this inbox' }),
+      `Couldn't load your inbox — the server refused this session: ${READ}: HTTP 403: emp-001 may not read this inbox`],
     // The line names the read even when the browser's message does not
     // (backlog 0ef5e008).
     ['unreachable', (r) => r.abort('connectionrefused'),
@@ -840,7 +846,7 @@ test.describe('/ux/inbox — empty, loading and failed reads never paint alike',
   });
 });
 
-test.describe('/ux/inbox — a read-only guest', () => {
+test.describe('/me/inbox — a read-only guest', () => {
   test('Compose, the bulk bar and every row control are behind the gate, and a link is only a navigation', async ({ page }) => {
     const backend = await install(page, { session: { username: 'guest-7', role: 'audit-readonly' } });
     await mountPage(page, PATH, { titleMatch: /waiting on you/ });

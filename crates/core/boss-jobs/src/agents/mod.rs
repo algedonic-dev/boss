@@ -60,14 +60,20 @@
 pub mod automations;
 pub mod door;
 pub mod http;
+pub mod identity;
 pub mod in_memory;
+#[cfg(test)]
+mod one_kind_tests;
 pub mod port;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod seed;
 pub mod types;
 
-pub use automations::{AUTOMATION_DECLARED, AutomationActor, AutomationsSeedOutcome};
+pub use automations::{
+    AUTOMATION_DECLARED, AutomationActor, AutomationsSeedOutcome, RecordedTier,
+    reresolve_recorded_reader, resolve_recorded_reader,
+};
 pub use door::{
     Judged, LoginDoor, ROW_ROLE_MODE_FILE, ROW_ROLE_MODE_FILE_ENV, Resolution, UNRESOLVED_LOGIN,
     decide, judge, resolve_login,
@@ -78,6 +84,6 @@ pub use port::{AGENT_DECLARED, AGENT_UPDATED, AgentsError, AgentsRegistry};
 pub use postgres::PgAgents;
 pub use seed::{load_agents_toml, parse_agents_toml};
 pub use types::{
-    AgentInput, AgentRow, AgentsBatchOutcome, FieldChange, UpdatedRow, render_updated,
-    validate_agent,
+    AgentInput, AgentRow, AgentsBatchOutcome, FieldChange, SeatOutcome, UpdatedRow, render_updated,
+    validate_agent, validate_seats,
 };

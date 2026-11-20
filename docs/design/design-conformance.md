@@ -1,6 +1,11 @@
 # Design: holding the implementation to the design
 
-**Status**: approved — in-review (2026-08-16).
+**Status**: living reference (re-statused 2026-11-18, backlog 924de432).
+All 3 questions were decided on 2026-08-16 (see Decisions). It stays
+because it defines the three enforcement classes (enforced, checked,
+unenforced) that the invariant register under `docs/invariants/` and
+`infra/lint/invariant-register.sh` hold every entry to. New decisions
+go on design packets, not here.
 **Origin**: David, 2026-08-13: *"Our biggest risk is that we aren't
 holding our actual software implementation to the ideals of our
 design."*
@@ -17,8 +22,8 @@ read as authoritative:
 
 | claim | reality |
 |---|---|
-| "every executor has an actor station" (`stations.md`) | two seeded `batch` rows; no actor, group or constraint rows; no authoring API |
-| "a queue is a lens … **never a reified structure**" (`queue-visibility.md`) | the station registry ships as rows |
+| "every executor has an actor station" (`stations.md`, now `station-tree.md`) | two seeded `batch` rows; no actor, group or constraint rows; no authoring API |
+| "a queue is a lens … **never a reified structure**" (`queue-visibility.md`, folded into the decision record) | the station registry ships as rows |
 | "group→role mapping is a registry, not gateway code" (`idm-kanidm.md`) | `oidc.rs` deliberately has no such registry — roles come off the employee row |
 | "systemd demoted to supervision" (implied by cadence work) | the *train's* timers retired; **12 systemd timers remain** |
 | crate roster: 27 / 16 / 5 (`CLAUDE.md`, twice) | 29 / 18 / 6 |

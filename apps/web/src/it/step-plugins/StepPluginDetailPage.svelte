@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { pageLink } from '../../shell/stationAddresses.svelte';
   // /admin/step-plugins/:slug — port of
   // apps/web/src/admin/StepPluginDetailPage.tsx.
 
@@ -112,7 +113,7 @@
   {@const versions = loadState.versions}
   {@const hasDraft = versions.some((v) => v.status === 'draft')}
   <div class="catalog theme-exec">
-    <Breadcrumb to={href('/it/registry/step-plugins')}>
+    <Breadcrumb to={pageLink('system-step-plugins')}>
       ← All step plugins
     </Breadcrumb>
     <PageHeader

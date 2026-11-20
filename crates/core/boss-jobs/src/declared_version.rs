@@ -53,6 +53,19 @@ pub fn not_above(name: &str, version: i32, newest: i32) -> String {
     )
 }
 
+/// The refusal a publish signed over one live version answers when the
+/// lineage's newest, read under the write's own lock, is another —
+/// review R1 of car 4019ba69 (2026-11-08): a signed approval is a diff
+/// against a NAMED version, and a client's read before its write cannot
+/// hold that version still. Worded once, for both adapters.
+pub fn moved(name: &str, over: i32, newest: i32) -> String {
+    format!(
+        "{name}: this publish was signed over live v{over}, and the lineage's newest version \
+         is v{newest}; what was approved is a diff against v{over}, not against what is live \
+         now, so nothing was written — file the change again over v{newest}"
+    )
+}
+
 /// Serialise every declared write of `name` in `table` behind this
 /// transaction, then read the newest version its lineage holds — in
 /// that order, and as two statements (module doc). `table` and
@@ -65,11 +78,28 @@ pub async fn lock_and_read_newest(
     name_column: &'static str,
     name: &str,
 ) -> Result<i32, sqlx::Error> {
+    lock_and_read_newest_with_budget(tx, table, name_column, name, None).await
+}
+
+#[cfg(feature = "postgres")]
+pub(crate) async fn lock_and_read_newest_with_budget(
+    tx: &mut sqlx::PgConnection,
+    table: &'static str,
+    name_column: &'static str,
+    name: &str,
+    budget: Option<boss_events::statement_budget::StatementBudget>,
+) -> Result<i32, sqlx::Error> {
+    boss_events::statement_budget::refresh(tx, budget)
+        .await
+        .map_err(sqlx::Error::Protocol)?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
         .bind(table)
         .bind(name)
         .execute(&mut *tx)
         .await?;
+    boss_events::statement_budget::refresh(tx, budget)
+        .await
+        .map_err(sqlx::Error::Protocol)?;
     let max: Option<i32> = sqlx::query_scalar(&format!(
         "SELECT MAX(version) FROM {table} WHERE {name_column} = $1"
     ))
@@ -87,6 +117,14 @@ mod tests {
     fn a_name_never_held_has_newest_zero() {
         assert_eq!(newest(std::iter::empty()), 0);
         assert_eq!(newest([3, 5, 4].into_iter()), 5);
+    }
+
+    #[test]
+    fn a_moved_baseline_names_both_versions_and_the_one_to_refile_over() {
+        let text = moved("robots:door", 1, 2);
+        assert!(text.contains("signed over live v1"), "{text}");
+        assert!(text.contains("newest version is v2"), "{text}");
+        assert!(text.ends_with("file the change again over v2"), "{text}");
     }
 
     #[test]

@@ -50,7 +50,7 @@ impl installation::HttpPodReader {
         let mut response = match response {
             Ok(response) => response,
             Err(error) => {
-                original.error = Some(error.to_string());
+                original.error = Some(with_causes(&error));
                 return Ok(original);
             }
         };
@@ -75,12 +75,22 @@ impl installation::HttpPodReader {
                 }
                 Ok(None) => return Ok(original),
                 Err(error) => {
-                    original.error = Some(error.to_string());
+                    original.error = Some(with_causes(&error));
                     return Ok(original);
                 }
             }
         }
     }
+}
+/// An error and every cause beneath it, `: `-joined. reqwest's own text
+/// stops at "error sending request", so a read that timed out recorded only
+/// that it failed, and red train 1b2ef0e0 could not say which (backlog
+/// edca7e41).
+fn with_causes(error: &dyn std::error::Error) -> String {
+    std::iter::successors(Some(error), |e| e.source())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 #[async_trait]
 impl NativeReads for installation::HttpPodReader {

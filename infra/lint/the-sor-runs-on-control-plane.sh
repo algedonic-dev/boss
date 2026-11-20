@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The SoR stack schedules on control-plane, not a flaky worker.
+# The SoR stack stays off build nodes; PostgreSQL uses the data node.
 #
 # 2026-09-06 (backlog 90932d98): the boss app Deployment carried no
 # nodeSelector, so the scheduler put it on worker w-1. When w-1 shed
@@ -15,25 +15,12 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 f="infra/cluster/manifests/boss.yaml"
 [ -f "$f" ] || { echo "sor-control-plane: $f is missing"; exit 1; }
 
-# `|| true` ON BOTH COUNTS, and the reason is the whole point of this
-# lint. `grep -c` prints 0 and exits 1 when nothing matches, and under
-# the `set -e` above that kills the script even though the count is
-# captured — the assignment takes grep's status as its own. Zero pins
-# is EXACTLY the condition this lint exists to catch (90932d98), so
-# without these the script died on line 19 in its own worst case and
-# the diagnostic below never printed: failing closed, but silently,
-# which CLAUDE.md §Diagnosis calls a verdict nobody can act on
-# (backlog 4c9733f7).
-workloads=$(grep -cE '^kind: (Deployment|StatefulSet)' "$f" || true)
-pinned=$(grep -c 'node-role.kubernetes.io/control-plane' "$f" || true)
-if [ "$pinned" -lt "$workloads" ]; then
-    echo "sor-control-plane: $f has $workloads workload(s) but only $pinned"
-    echo "  control-plane nodeSelector(s). A boss workload without it can land on a"
-    echo "  flaky worker (w-1) and take the SoR down when that node sheds pods (90932d98)."
-    echo "  Pin every Deployment/StatefulSet:"
-    echo "      nodeSelector:"
-    echo "        node-role.kubernetes.io/control-plane: \"\""
+# The old global grep count could count a comment or another workload's
+# selector. Read each actual pod spec, including PostgreSQL's approved
+# required database affinity (3c475a19 car 4), and keep a named refusal.
+command -v bun >/dev/null 2>&1 || { echo "sor-control-plane: bun is missing; placement was not read" >&2; exit 1; }
+if ! workloads=$(bun infra/lint/lib/sor-placement.ts "$f"); then
     exit 1
 fi
 lint_scanned the-sor-runs-on-control-plane "$workloads" "workload(s) in $f"
-echo "sor-control-plane: OK — all $workloads boss workload(s) pin to control-plane"
+echo "sor-control-plane: OK — all $workloads boss workload(s) have required placement off build nodes"

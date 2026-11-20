@@ -9,6 +9,7 @@ After=network-online.target
 Type=oneshot
 User=root
 EnvironmentFile=/etc/boss/sor.env
+Environment=BOSS_WRAP_OPEN_RETRY=3
 WorkingDirectory=/var/lib/boss/gcp-tree/current
 RuntimeDirectory=boss-protocol-drift
 RuntimeDirectoryMode=0700

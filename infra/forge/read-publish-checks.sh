@@ -63,12 +63,28 @@
 #      reading records the declared count beside the read count);
 #   3b. reads every OTHER failing check's annotations too, for the
 #      failed checks infra/gate.sh names there on Actions — the Gate's
-#      job log is admin-only, its annotations are public (backlog
-#      29c36336) — and puts them on that check's `failing` entry;
+#      job log answers 403 to an anonymous reader, its annotations are
+#      public (backlog 29c36336) — and puts them on that check's
+#      `failing` entry, and
+#      the same read WHOLE as `failing_annotations` (backlog 1b32c950):
+#      per failing check its name and id, and every annotation with its
+#      path, line, level, title and message, one page of fifty, a read
+#      the anonymous rate limit would refuse not made and said;
+#   3c. reads each failing Actions check's JOB LOG with the read-only
+#      token the credential broker mints (backlog b7a74610; THE CHECKS
+#      TOKEN below), and records as `failing_logs` every test the log
+#      says FAILED, with its binary and cargo's rerun selector, and the
+#      gate's receipt off the `cat .gate-receipt.json` step — so a
+#      GitHub-only red names its failing test without a person. No
+#      token, a refused read, or a log with no receipt is stated on the
+#      entry, never silence;
 #   4. PATCHes the reading onto the packet's metadata as
 #      `code_scanning` — one entry per check with its conclusion, and
 #      for the scanning check the counts by rule, by file and by level
-#      — and completes `read-checks` with `conclusion`, `alerts` and
+#      — beside `failing_annotations`, in the same body, held to a
+#      stated allowance and re-sent without the annotations on a 413
+#      (review 75bb4029 B1), so the scan's reading always lands,
+#      and completes `read-checks` with `conclusion`, `alerts` and
 #      `rules`. The protocol's `judge-checks` step then asks the agent
 #      for a disposition per rule; the merge on GitHub stays David's.
 #
@@ -143,6 +159,67 @@ CEILING="${BOSS_CHECKS_CEILING_SECONDS:-14400}"
 # GitHub pages a check-run's annotations 100 at a time; ten pages is
 # well past what it exposes for one run.
 MAX_PAGES=10
+# A FAILING check's annotations are read ONE page of this many, and that
+# page is the bound on what `failing_annotations` records for it (backlog
+# 1b32c950): GitHub Actions keeps at most fifty annotations per job, so
+# one page is the whole of what a workflow check exposes, and a check
+# that declares more says so as `declared` beside `read` — never cut.
+ANNOTATIONS_PER_CHECK=50
+# THE ALLOWANCE on what `failing_annotations` may weigh, encoded (review
+# 75bb4029 B1). The jobs API refuses a write that grows a packet once its
+# state event encodes at or past boss_jobs::packet_budget::BUDGET —
+# 737,280 bytes, three quarters of the event bound — and answers 413; the
+# reading rides ONE PATCH with `code_scanning`. GitHub takes annotation
+# messages up to 64 KB, so fifty of them on one failing check can pass
+# the budget alone, and the refusal would take the scan's reading with
+# it. So the record is held to a QUARTER of the budget, leaving the rest
+# to `code_scanning` and everything else the packet carries (the sixty
+# newest publish packets carried at most 8,162 bytes of metadata,
+# measured 2026-11-16). Over it, the largest checks' annotations are not
+# recorded, each saying so with its byte count (4a below) — a stated
+# non-record, never a cut message. Held equal to BUDGET / 4 by
+# read_publish_checks_sh::the_annotation_allowance_is_a_quarter_of_the_packet_budget.
+FAILING_ANNOTATIONS_ALLOWANCE=184320
+
+# THE CHECKS TOKEN (backlog b7a74610, 2026-11-19). Publish PR #260's Gate
+# failed its `test` check and nothing in BOSS could say which test: the
+# annotations quoted a prose line (54278a24), and the job log that names
+# it answers 403 to an anonymous reader. David opened it in a browser and
+# pasted the name. So a failing Actions check's log is read (3c) with a
+# GitHub App installation token narrowed to actions:read + metadata:read
+# on the mirror, which the broker mints into Secret
+# boss/github-app-algedonic-dev under one standing key when this verb's
+# request is filed. The rule is NAMED, not searched for: it shares its
+# credential_id with the admin rules github-act.sh selects by. The token
+# reaches this host only through infra/forge/credential-render.sh, into
+# this verb's own slot, and only on a run that has a log to read; it
+# reaches curl only through a 0600 header file (lib/secret-header.sh).
+# Nothing here mints, places or prints a credential.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CHECKS_RULE="$HERE/../dispatcher/rules/broker-mints-the-algedonic-dev-checks-token-when-a-checks-read-is-filed.toml"
+CHECKS_TOKEN_FILE="${BOSS_CHECKS_TOKEN_FILE:-/etc/boss-publish/github-app/algedonic-dev-checks.token}"
+CHECKS_TOKEN_OWNER_UID="${BOSS_CHECKS_TOKEN_OWNER_UID:-0}"
+CHECKS_RENDER="${BOSS_CHECKS_RENDER:-$HERE/credential-render.sh}"
+# The token must outlive the log read: the verb's own timeout, 120 s
+# (infra/ops/verbs/read-publish-checks.json).
+CHECKS_TOKEN_MARGIN_S=120
+# The receipt step, as GitHub heads it in a job log: `##[group]Run ` and
+# the step's `run:` line in .github/workflows/ci.yml, held equal by
+# read_publish_checks_sh::the_receipt_step_the_verb_reads_is_the_one_the_mirror_runs.
+RECEIPT_STEP_RUN='cat .gate-receipt.json || echo "no receipt — the gate stopped before it could write one"'
+# What one run reads, bounded, because the forge's runner is serial and
+# the packet is budgeted. At most LOGS_PER_RUN logs (the mirror runs one
+# Gate job; any further failing check is stated not read), each at most
+# LOG_MAX_BYTES within LOG_READ_SECONDS. Recorded per check: the first
+# FAILED_TESTS_MAX failed tests (the rest counted), and the receipt
+# whole when it encodes within RECEIPT_ALLOWANCE bytes — over it, stated
+# not recorded with its size, its failed checks still named. The log
+# itself is never stored: GitHub keeps it, and the entry says where.
+LOGS_PER_RUN=2
+LOG_MAX_BYTES=67108864
+LOG_READ_SECONDS=40
+FAILED_TESTS_MAX=50
+RECEIPT_ALLOWANCE=32768
 ACTOR="${BOSS_OPS_ACTOR:-automation:read-publish-checks}"
 BOSS_USER="{\"id\":\"$ACTOR\",\"role\":\"platform-admin\",\"access_tier\":\"operator\",\"territory_account_ids\":[],\"direct_report_ids\":[],\"department\":\"platform\"}"
 
@@ -152,7 +229,23 @@ refuse() { echo "$me: REFUSED — $*" >&2; exit 2; }
 fail() { echo "$me: FAILED — $*" >&2; exit 1; }
 
 workdir=$(mktemp -d) || { echo "$me: FAILED — no working directory under ${TMPDIR:-/tmp}" >&2; exit 1; }
-trap 'rm -rf "$workdir"' EXIT
+# THE CHECKS SLOT ON EVERY EXIT PATH (review f5a9b7f8, B1). The slot is
+# on the forge's persistent disk, under /etc, so a run that renders it
+# must remove it however it ends. The happy path's removal was the only
+# one, and an error under `set -e` after the render, or the SIGTERM the
+# ops runner's `timeout` sends (ops-runner.sh), left a live token resting
+# there for up to an hour. So the EXIT trap removes it from the moment
+# the render is attempted, and HUP / INT / TERM exit through that trap by
+# name rather than by bash's default for an untrapped signal. Set BEFORE
+# secret_header first arms below, so its cleanup chains in front of this
+# one and keeps it. A SIGKILL runs no trap: the next run removes what it
+# left (A run., below).
+checks_token_taken=0
+drop_checks_slot() { rm -f -- "$CHECKS_TOKEN_FILE" "$CHECKS_TOKEN_FILE.expires-at" "$CHECKS_TOKEN_FILE.request"; }
+trap 'rm -rf "$workdir"; [ "$checks_token_taken" != 1 ] || drop_checks_slot' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # The machine token rides to curl in a 0600 file, never in its argv,
 # where every local user reads it in ps (backlog 5f3ad356). Made here,
@@ -180,13 +273,40 @@ check_inputs() {
     return $rc
 }
 
+# checks_token_problem — the rule the broker mints the checks token under
+# must be there and be the STANDING kind (no request_id) credential-render
+# renders without --request, and the render must be runnable; anything
+# else is a reader with no way to a log. A run does not refuse on it — the
+# scan's reading never depended on a log — it states it on each entry.
+checks_token_problem() {
+    if [ ! -r "$CHECKS_RULE" ]; then
+        echo "the broker rule that mints the checks token is not readable at $CHECKS_RULE"
+    elif ! grep -qF 'handler = "credential.rotate.github-app-installation"' "$CHECKS_RULE" \
+        || grep -qE '^args = .*request_id = ' "$CHECKS_RULE"; then
+        echo "$CHECKS_RULE is not a standing GitHub App installation-token rule (its handler, and no request_id)"
+    elif [ ! -x "$CHECKS_RENDER" ]; then
+        echo "the render $CHECKS_RENDER is not executable — the token the broker mints could not reach this host's slot"
+    fi
+}
+
 if [ "${1:-}" = "--check" ]; then
     echo "$me --check"
     echo "  mirror     : $MIRROR_SLUG via $GITHUB_API (public, unauthenticated)"
     echo "  scan check : $SCAN_CHECK, with its jobs named '$SCAN_JOBS…'"
     echo "  reading    : ONE per run, never a wait; any check still running is not yet (exit 75), re-read every 15 minutes, which also re-reads every standing publish PR's state"
     echo "  ceiling    : ${CEILING}s after the PR opened, a check still running completes the step as unfinished"
+    echo "  failing    : each failing check's annotations, one read of ${ANNOTATIONS_PER_CHECK}, recorded whole as failing_annotations; none read once GitHub says the anonymous rate limit is spent"
+    echo "  allowance  : failing_annotations held to ${FAILING_ANNOTATIONS_ALLOWANCE} bytes encoded (a quarter of the packet event budget); over it the largest checks' are not recorded, each saying so with its byte count, and a 413 on the reading re-sends it without them"
+    # Named as NOT covered: --check holds no token and opens no socket, so
+    # whether the broker has minted one is known only when a run renders it.
+    echo "  job logs   : each failing Actions check's, at most ${LOGS_PER_RUN} a run, read with the read-only token minted by $(basename "$CHECKS_RULE") and rendered to $CHECKS_TOKEN_FILE at run time — not here"
     echo "  jobs api   : ${BOSS_JOBS_URL:-<unset — the ops-runner pins it on its Exec line>}"
+    problem=$(checks_token_problem)
+    if [ -n "$problem" ]; then
+        echo "$me: $problem" >&2
+        echo "$me: --check FAILED — see above" >&2
+        exit 1
+    fi
     if check_inputs; then
         echo "$me: --check ok"
         exit 0
@@ -199,6 +319,18 @@ fi
 # ---------------------------------------------------------------------
 # A run.
 # ---------------------------------------------------------------------
+# A slot an earlier run left — one killed outright, which runs no trap —
+# is removed first, whether or not this run has a log to read: the
+# forge's runner is serial, so no other run is between its render and
+# its read. --check, above, touches nothing.
+if [ -e "$CHECKS_TOKEN_FILE" ] || [ -L "$CHECKS_TOKEN_FILE" ] \
+    || [ -e "$CHECKS_TOKEN_FILE.expires-at" ] || [ -e "$CHECKS_TOKEN_FILE.request" ]; then
+    if drop_checks_slot 2> "$workdir/err"; then
+        say "checks token: removed the slot an earlier run left at $CHECKS_TOKEN_FILE"
+    else
+        echo "$me: checks token: the slot an earlier run left at $CHECKS_TOKEN_FILE could not be removed — $(cat "$workdir/err")" >&2
+    fi
+fi
 [ -n "${BOSS_JOBS_URL:-}" ] || refuse "BOSS_JOBS_URL is not set; the ops-runner pins it on its Exec line and a hand run must name the system of record"
 BASE="${BOSS_JOBS_URL%/}"
 check_inputs || refuse "inputs incomplete (see above); nothing was read"
@@ -220,7 +352,7 @@ publish_pr_states "read-publish-checks"
 #    The read carries the machine token as the writes do (backlog
 #    44b2087e: it went out with x-boss-user alone, six times in half an
 #    hour on 2026-10-07, each a caller the jobs gate would refuse).
-if ! curl -fsS -H "x-boss-user: $BOSS_USER" \
+if ! curl -q -fsS -H "x-boss-user: $BOSS_USER" \
         ${MT_HDR:+-H "$MT_HDR"} \
         "$BASE/api/jobs?kind=publish-to-github&status=open&limit=20&full=true" > "$workdir/jobs" 2> "$workdir/err"; then
     fail "jobs API unreachable at $BASE — $(cat "$workdir/err")"
@@ -266,7 +398,7 @@ job_id=$(printf '%s' "$target" | jq -r '.id')
 #     A hand run has no request, and writes nothing here.
 if [[ "${OPS_REQUEST_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
     jq -n -c --arg p "$job_id" '{for_publish: $p}' > "$workdir/for-publish"
-    if curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+    if curl -q -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
             ${MT_HDR:+-H "$MT_HDR"} \
             --data-binary @"$workdir/for-publish" "$BASE/api/jobs/$OPS_REQUEST_ID/metadata" > /dev/null 2>"$workdir/err"; then
         say "request ${OPS_REQUEST_ID:0:8} names publish $job_id (for_publish)"
@@ -290,11 +422,39 @@ esac
 say "packet ${job_id:0:8} — reading the checks on $pr_url (head ${head:0:12})"
 
 # 2. The check-runs: ONE reading, never a wait (backlog b81ff4ca).
+gh_hdr="$workdir/gh-headers"
 gh_get() {
     # One GET against the public API; the body to stdout, curl's words
-    # to $workdir/err. No token: the mirror is public, and this verb
-    # holds none.
-    curl -fsS -H "accept: application/vnd.github+json" "$GITHUB_API/repos/$MIRROR_SLUG/$1" 2>"$workdir/err"
+    # to $workdir/err, the answer's headers to $gh_hdr. No token: the
+    # mirror is public. The one credentialed read is 3c's job log, and
+    # it never goes through here.
+    rm -f "$gh_hdr"
+    curl -q -fsS -D "$gh_hdr" -H "accept: application/vnd.github+json" "$GITHUB_API/repos/$MIRROR_SLUG/$1" 2>"$workdir/err"
+}
+# THE ANONYMOUS RATE LIMIT (backlog 1b32c950). GitHub answers a reader
+# with no credential a fixed number of requests an hour per address
+# (sixty, measured 2026-11-16) and states what is left on every answer.
+# True when the LAST answer said none is left, with $rate_why naming the
+# limit and when it resets — so a read GitHub would refuse is not made,
+# and a refused one says why rather than only its status code.
+rate_why=""
+hdr_value() {
+    # The last value of header $1 (lower-case) in GitHub's last answer.
+    tr -d '\r' < "$gh_hdr" | awk -F': *' -v k="$1" 'tolower($1) == k {v = $2} END {print v}'
+}
+rate_spent() {
+    local left limit reset at
+    [ -f "$gh_hdr" ] || return 1
+    left=$(hdr_value x-ratelimit-remaining)
+    [ "$left" = 0 ] || return 1
+    limit=$(hdr_value x-ratelimit-limit)
+    reset=$(hdr_value x-ratelimit-reset)
+    case "${reset:-empty}" in
+        empty|*[!0-9]*) at="a time the answer did not state" ;;
+        *) at=$(date -u -d "@$reset" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "epoch $reset") ;;
+    esac
+    rate_why="not read: GitHub's anonymous rate limit is spent (x-ratelimit-remaining 0 of ${limit:-an unstated limit}), it resets at $at"
+    return 0
 }
 checks="$workdir/checks.json"
 # A GitHub that cannot be read is a FAILURE, not a not-yet: nothing was
@@ -338,7 +498,7 @@ if [ -n "$note" ]; then
                                       annotations: .output.annotations_count, url: .html_url,
                                       app: .app.slug}],
             still_running: [.check_runs[]? | select(.status != "completed") | .name]}}' "$checks" > "$workdir/partial"
-    curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+    curl -q -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
         ${MT_HDR:+-H "$MT_HDR"} \
         --data-binary @"$workdir/partial" "$BASE/api/jobs/$job_id/metadata" > /dev/null 2>"$workdir/err" \
         || fail "writing the partial reading onto ${job_id:0:8} (PATCH /api/jobs/$job_id/metadata) — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
@@ -384,35 +544,297 @@ fi
 #     read GitHub refuses is recorded as unread, by its error — the
 #     check's failure stands either way, so the reading does not fail
 #     on it.
+#
+#     The SAME read is also recorded WHOLE (backlog 1b32c950, design
+#     62f27539 C2): `failing` keeps only the gate's GATE FAIL / GATE
+#     REFUSED titles, and everything else a failing check annotated —
+#     a browser error with its file and line, a check that is not this
+#     gate and prints no GATE FAIL — was read and then discarded, the
+#     one copy a reader without admin rights can have. Step 4 writes
+#     every annotation of every failing check onto the packet as
+#     `failing_annotations`. One read per failing check per run, one
+#     page of $ANNOTATIONS_PER_CHECK, and none once GitHub has said the
+#     anonymous rate limit is spent: that check is recorded as not read,
+#     naming the limit and its reset.
 gate_ann="$workdir/gate-annotations.json"
 echo '{}' > "$gate_ann"
+# The checks 3b and 3c read: completed, not passed, and not the scan,
+# whose annotations are its alerts. One predicate, written once.
+FAILING_CHECKS='.check_runs[]? | select(.status == "completed"
+                        and ((.conclusion // "none") | IN("success", "neutral", "skipped") | not)
+                        and .name != $n and (.name | startswith($p) | not))'
 while read -r run_id; do
     [ -n "$run_id" ] || continue
+    if rate_spent; then
+        jq --arg id "$run_id" --arg e "$rate_why" '. + {($id): {error: $e}}' \
+            "$gate_ann" > "$gate_ann.new" && mv "$gate_ann.new" "$gate_ann"
+        say "check-run $run_id: $rate_why"
+        continue
+    fi
     # An empty 200 is no annotation list, and `jq -e` alone reads
     # silence as a pass (d96e38ab).
-    if gh_get "check-runs/$run_id/annotations?per_page=100" > "$workdir/page" \
+    if gh_get "check-runs/$run_id/annotations?per_page=$ANNOTATIONS_PER_CHECK" > "$workdir/page" \
         && jq_doc_file "$workdir/page" \
         && jq -e 'type == "array"' "$workdir/page" > /dev/null 2>&1; then
         jq --arg id "$run_id" --slurpfile a "$workdir/page" '. + {($id): {annotations: $a[0]}}' \
             "$gate_ann" > "$gate_ann.new" && mv "$gate_ann.new" "$gate_ann"
+        say "check-run $run_id: $(jq 'length' "$workdir/page") annotations read"
     else
         err="$(head -c 200 "$workdir/err" | tr '\n' ' ')"
-        jq --arg id "$run_id" --arg e "${err:-the answer was not an annotation list}" '. + {($id): {error: $e}}' \
+        err="${err:-the answer was not an annotation list}"
+        if rate_spent; then err="$rate_why — $err"; fi
+        jq --arg id "$run_id" --arg e "$err" '. + {($id): {error: $e}}' \
             "$gate_ann" > "$gate_ann.new" && mv "$gate_ann.new" "$gate_ann"
-        say "check-run $run_id: its annotations could not be read — ${err:-the answer was not an annotation list}"
+        say "check-run $run_id: its annotations could not be read — $err"
     fi
-done < <(jq -r --arg n "$SCAN_CHECK" --arg p "$SCAN_JOBS" '
-    .check_runs[]? | select(.status == "completed"
-                            and ((.conclusion // "none") | IN("success", "neutral", "skipped") | not)
-                            and .name != $n and (.name | startswith($p) | not))
-    | .id' "$checks")
+done < <(jq -r --arg n "$SCAN_CHECK" --arg p "$SCAN_JOBS" "$FAILING_CHECKS | .id" "$checks")
+
+# 3c. THE FAILING CHECK'S JOB LOG (backlog b7a74610). The annotations of
+#     3b name a failed CHECK at best — `GATE FAIL: test` — and on PR #260
+#     quoted a prose line; which TEST failed is only in the job log,
+#     which GitHub serves to a reader holding Actions: Read and answers
+#     403 to an anonymous one. So for each failing check GitHub Actions
+#     ran (its check-run id IS its job id), the log is read ONCE with the
+#     broker's read-only checks token, and `failing_logs` records:
+#       - `failed_tests`: every `test <name> ... FAILED` line, in log
+#         order, with the binary cargo was `Running` and the selector of
+#         the `error: test failed, to rerun pass` line infra/cargo-test-
+#         wide.sh prints after a failed binary — `cargo test <rerun>
+#         <test>` reproduces it;
+#       - `receipt`: the gate's receipt as the `cat .gate-receipt.json`
+#         step printed it, parsed, and `receipt_failed_checks`, the checks
+#         it names `fail`.
+#     The token is rendered from the broker's Secret only when there is a
+#     log to read, and validated as publish-github-pr.sh validates its
+#     own: a regular file, root's, 0600 or 0400, its expiry beside it and
+#     live past this verb's timeout. It rides to curl in a 0600 header
+#     file; on the redirect GitHub answers a log read with (to a signed
+#     blob URL on another host) curl drops a -H Authorization header,
+#     which it has done since 7.58. NO TOKEN, A REFUSED READ, A LOG WITH
+#     NO RECEIPT: each is stated on that check's entry with why — the
+#     render's own word, GitHub's status and message — and the reading
+#     still lands, because no check's failure depended on its log.
+logs="$workdir/failing-logs.json"
+echo '{}' > "$logs"
+log_entry() { # <check id> <entry json>
+    jq --arg id "$1" --argjson e "$2" '. + {($id): $e}' "$logs" > "$logs.new" && mv "$logs.new" "$logs"
+}
+CHECKS_HDR="" CHECKS_WHY=""
+# take_checks_token — in the script's own shell (secret_header's first
+# call may not be in a subshell): CHECKS_HDR is the header file, or
+# CHECKS_WHY says why there is none.
+take_checks_token() {
+    local out="" rc=0 line word mode uid expires="" expires_s token=""
+    checks_token_taken=1
+    CHECKS_WHY="$(checks_token_problem)"
+    [ -z "$CHECKS_WHY" ] || return 0
+    "$CHECKS_RENDER" --rule "$CHECKS_RULE" --dest "$CHECKS_TOKEN_FILE" > "$workdir/render" 2>&1 || rc=$?
+    # The render's words, made in this script's own file: awk reads it
+    # whole (no early-exiting reader), and a read that fails stops here.
+    out="$(awk '{ printf "%s ", $0 }' "$workdir/render")" \
+        || { CHECKS_WHY="the render's output could not be read back from $workdir/render"; return 0; }
+    [ -z "$out" ] || say "checks token: ${out:0:600}"
+    case "$rc" in
+        0 | 1) ;;
+        *) CHECKS_WHY="the render refused (exit $rc): ${out:0:300}"; return 0 ;;
+    esac
+    if [ ! -e "$CHECKS_TOKEN_FILE" ] && [ ! -L "$CHECKS_TOKEN_FILE" ]; then
+        # The render's one line names what it found: `<file>: <word>: …`.
+        line="$(awk -v k="$CHECKS_TOKEN_FILE: " 'index($0, k) { l = $0 } END { print l }' "$workdir/render")" \
+            || { CHECKS_WHY="no live checks token at $CHECKS_TOKEN_FILE, and the render's output could not be read back"; return 0; }
+        line="${line##*"$CHECKS_TOKEN_FILE: "}"
+        word="${line%%:*}"
+        [[ $word =~ ^[a-z][a-z\ ]{0,30}$ ]] || word="unstated"
+        CHECKS_WHY="no live checks token at $CHECKS_TOKEN_FILE — the render found the broker's Secret '$word'. The broker mints it when a read-publish-checks request is filed ($(basename "$CHECKS_RULE")), from the App's installation on the mirror's owner, which must hold Actions: Read; a mint GitHub refuses is on the dispatcher's firing record"
+        return 0
+    fi
+    if [ -L "$CHECKS_TOKEN_FILE" ] || [ ! -f "$CHECKS_TOKEN_FILE" ]; then
+        CHECKS_WHY="the token slot $CHECKS_TOKEN_FILE is not a regular file (a link is refused: it could point anywhere)"; return 0
+    fi
+    mode="$(stat -c %a "$CHECKS_TOKEN_FILE")" \
+        || { CHECKS_WHY="cannot read the mode of the token slot $CHECKS_TOKEN_FILE"; return 0; }
+    case "$mode" in
+        600 | 400) ;;
+        *) CHECKS_WHY="the token slot $CHECKS_TOKEN_FILE is mode '${mode}' — a token file must be 0600 or 0400"; return 0 ;;
+    esac
+    # The mode says who may READ it; the owner says who could have WRITTEN it.
+    uid="$(stat -c %u "$CHECKS_TOKEN_FILE")" \
+        || { CHECKS_WHY="cannot read the owner of the token slot $CHECKS_TOKEN_FILE"; return 0; }
+    if [ "$uid" != "$CHECKS_TOKEN_OWNER_UID" ]; then
+        CHECKS_WHY="the token slot $CHECKS_TOKEN_FILE is owned by uid '${uid}', not $CHECKS_TOKEN_OWNER_UID (root)"; return 0
+    fi
+    if [ ! -L "$CHECKS_TOKEN_FILE.expires-at" ] && [ -f "$CHECKS_TOKEN_FILE.expires-at" ]; then
+        IFS= read -r expires < "$CHECKS_TOKEN_FILE.expires-at" || true
+    fi
+    if ! expires_s="$(date -u -d "${expires:-no expiry}" +%s 2>/dev/null)"; then
+        CHECKS_WHY="no readable expiry at $CHECKS_TOKEN_FILE.expires-at ('${expires:-none}') — the render writes one beside every token it places"; return 0
+    fi
+    if [ "$expires_s" -le $(($(date -u +%s) + CHECKS_TOKEN_MARGIN_S)) ]; then
+        CHECKS_WHY="the checks token expires at $expires, within ${CHECKS_TOKEN_MARGIN_S}s — too close to outlive this read"; return 0
+    fi
+    IFS= read -r token < "$CHECKS_TOKEN_FILE" || [ -n "$token" ] || true
+    if [ -z "$token" ] || [[ $token =~ [[:space:]] ]]; then
+        token=""
+        CHECKS_WHY="the token slot $CHECKS_TOKEN_FILE does not hold one token"; return 0
+    fi
+    # printf inside secret_header is a builtin: the value reaches the 0600
+    # file without an argv, and nothing here echoes it.
+    if ! secret_header CHECKS_HDR "Authorization: Bearer $token"; then
+        token="" CHECKS_HDR=""
+        CHECKS_WHY="the token's header file could not be written (lib/secret-header.sh, above)"; return 0
+    fi
+    token=""
+    say "checks token rendered (valid until $expires)"
+}
+# The failed tests of a job log already stripped of GitHub's framing, as
+# TSV: test, the binary cargo was Running, the rerun selector.
+failed_tests_tsv() {
+    awk '
+        function flush(r,   i) { for (i = 1; i <= n; i++) printf "%s\t%s\t%s\n", t[i], b[i], r; n = 0 }
+        /^[[:space:]]*Running / { flush(""); bin = $0; sub(/^[[:space:]]*Running /, "", bin); sub(/ \(.*$/, "", bin); next }
+        /^[[:space:]]*Doc-tests / { flush(""); bin = "doctests"; next }
+        /^test .* \.\.\. FAILED$/ { s = $0; sub(/^test /, "", s); sub(/ \.\.\. FAILED$/, "", s); n++; t[n] = s; b[n] = bin; next }
+        /^error: test failed, to rerun pass `/ { r = $0; sub(/^error: test failed, to rerun pass `/, "", r); sub(/`.*$/, "", r); flush(r); next }
+        END { flush("") }' "$1"
+}
+# The receipt step's output: after its `##[group]Run …` header and that
+# group's `##[endgroup]`, up to the next `##[` line or the runner's own
+# post-job lines. Exit 3 when the log holds no such step.
+receipt_text() {
+    awk -v want="##[group]Run $RECEIPT_STEP_RUN" '
+        !found && index($0, want) == 1 { found = 1; hdr = 1; next }
+        hdr { if ($0 == "##[endgroup]") { hdr = 0; body = 1 }; next }
+        body && (/^##\[/ || /^Post job cleanup\.$/ || /^Cleaning up orphan processes$/) { body = 0; done = 1 }
+        body && !done { print }
+        END { if (!found) exit 3 }' "$1"
+}
+logs_read=0
+while IFS=$'\t' read -r run_id app; do
+    [ -n "$run_id" ] || continue
+    log_path="/repos/$MIRROR_SLUG/actions/jobs/$run_id/logs"
+    if [ "$app" != "github-actions" ]; then
+        log_entry "$run_id" "$(jq -n -c --arg a "${app:-unstated}" '{error: "not read: a check-run of app \($a) has no GitHub Actions job log"}')"
+        continue
+    fi
+    if [ "$logs_read" -ge "$LOGS_PER_RUN" ]; then
+        log_entry "$run_id" "$(jq -n -c --arg p "$log_path" --argjson m "$LOGS_PER_RUN" '{error: "not read: this run reads at most \($m) job logs (the forge runner is serial) — GET \($p) holds it"}')"
+        continue
+    fi
+    [ "$checks_token_taken" -eq 1 ] || take_checks_token
+    if [ -z "$CHECKS_HDR" ]; then
+        log_entry "$run_id" "$(jq -n -c --arg w "$CHECKS_WHY" '{error: "not read: \($w)"}')"
+        say "check-run $run_id: its job log was not read — $CHECKS_WHY"
+        continue
+    fi
+    logs_read=$((logs_read + 1))
+    : > "$workdir/joblog"
+    crc=0
+    # --proto-redir =https: GitHub answers the logs endpoint with a 302 to
+    # its blob store over https, and a downgrade redirect is refused by the
+    # verb rather than by whichever curl the forge carries (review
+    # f5a9b7f8, N2; curl already drops the header on a cross-host hop).
+    code=$(curl -q -sS -L --proto-redir =https --max-time "$LOG_READ_SECONDS" --max-filesize "$LOG_MAX_BYTES" \
+            -o "$workdir/joblog" -w '%{http_code}' \
+            -H "accept: application/vnd.github+json" -H "$CHECKS_HDR" \
+            "$GITHUB_API$log_path" 2>"$workdir/err") || crc=$?
+    if [ "$crc" -ne 0 ]; then
+        log_entry "$run_id" "$(jq -n -c --arg p "$log_path" --arg e "$(head -c 200 "$workdir/err" | tr '\n' ' ')" --arg c "$crc" \
+            '{error: "not read: GET \($p) did not complete (curl exit \($c): \($e))"}')"
+        say "check-run $run_id: its job log could not be read (curl exit $crc)"
+        continue
+    fi
+    if [ "$code" != 200 ]; then
+        # GitHub's refusal is a JSON body naming why; anything else is
+        # quoted as it came.
+        msg=""
+        if jq_doc_file "$workdir/joblog"; then
+            msg="$(jq -r '(objects | .message // empty) | tostring' "$workdir/joblog")" \
+                || msg="(GitHub's answer could not be read back)"
+        fi
+        msg="${msg:-$(head -c 200 "$workdir/joblog" | tr '\n' ' ')}"
+        log_entry "$run_id" "$(jq -n -c --arg p "$log_path" --arg c "$code" --arg m "$msg" \
+            '{error: "not read: GitHub answered \($c) to GET \($p) — \($m)"}')"
+        say "check-run $run_id: GitHub answered $code to its job log — $msg"
+        continue
+    fi
+    # GitHub's framing off: the BOM, a CR, the timestamp on every line.
+    LC_ALL=C sed -E -e '1s/^\xEF\xBB\xBF//' -e 's/\r$//' -e 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z ?//' \
+        "$workdir/joblog" > "$workdir/joblog.txt"
+    failed_tests_tsv "$workdir/joblog.txt" > "$workdir/failed-tests.tsv"
+    rrc=0
+    receipt_text "$workdir/joblog.txt" > "$workdir/receipt.txt" || rrc=$?
+    receipt='null' receipt_why=""
+    # The receipt is ONE JSON object. Two are not a receipt (review
+    # f5a9b7f8, N1): handed to `--argjson r` below they ended the run under
+    # `set -e` with no reading landed and only jq's words to say why, so
+    # the count is taken first and anything but one is stated, not taken.
+    # Output that is not JSON at all is named as such (unparsed), never
+    # read as a count of nothing.
+    unparsed=0
+    objects="$(jq -s '[.[] | objects] | length' "$workdir/receipt.txt" 2>/dev/null)" || unparsed=1
+    if [ "$rrc" -eq 3 ]; then
+        receipt_why="the log holds no step headed Run $RECEIPT_STEP_RUN"
+    elif [ "$unparsed" -eq 0 ] && [ "$objects" = 1 ] \
+        && receipt="$(jq -c -s 'first(.[] | objects)' "$workdir/receipt.txt" 2>/dev/null)"; then
+        :
+    else
+        receipt='null'
+        case "$unparsed:${objects:-empty}" in
+            0:[2-9] | 0:[1-9][0-9]*) receipt_why="the receipt step printed $objects JSON objects, not one — none is taken as the gate's receipt" ;;
+            1:*) receipt_why="the receipt step printed no receipt (its output is not JSON): $(head -c 200 "$workdir/receipt.txt" | tr '\n' ' ')" ;;
+            *) receipt_why="the receipt step printed no receipt: $(head -c 200 "$workdir/receipt.txt" | tr '\n' ' ')" ;;
+        esac
+    fi
+    entry="$(jq -R -s -c --argjson max "$FAILED_TESTS_MAX" --argjson r "$receipt" --arg why "$receipt_why" \
+            --argjson allow "$RECEIPT_ALLOWANCE" --arg p "$log_path" '
+        [split("\n")[] | select(length > 0) | split("\t")
+         | {test: .[0]} + (if (.[1] // "") != "" then {in: .[1]} else {} end)
+                        + (if (.[2] // "") != "" then {rerun: .[2]} else {} end)] as $all
+        # The same test named twice (a binary re-run) is one entry.
+        | [range($all | length) as $i | select([$all[:$i][] == $all[$i]] | any | not) | $all[$i]] as $t
+        | {failed_tests: $t[:$max]}
+        + (if ($t | length) > $max then {failed_tests_more: (($t | length) - $max)} else {} end)
+        + (if $r == null then {receipt_unread: $why}
+           else {receipt_failed_checks: [$r.checks[]? | select(.result == "fail") | .name]}
+                + (($r | tojson | utf8bytelength) as $n
+                   | if $n <= $allow then {receipt: $r}
+                     else {receipt_unrecorded: "not recorded: \($n) bytes, over the allowance of \($allow); GET \($p) holds it"} end)
+           end)' "$workdir/failed-tests.tsv")"
+    log_entry "$run_id" "$entry"
+    say "check-run $run_id: job log read — $(jq '.failed_tests | length' <<<"$entry") failed test(s) named, $(jq -r 'if has("receipt_unread") then "no receipt: " + .receipt_unread else "the gate'"'"'s receipt read" end' <<<"$entry")"
+done < <(jq -r --arg n "$SCAN_CHECK" --arg p "$SCAN_JOBS" "$FAILING_CHECKS | [.id, (.app.slug // \"\")] | @tsv" "$checks")
+# The slot is this run's, rendered for these reads: removed as soon as
+# they are done, before the writes below, so it rests on the host no
+# longer than the reads. The EXIT trap removes it on every other way out
+# (an error, a signal), and the next run removes what a SIGKILL left.
+# The next run with a log to read renders it again; the header file goes
+# with the EXIT trap.
+if [ "$checks_token_taken" -eq 1 ]; then
+    drop_checks_slot
+fi
 
 # 4. The reading, and the writes: the packet's metadata first, then the
 #    step, so a step that reads done always has its reading beside it.
 jq -n -c --slurpfile checks "$checks" --slurpfile ann "$ann" --slurpfile gann "$gate_ann" \
+      --slurpfile glogs "$logs" \
       --arg head "$head" --arg pr "$pr_url" --arg scan "$SCAN_CHECK" \
       --arg capped "past the gate's annotation cap; its words are in the job log" \
       --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+    # The annotations of a failing check as read (3b), WHOLE (backlog
+    # 1b32c950): its name and id, what the check-run declares beside
+    # what was read, and every annotation in the order of the API with its
+    # path, start and end line, level, title and message — nothing
+    # filtered, no message cut. A read that failed is recorded with why,
+    # never as an empty list. (Columns, raw_details and blob_href are not
+    # kept: Actions annotations carry the line range and the words.)
+    def recorded($run; $r):
+      {check: $run.name, id: $run.id, conclusion: ($run.conclusion // "none"),
+       declared: ($run.output.annotations_count // 0)}
+      + if $r.error then {error: $r.error}
+        else {read: ($r.annotations | length),
+              annotations: [$r.annotations[] | {path, start_line, end_line,
+                                                 level: .annotation_level, title, message}]}
+        end;
     # What the annotations of a check-run say failed (3b): each
     # `GATE FAIL: <name>` with its message, in log order; each name the
     # `GATE FAIL (N more)` summary lists after its first line; and a
@@ -437,14 +859,29 @@ jq -n -c --slurpfile checks "$checks" --slurpfile ann "$ann" --slurpfile gann "$
     ($checks[0].check_runs) as $runs
     | ($ann[0]) as $a
     | ($gann[0]) as $g
+    | ($glogs[0]) as $l
     | ([$runs[] | select(.name == $scan)] | .[0]) as $s
     # A check that ran and did not pass. `neutral` and `skipped` are
-    # GitHub saying the check had nothing to object to.
+    # GitHub saying the check had nothing to object to. The tests its job
+    # log names failed (3c) ride its entry, so the judge reads them here.
     | [$runs[] | select(.status == "completed"
                         and ((.conclusion // "none") | IN("success", "neutral", "skipped") | not))
-               | {name, conclusion: (.conclusion // "none")} + gate_reading($g[(.id | tostring)])] as $failing
+               | {name, conclusion: (.conclusion // "none")} + gate_reading($g[(.id | tostring)])
+               + (($l[(.id | tostring)].failed_tests // []) as $ft
+                  | if $ft != [] then {failed_tests: $ft} else {} end)] as $failing
     | ([$runs[] | select(.status != "completed") | .name]) as $running
-    | {code_scanning: {
+    # Exactly the checks 3b handled (its loop chose them: failing, and
+    # not the scan, whose annotations are its alerts, counted below), in
+    # the order of the check list; one predicate, written once, there.
+    | [$runs[] | (.id | tostring) as $id | select($g | has($id))
+               | recorded(.; $g[$id])] as $failing_annotations
+    # Each job log 3c read or stated not read, in the order of the check
+    # list: the check and its id, then what the log said or why not.
+    | [$runs[] | (.id | tostring) as $id | select($l | has($id))
+               | {check: .name, id: .id} + $l[$id]] as $failing_logs
+    | {failing_annotations: $failing_annotations,
+       failing_logs: $failing_logs,
+       code_scanning: {
         read_at: $at, head: $head, pr_url: $pr, complete: ($running | length == 0),
         # THE VERDICT OVER EVERY CHECK (backlog c6cb678b): the scan when
         # it did not pass, else `failure` when any other check failed —
@@ -475,6 +912,81 @@ jq -n -c --slurpfile checks "$checks" --slurpfile ann "$ann" --slurpfile gann "$
                     by_file: ($a | group_by(.path) | map({path: .[0].path, count: length})
                               | sort_by(-.count, .path))
                  } end)}}' > "$workdir/reading"
+
+# 4a. THE ALLOWANCE (review 75bb4029 B1). `failing_annotations` encoded
+#     over $FAILING_ANNOTATIONS_ALLOWANCE bytes would take the scan's
+#     reading down with it in a 413, so the largest checks' annotations
+#     are not recorded, largest first, until the rest fit — each such
+#     check keeps its name, id, conclusion, declared and read, and says
+#     in `error` how many bytes were not recorded, against what, and
+#     where GitHub holds them. Nothing is cut: a check is recorded whole
+#     or stated as not recorded. Under the allowance this changes nothing.
+jq -c --argjson m "$FAILING_ANNOTATIONS_ALLOWANCE" --arg slug "$MIRROR_SLUG" '
+    def bytes: tojson | utf8bytelength;
+    (.failing_annotations | bytes) as $total
+    | if $total <= $m then . else
+        .failing_annotations as $fa
+        | ([range(0; $fa | length) | select($fa[.] | has("annotations"))
+            | {i: ., n: ($fa[.].annotations | bytes)}] | sort_by(-.n, .i)) as $largest
+        | .failing_annotations = (reduce $largest[] as $o ({fa: $fa, total: $total};
+            if .total <= $m then . else
+              (.fa[$o.i] | bytes) as $was
+              | .fa[$o.i] |= (del(.annotations)
+                  + {error: "not recorded: \($o.n) bytes of annotations; the failing checks annotated \($total) bytes, over the allowance of \($m) (a quarter of the packet event budget), and the largest are left unrecorded until the rest fit — GET /repos/\($slug)/check-runs/\(.id)/annotations holds them"})
+              | .total += ((.fa[$o.i] | bytes) - $was)
+            end) | .fa)
+      end' "$workdir/reading" > "$workdir/reading.new" && mv "$workdir/reading.new" "$workdir/reading"
+unrecorded=$(jq -r '[.failing_annotations[] | select((.error // "") | startswith("not recorded: ")) | .check] | join(", ")' "$workdir/reading")
+[ -z "$unrecorded" ] || say "failing_annotations: over the ${FAILING_ANNOTATIONS_ALLOWANCE}-byte allowance, not recorded for: $unrecorded (each entry says why)"
+
+# THE READING'S WRITE, and what a refusal of it costs (review 75bb4029
+# B1). The allowance keeps the annotations under the budget; this is the
+# second line, for a packet whose OTHER metadata has grown: a 413 from
+# the jobs API (its packet event budget) re-sends the reading with each
+# recorded check's annotations replaced by why they are not, so
+# `code_scanning` lands and the step can complete. Without it the verb
+# was dead on that packet — the same refusal re-filed every fifteen
+# minutes, and the scan's reading, which origin/main delivered, lost.
+# Any other answer, or the re-send refused, is a FAILED line as before.
+write_reading() {
+    local what="$1" code why
+    : > "$workdir/answer"
+    code=$(curl -q -sS -o "$workdir/answer" -w '%{http_code}' -X PATCH \
+            -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+            ${MT_HDR:+-H "$MT_HDR"} \
+            --data-binary @"$workdir/reading" "$BASE/api/jobs/$job_id/metadata" 2>"$workdir/err") \
+        || fail "writing $what onto ${job_id:0:8} (PATCH /api/jobs/$job_id/metadata) — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
+    case "$code" in
+        2??) return 0 ;;
+        413) ;;
+        *) fail "writing $what onto ${job_id:0:8} (PATCH /api/jobs/$job_id/metadata) answered ${code:-nothing} — $(head -c 300 "$workdir/answer" | tr '\n' ' ')" ;;
+    esac
+    why="not recorded: the jobs API refused the reading with them (413: $(head -c 300 "$workdir/answer" | tr '\n' ' ')), so it was written without them"
+    # A receipt is the other sizable thing the reading carries (3c): it
+    # goes the same way, and the failed tests — the point of the read,
+    # and small — stay.
+    jq -c --arg why "$why" --arg slug "$MIRROR_SLUG" '
+        .failing_annotations |= map(if has("annotations")
+            then del(.annotations)
+                 + {error: "\($why) — GET /repos/\($slug)/check-runs/\(.id)/annotations holds them"}
+            else . end)
+        | .failing_logs |= map(if has("receipt")
+            then del(.receipt)
+                 + {receipt_unrecorded: "\($why) — GET /repos/\($slug)/actions/jobs/\(.id)/logs holds it"}
+            else . end)' "$workdir/reading" > "$workdir/reading.new" && mv "$workdir/reading.new" "$workdir/reading"
+    say "the jobs API refused $what with failing_annotations (413); re-sending it without them, each check saying why"
+    : > "$workdir/answer"
+    code=$(curl -q -sS -o "$workdir/answer" -w '%{http_code}' -X PATCH \
+            -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+            ${MT_HDR:+-H "$MT_HDR"} \
+            --data-binary @"$workdir/reading" "$BASE/api/jobs/$job_id/metadata" 2>"$workdir/err") \
+        || fail "writing $what onto ${job_id:0:8} without failing_annotations (PATCH /api/jobs/$job_id/metadata) — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
+    case "$code" in
+        2??) return 0 ;;
+        *) fail "writing $what onto ${job_id:0:8} without failing_annotations (PATCH /api/jobs/$job_id/metadata) answered ${code:-nothing} — $(head -c 300 "$workdir/answer" | tr '\n' ' ')" ;;
+    esac
+}
+
 alerts=$(jq -r '.code_scanning.alerts.read' "$workdir/reading")
 rules=$(jq -r '.code_scanning.alerts.by_rule | length' "$workdir/reading")
 files=$(jq -r '.code_scanning.alerts.by_file | length' "$workdir/reading")
@@ -492,10 +1004,7 @@ if [ -n "$running" ]; then
     if [ "$past" -eq 0 ]; then
         # The partial reading goes on the packet — the scan's counts are
         # final, and what is still running is named — and nothing else.
-        curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
-            ${MT_HDR:+-H "$MT_HDR"} \
-            --data-binary @"$workdir/reading" "$BASE/api/jobs/$job_id/metadata" > /dev/null 2>"$workdir/err" \
-            || fail "writing the partial reading onto ${job_id:0:8} (PATCH /api/jobs/$job_id/metadata) — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
+        write_reading "the partial reading"
         echo "$me: not yet: $running still running on ${head:0:12}, ${age} after the PR opened (ceiling ${CEILING}s) — the partial reading is on ${job_id:0:8} (code_scanning.complete=false), read-checks stays open, and reread-publish-pr-every-15-minutes reads it again"
         exit 75
     fi
@@ -511,14 +1020,14 @@ conclusion=$(jq -r '.code_scanning.conclusion' "$workdir/reading")
 failing=$(jq -r '[.code_scanning.failing[]
     | "\(.name): \(.conclusion)"
       + (if (.failed_checks // []) != [] then " (failed: \([.failed_checks[].name] | join(", ")))" else "" end)
+      + (if (.failed_tests // []) != [] then
+           " (failed tests: \([.failed_tests[] | ((.rerun // .in // "") | if . == "" then "" else . + " " end) + .test] | join("; ")))"
+         else "" end)
       + (if .refused then " (refused: \(.refused))" else "" end)
       + (if .annotations_unread then " (its annotations could not be read)" else "" end)]
     | join("; ")' "$workdir/reading")
 
-curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
-    ${MT_HDR:+-H "$MT_HDR"} \
-    --data-binary @"$workdir/reading" "$BASE/api/jobs/$job_id/metadata" > /dev/null 2>"$workdir/err" \
-    || fail "writing the reading onto ${job_id:0:8} (PATCH /api/jobs/$job_id/metadata) — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
+write_reading "the reading"
 say "reading written onto ${job_id:0:8} as code_scanning"
 
 # Merge, never replace — and the SERVER merges: the verb's keys go
@@ -533,11 +1042,11 @@ jq -n -c --arg c "$conclusion" --arg a "$alerts" --arg r "$rules" --arg h "$head
      failing: $f, still_running: $s}' \
     > "$workdir/payload"
 printf '%s\n' '{"status":"completed"}' > "$workdir/done"
-curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+curl -q -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
     ${MT_HDR:+-H "$MT_HDR"} \
     --data-binary @"$workdir/payload" "$BASE/api/jobs/$job_id/steps/$step_id/metadata" > /dev/null 2>"$workdir/err" \
     || fail "the reading is on ${job_id:0:8} but writing it onto read-checks failed — $(head -c 300 "$workdir/err" | tr '\n' ' '); complete the step by hand with conclusion=$conclusion alerts=$alerts rules=$rules"
-curl -fsS -X PUT -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+curl -q -fsS -X PUT -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
     ${MT_HDR:+-H "$MT_HDR"} \
     --data-binary @"$workdir/done" "$BASE/api/jobs/$job_id/steps/$step_id" > /dev/null 2>"$workdir/err" \
     || fail "the reading is on ${job_id:0:8} and on read-checks, but completing read-checks failed — $(head -c 300 "$workdir/err" | tr '\n' ' '); complete the step by hand"

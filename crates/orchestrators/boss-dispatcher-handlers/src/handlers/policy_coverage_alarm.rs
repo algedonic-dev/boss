@@ -44,9 +44,10 @@ use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 use boss_jobs::channels::InputChannel;
 use serde_json::{Value as Json, json};
 
+use super::alarm_item::{self, Occurrence, Raised};
 use super::common::{
     RECOVERED_AT, Retraction, api_client, complete_step, get_json, jobs_where, owner_for_filing,
-    post_json, recovery_note, relapse_patch, retraction, with_lane, withdrawal_fields, write_json,
+    recovery_note, retraction, with_lane, withdrawal_fields, write_json,
 };
 
 /// The handler's registered name.
@@ -84,7 +85,7 @@ pub fn unreadable_body(error: &str, owner: &str, now: &str, rule: &str) -> Json 
         "title": "COVERAGE UNREADABLE: the backstop cannot say who holds the controls",
         "subject": {"subject_kind": "custom", "id": UNREADABLE},
         "owner_id": owner,
-        "priority": "urgent",
+        "priority": "standard",
         "status": "open",
         "tags": [],
         "metadata": with_lane(json!({
@@ -231,45 +232,35 @@ impl PolicyCoverageAlarm {
         })
     }
 
-    /// File `body` for `control` unless an open alarm already names it;
-    /// an open one told it had recovered is told it did not. True when
-    /// a new alarm was filed.
+    /// File `body` for `control` unless an open alarm already names it,
+    /// through the one helper every alarm raises with (backlog
+    /// f4b0ad41): an open one told it had recovered takes the relapse
+    /// as an occurrence. True when a new alarm was filed.
     async fn raise(
         &self,
         control: &str,
         body: Json,
         filed: &BTreeMap<String, Json>,
+        now: &str,
         rule: &str,
     ) -> Result<bool, HandlerError> {
-        match filed.get(control) {
-            Some(alarm)
-                if alarm
-                    .pointer(&format!("/metadata/{RECOVERED_AT}"))
-                    .is_some_and(|v| !v.is_null()) =>
-            {
-                let id = alarm.get("id").and_then(Json::as_str).unwrap_or_default();
-                write_json(
-                    &self.client,
-                    reqwest::Method::PATCH,
-                    &format!("{}/api/jobs/{id}/metadata", self.jobs_base),
-                    &relapse_patch(),
-                    rule,
-                )
-                .await?;
-                Ok(false)
-            }
-            Some(_) => Ok(false),
-            None => {
-                post_json(
-                    &self.client,
-                    &format!("{}/api/jobs", self.jobs_base),
-                    &body,
-                    rule,
-                )
-                .await?;
-                Ok(true)
-            }
-        }
+        let occ = Occurrence::new(
+            now,
+            format!(
+                "{HANDLER} read {COVERAGE_PATH} at {now}: `{control}` is held by no real person."
+            ),
+        );
+        let raised = alarm_item::raise(
+            &self.client,
+            &self.jobs_base,
+            filed.get(control),
+            body,
+            &occ,
+            Default::default(),
+            rule,
+        )
+        .await?;
+        Ok(matches!(raised, Raised::Filed(_)))
     }
 
     async fn withdraw(
@@ -365,16 +356,19 @@ impl Handler for PolicyCoverageAlarm {
         );
         let owner = owner_for_filing(self.owner.as_ref(), rule).await;
 
-        let read = match get_json(
-            &self.client,
-            &format!("{}{COVERAGE_PATH}", self.policy_base),
-            rule,
-        )
-        .await
-        {
-            Ok(body) => judge(&body).map_err(HandlerError::Downstream),
-            Err(e) => Err(e),
-        };
+        let read = super::backstop_read::retry_once(|| async {
+            match get_json(
+                &self.client,
+                &format!("{}{COVERAGE_PATH}", self.policy_base),
+                rule,
+            )
+            .await
+            {
+                Ok(body) => judge(&body).map_err(HandlerError::Downstream),
+                Err(e) => Err(e),
+            }
+        })
+        .await;
         let (orphans, held) = match read {
             Ok(judged) => judged,
             Err(e) => {
@@ -383,15 +377,35 @@ impl Handler for PolicyCoverageAlarm {
                 // so no successful firing is recorded for a read that
                 // judged nothing — which is what the proof probe reads.
                 let body = unreadable_body(&e.to_string(), &owner, &now, rule);
-                self.raise(UNREADABLE, body, &filed, rule).await?;
+                super::backstop_read::raise_unreadable(
+                    &self.client,
+                    &self.jobs_base,
+                    filed.get(UNREADABLE),
+                    body,
+                    ctx,
+                )
+                .await?;
                 return Err(e);
             }
         };
 
+        let may_withdraw_unreadable = super::backstop_read::recovered(
+            &self.client,
+            &self.jobs_base,
+            filed.get(UNREADABLE),
+            ctx,
+        )
+        .await?;
         let mut raised = 0usize;
         for o in &orphans {
             if self
-                .raise(&o.control, alarm_body(o, &owner, &now, rule), &filed, rule)
+                .raise(
+                    &o.control,
+                    alarm_body(o, &owner, &now, rule),
+                    &filed,
+                    &now,
+                    rule,
+                )
                 .await?
             {
                 raised += 1;
@@ -401,7 +415,9 @@ impl Handler for PolicyCoverageAlarm {
         let orphaned: BTreeSet<&str> = orphans.iter().map(|o| o.control.as_str()).collect();
         let mut withdrawn = 0usize;
         for (control, alarm) in &filed {
-            if orphaned.contains(control.as_str()) {
+            if orphaned.contains(control.as_str())
+                || (control == UNREADABLE && !may_withdraw_unreadable)
+            {
                 continue;
             }
             self.withdraw(control, held.get(control), alarm, &now, rule)
@@ -590,6 +606,9 @@ mod tests {
         assert_eq!(sent.len(), 1, "{sent:?}");
         assert_eq!(sent[0].0, "PATCH /api/jobs/al-1/metadata");
         assert!(sent[0].1[RECOVERED_AT].is_null());
+        // The relapse is an occurrence on the item (backlog f4b0ad41).
+        assert_eq!(sent[0].1[alarm_item::OCCURRENCES], 2);
+        assert_eq!(sent[0].1[alarm_item::LAST_SEEN], NOW);
     }
 
     #[tokio::test]
@@ -630,11 +649,27 @@ mod tests {
             sent[0].1
         );
 
-        // Still dark on the next tick, its alarm open: nothing new.
+        // An existing alarm is not duplicated; its first observed failed tick is recorded.
         let stub =
             listing_stub::serve(vec![(ALARMS, listing(vec![alarm_row(UNREADABLE, false)]))]).await;
         assert!(handler(&stub).invoke(&[], &ctx()).await.is_err());
-        assert!(stub.writes().is_empty(), "{:?}", stub.writes());
+        let sent = stub.sent();
+        assert!(
+            !sent.iter().any(|(method, _)| method == "POST /api/jobs"),
+            "no duplicate alarm: {sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|(method, body)| method == "PATCH /api/jobs/al-1/metadata"
+                    && body["backstop_unreadable"]["consecutive_failed_ticks"] == 1),
+            "a legacy alarm starts with one observed failed tick: {sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|(method, body)| method == "PUT /api/jobs/al-1/priority"
+                    && body["priority"] == "standard"),
+            "unknown continuity is not urgent: {sent:?}"
+        );
     }
 
     /// The next whole read withdraws the unreadable alarm.
@@ -688,6 +723,133 @@ mod tests {
                 .iter()
                 .any(|r| r.do_steps.iter().any(|d| d.handler == HANDLER)),
             "a shipped rule invokes this handler"
+        );
+    }
+
+    #[test]
+    fn d894_contract_first_unreadable_tick_is_standard() {
+        let body = unreadable_body(
+            "fixture read unavailable",
+            "emp-owner",
+            "2026-10-31T19:00:00Z",
+            "fixture-rule",
+        );
+        assert_eq!(
+            body["priority"], "standard",
+            "one failed backstop tick is not a sustained failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn d894_contract_one_failed_read_gets_one_retry_before_any_alarm() {
+        let good = coverage(vec![]);
+        let stub = listing_stub::serve_sequence(
+            vec![(ALARMS, listing(vec![]))],
+            vec![(
+                COVERAGE_PATH,
+                vec![json!({"error":"transient fixture read"}), good],
+            )],
+        )
+        .await;
+        let result = handler(&stub).invoke(&[], &ctx()).await;
+        assert_eq!(
+            stub.read_count(COVERAGE_PATH),
+            2,
+            "the actual HTTP read must retry exactly once"
+        );
+        assert!(
+            result.is_ok(),
+            "the retry judges the second complete answer: {result:?}"
+        );
+        assert!(
+            stub.sent().is_empty(),
+            "a recovered first tick files nothing: {:?}",
+            stub.sent()
+        );
+    }
+
+    #[tokio::test]
+    async fn d894_contract_second_failed_tick_promotes_the_existing_alarm() {
+        let mut alarm = alarm_row(UNREADABLE, false);
+        alarm["priority"] = json!("standard");
+        alarm["metadata"]["backstop_unreadable"] = json!({"rule":ctx().rule_name,"last_failed_tick":(ctx().firing_instant().unwrap() - chrono::Duration::hours(1)).to_rfc3339(),"consecutive_failed_ticks":1});
+        let stub = listing_stub::serve(vec![(ALARMS, listing(vec![alarm]))]).await;
+        assert!(handler(&stub).invoke(&[], &ctx()).await.is_err());
+        assert_eq!(
+            stub.read_count(COVERAGE_PATH),
+            2,
+            "still only one short retry"
+        );
+        assert!(
+            stub.sent()
+                .iter()
+                .any(|(method, body)| method == "PUT /api/jobs/al-1/priority"
+                    && body["priority"] == "urgent"),
+            "two distinct failed ticks must become urgent through the priority door: {:?}",
+            stub.sent()
+        );
+        assert!(
+            !stub
+                .sent()
+                .iter()
+                .any(|(method, _)| method == "POST /api/jobs"),
+            "the second tick never duplicates the alarm"
+        );
+    }
+
+    #[tokio::test]
+    async fn d894_contract_first_failed_tick_leaves_the_state_the_next_tick_reads() {
+        let stub = listing_stub::serve(vec![(ALARMS, listing(vec![]))]).await;
+        assert!(handler(&stub).invoke(&[], &ctx()).await.is_err());
+        let sent = stub.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "POST /api/jobs");
+        assert_eq!(sent[0].1["priority"], "standard");
+        assert_eq!(
+            sent[0].1["metadata"]["backstop_unreadable"]["consecutive_failed_ticks"],
+            1
+        );
+        assert_eq!(
+            sent[0].1["metadata"]["backstop_unreadable"]["last_failed_tick"],
+            ctx().firing_instant().unwrap().to_rfc3339()
+        );
+    }
+
+    #[tokio::test]
+    async fn d894_contract_a_whole_read_clears_failed_tick_continuity() {
+        let mut alarm = alarm_row(UNREADABLE, false);
+        alarm["metadata"]["backstop_unreadable"] = json!({"rule":ctx().rule_name,"last_failed_tick":(ctx().firing_instant().unwrap() - chrono::Duration::hours(1)).to_rfc3339(),"consecutive_failed_ticks":1});
+        let stub = listing_stub::serve(vec![
+            (COVERAGE_PATH, coverage(vec![])),
+            (ALARMS, listing(vec![alarm])),
+        ])
+        .await;
+        handler(&stub).invoke(&[], &ctx()).await.unwrap();
+        assert!(
+            stub.sent()
+                .iter()
+                .any(|(method, body)| method == "PATCH /api/jobs/al-1/metadata"
+                    && body.get("backstop_unreadable").is_some_and(Json::is_null)),
+            "a judged-good tick must reset the streak even if its routed alarm remains open: {:?}",
+            stub.sent()
+        );
+    }
+
+    #[tokio::test]
+    async fn d894_contract_an_older_good_tick_does_not_erase_a_newer_failure() {
+        let mut alarm = alarm_row(UNREADABLE, false);
+        alarm["priority"] = json!("urgent");
+        alarm["metadata"]["backstop_unreadable"] = json!({"rule":ctx().rule_name,"last_failed_tick":(ctx().firing_instant().unwrap() + chrono::Duration::hours(1)).to_rfc3339(),"consecutive_failed_ticks":2});
+        let stub = listing_stub::serve(vec![
+            (COVERAGE_PATH, coverage(vec![])),
+            (ALARMS, listing(vec![alarm])),
+        ])
+        .await;
+        handler(&stub).invoke(&[], &ctx()).await.unwrap();
+        assert!(
+            stub.sent().is_empty(),
+            "an older replay cannot clear or retract the newer alarm: {:?}",
+            stub.sent()
         );
     }
 }

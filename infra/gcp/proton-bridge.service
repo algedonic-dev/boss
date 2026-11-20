@@ -1,0 +1,26 @@
+[Unit]
+Description=Proton Bridge for the support mailbox (owner login required)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=boss-bridge
+Group=boss-bridge
+ExecStart=/usr/bin/python3 @CONTROL@ daemon
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/boss-bridge
+# CLI info is never a service command: credentials must not reach the journal.
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target

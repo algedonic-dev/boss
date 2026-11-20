@@ -10,6 +10,40 @@
 import { describe, expect, test } from 'bun:test';
 import { notFoundBack, parseRoute } from './router';
 import { RETIRED_ROUTES } from '../tests/mocked/_routes';
+import { ADDRESSES } from '../tests/fixtures/station-tree';
+
+// Every path is read against the shared fixture's station tree, the
+// server's read standing in: a hosted page's address is its host
+// station's in the tree plus its slug (backlog 0bc2eb68), so the router
+// places it only with a tree in hand. src/shell/page-address.test.ts
+// pins the unread and failed trees, and a re-parented one.
+const parse = (path: string, search = '') => parseRoute(path, search, ADDRESSES);
+
+// STEP 1 OF DESIGN 01fa5bdf (David, 2026-11-17): the /ux business pages,
+// HR, /it/operate, Atlas, Bottlenecks, Experiments and Policy answer
+// nothing. Each is held to not-found by RETIRED_ROUTES at the end of this
+// file; these are the spellings that would otherwise fall to a broader
+// branch and look served.
+test('the removed pages answer nothing, under any spelling a broader branch could catch', () => {
+  for (const path of ['/people/hr', '/ux/people/hr', '/people/emp-1', '/ux/service/abc', '/ux/sales/abc', '/service/abc', '/sales/abc', '/accounts/a-1', '/shop/sku-1']) {
+    expect({ path, route: parse(path) }).toEqual({ path, route: { kind: 'notFound', path } });
+  }
+  // A bare segment is a department's address, never a removed page: the
+  // departments that owned one land on their jobs view now.
+  expect(parse('/hr')).toEqual({ kind: 'department', code: 'hr' });
+  expect(parse('/executive')).toEqual({ kind: 'department', code: 'executive' });
+  // <registry>/<kind> is a workflow's page, so registry/policy asks the
+  // registry for a workflow named `policy` — not the Policy page.
+  expect(parse('/engineering/registry/policy')).toEqual({ kind: 'workflowDetail', kindSlug: 'policy' });
+});
+
+test('the flat company map is gone; the root station view is the company index', () => {
+  // '/map' is now one more unclaimed segment: the department catch-all
+  // takes it, and the registry check (sections.ts withRoster) finds no
+  // department `map`, so the page renders not-found.
+  expect(parse('/map')).toEqual({ kind: 'department', code: 'map' });
+  expect(parse('/it/tree').kind).toBe('systemTree');
+});
 
 // No window is planted here. parseRoute takes the query string as its
 // second argument; it read `window.location.search` until backlog
@@ -32,13 +66,11 @@ describe('parseRoute reads no global', () => {
       },
     };
     try {
-      expect(parseRoute('/ux/products', '?q=ipa')).toEqual({ kind: 'products', q: 'ipa' });
-      expect(parseRoute('/ux/finance', '?tab=invoices')).toEqual({
+      expect(parseRoute('/finance', '?tab=invoices')).toEqual({
         kind: 'finance',
         view: { tab: 'invoices', entry: '', fact: '' },
       });
       expect(parseRoute('/ux/search', '?q=cascade')).toEqual({ kind: 'search', q: 'cascade' });
-      expect(parseRoute('/ux/jobs', '?status=closed')).toEqual({ kind: 'jobs', jobStatus: 'closed' });
       expect(parseRoute('/ux/jobs/j-1/steps/s-1', '?from=%2Fit')).toEqual({
         kind: 'stepFocus',
         jobId: 'j-1',
@@ -52,11 +84,11 @@ describe('parseRoute reads no global', () => {
   });
 
   test('an omitted query is no query', () => {
-    expect(parseRoute('/ux/finance')).toEqual({
+    expect(parseRoute('/finance')).toEqual({
       kind: 'finance',
       view: { tab: 'overview', entry: '', fact: '' },
     });
-    expect(parseRoute('/ux/jobs')).toEqual({ kind: 'jobs' });
+    expect(parseRoute('/ux/search')).toEqual({ kind: 'search', q: '' });
   });
 });
 
@@ -66,119 +98,104 @@ describe('parseRoute — every specific path matches its specific case', () => {
   // that the discriminator `kind` is right + any positional param
   // is captured.
   const cases: Array<[string, Record<string, unknown>]> = [
-    // User Experiences home — bare / and the canonical /ux both land on
-    // My Day (the actor's personal work view) by default.
+    // User Experiences home — bare / and /ux both land on My Day (the
+    // actor's personal work view) by default, rendered in place: its own
+    // address is /me, the person's station (backlog 5cb56bb3), with the
+    // inbox and the calendar below it.
     ['/', { kind: 'me' }],
     ['/ux', { kind: 'me' }],
+    ['/me', { kind: 'me' }],
+    ['/me/inbox', { kind: 'inbox' }],
+    ['/me/calendar', { kind: 'myCalendar' }],
     // Browse / domain dashboards — User Experiences perspective (/ux/*).
-    ['/ux/jobs', { kind: 'jobs' }],
+    // A packet's own page; the /ux/jobs list went with step 1 of design
+    // 01fa5bdf (review df7aeb9c) and is held to not-found below.
     ['/ux/jobs/abc-123', { kind: 'jobDetail', jobId: 'abc-123' }],
-    ['/ux/accounts', { kind: 'accounts' }],
-    ['/ux/people', { kind: 'people' }],
-    ['/ux/people/emp-aa-004', { kind: 'employee', empId: 'emp-aa-004' }],
-    ['/ux/parts', { kind: 'parts' }],
-    ['/ux/parts/SKU-1', { kind: 'part', partSku: 'SKU-1' }],
-    ['/ux/products', { kind: 'products' }],
-    ['/ux/products/FP-IPA-1-2-BBL', { kind: 'product', productSku: 'FP-IPA-1-2-BBL' }],
-    // Finance — the regression nest. Specific cases MUST win over
-    // the catch-all `/finance/(.+)` → invoice route.
-    ['/ux/finance', { kind: 'finance' }],
-    ['/ux/finance/new', { kind: 'newInvoice' }],
-    ['/ux/finance/journal-entries/new', { kind: 'newJournalEntry' }],
-    ['/ux/finance/inv-step-12345678', { kind: 'invoice', invoiceId: 'inv-step-12345678' }],
-    // Shipping / shipments / support
-    ['/ux/shipping', { kind: 'shipping' }],
-    ['/ux/shipments/ship-1', { kind: 'shipmentDetail', shipmentId: 'ship-1' }],
-    ['/ux/support', { kind: 'support' }],
+    // Finance — its own address since car 4 of design 8c3e9599 (backlog
+    // c7ef4728). The regression nest: /invoices/new MUST win over the
+    // `/finance/invoices/:id` wildcard.
+    ['/finance', { kind: 'finance' }],
+    ['/finance/invoices/new', { kind: 'newInvoice' }],
+    ['/finance/journal-entries/new', { kind: 'newJournalEntry' }],
+    ['/finance/invoices/inv-step-12345678', { kind: 'invoice', invoiceId: 'inv-step-12345678' }],
+    ['/finance/vendors', { kind: 'vendors' }],
+    ['/finance/vendors/v-1', { kind: 'vendor', vendorLookup: 'v-1' }],
+    // Engineering's station page at its own top-level address (backlog
+    // 950ad972, David 2026-11-12: "As a test, I would love to see this
+    // under /engineering too"; design deba3000). One segment is a
+    // department's address first, so the router answers the department
+    // and the registry check makes it the station page where there is no
+    // such department (page-address.test.ts pins that); a room inside a
+    // department is its station page here. /it/tree/<name> stays.
+    ['/engineering', { kind: 'department', code: 'engineering' }],
+    ['/engineering/gates', { kind: 'systemStation', station: 'gates' }],
+    ['/it/tree/engineering', { kind: 'systemStation', station: 'engineering' }],
     // Calendar / scheduling
     // The launch calendar retired with the second example tenant
     // (design 2ea444f5, backlog a8991c86): /ux/calendar is an unknown
-    // path now and takes the catch-all; /ux/calendar/me is untouched.
+    // path now and takes the catch-all; the person's calendar answers at
+    // /me/calendar since backlog 5cb56bb3, and its /ux spelling is gone.
     ['/ux/calendar', { kind: 'notFound', path: '/ux/calendar' }],
     // The landing page (the System Model live view) was reachable ONLY
     // through the catch-all until design ee3a3a2f gave it a door.
     ['/ux/system-model', { kind: 'home' }],
-    ['/ux/calendar/me', { kind: 'myCalendar' }],
-    ['/ux/service/schedule', { kind: 'schedule' }],
-    // Exec (User Experiences)
-    ['/ux/exec', { kind: 'exec' }],
+    ['/ux/calendar/me', { kind: 'notFound', path: '/ux/calendar/me' }],
     // A department's own jobs view (cc76f755) — at /<code>/jobs since car
     // 2 of design 8c3e9599. The code is registry data, so the route
     // carries it rather than the router knowing it; the `department`
     // describe below pins the rest.
     ['/sales/jobs', { kind: 'department', code: 'sales' }],
     ['/operations/jobs', { kind: 'department', code: 'operations' }],
-    // System Model perspective — IT surfaces re-rooted under /system/*.
-    // The consolidated IT department (1f6d55e0): six surfaces,
-    // families as tabs, /system gone.
-    ['/it/operate/perf', { kind: 'systemMonitoringPerf' }],
-    ['/it/operate/audit', { kind: 'systemMonitoringEvents' }],
-    ['/it/operate/atlas', { kind: 'systemMonitoringAtlas' }],
-    ['/it/operate/bottlenecks', { kind: 'systemFleet' }],
-    ['/it/kb', { kind: 'systemKb' }],
-    ['/it/registry/subjects', { kind: 'systemSubjects' }],
+    // The former IT family pages, each at its host station's address in
+    // the tree plus its slug since backlog 0bc2eb68 (the placement table
+    // of design 01fa5bdf): Operate and the estate and vault pages under
+    // Operations, the registry family, the codebase, the KB and the
+    // manual under Engineering, Design at the design station's own
+    // address, the alarms board at the root.
+    ['/operations/perf', { kind: 'systemMonitoringPerf' }],
+    ['/operations/audit', { kind: 'systemMonitoringEvents' }],
+    ['/engineering/kb', { kind: 'systemKb' }],
+    ['/engineering/registry/subjects', { kind: 'systemSubjects' }],
     // The Drift tab (4ae9969e): declared before the workflow-detail
     // wildcard, which would otherwise read 'drift' as a kind slug.
-    ['/it/registry/drift', { kind: 'systemRegistryDrift' }],
+    ['/engineering/registry/drift', { kind: 'systemRegistryDrift' }],
     // The Agents tab (62988516), before the same wildcard for the same
     // reason.
-    ['/it/registry/agents', { kind: 'systemAgents' }],
-    // The Credentials tab (851259b9, design 76155676), before the same
-    // wildcard for the same reason.
-    ['/it/registry/credentials', { kind: 'systemCredentials' }],
-    // /it/* is the canonical spelling for IT surfaces (0fc8b216); the
-    // /system/* rows above stay because bookmarks, the station
-    // registry's upstream hrefs and the docs all still use them.
-    ['/it/design', { kind: 'systemDesign' }],
-    ['/it/design/experiments', { kind: 'experiments' }],
-    ['/it/codebase', { kind: 'systemCodebase' }],
+    ['/engineering/registry/agents', { kind: 'systemAgents' }],
+    // The Credentials tab (851259b9, design 76155676), hosted at the vault.
+    ['/operations/vault/credentials', { kind: 'systemCredentials' }],
+    ['/engineering/design', { kind: 'systemDesign' }],
+    ['/engineering/codebase', { kind: 'systemCodebase' }],
+    ['/alarms', { kind: 'systemYard' }],
+    // IT's own address renders its landing in place: the IT tab links here.
     ['/it', { kind: 'systemYard' }],
-    ['/it/estate', { kind: 'systemEstate' }],
-    
-    ['/it/operate', { kind: 'incidents' }],
-    
-    
-    
-    ['/it/registry/step-plugins', { kind: 'systemStepPlugins' }],
-    ['/it/registry/step-plugins/pour-quality-check', { kind: 'systemStepPluginDetail', pluginSlug: 'pour-quality-check' }],
-    ['/it/registry/dispatcher', { kind: 'dispatcherRules' }],
-    ['/it/registry/rules', { kind: 'dispatcherRulesList' }],
-    ['/it/registry/rules/restock-on-low', { kind: 'dispatcherRuleEdit', ruleName: 'restock-on-low' }],
-    // Warehouse / catalog / assets
-    ['/ux/warehouse', { kind: 'warehouse' }],
-    ['/ux/catalog', { kind: 'catalog' }],
-    ['/ux/catalog/some-sku', { kind: 'device', sku: 'some-sku' }],
-    ['/ux/assets', { kind: 'assets' }],
-    ['/ux/assets/asset-1', { kind: 'asset', assetId: 'asset-1' }],
-    ['/ux/marketing-assets', { kind: 'marketingAssets' }],
-    ['/ux/marketing-assets/mkt-1', { kind: 'marketingAsset', assetId: 'mkt-1' }],
-    // Manual + workflows + watchlist + shop
-    ['/ux/manual', { kind: 'manual' }],
-    ['/it/registry', { kind: 'workflows' }],
-    ['/ux/manual/intro', { kind: 'manualSection', slug: 'intro' }],
-    ['/ux/watchlist', { kind: 'watchlist' }],
-    ['/ux/shop', { kind: 'shop' }],
-    ['/ux/shop/FP-IPA-1-2-BBL', { kind: 'shopProduct', sku: 'FP-IPA-1-2-BBL' }],
-    // PO + purchase orders
-    ['/ux/purchase-orders/po-1', { kind: 'po', poId: 'po-1' }],
-    ['/ux/vendor-invoices/vi-1', { kind: 'vendorInvoice', vendorInvoiceId: 'vi-1' }],
-    // HR + QA + ops
-    ['/ux/hr', { kind: 'hr' }],
-    ['/ux/qa', { kind: 'qa' }],
-    // Policy + Workflow authoring (System Model). The workflows
+    ['/operations/estate', { kind: 'systemEstate' }],
+    ['/engineering/registry/step-plugins', { kind: 'systemStepPlugins' }],
+    ['/engineering/registry/step-plugins/pour-quality-check', { kind: 'systemStepPluginDetail', pluginSlug: 'pour-quality-check' }],
+    ['/engineering/registry/dispatcher', { kind: 'dispatcherRules' }],
+    ['/engineering/registry/rules', { kind: 'dispatcherRulesList' }],
+    ['/engineering/registry/rules/restock-on-low', { kind: 'dispatcherRuleEdit', ruleName: 'restock-on-low' }],
+    // Manual + workflows + watchlist
+    ['/engineering/manual', { kind: 'manual' }],
+    ['/engineering/registry', { kind: 'workflows' }],
+    ['/engineering/manual/intro', { kind: 'manualSection', slug: 'intro' }],
+    // The Churn watchlist, hosted at the root (backlog 5cb56bb3).
+    ['/watchlist', { kind: 'watchlist' }],
+    // PO + vendor invoices — Finance's, under its address.
+    ['/finance/purchase-orders/po-1', { kind: 'po', poId: 'po-1' }],
+    ['/finance/vendor-invoices/vi-1', { kind: 'vendorInvoice', vendorInvoiceId: 'vi-1' }],
+    // Workflow authoring (System Model). The workflows
     // `/authoring/<jobId>` route is the wildcard-precedence trap: it MUST
     // resolve before the catch-all `/workflows/(.+)` detail route.
-    ['/it/registry/policy', { kind: 'policy' }],
-    ['/it/auth-admin', { kind: 'authAdmin' }],
-    
-    ['/it/registry/new', { kind: 'workflowNew' }],
-    ['/it/registry/authoring/job-abc-123', { kind: 'workflowDesign', jobId: 'job-abc-123' }],
-    ['/it/registry/seasonal-release', { kind: 'workflowDetail', kindSlug: 'seasonal-release' }],
+    ['/operations/vault/auth-admin', { kind: 'authAdmin' }],
+    ['/engineering/registry/new', { kind: 'workflowNew' }],
+    ['/engineering/registry/authoring/job-abc-123', { kind: 'workflowDesign', jobId: 'job-abc-123' }],
+    ['/engineering/registry/seasonal-release', { kind: 'workflowDetail', kindSlug: 'seasonal-release' }],
   ];
 
   for (const [path, expected] of cases) {
     test(`${path}`, () => {
-      const actual = parseRoute(path);
+      const actual = parse(path);
       for (const [key, value] of Object.entries(expected)) {
         expect((actual as Record<string, unknown>)[key]).toBe(value);
       }
@@ -192,30 +209,31 @@ describe('parseRoute — every specific path matches its specific case', () => {
 // plausible page and the reader concluded they had misremembered.
 describe('an unmatched path is notFound, naming the path', () => {
   test('an unknown path is notFound, not the landing page', () => {
-    expect(parseRoute('/no-such/route')).toEqual({ kind: 'notFound', path: '/no-such/route' });
-    expect(parseRoute('/ux/no-such-route')).toEqual({ kind: 'notFound', path: '/ux/no-such-route' });
+    expect(parse('/no-such/route')).toEqual({ kind: 'notFound', path: '/no-such/route' });
+    expect(parse('/ux/no-such-route')).toEqual({ kind: 'notFound', path: '/ux/no-such-route' });
     // One bare segment is a department's address (/<code>) since car 2
     // of design 8c3e9599, so the router cannot call it unknown: the
     // registry decides, in sections.ts `withRoster`, and a code the
     // instance does not have is not found there.
-    expect(parseRoute('/no-such-route')).toEqual({ kind: 'department', code: 'no-such-route' });
+    expect(parse('/no-such-route')).toEqual({ kind: 'department', code: 'no-such-route' });
   });
 
   test('an unknown /it path is notFound, not the yard', () => {
-    expect(parseRoute('/it/no-such')).toEqual({ kind: 'notFound', path: '/it/no-such' });
+    expect(parse('/it/no-such')).toEqual({ kind: 'notFound', path: '/it/no-such' });
     // /system retired with the IT consolidation; it is unknown like any other.
-    expect(parseRoute('/it/system/yard').kind).toBe('notFound');
+    expect(parse('/it/system/yard').kind).toBe('notFound');
   });
 
   test('the path named is the one asked for, mount and all', () => {
-    expect(parseRoute('/dashboard/ux/nope')).toEqual({ kind: 'notFound', path: '/dashboard/ux/nope' });
+    expect(parse('/dashboard/ux/nope')).toEqual({ kind: 'notFound', path: '/dashboard/ux/nope' });
   });
 
   test('the one back link goes to the department the path was under', () => {
-    expect(notFoundBack('/it/no-such')).toEqual({ href: '/it', label: 'Back to the Department Map' });
-    expect(notFoundBack('/dashboard/it/no-such/')).toEqual({ href: '/it', label: 'Back to the Department Map' });
-    expect(notFoundBack('/ux/no-such')).toEqual({ href: '/ux', label: 'Back to My Day' });
-    expect(notFoundBack('/items')).toEqual({ href: '/ux', label: 'Back to My Day' });
+    expect(notFoundBack('/it/no-such')).toEqual({ href: '/it', label: 'Back to the alarms board' });
+    expect(notFoundBack('/dashboard/it/no-such/')).toEqual({ href: '/it', label: 'Back to the alarms board' });
+    // My Day's own address: the person's station (backlog 5cb56bb3).
+    expect(notFoundBack('/ux/no-such')).toEqual({ href: '/me', label: 'Back to My Day' });
+    expect(notFoundBack('/items')).toEqual({ href: '/me', label: 'Back to My Day' });
   });
 
   test('a department this instance does not have sends the reader Home, even from /it', () => {
@@ -233,40 +251,90 @@ describe('an unmatched path is notFound, naming the path', () => {
 // /ux/departments/<code> retired with no alias (David, 2026-09-25).
 describe('a department is addressed by its code', () => {
   test('/<code>/jobs is the jobs view, for a code the catalog has never heard of', () => {
-    expect(parseRoute('/hosting/jobs')).toEqual({ kind: 'department', code: 'hosting' });
-    expect(parseRoute('/dashboard/sales/jobs/')).toEqual({ kind: 'department', code: 'sales' });
-    expect(parseRoute('/front%20of%20house/jobs')).toEqual({ kind: 'department', code: 'front of house' });
+    expect(parse('/hosting/jobs')).toEqual({ kind: 'department', code: 'hosting' });
+    expect(parse('/dashboard/sales/jobs/')).toEqual({ kind: 'department', code: 'sales' });
+    expect(parse('/front%20of%20house/jobs')).toEqual({ kind: 'department', code: 'front of house' });
   });
 
   test('/<code>/jobs wins over a family wildcard that would read "jobs" as an id', () => {
-    // /finance/:invoiceId, /sales/:jobId, /service/:jobId and
-    // /people/:empId each take one segment, and "jobs" is not an id.
-    expect(parseRoute('/finance/jobs')).toEqual({ kind: 'department', code: 'finance' });
-    expect(parseRoute('/sales/jobs')).toEqual({ kind: 'department', code: 'sales' });
-    expect(parseRoute('/service/jobs')).toEqual({ kind: 'department', code: 'service' });
-    expect(parseRoute('/people/jobs')).toEqual({ kind: 'department', code: 'people' });
+    // /sales/:jobId, /service/:jobId and /people/:empId each took one
+    // segment until design 01fa5bdf removed them, and "jobs" is not an
+    // id. (/finance/:invoiceId was the fourth until its invoices moved
+    // under /finance/invoices, c7ef4728.)
+    expect(parse('/finance/jobs')).toEqual({ kind: 'department', code: 'finance' });
+    expect(parse('/sales/jobs')).toEqual({ kind: 'department', code: 'sales' });
+    expect(parse('/service/jobs')).toEqual({ kind: 'department', code: 'service' });
+    expect(parse('/people/jobs')).toEqual({ kind: 'department', code: 'people' });
   });
 
   test('IT carries the jobs view too, and keeps every path it had', () => {
-    expect(parseRoute('/it/jobs')).toEqual({ kind: 'department', code: 'it' });
-    expect(parseRoute('/it')).toEqual({ kind: 'systemYard' });
+    expect(parse('/it/jobs')).toEqual({ kind: 'department', code: 'it' });
+    expect(parse('/it')).toEqual({ kind: 'systemYard' });
   });
 
   test('/<code> renders the landing: the flagged entry, else the first in catalog order, else the jobs view', () => {
-    // IT's entry is flagged `landing`; Executive's and Distribution's are
-    // their first entries; a code that owns nothing lands on its jobs.
-    expect(parseRoute('/it')).toEqual({ kind: 'systemYard' });
-    expect(parseRoute('/executive')).toEqual({ kind: 'exec' });
-    expect(parseRoute('/distribution')).toEqual({ kind: 'shipping' });
-    expect(parseRoute('/maintenance')).toEqual({ kind: 'catalog' });
-    expect(parseRoute('/hosting')).toEqual({ kind: 'department', code: 'hosting' });
-    expect(parseRoute('/dashboard/hosting/')).toEqual({ kind: 'department', code: 'hosting' });
+    // IT's entry is flagged `landing`; Finance's is its first entry; a
+    // code that owns nothing lands on its jobs. Executive, Distribution
+    // and Maintenance landed on their first entries (Exec, Shipments,
+    // Equipment) until those went with step 1 of design 01fa5bdf, and
+    // Sales owns only the unlisted watchlist now.
+    expect(parse('/it')).toEqual({ kind: 'systemYard' });
+    expect(parse('/executive')).toEqual({ kind: 'department', code: 'executive' });
+    expect(parse('/distribution')).toEqual({ kind: 'department', code: 'distribution' });
+    expect(parse('/maintenance')).toEqual({ kind: 'department', code: 'maintenance' });
+    expect(parse('/sales')).toEqual({ kind: 'department', code: 'sales' });
+    expect(parse('/hosting')).toEqual({ kind: 'department', code: 'hosting' });
+    expect(parse('/dashboard/hosting/')).toEqual({ kind: 'department', code: 'hosting' });
   });
 
   test('the retired /ux/departments/<code> answers nothing, and /ux/<code> is no department', () => {
-    expect(parseRoute('/ux/departments/sales')).toEqual({ kind: 'notFound', path: '/ux/departments/sales' });
-    expect(parseRoute('/ux/hosting')).toEqual({ kind: 'notFound', path: '/ux/hosting' });
-    expect(parseRoute('/ux/hosting/jobs')).toEqual({ kind: 'notFound', path: '/ux/hosting/jobs' });
+    expect(parse('/ux/departments/sales')).toEqual({ kind: 'notFound', path: '/ux/departments/sales' });
+    expect(parse('/ux/hosting')).toEqual({ kind: 'notFound', path: '/ux/hosting' });
+    expect(parse('/ux/hosting/jobs')).toEqual({ kind: 'notFound', path: '/ux/hosting/jobs' });
+  });
+});
+
+// FINANCE'S PAGES LIVE AT FINANCE'S ADDRESS (backlog c7ef4728, car 4 of
+// design 8c3e9599; design deba3000: the URL is the address of the station
+// that hosts the page). Every old spelling — the /ux one and the
+// unprefixed one the router also answered — retired with no alias and no
+// redirect (David, 2026-09-25): each is a not-found naming the path as it
+// was asked for, never a page that quietly works.
+describe("Finance's pages are under /finance, and their old spellings answer nothing", () => {
+  const retired = [
+    '/ux/finance',
+    '/ux/finance/new',
+    '/ux/finance/journal-entries/new',
+    '/ux/finance/inv-1',
+    '/ux/vendors',
+    '/ux/vendors/v-1',
+    '/ux/purchase-orders/po-1',
+    '/ux/vendor-invoices/vi-1',
+    // The unprefixed forms the /ux strip let through.
+    '/finance/new',
+    '/finance/inv-1',
+    '/purchase-orders/po-1',
+    '/vendor-invoices/vi-1',
+    '/vendors/v-1',
+  ];
+  for (const path of retired) {
+    test(`${path} is not found`, () => {
+      expect(parse(path)).toEqual({ kind: 'notFound', path });
+    });
+  }
+
+  test('/finance is the landing and /finance/jobs its jobs view', () => {
+    expect(parse('/finance').kind).toBe('finance');
+    expect(parse('/dashboard/finance/')).toEqual({
+      kind: 'finance',
+      view: { tab: 'overview', entry: '', fact: '' },
+    });
+    expect(parse('/finance/jobs')).toEqual({ kind: 'department', code: 'finance' });
+  });
+
+  test('an id holding a slash is one encoded segment under its slug', () => {
+    expect(parse('/finance/invoices/a%2Fb')).toEqual({ kind: 'invoice', invoiceId: 'a/b' });
+    expect(parse('/finance/vendors/acme%20co')).toEqual({ kind: 'vendor', vendorLookup: 'acme co' });
   });
 });
 
@@ -277,98 +345,77 @@ describe('a department is addressed by its code', () => {
 // (design ee3a3a2f Q6); an id holding a slash arrives percent-encoded.
 describe('a single-id wildcard takes one segment', () => {
   test('the two motivating dead links are notFound, not a missing entity', () => {
-    expect(parseRoute('/ux/accounts/agreements/x').kind).toBe('notFound');
-    expect(parseRoute('/ux/sales/opportunities/x').kind).toBe('notFound');
+    expect(parse('/ux/accounts/agreements/x').kind).toBe('notFound');
+    expect(parse('/ux/sales/opportunities/x').kind).toBe('notFound');
   });
 
+  // The /ux business families went with step 1 of design 01fa5bdf; the
+  // families that stay are each held to one segment.
   const families = [
-    '/ux/accounts', '/ux/vendors', '/ux/people', '/ux/parts', '/ux/products', '/ux/finance',
-    '/ux/shipments', '/ux/catalog', '/ux/assets', '/ux/marketing-assets', '/ux/purchase-orders',
-    '/ux/vendor-invoices', '/ux/shop', '/ux/service', '/ux/sales', '/ux/jobs',
-    '/it/registry', '/it/registry/authoring', '/it/registry/step-plugins', '/it/registry/rules',
+    '/finance/vendors', '/finance/invoices', '/finance/purchase-orders',
+    '/finance/vendor-invoices', '/ux/jobs',
+    '/engineering/registry', '/engineering/registry/authoring', '/engineering/registry/step-plugins',
+    '/engineering/registry/rules',
   ];
   for (const f of families) {
     test(`${f}/a/b is notFound`, () => {
-      expect(parseRoute(`${f}/a/b`)).toEqual({ kind: 'notFound', path: `${f}/a/b` });
+      expect(parse(`${f}/a/b`)).toEqual({ kind: 'notFound', path: `${f}/a/b` });
     });
   }
 
   test('an encoded slash is one segment, and arrives decoded', () => {
-    expect(parseRoute('/ux/accounts/a%2Fb')).toEqual({ kind: 'account', accountId: 'a/b' });
-    expect(parseRoute('/ux/people/a%2Fb')).toEqual({ kind: 'employee', empId: 'a/b' });
-    expect(parseRoute('/ux/jobs/a%2Fb')).toEqual({ kind: 'jobDetail', jobId: 'a/b' });
-    expect(parseRoute('/ux/service/a%2Fb')).toEqual({ kind: 'jobDetail', jobId: 'a/b' });
-    expect(parseRoute('/ux/sales/a%2Fb')).toEqual({ kind: 'jobDetail', jobId: 'a/b' });
+    expect(parse('/ux/jobs/a%2Fb')).toEqual({ kind: 'jobDetail', jobId: 'a/b' });
+    expect(parse('/finance/vendors/a%2Fb')).toEqual({ kind: 'vendor', vendorLookup: 'a/b' });
   });
 
   test('a malformed escape does not throw; the segment arrives as typed', () => {
-    expect(parseRoute('/ux/accounts/%E0')).toEqual({ kind: 'account', accountId: '%E0' });
+    expect(parse('/ux/jobs/%E0')).toEqual({ kind: 'jobDetail', jobId: '%E0' });
   });
 
   test('a manual section slug may hold a slash — the content API routes {*slug}', () => {
-    expect(parseRoute('/ux/manual/ops/brewing')).toEqual({ kind: 'manualSection', slug: 'ops/brewing' });
+    expect(parse('/engineering/manual/ops/brewing')).toEqual({ kind: 'manualSection', slug: 'ops/brewing' });
   });
 
   test('a job id followed by a lone steps segment is not a job page', () => {
-    expect(parseRoute('/ux/jobs/job-1/steps').kind).toBe('notFound');
+    expect(parse('/ux/jobs/job-1/steps').kind).toBe('notFound');
   });
 });
 
 describe('parseRoute — wildcard does not shadow specific cases', () => {
-  // Pins the canonical fix for the `/finance/(.+)` wildcard
-  // precedence bug: specific cases MUST be declared before the
-  // wildcard or they resolve as `{ kind: 'invoice', invoiceId: ... }`.
-  // Any new `/finance/X` case the SPA introduces should be added to
-  // the table above + a regression assertion here.
-  test('/ux/finance/new → newInvoice, NOT invoice', () => {
-    const r = parseRoute('/ux/finance/new');
+  // Pins the canonical fix for the invoice wildcard's precedence bug:
+  // specific cases MUST be declared before the wildcard or they resolve
+  // as `{ kind: 'invoice', invoiceId: ... }`. Any new
+  // `/finance/invoices/X` case the SPA introduces should be added to the
+  // table above + a regression assertion here.
+  test('/finance/invoices/new → newInvoice, NOT invoice', () => {
+    const r = parse('/finance/invoices/new');
     expect(r.kind).toBe('newInvoice');
   });
-  test('/ux/finance/journal-entries/new → newJournalEntry, NOT invoice', () => {
-    const r = parseRoute('/ux/finance/journal-entries/new');
+  test('/finance/journal-entries/new → newJournalEntry, NOT invoice', () => {
+    const r = parse('/finance/journal-entries/new');
     expect(r.kind).toBe('newJournalEntry');
   });
-  test('/it/registry/authoring/X → workflowDesign, NOT workflowDetail', () => {
-    const r = parseRoute('/it/registry/authoring/job-abc-123');
+  test('/engineering/registry/authoring/X → workflowDesign, NOT workflowDetail', () => {
+    const r = parse('/engineering/registry/authoring/job-abc-123');
     expect(r.kind).toBe('workflowDesign');
   });
   // The bare /it/registry/authoring rendered a second list over the same
   // GET /api/workflows (WorkflowsAdminPage) that no link reached; deleted
   // with page audit 9da74410 (d854fe9c). The path is one more kind slug
   // now, like any other, and only its /<jobId> child is authoring.
-  test('/it/registry/authoring is a kind slug, not a second workflow list', () => {
-    expect(parseRoute('/it/registry/authoring')).toEqual({ kind: 'workflowDetail', kindSlug: 'authoring' });
+  test('/engineering/registry/authoring is a kind slug, not a second workflow list', () => {
+    expect(parse('/engineering/registry/authoring')).toEqual({ kind: 'workflowDetail', kindSlug: 'authoring' });
   });
 });
 
-// The /ux/products search box writes its query back as `q` (backlog
-// 1c2db4c2), so the route must hand it to the page on a reload or a
-// shared link; absent and empty both mean no query.
-describe('products list search from the query string', () => {
-  const at = (search: string) => parseRoute('/ux/products', search) as { kind: string; q?: string };
+// The /ux/products list's `q` (backlog 1c2db4c2) was read here until
+// the page went with step 1 of design 01fa5bdf.
 
-  test('a query is carried through', () => {
-    const r = at('?q=pale+ale');
-    expect(r.kind).toBe('products');
-    expect(r.q).toBe('pale ale');
-  });
-
-  test('no query is the empty string, and is still the list route', () => {
-    expect(at('')).toEqual({ kind: 'products', q: '' });
-    expect(at('?q=')).toEqual({ kind: 'products', q: '' });
-  });
-
-  test('a product page does not read the list query', () => {
-    const r = parseRoute('/ux/products/FP-IPA-1-2-BBL');
-    expect(r).toEqual({ kind: 'product', productSku: 'FP-IPA-1-2-BBL' });
-  });
-});
-
-// /ux/finance's tab, entry and fact ride in the query (backlog
+// /finance's tab, entry and fact ride in the query (backlog
 // 2ab44d55): NewJournalEntryPage lands on ?entry=<id> after a post, and
 // the route must hand that to the page rather than drop it.
 describe('finance view from the query string', () => {
-  const at = (search: string) => parseRoute('/ux/finance', search);
+  const at = (search: string) => parse('/finance', search);
 
   test('a posted entry is carried through, onto the Trial Balance', () => {
     expect(at('?entry=ent-1')).toEqual({
@@ -388,12 +435,12 @@ describe('finance view from the query string', () => {
     });
   });
 
-  test('a bare /ux/finance is the Overview', () => {
+  test('a bare /finance is the Overview', () => {
     expect(at('')).toEqual({ kind: 'finance', view: { tab: 'overview', entry: '', fact: '' } });
   });
 
   test('an invoice page does not read the finance query', () => {
-    expect(parseRoute('/ux/finance/inv-1', '?entry=ent-1')).toEqual({
+    expect(parse('/finance/invoices/inv-1', '?entry=ent-1')).toEqual({
       kind: 'invoice',
       invoiceId: 'inv-1',
     });
@@ -402,125 +449,42 @@ describe('finance view from the query string', () => {
 
 describe('global search results route', () => {
   test('/search carries the query through', () => {
-    const r = parseRoute('/ux/search', '?q=cascade');
+    const r = parse('/ux/search', '?q=cascade');
     expect(r.kind).toBe('search');
     expect((r as { q: string }).q).toBe('cascade');
   });
 
   test('/search with no query is still the search route, not the catch-all', () => {
-    const r = parseRoute('/ux/search', '');
+    const r = parse('/ux/search', '');
     expect(r.kind).toBe('search');
     expect((r as { q: string }).q).toBe('');
   });
 });
 
-// An ABSENT status and an EMPTY one are two different requests. With
-// no `status` the page defaults to open; `status=` is a deep link
-// asking for every status, the same thing the page's own All button
-// sets. EmployeePage links "View this employee's owned jobs" as
-// `/ux/jobs?owner_id=…&status=`, and the router's truthiness check
-// dropped the empty value, so that link showed open jobs only (backlog
-// 03e198e5, found by page-audit 473f4f92 GAP 7).
-describe('jobs list status filter from the query string', () => {
-  const at = (search: string) => parseRoute('/ux/jobs', search) as { kind: string; jobStatus?: string };
-
-  test('an explicit empty status is carried as the empty string (all statuses)', () => {
-    const r = at('?owner_id=emp-1&status=');
-    expect(r.kind).toBe('jobs');
-    expect(r.jobStatus).toBe('');
-  });
-
-  test('an absent status is left unset, so the page defaults to open', () => {
-    const r = at('?owner_id=emp-1');
-    expect('jobStatus' in r).toBe(false);
-  });
-
-  test('a named status is carried through', () => {
-    expect(at('?status=closed').jobStatus).toBe('closed');
-  });
-});
-
-// `filter_subject_kind` was parsed into the route and handed to the
-// page, which captured it and never sent it: no link in the tree
-// produced it and the jobs API's ListJobsQuery has no subject_kind
-// filter, so it narrowed nothing. Deleted rather than implemented just
-// in case (backlog 45ca0f89, found by page-audit 473f4f92 GAP 8).
-describe('jobs list subject filter from the query string', () => {
-  const at = (search: string) => parseRoute('/ux/jobs', search) as Record<string, unknown>;
-
-  test('filter_subject_kind is not a route field: nothing downstream reads it', () => {
-    const r = at('?filter_subject_kind=account&subject_id=account-00001');
-    expect(r.kind).toBe('jobs');
-    expect('jobSubjectKind' in r).toBe(false);
-  });
-
-  test('subject_id still filters the list, the one subject filter the server takes', () => {
-    expect(at('?subject_id=account-00001').jobSubjectId).toBe('account-00001');
-  });
-
-  // Under `new=1` the subject_id is the NEW job's subject, and it
-  // filtered the list behind the form as well: an Account page's "new
-  // job" link opened a form over a list narrowed to that account, and
-  // Cancel left the list narrowed under a URL that no longer said so
-  // (backlog d0b93b80, found by the /ux/jobs page audit's spec).
-  test('under new=1, subject_id names the new job subject and filters nothing', () => {
-    const r = at('?new=1&subject_kind=account&subject_id=acc-1&status=closed');
-    expect(r.newJobOpen).toBe(true);
-    expect(r.newJobSubjectKind).toBe('account');
-    expect(r.newJobSubjectId).toBe('acc-1');
-    expect('jobSubjectId' in r).toBe(false);
-    expect(r.jobStatus).toBe('closed');
-  });
-
-  // The same mix-up, for `kind`: HrPage's "start a workflow" link sends
-  // /jobs?new=1&kind=…&subject_kind=employee&subject_id=…, and the kind
-  // it names was read as the list's Kind filter — so the list behind
-  // the form narrowed to that workflow, and the form's own Kind came up
-  // unpicked (backlog 3f5cce16, excluded from d0b93b80's car).
-  test('under new=1, kind names the new job kind and filters nothing', () => {
-    const r = at('?new=1&kind=onboarding&subject_kind=employee&subject_id=emp-7&status=closed');
-    expect(r.newJobOpen).toBe(true);
-    expect(r.newJobKind).toBe('onboarding');
-    expect(r.newJobSubjectKind).toBe('employee');
-    expect(r.newJobSubjectId).toBe('emp-7');
-    expect('workflow' in r).toBe(false);
-    expect('jobSubjectId' in r).toBe(false);
-    expect(r.jobStatus).toBe('closed');
-  });
-
-  // Without `new=1` there is no new job, so the same parameters are the
-  // list's filters and seed nothing.
-  test('without new=1, kind and subject_id filter the list and seed no new job', () => {
-    const r = at('?kind=onboarding&subject_kind=employee&subject_id=emp-7');
-    expect(r.workflow).toBe('onboarding');
-    expect(r.jobSubjectId).toBe('emp-7');
-    expect('newJobOpen' in r).toBe(false);
-    expect('newJobKind' in r).toBe(false);
-    expect('newJobSubjectKind' in r).toBe(false);
-    expect('newJobSubjectId' in r).toBe(false);
-  });
-});
+// The jobs list's query-string filters (status, owner, subject, the
+// new-job seed) were pinned here until the list went with step 1 of
+// design 01fa5bdf (review df7aeb9c); /ux/jobs with any query is not
+// found (src/jobs/the-jobs-list-is-retired.test.ts).
 
 describe('standalone Views retirement', () => {
   for (const path of ['/ux/views', '/views']) {
     test(`${path} has no page and retains the requested address`, () => {
       // Bare one-segment addresses are resolved against the department
       // registry by withRoster; this parser must no longer select Views.
-      if (path.startsWith('/ux/')) expect(parseRoute(path)).toEqual({ kind: 'notFound', path });
-      else expect(parseRoute(path)).toEqual({ kind: 'department', code: 'views' });
+      if (path.startsWith('/ux/')) expect(parse(path)).toEqual({ kind: 'notFound', path });
+      else expect(parse(path)).toEqual({ kind: 'department', code: 'views' });
     });
   }
-  test('remaining Home routes keep their meanings', () => {
-    expect(parseRoute('/').kind).toBe('me');
-    expect(parseRoute('/ux/inbox').kind).toBe('inbox');
-    expect(parseRoute('/ux/jobs').kind).toBe('jobs');
-    expect(parseRoute('/ux/service/schedule').kind).toBe('schedule');
+  test('remaining Home routes keep their meanings, at the person’s station', () => {
+    expect(parse('/').kind).toBe('me');
+    expect(parse('/me/inbox').kind).toBe('inbox');
+    expect(parse('/me/calendar').kind).toBe('myCalendar');
   });
 });
 
 describe('full-page step route', () => {
   test('parses /jobs/{job}/steps/{step} to stepFocus', () => {
-    const r = parseRoute('/ux/jobs/job-123/steps/step-456');
+    const r = parse('/ux/jobs/job-123/steps/step-456');
     expect(r.kind).toBe('stepFocus');
     expect((r as { jobId: string }).jobId).toBe('job-123');
     expect((r as { stepId: string }).stepId).toBe('step-456');
@@ -530,7 +494,7 @@ describe('full-page step route', () => {
     // David, 40fe7291: Back from a design review landed on the job
     // page instead of the queue he came from. Only the lens knows
     // where back is, so it says so on the URL.
-    const r = parseRoute(
+    const r = parse(
       '/ux/jobs/job-123/steps/step-456',
       '?from=%2Fit%2Fdesign&from_label=Design%20Review',
     );
@@ -552,7 +516,7 @@ describe('full-page step route', () => {
       '/\t/evil.example',
       'javascript:alert(1)',
     ]) {
-      const r = parseRoute(
+      const r = parse(
         '/ux/jobs/job-123/steps/step-456',
         `?from=${encodeURIComponent(hostile)}`,
       );
@@ -565,12 +529,12 @@ describe('full-page step route', () => {
     // The greedy /jobs/(.+) branch sits right after this one; if the
     // step pattern were looser (or ordered later) one of these two
     // would swallow the other.
-    expect(parseRoute('/ux/jobs/job-123').kind).toBe('jobDetail');
-    expect((parseRoute('/ux/jobs/job-123') as { jobId: string }).jobId).toBe('job-123');
+    expect(parse('/ux/jobs/job-123').kind).toBe('jobDetail');
+    expect((parse('/ux/jobs/job-123') as { jobId: string }).jobId).toBe('job-123');
   });
 
   test('a job id containing "steps" still resolves to jobDetail', () => {
-    const r = parseRoute('/ux/jobs/steps');
+    const r = parse('/ux/jobs/steps');
     expect(r.kind).toBe('jobDetail');
   });
 });
@@ -582,15 +546,17 @@ describe('full-page step route', () => {
 // selection, which is the whole point of putting it on top.
 describe('/it?at= — the Department Map carries its selection in the query', () => {
   test('a station named in `at` is the selection, and the bare landing selects nothing', () => {
-    expect(parseRoute('/it', '?at=gates')).toEqual({ kind: 'systemYard', at: 'gates' });
-    expect(parseRoute('/dashboard/it/', '?at=shop-floor')).toEqual({ kind: 'systemYard', at: 'shop-floor' });
-    expect(parseRoute('/it')).toEqual({ kind: 'systemYard' });
+    expect(parse('/it', '?at=gates')).toEqual({ kind: 'systemYard', at: 'gates' });
+    expect(parse('/dashboard/it/', '?at=shop-floor')).toEqual({ kind: 'systemYard', at: 'shop-floor' });
+    expect(parse('/it')).toEqual({ kind: 'systemYard' });
     // An empty `at` selects nothing rather than a station named "".
-    expect(parseRoute('/it', '?at=')).toEqual({ kind: 'systemYard' });
+    expect(parse('/it', '?at=')).toEqual({ kind: 'systemYard' });
   });
 
   test('`at` is read on the landing only — another IT page ignores it', () => {
-    expect(parseRoute('/it/estate', '?at=gates')).toEqual({ kind: 'systemEstate' });
+    expect(parse('/operations/estate', '?at=gates')).toEqual({ kind: 'systemEstate' });
+    // The board's own address reads it as the landing does.
+    expect(parse('/alarms', '?at=gates')).toEqual({ kind: 'systemYard', at: 'gates' });
   });
 });
 
@@ -604,11 +570,49 @@ describe('/it?at= — the Department Map carries its selection in the query', ()
 // answered go with them.
 // The list is the crawl roster's (_routes.ts `RETIRED_ROUTES`), so the
 // mocked spec that opens each page and this pin read one definition.
-describe('the retired station and floor pages are not found', () => {
+// Step 1 of design 01fa5bdf added the map's own leftovers and the /ux
+// business pages: an IT path's door is the alarms board, any other's
+// My Day.
+describe('the retired pages are not found', () => {
   for (const path of RETIRED_ROUTES) {
-    test(`${path} is notFound, and its back link is the Department Map`, () => {
-      expect(parseRoute(path)).toEqual({ kind: 'notFound', path });
-      expect(notFoundBack(path)).toEqual({ href: '/it', label: 'Back to the Department Map' });
+    const door = path === '/it' || path.startsWith('/it/')
+      ? { href: '/it', label: 'Back to the alarms board' }
+      : { href: '/me', label: 'Back to My Day' };
+    test(`${path} is notFound, and its back link is ${door.href}`, () => {
+      expect(parse(path)).toEqual({ kind: 'notFound', path });
+      expect(notFoundBack(path)).toEqual(door);
     });
   }
+});
+
+// THE ADDRESS A HOSTED PAGE HAD BEFORE ITS HOST (backlog 0bc2eb68). Each
+// IT family page and the manual answered at a hand-typed /it or /ux path;
+// they answer at their host stations' addresses now, and the old spelling
+// is a not-found naming the path, never an alias (David, 2026-09-25: no
+// shims before 1.0.0). /it itself is not on this list: it is IT's
+// department address, which the IT tab links to.
+describe('the spellings a hosted page had before its host answer nothing', () => {
+  const moved = [
+    '/it/operate/audit', '/it/operate/perf', '/it/registry', '/it/registry/new',
+    '/it/registry/authoring/j-1', '/it/registry/seasonal-release', '/it/registry/step-plugins',
+    '/it/registry/step-plugins/p-1', '/it/registry/dispatcher', '/it/registry/subjects',
+    '/it/registry/drift', '/it/registry/agents', '/it/registry/credentials', '/it/registry/rules',
+    '/it/registry/rules/r-1', '/it/design', '/it/codebase', '/it/estate', '/it/kb', '/it/auth-admin',
+    '/ux/manual', '/ux/manual/intro', '/manual/intro',
+    // The person's pages, at /me since backlog 5cb56bb3.
+    '/ux/me', '/ux/inbox', '/ux/calendar/me', '/calendar/me',
+    // The Churn watchlist's /ux spelling, until backlog 5cb56bb3 hosted
+    // it at the root.
+    '/ux/watchlist',
+  ];
+  for (const path of moved) {
+    test(`${path} is not found`, () => {
+      expect(parse(path)).toEqual({ kind: 'notFound', path });
+    });
+  }
+  // One bare segment is a department's address, which the registry
+  // judges: /manual is no department, so withRoster renders it not found.
+  test('/manual is one more unclaimed segment', () => {
+    expect(parse('/manual')).toEqual({ kind: 'department', code: 'manual' });
+  });
 });

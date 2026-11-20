@@ -6,7 +6,7 @@
   // or a React plugin bundle based on step.kind).
 
   import { navigate, href } from '../router';
-  import { shortId } from '../data/ids';
+  import { isIdPrefix, shortId } from '../data/ids';
   import {
     parseJob,
     subjectLabel,
@@ -24,6 +24,9 @@
   // Renders only when the packet carries a gate lifecycle stamp
   // (`launched_at` / `queued_at`) — a gate-run's two ages (4d088a7e).
   import GateTimes from '../it/yard/GateTimes.svelte';
+  // Renders only when the server reads the packet as a rendered plan —
+  // files its mutating request as the viewer (backlog 7aef2405).
+  import FileTheRequest from './FileTheRequest.svelte';
   import { fetchRemote, type Remote } from '../data/remote';
   import WriteGate from '@boss/web-kit/ui/WriteGate.svelte';
   import { session } from '@boss/web-kit/session/session.svelte';
@@ -184,48 +187,59 @@
     loading = true;
     refreshing = false;
 
-    try {
-      const streamUrl = `/api/jobs/${encodeURIComponent(id)}/stream`;
-      es = new EventSource(streamUrl);
-      es.onmessage = (ev) => {
-        if (cancelled) return;
-        try {
-          const detail = parseJob(streamUrl, JSON.parse(ev.data));
-          job = detail;
-          firstAnswered = true;
-          loading = false;
-          refreshing = false;
-          error = null;
-        } catch (e) {
-          // A frame that is not a Job never replaces the one rendered;
-          // the next push corrects it. But it is said, not dropped: with
-          // nothing rendered yet the failure line names it, where a
-          // silent drop left "Loading…" up (backlog c2e18fdd).
-          error = e instanceof Error ? e.message : String(e);
-          loading = false;
-        }
-      };
-      es.addEventListener('error', () => {
-        if (es && es.readyState === EventSource.CLOSED) {
-          es.close();
-          es = null;
-          // On 404 / proxy down, fall back to the on-mount fetch
-          // + slow-poll. On a transient blip the browser
-          // auto-reconnects, so we only fall through on CLOSED.
-          if (pollFallbackId === null) {
-            void load();
-            pollFallbackId = window.setInterval(() => void load(), 30_000);
-          }
-        }
-      });
-      es.addEventListener('gone', () => {
-        // Server says the Job is gone — refetch once so error
-        // state lands consistently.
-        void load();
-      });
-    } catch {
+    // A SHORT id (`/jobs/21d54f4a` — the eight characters every surface
+    // prints, and what the post-mortem archive links a finding's packet
+    // refs to, 434b6e0d) goes straight to the read, which resolves a
+    // prefix (cd7b0054). The stream parses a full uuid only: it answers
+    // anything else with one `error` frame and ends, the browser
+    // reconnects, and the read never ran — "Loading…" for good.
+    if (isIdPrefix(id)) {
       void load();
       pollFallbackId = window.setInterval(() => void load(), 30_000);
+    } else {
+      try {
+        const streamUrl = `/api/jobs/${encodeURIComponent(id)}/stream`;
+        es = new EventSource(streamUrl);
+        es.onmessage = (ev) => {
+          if (cancelled) return;
+          try {
+            const detail = parseJob(streamUrl, JSON.parse(ev.data));
+            job = detail;
+            firstAnswered = true;
+            loading = false;
+            refreshing = false;
+            error = null;
+          } catch (e) {
+            // A frame that is not a Job never replaces the one rendered;
+            // the next push corrects it. But it is said, not dropped: with
+            // nothing rendered yet the failure line names it, where a
+            // silent drop left "Loading…" up (backlog c2e18fdd).
+            error = e instanceof Error ? e.message : String(e);
+            loading = false;
+          }
+        };
+        es.addEventListener('error', () => {
+          if (es && es.readyState === EventSource.CLOSED) {
+            es.close();
+            es = null;
+            // On 404 / proxy down, fall back to the on-mount fetch
+            // + slow-poll. On a transient blip the browser
+            // auto-reconnects, so we only fall through on CLOSED.
+            if (pollFallbackId === null) {
+              void load();
+              pollFallbackId = window.setInterval(() => void load(), 30_000);
+            }
+          }
+        });
+        es.addEventListener('gone', () => {
+          // Server says the Job is gone — refetch once so error
+          // state lands consistently.
+          void load();
+        });
+      } catch {
+        void load();
+        pollFallbackId = window.setInterval(() => void load(), 30_000);
+      }
     }
 
     return () => {
@@ -324,6 +338,7 @@
     <div class="tab-grid">
       <ArrivalReport job={j} />
       <GateTimes jobId={j.id} open={j.status === 'open'} metadata={j.metadata} />
+      <FileTheRequest jobId={j.id} metadata={j.metadata} />
       {#if annotations.length > 0}
         <!-- The packet's own annotations, first after an arrival report:
              an alarm plan (owner, plan, ETA, what needs David) is the
@@ -391,15 +406,21 @@
           <div class="jd-info-row">
             <span class="jd-info-label">ID</span>
             <span class="jd-info-value jd-mono">
-              <a
-                href={safeLinkHref(href(subjectPath(j.subject)))}
-                onclick={(e) => {
-                  e.preventDefault();
-                  navigate(href(subjectPath(j.subject)));
-                }}
-              >
-                {subjectLabel(j.subject)}
-              </a>
+              <!-- A kind with no page is text (subjectPath, design 01fa5bdf). -->
+              {#if subjectPath(j.subject) !== null}
+                {@const to = href(subjectPath(j.subject)!)}
+                <a
+                  href={safeLinkHref(to)}
+                  onclick={(e) => {
+                    e.preventDefault();
+                    navigate(to);
+                  }}
+                >
+                  {subjectLabel(j.subject)}
+                </a>
+              {:else}
+                <span data-pageless={j.subject.subject_kind}>{subjectLabel(j.subject)}</span>
+              {/if}
             </span>
           </div>
           <div class="jd-info-row">
@@ -440,7 +461,7 @@
   .jd-annotations { margin: 0; display: grid; gap: 8px; font-size: 13px; }
   .jd-ann { display: grid; grid-template-columns: minmax(8rem, 14rem) 1fr; gap: 12px; }
   .jd-ann:not(.jd-ann-text) { grid-template-columns: 1fr; gap: 2px; }
-  .jd-ann dt { color: var(--text-dim); font-family: monospace; font-size: 12px; overflow-wrap: anywhere; }
+  .jd-ann dt { color: var(--text-dim); font-family: var(--font-mono); font-size: 12px; overflow-wrap: anywhere; }
   .jd-ann dd { margin: 0; overflow-wrap: anywhere; }
   .jd-ann-prose { margin: 0; white-space: pre-wrap; line-height: 1.45; }
   .jd-ann-list { margin: 0; padding-left: 1.2em; }

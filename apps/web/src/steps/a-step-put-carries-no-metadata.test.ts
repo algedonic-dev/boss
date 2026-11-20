@@ -59,7 +59,9 @@ describe('a step PUT carries no metadata — one door builds the step URL', () =
     // door's own spelling while passing over the doors beside it.
     const names = FILES.map((f) => f.name);
     expect(names).toContain(DOOR);
-    expect(names).toContain(join('apps', 'web', 'src', 'jobs', 'TriageBoard.svelte'));
+    // (TriageBoard.svelte was this control until it went with the
+    // Department Map's boards, design 01fa5bdf step 1.)
+    expect(names).toContain(join('apps', 'web', 'src', 'jobs', 'JobDetailPage.svelte'));
     expect(names).toContain(join('libs', 'web-kit', 'src', 'FeedbackControl.svelte'));
     expect(hits(FILES.find((f) => f.name === DOOR)?.text ?? '').length).toBeGreaterThan(0);
     expect(hits('fetch(`/api/jobs/${encodeURIComponent(j)}/steps/${encodeURIComponent(s)}`, {')).toEqual([1]);

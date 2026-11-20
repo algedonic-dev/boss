@@ -5,3 +5,5 @@
 id = "automation:surface-usage"
 role = "platform-admin"
 description = 'Rolls up which surfaces each operator opened, daily, and files it as a packet (infra/surface-usage.sh).'
+# Host station: executive (backlog 6ecb5480, station-tree.md section 6).
+station = "5f922a2a-31f5-4f07-acf1-41dc140687a4"
