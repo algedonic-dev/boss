@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { pageLink } from '../shell/stationAddresses.svelte';
   // /it/registry/rules — list the ACTIVE dispatcher rules, each linking
   // to its editor. Authoring sibling of the /it/registry/dispatcher cascade viz.
   // Models the step-plugins list page (PageHeader/Section + data-table +
@@ -54,7 +55,7 @@
 </script>
 
 <div class="catalog theme-exec">
-  <Breadcrumb to={href('/it/registry/dispatcher')}>← Dispatcher cascade</Breadcrumb>
+  <Breadcrumb to={pageLink('system-dispatcher')}>← Dispatcher cascade</Breadcrumb>
   <PageHeader
     eyebrow="Platform · Dispatcher rules"
     title="Rule authoring"
@@ -72,7 +73,7 @@
        7d9df2fe, design ff1c3615): a product rule made in the SPA was
        retired by the dispatcher's boot seed at the next restart. -->
   <div style="padding:0 24px 16px; display:flex; gap:12px; align-items:center">
-    <Link to={href('/it/registry/rules/new')} className="btn btn-primary">
+    <Link to={pageLink('system-dispatcher-rule', { ruleName: 'new' })} className="btn btn-primary">
       + New rule
     </Link>
     <span style="font-size:13px">
@@ -100,7 +101,7 @@
   {#if rules.length === 0 && !loading && !error}
     <p class="empty" style="padding:0 24px">
       No active dispatcher rules. A rule is authored as a file or a tenant seed —
-      <Link to={href('/it/registry/rules/new')}>+ New rule</Link> says how.
+      <Link to={pageLink('system-dispatcher-rule', { ruleName: 'new' })}>+ New rule</Link> says how.
     </p>
   {/if}
 
@@ -125,7 +126,7 @@
               {@const prov = ruleProvenance(r, registry)}
               <tr>
                 <td>
-                  <Link to={href(`/it/registry/rules/${encodeURIComponent(r.name)}`)}>
+                  <Link to={pageLink('system-dispatcher-rule', { ruleName: r.name })}>
                     <span class="mono">{r.name}</span>
                   </Link>
                   <!-- The rule file's why (backlog f9e34a2c) — folded, as

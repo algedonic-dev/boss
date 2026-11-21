@@ -171,7 +171,26 @@ wt_bound_build_jobs() {
     common=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null) || return 0
     [ "$gitdir" != "$common" ] || return 0
 
+    # BASH ONLY, and said so (backlog 9f7ee428, ask 4). The file is found
+    # beside this helper through BASH_SOURCE, which dash does not have:
+    # there it printed `Bad substitution`, read the file as
+    # `/pod-build.env`, and refused in the missing-bound words below —
+    # naming a file that was never in question. Both callers, wt-cargo
+    # and gate.sh, are bash; a caller that is not gets the reason.
+    if [ -z "${BASH_VERSION:-}" ]; then
+        printf '%s\n' "gate: wt_bound_build_jobs needs bash — it finds infra/dev/pod-build.env beside itself through BASH_SOURCE, which this shell does not set, so it cannot read this linked worktree's cargo bound. Refusing." >&2
+        return 2
+    fi
+
     env_file=$(dirname "${BASH_SOURCE[0]}")/pod-build.env
+    # MISSING and DECLARING NOTHING are two refusals, as they are in
+    # wt-cargo (ask 1): a missing file is a checkout or fixture that did
+    # not carry it, an empty one is an edit to the file itself, and one
+    # sentence for both sent the reader to the wrong repair.
+    if [ ! -f "$env_file" ]; then
+        printf '%s\n' "gate: $env_file is missing — this linked worktree's cargo bound has no home to read, and an unbounded cargo here is one job per NODE CPU against the dev container's memory (backlog 9ecd12ea). Refusing." >&2
+        return 2
+    fi
     bound=$(
         CARGO_BUILD_JOBS=
         # shellcheck source=pod-build.env

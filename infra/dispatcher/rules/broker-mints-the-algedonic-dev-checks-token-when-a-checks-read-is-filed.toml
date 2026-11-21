@@ -1,0 +1,79 @@
+# ---------------------------------------------------------------------
+# The credential broker mints the READ-ONLY token the mirror's job logs
+# are read with, when a read of the mirror's checks is filed (backlog
+# b7a74610, 2026-11-19).
+#
+# WHY. Publish PR #260's Gate failed its `test` check on 2026-11-19 and
+# nothing in BOSS could say which test: infra/forge/read-publish-checks.sh
+# read the check's public annotations, which quoted a prose line
+# (54278a24), and the job log that names the test answers 403 to an
+# anonymous reader ("Must have admin rights to Repository"). David opened
+# it in a browser and pasted the test's name before any fix could start.
+# A GitHub-only red must name its failing test without a person, so the
+# verb reads a failing check's job log with THIS token, and records the
+# failed tests and the gate's receipt on the publish packet.
+#
+# THE CREDENTIAL is the algedonic-dev installation's (registry id
+# github-app-algedonic-dev, Secret boss/github-app-algedonic-dev, the
+# broker's existing name-scoped grant) — the same installation, Secret
+# and registry row as the admin and publish mints, under a key of its
+# own: `checks-token`, which no per-request key (`token-<id>`,
+# `publish-token-<id>`) can equal. NARROWEST of the three: one
+# repository (the mirror, `boss`) and two READ permissions —
+#   actions:read    GET /repos/<mirror>/actions/jobs/<id>/logs
+#   metadata:read   GitHub requires it of every installation token
+# and nothing that writes. The App itself must hold Actions: Read on the
+# algedonic-dev installation; until it does, GitHub refuses the narrowed
+# exchange, the refusal is on the dispatcher's firing record, and the
+# verb states on the publish packet that it held no token.
+#
+# ONE STANDING KEY, KEPT ALIVE BY ITS READER'S FILING. The reader is
+# filed every fifteen minutes (reread-publish-pr-every-15-minutes) and
+# whenever a publish's read-checks step goes ready. A key per filing —
+# the publish token's shape — would grow the shared Secret by ninety-six
+# keys a day, and the Secret's size bound is the one every algedonic-dev
+# mint writes under. So this keys no request: the handler's refresh path
+# re-mints only when the held token has fewer than forty minutes left.
+# Forty is wider than the reader's fifteen-minute cadence, so the token a
+# run renders has at least twenty-five minutes left even when the
+# filing's own mint has not landed when the forge's runner reaches it.
+# No clock: when nothing files the reader, nothing needs the token, and
+# it dies within the hour. A leak is answered the way an hour-long token
+# is: it dies on its own, and the next mint replaces it.
+#
+# WHICH REQUESTS. A `read-publish-checks` request with no `--check`: the
+# verb's one admitted argument is its no-network input check, which
+# holds no token and must not mint one. A run carries no args, and an
+# absent `metadata.args.0` compares unequal to the literal (boss-expr:
+# Absent is unequal to every literal), so it fires.
+#
+# THE CONSUMER is off the cluster: read-publish-checks.sh on the forge
+# host renders this rule's key through infra/forge/credential-render.sh
+# into /etc/boss-publish/github-app/algedonic-dev-checks.token — its own
+# slot — only when the reading holds a failing Actions check, removing
+# it once the logs are read and on every other way the run ends (its
+# EXIT trap, through which HUP / INT / TERM exit); a slot a SIGKILL left
+# is removed at the start of the next run (review f5a9b7f8, B1). It is
+# named after this file; pinned by
+# crates/core/boss-dispatcher/tests/github_app_installation_token_rules.rs,
+# with the rest of this file's shape. github-act.sh still selects the
+# admin filing rule as the first file declaring github-app-algedonic-dev
+# (`...-admin-token-...` sorts before `...-checks-token-...`).
+[[rule]]
+name = "broker-mints-the-algedonic-dev-checks-token-when-a-checks-read-is-filed"
+why = """
+EXTERNAL GLUE, the census class for reactions whose effect lives outside
+the system: the broker speaks to GITHUB's App API (the installation-token
+exchange) and the k8s Secret store, neither of which a Workflow
+definition can address. It adds no routing and spawns nothing: it fills
+one key of one Secret and records credential.installed. Backlog
+b7a74610 (2026-11-19): a GitHub-only red could not name its failing
+test, because the mirror's job log answers 403 to the anonymous reader;
+this mints the read-only token the reader reads it with.
+"""
+version = 1
+on_event = "jobs.job.created"
+when = 'kind = "ops-request" AND metadata.verb = "read-publish-checks" AND metadata.args.0 != "--check"'
+[[rule.do]]
+handler = "credential.rotate.github-app-installation"
+args = { phase = "\"refresh\"", refresh_within_minutes = "\"40\"", secret_namespace = "\"boss\"", secret_name = "\"github-app-algedonic-dev\"", secret_key = "\"checks-token\"", credential_id = "\"github-app-algedonic-dev\"", verify_repo = "\"algedonic-dev/boss\"", repositories = "\"boss\"", permissions = "\"actions:read,metadata:read\"" }

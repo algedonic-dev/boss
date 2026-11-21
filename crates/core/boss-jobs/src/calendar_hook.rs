@@ -42,7 +42,7 @@ use boss_calendar_client::{CalendarClient, CalendarClientError};
 use boss_core::calendar::{
     Reservation, ReservationId, ReservationRequest, ReservationStrength, TimeWindow, reason,
 };
-use boss_core::job::{Step, StepStatus, Subject};
+use boss_core::job::{Step, StepId, StepStatus, Subject};
 
 /// What the hook decided to do given (old, new) statuses + step
 /// metadata. The HTTP handler maps this onto status codes; sim /
@@ -196,7 +196,131 @@ fn is_this_hold(held: &Reservation, req: &ReservationRequest) -> bool {
     held.reason_kind == req.reason_kind
         && held.reason_ref_id == req.reason_ref_id
         && held.subject == req.subject
-        && held.window == req.window
+        && same_window_as_stored(&held.window, &req.window)
+}
+
+/// Whether two windows are one window as the calendar STORES it: at
+/// microseconds, the precision of Postgres's `timestamptz` (backlog
+/// 868c2cf9). A `scheduled_at` finer than that is truncated on the way
+/// in — sqlx-postgres 0.8 binds `(t - 2000-01-01).num_microseconds()`,
+/// which for any instant after its epoch is the floor `timestamp_micros`
+/// takes — so the hold the calendar hands back was never byte-equal to
+/// the request that placed it, and a start met the step's own hold on
+/// its own time as a conflict.
+fn same_window_as_stored(a: &TimeWindow, b: &TimeWindow) -> bool {
+    a.start.timestamp_micros() == b.start.timestamp_micros()
+        && a.end.timestamp_micros() == b.end.timestamp_micros()
+}
+
+/// How long a hold keyed on a step may stand while that step does not
+/// hold it before a start it blocks takes it as abandoned (backlog
+/// 868c2cf9). An attempt lives from its reservation to its write for
+/// one request — seconds; the station claim's whole pre-commit budget is
+/// five (`station_claim::SELECTION_PRE_COMMIT_BUDGET`). Inside this
+/// window a hold may still be a start that has reserved and not yet
+/// written, and releasing it would leave that start, when it lands,
+/// Active and holding nothing (the review of car 983696b5). Past it, no
+/// attempt is still alive to settle it, and nothing else ever would.
+pub const ABANDONED_AFTER_MINUTES: i64 = 10;
+
+/// What [`release_abandoned_holds`] did: the holds it handed back, and
+/// what re-holding a step that started in the gap found — a
+/// [`HookOutcome::HoldLost`] there is the caller's to record.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReleasedAbandoned {
+    pub released: usize,
+    pub reheld: Vec<HookOutcome>,
+}
+
+/// Hand back the holds in `blocking` that no step holds any longer and
+/// no attempt can still settle (backlog 868c2cf9, the round-2 review of
+/// car 983696b5). `blocking` is what the calendar answered a start's
+/// reservation with; `read_step` reads a step as the store holds it now.
+///
+/// An attempt cut off between its reservation and its write — a client
+/// that disconnected, a pod that rolled — runs neither
+/// [`release_after_refused_write`] nor [`settle_landed_start`], and a
+/// skip cut off before [`after_step_written`] never releases. Nothing
+/// else ever removed such a hold: a rescheduled start of the same step
+/// met its own leftover as "calendar conflict", and so did any start of
+/// the assignee's time, until someone cancelled it by hand. This is the
+/// sweep of exactly the holds that refuse a start, run by that start.
+///
+/// A hold is abandoned when all of these are true, and kept otherwise:
+/// - it is a step's hold ([`reason::JOB_STEP`]) on a step id this
+///   service can read — a step the read cannot find is NOT judged
+///   absent, because a wrong target answers instead of erroring;
+/// - it was placed more than [`ABANDONED_AFTER_MINUTES`] before `now`,
+///   the calendar's wall clock that stamped `created_at`;
+/// - its step, as stored, does not hold exactly this time for this
+///   person: Active over it, or Completed over it (the record of the
+///   work, `done_does_not_cancel`). Ready, Pending and Skipped hold
+///   nothing; another window or another holder is not this hold.
+///
+/// Each goes back BY ITS ID, never by the step's reason key (983696b5).
+/// The step is read again after the release: a start that took this
+/// very hold as its own and landed between the judgement and the
+/// release is re-held, as in [`release_after_refused_write`] —
+/// whichever of the two runs last finds the step holding no time and
+/// places it. Best-effort: a cancel that fails is logged and the hold
+/// stays, as it would have.
+pub async fn release_abandoned_holds<F, Fut>(
+    calendar: Option<&Arc<dyn CalendarClient>>,
+    blocking: &[Reservation],
+    now: DateTime<Utc>,
+    actor: &str,
+    read_step: F,
+) -> ReleasedAbandoned
+where
+    F: Fn(StepId) -> Fut,
+    Fut: std::future::Future<Output = Option<Step>>,
+{
+    let mut done = ReleasedAbandoned::default();
+    let Some(calendar) = calendar else {
+        return done;
+    };
+    let placed_before = now - chrono::Duration::minutes(ABANDONED_AFTER_MINUTES);
+    for held in blocking {
+        if held.reason_kind != reason::JOB_STEP || held.created_at > placed_before {
+            continue;
+        }
+        let Ok(step_id) = uuid::Uuid::parse_str(&held.reason_ref_id).map(StepId::from_uuid) else {
+            continue;
+        };
+        if read_step(step_id)
+            .await
+            .is_none_or(|stored| step_holds(&stored, held))
+        {
+            continue;
+        }
+        if let Err(e) = calendar.cancel(held.id, actor).await {
+            tracing::warn!(
+                error = %e,
+                reservation = %held.id,
+                step_id = %step_id,
+                "calendar: could not release an abandoned hold"
+            );
+            continue;
+        }
+        done.released += 1;
+        if let Some(stored) = read_step(step_id).await
+            && step_holds(&stored, held)
+        {
+            done.reheld
+                .push(reassert_hold(calendar, &stored, actor).await);
+        }
+    }
+    done
+}
+
+/// Whether `stored` holds exactly `held`: the step is Active or
+/// Completed, and its own start would ask for this very hold.
+fn step_holds(stored: &Step, held: &Reservation) -> bool {
+    matches!(stored.status, StepStatus::Active | StepStatus::Completed)
+        && start_request(stored, &held.created_by)
+            .ok()
+            .flatten()
+            .is_some_and(|req| is_this_hold(held, &req))
 }
 
 /// The calendar half of a step write that LANDED: `stored` is the row
@@ -494,7 +618,6 @@ fn scheduling_fields(step: &Step) -> Option<(DateTime<Utc>, f64, String)> {
 mod tests {
     use super::*;
     use boss_calendar_client::{FakeCalendarClient, FakeCall};
-    use boss_core::job::StepId;
     use serde_json::json;
 
     fn step_with(
@@ -891,6 +1014,222 @@ mod tests {
                 "{staged:?} -> {out:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_steps_own_hold_matches_at_the_precision_postgres_stores() {
+        // Backlog 868c2cf9: a `scheduled_at` finer than a microsecond is
+        // stored by Postgres (timestamptz) at microseconds, so the hold
+        // the calendar hands back is never byte-equal to the request, and
+        // a re-send met the step's own hold as a conflict.
+        let (mut old, _, mut held) = a_start_and_its_hold(None);
+        old.metadata["scheduled_at"] = json!("2026-04-27T10:00:00.123456789Z");
+        let mut new = old.clone();
+        new.status = StepStatus::Active;
+        held.reason_ref_id = new.id.to_string();
+        let stored_start = DateTime::parse_from_rfc3339("2026-04-27T10:00:00.123456Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        held.window =
+            TimeWindow::new(stored_start, stored_start + chrono::Duration::minutes(120)).unwrap();
+        let fake = Arc::new(FakeCalendarClient::new());
+        fake.stage_conflict(vec![held]);
+        let cal: Arc<dyn CalendarClient> = fake;
+        let out = apply_step_transition(Some(&cal), &old, &new, "emp-1")
+            .await
+            .unwrap();
+        assert_eq!(out, HookOutcome::AlreadyHeld);
+    }
+
+    /// A `read_step` that answers `rows` in order, whatever step is
+    /// asked for, then nothing.
+    fn step_reads<const N: usize>(
+        rows: [Option<Step>; N],
+    ) -> impl Fn(StepId) -> std::future::Ready<Option<Step>> {
+        let rows = std::sync::Mutex::new(std::collections::VecDeque::from(rows));
+        move |_| std::future::ready(rows.lock().unwrap().pop_front().flatten())
+    }
+
+    /// The instant `minutes` after `held` was reserved.
+    fn abandoned_after(held: &Reservation, minutes: i64) -> DateTime<Utc> {
+        held.created_at + chrono::Duration::minutes(minutes)
+    }
+
+    fn cancelled(fake: &FakeCalendarClient) -> Vec<ReservationId> {
+        fake.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                FakeCall::Cancel(id, _) => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_hold_its_step_does_not_hold_is_released_once_abandoned() {
+        // Backlog 868c2cf9: an attempt cut off between its reservation and
+        // its write leaves a hold nothing cleans up. The step as stored is
+        // Ready — rescheduled, Skipped and Pending alike hold no time — so
+        // once no attempt can still be writing, the start it blocks hands
+        // it back, by its id.
+        for status in [StepStatus::Ready, StepStatus::Pending, StepStatus::Skipped] {
+            let (mut stored, _, held) = a_start_and_its_hold(None);
+            stored.status = status;
+            let now = abandoned_after(&held, ABANDONED_AFTER_MINUTES + 1);
+            let fake = Arc::new(FakeCalendarClient::new());
+            let cal: Arc<dyn CalendarClient> = fake.clone();
+            let out = release_abandoned_holds(
+                Some(&cal),
+                std::slice::from_ref(&held),
+                now,
+                "emp-1",
+                step_reads([Some(stored.clone()), Some(stored)]),
+            )
+            .await;
+            assert_eq!(out.released, 1, "{status:?}");
+            assert_eq!(cancelled(&fake), vec![held.id], "{status:?}");
+            assert!(out.reheld.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hold_still_inside_an_attempts_life_is_kept() {
+        // The attempt that placed it may be between its reservation and
+        // its write right now; releasing it would leave that start, when
+        // it lands, Active and holding nothing (983696b5).
+        let (stored, _, held) = a_start_and_its_hold(None);
+        let now = abandoned_after(&held, ABANDONED_AFTER_MINUTES - 1);
+        let fake = Arc::new(FakeCalendarClient::new());
+        let cal: Arc<dyn CalendarClient> = fake.clone();
+        let out = release_abandoned_holds(
+            Some(&cal),
+            std::slice::from_ref(&held),
+            now,
+            "emp-1",
+            step_reads([Some(stored)]),
+        )
+        .await;
+        assert_eq!(out, ReleasedAbandoned::default());
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    }
+
+    #[tokio::test]
+    async fn a_hold_its_step_holds_as_stored_or_that_cannot_be_judged_is_kept() {
+        let (ready, _, held) = a_start_and_its_hold(None);
+        let now = abandoned_after(&held, ABANDONED_AFTER_MINUTES + 60);
+        let mut active = ready.clone();
+        active.status = StepStatus::Active;
+        let mut completed = ready.clone();
+        completed.status = StepStatus::Completed;
+        let mut not_a_step = held.clone();
+        not_a_step.reason_kind = "pto".into();
+        let mut no_step_id = held.clone();
+        no_step_id.reason_ref_id = "not-a-uuid".into();
+        for (row, read) in [
+            // The step holds exactly this time: its hold, and the record
+            // of the work once it completed (`done_does_not_cancel`).
+            (held.clone(), Some(active)),
+            (held.clone(), Some(completed)),
+            // A step this read cannot find is not judged absent: a wrong
+            // target answers instead of erroring.
+            (held.clone(), None),
+            // Not a step's hold, or not a step this service can read.
+            (not_a_step, Some(ready.clone())),
+            (no_step_id, Some(ready.clone())),
+        ] {
+            let fake = Arc::new(FakeCalendarClient::new());
+            let cal: Arc<dyn CalendarClient> = fake.clone();
+            let out = release_abandoned_holds(
+                Some(&cal),
+                std::slice::from_ref(&row),
+                now,
+                "emp-1",
+                step_reads([read]),
+            )
+            .await;
+            assert_eq!(out.released, 0, "{row:?}");
+            assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hold_on_time_or_a_person_its_active_step_does_not_hold_is_released() {
+        // The step is Active, but over another window or for another
+        // holder: this row is no part of what it holds (a dead attempt
+        // before a reschedule, or before the claim moved to someone else).
+        let (ready, _, held) = a_start_and_its_hold(None);
+        let now = abandoned_after(&held, ABANDONED_AFTER_MINUTES + 1);
+        let mut moved = ready.clone();
+        moved.status = StepStatus::Active;
+        moved.metadata["scheduled_at"] = json!("2026-04-27T11:00:00Z");
+        let mut reassigned = ready.clone();
+        reassigned.status = StepStatus::Active;
+        reassigned.assignee_id = Some("emp-2".into());
+        for stored in [moved, reassigned] {
+            let fake = Arc::new(FakeCalendarClient::new());
+            let cal: Arc<dyn CalendarClient> = fake.clone();
+            let out = release_abandoned_holds(
+                Some(&cal),
+                std::slice::from_ref(&held),
+                now,
+                "emp-1",
+                step_reads([Some(stored.clone()), Some(stored)]),
+            )
+            .await;
+            assert_eq!(out.released, 1);
+            assert_eq!(cancelled(&fake), vec![held.id]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_start_landing_between_the_judgement_and_the_release_is_held_again() {
+        // The judging read found the step Ready; a start that took this
+        // very hold as its own (AlreadyHeld) landed before the cancel.
+        // Whichever runs last re-holds, as `release_after_refused_write`.
+        let (ready, _, held) = a_start_and_its_hold(None);
+        let now = abandoned_after(&held, ABANDONED_AFTER_MINUTES + 1);
+        let mut landed = ready.clone();
+        landed.status = StepStatus::Active;
+        let fake = Arc::new(FakeCalendarClient::new());
+        let cal: Arc<dyn CalendarClient> = fake.clone();
+        let out = release_abandoned_holds(
+            Some(&cal),
+            std::slice::from_ref(&held),
+            now,
+            "emp-1",
+            step_reads([Some(ready), Some(landed.clone())]),
+        )
+        .await;
+        assert_eq!(out.released, 1);
+        assert!(
+            matches!(out.reheld.as_slice(), [HookOutcome::Reserved(_)]),
+            "{:?}",
+            out.reheld
+        );
+        let calls = fake.calls();
+        assert!(
+            matches!(
+                calls.as_slice(),
+                [FakeCall::Cancel(id, _), FakeCall::Reserve(req)]
+                    if *id == held.id && req.reason_ref_id == landed.id.to_string()
+            ),
+            "{calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_calendar_releases_nothing() {
+        let (ready, _, held) = a_start_and_its_hold(None);
+        let now = abandoned_after(&held, ABANDONED_AFTER_MINUTES + 1);
+        let out = release_abandoned_holds(
+            None,
+            std::slice::from_ref(&held),
+            now,
+            "emp-1",
+            step_reads([Some(ready)]),
+        )
+        .await;
+        assert_eq!(out, ReleasedAbandoned::default());
     }
 
     #[tokio::test]

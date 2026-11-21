@@ -1,0 +1,8 @@
+[[invariant]]
+id = "one-parent-one-root"
+claim = "Stations form a tree: every station has exactly one parent except the root, and there is exactly one root, whose pools are the system's constraints."
+source = "docs/design/factory-taxonomy-v2.md (R1); docs/design/station-tree.md §8.6; design 4b27a65a, car T2"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "DOES NOT HOLD TODAY. Filed by T0 (backlog ac434bd4). Station rows in infra/platform/stations/ carry no parent field, so the registry is flat and there is no root row. T2 (backlog 3f58c823) gives each row a stable id and a parent and declares the root; this entry flips when a lint or the station registry's viability check refuses a second root, a row with no parent that is not the root, or a parent cycle."

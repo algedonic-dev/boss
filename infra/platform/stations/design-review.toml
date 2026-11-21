@@ -26,15 +26,41 @@
 # `design-decided` station beside this file rather than by widening
 # this one, because this station is the reviewer's queue and a fold is
 # not a decision waiting on anyone.
+#
+# Version 4 (item 0a78f8f8, factory taxonomy M2, 2026-11-03): kind
+# batch -> group, bumped from the LIVE newest (v3). The batch kind is
+# deleted; a design is decided by its reviewers, a set of actors, so
+# the row is a generic station. Nothing else changed.
+#
+# Version 5 (pass item 4 of design ccfe87ff, backlog 1bb8c479; bumped
+# from the LIVE newest, v4): the station declares its edge. The same
+# design-doc packet leaves this queue when its `review` step completes,
+# and a completed `review` is exactly what puts it on `design-decided`
+# (that station's predicate, beside this file). Nothing else changed.
+#
+# Version 6 (T2 of design 4b27a65a, backlog 3f58c823; bumped from the
+# LIVE newest, v5): the station stands in the tree — its stable `id`, its
+# `parent` /algedonic/executive (proposal section 6), its mode. Nothing
+# else changed.
+#
+# Version 7 (design c0ae096f section 2, car 1, backlog 599fec3e; bumped
+# from the LIVE newest, v6): the queue moves from executive to
+# /algedonic/engineering/design, the stage where designs are drafted and
+# decided — one `parent` edit. The retired department label is removed
+# with its floor reader (backlog aa82eb11).
 # ---------------------------------------------------------------------------
 
 [[station]]
 name = "design-review"
-version = 2
+version = 8
+id = "202dc00d-c5a7-4cde-81f5-d6a6fcd26e6b"
+parent = "cc856b32-3667-4e70-b6cd-667f6fe89007"
+mode = "standing"
 status = "active"
 title = "Design review queue"
-kind = "batch"
+kind = "group"
 discipline = ["priority", "age"]
+edges = ["design-decided"]
 
 [station.predicate]
 kind = "design-doc"

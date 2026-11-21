@@ -72,6 +72,32 @@ const SWEEP_RULE: &str = "cadence-silence-sweep-daily";
 /// an entry here would be an exemption with nothing to exempt.
 const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
     (
+        "pending-readiness-every-five-minutes",
+        "runs `jobs.reconcile-readiness`, which reevaluates existing packets under their \
+         pinned protocols and emits the existing step promotion events. It opens no packet, \
+         and a healthy pass may promote ZERO steps. A packet-count silence sweep cannot \
+         measure this rule: the work it repairs was opened by other actors and workflows, \
+         not by its five-minute clock (backlog 45479130).",
+    ),
+    (
+        "resource-leases-are-swept-every-five-minutes",
+        "runs `jobs.sweep-resource-leases`, which POSTs the jobs API's lease sweep door: \
+         each lapsed lease becomes one `jobs.step.resource_lease_expired` fact on the packet \
+         that claimed it, FLOW released and STOCK left as an obligation (backlog 3aeaf08c). \
+         It opens no packet, and on a tick with no lapsed lease it expires NOTHING, which is \
+         the healthy reading. The packets it touches are of every kind that bills a pool, so \
+         there is no one kind a sweep keyed by kind could watch; a refusal or an undrained \
+         backlog is an error on the dispatcher's firing record.",
+    ),
+    (
+        "roster-pools-are-observed-every-five-minutes",
+        "runs `pools.observe-rosters`, which POSTs the people service's roster-capacity \
+         door: each roster pool whose count changed is published as its next version \
+         (backlog a6cb448a). It opens no packet, and on a tick where no roster moved it \
+         publishes NOTHING, which is the healthy reading; a refusal or a pool the door could \
+         not observe is an error on the dispatcher's firing record.",
+    ),
+    (
         "network-census-daily",
         "runs `network.census`, which records an observation and spawns no packet. \
          `kind=network-census` has total=0 and always will — a rule that produces no \
@@ -183,6 +209,56 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          sweep keyed by kind could watch.",
     ),
     (
+        "agent-run-dies-when-its-verdict-never-comes",
+        "runs `jobs.age_out_step` on the `verdict` step of an agent-run handed to its gate \
+         (backlog 87d1ae40): the same silence bound as the building clock, aimed at a run \
+         that gave its robot back at the hand-off. It files nothing: it CLOSES packets a \
+         dispatch opened, so on an hour with no stranded verdict it produces NOTHING, and \
+         that zero is the healthy reading.",
+    ),
+    (
+        "an-abandoned-step-is-reclaimed-when-its-verdict-died",
+        "runs `jobs.reclaim_abandoned_step` for a run whose `verdict` step died (backlog \
+         87d1ae40), a bound after the death rule above: it puts the work back where the \
+         claim took it from and files nothing, so on an hour with no dead handed run it \
+         produces NOTHING, and that zero is the healthy reading.",
+    ),
+    (
+        "a-red-gate-returns-the-build-to-its-station",
+        "runs `jobs.reclaim_abandoned_step` for a run whose `verdict` a red gate ended \
+         `refused` (backlog 2b927025): it puts the item's build back at its station, carrying \
+         the gate-run, and files nothing, so on a tick with no red holding a step it produces \
+         NOTHING, and that zero is the healthy reading.",
+    ),
+    (
+        "an-urgent-item-is-released-when-unrun-and-rescoped-when-long",
+        "runs `jobs.urgent_item_watch`, which releases an urgent item's build claimed with no \
+         open agent-run and no car in flight past its bound, and files one alarm per urgent \
+         item that has run for days without converging (backlog 9788e22d). On an hour with \
+         neither it produces NOTHING, and that zero is the healthy reading; what it files is an \
+         alarm keyed by item, not a packet of a kind a sweep could count, and what it releases \
+         goes back to a queue rather than becoming a packet.",
+    ),
+    (
+        "an-idle-actor-holding-urgent-nominations-is-alarmed",
+        "runs `jobs.idle_actor_watch`, which files one urgent backlog-item alarm per agent \
+         that holds a ready urgent nomination with no agent-run open and none moved inside \
+         its bound (backlog 861360bc), held by the alarm staying open. On a tick with every \
+         holder working it produces NOTHING, and that zero is the healthy reading; what it \
+         files is an alarm keyed by actor, not a packet of a kind a sweep could count. It is \
+         itself the watch on a stopped factory, which no event reports.",
+    ),
+    (
+        "a-silent-factory-holding-claimed-work-is-alarmed",
+        "runs `jobs.silent_session_watch`, which files one urgent backlog-item alarm per agent \
+         that holds claimed work while its open work-session has had no write of its own for \
+         its bound (backlog 628dc540), and withdraws it when the session is written again. On \
+         a tick with every busy factory writing it produces NOTHING, and that zero is the \
+         healthy reading; what it files is an alarm keyed by actor, not a packet of a kind a \
+         sweep could count. It is itself the watch on a factory stopped at a model limit, \
+         which no event reports.",
+    ),
+    (
         "a-declared-worker-receipt-is-observed-every-five-minutes",
         "runs `jobs.receipt_overdue`, which files one urgent backlog-item alarm only when \
          a newly declared worker receipt is missing past its native dispatch bound, and \
@@ -200,6 +276,35 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          step it produces NOTHING, and that zero is the healthy reading; what it files is an \
          alarm keyed by step, not a packet of a kind a sweep could count. It is itself the \
          watch on work no event reports as late.",
+    ),
+    (
+        "an-unheld-ready-review-past-its-bound-is-alarmed",
+        "runs `jobs.unheld_review_watch`, which files one urgent backlog-item alarm per station \
+         whose ready reviewer steps nobody holds have waited past the `duration_hours` their \
+         pinned workflow declares (backlog f0e604dc), held by the alarm staying open. On an \
+         hour with no late unheld review it produces NOTHING, and that zero is the healthy \
+         reading; what it files is an alarm keyed by station, not a packet of a kind a sweep \
+         could count. It is itself the watch on a claim no event reports as missing.",
+    ),
+    (
+        "a-factory-idle-past-an-hour-alarms-the-owner",
+        "runs `jobs.factory_idle_watch`, which files one urgent backlog-item alarm per idle \
+         episode when no car gate has launched for its bound while declared ready work waits, \
+         and tells the platform owner by direct message (backlog 5627a4e1). On a tick with a \
+         recent car gate it produces NOTHING, and that zero is the healthy reading; what it \
+         files is an alarm keyed by episode, not a packet of a kind a sweep could count. It is \
+         itself the watch on a stopped factory, which no event reports.",
+    ),
+    (
+        "a-stale-unsigned-publish-is-superseded-daily",
+        "runs `jobs.supersede_stale_unsigned`, which files a publish-to-github packet ONLY \
+         when an open one is unsigned and its own reading names a newer tree than it \
+         measured, and merges the supersession onto the stale one (design 62f27539 C1, \
+         backlog 44caee88). On a day with no such packet it files NOTHING, and that zero is \
+         the healthy reading. The packets it does file are the kind \
+         `publish-to-github-daily` already declares as a cadence on the same mirror, so the \
+         sweep already counts them there; a second declaration of that identity would be \
+         the same cadence measured twice.",
     ),
     (
         "every-control-has-a-real-person-hourly",
@@ -236,6 +341,25 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          no rotting flight it produces NOTHING, and that zero is the healthy reading; what it \
          files is an alarm keyed by flight, not a packet of a kind a sweep could count. It is \
          itself the watch on a decision no event reports as missing.",
+    ),
+    (
+        "a-standing-hold-its-step-executor-refuses-is-released-hourly",
+        "runs `jobs.release_executor_refused` over the open board (backlog 231cb747): every \
+         held step whose packet's PINNED executor declaration refuses its holder is released \
+         to the step's role audience with an `executor_refused` note. It files nothing and \
+         RELEASES steps, so on an hour with no refused holder it produces NOTHING, and that \
+         zero is the healthy reading; the steps it moves belong to packets of every kind, so \
+         no sweep keyed by kind could count it. Its event twin \
+         `a-hold-its-step-executor-refuses-is-released` handles each new assignment.",
+    ),
+    (
+        "a-stranded-review-nomination-returns-to-its-station",
+        "runs `jobs.return_stranded_review` over the open cars (backlog eb86a174): a ready \
+         review nominated to its car's builder, or unclaimed past the rule's bound, goes back \
+         to its station's queue with a `returned_to_station` note. It files nothing and \
+         RETURNS steps, so on a tick with no stranded nomination it produces NOTHING, and that \
+         zero is the healthy reading; the steps it moves were nominated by hands on cars other \
+         doors opened, so no sweep keyed by kind could count it.",
     ),
     (
         "work-session-ends-when-silent",

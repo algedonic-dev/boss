@@ -1,0 +1,54 @@
+# Read every daily check of the suspended cluster chores, and alarm when a
+# suspension has stood 24 hours or the check could not read.
+#
+# THE GAP (backlog 87e08026). check-suspended-chores-daily files the
+# read-only check every day, and its ops-request closes `answered`
+# whenever the verb RAN — a chore suspended for a week and a CANNOT
+# ANSWER included. A closed packet nobody opens is the suspension
+# forgotten, one layer up.
+#
+# THE READER. `ops.judge` in WATCH mode (no then_verb / then_host /
+# then_args), as watch-check-longhorn-drain-policy-daily: nothing is filed
+# on a run whose `when` holds, and ONE urgent alarm, keyed for_request, is
+# filed for a run that FAILED (exit 1 — a read that could not look, an
+# answer naming no chore at all, a suspension whose time cannot be read),
+# was REFUSED by the runner, printed no verdict, or carries a verdict
+# `when` is false over.
+#
+# ONE ALARM PER PASS, NOT PER CHORE. The item asked one per chore;
+# ops.judge keys its alarm only by for_request, so a pass with two chores
+# past the threshold files one alarm whose verdict names both. Keying it
+# per chore across passes is a handler change, left out of this car
+# (triage run 507c7830, 2026-11-11).
+#
+# THE VERDICT is the check's last line, read out of the script by
+# crates/core/boss-testing/tests/check_suspended_chores_sh.rs:
+# `READ — suspended <n>, oldest_hours <h>, chores <ns/name,...|none>`.
+# THE THRESHOLD IS HERE, in `when`, and nowhere in the script: 24 hours,
+# the item's figure. The pattern avoids the em-dash (`.` spans it) and a
+# backslash: the arg crosses TOML's lexer and then boss-expr's.
+[[rule]]
+name = "watch-check-suspended-chores-daily"
+why = """
+A CROSS-PROTOCOL READER no Workflow consequence can express: the
+ops-request protocol closes a request when its verb has run, and
+`jobs.job.closed` carries neither the exit nor the output. Asked for on
+backlog 87e08026 (car 2 of d28c0051): a chore left suspended was reported
+by nothing. ops.judge already reads a closed request's exit and verdict
+line and files a for_request-keyed alarm; this rule runs it as a watch,
+with no follow-on, so a suspension standing 24 hours is an urgent packet
+rather than a closed one. Redelivery-safe: the request carries `judged`
+once read, and an open alarm with the same for_request is reused.
+"""
+version = 2
+on_event = "jobs.job.closed"
+# `failed` and `indeterminate` are how the ops-request row closes a verb
+# that RAN with a nonzero or an unknown exit (design b7bb1625, backlog
+# 50a1578f); before that row it closed `answered` whatever the exit, so
+# this rule hears exactly the runs it heard before, and its judge still
+# reads the exit off the execute record. Pinned by boss-dispatcher's
+# an_ops_request_rule_that_hears_an_answer_hears_a_failure.
+when = 'kind = "ops-request" AND (outcome = "answered" OR outcome = "failed" OR outcome = "indeterminate" OR outcome = "refused")'
+[[rule.do]]
+handler = "ops.judge"
+args = { verb = '"check-suspended-chores"', verdict_pattern = '"^check-suspended-chores: READ . suspended (?P<suspended>[0-9]+), oldest_hours (?P<oldest_hours>[0-9]+), chores (?P<chores>[a-z0-9./,-]+)$"', when = '"suspended = 0 OR oldest_hours < 24"' }

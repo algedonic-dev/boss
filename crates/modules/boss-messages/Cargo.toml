@@ -21,7 +21,7 @@ required-features = ["postgres"]
 
 [features]
 default = []
-postgres = ["dep:sqlx", "boss-events/postgres", "dep:boss-subject-kinds"]
+postgres = ["dep:sqlx", "boss-events/postgres", "dep:boss-subject-kinds", "dep:boss-jobs"]
 
 [dependencies]
 boss-subject-kinds = { path = "../../core/boss-subject-kinds", features = ["postgres"], optional = true }
@@ -41,6 +41,9 @@ uuid = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"], optional = true }
 
 boss-core = { path = "../../core/boss-core" }
+# The binary composes the sensor-owned telemetry adapter; message domain code
+# still depends only on the shared small recorder port in boss-core.
+boss-jobs = { path = "../../core/boss-jobs", features = ["postgres"], optional = true }
 boss-clock-client = { path = "../../core/boss-clock-client" }
 boss-ports = { path = "../../core/boss-ports" }
 boss-events = { path = "../../core/boss-events" }

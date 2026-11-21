@@ -47,7 +47,7 @@
 //! different table name (`[[rule]]` where the loader reads `[[grants]]`)
 //! is INVALID naming both: no evidence is not a pass.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -94,8 +94,14 @@ struct Ctx {
     /// (backlog aa860c6d). `None` exactly when `chart` is.
     revenue_chart: Option<BTreeSet<String>>,
     /// The kinds `seeds/workflows.toml` declares — half of what a
-    /// sensor's `opens` is checked against (backlog b8d8c928).
+    /// sensor's `opens` and a rule's spawned kind are checked against
+    /// (backlog b8d8c928, 192d49f1).
     workflows: Declared,
+    /// Each kind that file declares, with its step slugs — what a
+    /// rule's route onto a TENANT kind names its step against
+    /// (backlog 192d49f1). Empty when the file is absent or does not
+    /// parse; its own row carries that.
+    workflow_steps: BTreeMap<String, BTreeSet<String>>,
     /// The ids `seeds/credentials.toml` declares — what a sensor's
     /// `credential` is checked against, when the tenant wrote one.
     credentials: Declared,
@@ -288,8 +294,11 @@ pub const CONTRACT: &[Entry] = &[
                 init` writes the hosted default `data` explicitly, and a name the map lacks is \
                 INVALID; a479faf7, design 01c3cc3f); `[modules] <module> = bool` — a module \
                 is ON only when listed true, a missing key is off (ce68f137); the SPA reads \
-                `equipment`, `exec`, `finance`, `marketing-assets`, `parts`, `qa`, \
-                `shipping`, `shop`, `sim`, `support`, `warehouse`; `[labels] <dotted.key> = str`; \
+                `commerce`, `equipment`, `exec`, `finance`, `marketing-assets`, `parts`, `qa`, \
+                `shipping`, `shop`, `sim`, `support`, `warehouse` — `commerce` (boss-commerce: \
+                /finance's AR aging, gross margin, Invoices) and `warehouse` (boss-inventory: its \
+                AP aging, PO Approvals) draw those sections, absent otherwise (backlog 801b6a7a, \
+                design c2820008 D1); `[labels] <dotted.key> = str`; \
                 `[gateway] public_reads = [path, ...]` — the API reads the instance answers WITHOUT \
                 a session, from the three the gateway can offer (`/api/workflows`, \
                 `/api/jobs/live`, `/api/events/public-tail`); absent is none (design 11e60367). \
@@ -491,12 +500,20 @@ pub const CONTRACT: &[Entry] = &[
                   names each change from → to (design e187198f); the jobs API's login door \
                   resolves each alias to the id (design 6fda05ae; backlog f56155f0)",
         shape: "`[[agent]]` rows: id (`agent-<slug>`), display_name, default_model (a rate-card \
-                model, e.g. `opus-5[1m]`), aliases? (the logins that sign as it), role? (a \
+                model, e.g. `opus-5[1m]`), model_class? (the <class> of an active \
+                `robots:<class>` pool, checked at the batch door — what a `model:<class>` \
+                step admits a robot by; never derived from default_model, backlog 06d8988b), \
+                aliases? (the logins that sign as it), role? (a \
                 Class code under (employee, role)) and department? (a departments-registry \
                 code, backlog c87e3d6d), checked at the batch door like an employee's — a role \
                 audience resolves to every holder, agents included; backlog ab192a9f), \
-                hourly_budget_usd_micros?, max_concurrent_runs? — the `agents` table's columns \
-                and nothing else; validated by `boss_jobs::agents::load_agents_toml`",
+                hourly_budget_usd_micros?, max_concurrent_runs? (stored; bounds nothing \
+                since backlog 3e927996, a robot is bounded by its robots:<class> pool), \
+                stations? (the stations the \
+                executor is seated at, in the order it serves them — each an active station, \
+                checked at the batch door; omitted keeps the held seats, `[]` unseats; design \
+                506e0a1c) — the `agents` table's columns and nothing else; validated by \
+                `boss_jobs::agents::load_agents_toml`",
         parse: parse_agents,
         scaffold: Some(scaffold_agents),
     },
@@ -560,7 +577,10 @@ pub const CONTRACT: &[Entry] = &[
                 name, why, version, on_event or schedule, when?, delay?, `[[rule.do]]` handler + args \
                 — parsed by `boss_dispatcher::rules::registry::parse_raw_file`, validated by the \
                 publish door's own `authoring::validate`, handler names checked against \
-                `cascade::handler_emits` (this build's roster)",
+                `cascade::handler_emits` (this build's roster); a literal `jobs.spawn` kind must \
+                name a workflow this tenant declares or the platform ships, and a literal \
+                `jobs.complete_linked_step` route must be one the handler reads, onto such a \
+                kind, and onto a step that kind has when the tenant declares it (backlog 192d49f1)",
         parse: parse_rules,
         scaffold: Some(scaffold_rules),
     },
@@ -894,7 +914,7 @@ fn parse_credentials(path: &Path, _: &Ctx) -> Result<String, String> {
 /// follow against the chart: the file the reference points into is the
 /// authority, and its absence is refused rather than excused.
 fn cross_check_sensor(s: &boss_jobs::sensors::SensorInput, ctx: &Ctx) -> Result<(), String> {
-    if !ctx.workflows.holds(&s.opens) && !PLATFORM_WORKFLOW_KINDS.contains(&s.opens.as_str()) {
+    if !is_workflow(&s.opens, ctx) {
         return Err(format!(
             "sensor {}: opens `{}`, which is no workflow — seeds/workflows.toml does not \
              declare it and it is none of the {} kinds the product ships. Every reading of \
@@ -916,6 +936,117 @@ fn cross_check_sensor(s: &boss_jobs::sensors::SensorInput, ctx: &Ctx) -> Result<
         ));
     }
     Ok(())
+}
+
+/// A kind this tenant can open: one `seeds/workflows.toml` declares,
+/// or one the product ships — the one authority every cross-file
+/// reference to a workflow kind is judged by (see
+/// [`cross_check_sensor`] for why it is these two and never the
+/// network).
+fn is_workflow(kind: &str, ctx: &Ctx) -> bool {
+    ctx.workflows.holds(kind) || PLATFORM_WORKFLOW_KINDS.contains(&kind)
+}
+
+/// A rule arg's value when it is a plain string literal, as the
+/// dispatcher's own expression parser reads it. `None` when it is
+/// computed per firing — an identifier off the payload, a call — and
+/// so has no fixed value an offline check may pretend to know.
+fn literal_arg(step: &boss_dispatcher::rules::registry::RawDoStep, name: &str) -> Option<String> {
+    use boss_dispatcher::rules::expr::{self, Expr, Value};
+    match expr::parse(step.args.get(name)?) {
+        Ok(Expr::Literal(Value::String(s))) => Some(s),
+        _ => None,
+    }
+}
+
+/// The contract's cross-check on one rule step (backlog 192d49f1), the
+/// sensor's (b8d8c928) applied to the rows a rule names in OTHER files.
+/// Observed 2026-09-25 by run 4cb2a8be: a rule spawning
+/// `measure-the-page` passed while no workflow declared that kind, so
+/// every firing would have reached `POST /api/jobs` and been refused
+/// there, one event at a time, after publish.
+///
+/// What is judged, and what is not, offline:
+/// - `jobs.spawn`'s `kind`, when literal: a kind this tenant can open.
+/// - `jobs.complete_linked_step`'s `route`, when literal: it must be
+///   what the handler reads (a JSON list of `{kind, step, metadata}`,
+///   or one such object) — a route it cannot read is dropped with a
+///   log line and the obligation runs without routing, which is the
+///   silence this check exists to refuse — and each entry's `kind`
+///   must be one this tenant can open, and its `step` a step of that
+///   kind when the TENANT declares the kind.
+/// - NOT a step of a PLATFORM kind, and NOT the `steps` arg (the far
+///   end's kind is whatever the link points at, which a rule does not
+///   state): this CLI compiles in the platform roster by file NAME
+///   only (build.rs; `cli_inputs` projects that directory by names so
+///   a protocol edit does not invalidate the image's CLI), so the
+///   platform's step slugs are not known here, and refusing a name the
+///   tenant's own workflows lack would refuse every valid platform
+///   step.
+fn cross_check_rule_step(
+    rule: &str,
+    step: &boss_dispatcher::rules::registry::RawDoStep,
+    ctx: &Ctx,
+) -> Result<(), String> {
+    let undeclared = |what: &str, kind: &str| {
+        format!(
+            "rule `{rule}`: {what} `{kind}`, which is no workflow — seeds/workflows.toml does \
+             not declare it and it is none of the {} kinds the product ships. Every firing of \
+             this rule would act on nothing; declare the protocol there, or name a kind that \
+             exists",
+            PLATFORM_WORKFLOW_KINDS.len()
+        )
+    };
+    match step.handler.as_str() {
+        "jobs.spawn" => match literal_arg(step, "kind") {
+            Some(kind) if !is_workflow(&kind, ctx) => Err(undeclared("jobs.spawn kind", &kind)),
+            _ => Ok(()),
+        },
+        "jobs.complete_linked_step" => {
+            let Some(src) = literal_arg(step, "route") else {
+                return Ok(());
+            };
+            let entries = match serde_json::from_str::<serde_json::Value>(&src) {
+                Ok(serde_json::Value::Array(list)) if !list.is_empty() => list,
+                Ok(one @ serde_json::Value::Object(_)) => vec![one],
+                _ => Vec::new(),
+            };
+            let routes: Option<Vec<(&str, &str)>> = entries
+                .iter()
+                .map(|e| {
+                    e.get("metadata")?.as_object()?;
+                    Some((e.get("kind")?.as_str()?, e.get("step")?.as_str()?))
+                })
+                .collect();
+            let Some(routes) = routes.filter(|r| !r.is_empty()) else {
+                return Err(format!(
+                    "rule `{rule}`: jobs.complete_linked_step route is not a JSON object (or a \
+                     non-empty list of them) with kind, step and metadata — the handler would \
+                     drop it with a log line and complete without routing"
+                ));
+            };
+            for (kind, slug) in routes {
+                if !is_workflow(kind, ctx) {
+                    return Err(undeclared(
+                        "jobs.complete_linked_step routes onto kind",
+                        kind,
+                    ));
+                }
+                if let Some(steps) = ctx.workflow_steps.get(kind)
+                    && !steps.contains(slug)
+                {
+                    return Err(format!(
+                        "rule `{rule}`: jobs.complete_linked_step routes onto step `{slug}` \
+                         of `{kind}`, which seeds/workflows.toml declares with no such step \
+                         (it has {}) — the route would complete nothing",
+                        steps.iter().cloned().collect::<Vec<_>>().join(", ")
+                    ));
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn parse_sensors(path: &Path, ctx: &Ctx) -> Result<String, String> {
@@ -1055,7 +1186,7 @@ fn parse_locations(path: &Path, _: &Ctx) -> Result<String, String> {
 /// tenant learns BEFORE publishing that its rule names a handler this
 /// build does not carry (the real tenant's first rule names one a
 /// sibling car is building, and reads INVALID here until it lands).
-fn parse_rules(path: &Path, _: &Ctx) -> Result<String, String> {
+fn parse_rules(path: &Path, ctx: &Ctx) -> Result<String, String> {
     use boss_dispatcher::rules::{authoring, registry};
     let raw = registry::parse_raw_file(path).map_err(|e| e.to_string())?;
     refuse_if_stray(&read(path)?, "rule", raw.rules.len())?;
@@ -1075,6 +1206,7 @@ fn parse_rules(path: &Path, _: &Ctx) -> Result<String, String> {
                     known.len()
                 ));
             }
+            cross_check_rule_step(&rule.name, step, ctx)?;
         }
         let trigger = match (&rule.on_event, &rule.schedule) {
             (Some(topic), _) => topic.clone(),
@@ -1314,6 +1446,17 @@ pub fn check(dir: &Path) -> Report {
             },
             |s| s.kind,
         ),
+        workflow_steps: boss_jobs::seed_loader::load_workflows_with_owning_team(
+            dir.join("seeds/workflows.toml"),
+            &tenant_id,
+        )
+        .map(|specs| {
+            specs
+                .into_iter()
+                .map(|s| (s.kind, s.steps.into_iter().map(|st| st.title).collect()))
+                .collect()
+        })
+        .unwrap_or_default(),
         credentials: declared(
             &dir.join("seeds/credentials.toml"),
             Declared::NotJudged,
@@ -3455,6 +3598,91 @@ terminal = { outcome = "sponsored" }
         let row = rules("# none yet\n");
         assert_eq!(row.status, Status::Ok, "{row:?}");
         assert!(row.detail.contains("0 rules"), "{row:?}");
+    }
+
+    /// A RULE NAMES ROWS IN ANOTHER FILE, and the check holds the two
+    /// together the way it holds a sensor's `opens` (backlog 192d49f1,
+    /// the b8d8c928 shape). Observed 2026-09-25 by run 4cb2a8be: a rule
+    /// spawning `measure-the-page` passed while no workflow declared that
+    /// kind, so every firing would have spawned nothing. The refusal
+    /// names the rule and the reference.
+    #[test]
+    fn a_rule_naming_a_workflow_or_step_nobody_declares_is_invalid_naming_the_rule() {
+        let dir = sensor_fixture("boss-cli-tenant-check-rule-refs");
+        let rules = |body: &str| {
+            put(&dir, "seeds/rules.toml", body);
+            status_of(&check(&dir), "seeds/rules.toml")
+                .cloned()
+                .unwrap()
+        };
+        let spawn = |kind: &str| {
+            format!(
+                "[[rule]]\nname = \"measure-on-close\"\nwhy = \"\"\"\na reactor\n\"\"\"\n\
+                 on_event = \"jobs.job.closed\"\n[[rule.do]]\nhandler = \"jobs.spawn\"\n\
+                 args = {{ kind = '{kind}', subject_kind = '\"custom\"', subject = '\"www\"' }}\n"
+            )
+        };
+
+        // The observed case: a literal kind no workflow declares.
+        let row = rules(&spawn("\"measure-the-page\""));
+        assert_eq!(row.status, Status::Invalid, "{row:?}");
+        assert!(
+            row.detail.contains("measure-on-close") && row.detail.contains("measure-the-page"),
+            "the refusal names the rule and the kind: {row:?}"
+        );
+        assert!(row.detail.contains("seeds/workflows.toml"), "{row:?}");
+
+        // A kind the tenant declares, and one the product ships, pass.
+        assert_eq!(
+            rules(&spawn("\"receive-a-sponsorship\"")).status,
+            Status::Ok
+        );
+        assert_eq!(rules(&spawn("\"backlog-item\"")).status, Status::Ok);
+        // A kind computed per firing has no fixed value to judge offline.
+        assert_eq!(rules(&spawn("kind")).status, Status::Ok);
+
+        let linked = |route: &str| {
+            format!(
+                "[[rule]]\nname = \"close-the-ask\"\nwhy = \"\"\"\na reactor\n\"\"\"\n\
+                 on_event = \"jobs.job.closed\"\n[[rule.do]]\n\
+                 handler = \"jobs.complete_linked_step\"\n\
+                 args = {{ link = '\"asked_by\"', steps = '\"sponsored\"', route = '{route}' }}\n"
+            )
+        };
+        // A route onto a kind nobody declares.
+        let row = rules(&linked(
+            r#""[{\"kind\": \"no-such-kind\", \"step\": \"triage\", \"metadata\": {}}]""#,
+        ));
+        assert_eq!(row.status, Status::Invalid, "{row:?}");
+        assert!(
+            row.detail.contains("close-the-ask") && row.detail.contains("no-such-kind"),
+            "{row:?}"
+        );
+        // A route onto a step the tenant's own workflow does not have.
+        let row = rules(&linked(
+            r#""[{\"kind\": \"receive-a-sponsorship\", \"step\": \"triage\", \"metadata\": {}}]""#,
+        ));
+        assert_eq!(row.status, Status::Invalid, "{row:?}");
+        assert!(
+            row.detail.contains("close-the-ask")
+                && row.detail.contains("`triage`")
+                && row.detail.contains("receive-a-sponsorship"),
+            "the refusal names the rule, the step and the kind: {row:?}"
+        );
+        // A route the handler cannot read routes nothing, silently.
+        let row = rules(&linked(r#""{\"kind\": \"receive-a-sponsorship\"}""#));
+        assert_eq!(row.status, Status::Invalid, "{row:?}");
+        assert!(row.detail.contains("close-the-ask"), "{row:?}");
+        // A step the tenant's workflow has, the single-object shape the
+        // handler still reads, and a platform kind's route all pass.
+        let row = rules(&linked(
+            r#""{\"kind\": \"receive-a-sponsorship\", \"step\": \"sponsored\", \"metadata\": {}}""#,
+        ));
+        assert_eq!(row.status, Status::Ok, "{row:?}");
+        let row = rules(&linked(
+            r#""[{\"kind\": \"backlog-item\", \"step\": \"triage\", \"metadata\": {}}]""#,
+        ));
+        assert_eq!(row.status, Status::Ok, "{row:?}");
     }
 
     #[test]

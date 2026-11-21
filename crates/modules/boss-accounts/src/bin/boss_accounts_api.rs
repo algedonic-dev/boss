@@ -160,12 +160,7 @@ async fn main() -> Result<()> {
         // a simple liveness route so they don't 404. The six sub-routers
         // all mount under /api/people/accounts/*; this is the canonical
         // service-level health.
-        .route(
-            "/api/accounts/health",
-            axum::routing::get(|| async {
-                axum::Json(serde_json::json!({"status":"ok","service":"boss-accounts-api"}))
-            }),
-        )
+        .route("/api/accounts/health", axum::routing::get(health))
         .merge(wiring.inventory);
     // Sim-origin middleware: extract x-sim-origin header and set the
     // per-request task-local so the publisher inherits the sim
@@ -201,4 +196,16 @@ async fn main() -> Result<()> {
     )
     .await?;
     Ok(())
+}
+
+/// The shared health body, so the read names the build that answered.
+/// Until backlog 56f88ada (2026-11-20) this was an inline closure
+/// answering `{status, service}` with no commit. `postgres`: this
+/// binary requires that feature and serves every router off one pool.
+async fn health() -> axum::Json<boss_core::startup::HealthResponse> {
+    axum::Json(boss_core::startup::health_response(
+        "boss-accounts-api",
+        env!("CARGO_PKG_VERSION"),
+        "postgres",
+    ))
 }

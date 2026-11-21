@@ -180,6 +180,7 @@ async fn main() -> Result<()> {
                 reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
             )
             .context("local-auth machine client")?,
+            classes_timeout: boss_core::http_client::CLIENT_TIMEOUT,
             audit: build_auth_audit(),
             // One flag, one question: does this deployment hand out
             // a read-only session to anyone who asks?
@@ -493,7 +494,7 @@ fn build_router(
             "/api/jobs/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::JOBS)),
         )
-        // Stations — the network's nodes (stations.md). Registry rows
+        // Stations — the network's nodes (station-tree.md). Registry rows
         // and their evaluated queues live on the jobs upstream beside
         // workflows, so they proxy there. Auth-gated like `/api/jobs`:
         // the handlers apply the same job-read policy scope inside, so
@@ -507,6 +508,23 @@ fn build_router(
         )
         .route(
             "/api/stations/{*rest}",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
+        // The live pools door (backlog f399458f): resource pool rows,
+        // their lineage, the lint and the publish, served on the jobs
+        // upstream beside stations. Auth-gated like stations and
+        // `/api/workflows`, and the door's own `pool` policy decides
+        // every read and write inside. Ask 1 shipped the door with no
+        // line here, so the website could not read the row its approval
+        // (ask 2, publish-a-protocol's publish-pool step) puts live.
+        // Both matchers for the stations reason: the bare list has no
+        // trailing segment for `{*rest}` to match.
+        .route(
+            "/api/pools",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
+        .route(
+            "/api/pools/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::JOBS)),
         )
         // The departments registry — the `departments` table and each
@@ -537,6 +555,21 @@ fn build_router(
         .route(
             "/api/yard/status",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
+        .route(
+            "/api/claims",
+            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
+        // The retained cuts the review screen scrubs to (console car 3c).
+        .route(
+            "/api/claims/cuts",
+            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
+        // A pool's claim line, in order (claims_console.rs `waiting`):
+        // the station Resources view draws it (backlog 87575d69).
+        .route(
+            "/api/claims/waiting",
+            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
         )
         // The yard's REGIONS — the region-card system map at /it (design
         // 0524fc95 car 2, train #475). Shipped on the jobs upstream and
@@ -629,12 +662,29 @@ fn build_router(
         // The agents registry's list — the IT Agents tab's one roster
         // read (backlog 62988516; David 2026-09-26: agents get a page in
         // IT, never the People roster). Bare and GET only, as the
-        // agent-run reads above: `POST /api/agents/batch` is `boss
-        // tenant publish`'s door and reaches boss-jobs-api directly, so
-        // it stays a catch-all miss here.
+        // agent-run reads above.
         .route(
             "/api/agents",
             axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
+        // The registry's one browser write, PUT only: the Agents page
+        // seats an agent at a station through it (backlog cdbebc22; David
+        // 2026-11-19, "I should place you at the root station formally",
+        // from the website he controls from). The SEAT door, never the
+        // tenant batch `POST /api/agents/batch`, which stays a catch-all
+        // miss here: the batch takes a whole row, so a seat edit through
+        // it restored a role another writer had narrowed (review
+        // 1a49c3a7), and routing it would hand an elevated browser every
+        // field the registry holds. This door writes `stations` alone,
+        // over the seats the caller read. Its authority is the DOOR's, not
+        // this route's: boss-jobs admits an operator-tier caller only
+        // (`trust::is_trusted`), and the one browser session at that tier
+        // is the platform owner's after his operator passkey (elevation.rs).
+        // The session proxy signs the cookie's identity, so the write is
+        // credited to that person and no agent reaches it.
+        .route(
+            "/api/agents/{id}/stations",
+            axum::routing::put(|s, r| proxy::handle(s, r, &proxy::JOBS)),
         )
         // The credentials registry's list — the IT Credentials tab's one
         // registry read (backlog 851259b9; design 76155676 step 3). It
@@ -1403,6 +1453,9 @@ mod routing_tests {
     #[tokio::test]
     async fn no_service_route_is_shadowed_by_the_catch_all() {
         const REAL: &[&str] = &[
+            "/api/claims?as_of=42&window=24h",
+            "/api/claims/cuts?buckets=8",
+            "/api/claims/waiting?pool=robots:opus",
             "/api/session",
             "/api/tenant/manifest",
             "/api/finance/revenue-categories",
@@ -1429,6 +1482,12 @@ mod routing_tests {
             // the door until train #12 — the reason this list exists.
             "/api/stations",
             "/api/stations/loading-dock/queue",
+            // The live pools door (backlog f399458f ask 1) shipped on the
+            // jobs upstream with no route here, so the website approval
+            // of a pool row (ask 2) had nothing to read it through: the
+            // stations shape again, caught in the car that routes it.
+            "/api/pools",
+            "/api/pools/robots:opus/versions",
             // The departments registry: the bare list is what the
             // chrome bar reads on every page (dc5788ba), and it is
             // exactly the shape — a list endpoint with no trailing
@@ -1537,53 +1596,60 @@ mod routing_tests {
                 .unwrap_or(&file)
                 .display()
                 .to_string();
-            for (i, _) in text.match_indices("/api/") {
-                // The literal must OPEN here — the byte before is a quote
-                // or a backtick — and not inside a comment.
-                if i == 0 || !matches!(text.as_bytes()[i - 1], b'\'' | b'"' | b'`') {
-                    continue;
-                }
-                let line_start = text[..i].rfind('\n').map_or(0, |n| n + 1);
-                let before = &text[line_start..i - 1];
-                if before.contains("//") || before.trim_start().starts_with('*') {
-                    continue;
-                }
-                let literal = &text[i..];
-                // A fully dynamic first segment names no owning service.
-                if literal.starts_with("/api/${") {
-                    continue;
-                }
-                let expanded;
-                let rest = if text.as_bytes()[i - 1] == b'`' {
-                    expanded =
-                        template_route_parameters(literal.split('`').next().unwrap_or(literal));
-                    expanded.as_str()
-                } else {
-                    literal
-                };
-                let end = rest
-                    .find(|c: char| {
-                        !(c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
-                    })
-                    .unwrap_or(rest.len());
-                let mut path = rest[..end].to_string();
-                // `const API_BASE = '…'` — with the spaces; an HTML
-                // `href="…"` has none and is a fetch of exactly that path.
-                let interpolated = text.as_bytes()[i - 1] == b'`'
-                    && literal.split('`').next().is_some_and(|v| v.contains("${"));
-                let assigned = before.ends_with(" = ") && !interpolated;
-                if assigned {
-                    path.push_str("/probe");
-                } else if path.ends_with('/') {
-                    continue;
-                }
-                // The prefix of a fully dynamic path names no route.
-                if path == "/api/probe" {
-                    continue;
-                }
+            for path in api_paths_in_source(&text) {
                 if !found.iter().any(|(p, _)| *p == path) {
                     found.push((path, rel.clone()));
                 }
+            }
+        }
+        found
+    }
+
+    fn api_paths_in_source(text: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for (i, _) in text.match_indices("/api/") {
+            // The literal must OPEN here — the byte before is a quote
+            // or a backtick — and not inside a comment.
+            if i == 0 || !matches!(text.as_bytes()[i - 1], b'\'' | b'"' | b'`') {
+                continue;
+            }
+            let line_start = text[..i].rfind('\n').map_or(0, |n| n + 1);
+            let before = &text[line_start..i - 1];
+            if before.contains("//") || before.trim_start().starts_with('*') {
+                continue;
+            }
+            let literal = &text[i..];
+            // A fully dynamic first segment names no owning service.
+            if literal.starts_with("/api/${") {
+                continue;
+            }
+            let expanded;
+            let rest = if text.as_bytes()[i - 1] == b'`' {
+                expanded = template_route_parameters(literal.split('`').next().unwrap_or(literal));
+                expanded.as_str()
+            } else {
+                literal
+            };
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.')))
+                .unwrap_or(rest.len());
+            let mut path = rest[..end].to_string();
+            // `const API_BASE = '…'` — with the spaces; an HTML
+            // `href="…"` has none and is a fetch of exactly that path.
+            let interpolated = text.as_bytes()[i - 1] == b'`'
+                && literal.split('`').next().is_some_and(|v| v.contains("${"));
+            let assigned = before.ends_with(" = ") && !interpolated;
+            if assigned {
+                path.push_str("/probe");
+            } else if path.ends_with('/') {
+                continue;
+            }
+            // The prefix of a fully dynamic path names no route.
+            if path == "/api/probe" {
+                continue;
+            }
+            if !found.contains(&path) {
+                found.push(path);
             }
         }
         found
@@ -1642,16 +1708,37 @@ mod routing_tests {
 
     #[test]
     fn a_readings_template_keeps_its_literal_suffix_in_the_route_probe() {
-        let paths = api_paths_the_web_fetches();
-        assert!(
-            paths
-                .iter()
-                .any(|(path, _)| path == "/api/sensors/probe/readings"),
+        // The consumer was retired in 1f3a9725e; its literal remains a
+        // parser fixture, independent of which screens ship (16cd47a4).
+        let source = r#"const url = `/api/sensors/${encodeURIComponent(s.id)}/readings?since=${encodeURIComponent(since)}&until=${encodeURIComponent(at)}`;"#;
+        assert_eq!(
+            api_paths_in_source(source),
+            ["/api/sensors/probe/readings"],
             "the interpolated sensor identity must retain the readings door"
         );
-        assert!(
-            !paths.iter().any(|(path, _)| path == "/api/sensors/probe"),
-            "no consumer fetches a sensor detail door"
+    }
+
+    #[test]
+    fn source_route_probes_preserve_literals_and_ignore_prefixes_and_comments() {
+        let source = r#"
+// fetch('/api/comment');
+ * `/api/comment-template/${id}`
+const API_BASE = '/api/ledger';
+fetch('/api/ledger');
+fetch(`/api/jobs/${choose({id: x})}/steps/${step}/metadata?since=${since}`);
+fetch(`/api/jobs/${id}/steps/${step}/metadata`);
+path.startsWith('/api/prefix/');
+fetch(`/api/${service}/items`);
+<a href="/api/jobs">Jobs</a>
+"#;
+        assert_eq!(
+            api_paths_in_source(source),
+            [
+                "/api/ledger/probe",
+                "/api/ledger",
+                "/api/jobs/probe/steps/probe/metadata",
+                "/api/jobs",
+            ]
         );
     }
 
@@ -1668,6 +1755,7 @@ mod routing_tests {
                 reqwest::Client::builder(),
             )
             .unwrap(),
+            classes_timeout: boss_core::http_client::CLIENT_TIMEOUT,
             audit: boss_gateway::audit::AuthAudit::disabled(),
             guest_access: GuestAccess::Basic,
             oidc: None,
@@ -1812,6 +1900,21 @@ mod routing_tests {
     }
 
     #[tokio::test]
+    async fn claims_console_history_is_routed_and_session_gated_with_its_query() {
+        let (status, body) = get(
+            app_declaring(None, &demo()),
+            "/api/claims?as_of=42&window=24h",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the query must reach the existing session gate: {body}"
+        );
+        assert!(!body.contains(MISS));
+    }
+
+    #[tokio::test]
     async fn the_jobs_summary_is_session_gated_on_the_demo_tenant() {
         for path in ["/api/jobs/summary", "/api/jobs/summary?status=closed"] {
             let (status, body) = get(app_declaring(None, &demo()), path).await;
@@ -1886,6 +1989,68 @@ mod routing_tests {
         }
     }
 
+    /// The agents registry's one browser write — the Agents page seating
+    /// an agent at a station (backlog cdbebc22). The SEAT door rides the
+    /// SESSION proxy, so a caller with no session is refused 401 here
+    /// before anything is forwarded, and never reaches the catch-all; the
+    /// operator-tier check stays the door's own (boss-jobs
+    /// `trust::is_trusted`), which a browser session passes only after
+    /// the owner's passkey elevation. The route opens the PUT alone. The
+    /// tenant batch is NOT routed (review 1a49c3a7: a whole-row take is
+    /// the wrong grain for a seat edit, and would hand an elevated
+    /// browser every registry field): a POST to it is a catch-all miss.
+    #[tokio::test]
+    async fn only_the_agents_seat_door_meets_the_session_gate() {
+        let send = |method: &str, uri: &str| {
+            app().oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"expected":[],"stations":[]}"#))
+                    .unwrap(),
+            )
+        };
+        let read = |resp: axum::response::Response| async move {
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        };
+
+        let (status, body) = read(
+            send("PUT", "/api/agents/agent-claude/stations")
+                .await
+                .expect("router responds"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "PUT /api/agents/{{id}}/stations must meet the session gate: {body}"
+        );
+        assert!(!body.contains(MISS), "reached the /api catch-all: {body}");
+
+        let (status, body) = read(
+            send("POST", "/api/agents/batch?mode=take")
+                .await
+                .expect("router responds"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "the tenant batch must not be routed to a browser: {body}"
+        );
+        assert!(body.contains(MISS), "{body}");
+
+        let (status, body) = get(app(), "/api/agents/agent-claude/stations").await;
+        assert_eq!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "GET of the seat door must not be proxied: {body}"
+        );
+    }
+
     /// boss-observability retired as superseded-by (backlog 467175e7,
     /// car B, 2026-09-23), and its three routes left with it: the
     /// snapshot, its sub-paths, and the health alias the old IT
@@ -1906,6 +2071,18 @@ mod routing_tests {
             assert!(
                 body.contains(MISS),
                 "`{path}` must reach the /api catch-all, not a proxy: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_retired_department_floor_routes_are_misses() {
+        for path in ["/api/floor", "/api/floor/finance"] {
+            let (status, body) = get(app(), path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "`{path}`: {body}");
+            assert!(
+                body.contains(MISS),
+                "retired route must reach the API catch-all: {body}"
             );
         }
     }
@@ -1987,6 +2164,7 @@ mod routing_tests {
                 reqwest::Client::builder(),
             )
             .unwrap(),
+            classes_timeout: boss_core::http_client::CLIENT_TIMEOUT,
             audit: boss_gateway::audit::AuthAudit::disabled(),
             guest_access: GuestAccess::Basic,
             oidc: None,
@@ -2027,6 +2205,7 @@ mod routing_tests {
                 reqwest::Client::builder(),
             )
             .unwrap(),
+            classes_timeout: boss_core::http_client::CLIENT_TIMEOUT,
             audit: boss_gateway::audit::AuthAudit::disabled(),
             guest_access: GuestAccess::Basic,
             oidc: None,
@@ -2088,6 +2267,7 @@ mod routing_tests {
                 reqwest::Client::builder(),
             )
             .unwrap(),
+            classes_timeout: boss_core::http_client::CLIENT_TIMEOUT,
             audit: boss_gateway::audit::AuthAudit::disabled(),
             guest_access: GuestAccess::Off,
             oidc: None,
@@ -2204,6 +2384,52 @@ mod routing_tests {
                 "a /simulator path must never be answered with another app's HTML \
                  shell: {body}"
             );
+
+            // Since backlog 7d70cad6 the root SPA handler sends a
+            // signed-out navigation to the same `/login?next=…`, so the
+            // legs above no longer tell the two handlers apart. Signed
+            // in, they differ: the root SPA serves the main app's
+            // index.html (or "frontend not built" where none is on
+            // disk); the simulator proxy forwards to its upstream.
+            let (status, body) = navigate_signed_in(app(), path).await;
+            assert!(
+                !body.contains("frontend not built")
+                    && !body.to_lowercase().contains("<!doctype html"),
+                "`{path}` was answered by the root SPA handler, not boss-simulator: \
+                 {status} {body}"
+            );
         }
+    }
+
+    async fn navigate_signed_in(app: axum::Router, path: &str) -> (StatusCode, String) {
+        let cookie = boss_gateway::session::Session::new("reader", 60).encode(&[0u8; 32]);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(axum::http::header::ACCEPT, "text/html,*/*;q=0.8")
+                    .header(
+                        axum::http::header::COOKIE,
+                        format!("{}={cookie}", boss_gateway::session::COOKIE_NAME),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The root SPA's signed-out navigation keeps the page, query and
+    /// all (backlog 7d70cad6) — through the router, not only the
+    /// handler, so a route that bypasses `static_files::handle` for a
+    /// page shape shows here.
+    #[tokio::test]
+    async fn a_signed_out_deep_link_goes_to_sign_in_with_the_page() {
+        let (status, location, _) = navigate(app(), "/ux/jobs/abc?tab=steps").await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(location, "/login?next=/ux/jobs/abc%3Ftab%3Dsteps");
     }
 }

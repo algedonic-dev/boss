@@ -1,7 +1,7 @@
 //! Broker-owned transport preparation, not receiver enrollment or rotation.
 use async_trait::async_trait;
 use boss_dispatcher_handlers::handlers::broker_transport_key::{
-    IssuedKey, KeyIssuer, PreparedKey, RsaSshIssuer, prepare,
+    IssuedKey, KeyIssuer, PreparedKey, RsaSshIssuer, authorized_keys_line, prepare,
 };
 use boss_dispatcher_handlers::handlers::credential_issuer::{SecretData, SecretStore, WriteAt};
 use std::collections::BTreeMap;
@@ -645,6 +645,243 @@ async fn a_rule_row_names_the_purpose_and_the_forced_command_the_enrollment_sign
         .await;
         assert!(refused.is_err(), "accepted forced_command {hostile:?}");
         assert_eq!(*issuer.0.lock().unwrap(), 0, "minted for {hostile:?}");
+    }
+}
+
+/// THE CRASH WINDOW: THE LINE IS WRITTEN AND NOTHING ELSE IS (backlog
+/// 54b5090f, review N4 of car c1cdb202). Under a forced command the
+/// handler writes the enroll proposal — the line, and no bare key —
+/// BEFORE it writes and completes `issue` and `install`. A broker that
+/// stops between the two leaves the line as the only record of the key
+/// it proposed. The replay counted that line as recorded but took no
+/// key out of it, so the pair the Secret held was compared with nothing:
+/// a pair replaced in that window (still `minted_for` this packet) was
+/// joined into a new line and PATCHed over the proposal the passkey
+/// signs, where every other recorded shape refuses. The line ends with
+/// the key, so the replay reads it from there and compares like every
+/// other replay; a line whose tail is not a key refuses outright.
+#[tokio::test]
+async fn a_line_only_enroll_replay_compares_the_stored_pair_with_the_lines_key() {
+    let forced = "exec sudo -n /usr/local/libexec/boss/ops-credential-recv machine-token";
+    let extra = [
+        ("purpose", "estate machine token deposit"),
+        ("forced_command", forced),
+    ];
+    // Two real, generated, throwaway pairs, both minted for this packet.
+    let first = Memory::default();
+    let second = Memory::default();
+    prepare(&first, &RsaSshIssuer, "boss", "runner-deposit-key", JOB)
+        .await
+        .unwrap();
+    prepare(&second, &RsaSshIssuer, "boss", "runner-deposit-key", JOB)
+        .await
+        .unwrap();
+    let first_pair = first.held.lock().unwrap().clone();
+    let second_pair = second.held.lock().unwrap().clone();
+    assert_ne!(
+        first_pair.data["public_key"],
+        second_pair.data["public_key"]
+    );
+
+    // The line, alone on enroll; issue and install as if never written.
+    let crash_window = |api: &NativeApi, line: Option<&str>| {
+        for step in api.packet.lock().unwrap()["steps"].as_array_mut().unwrap() {
+            match step["spec_slug"].as_str().unwrap() {
+                "issue" => {
+                    step["status"] = serde_json::json!("ready");
+                    step["metadata"] = serde_json::json!({});
+                }
+                "install" => {
+                    step["status"] = serde_json::json!("pending");
+                    step["metadata"] = serde_json::json!({});
+                }
+                "enroll" => {
+                    assert!(step["metadata"].get("public_key").is_none());
+                    if let Some(line) = line {
+                        step["metadata"]["authorized_keys_line"] = serde_json::json!(line);
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
+
+    let not_a_key = format!("command=\"{forced}\",restrict");
+    for (case, held, line) in [
+        ("a replaced pair", &second_pair, None),
+        ("a line with no key", &first_pair, Some(not_a_key.as_str())),
+    ] {
+        let api = native_api(preparation_packet()).await;
+        let store = Arc::new(Memory::default());
+        *store.held.lock().unwrap() = first_pair.clone();
+        invoke_preparation_with(&api, store.clone(), Arc::new(RsaSshIssuer), &extra)
+            .await
+            .unwrap();
+        crash_window(&api, line);
+        *store.held.lock().unwrap() = held.clone();
+        let held_before = store.held.lock().unwrap().clone();
+        let enroll_before = api.packet.lock().unwrap()["steps"][3]["metadata"].clone();
+        let writes_before = api.writes.lock().unwrap().len();
+        let refused =
+            invoke_preparation_with(&api, store.clone(), Arc::new(RsaSshIssuer), &extra).await;
+        assert!(refused.is_err(), "{case}: the replay was accepted");
+        assert_eq!(
+            api.writes.lock().unwrap().len(),
+            writes_before,
+            "{case}: the replay wrote native evidence or a new proposal"
+        );
+        assert_eq!(
+            api.packet.lock().unwrap()["steps"][3]["metadata"],
+            enroll_before,
+            "{case}: the proposal the passkey signs was rewritten"
+        );
+        assert_eq!(
+            *store.held.lock().unwrap(),
+            held_before,
+            "{case}: the Secret was modified"
+        );
+    }
+
+    // CONTROL: the pair the line was joined from replays cleanly, so the
+    // key read off the line is exactly the prepared public half.
+    let api = native_api(preparation_packet()).await;
+    let store = Arc::new(Memory::default());
+    *store.held.lock().unwrap() = first_pair.clone();
+    invoke_preparation_with(&api, store.clone(), Arc::new(RsaSshIssuer), &extra)
+        .await
+        .unwrap();
+    crash_window(&api, None);
+    invoke_preparation_with(&api, store, Arc::new(RsaSshIssuer), &extra)
+        .await
+        .unwrap();
+    let packet = api.packet.lock().unwrap().clone();
+    for index in [1, 2] {
+        assert_eq!(packet["steps"][index]["status"], "completed");
+        assert_eq!(
+            packet["steps"][index]["metadata"]["public_key"],
+            first_pair.data["public_key"]
+        );
+    }
+}
+
+/// THE LINE'S KEY IS ALSO HELD TO THE RECEIPTS (backlog b5caa9d4, review
+/// run 7b7b72fe of car 6114f5bb). The test above blanks issue and install,
+/// so when it reads the line there is nothing recorded to compare it
+/// with, and the cross-check the line-only branch carries never ran:
+/// deleting it left every test green. Here issue and install are
+/// COMPLETED with the first pair's key — the receipts the procedure tells
+/// the signer to compare the line against — while the open enroll's line
+/// carries the second pair's key and the Secret holds that second pair,
+/// minted for this packet. Only that shape discriminates (filer
+/// correction 2026-10-18): a Secret holding the first pair is refused at
+/// prepare_checked whether or not the cross-check exists. Without the
+/// check the replay answers Ok with no write, and a passkey is left to
+/// sign a line whose key disagrees with the install receipt.
+#[tokio::test]
+async fn a_line_whose_key_disagrees_with_the_completed_receipts_is_refused() {
+    let forced = "exec sudo -n /usr/local/libexec/boss/ops-credential-recv machine-token";
+    let extra = [
+        ("purpose", "estate machine token deposit"),
+        ("forced_command", forced),
+    ];
+    // Two real, generated, throwaway pairs, both minted for this packet.
+    let first = Memory::default();
+    let second = Memory::default();
+    prepare(&first, &RsaSshIssuer, "boss", "runner-deposit-key", JOB)
+        .await
+        .unwrap();
+    prepare(&second, &RsaSshIssuer, "boss", "runner-deposit-key", JOB)
+        .await
+        .unwrap();
+    let first_pair = first.held.lock().unwrap().clone();
+    let second_pair = second.held.lock().unwrap().clone();
+    assert_ne!(
+        first_pair.data["public_key"],
+        second_pair.data["public_key"]
+    );
+    let edited_line = authorized_keys_line(forced, &second_pair.data["public_key"]);
+
+    // A whole preparation with the first pair, then the open enroll's
+    // line edited to carry the second key and the Secret swapped to the
+    // second pair. `blank_receipts` is the control: with issue and
+    // install as if never written the same line and Secret replay
+    // cleanly, so what refuses below is the comparison with the
+    // receipts, not the Secret's own check against the line.
+    let edited = |blank_receipts: bool| {
+        let edited_line = edited_line.clone();
+        let first_pair = first_pair.clone();
+        let second_pair = second_pair.clone();
+        async move {
+            let api = native_api(preparation_packet()).await;
+            let store = Arc::new(Memory::default());
+            *store.held.lock().unwrap() = first_pair.clone();
+            invoke_preparation_with(&api, store.clone(), Arc::new(RsaSshIssuer), &extra)
+                .await
+                .unwrap();
+            for step in api.packet.lock().unwrap()["steps"].as_array_mut().unwrap() {
+                match step["spec_slug"].as_str().unwrap() {
+                    "issue" | "install" if blank_receipts => {
+                        step["status"] = serde_json::json!("pending");
+                        step["metadata"] = serde_json::json!({});
+                    }
+                    "issue" | "install" => {
+                        assert_eq!(step["status"], "completed");
+                        assert_eq!(
+                            step["metadata"]["public_key"],
+                            first_pair.data["public_key"]
+                        );
+                    }
+                    "enroll" => {
+                        assert_ne!(step["status"], "completed");
+                        assert!(step["metadata"].get("public_key").is_none());
+                        step["metadata"]["authorized_keys_line"] = serde_json::json!(edited_line);
+                    }
+                    _ => {}
+                }
+            }
+            *store.held.lock().unwrap() = second_pair;
+            (api, store)
+        }
+    };
+
+    let (api, store) = edited(false).await;
+    let held_before = store.held.lock().unwrap().clone();
+    let packet_before = api.packet.lock().unwrap().clone();
+    let writes_before = api.writes.lock().unwrap().len();
+    let refused =
+        invoke_preparation_with(&api, store.clone(), Arc::new(RsaSshIssuer), &extra).await;
+    let error = refused.expect_err("a line whose key disagrees with the install receipt replayed");
+    assert!(
+        error.contains("recorded preparation public identities disagree; nothing minted"),
+        "refused for another reason, so the cross-check is not what held: {error}"
+    );
+    assert_eq!(
+        api.writes.lock().unwrap().len(),
+        writes_before,
+        "the refused replay wrote native evidence or a new proposal"
+    );
+    assert_eq!(
+        *api.packet.lock().unwrap(),
+        packet_before,
+        "the refused replay changed a step"
+    );
+    assert_eq!(
+        *store.held.lock().unwrap(),
+        held_before,
+        "the refused replay modified the Secret"
+    );
+
+    // CONTROL: the same line and Secret with no receipts to disagree with.
+    let (api, store) = edited(true).await;
+    invoke_preparation_with(&api, store, Arc::new(RsaSshIssuer), &extra)
+        .await
+        .unwrap();
+    let packet = api.packet.lock().unwrap().clone();
+    for index in [1, 2] {
+        assert_eq!(
+            packet["steps"][index]["metadata"]["public_key"],
+            second_pair.data["public_key"]
+        );
     }
 }
 

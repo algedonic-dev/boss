@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import {
   AGENT_RUN_EDGE,
   RELEASE,
+  RELEASED_FROM,
   RELEASED_KEY,
   assigneeChange,
   claimedFor,
@@ -107,10 +108,10 @@ describe('the release', () => {
     // 675f1858, #1). `boss step release` sends the null unconditionally
     // and the merge door deletes a missing key quietly, so the page does
     // the same.
-    expect(releaseMetadata({ brief: 'kept' }, 'handing over', 'emp-001', AT)).toMatchObject({
+    expect(releaseMetadata({ brief: 'kept' }, 'handing over', 'emp-001', AT, null)).toMatchObject({
       [AGENT_RUN_EDGE]: null,
     });
-    expect(releaseMetadata({}, 'handing over', 'emp-001', AT)).toMatchObject({
+    expect(releaseMetadata({}, 'handing over', 'emp-001', AT, null)).toMatchObject({
       [AGENT_RUN_EDGE]: null,
     });
   });
@@ -119,31 +120,51 @@ describe('the release', () => {
     // The review of car 675f1858, #2: the page's release left no reason
     // and no stamp, so a step it freed read to the next operator exactly
     // like the stall it was. The shape is release_patch's in
-    // boss-cli/src/steps.rs: {why, by, at, from_run}.
+    // boss-cli/src/steps.rs: {why, by, at, from_run, from}. `from` is
+    // the holder the step is taken from, which the dispatcher's
+    // capability pick leaves out so the step does not hash straight back
+    // to it (backlog ff0f0ff5) — a page's release is the same release.
     expect(
-      releaseMetadata({ [AGENT_RUN_EDGE]: 'run-1', brief: 'kept' }, '  handing over  ', 'emp-001', AT),
+      releaseMetadata(
+        { [AGENT_RUN_EDGE]: 'run-1', brief: 'kept' },
+        '  handing over  ',
+        'emp-001',
+        AT,
+        'agent-claude',
+      ),
     ).toEqual({
       [AGENT_RUN_EDGE]: null,
-      [RELEASED_KEY]: { why: 'handing over', by: 'emp-001', at: AT, from_run: 'run-1' },
+      [RELEASED_KEY]: {
+        why: 'handing over',
+        by: 'emp-001',
+        at: AT,
+        from_run: 'run-1',
+        [RELEASED_FROM]: 'agent-claude',
+      },
     });
-    expect(releaseMetadata({}, 'why', null, AT)).toEqual({
+    expect(releaseMetadata({}, 'why', null, AT, null)).toEqual({
       [AGENT_RUN_EDGE]: null,
-      [RELEASED_KEY]: { why: 'why', by: null, at: AT, from_run: null },
+      [RELEASED_KEY]: { why: 'why', by: null, at: AT, from_run: null, [RELEASED_FROM]: null },
     });
   });
 
-  test('names the stamp the CLI names (boss-cli steps::RELEASED_KEY)', () => {
+  test('names the stamp the core names (boss_jobs::step_release::KEY and FROM)', () => {
     // A fact that lives twice gets an equality test (CLAUDE.md §9a).
+    // The CLI's RELEASED_KEY is core's since backlog ff0f0ff5, because
+    // the dispatcher reads the stamp too, so core is where it is spelled.
     const src = readFileSync(
       join(
         import.meta.dir, '..', '..', '..', '..',
-        'crates', 'orchestrators', 'boss-cli', 'src', 'steps.rs',
+        'crates', 'core', 'boss-jobs', 'src', 'step_release.rs',
       ),
       'utf8',
     );
-    const key = src.match(/pub\(crate\) const RELEASED_KEY: &str = "([^"]+)";/);
-    expect(key, 'boss-cli steps::RELEASED_KEY is where the CLI spells it').not.toBeNull();
+    const key = src.match(/pub const KEY: &str = "([^"]+)";/);
+    expect(key, 'boss_jobs::step_release::KEY is where core spells it').not.toBeNull();
     expect(RELEASED_KEY).toBe(key![1]!);
+    const from = src.match(/pub const FROM: &str = "([^"]+)";/);
+    expect(from, 'boss_jobs::step_release::FROM is where core spells it').not.toBeNull();
+    expect(RELEASED_FROM).toBe(from![1]!);
   });
 
   test('names the edge the server names (boss_jobs::agent_runs::EDGE_KEY)', () => {

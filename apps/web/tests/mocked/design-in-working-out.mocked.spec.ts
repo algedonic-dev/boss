@@ -1,4 +1,4 @@
-// /it/design as IN, WORKING and OUT (backlog 08372fdb, from page audit
+// /engineering/design as IN, WORKING and OUT (backlog 08372fdb, from page audit
 // 79db48ae, 2026-09-23).
 //
 // The page rendered only an untouched IN queue: a review saved but not
@@ -16,6 +16,7 @@
 
 import { expect, test, type Page, type Route } from './_test';
 import { servePeopleRows } from './_smokeMocks';
+import { nameOf, stationList, treeRead } from '../fixtures/station-tree';
 
 const json = (r: Route, b: unknown, status = 200) =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(b) });
@@ -39,8 +40,7 @@ const fold = (id: string, status: string, metadata: Record<string, unknown> = {}
   ({ id, kind: 'task', spec_slug: 'fold', status, metadata });
 
 const IN = {
-  station: 'design-review', kind: 'batch', discipline: ['priority', 'age'], over_limit: false,
-  total: 2,
+  station: 'design-review', kind: 'group', discipline: ['priority', 'age'], total: 2,
   lens: { title: 'Design review', panels: ['queue', 'decided'], with_steps: true },
   data: [D('in-saved', 'A half-answered design', 'open'), D('in-fresh', 'An untouched design', 'open')],
   steps: {
@@ -50,8 +50,7 @@ const IN = {
 };
 
 const DECIDED = {
-  station: 'design-decided', kind: 'batch', discipline: ['recency'], over_limit: false,
-  terminal_window_days: 7, total: 2,
+  station: 'design-decided', kind: 'group', discipline: ['recency'], terminal_window_days: 7, total: 2,
   lens: { title: 'Decided designs', with_steps: true },
   data: [
     D('w-fold', 'A design being folded', 'open'),
@@ -71,13 +70,18 @@ async function mocks(page: Page, decided: (r: Route) => Promise<void>): Promise<
   await page.route(/\/api\/session$/, (r) =>
     json(r, { username: 'david', employee_id: 'emp-david', role: 'platform-admin' }));
   await page.route(/\/api\/jobs\/live$/, (r) => json(r, { counts: {}, open_total: 0, recent: [], sim_clock: {} }));
+  // The tree the router places the design page on (backlog 0bc2eb68).
+  await page.route(/\/api\/stations(\?|$)/, (r) => {
+    const under = new URL(r.request().url()).searchParams.get('under');
+    return json(r, under === null ? stationList() : treeRead(nameOf(under)));
+  });
   await page.route(/\/api\/stations\/design-review\/queue/, (r) => json(r, IN));
   await page.route(/\/api\/stations\/design-decided\/queue/, decided);
 }
 
 test('IN says how far each review has got — a saved one does not read as untouched', async ({ page }) => {
   await mocks(page, (r) => json(r, DECIDED));
-  await page.goto('/it/design');
+  await page.goto('/engineering/design');
 
   const row = (title: string) => page.locator('.design-table tr').filter({ hasText: title });
   await expect(row('A half-answered design')).toContainText('saved · 2 of 3 answered');
@@ -86,7 +90,7 @@ test('IN says how far each review has got — a saved one does not read as untou
 
 test('WORKING and OUT render what the decided station holds', async ({ page }) => {
   await mocks(page, (r) => json(r, DECIDED));
-  await page.goto('/it/design');
+  await page.goto('/engineering/design');
 
   await expect(page.getByText('Decided, being folded (1)')).toBeVisible();
   const working = page.locator('.decided-table tr').filter({ hasText: 'A design being folded' });
@@ -100,7 +104,7 @@ test('WORKING and OUT render what the decided station holds', async ({ page }) =
 
 test('a failed decided read says so, and the review queue still renders', async ({ page }) => {
   await mocks(page, (r) => json(r, 'down', 503));
-  await page.goto('/it/design');
+  await page.goto('/engineering/design');
 
   await expect(page.locator('.load-failed')).toContainText('Could not read the decided designs: HTTP 503');
   // Not an empty WORKING and OUT: a failed read is never "nothing decided".

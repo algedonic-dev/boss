@@ -10,8 +10,8 @@ Audience: whoever is setting up a laptop or a VM to build and test
 BOSS. Assumes Ubuntu 24.04 (macOS notes inline) and the repo cloned.
 
 **BOSS's own development runs on the cluster dev pod**
-([`docs/design/dev-cluster.md`](../design/dev-cluster.md),
-the way in: the recovery sheet's source,
+([`docs/architecture-decisions.md`](../architecture-decisions.md)
+§Deployment, the forge, and the cluster; the way in: the recovery sheet's source,
 [`infra/recovery/re-entry.toml`](../../infra/recovery/re-entry.toml),
 rendered by `boss recovery sheet`), which ships every tool
 below and builds through `wt-cargo`. This runbook is for a box that

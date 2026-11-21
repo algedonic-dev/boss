@@ -111,8 +111,10 @@ pub fn decide(id: &str, alias: Option<String>, method: &Method) -> Resolution {
     }
 }
 
-/// The door's two dependencies: who answers the alias question, and
-/// where the count is written. Mount it with
+/// The door's two dependencies: who answers the alias question (and
+/// stages the count on the outbox, [`AgentsRegistry::count_unresolved_login`]),
+/// and who stamps the count — the publisher's actor, source and
+/// partition; it no longer publishes anything. Mount it with
 /// `axum::middleware::from_fn_with_state(Arc::new(door), resolve_login)`,
 /// applied AFTER (so it runs BEFORE) `request_context_middleware`.
 pub struct LoginDoor {
@@ -535,6 +537,11 @@ pub async fn resolve_login(
             // and the unresolved login is the SUBJECT in the payload.
             // Stamping the event with the login itself would put the
             // address into `_actor`, which is the defect being counted.
+            // The publisher stamps; the registry stages. The count rides
+            // the transactional outbox, never the bus directly: until
+            // 2026-11-10 it was `publisher.publish`, which on a dark bus
+            // logged ERROR and dropped it (backlog 2e45840a, design
+            // ad9519bc part d).
             let stamp = door
                 .publisher
                 .stamp_with_actor(door.publisher.default_actor())
@@ -547,7 +554,19 @@ pub async fn resolve_login(
                     "path": path,
                 }),
             );
-            door.publisher.publish(event).await;
+            if let Err(e) = door.registry.count_unresolved_login(&event).await {
+                // The request still passes — the window is open, and a
+                // count the store could not take is not the caller's
+                // fault — but the loss is loud, with the event's
+                // identity, as the publisher's was.
+                tracing::error!(
+                    login = %user.id,
+                    kind = %event.kind,
+                    event_id = %event.id,
+                    error = %e,
+                    "the unresolved-login count could not be staged on the outbox; this admitted write is NOT counted"
+                );
+            }
         }
         Resolution::PassThrough => {}
     }
@@ -646,13 +665,16 @@ mod tests {
 
     fn row(id: &str, role: Option<&str>) -> AgentRow {
         AgentRow {
+            factory_rotation: true,
             id: id.into(),
             display_name: id.into(),
             default_model: "opus-5".into(),
+            model_class: None,
             role: role.map(str::to_string),
             department: None,
             hourly_budget_usd_micros: None,
             max_concurrent_runs: None,
+            stations: vec![],
             aliases: Vec::new(),
         }
     }

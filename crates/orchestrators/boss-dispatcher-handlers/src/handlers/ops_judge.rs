@@ -36,7 +36,12 @@
 //!   `then_args` is whitespace-separated (a verb param admits none,
 //!   `infra/ops/ops-runner.sh`), rendered as the JSON array the runner's
 //!   argv contract reads off `metadata.args`. All three, or none: a rule
-//!   with none is a WATCH (below).
+//!   with none is a WATCH (below). A `{name}` in `then_args` is that
+//!   named group of the verdict (backlog 090643a1: a replica rebuild
+//!   still moving at its bound names its volume, and the read that
+//!   follows must read that volume); a name the pattern does not capture
+//!   is refused when the rule is read. The runner still validates each
+//!   rendered word against the follow-on verb's own params.
 //!
 //! ## Watch mode (backlog 8d77d670)
 //!
@@ -199,6 +204,25 @@ impl Judgement {
         let when = expr::parse(&when_src).map_err(|e| {
             HandlerError::Permanent(format!("when {when_src:?} does not parse: {e}"))
         })?;
+        // A `{name}` in then_args is a group of the verdict (backlog
+        // 090643a1); one the pattern cannot capture is rule authoring,
+        // refused when the rule is read rather than when it files.
+        if let Some(then) = &then {
+            let groups: Vec<&str> = pattern.capture_names().flatten().collect();
+            let unknown: Vec<String> = then
+                .args
+                .iter()
+                .flat_map(|a| placeholders(a))
+                .filter(|n| !groups.contains(&n.as_str()))
+                .map(|n| format!("{{{n}}}"))
+                .collect();
+            if !unknown.is_empty() {
+                return Err(HandlerError::Permanent(format!(
+                    "then_args names {unknown:?}, which verdict_pattern {pattern_src:?} does not \
+                     capture (its named groups: {groups:?})"
+                )));
+            }
+        }
         Ok(Self {
             verb,
             pattern,
@@ -207,6 +231,79 @@ impl Judgement {
             then,
         })
     }
+}
+
+/// One then_args word read once, left to right: literal text and `{name}`
+/// placeholders. The rule-read check and the renderer both take this one
+/// reading, so what is refused at rule read is exactly what renders.
+enum Piece<'a> {
+    Text(&'a str),
+    Name(&'a str),
+}
+
+fn pieces(word: &str) -> Vec<Piece<'_>> {
+    let mut out = Vec::new();
+    let mut rest = word;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else { break };
+        let name = &after[..close];
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            out.push(Piece::Text(&rest[..open]));
+            out.push(Piece::Name(name));
+        } else {
+            out.push(Piece::Text(&rest[..open + 1 + close + 1]));
+        }
+        rest = &after[close + 1..];
+    }
+    out.push(Piece::Text(rest));
+    out
+}
+
+/// A `{name}` in one then_args word: the names, in order.
+fn placeholders(word: &str) -> Vec<String> {
+    pieces(word)
+        .into_iter()
+        .filter_map(|p| match p {
+            Piece::Name(n) => Some(n.to_string()),
+            Piece::Text(_) => None,
+        })
+        .collect()
+}
+
+/// PURE: then_args with each `{name}` replaced by that group of the
+/// verdict (backlog 090643a1). A rebuild that outlived its read-back
+/// names its volume in its verdict, and the read that follows it must
+/// read THAT volume — which a literal word in a rule file cannot say.
+/// The runner still validates each rendered word against the follow-on
+/// verb's own param patterns before anything runs, so a group widens
+/// nothing the verb file does not admit. A group the line did not
+/// capture is an `Err` naming it: nothing is filed on half an argument.
+/// The TEMPLATE is read once and each captured value appended as data:
+/// a global replace per name read a captured `{right}` as the next
+/// placeholder (review run f7c634e8, B2).
+pub(crate) fn render_args(
+    template: &[String],
+    groups: &serde_json::Value,
+) -> Result<Vec<String>, String> {
+    template
+        .iter()
+        .map(|word| {
+            pieces(word)
+                .into_iter()
+                .try_fold(String::new(), |mut acc, piece| {
+                    match piece {
+                        Piece::Text(t) => acc.push_str(t),
+                        Piece::Name(name) => match groups.get(name) {
+                            Some(serde_json::Value::String(s)) => acc.push_str(s),
+                            Some(serde_json::Value::Number(n)) => acc.push_str(&n.to_string()),
+                            _ => return Err(format!("the verdict captured no {{{name}}}")),
+                        },
+                    }
+                    Ok(acc)
+                })
+        })
+        .collect()
 }
 
 /// PURE: the verdict a recorded output carries — the LAST line the
@@ -499,7 +596,16 @@ fn approver_decline(job: &serde_json::Value) -> Option<ApproverDecline> {
         .get("completed_by")
         .and_then(|v| v.as_str())
         .map(str::trim)
-        .filter(|b| !b.is_empty() && !b.starts_with("automation:"))?;
+        .filter(|b| {
+            // A person's act: a NAMED signer (a blank id parses as a bare
+            // Human, so the name is checked first), then the one
+            // executor-kind mapping, never an id prefix (backlog
+            // 8e8d0b1a) - an agent, a legacy rule or an unresolved login
+            // is no approver.
+            !b.is_empty()
+                && b.parse::<boss_core::actor::ActorId>()
+                    .is_ok_and(|a| a.executor_kind() == boss_core::actor::ExecutorKind::Human)
+        })?;
     let decision = meta_str(approve, "decision").filter(|d| DECLINING_DECISIONS.contains(d))?;
     Some(ApproverDecline {
         by: by.to_string(),
@@ -1004,6 +1110,22 @@ impl Handler for OpsJudge {
             return Ok(());
         }
 
+        // The follow-on's words, with the verdict's groups in place of
+        // any `{name}` (backlog 090643a1). The step-1 guard above
+        // compares the rule's LITERAL args, so a templated follow-on of
+        // the same verb IS judged: that chain ends on the verb's own
+        // answer — a verdict this pattern does not match, or a failure —
+        // never on the guard.
+        let then = &FollowOn {
+            verb: then.verb.clone(),
+            host: then.host.clone(),
+            args: render_args(&then.args, &groups).map_err(|e| {
+                HandlerError::Permanent(format!(
+                    "then_args {:?} over {groups}: {e}; verdict: {verdict}",
+                    then.args
+                ))
+            })?,
+        };
         let open = open_jobs_of_kind(&self.client, self.base(), "ops-request", rule).await?;
         let filed_id = match open
             .iter()
@@ -1912,6 +2034,26 @@ mod tests {
         }
     }
 
+    /// A DECLINE NOBODY SIGNED IS NO PERSON'S DECISION (Codex review of
+    /// 8e8d0b1a, 2026-11-08). A blank id parses as a bare Human id, so the
+    /// executor-kind mapping alone let `completed_by = ""` read as a
+    /// person's signed decline and quieted the alarm. A signer must be
+    /// named before its kind is asked.
+    #[tokio::test]
+    async fn a_decline_with_a_blank_signer_is_still_an_alarm() {
+        for signer in ["", "   "] {
+            let mut job = declined("rejected");
+            job["steps"][1]["completed_by"] = json!(signer);
+            let (base, writes) = mock_jobs(vec![job]).await;
+            judge(base)
+                .invoke(&watch_args(), &refused_ctx())
+                .await
+                .unwrap();
+            let w = writes.lock().unwrap().clone();
+            assert_eq!(alarms(&w).len(), 1, "{signer:?}: {w:?}");
+        }
+    }
+
     /// THE RUNNER'S REASON IS QUOTED WHEREVER THE RUNNER WROTE IT. A
     /// request whose execute is still pending behind `approve` is refused
     /// through ops-runner.sh's `abort_request`, which writes `reason` onto
@@ -1954,6 +2096,191 @@ mod tests {
                 filed[0]
             );
         }
+    }
+
+    // ---- a group named in then_args (backlog 090643a1) -----------------
+
+    const VOL: &str = "pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56";
+    /// The rebuild chain's pattern as its rule file spells it: `.` for
+    /// the em-dash, `[0-9]+` for digits (the module doc's two lexers).
+    const IN_PROGRESS: &str = "^(rebuild-a-failed-replica|read-a-replica-rebuild): IN PROGRESS . volume (?P<volume>pvc-[0-9a-f-]+) .* last moved (?P<moved>[0-9]+)s ago";
+
+    fn rebuild_args(verb: &str) -> Vec<(String, Value)> {
+        [
+            ("verb", verb),
+            ("verdict_pattern", IN_PROGRESS),
+            ("when", "moved >= 0"),
+            ("then_verb", "read-a-replica-rebuild"),
+            ("then_host", "forge"),
+            ("then_args", "{volume}"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), Value::String(v.into())))
+        .collect()
+    }
+
+    fn in_progress_output(verb: &str) -> String {
+        format!(
+            "{verb}: IN PROGRESS — volume {VOL} is still rebuilding after 1202s, last moved 14s ago: replicas a (mode WO); rebuilding tcp://10.244.4.4:10000 at 61% — not yet proven\n"
+        )
+    }
+
+    /// A replica rebuild that outlived its read-back bound (ops-request
+    /// d326b6c7) names its VOLUME in its verdict, and the read that
+    /// follows it must read that volume: a static `then_args` could not
+    /// say which, so the group the pattern captured is the argument.
+    #[tokio::test]
+    async fn a_group_named_in_then_args_carries_the_verdicts_value_onto_the_follow_on() {
+        let out = in_progress_output("rebuild-a-failed-replica");
+        let (base, writes) = mock_jobs(vec![request_exit(
+            CHECK,
+            "rebuild-a-failed-replica",
+            &[VOL, &format!("{VOL}-r-1269eb6e"), &"a".repeat(64)],
+            &out,
+            "75",
+        )])
+        .await;
+        let h = judge(base);
+        h.invoke(&rebuild_args("rebuild-a-failed-replica"), &ctx())
+            .await
+            .unwrap();
+        let w = writes.lock().unwrap().clone();
+        let filed = posts(&w);
+        assert_eq!(filed.len(), 1, "one follow-on read: {w:?}");
+        let m = &filed[0]["metadata"];
+        assert_eq!(m["verb"], "read-a-replica-rebuild");
+        assert_eq!(m["host"], "forge");
+        assert_eq!(m["args"], json!([VOL]), "the captured volume, not the word");
+        assert_eq!(m[FOR_CHECK], CHECK);
+        assert!(
+            filed[0]["title"].as_str().unwrap_or("").contains(VOL),
+            "{}",
+            filed[0]["title"]
+        );
+        let note = w
+            .iter()
+            .find(|(m, _, _)| m == "PATCH")
+            .map(|(_, _, b)| b[JUDGED].as_str().unwrap_or("").to_string())
+            .unwrap_or_default();
+        assert!(
+            note.contains(&format!("filed read-a-replica-rebuild {VOL} on forge")),
+            "the note names the rendered follow-on: {note}"
+        );
+    }
+
+    /// The read that is itself still in progress files the next read of
+    /// the same volume. The step-1 guard (a request that IS the packet
+    /// this rule files is never judged) compares the rule's LITERAL
+    /// args, so a templated follow-on is judged — and the chain ends on
+    /// the verb's own answer: proven (no line matches) or stalled (a
+    /// failure, an alarm).
+    #[tokio::test]
+    async fn a_read_still_in_progress_files_the_next_read_of_the_same_volume() {
+        let out = in_progress_output("read-a-replica-rebuild");
+        let (base, writes) = mock_jobs(vec![request_exit(
+            CHECK,
+            "read-a-replica-rebuild",
+            &[VOL],
+            &out,
+            "75",
+        )])
+        .await;
+        let h = judge(base);
+        h.invoke(&rebuild_args("read-a-replica-rebuild"), &ctx())
+            .await
+            .unwrap();
+        let w = writes.lock().unwrap().clone();
+        let filed = posts(&w);
+        assert_eq!(filed.len(), 1, "{w:?}");
+        assert_eq!(filed[0]["metadata"]["args"], json!([VOL]));
+        assert_eq!(filed[0]["metadata"][FOR_CHECK], CHECK);
+
+        // A STALL is a failure: no read is filed, the alarm is.
+        let stalled = format!(
+            "read-a-replica-rebuild: FAILED — STALLED: the rebuild of {VOL} has not moved for 900s\n"
+        );
+        let (base, writes) = mock_jobs(vec![request_exit(
+            CHECK,
+            "read-a-replica-rebuild",
+            &[VOL],
+            &stalled,
+            "1",
+        )])
+        .await;
+        let h = judge(base);
+        h.invoke(&rebuild_args("read-a-replica-rebuild"), &ctx())
+            .await
+            .unwrap();
+        let w = writes.lock().unwrap().clone();
+        let filed = posts(&w);
+        assert_eq!(filed.len(), 1, "{w:?}");
+        assert_eq!(filed[0]["kind"], "backlog-item", "the alarm, not a read");
+        assert_eq!(filed[0]["priority"], "urgent");
+        assert!(
+            filed[0]["metadata"]["failed"]
+                .as_str()
+                .unwrap_or("")
+                .contains("STALLED"),
+            "{}",
+            filed[0]
+        );
+    }
+
+    /// A `{name}` the pattern does not capture is rule authoring, caught
+    /// when the rule is read rather than when a follow-on is filed.
+    #[test]
+    fn a_then_args_group_the_pattern_does_not_capture_is_permanent() {
+        let mut a = rebuild_args("rebuild-a-failed-replica");
+        a.iter_mut().find(|(k, _)| k == "then_args").unwrap().1 =
+            Value::String("{volume} {replica}".into());
+        let err = Judgement::from_args(&a).err().expect("refused");
+        assert!(
+            matches!(err, HandlerError::Permanent(ref m) if m.contains("{replica}")),
+            "{err:?}"
+        );
+        assert_eq!(
+            render_args(&["{volume}".into(), "--x".into()], &json!({"volume": VOL})).unwrap(),
+            vec![VOL.to_string(), "--x".to_string()]
+        );
+        assert_eq!(
+            render_args(&["n={moved}".into()], &json!({"moved": 14})).unwrap(),
+            vec!["n=14".to_string()],
+            "a number group renders as its digits"
+        );
+        assert!(render_args(&["{volume}".into()], &json!({})).is_err());
+    }
+
+    /// Review run f7c634e8 (B2, P2, 2026-11-14): each placeholder was a
+    /// global replace over the word as rendered SO FAR, so a captured
+    /// value holding braces was read again as another placeholder, and a
+    /// repeated one re-expanded its own value. A capture is data: the
+    /// template is read once and each value is appended as it was caught.
+    #[test]
+    fn a_captured_value_is_rendered_as_data_and_never_read_again() {
+        let one = |word: &str, groups: serde_json::Value| render_args(&[word.to_string()], &groups);
+        assert_eq!(
+            one(
+                "{left}:{right}",
+                json!({"left": "{right}", "right": "volume-b"})
+            )
+            .unwrap(),
+            vec!["{right}:volume-b".to_string()],
+            "a captured brace is not the next placeholder"
+        );
+        assert_eq!(
+            one("{v}-{v}", json!({"v": "x{v}"})).unwrap(),
+            vec!["x{v}-x{v}".to_string()],
+            "a repeated placeholder does not expand its own value"
+        );
+        assert_eq!(
+            one("{not a name}{v}", json!({"v": "a"})).unwrap(),
+            vec!["{not a name}a".to_string()],
+            "what is not a placeholder stays as written"
+        );
+        assert!(
+            one("{left}:{right}", json!({"left": "a"})).is_err(),
+            "a missing capture still files nothing"
+        );
     }
 
     #[test]

@@ -6,8 +6,7 @@
 # writes it rather than copied onto the Job. Discipline `age` alone:
 # every train carries the same priority, and the oldest red train is
 # the one blocking the most cars. No WIP limit — nobody chooses to pull
-# a red train, so the depth IS the signal. Upstream is the yard, where
-# a red train is diagnosed by what it is carrying.
+# a red train, so the depth IS the signal.
 #
 # Declared here since 2026-09-18 (backlog 393d3234, consolidation H4);
 # the seed publishes it insert-if-missing and migrations newer than the
@@ -15,15 +14,45 @@
 # schema only. To change this station, bump `version` — the seed
 # refuses a row that differs from the live active row of the same
 # (name, version).
+#
+# Version 3 (item 0a78f8f8, factory taxonomy M2, 2026-11-03): kind
+# batch -> group, bumped from the LIVE newest (v2). The batch kind is
+# deleted; a red train is pulled by whoever repairs it, a set of
+# actors, so the row is a generic station. Nothing else changed.
+#
+# Version 4 (pass item 4 of design ccfe87ff, backlog 1bb8c479; bumped
+# from the LIVE newest, v3): the station declares its edge. A train
+# refused at its gate is disassembled and the cars it did not strike go
+# back to the loading dock — the hand-off `cadence:train-reconcile`,
+# pr-train@ci to ship-a-change@review, in infra/platform/yard/
+# handoffs.toml. Nothing else changed.
+#
+# Version 5 (T2 of design 4b27a65a, backlog 3f58c823; bumped from the
+# LIVE newest, v4): the station stands in the tree — its stable `id`, its
+# `parent` /algedonic/operations (handoff section 7: the garage becomes
+# /operations/repair), its mode. Nothing else changed.
+#
+# Version 6 (backlog a1c0a0ff, design deba3000; bumped from the tree's
+# v5): the hand-typed `[station.upstream]` is gone. It named a /system
+# route the IT consolidation retired on 2026-08-31, so the walk upstream
+# led to a not-found page. A station's upstream is now DERIVED from the
+# tree, as its parent station's page (`upstreamOf` in
+# apps/web/src/it/tree/station-page.ts), and the seed refuses a declared
+# one. The retired department label is removed with its floor reader
+# (backlog aa82eb11); the station's parent places it in the tree.
 # ---------------------------------------------------------------------------
 
 [[station]]
 name = "repair"
-version = 1
+version = 7
+id = "3304665a-841c-45af-bdc7-37357dcf9013"
+parent = "9660c60f-eb47-4405-ae08-fcbb30c71e5f"
+mode = "standing"
 status = "active"
 title = "Repair — trains whose CI went red"
-kind = "batch"
+kind = "group"
 discipline = ["age"]
+edges = ["loading-dock"]
 
 [station.predicate]
 kind = "pr-train"
@@ -34,7 +63,3 @@ slug = "ci"
 
 [station.predicate.step.metadata_equals]
 result = "failing"
-
-[station.upstream]
-label = "THE YARD"
-href = "/system/yard"

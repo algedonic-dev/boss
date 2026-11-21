@@ -88,6 +88,10 @@ export type StepField = {
   name: string;
   field_type: string;
   required?: boolean;
+  /// The one credential principal the step doors admit for this key
+  /// (`StepField::writer`, design f623e425); absent when any caller the
+  /// policy admits may write it. A surface offers no input for it.
+  writer?: string;
 };
 
 export type Step = {
@@ -207,40 +211,26 @@ export function subjectLabel(s: Subject): string {
   return s.id || '(unknown subject)';
 }
 
-/// Pick the canonical SPA path for a Subject — where clicking the
-/// subject in a list should navigate to.
+/// The page a Subject opens, or null when its kind has none.
 ///
-/// The cases are the kinds this SPA has a page for. Every other kind
-/// lands on its own packets, and needs no case to: a kind is registry
-/// data (boss-subject-kinds), a tenant adds one without touching this
-/// file, and every Subject a Job points at has at least that Job.
-/// `subject_id` is the filter the /jobs route already parses, and it
-/// asks the honest question — this subject's work, whatever protocol
-/// it runs under.
-///
-/// A campaign got there first, from `kind=marketing-motion`, a tenant
-/// workflow hardcoded into shared frontend (backlog 423a531d,
-/// 2026-09-22). `custom` and every unnamed kind answered `'#'` until
-/// backlog 4af37dd8 (2026-09-24): `href('#')` is `/#`, which parses as
-/// `/`, so the click landed on Home — for every open packet on the
-/// instance, all of which are `custom`.
-export function subjectPath(s: Subject): string {
-  // The canonical /ux/… spelling, as entityHref writes it. These were
-  // the router's unprefixed legacy paths, which resolve only because
-  // the router strips /ux "defensively" (backlog d0b93b80).
+/// Only a purchase order and a vendor have a page of their own, at
+/// Finance's address (backlog c7ef4728). Every other kind answered its
+/// own packets on the jobs list (the `subject_id` filter) until that
+/// list went with step 1 of design 01fa5bdf (review df7aeb9c). Such a
+/// subject is drawn as text now, the way EntityLink draws a
+/// PAGELESS_KINDS id, because a link would land on not-found. A kind is
+/// registry data (boss-subject-kinds), so a kind this file never names
+/// takes the text arm with no branch here. Null, never a placeholder:
+/// `'#'` was one until 4af37dd8 (2026-09-24), and `href('#')` is `/`,
+/// so every custom subject linked to Home.
+export function subjectPath(s: Subject): string | null {
   const id = encodeURIComponent(s.id ?? '');
   switch (s.subject_kind) {
-    case 'asset':
-      return `/ux/assets/${id}`;
-    case 'account':
-      return `/ux/accounts/${id}`;
     case 'purchase_order':
-      return `/ux/purchase-orders/${id}`;
-    case 'employee':
-      return `/ux/people/${id}`;
+      return `/finance/purchase-orders/${id}`;
     case 'vendor':
-      return `/ux/vendors/${id}`;
+      return `/finance/vendors/${id}`;
     default:
-      return `/ux/jobs?subject_id=${id}`;
+      return null;
   }
 }

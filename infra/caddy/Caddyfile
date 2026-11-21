@@ -15,8 +15,10 @@
 # Certificate, AWS ALB termination, GCP HTTPS LB) used to live
 # here as a second virtual host pinned to the project's old
 # playground deployment. The 2026-05-06 cloud-provisioning rip
-# moved those recipes to a future "Cloud provider blueprints"
-# Post-release item — see TODO.md.
+# removed them. The old roadmap planned them back as opt-in
+# infra/blueprints/<provider>/ recipes ("Cloud-provider
+# blueprints", git show dab00c7bb6f3:TODO.md); none exists today,
+# and no backlog item tracks them (2026-11-17).
 
 {$BOSS_HOSTNAME} {
     encode gzip

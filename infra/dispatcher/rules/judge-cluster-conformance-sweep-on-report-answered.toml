@@ -32,8 +32,15 @@ judgement of a finding stays a person's. Self-filters to this one
 sweep by the (target, verb) pair, which sweep_verdict_rules.rs pins to
 the pair the measure rule files.
 """
+version = 2
 on_event = "jobs.job.closed"
-when = 'kind = "ops-request" AND outcome = "answered"'
+# `failed` and `indeterminate` are how the ops-request row closes a verb
+# that RAN with a nonzero or an unknown exit (design b7bb1625, backlog
+# 50a1578f); before that row it closed `answered` whatever the exit, so
+# this rule hears exactly the runs it heard before, and its judge still
+# reads the exit off the execute record. Pinned by boss-dispatcher's
+# an_ops_request_rule_that_hears_an_answer_hears_a_failure.
+when = 'kind = "ops-request" AND (outcome = "answered" OR outcome = "failed" OR outcome = "indeterminate")'
 [[rule.do]]
 handler = "maintenance.sweep.judge"
 args = { target = "\"cluster-conformance\"", verb = "\"conformance-report\"" }

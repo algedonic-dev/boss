@@ -8,6 +8,9 @@
 //!   the R3 mint derives `cust-<sha256(email)[..12]>` — so the /shop
 //!   checkout can re-POST the same buyer forever and always land on
 //!   the same row. Sim births pass explicit pool ids.
+//!
+//! The two reads ask policy (backlog cda177ef, 2026-11-19): `Read` on
+//! `customer`, at scope `all` — see [`read_customers`].
 
 use std::sync::Arc;
 
@@ -17,6 +20,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use boss_policy_client::{CurrentUser, Decision, PolicyClient, Scope, User, controls};
 use serde::Deserialize;
 
 use crate::port::{CustomersError, CustomersRepository};
@@ -27,6 +31,10 @@ pub struct CustomersApiState<R: CustomersRepository> {
     pub customers: Arc<R>,
     /// Authoritative clock — every stamp routes through clock-api.
     pub clock: Arc<dyn boss_clock_client::ClockClient>,
+    /// What every read asks (backlog cda177ef). Not optional: a read
+    /// that runs without a policy client answers its caller unasked,
+    /// which is the defect this field closes.
+    pub policy: Arc<dyn PolicyClient>,
 }
 
 pub fn router<R: CustomersRepository + 'static>(state: CustomersApiState<R>) -> Router {
@@ -41,8 +49,15 @@ pub fn router<R: CustomersRepository + 'static>(state: CustomersApiState<R>) -> 
         .with_state(shared)
 }
 
-async fn health() -> Response {
-    Json(serde_json::json!({"status": "ok"})).into_response()
+/// The shared health body, so the read names the build that answered
+/// (backlog 56f88ada). `postgres`: the one binary serving this router
+/// requires that feature and wires `PgCustomers`.
+async fn health() -> Json<boss_core::startup::HealthResponse> {
+    Json(boss_core::startup::health_response(
+        "boss-customers-api",
+        env!("CARGO_PKG_VERSION"),
+        "postgres",
+    ))
 }
 
 #[derive(Deserialize)]
@@ -100,10 +115,42 @@ async fn create_customer<R: CustomersRepository + 'static>(
     }
 }
 
+/// Whether `user` may read the buyers, or the response that refuses
+/// (backlog cda177ef). Both reads asked nobody, so a Basic guest — the
+/// `visitor` role, granted nothing on `customer` — read every buyer's
+/// name, email and phone, while the OSS README said it read only what
+/// policy grants it.
+///
+/// Only a grant at scope `all` reads: a buyer row has no owner,
+/// account team, team or department, so a narrower grant names none of
+/// them, and is refused saying so rather than answered with an empty
+/// list that reads as "no buyers". A policy service that cannot answer
+/// refuses — a gate that cannot be asked is not a gate that passed.
+async fn read_customers(policy: &dyn PolicyClient, user: &User) -> Result<(), Response> {
+    match policy.ask(user, controls::READ_CUSTOMER).await {
+        Ok(Decision::Allow { scope: Scope::All }) => Ok(()),
+        Ok(Decision::Allow { scope }) => Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "a customer row has no owner, account team, team or department, so only a grant \
+                 of read on customer at scope all reads one; this caller holds it at scope {}",
+                scope.to_db_string()
+            ),
+        )
+            .into_response()),
+        Ok(Decision::Deny { reason }) => Err((StatusCode::FORBIDDEN, reason).into_response()),
+        Err(e) => Err(e.into_response()),
+    }
+}
+
 async fn get_customer<R: CustomersRepository + 'static>(
     State(state): State<Arc<CustomersApiState<R>>>,
+    CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Response {
+    if let Err(refused) = read_customers(state.policy.as_ref(), &user).await {
+        return refused;
+    }
     match state.customers.get_customer(&id).await {
         Ok(Some(c)) => Json(c).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -113,7 +160,11 @@ async fn get_customer<R: CustomersRepository + 'static>(
 
 async fn list_customers<R: CustomersRepository + 'static>(
     State(state): State<Arc<CustomersApiState<R>>>,
+    CurrentUser(user): CurrentUser,
 ) -> Response {
+    if let Err(refused) = read_customers(state.policy.as_ref(), &user).await {
+        return refused;
+    }
     match state.customers.list_customers().await {
         Ok(all) => Json(all).into_response(),
         Err(e) => error_response(e),

@@ -104,6 +104,11 @@
 #      today's plan hashes to the signed one; a second run of an applied
 #      plan is refused, because the timer it names is no longer running.
 #
+# THE WAKER GOES WITH THE TIMER, by the unit and not by this script
+# (backlog ca6f40c2): boss-ops-runner-wake.service is PartOf= the timer,
+# so the one stop below stops it too, and it never starts a runner whose
+# timer is not active. Its files go with the runner's, at the converge.
+#
 # WHAT IT DOES NOT DO. It deletes no file — the converge removes the unit
 # files once the timer is off and the role undeclared. It never touches
 # boss-ops-runner.service, another host, or infra/gcp/uninstall-not-in-
@@ -221,7 +226,7 @@ if [ -r "$REPO/infra/lib/secret-header.sh" ]; then
     machine_token_header NODES_MT_HDR "${BOSS_ESTATE_NODES_URL:-$BASE/api/estate/nodes}" || NODES_MT_HDR=""
     machine_token_header MT_HDR "$BASE" || MT_HDR=""
 fi
-if ! curl -fsS --max-time 15 ${NODES_MT_HDR:+-H "$NODES_MT_HDR"} \
+if ! curl -q -fsS --max-time 15 ${NODES_MT_HDR:+-H "$NODES_MT_HDR"} \
         -H "x-boss-user: $(sor_reader_header "automation:$ME")" \
         "${BOSS_ESTATE_NODES_URL:-$BASE/api/estate/nodes}" > "$TMP/nodes.json" 2> "$TMP/nodes.err"; then
     refuse "the estate registry did not answer the read for the other runners: $(head -c 500 "$TMP/nodes.err" | tr '\n' ' ') — whether $HOST is the last door cannot be evaluated. Nothing was stopped."
@@ -256,7 +261,7 @@ BOSS_USER="{\"id\":\"$ACTOR\",\"role\":\"platform-admin\",\"access_tier\":\"oper
 host_doc=$(jq -rn --arg h "$HOST" '{host: $h} | tojson | @uri') \
     || refuse "could not encode the host filter. Nothing was stopped."
 QUEUE_URL="$BASE/api/jobs?kind=ops-request&status=open&metadata=$host_doc&limit=1000"
-if ! curl -fsS --max-time 15 -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} \
+if ! curl -q -fsS --max-time 15 -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} \
         "$QUEUE_URL" > "$TMP/queue.json" 2> "$TMP/queue.err"; then
     refuse "the system of record did not answer the queue read ($QUEUE_URL): $(head -c 500 "$TMP/queue.err" | tr '\n' ' ') — whether another request waits on $HOST cannot be evaluated. Nothing was stopped."
 fi

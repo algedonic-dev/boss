@@ -16,6 +16,11 @@
 # so the step says WHICH closing packet landed it. A car with no
 # `agent_run` key — every hand-gated car — is the handler's first
 # return: no declared edge, no obligation, nothing written.
+#
+# TWO STEPS, ONE OPEN (backlog 87d1ae40): `building` on a run admitted
+# before agent-run carried `verdict`, `verdict` on a run handed to its
+# gate — the same pair the gate-green rule names, held equal by
+# platform_bundle_agent_run.rs.
 [[rule]]
 name = "agent-run-lands-on-car-merged"
 why = """
@@ -28,9 +33,9 @@ arrived by any path other than its first green stayed at `building`
 until the silence rule aged it out as died — a run that landed,
 recorded as one that did not.
 """
-version = 1
+version = 2
 on_event = "jobs.job.closed"
 when = "kind = \"ship-a-change\" AND outcome = \"merged\""
 [[rule.do]]
 handler = "jobs.complete_linked_step"
-args = { link = "\"agent_run\"", steps = "\"building\"", evidence_key = "\"car\"", done_metadata = '"{\"result\": \"gated\"}"' }
+args = { link = "\"agent_run\"", steps = "\"building,verdict\"", evidence_key = "\"car\"", done_metadata = '"{\"result\": \"gated\"}"' }

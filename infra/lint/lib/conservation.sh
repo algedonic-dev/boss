@@ -75,8 +75,8 @@ pipeline introducing drift. Fix by recording a compensating event
 (NOT by editing the projection table directly).
 
 If the violation is a known stop-gap that's been deliberately
-accepted, document it in TODO.md with the next milestone that will
-clear it.
+accepted, file a backlog-item packet in BOSS naming the invariant and
+what will clear it (from outside the instance, a GitHub issue).
 EOF
         exit 1
     fi

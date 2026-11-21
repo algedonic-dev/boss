@@ -1,0 +1,51 @@
+# A station hold — a declared quiet window on a station's automata
+# (backlog 95401d82, 2026-11-07).
+#
+# WHY A ROW. During the gate-volume move that day the conductor wrote
+# GATE HOLD orders to both builder sessions at 15:03Z and 17:50Z, and
+# both complied, yet w-1 was never free of a gate pod: the post-landing
+# full main gate (twice) and the dock-depth board each launched a
+# ~40-minute pod that mounts /var/mnt/gate, and retire-a-user-volume
+# rightly refused while one ran. An order holds actors; the automata
+# read no order. So the hold is a row in the system of record that every
+# launcher reads before it launches: the board, main's full gate, the
+# dock's re-gates and the resident gate line (all in boss-cli,
+# `gate_hold.rs` names each reader), and `boss gate` itself, which
+# refuses unless --despite-hold says why.
+#
+# ONE ROW, ITS WHOLE LIFE ON THE RECORD. Open is held; `boss gates hold
+# --why <reason> --for <bound>` files it (who is the filer, `since` and
+# `until` ride its metadata), and `boss gates release --why <reason>`
+# completes `release`, which closes it `released`. A hold past its
+# `until` does NOT lift itself — the conductor's reconcile files one
+# alarm for it — because a quiet window that ends on a timer would
+# start a gate pod under a data move that ran long, which is the exact
+# failure the row exists to prevent.
+#
+# `station` names the station held. Only `gates` has readers today; the
+# key is there so the row says what it holds rather than implying it.
+[[workflow]]
+kind = "station-hold"
+label = "Station hold"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "A declared quiet window on a station's automata: while open, every launcher of that station reads it and launches nothing. Filed by `boss gates hold` with a reason and a bound; closed by `boss gates release`. A hold past its bound raises an alarm and never lifts itself."
+metadata = { owner = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5", department = "it", owner_role = "platform-admin" }
+metadata_schema = { type = "object", required = ["station", "why", "held_by", "since", "until"], properties = { station = { type = "string" }, why = { type = "string" }, held_by = { type = "string" }, since = { type = "string" }, until = { type = "string" } } }
+
+[[workflow.step]]
+title = "release"
+kind = "task"
+ready_when = "true"
+title_template = "Release the hold on {metadata.station}"
+authority_role = "platform-admin"
+metadata_defaults = { procedure = "Run `boss gates release --why <reason>` once the quiet window this hold declared is over; it completes this step and reads back that no hold stands. Never complete it by hand: the launchers resume the moment it closes." }
+fields = [{ name = "released_why", field_type = "string", required = true }, { name = "released_by", field_type = "string", required = true }]
+
+[[workflow.step]]
+title = "released"
+kind = "outcome"
+ready_when = "steps.release.done"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "released" }

@@ -1,5 +1,5 @@
 import { renderMarkdown } from '@boss/web-kit/markdown';
-import { entityHref, ID_IS_LABEL } from '@boss/web-kit/ui/entity-href';
+import { entityHref, hasPage, ID_IS_LABEL } from '@boss/web-kit/ui/entity-href';
 import { tokenize } from './richBody';
 
 const escapeText = (text: string): string => text.replaceAll('&', '&amp;')
@@ -21,6 +21,11 @@ export function renderRichMarkdown(body: string, employeeNames?: ReadonlyMap<str
       const label = token.entityKind === 'employee' ? employeeNames?.get(token.id) : undefined;
       const title = label && label !== token.id ? ` title="${escapeText(token.id)}"` : '';
       const classes = ID_IS_LABEL.has(token.entityKind) ? 'entity-link mono' : 'entity-link';
+      // A kind with no page is text, not a link to not-found (design
+      // 01fa5bdf; entity-href.ts PAGELESS_KINDS).
+      if (!hasPage(token.entityKind)) {
+        return `<span class="${classes}"${title}>${escapeText(label || token.id)}</span>`;
+      }
       return `<a href="${escapeText(entityHref(token.entityKind, token.id))}" class="${classes}"><span${title}>${escapeText(label || token.id)}</span></a>`;
     }).join('');
   }).join('');

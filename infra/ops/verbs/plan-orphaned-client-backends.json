@@ -1,0 +1,8 @@
+{
+  "about": "READ-ONLY — plan one oldest eligible active client backend older than 15 minutes in the protected jobs API's actual database on boss/postgres-0. Its address must be in a declared cluster Pod CIDR, non-loopback/non-link-local, and absent from complete cluster-wide live Pod and node address censuses. The exact approved plan names selected one and every deferred original candidate; another approval is required for the next. Retains native target, server lifetime and exact session identities. No query text, free SQL, new credentials or grants. Empty, malformed, partial or ambiguous observations refuse. Native reads have a fixed strict per-call cap; measured transport calibration is not a promise that this census will finish. Ownership checks are not a cross-resource lock against later IP reuse.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/orphan-backends.sh", "--plan"],
+  "params": [],
+  "capture": "separate-streams",
+  "timeout": 190
+}

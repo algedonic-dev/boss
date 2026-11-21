@@ -43,8 +43,15 @@ pub fn router<R: CampaignsRepository + 'static>(state: CampaignsApiState<R>) -> 
         .with_state(shared)
 }
 
-async fn health() -> Response {
-    Json(serde_json::json!({"status": "ok"})).into_response()
+/// The shared health body, so the read names the build that answered
+/// (backlog 56f88ada). `postgres`: the one binary serving this router
+/// requires that feature and wires `PgCampaigns`.
+async fn health() -> Json<boss_core::startup::HealthResponse> {
+    Json(boss_core::startup::health_response(
+        "boss-campaigns-api",
+        env!("CARGO_PKG_VERSION"),
+        "postgres",
+    ))
 }
 
 /// Tolerant birth body: sim-synthesized payloads carry `id` + `name`

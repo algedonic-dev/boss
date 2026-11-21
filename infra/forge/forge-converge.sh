@@ -11,7 +11,8 @@
 # train. "Landed but never installed" was a recurring, expensive class
 # of defect, and its single cause was that nothing ran install.sh. This
 # closes the class: main moves, the next converge installs whatever is
-# new. (docs/design/the-build-plane-manages-itself.md, car 4 / keystone.)
+# new. (Car 4 / keystone of "The build plane manages itself",
+# docs/architecture-decisions.md.)
 #
 # It runs install.sh, which is idempotent — installs+enables every unit
 # in its UNITS list and restarts only what changed. forge-converge is
@@ -320,7 +321,9 @@ runuser -l "$OWNER" -c "cd '$REPO' && . infra/forge/checkout-lock.sh && checkout
 tree_rc=0
 tree_line="$("$INFRA/forge/root-tree.sh" refresh 2>&1)" || tree_rc=$?
 printf '%s\n' "$tree_line"
-run_summary_field root_tree "$(printf '%s' "$tree_line" | tail -n 1 | cut -c1-600)"
+# Copied whole: root-tree.sh bounds its own words, and a cut here
+# reduced the only copy the judge files from (backlog 80e5d9d8).
+run_summary_field root_tree "$(printf '%s' "$tree_line" | tail -n 1)"
 # `path` exits 1 when `current` names no whole generation: that is "no
 # tree", by name, and never an empty answer taken for one.
 no_tree=""
@@ -485,12 +488,14 @@ rtdir="${RUNTIME_DIRECTORY:-}"
 rtdir="${rtdir%%:*}"
 protect_rc=0
 offsite_rc=0
+account_rc=0
 auth_hdr=""
 if [ -z "$rtdir" ] || [ ! -d "$rtdir" ]; then
-    echo "forge-converge: REFUSED the forge header — RUNTIME_DIRECTORY is not a directory ('${RUNTIME_DIRECTORY:-unset}'); forge-converge.service's RuntimeDirectory= sets it, and the token is written nowhere else. protect-main and offsite-push are skipped this run; install.sh ran, so the next tick runs under a unit that has it." >&2
-    run_summary_field refused "RUNTIME_DIRECTORY is not a directory ('${RUNTIME_DIRECTORY:-unset}'): no forge header, protect-main and offsite-push skipped"
+    echo "forge-converge: REFUSED the forge header — RUNTIME_DIRECTORY is not a directory ('${RUNTIME_DIRECTORY:-unset}'); forge-converge.service's RuntimeDirectory= sets it, and the token is written nowhere else. protect-main, the forge accounts and offsite-push are skipped this run; install.sh ran, so the next tick runs under a unit that has it." >&2
+    run_summary_field refused "RUNTIME_DIRECTORY is not a directory ('${RUNTIME_DIRECTORY:-unset}'): no forge header, protect-main, forge-account and offsite-push skipped"
     protect_rc=78
     offsite_rc=78
+    account_rc=78
 else
     # STALE HEADERS FROM BEFORE THIS CAR. A run SIGKILLed or cut by a power
     # loss while the header lived in /tmp left it there; nothing writes
@@ -521,6 +526,26 @@ else
         unset FORGE_TOKEN
     fi
     BOSS_FORGE_AUTH_HEADER_FILE="$auth_hdr" "$RUN_FROM/forge/protect-main.sh" || protect_rc=$?
+
+    # THE FORGE ACCOUNTS THE BROKER MINTS FOR, made and verified here
+    # (design 0af333ee, resolved by David 2026-11-13, question `create`;
+    # backlog 70555ffd). Every estate forge token was david's, and david is
+    # a site admin, whose tokens reach every repository on the forge
+    # whatever their scope. infra/forge/forge-account.sh is the one
+    # definition and carries the reasoning: each account in
+    # infra/forge/forge-accounts.json is created when absent (never an
+    # admin, no password anyone holds), granted its ONE repository with
+    # this same header — repository administration, as protect-main's is —
+    # and verified by effect: not a site admin, and nothing else reachable.
+    # A site admin or a second repository reds this run and stands until a
+    # person acts, so its line is copied into `output` below. A generation
+    # from before the accounts carries no script and declares none: said
+    # on the packet, not red.
+    if [ -f "$RUN_FROM/forge/forge-account.sh" ]; then
+        BOSS_FORGE_AUTH_HEADER_FILE="$auth_hdr" "$RUN_FROM/forge/forge-account.sh" || account_rc=$?
+    else
+        run_summary_field forge_accounts "skipped: this generation ($RUN_FROM) carries no forge-account.sh and declares no forge account"
+    fi
 fi
 
 # THE DR COPY'S GITHUB TOKEN, RENDERED ON EVERY TICK AND BEFORE THE PUSH
@@ -636,18 +661,27 @@ fi
 reds=""
 case "$(printf '%s' "$tree_line" | tail -n 1)" in
     *REFUSED:*)
-        reds="RED forge-converge/root-tree refused: $(printf '%s' "$tree_line" | tail -n 1 | cut -c1-600)" ;;
+        reds="RED forge-converge/root-tree refused: $(printf '%s' "$tree_line" | tail -n 1)" ;;
 esac
 # A summary that cannot be read is named as that (and prints no line:
 # the installer's own stderr and exit still red the run); it is never
 # taken for "no unit was held".
-units_held_now="" gcp_runner_line="" summary_unread=""
+units_held_now="" gcp_runner_line="" account_red="" summary_unread=""
 if [ -n "${BOSS_RUN_SUMMARY_FILE:-}" ] && [ -s "$BOSS_RUN_SUMMARY_FILE" ]; then
     units_held_now="$(jq -r '.units_held // empty' "$BOSS_RUN_SUMMARY_FILE" 2>/dev/null | tr '\n' ' ')" || summary_unread=1
-    gcp_runner_line="$(jq -r '(.runner_credential_boss_gcp // "") | split("\n")[0] // "" | .[0:600]' "$BOSS_RUN_SUMMARY_FILE" 2>/dev/null)" || summary_unread=1
+    gcp_runner_line="$(jq -r '(.runner_credential_boss_gcp // "") | split("\n")[0] // ""' "$BOSS_RUN_SUMMARY_FILE" 2>/dev/null)" || summary_unread=1
+    account_red="$(jq -r '.forge_account_red // empty' "$BOSS_RUN_SUMMARY_FILE" 2>/dev/null)" || summary_unread=1
 fi
+# A forge account that is a site admin or holds a second repository
+# (forge-account.sh, above): the script writes its lines in the judge's
+# shape, one per account, and they are copied whole.
+case "$account_red" in
+    "RED "*)
+        reds="${reds:+$reds
+}$account_red" ;;
+esac
 if [ -n "$summary_unread" ]; then
-    echo "forge-converge: this run's summary at $BOSS_RUN_SUMMARY_FILE could not be read for units_held or runner_credential_boss_gcp — no RED line is left for either this tick" >&2
+    echo "forge-converge: this run's summary at $BOSS_RUN_SUMMARY_FILE could not be read for units_held, runner_credential_boss_gcp or forge_account_red — no RED line is left for any of them this tick" >&2
 elif [ -n "$units_held_now" ]; then
     reds="${reds:+$reds
 }RED forge-converge/units-held held: no unit file was replaced, a command a unit names is not an executable file or a tree file it hands one is not there —$units_held_now"
@@ -657,8 +691,15 @@ fi
 # refuses, a receiver its converge never replaced. Each stands until a
 # person acts, and it reached only `runner_credential_boss_gcp`, which the
 # judge does not read. The sender already prints it in the judge's shape,
-# on its own route (`RED runner-credential-send/<kind> refused: …`), so
-# its line is copied whole; a `not yet` is not one.
+# on its own route (`RED runner-credential-send/<kind> refused: …`), and
+# so does the push for its own standing failures — a missing pin, an
+# unreadable or lost deposit key, a refused enrollment
+# (`RED runner-credential-push/<route> <kind>: …`, backlog 3f7d5f23) — so
+# its line is copied whole; a `not yet` or a `failed:` is not one. WHOLE:
+# it was cut at 600 characters, and the key-unconfined line runs 738-797,
+# so the filed item lost the forced command to place and "No credential
+# byte was sent." (3f7d5f23, (e)). The sender bounds every part of the
+# line it did not write itself.
 case "$gcp_runner_line" in
     "RED "*)
         reds="${reds:+$reds
@@ -667,12 +708,13 @@ esac
 [ -z "$reds" ] || run_summary_field output "$reds"
 
 # install.sh's verdict first (it is the older and wider one), then the
-# protection's, then the off-site push's, the DR render's, the runner
-# credential's, boss-gcp's runner credential push's, then the checkout
-# deposit's: any reds this run and puts
+# protection's, the forge accounts', then the off-site push's, the DR
+# render's, the runner credential's, boss-gcp's runner credential push's,
+# then the checkout deposit's: any reds this run and puts
 # the packet on `failed`.
 [ "$install_rc" -eq 0 ] || exit "$install_rc"
 [ "$protect_rc" -eq 0 ] || exit "$protect_rc"
+[ "$account_rc" -eq 0 ] || exit "$account_rc"
 [ "$offsite_rc" -eq 0 ] || exit "$offsite_rc"
 [ "$render_rc" -eq 0 ] || exit "$render_rc"
 [ "$runner_rc" -eq 0 ] || exit "$runner_rc"

@@ -1,4 +1,4 @@
-// /it/registry/rules — "+ New rule" points at the two paths a rule
+// /engineering/registry/rules — "+ New rule" points at the two paths a rule
 // survives a restart on, and makes no rule itself (backlog 7d9df2fe,
 // design ff1c3615: David chose option b, 2026-09-23).
 //
@@ -27,9 +27,9 @@ test('+ New rule names the durable paths and creates nothing', async ({ page }) 
     }
   });
 
-  await mountPage(page, '/it/registry/rules');
+  await mountPage(page, '/engineering/registry/rules');
   await Promise.all([
-    page.waitForURL(/\/it\/registry\/rules\/new$/),
+    page.waitForURL(/\/engineering\/registry\/rules\/new$/),
     page.getByRole('link', { name: '+ New rule' }).first().click(),
   ]);
 

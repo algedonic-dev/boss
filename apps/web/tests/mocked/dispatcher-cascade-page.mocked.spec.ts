@@ -1,5 +1,5 @@
 import { isPageWrite } from './_smokeMocks';
-// /it/registry/dispatcher — every control the page audit counted, pinned
+// /engineering/registry/dispatcher — every control the page audit counted, pinned
 // (page-audit 2ee7cdfc, step `test`).
 //
 // The audit's inventory (controls_md, measured 2026-09-23 against
@@ -41,8 +41,8 @@ import { isPageWrite } from './_smokeMocks';
 //                    240×54 the layout reserves, so neighbours overlapped
 //                    — FIXED: each node is the page's own type, sized
 //                    to its layout box;
-// One finding no item owns, marked UNFILED where it is asserted:
-//   the stats say "1 rules" and "1 handlers" in the singular.
+//   covered B (3bfafd28): the stats use singular nouns for one rule
+//                    and one handler, retaining plurals for zero and many.
 //
 // THE FIXTURE. The payload is the server's shape: rules, the handler
 // roster as the dispatcher build declares it (boss-dispatcher-handlers
@@ -67,15 +67,21 @@ import { expect, test, type Locator, type Page, type Request, type Route } from 
 import { mountPage, settledReads } from './_helpers';
 import { installSmokeMocks } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
-import { parseRoute } from '../../src/router';
+import { parseRoute as parseRouteAt } from '../../src/router';
+import { ADDRESSES } from '../fixtures/station-tree';
+import { pagePath } from '../../src/shell/page-address';
+import type { NavItem } from '../../src/shell/nav-catalog';
 import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
 import { sectionForRoute } from '../../src/shell/sections';
+// The router reads a hosted page's address off the station tree
+// (backlog 0bc2eb68); this spec reads it off the tree the floor serves.
+const parseRoute = (path: string, search = '') => parseRouteAt(path, search, ADDRESSES);
 
 test.use({ viewport: { width: 2400, height: 1000 } });
 
-const PAGE = '/it/registry/dispatcher';
+const PAGE = '/engineering/registry/dispatcher';
 const TITLE = 'Dispatcher rules — reactive cascade';
-const RULES_PAGE = '/it/registry/rules';
+const RULES_PAGE = '/engineering/registry/rules';
 const SUBTITLE =
   'The side-effect wiring the boss-dispatcher runs: a step completes or an event fires → a rule matches → handlers run → they emit events that re-trigger more rules. Red = a feedback cycle.';
 
@@ -186,7 +192,7 @@ function watchWrites(page: Page): Request[] {
 }
 
 const catalogPaths = (): Set<string> =>
-  new Set(Object.values(ROUTE_CATALOG).map((r) => (r as { path: string }).path));
+  new Set(Object.values(ROUTE_CATALOG).map((r) => pagePath(r as NavItem, ADDRESSES) ?? `unplaced:${r.id}`));
 
 /// The section a path lights, when that section is a ROUTE_CATALOG key.
 function catalogued(path: string): string | null {
@@ -278,7 +284,7 @@ async function backHere(page: Page): Promise<void> {
   await expect(page.locator('.svelte-flow__node')).toHaveCount(NODES);
 }
 
-test.describe('/it/registry/dispatcher — the picture', () => {
+test.describe('/engineering/registry/dispatcher — the picture', () => {
   test('header, stats, legend, and the graph the payload builds', async ({ page }) => {
     await install(page);
     await mountGraph(page);
@@ -417,7 +423,7 @@ test.describe('/it/registry/dispatcher — the picture', () => {
   });
 });
 
-test.describe('/it/registry/dispatcher — the trigger filter', () => {
+test.describe('/engineering/registry/dispatcher — the trigger filter', () => {
   test('options are the event topics and the scheduled rules; a chip narrows, × and show all widen', async ({ page }) => {
     const writes = watchWrites(page);
     await install(page);
@@ -495,7 +501,7 @@ test.describe('/it/registry/dispatcher — the trigger filter', () => {
   });
 });
 
-test.describe('/it/registry/dispatcher — the side panel', () => {
+test.describe('/engineering/registry/dispatcher — the side panel', () => {
   test('a rule node opens its trigger, guard and do list; the pane closes it', async ({ page }) => {
     await install(page);
     await mountGraph(page);
@@ -618,7 +624,7 @@ test.describe('/it/registry/dispatcher — the side panel', () => {
   });
 });
 
-test.describe('/it/registry/dispatcher — the graph controls', () => {
+test.describe('/engineering/registry/dispatcher — the graph controls', () => {
   test('zoom in, zoom out and fit view do what they say; there is no lock; the minimap is there', async ({ page }) => {
     await install(page);
     await mountGraph(page);
@@ -688,7 +694,7 @@ test.describe('/it/registry/dispatcher — the graph controls', () => {
   });
 });
 
-test.describe('/it/registry/dispatcher — links, reads and writes', () => {
+test.describe('/engineering/registry/dispatcher — links, reads and writes', () => {
   test('one unfiltered read, no forms, no writes, and the page’s links', async ({ page }) => {
     const writes = watchWrites(page);
     const reads: string[] = [];
@@ -719,7 +725,7 @@ test.describe('/it/registry/dispatcher — links, reads and writes', () => {
     await mountGraph(page);
 
     const tabs = page.locator('nav.it-tabs[aria-label="IT registry"] a');
-    await expect(tabs).toHaveText(['Workflows', 'Dispatcher', 'Rules', 'Step plugins', 'Policy', 'Subjects', 'Drift', 'Agents', 'Credentials']);
+    await expect(tabs).toHaveText(['Workflows', 'Dispatcher', 'Rules', 'Step plugins', 'Subjects', 'Drift', 'Agents', 'Credentials']);
     await expect(tabs.nth(1)).toHaveAttribute('aria-current', 'page');
     await expect(tabs.nth(1)).toHaveAttribute('href', PAGE);
     expect(catalogued(PAGE)).toBe('system-dispatcher');
@@ -754,7 +760,7 @@ test.describe('/it/registry/dispatcher — links, reads and writes', () => {
   });
 });
 
-test.describe('/it/registry/dispatcher — loading, empty and failed are three paints', () => {
+test.describe('/engineering/registry/dispatcher — loading, empty and failed are three paints', () => {
   test('while the read is in flight it says Loading… and nothing else claims a state', async ({ page }) => {
     await installSmokeMocks(page);
     let release: () => void = () => {};
@@ -794,14 +800,11 @@ test.describe('/it/registry/dispatcher — loading, empty and failed are three p
     await expect(page.getByRole('link', { name: 'Edit rules →' })).toHaveCount(1);
   });
 
-  test('UNFILED: one rule and one handler are counted in the plural', async ({ page }) => {
-    // The words finding no item owns: the stats have no singular, where
-    // the rule list's header ("1 active rule") and this page's own
-    // filter note ("1 trigger") do.
+  test('one rule and one handler use singular nouns', async ({ page }) => {
     await install(page, [ASSIGNED]);
     await mountPage(page, PAGE, { titleMatch: new RegExp(TITLE) });
     await expect(page.locator('.svelte-flow__node')).toHaveCount(3);
-    await expect(page.locator('.dx-stats span')).toHaveText(['1 rules', '1 handlers', '0 in cycles']);
+    await expect(page.locator('.dx-stats span')).toHaveText(['1 rule', '1 handler', '0 in cycles']);
   });
 
   test('a read that never answers is a marked failure, not the empty line', async ({ page }) => {

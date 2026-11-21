@@ -26,20 +26,23 @@ test.describe('an unmatched path renders a not-found that names it', () => {
       // Rendered in place, never redirected: the dead path is the evidence.
       expect(new URL(page.url()).pathname).toBe(path);
       const back = page.getByRole('link', { name: /Back to My Day/ });
-      await expect(back).toHaveAttribute('href', '/ux');
-      await expect(page.locator('.perspective-tabs [aria-current="page"]')).toHaveText('Home');
+      await expect(back).toHaveAttribute('href', '/me');
+      // The bar walks the station tree since backlog 474e2c1c: a path no
+      // station answers stands at the company root, where its door leads.
+      await expect(page.locator('.perspective-tabs [aria-current="page"]')).toHaveAttribute('data-trail-stop', 'company');
     });
   }
 
-  test('an unknown /it path says so inside IT, with its one door back to the Department Map', async ({ page }) => {
+  test('an unknown /it path says so inside IT, with its one door back to the alarms board', async ({ page }) => {
     await installSmokeMocks(page);
     await mountPage(page, '/it/no-such', { titleMatch: new RegExp(TITLE) });
 
     await expect(page.locator('.app-shell')).toContainText('Nothing in this app answers /it/no-such');
     expect(new URL(page.url()).pathname).toBe('/it/no-such');
-    await expect(page.getByRole('link', { name: /Back to the Department Map/ })).toHaveAttribute('href', '/it');
-    // The IT chrome, as the yard fallback used to give it (design Q4).
-    await expect(page.locator('.perspective-tabs [aria-current="page"]')).toContainText('IT');
+    await expect(page.getByRole('link', { name: /Back to the alarms board/ })).toHaveAttribute('href', '/it');
+    // At the company root, which hosts the alarms board its door opens
+    // (backlog 474e2c1c: the bar walks the station tree).
+    await expect(page.locator('.perspective-tabs [aria-current="page"]')).toHaveAttribute('data-trail-stop', 'company');
   });
 });
 

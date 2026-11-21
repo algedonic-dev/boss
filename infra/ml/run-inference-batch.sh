@@ -141,7 +141,7 @@ by_model='{}'
 run_model() {
   local id="$1" body written errors
   echo "==> infer-batch ${id}"
-  if ! body="$("${CURL}" -sSf -X POST -H "x-boss-user: $CALLER_HEADER" ${MT_HDR:+-H "$MT_HDR"} "${BASE}/api/ml/models/${id}/infer-batch")"; then
+  if ! body="$("${CURL}" -q -sSf -X POST -H "x-boss-user: $CALLER_HEADER" ${MT_HDR:+-H "$MT_HDR"} "${BASE}/api/ml/models/${id}/infer-batch")"; then
     echo
     echo "inference-batch: infer-batch FAILED for ${id}" >&2
     return 1

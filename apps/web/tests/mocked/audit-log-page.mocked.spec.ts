@@ -1,5 +1,5 @@
 import { isPageWrite, pageWrites } from './_smokeMocks';
-// /it/operate/audit — the Audit Log, pinned
+// /operations/audit — the Audit Log, pinned
 // control by control. Page audit 65a273d5, step `test`.
 //
 // WHY THIS FILE EXISTS. The route sat in DEFERRED (_routes.ts) for want
@@ -34,10 +34,16 @@ import { expect, test, type Page, type Request, type Route } from './_test';
 import { mountPage, openedRequests, recordPageRequests } from './_helpers';
 import { FAILURE_MARKER } from './_routes';
 import { AUDIT_STATS, installSmokeMocks } from './_smokeMocks';
-import { parseRoute } from '../../src/router';
+import { parseRoute as parseRouteAt } from '../../src/router';
+import { pagePath } from '../../src/shell/page-address';
+import type { NavItem } from '../../src/shell/nav-catalog';
 import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
+import { ADDRESSES, pageAt } from '../fixtures/station-tree';
+// The router reads a hosted page's address off the station tree
+// (backlog 0bc2eb68); this spec reads it off the tree the floor serves.
+const parseRoute = (path: string, search = '') => parseRouteAt(path, search, ADDRESSES);
 
-const PATH = '/it/operate/audit';
+const PATH = '/operations/audit';
 
 const json = (r: Route, b: unknown, status = 200) =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(b) });
@@ -134,7 +140,7 @@ function route(path: string): ReturnType<typeof parseRoute> {
   return parseRoute(path);
 }
 
-const CATALOGUED = new Set(Object.values(ROUTE_CATALOG).map((i) => i.path));
+const CATALOGUED = new Set(Object.values(ROUTE_CATALOG).map((i) => pagePath(i as NavItem, ADDRESSES) ?? `unplaced:${i.id}`));
 
 /// The operate tab strip, in order, as ItTabs.svelte declares it — and
 /// whether the nav catalog (the ONE list, never a second one) carries
@@ -142,20 +148,18 @@ const CATALOGUED = new Set(Object.values(ROUTE_CATALOG).map((i) => i.path));
 /// (e52e3017). Car N3 of design e765b3fc
 /// (2026-09-25) took four tabs off the strip — Yard status, Conductor,
 /// Receiving Yard and Marshalling Yard — each a station's panel on the
-/// Department Map now, its page not found.
+/// Department Map now, its page not found. Step 1 of design 01fa5bdf
+/// (2026-11-17) took three more — Incidents, Atlas and Bottlenecks.
 const TABS: ReadonlyArray<{ label: string; path: string; catalogued: boolean }> = [
-  { label: 'Incidents', path: '/it/operate', catalogued: true },
-  { label: 'Audit Log', path: '/it/operate/audit', catalogued: true },
-  { label: 'Performance', path: '/it/operate/perf', catalogued: true },
-  { label: 'Atlas', path: '/it/operate/atlas', catalogued: true },
-  { label: 'Bottlenecks', path: '/it/operate/bottlenecks', catalogued: true },
+  { label: 'Audit Log', path: '/operations/audit', catalogued: true },
+  { label: 'Performance', path: '/operations/perf', catalogued: true },
 ];
 
 const stream = (page: Page) => page.locator('.events-table tbody tr.events-row');
 /// The one line that says what the live stream is doing (260879f5).
 const liveLine = (page: Page) => page.locator('.events-live');
 
-test.describe('/it/operate/audit — the page and its names', () => {
+test.describe('/operations/audit — the page and its names', () => {
   test('the header, the three sections, and the catalog use Audit Log (91b41817)', async ({ page }) => {
     await installAuditReads(page);
     await mountPage(page, PATH, { titleMatch: /Audit Log/ });
@@ -164,15 +168,15 @@ test.describe('/it/operate/audit — the page and its names', () => {
     for (const s of ['Size and growth', 'Filters', 'Stream']) {
       await expect(page.getByRole('heading', { name: s, exact: true })).toBeVisible();
     }
-    expect(ROUTE_CATALOG['system-monitoring'].path).toBe(PATH);
+    expect(pageAt('system-monitoring')).toBe(PATH);
     expect(ROUTE_CATALOG['system-monitoring'].label).toBe('Audit Log');
     expect(ROUTE_CATALOG['system-monitoring'].permKey).toBe('system-monitoring');
     expect(route(PATH)).toEqual({ kind: 'systemMonitoringEvents' });
   });
 });
 
-test.describe('/it/operate/audit — the tab links', () => {
-  test('five tabs, each served by the router and catalogued', async ({ page }) => {
+test.describe('/operations/audit — the tab links', () => {
+  test('two tabs, each served by the router and catalogued', async ({ page }) => {
     await installAuditReads(page);
     await mountPage(page, PATH, { titleMatch: /Audit Log/ });
     const tabs = page.locator('nav.it-tabs a');
@@ -199,7 +203,7 @@ test.describe('/it/operate/audit — the tab links', () => {
   }
 });
 
-test.describe('/it/operate/audit — size and growth (GET /api/events/stats)', () => {
+test.describe('/operations/audit — size and growth (GET /api/events/stats)', () => {
   test('the five figures, the per-day bars and the busiest kinds', async ({ page }) => {
     await installAuditReads(page);
     await mountPage(page, PATH, { titleMatch: /Audit Log/ });
@@ -243,7 +247,7 @@ test.describe('/it/operate/audit — size and growth (GET /api/events/stats)', (
   });
 });
 
-test.describe('/it/operate/audit — the stream (GET /api/events/tail)', () => {
+test.describe('/operations/audit — the stream (GET /api/events/tail)', () => {
   test('the default read is All, limit 100; the rows paint Time / Source / Kind / Actor', async ({ page }) => {
     await installAuditReads(page);
     const seen = watch(page);
@@ -512,7 +516,7 @@ test.describe('/it/operate/audit — the stream (GET /api/events/tail)', () => {
   });
 });
 
-test.describe('/it/operate/audit — the live stream (EventSource /api/events/stream)', () => {
+test.describe('/operations/audit — the live stream (EventSource /api/events/stream)', () => {
   test('frames arrive at the top, deduped against the snapshot; under All the stream sends no provenance', async ({ page }) => {
     await installAuditReads(page);
     const seen = watch(page);
@@ -745,7 +749,7 @@ test.describe('/it/operate/audit — the live stream (EventSource /api/events/st
   });
 });
 
-test.describe('/it/operate/audit — Download ⤓ (GET /api/events/export)', () => {
+test.describe('/operations/audit — Download ⤓ (GET /api/events/export)', () => {
   test('Download ⤓ opens the panel with a 7-day window; Cancel closes it without a request', async ({ page }) => {
     await installAuditReads(page);
     const exports: string[] = [];
@@ -866,7 +870,7 @@ test.describe('/it/operate/audit — Download ⤓ (GET /api/events/export)', () 
   });
 });
 
-test.describe('/it/operate/audit — writes', () => {
+test.describe('/operations/audit — writes', () => {
   test('the page issues no write: every control above is a read (0 writes in controls_md)', async ({ page }) => {
     await recordPageRequests(page);
     await installAuditReads(page);

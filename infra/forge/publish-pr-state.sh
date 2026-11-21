@@ -58,7 +58,7 @@ publish_pr_states() {
         fail "the caller made no machine_token_header MT_HDR call (infra/lib/secret-header.sh) — the pr-state writes would go out without the machine token"
     fi
     # The read carries the token as the writes below do (backlog 44b2087e).
-    if ! curl -fsS -H "x-boss-user: $BOSS_USER" \
+    if ! curl -q -fsS -H "x-boss-user: $BOSS_USER" \
             ${MT_HDR:+-H "$MT_HDR"} \
             "$BASE/api/jobs?kind=publish-to-github&limit=60&full=true" > "$workdir/prs-published" 2>"$workdir/prs-err"; then
         fail "jobs API unreachable at $BASE — $(cat "$workdir/prs-err")"
@@ -100,7 +100,7 @@ publish_pr_states() {
                 say "pr-state: ${pr_job:0:8} recorded '$pr_url', which is not a pull request url — its state stays never read"
                 continue ;;
         esac
-        if ! curl -fsS -H "accept: application/vnd.github+json" \
+        if ! curl -q -fsS -H "accept: application/vnd.github+json" \
                 "$GITHUB_API/repos/$MIRROR_SLUG/pulls/$pr_number" > "$workdir/prs-pr" 2>"$workdir/prs-err"; then
             say "pr-state: GitHub did not answer for $pr_url — $(head -c 200 "$workdir/prs-err" | tr '\n' ' '); its state stays never read"
             continue
@@ -114,7 +114,7 @@ publish_pr_states() {
                 empty|*[!0-9a-f]*)
                     say "pr-state: $pr_url names no head sha — its checks stay unread" ;;
                 *)
-                    if curl -fsS -H "accept: application/vnd.github+json" \
+                    if curl -q -fsS -H "accept: application/vnd.github+json" \
                             "$GITHUB_API/repos/$MIRROR_SLUG/commits/$head/check-runs?per_page=100" \
                             > "$workdir/prs-runs" 2>"$workdir/prs-err" \
                         && jq -c --arg head "$head" '
@@ -156,7 +156,7 @@ publish_pr_states() {
             say "pr-state: GitHub's answer for $pr_url carries no open/closed state — its state stays never read"
             continue
         fi
-        if ! curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+        if ! curl -q -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
                 ${MT_HDR:+-H "$MT_HDR"} \
                 --data-binary @"$workdir/prs-state" \
                 "$BASE/api/jobs/$pr_job/metadata" > /dev/null 2>"$workdir/prs-err"; then

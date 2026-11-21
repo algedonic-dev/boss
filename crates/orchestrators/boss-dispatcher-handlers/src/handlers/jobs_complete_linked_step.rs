@@ -396,7 +396,17 @@ fn deployed_generation(summary: &str) -> Option<&str> {
 /// already been completed, the work was done. If none of the named
 /// steps is open AND the packet still has some OTHER step open, the
 /// link pointed somewhere the obligation cannot act.
-fn noop_reason(target: &serde_json::Value, allowed: &[&str]) -> Option<String> {
+///
+/// A COUNTERPART THE PACKET ALREADY TOOK IN is not a dead link either
+/// (backlog ac141c99). A design that asks no question is recorded on
+/// the answered item's draft — `design_id` names it, `disposition =
+/// "recorded"` — and the item's own route skips `design-review` and
+/// opens `build` at filing. When that design publishes, the backstop
+/// rule finds no review and the build open; the packet's completed
+/// draft already names this very design, so the route answered it and
+/// silence is right. Read off any completed step's top-level values,
+/// not off a named key: what the packet recorded is the fact.
+fn noop_reason(target: &serde_json::Value, allowed: &[&str], closing_id: &str) -> Option<String> {
     let named: Vec<&serde_json::Value> = allowed
         .iter()
         .filter_map(|slug| step_by_slug(target, slug))
@@ -422,6 +432,21 @@ fn noop_reason(target: &serde_json::Value, allowed: &[&str]) -> Option<String> {
         .iter()
         .any(|s| s.get("status").and_then(|v| v.as_str()) == Some("completed"))
     {
+        return None;
+    }
+
+    // The packet's own route already took this counterpart in: a
+    // completed step records its id (see above).
+    let recorded_here = target
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|s| s.get("status").and_then(|v| v.as_str()) == Some("completed"))
+        .filter_map(|s| s.get("metadata").and_then(|m| m.as_object()))
+        .flat_map(|m| m.values())
+        .any(|v| v.as_str() == Some(closing_id));
+    if recorded_here {
         return None;
     }
 
@@ -793,7 +818,54 @@ impl JobsCompleteLinkedStep {
         let answer = &close.answer;
         let args = close.args;
 
+        // The rule may require evidence on the linked packet before an
+        // external step can deliver it. Reuse the rule expression language;
+        // protocol/profile names remain registry data, never handler branches.
+        let target_when = match arg(args, "target_when") {
+            None => None,
+            Some(Value::String(source)) if !source.trim().is_empty() => Some(
+                boss_dispatcher::rules::expr::parse(source)
+                    .map_err(|error| HandlerError::Permanent(format!("target_when: {error}")))?,
+            ),
+            _ => {
+                return Err(HandlerError::Permanent(
+                    "target_when must be a nonempty expression".into(),
+                ));
+            }
+        };
         let target = self.get_job(target_id, &ctx.rule_name).await?;
+        if let Some(predicate) = target_when {
+            let decision = {
+                let context = boss_dispatcher::rules::expr::Context {
+                    payload: &target,
+                    helpers: &boss_dispatcher::rules::expr::NoHelpers,
+                };
+                boss_dispatcher::rules::expr::eval(&predicate, &context)
+                    .map_err(|error| HandlerError::Permanent(format!("target_when: {error}")))?
+            };
+            match decision {
+                Value::Bool(true) => {}
+                Value::Bool(false) => {
+                    // A withheld delivery is evidence too. Reuse the
+                    // deduplicated metadata note, rather than leave a
+                    // run open with no explanation (f87641ae N2).
+                    self.note_noop(
+                        target_id,
+                        "packet",
+                        closing_id,
+                        "not delivered: target_when evidence predicate is false",
+                        &ctx.rule_name,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                _ => {
+                    return Err(HandlerError::Permanent(
+                        "target_when must return a boolean".into(),
+                    ));
+                }
+            }
+        }
 
         // GUARD 1 — a packet that already reached a terminal is
         // untouched. Its filer got their answer from whatever closed
@@ -902,7 +974,7 @@ impl JobsCompleteLinkedStep {
                     // Silent on a redelivery; loud when the link
                     // pointed at a packet this obligation cannot act
                     // on. See `noop_reason`.
-                    if let Some(why) = noop_reason(&target, allowed) {
+                    if let Some(why) = noop_reason(&target, allowed, closing_id) {
                         tracing::warn!(
                             rule = %ctx.rule_name,
                             car = %closing_id,
@@ -1296,22 +1368,10 @@ pub(crate) const FOR_REQUEST: &str = "for_request";
 /// §Diagnosis, a verdict must name what failed).
 const FAILURE_MARKERS: [&str; 2] = ["FAILED", "REFUSED"];
 
-/// The one exit that is non-zero and NOT a failure (53f54b3f):
-/// EX_TEMPFAIL, the estate's `not yet`. A verb that cannot answer YET
-/// says so and exits 75 without measuring or writing anything —
-/// `publish-drift` on a checkout behind the newest converged train
-/// (infra/gcp/publish-drift.sh), `publish-github-pr`'s `not_yet`,
-/// `install.sh` with no image in the registry, `checkout-lock` that
-/// never came — and the recorded-probe contract spells the same code
-/// the same way. A not-yet claims nothing, so there is nothing to
-/// trouble a step over and nothing to alert about; it takes the path a
-/// verb with no answer line already takes. Treating it as a failure
-/// would have filed an urgent packet on every converge that moved
-/// ahead of boss-gcp's checkout, which is most of them.
-pub(crate) const NOT_YET_EXIT: &str = "75";
-
 /// PURE over the closing packet: `Some` when its `execute` step records
-/// a non-zero `exit_code` other than [`NOT_YET_EXIT`], or an exit 0 the
+/// a non-zero `exit_code` other than the estate's not-yet
+/// ([`boss_jobs::ops_execution::NOT_YET_EXIT`]), an answer with no
+/// trustworthy exit (INDETERMINATE, design b7bb1625), or an exit 0 the
 /// runner recorded `effect_unproven` beside (the verb's declared effect
 /// was not shown, backlog fdbb447e) — the ops-runner's
 /// record of a verb that RAN and failed (a RUNNER refusal ran nothing,
@@ -1328,29 +1388,62 @@ pub(crate) const NOT_YET_EXIT: &str = "75";
 /// verdict out of it. A second notion of failure in any of the three
 /// is the fact that lives twice.
 pub(crate) fn verb_failure(closing: &serde_json::Value) -> Option<VerbFailure> {
-    let meta = step_by_slug(closing, super::ops_judge::REPORT_STEP)?.get("metadata")?;
-    let exit = match meta.get("exit_code")? {
-        serde_json::Value::String(s) => s.trim().to_string(),
-        serde_json::Value::Number(n) => n.to_string(),
-        _ => return None,
-    };
-    // AN EXIT 0 IS NOT AN EFFECT (backlog fdbb447e part 1): the runner
-    // judged the verb's declared effect on this run and recorded that it
-    // was NOT shown. That is a verb that did not do its job, whatever its
-    // exit — the shape the daily prune's proof missed.
-    if exit == "0" {
-        let unproven = meta
-            .get("effect_unproven")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())?;
-        return Some(VerbFailure {
-            exit,
-            line: format!("EFFECT NOT SHOWN — {}", unproven.trim()),
-        });
-    }
-    if exit.is_empty() || exit == NOT_YET_EXIT {
+    use boss_jobs::ops_execution::{Effect, Execution, classify};
+    // The family judges ops-requests; another kind's `execute` step is
+    // not a runner's execution record, and is not read as one.
+    if closing
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .is_some_and(|k| k != "ops-request")
+    {
         return None;
     }
+    let meta = step_by_slug(closing, super::ops_judge::REPORT_STEP)?.get("metadata")?;
+    // HOW THE VERB ENDED IS READ BY THE ONE CLASSIFIER (design b7bb1625,
+    // backlog 50a1578f), which every other reader of the record shares.
+    // Until it, an answered execute with no exit, or a null one, read
+    // here as NO failure — the linked step completed on a verb whose
+    // result nobody recorded.
+    let exit = match classify(meta) {
+        // AN EXIT 0 IS NOT AN EFFECT (backlog fdbb447e part 1): the
+        // runner judged the verb's declared effect on this run and
+        // recorded that it was NOT shown. That is a verb that did not do
+        // its job, whatever its exit — the shape the daily prune's proof
+        // missed.
+        Execution::Answered {
+            effect: Effect::Unproven(why),
+        } => {
+            return Some(VerbFailure {
+                exit: "0".to_string(),
+                line: format!("EFFECT NOT SHOWN — {}", why.trim()),
+            });
+        }
+        Execution::Answered { .. } | Execution::Refused { .. } => return None,
+        // An unknown result is a failure in every judge here: never a
+        // success, never "nothing ran". The exit it recorded, if any, is
+        // kept as recorded; none is spelled `unrecorded`, never a number.
+        Execution::Indeterminate { raw, cause } => {
+            return Some(VerbFailure {
+                exit: raw.unwrap_or_else(|| "unrecorded".to_string()),
+                line: format!("INDETERMINATE — {cause}"),
+            });
+        }
+        // The one nonzero exit that is NOT a failure HERE (53f54b3f):
+        // EX_TEMPFAIL, the estate's `not yet`. A verb that cannot answer
+        // YET says so and exits 75 without measuring or writing anything
+        // — `publish-drift` on a checkout behind the newest converged
+        // train (infra/gcp/publish-drift.sh), `publish-github-pr`'s
+        // `not_yet`, `install.sh` with no image in the registry,
+        // `checkout-lock` that never came — and the recorded-probe
+        // contract spells the same code the same way. A not-yet claims
+        // nothing, so there is nothing to trouble a step over and nothing
+        // to alert about. Treating it as a failure would have filed an
+        // urgent packet on every converge that moved ahead of boss-gcp's
+        // checkout, which is most of them. The classifier reads it
+        // `failed` with `not_yet()`; the exemption is this family's.
+        e @ Execution::Failed { .. } if e.not_yet() => return None,
+        Execution::Failed { exit, .. } => exit,
+    };
     let output = meta.get("output").and_then(|v| v.as_str()).unwrap_or("");
     let mut lines = output.lines().map(str::trim).filter(|l| !l.is_empty());
     let line = FAILURE_MARKERS
@@ -1365,6 +1458,7 @@ pub(crate) fn verb_failure(closing: &serde_json::Value) -> Option<VerbFailure> {
 #[cfg(test)]
 mod verb_failure_tests {
     use super::*;
+    use boss_jobs::ops_execution::NOT_YET_EXIT;
 
     /// The answered request as the ops-runner completes it: the exit on
     /// the EXECUTE step, under `exit_code`, and nowhere else. That is
@@ -1434,6 +1528,30 @@ mod verb_failure_tests {
         let mut unread = answered("0", "acts: done\n");
         unread["steps"][0]["metadata"]["effect_unread"] = json!("prints no re-list");
         assert_eq!(verb_failure(&unread), None);
+    }
+
+    /// AN ANSWER WITH NO TRUSTWORTHY EXIT IS NOT A SUCCESS (design
+    /// b7bb1625, backlog 50a1578f). The runner writes an exit on every
+    /// invocation, so an answered execute with none — or with one that is
+    /// not an exit status — says the verb was invoked and not how it
+    /// ended. Read as no failure, it completed the linked step and filed
+    /// no alert; it is INDETERMINATE, and every judge here refuses it.
+    #[test]
+    fn an_answer_with_no_trustworthy_exit_is_a_failure() {
+        let mut missing = answered("0", "moving\n");
+        missing["steps"][0]["metadata"]["exit_code"] = json!(null);
+        let f = verb_failure(&missing).expect("an unrecorded exit is no success");
+        assert_eq!(f.exit, "unrecorded");
+        assert!(
+            f.line.starts_with("INDETERMINATE — ") && f.line.contains("no exit was recorded"),
+            "{}",
+            f.line
+        );
+        let f = verb_failure(&answered("", "moving\n")).expect("an empty exit is no success");
+        assert_eq!(f.exit, "unrecorded");
+        let f = verb_failure(&answered("-1", "moving\n")).expect("a malformed exit is no success");
+        assert_eq!(f.exit, "-1");
+        assert!(f.line.starts_with("INDETERMINATE — "), "{}", f.line);
     }
 
     /// The runner records 124 when it kills a verb at its timeout — the
@@ -1771,11 +1889,15 @@ impl JobsCompleteLinkedStep {
             .map(|t| fill(&existing, t, shipped))
             .unwrap_or_default();
         fields.insert(evidence_key.to_string(), shipped.evidence.clone());
-        super::common::complete_step(
+        // The step as read, so a run's claimed `building` is exited by
+        // naming its claim: the green and the delivery free the slot at
+        // the verdict, not at the lease (backlog 7b5195ea).
+        super::common::complete_read_step(
             &self.client,
             self.jobs_base.trim_end_matches('/'),
             target_id,
             step_id,
+            step,
             fields,
             rule,
         )
@@ -3479,19 +3601,139 @@ mod tests {
 
     /// The rule row `agent-run-delivers-when-its-step-is-done` carries.
     fn delivery_args() -> Vec<(String, Value)> {
-        vec![
-            ("link".to_string(), Value::String("agent_run".into())),
-            ("link_from".to_string(), Value::String("step".into())),
-            ("steps".to_string(), Value::String("building".into())),
+        let source = std::fs::read_to_string(
+            boss_testing::repo_root()
+                .join("infra/dispatcher/rules/agent-run-delivers-when-its-step-is-done.toml"),
+        )
+        .unwrap();
+        let row: toml::Value = toml::from_str(&source).unwrap();
+        row["rule"][0]["do"][0]["args"]
+            .as_table()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| {
+                let expression =
+                    boss_dispatcher::rules::expr::parse(value.as_str().unwrap()).unwrap();
+                let value = boss_dispatcher::rules::expr::eval(
+                    &expression,
+                    &boss_dispatcher::rules::expr::Context {
+                        payload: &serde_json::Value::Null,
+                        helpers: &boss_dispatcher::rules::expr::NoHelpers,
+                    },
+                )
+                .unwrap();
+                (key.clone(), value)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_external_step_completion_cannot_deliver_a_verdictless_reviewer() {
+        let mut reviewer = run("active");
+        reviewer["metadata"]["profile"] = json!("reviewer");
+        reviewer["metadata"]["step"] = json!("review");
+        let (base, puts, patches) =
+            mock_jobs(vec![executing_packet(json!({"agent_run":RUN})), reviewer]).await;
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
+        let args = delivery_args();
+        h.invoke(&args, &step_ctx(step_done_marker(json!({"agent_run":RUN}))))
+            .await
+            .expect("an unpaid obligation remains open");
+        assert!(puts.lock().unwrap().is_empty(), "no invented delivery");
+        let notes = patches.lock().unwrap();
+        assert_eq!(notes.len(), 1, "an unpaid verdict must leave a diagnostic");
+        assert!(
+            notes[0].1["obligation_noop"]["why"]
+                .as_str()
+                .unwrap()
+                .contains("target_when")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_delivery_rule_keeps_real_verdicts_and_ordinary_builders() {
+        let valid = json!({"verdict":"release","car":PACKET,
+            "reviewed_sha":"a".repeat(40),"at":"2026-10-24T17:00:00Z"});
+        let mut changes = valid.clone();
+        changes["verdict"] = json!("changes");
+        let mut mismatches = Vec::new();
+        for (profile, step, review, delivered) in [
+            ("builder", "build", serde_json::Value::Null, true),
+            ("analyst", "measure", serde_json::Value::Null, true),
+            ("tenant-reviewer", "review", serde_json::Value::Null, true),
+            ("analyst", "review", serde_json::Value::Null, true),
+            ("reviewer", "landed-review", serde_json::Value::Null, true),
+            ("reviewer", "review", valid.clone(), true),
+            ("reviewer", "review", changes, true),
+            ("reviewer", "review", json!({"verdict":"looks fine"}), false),
+            ("reviewer", "review", json!({"verdict":"release"}), false),
             (
-                "evidence_key".to_string(),
-                Value::String("delivered".into()),
+                "reviewer",
+                "review",
+                json!({"verdict":"release","car":"another","reviewed_sha":"a".repeat(40),"at":"now"}),
+                false,
             ),
-            (
-                "done_metadata".to_string(),
-                Value::String(r#"{"result": "delivered"}"#.into()),
-            ),
-        ]
+        ] {
+            let mut target = run("active");
+            target["metadata"]["profile"] = json!(profile);
+            target["metadata"]["step"] = json!(step);
+            target["metadata"]["review"] = review;
+            let (base, puts, _) =
+                mock_jobs(vec![executing_packet(json!({"agent_run":RUN})), target]).await;
+            let handler = JobsCompleteLinkedStep::with_client(
+                crate::handlers::common::api_client(),
+                base,
+                test_owner(),
+            );
+            handler
+                .invoke(
+                    &delivery_args(),
+                    &step_ctx(step_done_marker(json!({"agent_run":RUN}))),
+                )
+                .await
+                .expect("valid rule data");
+            let actual = puts.lock().unwrap().len();
+            if actual != usize::from(delivered) {
+                mismatches.push((profile, step, actual, delivered));
+            }
+        }
+        assert!(mismatches.is_empty(), "delivery mismatches: {mismatches:?}");
+    }
+
+    #[tokio::test]
+    async fn malformed_target_predicates_never_complete_the_linked_step() {
+        for predicate in [
+            Value::Int(1),
+            Value::String("".into()),
+            Value::String("metadata.".into()),
+            Value::String("1".into()),
+        ] {
+            let (base, puts, patches) = mock_jobs(vec![
+                executing_packet(json!({"agent_run":RUN})),
+                run("active"),
+            ])
+            .await;
+            let handler = JobsCompleteLinkedStep::with_client(
+                crate::handlers::common::api_client(),
+                base,
+                test_owner(),
+            );
+            let mut args = delivery_args();
+            args.retain(|(key, _)| key != "target_when");
+            args.push(("target_when".into(), predicate));
+            assert!(
+                handler
+                    .invoke(&args, &step_ctx(step_done_marker(json!({"agent_run":RUN}))))
+                    .await
+                    .is_err()
+            );
+            assert!(puts.lock().unwrap().is_empty());
+            assert!(patches.lock().unwrap().is_empty());
+        }
     }
 
     fn step_ctx(payload: serde_json::Value) -> InvocationContext {
@@ -3760,6 +4002,46 @@ mod tests {
         assert!(puts.lock().unwrap().is_empty());
     }
 
+    /// A RUN HANDED TO THE GATE STILL RECEIVES ITS VERDICT (backlog
+    /// a99dd722). The hand-off releases the run's slot against the cap and
+    /// leaves the run open at `building`; the green lands it exactly as
+    /// before, through the edge on the GATE-RUN, with the run's own
+    /// `handed_to_gate` record beside it and untouched by the landing.
+    #[tokio::test]
+    async fn a_run_handed_to_the_gate_still_lands_on_its_green() {
+        let mut handed = run("active");
+        handed["metadata"][boss_jobs::gate_handoff::KEY] = json!({
+            "schema": 1, "run": RUN, "gate_run": GATE,
+            "command": "99999999-9999-4999-8999-999999999999",
+            "accepted_at": "2026-11-06T17:00:00Z", "accepted_by": "agent-claude-b",
+            "branch": "fix/x", "sha": "abc123" });
+        let (base, puts, patches) = mock_jobs(vec![
+            green_gate(json!({ "agent_run": RUN, "branch": "fix/x" })),
+            handed,
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
+        let marker = json!({ "id": GATE, "kind": "gate-run", "outcome": "completed",
+                             "closed_on": "2026-11-06", "parent_step_id": null });
+        h.invoke(&landing_args(), &ctx(marker)).await.expect("runs");
+        let puts = puts.lock().unwrap().clone();
+        assert_eq!(puts.len(), 1, "{puts:?}");
+        assert_eq!(puts[0].0, "r-building");
+        assert_eq!(puts[0].1["metadata"]["result"], "gated");
+        assert!(
+            patches
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, body)| body.get(boss_jobs::gate_handoff::KEY).is_none()),
+            "the landing writes nothing over the hand-off"
+        );
+    }
+
     /// THE BUILDER'S WORKTREE RIDES THE GREEN (backlog a3355e14). The
     /// run packet used to record the DISPATCHER's cwd as its worktree;
     /// the only party that knows the builder's is the gate it
@@ -3812,6 +4094,192 @@ mod tests {
         );
     }
 
+    /// THE VERDICT FREES THE SLOT (backlog 7b5195ea). Since agent-run v11
+    /// a run's `building` holds a robots-pool claim, and the PUT refuses
+    /// to take a claimed step out of Active unless the body names the
+    /// claim. On 2026-11-08 the green's landing and the analyst's
+    /// delivery sent a bare status, so finished runs held robots:opus
+    /// 4/4 until their leases ran out. Both landings now name the claim
+    /// the step held as they read it; a step holding none sends none.
+    #[tokio::test]
+    async fn a_landing_names_the_claim_the_runs_building_holds() {
+        use boss_jobs::flow_resources::{EXIT_CLAIM_KEY, TOKEN_KEY};
+        const CLAIM: &str = "5b0f3c1e-8f2a-4f0e-9a51-3d2c1b0a9f8e";
+        let claimed = || {
+            let mut r = run("active");
+            r["steps"][2]["metadata"][TOKEN_KEY] = json!({ "id": CLAIM });
+            r
+        };
+        let green = json!({ "id": GATE, "kind": "gate-run", "outcome": "completed",
+                            "closed_on": "2026-11-08", "parent_step_id": null });
+        let landed = |gate_or_packet: serde_json::Value, run: serde_json::Value| async move {
+            let (base, puts, _) = mock_jobs(vec![gate_or_packet, run]).await;
+            let h = JobsCompleteLinkedStep::with_client(
+                crate::handlers::common::api_client(),
+                base,
+                test_owner(),
+            );
+            (h, puts)
+        };
+
+        let (h, puts) = landed(green_gate(json!({ "agent_run": RUN })), claimed()).await;
+        h.invoke(&landing_args(), &ctx(green.clone()))
+            .await
+            .expect("the green lands");
+        let puts = puts.lock().unwrap().clone();
+        assert_eq!(puts.len(), 1, "{puts:?}");
+        assert_eq!(puts[0].1[EXIT_CLAIM_KEY], CLAIM, "{puts:?}");
+
+        let (h, puts) = landed(executing_packet(json!({ "agent_run": RUN })), claimed()).await;
+        h.invoke(
+            &delivery_args(),
+            &step_ctx(step_done_marker(json!({ "agent_run": RUN }))),
+        )
+        .await
+        .expect("the delivery lands");
+        let puts = puts.lock().unwrap().clone();
+        assert_eq!(puts.len(), 1, "{puts:?}");
+        assert_eq!(puts[0].1[EXIT_CLAIM_KEY], CLAIM, "{puts:?}");
+
+        let (h, puts) = landed(green_gate(json!({ "agent_run": RUN })), run("active")).await;
+        h.invoke(&landing_args(), &ctx(green)).await.expect("runs");
+        let puts = puts.lock().unwrap().clone();
+        assert!(puts[0].1.get(EXIT_CLAIM_KEY).is_none(), "{puts:?}");
+    }
+
+    /// A RED ENDS THE RUN AND FREES ITS SLOT (backlog e5cec272). A red
+    /// gate landed nothing on its run, so the run's robots claim held
+    /// its slot until `lease_until`. The rule
+    /// `agent-run-is-refused-on-gate-red`, read from its file and
+    /// matched as the dispatcher matches it, fires on a FAILED gate-run
+    /// close only, and completes `building` with `result = refused`
+    /// naming the claim the step held — and a green does not match it.
+    #[tokio::test]
+    async fn a_red_gate_refuses_its_run_and_names_the_claim() {
+        use boss_dispatcher::rules::expr::NoHelpers;
+        use boss_dispatcher::rules::registry::{Registry, match_event};
+        use boss_jobs::flow_resources::{EXIT_CLAIM_KEY, TOKEN_KEY};
+        const CLAIM: &str = "5b0f3c1e-8f2a-4f0e-9a51-3d2c1b0a9f8e";
+        let path =
+            boss_testing::dispatcher_rules_dir().join("agent-run-is-refused-on-gate-red.toml");
+        let toml = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let reg = Registry::from_toml(&toml).expect("the rule file parses");
+        let close = |outcome: &str| {
+            json!({ "id": GATE, "kind": "gate-run", "outcome": outcome,
+                    "closed_on": "2026-11-08", "parent_step_id": null })
+        };
+        assert!(
+            match_event(&reg, "jobs.job.closed", &close("completed"), &NoHelpers)
+                .matched
+                .is_empty(),
+            "a green is the landing rule's, not this one's"
+        );
+        let red = close("failed");
+        let matched = match_event(&reg, "jobs.job.closed", &red, &NoHelpers).matched;
+        assert_eq!(matched.len(), 1, "a red gate-run fires the rule once");
+        let inv = &matched[0].invocations[0];
+        assert_eq!(inv.handler, "jobs.complete_linked_step");
+
+        let mut claimed = run("active");
+        claimed["steps"][2]["metadata"][TOKEN_KEY] = json!({ "id": CLAIM });
+        let (base, puts, _) = mock_jobs(vec![
+            green_gate(json!({ "agent_run": RUN, "branch": "fix/x" })),
+            claimed,
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
+        h.invoke(&inv.args, &ctx(red))
+            .await
+            .expect("the red ends the run");
+        let puts = puts.lock().unwrap().clone();
+        assert_eq!(puts.len(), 1, "{puts:?}");
+        assert_eq!(puts[0].0, "r-building");
+        assert_eq!(puts[0].1["status"], "completed", "{puts:?}");
+        assert_eq!(puts[0].1["metadata"]["result"], "refused", "{puts:?}");
+        assert_eq!(puts[0].1["metadata"]["gate_run"]["branch"], "fix/x");
+        assert_eq!(puts[0].1[EXIT_CLAIM_KEY], CLAIM, "{puts:?}");
+    }
+
+    /// A WITHDRAWN GATE ENDS ITS HANDED RUN AT ONCE (backlog 19a674cf).
+    /// A gate withdrawn before any runner pod existed judged nothing, so
+    /// neither the green nor the red rule ever reaches the run `boss
+    /// gate` handed it — the run waited on `verdict` until the silence
+    /// clock aged it `died` hours later. The rule
+    /// `agent-run-is-refused-on-gate-withdrawn`, read from its file and
+    /// matched as the dispatcher matches it, fires on a WITHDRAWN close
+    /// only, and completes the handed run's `verdict` as `refused` with
+    /// `category = gate-withdrawn`.
+    #[tokio::test]
+    async fn a_withdrawn_gate_refuses_its_handed_run() {
+        use boss_dispatcher::rules::expr::NoHelpers;
+        use boss_dispatcher::rules::registry::{Registry, match_event};
+        let path = boss_testing::dispatcher_rules_dir()
+            .join("agent-run-is-refused-on-gate-withdrawn.toml");
+        let toml = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let reg = Registry::from_toml(&toml).expect("the rule file parses");
+        let close = |outcome: &str| {
+            json!({ "id": GATE, "kind": "gate-run", "outcome": outcome,
+                    "closed_on": "2026-11-19", "parent_step_id": null })
+        };
+        for other in ["completed", "failed", "lost", "refused"] {
+            assert!(
+                match_event(&reg, "jobs.job.closed", &close(other), &NoHelpers)
+                    .matched
+                    .is_empty(),
+                "a `{other}` gate-run is not this rule's"
+            );
+        }
+        let withdrawn = close("withdrawn");
+        let matched = match_event(&reg, "jobs.job.closed", &withdrawn, &NoHelpers).matched;
+        assert_eq!(matched.len(), 1, "a withdrawn gate-run fires the rule once");
+        let inv = &matched[0].invocations[0];
+        assert_eq!(inv.handler, "jobs.complete_linked_step");
+
+        // The run as `boss gate` leaves it: `building` completed
+        // `handed`, the hand-off record on the packet, `verdict` open.
+        let mut handed = run("completed");
+        handed["steps"][2]["metadata"]["result"] = json!("handed");
+        handed["steps"].as_array_mut().expect("steps").insert(
+            3,
+            json!({ "id": "r-verdict", "spec_slug": "verdict",
+                               "status": "ready", "metadata": {} }),
+        );
+        handed["metadata"][boss_jobs::gate_handoff::KEY] = json!({
+            "schema": 1, "run": RUN, "gate_run": GATE,
+            "command": "99999999-9999-4999-8999-999999999999",
+            "accepted_at": "2026-11-19T13:00:00Z", "accepted_by": "agent-claude",
+            "branch": "fix/x", "sha": "abc123" });
+        let (base, puts, _) = mock_jobs(vec![
+            green_gate(json!({ "agent_run": RUN, "branch": "fix/x" })),
+            handed,
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
+        h.invoke(&inv.args, &ctx(withdrawn))
+            .await
+            .expect("the withdrawal ends the run");
+        let puts = puts.lock().unwrap().clone();
+        assert_eq!(puts.len(), 1, "{puts:?}");
+        assert_eq!(puts[0].0, "r-verdict", "{puts:?}");
+        assert_eq!(puts[0].1["status"], "completed", "{puts:?}");
+        assert_eq!(puts[0].1["metadata"]["result"], "refused", "{puts:?}");
+        assert_eq!(
+            puts[0].1["metadata"]["category"], "gate-withdrawn",
+            "{puts:?}"
+        );
+        assert_eq!(puts[0].1["metadata"]["gate_run"]["branch"], "fix/x");
+    }
+
     /// The default is the JOB metadata — every rule authored before v7
     /// names no `link_from` and must be untouched by it.
     #[test]
@@ -3830,6 +4298,32 @@ mod noop_reason_tests {
     use serde_json::json;
 
     const ALLOWED: [&str; 3] = ["investigate", "design-review", "build"];
+    /// The closing packet — a car, or a design — the obligation follows.
+    const CAR: &str = "c4a1c0de-0000-4000-8000-000000000001";
+
+    /// A design that asks no question is RECORDED on the item's draft
+    /// (backlog ac141c99): the item's own route skips `design-review`
+    /// and opens `build` at filing. When that design later publishes,
+    /// the backstop rule finds no review to complete and the build
+    /// open — and that is not a dead link: the packet already took this
+    /// design in, on the completed draft that names it. Saying "most
+    /// often because nobody has triaged it yet" there, on both packets,
+    /// would be a confident wrong note.
+    #[test]
+    fn a_counterpart_the_packet_already_recorded_says_nothing() {
+        let item = json!({ "steps": [
+            { "spec_slug": "draft-design", "status": "completed",
+              "metadata": { "design_id": CAR, "disposition": "recorded" } },
+            { "spec_slug": "design-review", "status": "skipped", "metadata": {} },
+            { "spec_slug": "build", "status": "ready", "metadata": {} },
+        ]});
+        assert_eq!(noop_reason(&item, &["design-review"], CAR), None);
+        // The control: a DIFFERENT design reaching the same packet is
+        // one it never took in, and that is still said out loud.
+        let other = "d1ffe4e7-0000-4000-8000-000000000002";
+        let why = noop_reason(&item, &["design-review"], other).expect("reported");
+        assert!(why.contains("build"), "{why}");
+    }
 
     fn packet(steps: &[(&str, &str)]) -> serde_json::Value {
         json!({
@@ -3849,6 +4343,7 @@ mod noop_reason_tests {
         let why = noop_reason(
             &packet(&[("triage", "ready"), ("build", "pending")]),
             &ALLOWED,
+            CAR,
         )
         .expect("reported");
         assert!(why.contains("triage"), "{why}");
@@ -3864,7 +4359,8 @@ mod noop_reason_tests {
         assert_eq!(
             noop_reason(
                 &packet(&[("triage", "completed"), ("build", "completed")]),
-                &ALLOWED
+                &ALLOWED,
+                CAR
             ),
             None
         );
@@ -3877,7 +4373,8 @@ mod noop_reason_tests {
         assert_eq!(
             noop_reason(
                 &packet(&[("triage", "pending"), ("build", "pending")]),
-                &ALLOWED
+                &ALLOWED,
+                CAR
             ),
             None
         );
@@ -3890,14 +4387,18 @@ mod noop_reason_tests {
     fn an_actionable_packet_is_not_reported_as_a_noop() {
         // `build` is open and named — the caller completes it, so this
         // must not claim there was nothing to do.
-        assert_eq!(noop_reason(&packet(&[("build", "ready")]), &ALLOWED), None);
+        assert_eq!(
+            noop_reason(&packet(&[("build", "ready")]), &ALLOWED, CAR),
+            None
+        );
         // Even alongside another open step, which is the shape that
         // first tripped this: `triage` open is not evidence of a dead
         // link when `build` is open too.
         assert_eq!(
             noop_reason(
                 &packet(&[("triage", "ready"), ("build", "ready")]),
-                &ALLOWED
+                &ALLOWED,
+                CAR
             ),
             None
         );
@@ -3905,7 +4406,8 @@ mod noop_reason_tests {
 
     #[test]
     fn the_message_names_what_the_obligation_can_complete() {
-        let why = noop_reason(&packet(&[("needs-info", "active")]), &ALLOWED).expect("reported");
+        let why =
+            noop_reason(&packet(&[("needs-info", "active")]), &ALLOWED, CAR).expect("reported");
         for slug in ALLOWED {
             assert!(why.contains(slug), "{why} is missing {slug}");
         }

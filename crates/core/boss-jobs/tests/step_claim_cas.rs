@@ -1,4 +1,4 @@
-//! The claim primitive (queue-visibility Q2): Ready→Active is a
+//! The claim primitive (queue-visibility Q2, in the decision record): Ready→Active is a
 //! compare-and-set, not a blind PUT. Two actors pulling the same
 //! step from a group queue must resolve to exactly one winner, and
 //! the loser must be told who holds it — otherwise the network

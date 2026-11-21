@@ -23,6 +23,11 @@
 //!   regex. It lives here because this crate already holds the tests
 //!   that read the repository AS AN ARTEFACT (`gate_sh.rs`,
 //!   `codebase_metrics_sh.rs`) rather than any service's behaviour.
+//! - `reexec`, the one way a test re-runs its own binary as a child and
+//!   bounds only the child's work, never its start (backlog 7e30ddb0)
+//! - `path_stub`, the one spelling of a stub bin directory first on
+//!   PATH: the call log, the handoff to the real binary, and which calls
+//!   the fixture never answers (backlog 59f4b65d)
 //! - `adapters_agree!`, one body of assertions run against every adapter
 //!   of a port, one test per (case, adapter) — see `adapter_suite`
 //!   (design 3036296f, mechanism C)
@@ -37,12 +42,16 @@ pub mod kubectl_secret_stub;
 pub mod leaked_policy;
 pub mod ops_runner_stub;
 pub mod passkey;
+pub mod path_stub;
 pub mod production_source;
 pub mod proxy;
 pub mod rbac;
 pub mod recording_bus;
+pub mod reexec;
 pub mod request;
+pub mod root_tree;
 pub mod scratch;
+pub mod signals;
 #[cfg(feature = "postgres")]
 pub mod test_db;
 pub mod test_values;
@@ -55,10 +64,13 @@ pub use git::git_config_isolated;
 pub use proxy::{PROXY_VARS, without_proxy};
 pub use recording_bus::RecordingEventBus;
 pub use request::{TestRequest, TestResponse};
+pub use root_tree::export_root_generation;
 pub use scratch::{copy_exec, create_dir, scratch_dir, scratch_path, write_exec, write_file};
+pub use signals::with_default_signals;
 #[cfg(feature = "postgres")]
 pub use test_db::TestDb;
 pub use tree::{
-    LINT_LIB_DIRS, copy_gate_sh, copy_lint_libs, dispatcher_rules_dir, repo_root, tree_match,
+    CRATE_PIN_TEST_PATTERN, LINT_LIB_DIRS, TREE_WIDE_FILE_PATTERN, TREE_WIDE_TEST_PATTERN,
+    copy_gate_sh, copy_lint_libs, dispatcher_rules_dir, repo_root, tree_match, tree_wide_pattern,
     tunnel_ingress_summary,
 };

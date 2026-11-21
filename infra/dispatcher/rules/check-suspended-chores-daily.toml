@@ -1,0 +1,45 @@
+# Read which cluster chores stand suspended every day, so a chore
+# suspended by hand cannot stay suspended in silence.
+#
+# THE GAP (backlog 87e08026, car 2 of d28c0051). Suspending a chore
+# (a CronJob labelled boss-chore=true) sets spec.suspend, and nothing read
+# it afterwards: the converge's client-side apply does not own that field,
+# so it keeps a live true across every apply, and check-manifests-applied
+# only asks that each CronJob exists. boss/boss-search-reindex was
+# suspended by hand at 2026-11-11 05:02Z (832386eb) and the only sign of
+# it was its verdict packets no longer arriving.
+#
+# THE READER. This rule files the read-only check-suspended-chores for the
+# forge once a day; watch-check-suspended-chores-daily judges its verdict
+# line and files an urgent alarm once the oldest suspension has stood 24
+# hours (the threshold lives in that rule's `when`), or when the check
+# could not read. The age is the API server's own managedFields time for
+# the write that owns spec.suspend, not a clock this rule keeps, so a
+# suspension resumed within the day costs nothing and one forgotten is an
+# alarm a day later at most. The shape is check-longhorn-drain-policy-daily's:
+# one verb file, this rule, one watch; no unit, no new kind.
+#
+# NO GUARD. The check is read-only and idempotent; a `NOT open_*` guard
+# would let one unfinished request retire the cadence
+# (`a-dedup-guard-silently-retires-a-cadence`).
+#
+# The packet's subject is `suspended-chores`, an identity this rule alone
+# files, so `cadence_roster::clock_cadences` derives a daily
+# `ops-request/suspended-chores` the silence sweep can measure.
+[[rule]]
+name = "check-suspended-chores-daily"
+why = """
+A TIMER, the standing exemption: "a day passed with a chore still
+suspended" is no packet's event — the suspension is a kubectl write the
+log never saw, and the chore it stops files nothing — so no Workflow
+consequence can fire it. Asked for on backlog 87e08026 (car 2 of
+d28c0051): a chore suspended and never resumed must not stand in
+silence. It files the read-only check-suspended-chores verb;
+watch-check-suspended-chores-daily turns a suspension past the threshold
+into an alarm. It adds no routing: one firing spawns one ops-request,
+and what happens next is that protocol's row.
+"""
+schedule = { cadence = "daily", anchor_date = "2026-11-11" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"ops-request\"", subject_kind = "\"custom\"", subject = "\"suspended-chores\"", title = "\"read which cluster chores stand suspended, and since when\"", "metadata.host" = "\"forge\"", "metadata.verb" = "\"check-suspended-chores\"", "metadata.area" = "\"platform\"" }

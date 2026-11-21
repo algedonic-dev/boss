@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { safeLinkHref } from '@boss/web-kit/links';
+  import { pageLink } from '../shell/stationAddresses.svelte';
   // /it/kb — IT Knowledge Base.
   //
   // The IT department's reference: the four architecture diagrams,
@@ -116,9 +118,9 @@
          decision record in the making — are read (d133ebf0); no repo
          file is linked, because on any other deployer's instance it
          would point at our LAN-only forge. -->
-    <a href={href('/it/registry')} style="color:var(--fog)">Registry ↗</a>
+    <a href={safeLinkHref(pageLink('workflows'))} style="color:var(--fog)">Registry ↗</a>
     <span style="color:var(--static)">·</span>
-    <a href={href('/it/design')} style="color:var(--fog)">Design decisions ↗</a>
+    <a href={safeLinkHref(pageLink('system-design'))} style="color:var(--fog)">Design decisions ↗</a>
   </nav>
 
   <div class="tab-content" style="display:flex; flex-direction:column; gap:24px; padding:16px 0">
@@ -248,7 +250,7 @@
              /it/estate renders; drawing it here would be a second copy
              that drifts (34717528). -->
         How this instance runs is data, not a drawing:
-        <a href={href('/it/estate')}>This instance's estate, live ↗</a>
+        <a href={safeLinkHref(pageLink('system-estate'))}>This instance's estate, live ↗</a>
       </p>
       <KbDiagram diagram={kbDiagram('03-deployment.mmd')} />
     </section>

@@ -36,7 +36,7 @@ test(`a late prior refresh cannot replace the newest ${newest} result`, async ({
   await page.route(`/api/jobs/${NEW}`, (route) => answer(route, packet(NEW, 2)));
   await page.route(`/api/jobs/${OLD}`, (route) => answer(route, packet(OLD, 1)));
   try {
-    await mountPage(page, '/it/operate/audit');
+    await mountPage(page, '/operations/audit');
     await expect.poll(() => reads).toBe(1);
     await page.clock.fastForward(60_000);
     const region = page.getByRole('region', { name: 'Audit integrity' });

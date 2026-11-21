@@ -86,9 +86,20 @@ pub(crate) enum State {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum CacheError {
     InvalidBinding,
+    StaleReplacement(ReplacementRefusal),
     Unavailable,
     Conflict,
     Quarantined,
+}
+
+/// Fixed diagnostic codes only: no provider bytes, claims or private
+/// response text can travel in a replacement refusal (34f6b449).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ReplacementRefusal {
+    IdTokenUnchanged,
+    AccessTokenUnchanged,
+    RefreshTokenUnchanged,
+    IdTokenIssuedBeforeRefresh,
 }
 
 /// A trusted collector's metadata about privately retained/staged bytes.

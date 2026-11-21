@@ -104,8 +104,12 @@ fn is_an_employee(user: &User) -> bool {
 }
 
 /// Ask policy who `user` may read, or the response that refuses.
-/// A policy service that cannot answer refuses with 500: a gate that
-/// cannot be asked is not a gate that passed.
+/// A policy service that cannot answer refuses with the client's own
+/// rendering — 503 + `Retry-After` for an outage — because a gate that
+/// cannot be asked is not a gate that passed. Until backlog 12875389
+/// this answered a 500 carrying the client's detail, which names the
+/// policy service's internal address (fe9d212c), under a doc saying 500
+/// that no test held.
 pub(crate) async fn readable(
     policy: &dyn PolicyClient,
     user: &User,
@@ -114,13 +118,7 @@ pub(crate) async fn readable(
     let predicate = policy
         .scope_of(user, controls::READ_SCHEDULE)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("policy check failed: {e}"),
-            )
-                .into_response()
-        })?;
+        .map_err(IntoResponse::into_response)?;
     let original = from_predicate(&predicate, user);
     if let Some(reporter) = reporter {
         reporter.observe_selection("schedule-self-floor", user, &original, |candidate| {
@@ -138,17 +136,6 @@ pub(crate) async fn readable(
         )
             .into_response()
     })
-}
-
-/// The refusal of a read by id: generic, because the caller did not
-/// name the employee and must not learn it from the refusal
-/// (adversarial review, 2026-09-25).
-pub(crate) fn not_in_scope() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        "this assignment's schedule is outside your scope",
-    )
-        .into_response()
 }
 
 /// The refusal of a read that named `employee_id` itself — echoing

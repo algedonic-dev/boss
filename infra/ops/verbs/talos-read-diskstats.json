@@ -1,0 +1,17 @@
+{
+  "about": "READ-ONLY: per-device write and flush latency of one cluster node, from the kernel's own counters (infra/forge/talos-read-diskstats.sh <node>; backlog ba0b7308, design f29798c0 car 1 — the 2026-10-29 WAL stalls were blamed on the control-plane disks from the drive class alone, because no door recorded per-device latency, 803e10ed). Through the forge's ops_talosctl door, three literal calls at the registry's address: talosctl get disks -o json (each drive's model, serial, size and transport, as talos-get disks names them) and talosctl read /proc/diskstats twice, 30 s apart. Per device it prints the interval's writes, flushes and milliseconds spent, the mean write and mean flush (fsync) latency derived from them, reads, busy share and mean queue; a device that completed nothing has no mean, and counters that cannot be read or went backwards are named, never read as zero. iSCSI VIRTUAL-DISK devices are Longhorn volumes as the attaching node sees them. Both reads are printed after the figures. The node must be one the estate registry declares, not retired, with a talos-* role (a control plane may be read). Nothing is written. Timeout 270: the registry read (15 s), a first pull of the door's image (120 s), three talosctl calls bounded at 20 s each, the 30 s interval, and the containers' start time.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/talos-read-diskstats.sh",
+    "{1}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    }
+  ],
+  "timeout": 270
+}

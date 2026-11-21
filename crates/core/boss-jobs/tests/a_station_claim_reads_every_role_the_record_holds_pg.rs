@@ -98,14 +98,17 @@ async fn declare_agent(db: &TestDb, role: Option<&str>) {
     PgAgents::new(db.pool.clone())
         .publish(
             &[AgentInput {
+                factory_rotation: Some(true),
                 id: AGENT.into(),
                 display_name: "Claude (engineering)".into(),
                 default_model: MODEL.into(),
+                model_class: None,
                 aliases: vec!["claude@algedonic.dev".into()],
                 role: role.map(str::to_string),
                 department: Some("engineering".into()),
                 hourly_budget_usd_micros: None,
                 max_concurrent_runs: None,
+                stations: None,
             }],
             PublishMode::Take,
             &EventStamp::new("jobs", ActorId::Automation("test".into())),

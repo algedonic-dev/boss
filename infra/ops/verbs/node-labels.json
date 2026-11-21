@@ -1,0 +1,17 @@
+{
+  "about": "READ-ONLY: one cluster node's labels and taints, and whether the purpose label the estate registry declares for it is the one it carries (infra/forge/node-labels.sh <node>; backlog 01927489, filed from join-a-node aca68557, whose verify-role step asks for `labels` and `declared_in` — w-2's join 829f75a8 answered it with kubectl David ran by hand). Through the forge's ops_kubectl door, kubectl get node only: the node's estate role and address against the Node's InternalIP, the kubelet, OS, kernel and runtime the Node reports, its cordon and Ready condition; every label as `label <key>=<value>` and every taint as `taint <key>=<value>:<effect>`, sorted; then the boss.dev/purpose value the estate registry's row declares (its notes, where w-2's and w-3's live today) beside the value the Node carries, judged AGREES, DISAGREES, UNDECLARED (neither names one) or AMBIGUOUS (the row names two) on the closing line. A judgement is a reading, not a failure: exit 0 whatever it says. The node must be one the estate registry declares, not retired, with a talos-* role (a control plane may be read). Nothing is written; exit 78 is a refusal, exit 1 a read that could not look. Timeout 180: the registry read (15 s), one kubectl read (20 s) and, the first time, the door image's pull bounded at 120 s.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/node-labels.sh",
+    "{1}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    }
+  ],
+  "timeout": 180
+}

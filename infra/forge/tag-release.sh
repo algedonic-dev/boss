@@ -159,22 +159,15 @@ case "$REMOTE" in
     *[[:space:]\'\"]*) refuse "the remote \`$REMOTE\` contains whitespace or a quote; name one without" ;;
 esac
 [ -d "$TREE" ] || refuse "the tree $TREE does not exist, so the converged main cannot be read"
-OWNER="$(stat -c %U "$TREE" 2>/dev/null)"
-if [ -z "$OWNER" ] || [ "$OWNER" = "UNKNOWN" ] || ! id -u "$OWNER" >/dev/null 2>&1; then
-    refuse "cannot resolve the owner of $TREE (stat says '${OWNER:-}'), so there is no account to run its git as"
-fi
-OWNER_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"
 # Every git call runs as the checkout's OWNER: the ops-runner executes
 # verbs as root, and a root write into david's clone leaves root-owned
 # objects the owner's later fetches cannot collect (forge-converge.sh).
-# The owner's HOME is what carries the forge credential helper.
-as_owner() { # <command string>
-    if [ "$(id -un)" = "$OWNER" ]; then
-        bash -c "$1"
-    else
-        runuser -u "$OWNER" -- env HOME="${OWNER_HOME:-/}" PATH="$PATH" bash -c "$1"
-    fi
-}
+# The owner's HOME is what carries the forge credential helper. One
+# definition of that bound, infra/lib/git-owner.sh (backlog 5ff118da).
+# shellcheck source=infra/lib/git-owner.sh
+. "$SELF_DIR/../lib/git-owner.sh"
+git_owner_of "$TREE" \
+    || refuse "cannot resolve the owner of $TREE (stat says '${OWNER:-}'), so there is no account to run its git as"
 # GIT_TERMINAL_PROMPT=0: a unit has no terminal, and a prompt would
 # hang, not fail.
 G="GIT_TERMINAL_PROMPT=0 git -C '$TREE'"

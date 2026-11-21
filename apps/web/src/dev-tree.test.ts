@@ -21,7 +21,10 @@ const running: StandingServer[] = [];
 // Stand up a server that claims `tree` at TREE_PATH (or 404s there,
 // the way a dev-server from before this fix does) and serves a 200
 // shell everywhere else — the shape the old probe accepted blindly.
-function stand(tree: string | null, port: number): StandingServer {
+// `mocked` is the server's other half of the answer (backlog 14ab6f08):
+// true for a server some run started and will stop, false for a
+// standing `bun run dev`, absent for a server too old to say.
+function stand(tree: string | null, port: number, mocked?: boolean): StandingServer {
   const server = serve({
     port,
     fetch(req: Request): Response {
@@ -29,7 +32,7 @@ function stand(tree: string | null, port: number): StandingServer {
       if (path === TREE_PATH) {
         return tree === null
           ? new Response('not found', { status: 404 })
-          : Response.json({ tree });
+          : Response.json(mocked === undefined ? { tree } : { tree, mocked });
       }
       return new Response('<!doctype html><title>shell</title>', {
         headers: { 'content-type': 'text/html' },
@@ -77,14 +80,44 @@ describe('chooseTarget', () => {
     expect(target.port).not.toBe(port);
   });
 
-  test('reuses a server serving THIS tree', async () => {
+  test('reuses a standing server serving THIS tree', async () => {
     const port = await freePort();
-    stand(TREE_ID, port);
+    stand(TREE_ID, port, false);
 
     const target = await chooseTarget(port, {}, ANSWERED);
 
     expect(target.reuse).toBe(true);
     expect(target.port).toBe(port);
+  });
+
+  // Backlog 14ab6f08. A mocked-mode server is one some run started and
+  // will SIGTERM the moment its own Playwright exits. Borrowed by a
+  // second run in the same tree, it was stopped under the borrower:
+  // measured 2026-10-11 by agent-run b9e9795a, the owner's 8 s spec went
+  // green and the borrower's 12 s follow-up navigation died
+  // ERR_CONNECTION_REFUSED. Same tree is not the same lifetime, so the
+  // second run starts its own server on a free port.
+  test('refuses to borrow a same-tree server another run started and will stop', async () => {
+    const port = await freePort();
+    stand(TREE_ID, port, true);
+
+    const target = await chooseTarget(port, {}, ANSWERED);
+
+    expect(target.reuse).toBe(false);
+    expect(target.port).not.toBe(port);
+    expect(target.reason).toContain('another run');
+  });
+
+  // No evidence is not a pass: a same-tree server that does not say
+  // whose lifetime it has could be a run's, so it is not borrowed.
+  test('refuses a same-tree server that does not say whether a run owns it', async () => {
+    const port = await freePort();
+    stand(TREE_ID, port);
+
+    const target = await chooseTarget(port, {}, ANSWERED);
+
+    expect(target.reuse).toBe(false);
+    expect(target.port).not.toBe(port);
   });
 
   test.each([['CI'], ['GITHUB_ACTIONS'], ['FORGEJO_ACTIONS']])(

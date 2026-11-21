@@ -1,5 +1,5 @@
 import { isPageWrite } from './_smokeMocks';
-// /ux/vendors — "Vendors" (finance), every control and render state
+// /finance/vendors — "Vendors" (finance), every control and render state
 // pinned as the page behaves TODAY (page audit 6f282875, step `test`).
 //
 // Before this spec the route was reached by the two crawls only:
@@ -44,9 +44,15 @@ import { mountPage, settledReads } from './_helpers';
 import { installSmokeMocks, installTenantManifest } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
 import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
-import { parseRoute } from '../../src/router';
+import { ADDRESSES, pageAt } from '../fixtures/station-tree';
+import { parseRoute as parseRouteAt } from '../../src/router';
+import { pagePath } from '../../src/shell/page-address';
+import type { NavItem } from '../../src/shell/nav-catalog';
+// The router reads a hosted page's address off the station tree
+// (backlog 0bc2eb68); this spec reads it off the tree the floor serves.
+const parseRoute = (path: string, search = '') => parseRouteAt(path, search, ADDRESSES);
 
-const PATH = '/ux/vendors';
+const PATH = '/finance/vendors';
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
@@ -200,17 +206,17 @@ test('nullable Terms says absent while an explicit empty string and recorded ter
   await expect(terms.nth(0)).toHaveText('—');
 });
 
-test.describe('/ux/vendors — the served instance (warehouse off, no inventory upstream)', () => {
+test.describe('/finance/vendors — the served instance (warehouse off, no inventory upstream)', () => {
   test('the page is cleanly absent when warehouse is off, without inventory reads', async ({ page }) => {
     const seen = watch(page);
     await install(page, { vendors: noUpstream, orders: noUpstream, invoices: noUpstream }, MANIFEST_2026_09_23);
     await mountPage(page, PATH);
 
     //6d6f88bd removes only the register;45fad3bb preserves financial details.
-    expect(ROUTE_CATALOG.vendors.path).toBe(PATH);
+    expect(pageAt('vendors')).toBe(PATH);
     expect(ROUTE_CATALOG.vendors.owner).toBe('finance');
     expect(ROUTE_CATALOG.vendors.module).toBe('warehouse');
-    expect(ROUTE_CATALOG.warehouse.module).toBe('warehouse');
+
     await expect(page.locator('.module-disabled')).toHaveCount(0);
 
     await expect(page.getByRole('heading', { name: 'No page at this address', exact: true })).toBeVisible();
@@ -222,7 +228,7 @@ test.describe('/ux/vendors — the served instance (warehouse off, no inventory 
   });
 });
 
-test.describe('/ux/vendors — fixtures', () => {
+test.describe('/finance/vendors — fixtures', () => {
   test('the page renders every column, count and word, from three reads and no writes', async ({ page }) => {
     const seen = watch(page);
     await install(page, FIXTURES);
@@ -348,22 +354,22 @@ test.describe('/ux/vendors — fixtures', () => {
     await mountPage(page, PATH, { titleMatch: /4 vendors/ });
 
     const link = bodyRows(page).first().getByRole('link', { name: 'Cascade Hop Farm', exact: true });
-    await expect(link).toHaveAttribute('href', '/ux/vendors/vnd-hops-001');
+    await expect(link).toHaveAttribute('href', '/finance/vendors/vnd-hops-001');
     // The label is the name; the id rides as the tooltip.
     await expect(link.locator('span')).toHaveAttribute('title', 'vnd-hops-001');
     // A null name: the label falls back to the id.
     await expect(bodyRows(page).nth(3).getByRole('link')).toHaveText('vnd-bare-004');
-    await expect(bodyRows(page).nth(3).getByRole('link')).toHaveAttribute('href', '/ux/vendors/vnd-bare-004');
+    await expect(bodyRows(page).nth(3).getByRole('link')).toHaveAttribute('href', '/finance/vendors/vnd-bare-004');
 
     // Gap 6 (e9c8e28d): the catalog lists the primary list surface;
     // shared crawls now separately seed a native detail representative.
-    expect(parseRoute('/ux/vendors/vnd-hops-001')).toMatchObject({ kind: 'vendor' });
-    const catalogued = Object.values(ROUTE_CATALOG).map((entry) => entry.path);
+    expect(parseRoute('/finance/vendors/vnd-hops-001')).toMatchObject({ kind: 'vendor' });
+    const catalogued = Object.values(ROUTE_CATALOG).map((entry) => pagePath(entry as NavItem, ADDRESSES) ?? `unplaced:${entry.id}`);
     expect(catalogued).toContain(PATH);
-    expect(catalogued.filter((p) => p.startsWith('/ux/vendors/'))).toEqual([]);
+    expect(catalogued.filter((p) => p.startsWith('/finance/vendors/'))).toEqual([]);
 
     await link.click();
-    await expect.poll(() => new URL(page.url()).pathname).toBe('/ux/vendors/vnd-hops-001');
+    await expect.poll(() => new URL(page.url()).pathname).toBe('/finance/vendors/vnd-hops-001');
     await expect(page.locator('h1.detail-title')).toHaveText('Cascade Hop Farm');
 
     await page.goBack();
@@ -373,7 +379,7 @@ test.describe('/ux/vendors — fixtures', () => {
   });
 });
 
-test.describe('/ux/vendors — empty and failed reads', () => {
+test.describe('/finance/vendors — empty and failed reads', () => {
   test('an empty backend says there are no vendors, and a filter on it still blames nothing', async ({ page }) => {
     await install(page, { vendors: [], orders: [], invoices: [] });
     await mountPage(page, PATH, { titleMatch: /0 vendors/ });
@@ -430,7 +436,7 @@ test.describe('/ux/vendors — empty and failed reads', () => {
 
   test('the vendor page says which of its side reads failed, and its figures read unknown', async ({ page }) => {
     await install(page, { ...FIXTURES, orders: noUpstream, invoices: noUpstream });
-    await mountPage(page, '/ux/vendors/vnd-hops-001');
+    await mountPage(page, '/finance/vendors/vnd-hops-001');
     await expect(page.locator('h1.detail-title')).toHaveText('Cascade Hop Farm');
 
     // Gap 1 (223ebcd6), the detail half: VendorPage parsed all four of

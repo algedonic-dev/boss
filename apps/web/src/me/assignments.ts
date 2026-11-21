@@ -1,4 +1,4 @@
-// The My Day read surface: the assignments lens (queue-visibility Q1).
+// The My Day read surface: the assignments lens (queue-visibility Q1, in the decision record).
 //
 // One indexed call replaces the capped jobs?status=open scan — the
 // server's WHERE is the queue definition, and this module only

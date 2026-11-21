@@ -27,7 +27,9 @@
 #             jobs.complete_linked_step keyed by `metadata.agent_run` on
 #             the gate-run, which `boss gate` records when BOSS_AGENT_RUN
 #             is set), or by the car's arrival one hop later
-#             (`agent-run-lands-on-car-merged`);
+#             (`agent-run-lands-on-car-merged`); since backlog 87d1ae40
+#             a run `handed` to its gate waits on `verdict` instead, with
+#             no robot claim, and the same rules write `gated` there;
 #             `delivered`, an ANALYST's ending — the run executed a step
 #             that ships no car (a measure, a draft, a judgement), so
 #             there is no gate to go green and never was. Both open
@@ -124,7 +126,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "One agent's execution of one protocol step, as a packet: claimed at dispatch, briefed with the exact prompt, building until the run's gate goes green or a run that ships no car delivers its work (landed), the agent stops without doing it (refused), or the packet goes silent past twice the step's duration (died). The middle third of the operator surface — a builder that dies is a packet that ages."
-metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
+metadata = { owner = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5", department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
 metadata_schema = { type = "object", required = ["packet", "step", "agent", "model", "budget_usd", "effort"], properties = { claim_receipt = { type = "object", description = "The complete native step returned by the claim door, copied unchanged at dispatch; consumers verify its identity and metadata instead of parsing the prompt." }, packet = { type = "string", description = "The job whose step this run executes." }, step = { type = "string", description = "The step's spec_slug on that job." }, agent = { type = "string", description = "The actor id the run signs as." }, model = { type = "string" }, budget_usd = { type = "number" }, effort = { type = "string" }, worktree = { type = "string" }, host = { type = "string" }, gate_run = { type = "string" }, car = { type = "string" }, spend_usd = { type = "number" }, tokens = { type = "number" } } }
 
 [[workflow.step]]
@@ -147,6 +149,7 @@ authority_role = "platform-admin"
 fields = [
   { name = "prompt_bytes", field_type = "string", required = true },
 ]
+metadata_defaults = { at = "0409a62b-1022-4b1a-8507-a1522171d71b" }
 
 # The run. Two hours is the builder's measured shape on this pod (six
 # green first-try in one 2026-09-14 session, none over ninety minutes
@@ -172,10 +175,94 @@ duration_hours = 2.0
 # it once this step is claimed and the merge door never writes it
 # (review fd7f1030 F1), and a release believes it only on a step that
 # declares it.
-metadata_defaults = { worker_start_expectation = { schema = 1, minutes = 15 }, records_before_claim = ["launch.model"] }
+metadata_defaults = { at = "0409a62b-1022-4b1a-8507-a1522171d71b", worker_start_expectation = { schema = 1, minutes = 15 }, records_before_claim = ["launch.model"] }
 fields = [
-  { name = "result", field_type = "gated|delivered|refused|died", required = true },
+  { name = "result", field_type = "gated|delivered|handed|refused|died", required = true },
 ]
+# THE BILL: one slot of the run's own model class (allocation item 5 of
+# backlog 35e9babf; design 012822ea Q3; conductor decision
+# 20261106_1507Z (3)). `from-run` is resolved at the claim against this
+# packet's `model` — the class is the active model-slot pool whose
+# `models` lists it (backlog af5dd547) — so one row serves every model.
+# A slot means a run is working: `building` is claimed at `--started`
+# and released when building exits, and no other row bills a model
+# (pinned in boss-jobs tests/workflow_resources.rs). A bill turns on a
+# refusal, so it goes live at David's deliberate publish, after the pools
+# it reads; the rollback is the prior version. Nothing holds a billed row
+# BY DEFAULT since backlog a4b57aca: this row is held out of the drift
+# publish only while infra/platform/workflow-holds/agent-run.toml says so
+# (declared for db88f6a9's waiver below; review 71005282 B1).
+#
+# AND THE vCPU ITS WORKER REQUESTS (backlog 5608c1a2). Measured
+# 2026-11-08 10:05-10:42Z: a Codex reviewer's dev-build worker waited
+# 300 s on the scheduler for w-1 while robots:opus held 4 of 6 — the slot
+# admitted a run no box had room for. `vcpu` on a from-run bill is placed
+# at the claim on a HOST: the host:<node> pool this protocol's owner
+# (metadata.owner, engineering) floats the most room on, bounded by that
+# floating share — engineering's 28 of w-1 less the gates' 12, so 16 —
+# never the box's whole 32. A claim past it is refused at the dispatch
+# door naming host:w-1 and its numbers, and waits in that pool's line;
+# the worker is required onto the node the claim named
+# (infra/dev/dev-build.py `run_claimed_node`); the exit frees both. 2.5
+# is the worker Pod's own request, worker 2 plus its test database 0.5,
+# held equal by dev-build_test.py
+# `test_the_run_bills_the_vcpu_its_worker_requests` (CLAUDE.md 9a).
+#
+# BUT NOT FOR A RUN THAT BINDS NO WORKER (backlog db88f6a9). Measured
+# 2026-11-12 15:08Z on GET /api/claims: host:w-1 bound, six claims of 2.5
+# held 15 of the 16 floating, two of them triage analyst runs that bind no
+# worker and run no cargo, while a builder's run and a landed-review
+# reviewer were refused 'host:w-1 is exhausted'. One row serves every
+# profile, so it names the profiles that never bind a worker, and the
+# claim reads the run's `profile` against `workerless_profiles` before it
+# places the host: a listed profile holds its model slot alone. A run
+# naming no profile, or any other, still bills the 2.5 — the reviewer
+# included, because a source review binds a worker for its candidate
+# checks (reviewer-rules.md, `--local-root`). Held true at the door: `boss
+# dispatch <run> --started --local-root` refuses a run whose profile its
+# PINNED bill lists here, before the claim and the worker door
+# (dispatch_started.rs; review 71005282 B2), so a waived claim never has
+# an uncounted worker under it. And in the rules, by dev-build_test.py
+# `test_a_profile_the_bill_waives_never_binds_a_worker`: each listed
+# profile is a step-lane one whose rules never name `--local-root`.
+resources = { model = "from-run", vcpu = "2.5", workerless_profiles = ["analyst"] }
+
+# THE BUILDER STATION'S WORK ENDS AT THE HAND-OFF (backlog 87d1ae40;
+# David 2026-11-08 ~23:30Z: "A station never needs to worry about what
+# happens next. It should just be able to finish its work and send the
+# job on ... so that resources can be reallocated."). Measured that
+# evening: robots:opus 6 of 6 held while ONE robot was building — five
+# runs had handed their cars to the gate and sat 30-80 minutes in the
+# bay line holding a slot, and a dispatch was refused 'exhausted'. The
+# slot bought nothing on red either: a red restarts as a FRESH run.
+#
+# So `boss gate`, at the accepted durable submission that already
+# retires the run's worker and records its hand-off, completes
+# `building` with `result = handed`, naming the claim id its submission
+# read (the claim exits; the pool's in-use drops by one). The verdict is
+# the gates station's business, and this step carries the run to it
+# holding NO bill: the green completes it `gated` and the run reports,
+# the red completes it `refused` (agent-run-lands-on-gate-green and
+# agent-run-is-refused-on-gate-red name both steps), and a verdict that
+# never comes is aged `died` by agent-run-dies-when-its-verdict-never-
+# comes, which spares a queued or running gate exactly as the building
+# clock does (f6fefad6: a clock must never close the run under a live
+# gate, because the resident supervisor launches only under an OPEN
+# run). `reported` does not open on `handed`, so the unreported clock of
+# f6fefad6 cannot start while the gate waits. Runs admitted under an
+# older version have no such step, and `boss gate` leaves their
+# `building` alone: they keep the slot to the verdict, as before.
+[[workflow.step]]
+title = "verdict"
+kind = "task"
+ready_when = "steps.building.done AND steps.building.metadata.result = \"handed\""
+title_template = "Awaiting the gate's verdict"
+authority_role = "platform-admin"
+duration_hours = 2.0
+fields = [
+  { name = "result", field_type = "gated|refused|died", required = true },
+]
+metadata_defaults = { fulfilled_by = "gate-run" }
 
 # The agent's handback (rule 8 of the rules document): packet, branch,
 # sha, gate packet, what changed, what it saw — or, for an analyst run,
@@ -221,7 +308,7 @@ fields = [
 [[workflow.step]]
 title = "reported"
 kind = "task"
-ready_when = "steps.building.done AND (steps.building.metadata.result = \"gated\" OR steps.building.metadata.result = \"delivered\")"
+ready_when = "(steps.building.done AND (steps.building.metadata.result = \"gated\" OR steps.building.metadata.result = \"delivered\")) OR (steps.verdict.done AND steps.verdict.metadata.result = \"gated\")"
 title_template = "Report recorded"
 authority_role = "platform-admin"
 duration_hours = 1.0
@@ -231,6 +318,7 @@ fields = [
   { name = "spend_usd", field_type = "string" },
   { name = "tokens", field_type = "string" },
 ]
+metadata_defaults = { at = "0409a62b-1022-4b1a-8507-a1522171d71b" }
 
 [[workflow.step]]
 title = "landed"
@@ -258,7 +346,7 @@ terminal = { outcome = "unreported" }
 [[workflow.step]]
 title = "refused"
 kind = "outcome"
-ready_when = "steps.building.done AND steps.building.metadata.result = \"refused\""
+ready_when = "(steps.building.done AND steps.building.metadata.result = \"refused\") OR (steps.verdict.done AND steps.verdict.metadata.result = \"refused\")"
 title_template = "Refused — the builder stopped without building"
 metadata_defaults = { outcome_kind = "aborted" }
 terminal = { outcome = "refused" }
@@ -266,7 +354,7 @@ terminal = { outcome = "refused" }
 [[workflow.step]]
 title = "died"
 kind = "outcome"
-ready_when = "steps.building.done AND steps.building.metadata.result = \"died\""
+ready_when = "(steps.building.done AND steps.building.metadata.result = \"died\") OR (steps.verdict.done AND steps.verdict.metadata.result = \"died\")"
 title_template = "Died — silent past twice the build's duration"
 metadata_defaults = { outcome_kind = "aborted" }
 terminal = { outcome = "died" }

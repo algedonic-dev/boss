@@ -1,5 +1,6 @@
-//! boss-dispatcher — core service that auto-assigns ready Steps to
-//! role-matched Employees. See lib.rs for the architectural rationale.
+//! boss-dispatcher — core service that reacts to the record: the rules
+//! runner and the schedule runner. It names nobody to a step (backlog
+//! e1eaf72b). See lib.rs for the architectural rationale.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -7,7 +8,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use boss_calendar_client::ReqwestCalendarClient;
 use boss_dispatcher::config::DispatcherConfig;
-use boss_dispatcher::dispatcher::{DispatcherCtx, run_loop};
 use boss_dispatcher::http::{HttpState, router};
 use boss_dispatcher::liveness::DispatcherLiveness;
 use boss_dispatcher::rules::dead_letter::{DeadLetterSink, JobsApiDeadLetters};
@@ -45,18 +45,33 @@ use boss_dispatcher_handlers::handlers::{
     jobs_age_out_step::JobsAgeOutStep,
     jobs_agent_step_overdue::JobsAgentStepOverdue,
     jobs_auto_park::JobsAutoPark,
+    jobs_changes_return_the_build::JobsChangesReturnTheBuild,
     jobs_clear_waiting::JobsClearWaiting,
     jobs_complete_linked_step::JobsCompleteLinkedStep,
     jobs_complete_step::JobsCompleteStep,
     jobs_complete_step_from_record::JobsCompleteStepFromRecord,
     jobs_complete_step_matching::JobsCompleteStepMatching,
+    jobs_converge_trains_on_rolled::JobsConvergeTrainsOnRolled,
+    jobs_dock_red_returns_the_build::JobsDockRedReturnsTheBuild,
+    jobs_end_unlaunched_car::JobsEndUnlaunchedCar,
+    jobs_factory_idle_watch::JobsFactoryIdleWatch,
     jobs_flight_overdue::JobsFlightOverdue,
+    jobs_idle_actor_watch::JobsIdleActorWatch,
     jobs_receipt_overdue::JobsReceiptOverdue,
     jobs_reclaim_abandoned_step::JobsReclaimAbandonedStep,
+    jobs_reconcile_readiness::JobsReconcileReadiness,
+    jobs_release_executor_refused::JobsReleaseExecutorRefused,
     jobs_release_on_review::JobsReleaseOnReview,
+    jobs_reoffer_waiting::JobsReofferWaiting,
     jobs_retract_matching::JobsRetractMatching,
+    jobs_return_stranded_review::JobsReturnStrandedReview,
     jobs_run_car_probes::JobsRunCarProbes,
+    jobs_silent_session_watch::JobsSilentSessionWatch,
     jobs_subjob_resolve::JobsSubjobResolve,
+    jobs_supersede_stale_unsigned::JobsSupersedeStaleUnsigned,
+    jobs_sweep_resource_leases::JobsSweepResourceLeases,
+    jobs_unheld_review_watch::JobsUnheldReviewWatch,
+    jobs_urgent_item_watch::JobsUrgentItemWatch,
     ledger_bill_approve::LedgerBillApprove,
     ledger_keg_deposit_settle::LedgerKegDepositSettle,
     ledger_payroll_run_submit::LedgerPayrollRunSubmit,
@@ -78,6 +93,7 @@ use boss_dispatcher_handlers::handlers::{
     people_terminate::PeopleTerminate,
     policy_check_refusals_alarm::PolicyCheckRefusalsAlarm,
     policy_coverage_alarm::PolicyCoverageAlarm,
+    pools_observe_rosters::PoolsObserveRosters,
     products_consume::ProductsConsume,
     products_consume_from_invoice::ProductsConsumeFromInvoice,
     products_produce::ProductsProduce,
@@ -89,6 +105,7 @@ use boss_dispatcher_handlers::handlers::{
     stripe_payouts::StripePayouts,
     sweep_empty_decisions::MaintenanceSweepInspect,
     sweep_judge_report::MaintenanceSweepJudge,
+    verdict_streak::VerdictStreak,
     webhook_notify::WebhookNotify,
 };
 use tokio::net::TcpListener;
@@ -150,14 +167,18 @@ async fn main() -> Result<()> {
         jobs_api_url = %cfg.jobs_api_url,
         people_api_url = %cfg.people_api_url,
         inventory_api_url = %cfg.inventory_api_url,
-        assignment_strategy = ?cfg.assignment_strategy,
         "boss-dispatcher starting"
     );
 
-    let nats_client = async_nats::connect(&cfg.nats_url)
+    // The one constructor every service uses (design ad9519bc car 1,
+    // CLAUDE.md 9a): a dark bus retries in the background instead of
+    // failing here, and the durable stream is re-ensured on reconnect.
+    // `bus` stays bound for the whole of main, because that re-ensure
+    // lives only as long as a clone of the bus does.
+    let bus = boss_nats::NatsEventBus::connect(&cfg.nats_url)
         .await
         .with_context(|| format!("connecting to NATS at {}", cfg.nats_url))?;
-    let jetstream = async_nats::jetstream::new(nats_client);
+    let jetstream = bus.jetstream();
 
     // `--reset-stream`: dev/regen one-shot. Drop the durable buffer (and its
     // consumers) and recreate it empty, then exit — so a fresh regen doesn't
@@ -169,29 +190,22 @@ async fn main() -> Result<()> {
         info!("BOSS_EVENTS stream reset; exiting");
         return Ok(());
     }
-    // Durable dispatch requires the stream; fatal if JetStream is
-    // unavailable — the dispatcher cannot guarantee delivery without it.
-    boss_nats::durable::ensure_stream(&jetstream)
-        .await
-        .context("ensuring BOSS_EVENTS stream (JetStream required for durable dispatch)")?;
+    // No boot-time ensure of the durable stream here (backlog 2e45840a,
+    // design ad9519bc car 2). It used to be fatal, so a dark NATS exited
+    // the dispatcher 5-15 s after car 1 had made its connect survive
+    // one. The bus ensures the stream on EVERY (re)connect, and the
+    // durable consumers below open through a capped-backoff retry, so
+    // the dispatcher waits for the bus instead: /api/dispatcher/readyz
+    // reads "rules not running" until they bind.
 
-    let ctx = Arc::new(DispatcherCtx::new(
-        cfg.jobs_api_url.clone(),
-        cfg.people_api_url.clone(),
-        cfg.assignment_strategy,
-    ));
-    // Shared consumer liveness — both loops mark it; /api/dispatcher/readyz
+    // Shared consumer liveness — the rules loops mark it; /api/dispatcher/readyz
     // reads it. Lets readiness probes see the consumers actually bound, not
     // just the process answering /health.
     let live = Arc::new(DispatcherLiveness::default());
-    let js_for_loop = jetstream.clone();
-    let ctx_for_loop = ctx.clone();
-    let live_for_loop = live.clone();
-    tokio::spawn(async move {
-        if let Err(e) = run_loop(ctx_for_loop, js_for_loop, live_for_loop).await {
-            tracing::error!(error = %e, "dispatcher loop exited with error");
-        }
-    });
+    // The StepType registry the marker and gate handlers classify kinds
+    // by. It rode on the matchmaker's context until that was retired
+    // (backlog e1eaf72b).
+    let step_registry = Arc::new(boss_jobs::step_registry::StepRegistry::v1());
 
     // Postgres pool — the dispatcher loads its rule registry from the
     // append-only versioned `dispatcher_rules` table (replacing the legacy
@@ -396,6 +410,10 @@ async fn main() -> Result<()> {
                 cfg.jobs_api_url.clone(),
                 platform_owner.clone(),
             ));
+            // The other end of an admitted car (backlog 366c9fb1): a run
+            // or item that ends before any gate ends the car built for
+            // it, through `abandoned`.
+            handlers.register(JobsEndUnlaunchedCar::new(cfg.jobs_api_url.clone()));
             // The week's retros (design 3613f0af, backlog 1dffde5d):
             // one department-retro per department the departments
             // registry holds, read at fire time through
@@ -420,6 +438,18 @@ async fn main() -> Result<()> {
             // ops-runner (28ac45ab). Inert until a rule on
             // jobs.job.closed names it.
             handlers.register(JobsRunCarProbes::new(cfg.jobs_api_url.clone()));
+            handlers.register(JobsReconcileReadiness::new(cfg.jobs_api_url.clone()));
+            // A pool that frees re-offers the oldest step waiting in its
+            // line (backlog 587f395a): an exhausted pool means wait, and
+            // this is the release that ends one.
+            handlers.register(JobsReofferWaiting::new(cfg.jobs_api_url.clone()));
+            // Lapsed resource leases expire through the jobs API's sweep
+            // door: FLOW released, STOCK an obligation (backlog 3aeaf08c).
+            handlers.register(JobsSweepResourceLeases::new(cfg.jobs_api_url.clone()));
+            // Every roster pool is observed through the people service's
+            // door, so `people:*` capacity is the roster's count, never
+            // unknown for want of a caller (backlog a6cb448a).
+            handlers.register(PoolsObserveRosters::new(cfg.people_api_url.clone()));
             // The empty-decisions sweep runs itself: on the sweep's
             // Inspect checklist becoming ready, scan open packets for
             // approval decisions that recorded nothing, complete the
@@ -521,6 +551,15 @@ async fn main() -> Result<()> {
                 cfg.jobs_api_url.clone(),
                 platform_owner.clone(),
             ));
+            // A chore whose step has read the same verdict on its newest
+            // N completed runs files ONE backlog-item (ada4d019): boss-gcp's
+            // deposit-key audit reading `unverified` tick after tick was
+            // read by nothing. The count is read back from the packets;
+            // which kind, step, word and N ride the rule row.
+            handlers.register(VerdictStreak::new(
+                cfg.jobs_api_url.clone(),
+                platform_owner.clone(),
+            ));
             // A closing Job completes the open step it was authorized
             // by, on the Job its declared edge names — the merged car
             // → feedback-packet obligation (2c4ae549). Generic: which
@@ -538,6 +577,12 @@ async fn main() -> Result<()> {
             // two steps, the field and the path ride the rule row, and
             // the rule is the tenant's.
             handlers.register(JobsCompleteStepMatching::new(cfg.jobs_api_url.clone()));
+            // The cluster-deploy-runner's mid-run `rolled` report
+            // completes `converged` on the train whose merge it rolled,
+            // checked against the running jobs API's own build commit —
+            // the train no longer waits for the next two-minute
+            // reconcile, which stays the safety net (090720c3).
+            handlers.register(JobsConvergeTrainsOnRolled::new(cfg.jobs_api_url.clone()));
             // A fact that answers a machine-filed item withdraws every
             // open packet carrying its key — a redelivered or resolved
             // dead letter closes the item filed for its outbox row
@@ -566,6 +611,34 @@ async fn main() -> Result<()> {
                 cfg.jobs_api_url.clone(),
                 platform_owner.clone(),
             ));
+            // The same age read for a review NOBODY holds (f0e604dc): a
+            // ready reviewer step past its pinned `duration_hours` files
+            // one alarm per station, held while it stays open. Which
+            // kind, which profile and which slugs wait only when marked
+            // ride the rule row; it never touches the late steps. The
+            // alarm is assigned to nobody, so the platform owner is told
+            // by a direct inbox message (35dabc3d).
+            handlers.register(JobsUnheldReviewWatch::new(
+                cfg.jobs_api_url.clone(),
+                cfg.messages_api_url.clone(),
+                platform_owner.clone(),
+            ));
+            // The WHOLE factory stopped (5627a4e1): no car gate for the
+            // bound while declared ready work waits files one alarm per
+            // idle episode and sends the platform owner a direct inbox
+            // message — the reader the per-actor alarms lacked on
+            // 2026-11-17. The bound and the ready steps ride the row.
+            handlers.register(JobsFactoryIdleWatch::new(
+                cfg.jobs_api_url.clone(),
+                cfg.messages_api_url.clone(),
+                platform_owner.clone(),
+            ));
+            // An open packet whose sign-off is unsigned and whose own
+            // later reading names a newer tree than it measured is
+            // superseded by a fresh one (design 62f27539 C1, backlog
+            // 44caee88: d91c2b7b sat seven days frozen on d88cf723).
+            // Which kind, steps and reading ride the rule row.
+            handlers.register(JobsSupersedeStaleUnsigned::new(cfg.jobs_api_url.clone()));
             handlers.register(JobsReceiptOverdue::new(
                 cfg.jobs_api_url.clone(),
                 platform_owner.clone(),
@@ -587,12 +660,77 @@ async fn main() -> Result<()> {
             // step, the value that means dead, the edge key and the
             // second bound all ride the rule row.
             handlers.register(JobsReclaimAbandonedStep::new(cfg.jobs_api_url.clone()));
+            // The same release for a hold the step's PINNED executor
+            // declaration refuses (231cb747): judged by the claim
+            // door's own predicate, on the assignment marker and hourly
+            // for standing residue, with an `executor_refused` note. A
+            // person on a `role:` step is judged on the people roster,
+            // through the claim door's own roster adapter (c17dec0f).
+            handlers.register(JobsReleaseExecutorRefused::new(
+                cfg.jobs_api_url.clone(),
+                cfg.people_api_url.clone(),
+            ));
+            // The stranded-review return (eb86a174): a ready review
+            // nominated to its car's builder, or unclaimed past the
+            // rule's bound, goes back to its station's queue for any
+            // admissible reviewer to pull. The kind, the profile and the
+            // bound ride the rule row.
+            handlers.register(JobsReturnStrandedReview::new(cfg.jobs_api_url.clone()));
+            // The urgent-item watch (9788e22d): an urgent item's build
+            // claimed with no open run and no car in flight past a bound
+            // is released the same way, and an urgent item open for days
+            // with landed cars or many runs asks once for a finish line.
+            // Which priorities and every bound ride the rule row.
+            handlers.register(JobsUrgentItemWatch::new(
+                cfg.jobs_api_url.clone(),
+                platform_owner.clone(),
+            ));
+            // The ACTOR half beside it (861360bc): an agent holding a
+            // READY urgent nomination with no run open and none moved
+            // inside the bound files one alarm naming the actor, the
+            // held work, its last run and its session's last prompt.
+            // Which priorities and the minutes ride the rule row; it
+            // files and never routes; it tells the platform owner by a
+            // direct inbox message (35dabc3d).
+            handlers.register(JobsIdleActorWatch::new(
+                cfg.jobs_api_url.clone(),
+                cfg.messages_api_url.clone(),
+                platform_owner.clone(),
+                Arc::new(boss_people_client::ReqwestPeopleClient::new(
+                    cfg.people_api_url.clone(),
+                )),
+                Arc::new(boss_clock_client::WallClockClient),
+            ));
+            // The BUSY half beside it (628dc540): an agent holding
+            // claimed work whose open work-session has had no write of
+            // its own for the bound — a factory stopped at a model limit
+            // — files one alarm naming the actor, the silence and its
+            // last note, and withdraws it when the session is written
+            // again. The bound and the ignored key prefix ride the row.
+            // The platform owner is told by a direct inbox message
+            // (35dabc3d).
+            handlers.register(JobsSilentSessionWatch::new(
+                cfg.jobs_api_url.clone(),
+                cfg.messages_api_url.clone(),
+                platform_owner.clone(),
+            ));
             // A held car's dispatched reviewer recording RELEASE asks the
             // release door as the rule (design 393bdef6 Q1, backlog
             // 0cfc57e6): the door's judge decides, and a refusal is
             // recorded on the car's review step. Inert until the rule
             // on jobs.job.updated names it.
             handlers.register(JobsReleaseOnReview::new(cfg.jobs_api_url.clone()));
+            // The same verdict's CHANGES half (backlog c2b21676): the
+            // item's build goes back to its station, nobody's, for a
+            // builder to pull as the car's repair; `boss dispatch`
+            // judges the repair at the pull. Inert until the rule on
+            // jobs.job.updated names it.
+            handlers.register(JobsChangesReturnTheBuild::new(cfg.jobs_api_url.clone()));
+            // The same return for a car the dock stopped re-gating after
+            // two reds in a row on one check (backlog 8f3d731a): the
+            // item's build back at its station, the failing check
+            // attached. Inert until the rule on jobs.job.updated names it.
+            handlers.register(JobsDockRedReturnsTheBuild::new(cfg.jobs_api_url.clone()));
             // System-completes zero-duration, no-role markers
             // (trigger / outcome / milestone) the moment they go
             // Ready, so a Job flows past its structural checkpoints
@@ -601,7 +739,7 @@ async fn main() -> Result<()> {
             // like `task`).
             handlers.register(JobsCompleteStep::new(
                 cfg.jobs_api_url.clone(),
-                ctx.registry.clone(),
+                step_registry.clone(),
             ));
             // Agent gate executor: on step.ready for a gate kind
             // (demand-gate / availability-gate), read real
@@ -611,7 +749,7 @@ async fn main() -> Result<()> {
             handlers.register(GateResolve::new(
                 cfg.jobs_api_url.clone(),
                 cfg.products_api_url.clone(),
-                ctx.registry.clone(),
+                step_registry.clone(),
             ));
             // The credential broker's Forgejo rotation (7ee101aa first
             // leg): on a rotation packet's scope step
@@ -621,7 +759,10 @@ async fn main() -> Result<()> {
             // Both dependencies degrade to Unconfigured — the handler
             // stays registered (an UnknownHandler aborts EVERY co-fired
             // rule's dispatch) and a firing rule dead-letters naming
-            // the missing knob instead.
+            // the missing knob instead. A client that could not be BUILT
+            // degrades through Unconfigured::at_boot, which says so as an
+            // error now rather than at the first rotation (backlog
+            // 3107bfb1).
             {
                 use credential_issuer::{
                     AccessApps, CloudflareApi, CloudflareTunnels, ForgeTokenIssuer, ForgejoAdmin,
@@ -631,26 +772,37 @@ async fn main() -> Result<()> {
                     Some(root) => {
                         match ForgejoAdmin::new(cfg.broker_forge_url.clone(), root.clone()) {
                             Ok(admin) => admin,
-                            Err(e) => Arc::new(Unconfigured(format!(
+                            Err(e) => Unconfigured::at_boot(format!(
                                 "credential broker has no forge admin client: {e}"
-                            ))),
+                            )),
                         }
                     }
-                    None => Arc::new(Unconfigured(
+                    None => Unconfigured::at_boot_if_configured(
                         "credential broker unconfigured: BOSS_BROKER_FORGEJO_TOKEN unset \
                          (secret boss-credential-broker-root, key forgejo-token)"
                             .to_string(),
-                    )),
+                        false,
+                    ),
                 };
                 // One k8s client serves the Secret writes AND the
                 // connector restart (the same ServiceAccount, two
-                // name-scoped grants).
-                let kube = KubeSecretStore::in_cluster();
+                // name-scoped grants) — and its failure is said once,
+                // whichever of the two reaches for it.
+                let github_configured = cfg.broker_github_app_id.is_some()
+                    || cfg.broker_github_app_installation_id.is_some()
+                    || cfg.broker_github_app_private_key.is_some();
+                let broker_configured = cfg.broker_forgejo_token.is_some()
+                    || cfg.broker_cloudflare_token.is_some()
+                    || github_configured;
+                let kube = KubeSecretStore::in_cluster().map_err(|e| {
+                    Unconfigured::at_boot_if_configured(
+                        format!("credential broker has no in-cluster k8s credential: {e}"),
+                        broker_configured,
+                    )
+                });
                 let secrets: Arc<dyn SecretStore> = match &kube {
                     Ok(s) => s.clone(),
-                    Err(e) => Arc::new(Unconfigured(format!(
-                        "credential broker has no in-cluster k8s credential: {e}"
-                    ))),
+                    Err(unconfigured) => unconfigured.clone(),
                 };
                 handlers.register(CredentialRotateForgejo::new(
                     cfg.jobs_api_url.clone(),
@@ -694,17 +846,15 @@ async fn main() -> Result<()> {
                                    (secret boss-credential-broker-root, key cloudflare-token)"
                                 .to_string();
                         (
-                            Arc::new(Unconfigured(why.clone())),
-                            Arc::new(Unconfigured(why.clone())),
-                            Arc::new(Unconfigured(why)),
+                            Unconfigured::at_boot_if_configured(why.clone(), false),
+                            Unconfigured::at_boot_if_configured(why.clone(), false),
+                            Unconfigured::at_boot_if_configured(why, false),
                         )
                     }
                 };
                 let workloads: Arc<dyn WorkloadRestarter> = match &kube {
                     Ok(s) => s.clone(),
-                    Err(e) => Arc::new(Unconfigured(format!(
-                        "credential broker has no in-cluster k8s credential: {e}"
-                    ))),
+                    Err(unconfigured) => unconfigured.clone(),
                 };
                 handlers.register(CredentialRotateCloudflareTunnel::new(
                     cfg.jobs_api_url.clone(),
@@ -731,10 +881,10 @@ async fn main() -> Result<()> {
                     credential_issuer::GitHubApi::new(cfg.broker_github_api_url.clone(), root)
                 }) {
                     Ok(api) => (api.clone(), api),
-                    Err(why) => (
-                        Arc::new(Unconfigured(why.clone())),
-                        Arc::new(Unconfigured(why)),
-                    ),
+                    Err(why) => {
+                        let fallback = Unconfigured::at_boot_if_configured(why, github_configured);
+                        (fallback.clone(), fallback)
+                    }
                 };
                 handlers.register(CredentialRotateGitHubApp::new(
                     cfg.jobs_api_url.clone(),
@@ -1006,7 +1156,37 @@ async fn main() -> Result<()> {
                 let mut registry = registry;
                 let mut fp = fp;
                 loop {
+                    use boss_dispatcher::rules::delivery;
+                    let cutovers = if rules_source == "log"
+                        && !delivery::lane_rules(&registry).is_empty()
+                    {
+                        Err("independent delivery lanes require JetStream; log transport is unsupported".to_string())
+                    } else {
+                        delivery::bind_lanes(&pool_rules, &js_for_rules, &registry).await
+                    };
+                    let cutovers = match cutovers {
+                        Ok(value) => value,
+                        Err(error) => {
+                            tracing::error!(%error, "rules delivery cutover unavailable; consumers remain stopped, no fallback");
+                            live_rules.mark_rules_stopped();
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            if let Ok(next) = load_active_rules(&pool_rules)
+                                .await
+                                .and_then(RuleRegistry::from_raw)
+                            {
+                                registry = next;
+                            }
+                            continue;
+                        }
+                    };
+                    live_rules.configure_delivery_lanes(&cutovers.ready);
+                    live_rules.configure_delivery_lane_refusals(&cutovers.refused);
+                    for (lane, error) in &cutovers.refused {
+                        tracing::error!(%lane, %error, "delivery lane binding refused; other consumers and schedules continue; reconciliation retries on registry reload");
+                    }
+                    let cutovers = cutovers.ready;
                     let runner = Arc::new(RulesRunner {
+                        delivery_routes: Some(delivery::pg_routes(pool_rules.clone())),
                         registry: registry.clone(),
                         handlers: handlers.clone(),
                         helpers: helpers.clone(),
@@ -1028,24 +1208,38 @@ async fn main() -> Result<()> {
                         // side effect that landed.
                         firings: Some(firings.clone()),
                     });
-                    let ev = {
+                    let mut ev = tokio::task::JoinSet::new();
+                    {
                         let live = live_rules.clone();
+                        let runner = runner.clone();
                         if rules_source == "log" {
                             let pool = pool_rules.clone();
-                            tokio::spawn(async move {
+                            ev.spawn(async move {
                                 if let Err(e) = runner.run_log_tail(pool, live).await {
                                     tracing::error!(error = %e, "rules log tail exited with error");
                                 }
-                            })
+                            });
                         } else {
                             let js = js_for_rules.clone();
-                            tokio::spawn(async move {
+                            ev.spawn(async move {
                                 if let Err(e) = runner.run(js, live).await {
                                     tracing::error!(error = %e, "rules runner exited with error");
                                 }
-                            })
+                            });
                         }
-                    };
+                    }
+                    for lane in cutovers {
+                        let runner = runner.clone();
+                        let js = js_for_rules.clone();
+                        let live = live_rules.clone();
+                        ev.spawn(async move {
+                            let name = lane.lane.clone();
+                            if let Err(error) = runner.run_delivery(js, live.clone(), Some(lane)).await {
+                                live.mark_delivery_lane(&name, false);
+                                tracing::error!(%error, lane = %name, "independent rules consumer exited");
+                            }
+                        });
+                    }
                     // Clock-driven schedule runner: fires schedule-triggered
                     // rules on sim-day boundaries off the clock SSE feed.
                     // No-op (returns immediately) when the registry has no
@@ -1075,8 +1269,12 @@ async fn main() -> Result<()> {
                     info!(
                         "dispatcher_rules changed — reloading the registry and rebinding runners"
                     );
-                    ev.abort();
+                    ev.abort_all();
+                    while ev.join_next().await.is_some() {}
+                    live_rules.mark_rules_stopped();
+                    live_rules.configure_delivery_lanes(&[]);
                     sched.abort();
+                    let _ = sched.await;
                     match load_active_rules(&pool_rules)
                         .await
                         .and_then(RuleRegistry::from_raw)

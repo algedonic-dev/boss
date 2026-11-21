@@ -158,6 +158,22 @@ const READERS: &[Reader] = &[
         proof: ".header(\"x-boss-user\", boss_user());",
     },
     Reader {
+        file: "infra/dev/preflight-control.py",
+        door: "the published generation's own infra/dev/boss-api, run as `/bin/bash \
+               <generation>/infra/dev/boss-api GET …` with the operator's BOSS_ACTOR handed \
+               through by the dev-control bootstrap (backlog b50b8953)",
+        proof_file: "infra/dev/boss-api",
+        proof: "-H \"X-Boss-User: $ACTOR\"",
+    },
+    Reader {
+        file: "infra/dev/standby-banner.sh",
+        door: "the standby's infra/dev/boss-api from its clone of main, which signs as the \
+               operator's BOSS_ACTOR, or as operator:unidentified at the read role when none \
+               is named (design 0491591b)",
+        proof_file: "infra/dev/boss-api",
+        proof: "-H \"X-Boss-User: $ACTOR\"",
+    },
+    Reader {
         file: "apps/web/src/it/estate/estate.ts",
         door: "the browser, through the gateway's /api/estate proxy, which sets \
                x-boss-user from the session cookie (role_headers.rs) — David's \
@@ -165,6 +181,8 @@ const READERS: &[Reader] = &[
         proof_file: "crates/core/boss-gateway/src/main.rs",
         proof: "\"/api/estate/{*rest}\",",
     },
+    // apps/web/src/it/yard/estate-band.ts retired with the transit map's
+    // band under the floor (R3, backlog 23a4b4d7).
 ];
 
 /// Whether `text` carries `proof`: each of its `\n`-separated fragments
@@ -190,6 +208,11 @@ const NOT_READERS: &[(&str, &str)] = &[
     (
         "infra/lint/an-eviction-is-recorded-where-the-record-can-read-it.sh",
         "a stub curl's case arm: the lint PLAYS the registry to the observer it tests",
+    ),
+    (
+        "infra/dev/preflight-control_test.py",
+        "a fake reader's table: the test PLAYS the registry to the preflight's storage \
+         check and reads nothing (backlog b50b8953)",
     ),
     (
         "infra/lint/a-manifest-sender-presents-the-machine-token.sh",

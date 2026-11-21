@@ -1,0 +1,40 @@
+# THE CALLER CAR 2d DID NOT SHIP (backlog a6cb448a, 2026-11-06). Design
+# 4b27a65a's station tree makes people:platform-admin a root pool whose
+# capacity is read from the roster and never set by hand (station-tree.md
+# section 3; factory-taxonomy Q2: "re-derived when the roster changes").
+# Console car 2d (5502c1cd, train #1543) built the people snapshot and the
+# pool owner's fenced observation, and only tests called them: measured on
+# origin/main d6d422af, every roster pool read `unknown` forever and the
+# claim door refused a billed claim on it (flow_resources::plan
+# capacity-unknown).
+#
+# WHAT THIS RULE DECIDES: nothing. The people door observes every active
+# pool that declares a roster, the owner rechecks each declaration under
+# its lineage lock, and an observation that changes nothing writes
+# nothing — so on a quiet tick no version is published.
+#
+# A CLOCK, NOT THE EMPLOYEE EVENTS. Three things move a roster pool and
+# only one is a people event: a hire or a role change, a Class the
+# eligibility names being retired (a classes write — the snapshot then
+# answers unknown rather than keep a stale count), and the snapshot
+# itself answering unavailable while a people fact is still undrained,
+# which no later event repairs if the roster then stays still. A tick
+# converges all three. Every five minutes, the cadence of the lease sweep
+# beside it: a hire's capacity is claimable within one tick, and a tick
+# that finds nothing changed is two reads and no write.
+[[rule]]
+name = "roster-pools-are-observed-every-five-minutes"
+why = """
+A TIMER: the people pools are re-derived from the roster, and two of the
+three things that change the derivation (a retired eligibility Class, an
+observation that answered unavailable mid-drain) emit no people event a
+rule could react to. Measured 2026-11-06 on origin/main d6d422af (backlog
+a6cb448a): boss_jobs::pools::refresh_roster had no production caller, so
+people:platform-admin read unknown capacity forever. It adds no routing:
+the people service's roster-capacity door publishes the observed count as
+the pool's next version through the pool owner, and only when it changed.
+"""
+version = 1
+schedule = { cadence = "every-5-minutes", anchor_date = "2026-11-08" }
+[[rule.do]]
+handler = "pools.observe-rosters"

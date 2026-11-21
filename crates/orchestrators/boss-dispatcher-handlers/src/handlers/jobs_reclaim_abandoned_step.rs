@@ -100,6 +100,36 @@ const DEFAULT_EVIDENCE_KEY: &str = "reclaimed";
 /// of its own could judge hours a daily cadence never gave it.
 const TICK_AT: &str = "_at";
 
+/// PURE: the release's evidence, carrying the run's own account of how
+/// it ended when the rule names one.
+///
+/// `carry` is a metadata key on the run's `run_step` (backlog 2b927025,
+/// design d32b58b7 step 3). A run ended by a RED gate carries the
+/// gate-run's id and branch under `gate_run`, which
+/// `agent-run-is-refused-on-gate-red` writes; copied onto the freed
+/// step, they are the findings the next builder's brief prints with the
+/// step's metadata, verbatim, so the repair starts from the red rather
+/// than from a fetch. Absent on the run, the key is `null` here: the
+/// evidence says it looked.
+pub(crate) fn release_evidence(
+    run: &serde_json::Value,
+    run_step: &str,
+    carry: Option<&str>,
+    fields: serde_json::Value,
+) -> serde_json::Value {
+    let mut evidence = fields;
+    if let Some(key) = carry
+        && let Some(obj) = evidence.as_object_mut()
+    {
+        let carried = step_by_slug(run, run_step)
+            .and_then(|step| step.pointer(&format!("/metadata/{key}")))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        obj.insert(key.to_string(), carried);
+    }
+    evidence
+}
+
 /// The status a claim moves a step FROM (`Ready` → `Active`, the CAS in
 /// `claim_step`), which is therefore the status a release moves it back
 /// to. The pair is what makes the reclaim a restoration rather than a
@@ -323,6 +353,10 @@ impl Handler for JobsReclaimAbandonedStep {
             Some(Value::String(s)) if !s.is_empty() => s.as_str(),
             _ => DEFAULT_EVIDENCE_KEY,
         };
+        let carry = match arg(args, "carry") {
+            Some(Value::String(s)) if !s.is_empty() => Some(s.as_str()),
+            _ => None,
+        };
 
         let now = ctx
             .event_payload
@@ -449,15 +483,20 @@ impl Handler for JobsReclaimAbandonedStep {
                     &release_patch(
                         link,
                         evidence_key,
-                        json!({
-                            "from_run": run_id,
-                            "from_actor": run.pointer("/metadata/agent"),
-                            "died_at": died_at.to_rfc3339(),
-                            "since_death_hours": (since_death * 100.0).round() / 100.0,
-                            "after_hours": bound,
-                            "at": now.to_rfc3339(),
-                            "rule": ctx.rule_name,
-                        }),
+                        release_evidence(
+                            run,
+                            run_step,
+                            carry,
+                            json!({
+                                "from_run": run_id,
+                                "from_actor": run.pointer("/metadata/agent"),
+                                "died_at": died_at.to_rfc3339(),
+                                "since_death_hours": (since_death * 100.0).round() / 100.0,
+                                "after_hours": bound,
+                                "at": now.to_rfc3339(),
+                                "rule": ctx.rule_name,
+                            }),
+                        ),
                     ),
                     &ctx.rule_name,
                 )
@@ -942,6 +981,86 @@ mod tests {
         assert!(puts.lock().unwrap().is_empty());
     }
 
+    /// A RED GATE RETURNS ITS BUILD TO ITS STATION WITH THE RED ATTACHED
+    /// (backlog 2b927025, design d32b58b7 step 3). The red rule completes
+    /// a handed run's `verdict` as `refused` and stamps the gate-run under
+    /// `gate_run`; the rule reading that ending with `carry = gate_run`
+    /// frees the item's build at once (`after_hours = 0`), and the freed
+    /// step carries the gate-run, which the next builder's brief prints.
+    /// Measured 2026-11-17: six such repairs were dispatched by hand, the
+    /// step held by the coordinator in the meantime. A run whose verdict
+    /// ended any other way, and one with no `carry`, are untouched by it.
+    #[tokio::test]
+    async fn a_red_gates_build_returns_to_its_station_carrying_the_gate_run() {
+        let mut red = run(DEAD_RUN, "handed", Some("2026-11-17T10:00:00Z"));
+        red["steps"]
+            .as_array_mut()
+            .expect("the run has steps")
+            .push(json!({
+                "id": format!("{DEAD_RUN}-verdict"), "spec_slug": "verdict",
+                "status": "completed", "completed_at": "2026-11-17T10:20:00Z",
+                "metadata": { "result": "refused",
+                    "gate_run": { "car": "9a7e0000-0000-4000-8000-000000000000",
+                                  "branch": "fix/x", "outcome": "failed" } } }));
+        let (base, writes) = mock_jobs(vec![packet(PACKET, Some(DEAD_RUN)), red]).await;
+        let h = JobsReclaimAbandonedStep::with_client(crate::handlers::common::api_client(), &base);
+        let args = vec![
+            ("run_kind".to_string(), Value::String("agent-run".into())),
+            ("run_step".to_string(), Value::String("verdict".into())),
+            ("dead_result".to_string(), Value::String("refused".into())),
+            ("link".to_string(), Value::String("agent_run".into())),
+            ("after_hours".to_string(), Value::String("0".into())),
+            (
+                "evidence_key".to_string(),
+                Value::String("returned_for_red".into()),
+            ),
+            ("carry".to_string(), Value::String("gate_run".into())),
+        ];
+        h.invoke(&args, &ctx(tick("2026-11-17T10:30:00Z")))
+            .await
+            .expect("the tick runs");
+
+        let step = stored_step(&base, PACKET, &format!("{PACKET}-build")).await;
+        assert_eq!(step["status"], "ready", "{step}");
+        assert_eq!(step["assignee_id"], serde_json::Value::Null);
+        assert!(step["metadata"].get("agent_run").is_none(), "{step}");
+        let note = &step["metadata"]["returned_for_red"];
+        assert_eq!(note["from_run"], DEAD_RUN, "{note}");
+        assert_eq!(
+            note["gate_run"]["car"], "9a7e0000-0000-4000-8000-000000000000",
+            "the red gate-run rides on the freed step: {note}"
+        );
+        assert_eq!(note["gate_run"]["branch"], "fix/x", "{note}");
+
+        // A second tick finds the step ready, not claimed: nothing more.
+        let before = writes.lock().unwrap().len();
+        h.invoke(&args, &ctx(tick("2026-11-17T10:45:00Z")))
+            .await
+            .expect("the tick runs");
+        assert_eq!(writes.lock().unwrap().len(), before, "written once");
+    }
+
+    /// The evidence without a `carry` is the evidence as it was; with
+    /// one the run does not hold, it says it looked.
+    #[test]
+    fn the_evidence_carries_only_what_the_rule_names() {
+        let r = run(DEAD_RUN, "died", Some("2026-09-19T12:00:00Z"));
+        let base = json!({ "from_run": DEAD_RUN });
+        assert_eq!(
+            release_evidence(&r, "building", None, base.clone()),
+            base,
+            "no carry, no new key"
+        );
+        assert_eq!(
+            release_evidence(&r, "building", Some("gate_run"), base.clone())["gate_run"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            release_evidence(&r, "building", Some("result"), base)["result"],
+            "died"
+        );
+    }
+
     /// A run that ended some other way is not a death. `refused` is a
     /// hand's word, and the hand that writes it can release the step
     /// itself; a clock has no such excuse.
@@ -1224,7 +1343,7 @@ mod tests {
         let named: Vec<&str> = handler_args.iter().map(|(k, _)| k.as_str()).collect();
         for key in shipped.keys() {
             assert!(
-                named.contains(&key.as_str()) || key == "evidence_key",
+                named.contains(&key.as_str()) || key == "evidence_key" || key == "carry",
                 "`{key}` is read by nothing"
             );
         }

@@ -26,7 +26,8 @@
 // real finding and before that is stated as "nothing recorded yet".
 
 import { fetchRemote, type Remote } from '../../data/remote';
-import { ROUTE_CATALOG } from '../../shell/nav-catalog';
+import { ROUTE_CATALOG, type NavItem } from '../../shell/nav-catalog';
+import { pagePath, type StationAddresses } from '../../shell/page-address';
 import { envelopeShape } from './trend';
 
 export type RouteCount = Readonly<{ actor_id: string; route: string; opens: number; last_at: string }>;
@@ -114,10 +115,19 @@ export function perActor(rows: ReadonlyArray<RouteCount>): ReadonlyArray<ActorUs
 }
 
 /// Every path the nav catalog registers, once each, in catalog order.
-/// A parameterised path (`/it/registry/rules/:ruleName`) is compared as
-/// the pattern surface-opens records, which is the same spelling.
-export function catalogPaths(): ReadonlyArray<string> {
-  return [...new Set(Object.values(ROUTE_CATALOG).map((e) => e.path))];
+/// A parameterised path (`/engineering/registry/rules/:ruleName`) is
+/// compared as the pattern surface-opens records, which is the same
+/// spelling. A hosted page's path is its host station's address in the
+/// tree plus its slug (backlog 0bc2eb68), so the roster is read against
+/// the tree `at`; a page the tree cannot place yet is left out rather
+/// than listed under a guessed address.
+export function catalogPaths(at: StationAddresses): ReadonlyArray<string> {
+  return [
+    ...new Set(Object.values(ROUTE_CATALOG).flatMap((e) => {
+      const p = pagePath(e as NavItem, at);
+      return p === null ? [] : [p];
+    })),
+  ];
 }
 
 /// The catalogued surfaces no row names — nobody opened them in the

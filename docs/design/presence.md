@@ -1,6 +1,12 @@
 # Design: presence — passkey authorization as actor-auth on steps
 
-**Status**: approved — every question answered in packet `5158ab84`; carried to a file 2026-08-17.
+**Status**: living reference (re-statused 2026-11-18, backlog 924de432).
+Every question was answered in packet `5158ab84` and carried to this
+file on 2026-08-17. It stays because it is the presence contract the
+gateway, the passkey ceremony, the sign-off plugin and the web client
+cite; later decisions about presence are in
+`docs/architecture-decisions.md` §Policy & auth, and new ones go on
+design packets.
 
 **Origin**: David, 2026-08-16: *"Passkey authorization as actor-auth
 feature for job packets is broadly useful. Let's make sure we design

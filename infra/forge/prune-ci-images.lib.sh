@@ -70,10 +70,16 @@
 # got.
 #
 # WHAT IS A CANDIDATE. Only tags shaped like a git sha, which is what CI
-# stamps on a per-train image (`boss-ci:${GITHUB_SHA}`,
-# .forgejo/workflows/ci.yml). That structurally excludes the stable
-# bases every build pulls — `rust1.96`, `latest` — without a list of
-# exceptions anyone has to maintain. Anything still tagged for a train
+# stamped on a per-train image until 2026-10-18 (`boss-ci:${GITHUB_SHA}`).
+# That structurally excludes the stable bases every build pulls —
+# `rust1.96`, `latest` — without a list of exceptions anyone has to
+# maintain. It also excludes what CI tags now (backlog 399ee6c3): one
+# `boss-ci:<stamp>` per RECIPE, 64 hex, which every train of that recipe
+# runs in, so the 40-hex bound here is load-bearing — admitting it
+# would collect, once past its window, the image the next train pulls
+# again, 3.48 GB at a time. An old recipe's stamp
+# image is unused, and the below-floor pass (every unused image past its
+# window) takes it like any other. Anything still tagged for a train
 # that has arrived is safe to drop: the registry holds what is worth
 # keeping, and a re-pull is 3.47GB over the LAN. That last sentence is
 # also why collecting early is cheap and why a seven-hex key collision

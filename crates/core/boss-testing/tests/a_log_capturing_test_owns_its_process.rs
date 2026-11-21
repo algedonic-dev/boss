@@ -27,6 +27,8 @@
 //!      not a coin.
 //!   2. `set_global_default` appears only in a file under `tests/`
 //!      that declares exactly one test.
+//!      For boss-testing, integration_packaging also pins that file to
+//!      its own Cargo target so grouping cannot give it process siblings.
 //!
 //! tree-wide pin — it scans a tree no changed-file map can attribute
 //! to this crate, so every scoped gate runs it whatever its scope

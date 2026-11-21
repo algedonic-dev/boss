@@ -276,22 +276,92 @@ const DISK_TIGHT_FLOOR_PCT: i64 = 35;
 /// that stops the pipeline, and no longer permanently.
 const DISK_TIGHT_HEADROOM_CEILING_GB: i64 = 200;
 
+/// Longhorn's `storage-minimal-available-percentage`: a disk with less
+/// than this share of its maximum available takes no new replica.
+/// Longhorn's default, live on this cluster (every Longhorn verb reads
+/// it live, `infra/lib/longhorn-ledger.sh`; their fixtures carry 25).
+///
+/// WHY A CLUSTER NODE'S FLOOR ANSWERS TO IT (backlog 67e98635). Every
+/// Talos node's Longhorn default disk is `/var/lib/longhorn` on EPHEMERAL
+/// — the kubelet's nodefs, the very filesystem `disk_gb`/`disk_free_gb`
+/// describe (node-disk-usage read Longhorn's `available` and nodefs'
+/// both as 231.2 GiB on w-1). At 2026-10-19 14:50Z w-1 crossed 25% of
+/// 928.9 GiB and every new dev-build worker volume provisioned and never
+/// got a replica, while the floor above, capped at 200 GB, stayed clean:
+/// on a disk of 727 GB and more the headroom ceiling sits UNDER
+/// Longhorn's refusal, and an alarm that arrives after the pipeline stops
+/// is the failure the 35% raise was made to prevent. So on the cluster
+/// scope the floor is at least Longhorn's plus
+/// [`LONGHORN_FLOOR_MARGIN_PCT`]. A host has no Longhorn disk, and its
+/// floor is unchanged.
+const LONGHORN_MINIMAL_AVAILABLE_PCT: i64 = 25;
+
+/// How far above Longhorn's floor the alarm stands: within 10% of it is
+/// `disk_tight` — 23 GB of warning on w-1, inside the three consecutive
+/// readings the raiser wants at the rate images arrive (one ~0.9 GiB
+/// boss-ci per train), and far from permanently true once the kubelet's
+/// image GC (50/40 on every worker since 67e98635) holds the disk at
+/// half full.
+///
+/// The dev pod's /scratch reclaim must act ABOVE a cluster node's whole
+/// `disk_tight` floor, not at Longhorn's: its rule is the
+/// `SCRATCH_RECLAIM_*` keys in `infra/build-floor.env`, pinned above
+/// `disk_floor_gb(total).max(longhorn_alarm_gb(total))` at every disk
+/// size from 100 GB to 10 TB by boss-testing's
+/// `the_scratch_reclaim_floor_sits_above_the_estates_disk_tight_floor`
+/// (backlog 4cc39798), which reads this pair and the three
+/// `DISK_TIGHT_*` constants above out of this file — raise any of the
+/// five past the reclaim's rule and that test names the disk.
+const LONGHORN_FLOOR_MARGIN_PCT: i64 = 10;
+
+/// Longhorn's own floor for a disk of `total_gb`, rounded UP as every
+/// floor here is (free is whole GB, so `free < 232.25` is `free < 233`).
+fn longhorn_floor_gb(total_gb: i64) -> i64 {
+    (total_gb * LONGHORN_MINIMAL_AVAILABLE_PCT + 99) / 100
+}
+
+/// Longhorn's floor plus its margin, rounded up.
+fn longhorn_alarm_gb(total_gb: i64) -> i64 {
+    (total_gb * LONGHORN_MINIMAL_AVAILABLE_PCT * (100 + LONGHORN_FLOOR_MARGIN_PCT) + 9_999) / 10_000
+}
+
+/// Which surface a disk reading came from — what decides whether a
+/// Longhorn disk shares its filesystem.
+#[derive(Clone, Copy, PartialEq)]
+enum DiskScope {
+    /// `observe-host.sh`: a host's root filesystem; no Longhorn disk.
+    Host,
+    /// The kubernetes-nodes observation: a Talos node's nodefs, where
+    /// Longhorn's default disk lives.
+    ClusterNode,
+}
+
 /// The floor applied to one observed node — ONE definition, read by
 /// both scopes (CLAUDE.md §9a: the floor is a fact, and a fact that
 /// lives twice drifts). `None` when the node is fine OR when it carries
 /// no usable pair of numbers; an unmeasured node is not a clean one, and
 /// [`compare`] records that separately as `disk_unmeasured`.
-fn disk_tight_finding(node: &Json) -> Option<Json> {
+fn disk_tight_finding(node: &Json, scope: DiskScope) -> Option<Json> {
     let id = node.get("id").and_then(Json::as_str)?;
     let free = node.get("disk_free_gb").and_then(Json::as_i64)?;
     let total = node.get("disk_gb").and_then(Json::as_i64)?;
-    let floor = disk_floor_gb(total);
+    let floor = match scope {
+        DiskScope::Host => disk_floor_gb(total),
+        DiskScope::ClusterNode => disk_floor_gb(total).max(longhorn_alarm_gb(total)),
+    };
     // The finding carries the floor it crossed (e4ec8150): the
     // comparison holds that number when it decides, and an alarm that
     // says `free_gb: 192` without it sends the reader to re-derive the
-    // rule from this file — the reduce-before-storing class.
-    (total > 0 && free < floor)
-        .then(|| json!({ "id": id, "free_gb": free, "disk_gb": total, "floor_gb": floor }))
+    // rule from this file — the reduce-before-storing class. A cluster
+    // node's carries Longhorn's own floor too, the number the refusal
+    // that stops volumes is made at (67e98635).
+    (total > 0 && free < floor).then(|| {
+        let mut finding = json!({ "id": id, "free_gb": free, "disk_gb": total, "floor_gb": floor });
+        if scope == DiskScope::ClusterNode {
+            finding["longhorn_floor_gb"] = json!(longhorn_floor_gb(total));
+        }
+        finding
+    })
 }
 
 /// The effective floor for a disk of `total_gb`, in whole GB: free
@@ -340,7 +410,7 @@ pub(crate) fn compare_host(declared: &[Json], observation: &Json) -> Json {
         if node.get("ready").and_then(Json::as_bool) == Some(false) {
             not_ready.push(json!(id));
         }
-        if let Some(finding) = disk_tight_finding(node) {
+        if let Some(finding) = disk_tight_finding(node, DiskScope::Host) {
             disk_tight.push(finding);
         }
         let dec = declared
@@ -681,6 +751,136 @@ fn dead_letter_finding(observation: &Json) -> (Option<Json>, Option<String>) {
     )
 }
 
+fn dispatcher_lag_finding(observation: &Json) -> (Option<Json>, Option<Json>) {
+    use boss_dispatcher::rules::lag::{
+        LAG_AGE_THRESHOLD_SECONDS, LAG_PENDING_THRESHOLD, LAG_SAMPLE_MAX_AGE_SECONDS,
+    };
+    let unread = |why: &str| (None, Some(json!({"id": DISPATCHER_ID, "reason": why})));
+    let Some(lag) = observation.pointer("/dispatcher/rules_consumer_lag") else {
+        return unread("dispatcher consumer lag was not observed");
+    };
+    let Some(now) = observation
+        .get("observed_at")
+        .and_then(Json::as_str)
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|at| at.timestamp())
+    else {
+        return unread("observation time unavailable");
+    };
+    let Some(at) = lag.get("observed_at_unix").and_then(Json::as_i64) else {
+        return unread("lag sample time unavailable");
+    };
+    if lag.get("status").and_then(Json::as_str) != Some("observed")
+        || !now
+            .checked_sub(at)
+            .is_some_and(|age| (0..=LAG_SAMPLE_MAX_AGE_SECONDS).contains(&age))
+    {
+        return unread("consumer lag sample unavailable or stale");
+    }
+    let (Some(pending), Some(ack_pending)) = (
+        lag.get("pending").and_then(Json::as_u64),
+        lag.get("ack_pending").and_then(Json::as_u64),
+    ) else {
+        return unread("consumer lag counts unavailable");
+    };
+    let age = lag
+        .get("oldest_unacked_published_unix")
+        .and_then(Json::as_i64)
+        .and_then(|published| now.checked_sub(published))
+        .filter(|age| *age >= 0);
+    if pending > LAG_PENDING_THRESHOLD || age.is_some_and(|age| age > LAG_AGE_THRESHOLD_SECONDS) {
+        return (
+            Some(
+                json!({"id":DISPATCHER_ID, "pending":pending, "ack_pending":ack_pending,
+            "oldest_unacked_age_seconds":age, "sample":lag,
+            "pending_threshold":LAG_PENDING_THRESHOLD,"age_threshold_seconds":LAG_AGE_THRESHOLD_SECONDS}),
+            ),
+            None,
+        );
+    }
+    if (pending > 0 || ack_pending > 0) && age.is_none() {
+        return unread("backlog age unknown; counts alone cannot establish recovery");
+    }
+    (None, None)
+}
+
+#[cfg(test)]
+mod dispatcher_lag_tests {
+    use super::*;
+
+    #[test]
+    fn extreme_sample_times_are_unmeasured_not_a_comparator_panic() {
+        for at in [i64::MIN, i64::MAX] {
+            let observation = json!({"observed_at":"2026-10-30T14:00:00Z","nodes":[],"dispatcher":{
+                "dead_letters_unrecorded":0,"rules_consumer_lag":{"status":"observed","observed_at_unix":at,
+                    "pending":0,"ack_pending":0}}});
+            assert_eq!(
+                compare(&[], &observation)[EVALUATED]["dispatcher_lag"],
+                json!([])
+            );
+        }
+    }
+
+    #[test]
+    fn a_backlogged_but_bound_dispatcher_is_a_hard_estate_finding() {
+        let observation = json!({"observed_at":"2026-10-30T14:00:00Z", "nodes":[],
+            "dispatcher":{"dead_letters_unrecorded":0,
+                "rules_consumer_lag":{"status":"observed", "observed_at_unix":1793368800,
+                    "pending":1001,"ack_pending":12,"oldest_unacked_published_unix":1793368200}}});
+        let comparison = compare(&[], &observation);
+        assert_eq!(comparison["counts"]["dispatcher_lag"], 1);
+        assert_eq!(
+            comparison["findings"]["dispatcher_lag"][0]["id"],
+            "boss-dispatcher"
+        );
+    }
+
+    #[test]
+    fn unread_stale_and_unknown_age_cannot_clear_a_lag_alarm() {
+        let mut observation = json!({"observed_at":"2026-10-30T14:00:00Z", "nodes":[],
+            "dispatcher":{"dead_letters_unrecorded":0}});
+        for lag in [
+            json!(null),
+            json!({"status":"unavailable"}),
+            json!({"status":"observed","observed_at_unix":1793368700,"pending":0,"ack_pending":0}),
+            json!({"status":"observed","observed_at_unix":1793368800,"pending":1,"ack_pending":0}),
+            json!({"status":"observed","observed_at_unix":1793368801,"pending":0,"ack_pending":0}),
+        ] {
+            observation["dispatcher"]["rules_consumer_lag"] = lag;
+            let comparison = compare(&[], &observation);
+            assert_eq!(comparison["counts"]["dispatcher_lag"], 0);
+            assert_eq!(comparison[EVALUATED]["dispatcher_lag"], json!([]));
+            assert_eq!(
+                comparison["findings"]["dispatcher_lag_unmeasured"][0]["id"],
+                DISPATCHER_ID
+            );
+        }
+        observation["dispatcher"]["rules_consumer_lag"] =
+            json!({"status":"observed","observed_at_unix":1793368800,"pending":0,"ack_pending":0});
+        let comparison = compare(&[], &observation);
+        assert_eq!(
+            comparison[EVALUATED]["dispatcher_lag"],
+            json!([DISPATCHER_ID])
+        );
+        assert_eq!(
+            comparison["findings"]["dispatcher_lag_unmeasured"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn age_detects_a_small_old_backlog_and_thresholds_are_strict() {
+        let mut observation = json!({"observed_at":"2026-10-30T14:00:00Z","nodes":[],"dispatcher":{
+            "dead_letters_unrecorded":0,"rules_consumer_lag":{"status":"observed","observed_at_unix":1793368800,
+                "pending":1,"ack_pending":0,"oldest_unacked_published_unix":1793368499}}});
+        assert_eq!(compare(&[], &observation)["counts"]["dispatcher_lag"], 1);
+        observation["dispatcher"]["rules_consumer_lag"]["pending"] = json!(1000);
+        observation["dispatcher"]["rules_consumer_lag"]["oldest_unacked_published_unix"] =
+            json!(1793368500);
+        assert_eq!(compare(&[], &observation)["counts"]["dispatcher_lag"], 0);
+    }
+}
+
 /// A declared row participates in the kubernetes-nodes comparison iff
 /// its role names a cluster node. conductor/forge roles never
 /// participate — the observer cannot see them, so their absence is a
@@ -727,7 +927,7 @@ pub(crate) fn compare(declared: &[Json], observation: &Json) -> Json {
         // host scope uses, and for the same reason: a machine nobody
         // declared is still a machine that can fill, and w-1 (the node
         // that compiles this repository) was undeclared for five days.
-        if let Some(finding) = disk_tight_finding(node) {
+        if let Some(finding) = disk_tight_finding(node, DiskScope::ClusterNode) {
             disk_tight.push(finding);
         } else if node.get("disk_free_gb").and_then(Json::as_i64).is_none()
             || node.get("disk_gb").and_then(Json::as_i64).is_none()
@@ -808,6 +1008,10 @@ pub(crate) fn compare(declared: &[Json], observation: &Json) -> Json {
     // dispatcher's in-cluster door AND sign a write to the record.
     let (dead_letters_unrecorded, dispatcher_unread) = dead_letter_finding(observation);
     let dead_letters_unrecorded: Vec<Json> = dead_letters_unrecorded.into_iter().collect();
+    let (dispatcher_lag, dispatcher_lag_unmeasured) = dispatcher_lag_finding(observation);
+    let lag_evaluated = dispatcher_lag_unmeasured.is_none();
+    let dispatcher_lag: Vec<Json> = dispatcher_lag.into_iter().collect();
+    let dispatcher_lag_unmeasured: Vec<Json> = dispatcher_lag_unmeasured.into_iter().collect();
 
     json!({
         "counts": {
@@ -823,6 +1027,7 @@ pub(crate) fn compare(declared: &[Json], observation: &Json) -> Json {
             // node as "no drift" — the 2026-09-11 cp-2 + w-1 class.
             "not_ready": not_ready.len(),
             "dead_letters_unrecorded": dead_letters_unrecorded.len(),
+            "dispatcher_lag": dispatcher_lag.len(),
         },
         "findings": {
             "observed_not_declared": observed_not_declared,
@@ -834,6 +1039,8 @@ pub(crate) fn compare(declared: &[Json], observation: &Json) -> Json {
             "not_ready": not_ready,
             "dead_letters_unrecorded": dead_letters_unrecorded,
             "dispatcher_unread": dispatcher_unread,
+            "dispatcher_lag": dispatcher_lag,
+            "dispatcher_lag_unmeasured": dispatcher_lag_unmeasured,
         },
         EVALUATED: {
             "not_ready": ready_evaluated(&observed),
@@ -847,6 +1054,7 @@ pub(crate) fn compare(declared: &[Json], observation: &Json) -> Json {
             // Judged only when the counters were read: an unread
             // dispatcher yields no finding AND no evaluation.
             "dead_letters_unrecorded": if dispatcher_unread.is_none() { vec![DISPATCHER_ID] } else { vec![] },
+            "dispatcher_lag": if lag_evaluated { vec![DISPATCHER_ID] } else { vec![] },
         },
     })
 }
@@ -1178,9 +1386,8 @@ fn gib(bytes: i64) -> f64 {
 /// `blind:disk_tight/<ns>/<claim>` for a volume unread as long.
 ///
 /// The finding names the claim, its namespace, the Longhorn volume
-/// behind it and the act that relieves it. No ops verb expands a claim
-/// yet, and the remedy says so rather than naming one that does not
-/// exist. The alarm quotes the entry cut at 400 characters, so the
+/// behind it and the existing read-only plan followed by the approved
+/// expansion. The alarm quotes the entry cut at 400 characters, so the
 /// entry stays short enough to arrive whole.
 ///
 /// The reading rides the comparison whole and judged (`volumes`, each
@@ -1197,6 +1404,12 @@ pub(crate) fn compare_volumes(observation: &Json) -> Json {
     let mut disk_unmeasured: Vec<Json> = Vec::new();
     let mut evaluated: Vec<Json> = Vec::new();
     let mut volumes: Vec<Json> = Vec::new();
+    let mut scheduled_failed: Vec<Json> = Vec::new();
+    let mut scheduled_evaluated: Vec<Json> = Vec::new();
+    let mut scheduled_unmeasured: Vec<Json> = Vec::new();
+    let mut declaration_drift: Vec<Json> = Vec::new();
+    let mut declaration_evaluated: Vec<Json> = Vec::new();
+    let mut declaration_unmeasured: Vec<Json> = Vec::new();
 
     for v in &observed {
         let Some(id) = v.get("id").and_then(Json::as_str) else {
@@ -1207,6 +1420,83 @@ pub(crate) fn compare_volumes(observation: &Json) -> Json {
             v.get("free_bytes").and_then(Json::as_i64),
         );
         let mut row = (*v).clone();
+        // PVC status is readable even when no pod mounts its filesystem.
+        // Keep this declaration disagreement separate from disk health.
+        if let Some(declared) = v.get("standalone_declaration")
+            && let (Some(ns), Some(claim)) = (
+                v.get("namespace").and_then(Json::as_str),
+                v.get("claim").and_then(Json::as_str),
+            )
+            && !ns.is_empty()
+            && !claim.is_empty()
+            && id == format!("{ns}/{claim}")
+            && declared.get("namespace") == v.get("namespace")
+            && declared.get("claim") == v.get("claim")
+            && let (Some(wanted), Some(live), Some(file), Some(line)) = (
+                declared.get("bytes").and_then(Json::as_i64),
+                v.get("pvc_capacity_bytes").and_then(Json::as_i64),
+                declared.get("file").and_then(Json::as_str),
+                declared.get("line").and_then(Json::as_u64),
+            )
+            && wanted > 0
+            && live > 0
+            && line > 0
+            && file
+                .strip_prefix("infra/cluster/manifests/")
+                .is_some_and(|name| !name.contains('/') && name.ends_with(".yaml"))
+        {
+            declaration_evaluated.push(json!(id));
+            let is_drift = live > wanted
+                && declared.get("storage_policy").and_then(Json::as_str) != Some("floor");
+            if let Some(object) = row.as_object_mut() {
+                object.insert(
+                    "standalone_declaration_comparison".into(),
+                    json!({
+                        "verdict":if is_drift {"drift"} else {"covered"},
+                        "namespace":ns,"claim":claim,"file":file,"line":line,
+                        "declared_bytes":wanted,"live_bytes":live,
+                    }),
+                );
+            }
+            if is_drift {
+                declaration_drift.push(json!({
+                    "id":id, "namespace":ns, "claim":claim,
+                    "declared_bytes":wanted, "live_bytes":live, "file":file, "line":line,
+                    "fields":{"storage_bytes":{"declared":wanted,"observed":live}},
+                    "entry":format!("{ns}/{claim}: {file}:{line} declares {wanted} bytes; live PVC capacity is {live}; tree write-back owed"),
+                    "remedy":"write the already-expanded capacity back to the standalone manifest; do not shrink the claim",
+                }));
+            }
+        } else if v.get("standalone_declaration").is_some()
+            || v.get("standalone_declaration_unread").is_some()
+        {
+            if let Some(object) = row.as_object_mut() {
+                object.insert("standalone_declaration_comparison".into(), json!({
+                    "verdict":"unknown", "reason":"standalone declaration/live capacity provenance could not be evaluated",
+                }));
+            }
+            declaration_unmeasured.push(json!({
+                "id":id, "state":v.get("standalone_declaration_unread").or(v.get("pvc_capacity_unread")),
+                "reason":"standalone declaration/live capacity provenance could not be evaluated",
+            }));
+        }
+        if let Some(attempt) = v.get("scheduled_job")
+            && let Some(producer) = attempt
+                .get("id")
+                .and_then(Json::as_str)
+                .filter(|id| !id.is_empty())
+        {
+            match attempt.get("state").and_then(Json::as_str) {
+                Some("failed") => {
+                    scheduled_failed.push(attempt.clone());
+                    scheduled_evaluated.push(json!(producer));
+                }
+                Some("succeeded") => scheduled_evaluated.push(json!(producer)),
+                Some("unread") => scheduled_unmeasured.push(attempt.clone()),
+                // Pending and unread do not clear a prior failure.
+                _ => {}
+            }
+        }
         match figures {
             (Some(capacity), Some(free)) if capacity > 0 && free >= 0 => {
                 let floor = volume_floor_bytes(capacity);
@@ -1224,8 +1514,8 @@ pub(crate) fn compare_volumes(observation: &Json) -> Json {
                         "capacity_gib": gib(capacity),
                         "floor_gib": gib(floor),
                         "remedy": format!(
-                            "expand {claim} in {ns}: raise spec.resources.requests.storage \
-                             (Longhorn grows it online); no ops verb expands a claim yet"
+                            "plan-an-instance-volume-expansion {ns} {claim} <size>, \
+                             then approve expand-instance-volume to grow the claim"
                         ),
                     }));
                 }
@@ -1260,13 +1550,23 @@ pub(crate) fn compare_volumes(observation: &Json) -> Json {
                 "volumes": observed.len(),
                 "disk_tight": disk_tight.len(),
                 "disk_unmeasured": disk_unmeasured.len(),
+                "scheduled_job_failed": scheduled_failed.len(),
+                "scheduled_job_unmeasured": scheduled_unmeasured.len(),
+                "drift": declaration_drift.len(),
+                "pvc_declaration_unmeasured": declaration_unmeasured.len(),
             },
             "findings": {
                 "disk_tight": disk_tight,
                 "disk_unmeasured": disk_unmeasured,
+                "scheduled_job_failed": scheduled_failed,
+                "scheduled_job_unmeasured": scheduled_unmeasured,
+                "drift": declaration_drift,
+                "pvc_declaration_unmeasured": declaration_unmeasured,
             },
             EVALUATED: {
                 "disk_tight": evaluated,
+                "scheduled_job_failed": scheduled_evaluated,
+                "drift": declaration_evaluated,
             },
             "volumes": volumes,
         }),
@@ -1293,6 +1593,16 @@ async fn compare_and_record(
     rule: &str,
     observation: &Json,
 ) -> Result<(), HandlerError> {
+    let observation_id = observation
+        .get("_observation_id")
+        .and_then(Json::as_str)
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .ok_or_else(|| {
+            HandlerError::Permanent(
+                "retained observation identity is missing or unreadable; refusing to invent one"
+                    .into(),
+            )
+        })?;
     let scope = observation
         .get("scope")
         .and_then(Json::as_str)
@@ -1302,6 +1612,7 @@ async fn compare_and_record(
         let mut obj = body;
         if let Some(o) = obj.as_object_mut() {
             o.insert("scope".into(), json!(scope));
+            o.insert("observation_id".into(), json!(observation_id));
             // The observation's OWN stamp, never the clock: a
             // comparison replayed after an outage must say when the
             // reading was taken, so the series shows a gap that filled
@@ -1428,12 +1739,22 @@ impl Handler for EstateCompare {
         ctx: &InvocationContext,
     ) -> Result<(), HandlerError> {
         let rule = &ctx.rule_name;
-        let observation = &ctx.event_payload;
+        // Keep the source event identity in the retained input as well, so
+        // spool replay and JetStream redelivery name the same observation.
+        let mut input = ctx.event_payload.clone();
+        if let Some(object) = input.as_object_mut() {
+            let id = uuid::Uuid::parse_str(&ctx.triggering_event_id).map_err(|_| {
+                HandlerError::Permanent("estate observation event id is not a UUID".into())
+            })?;
+            object.insert("_observation_id".into(), json!(id));
+        }
+        let observation = &input;
 
         // The record could not take this observation. RETAIN it, so
         // the outage shows up afterwards as a comparison that arrived
         // late instead of one that never existed at all — the file is
-        // named by the observation's own `observed_at`, so a NAK'd
+        // named by the observation's own time and immutable event ID,
+        // so distinct facts at one instant remain distinct and a NAK'd
         // redelivery of the same observation lands on itself rather
         // than piling up. Returning the error keeps the redelivery
         // budget as the fast path; the spool is what is left when that
@@ -1443,7 +1764,8 @@ impl Handler for EstateCompare {
                 .get("observed_at")
                 .and_then(Json::as_str)
                 .unwrap_or_default();
-            match self.spool.put(observed_at, observation) {
+            let retained_key = format!("{observed_at}-{}", ctx.triggering_event_id);
+            match self.spool.put(&retained_key, observation) {
                 Ok(()) => tracing::warn!(
                     spool = %self.spool.dir().display(),
                     waiting = self.spool.waiting(),
@@ -1733,15 +2055,19 @@ mod tests {
             // comparison in this file is strict `<`, so "exactly at the
             // floor" is never a finding — the same reading as exactly 16
             // GiB free and exactly 35% free, both of which are clean.
+            // On a 700 GB disk, where the ceiling still rules on both
+            // scopes: on a cluster node of 727 GB and more the Longhorn
+            // clause rules instead (67e98635,
+            // `a_longhorn_disk_near_its_scheduling_floor_is_disk_tight`).
             (
                 DISK_TIGHT_HEADROOM_CEILING_GB,
-                929,
+                700,
                 0,
                 "exactly at the ceiling",
             ),
             (
                 DISK_TIGHT_HEADROOM_CEILING_GB - 1,
-                929,
+                700,
                 1,
                 "one GB under the ceiling",
             ),
@@ -1771,12 +2097,14 @@ mod tests {
         let dec = vec![json!({"id":"h","role":"talos-worker","retired":false})];
         let dec_host = vec![json!({"id":"h","role":"forge"})];
         for (free, total, floor, why) in [
-            // The e1fea3b2 reading: the headroom ceiling rules.
+            // The headroom ceiling rules — on 700 GB, because on w-1's 929
+            // (the e1fea3b2 reading, 192 free) a cluster node's floor is
+            // now the Longhorn clause's (67e98635), tested below.
             (
                 192,
-                929,
+                700,
                 DISK_TIGHT_HEADROOM_CEILING_GB,
-                "w-1, ceiling rules",
+                "a 700 GB disk, ceiling rules",
             ),
             // 35% of 228 is 79.8 GB; free is whole GB, so `free < 79.8`
             // is `free < 80` and the floor is stated as 80 — the same
@@ -1796,6 +2124,56 @@ mod tests {
                 assert_eq!(finding["floor_gb"], floor, "{scope} scope: {why}");
             }
         }
+    }
+
+    #[test]
+    fn a_longhorn_disk_near_its_scheduling_floor_is_disk_tight() {
+        // backlog 67e98635, the 14:56Z census of 2026-10-19 (ops-request
+        // c4331d4a, node-disk-usage w-1): nodefs 928.9 GiB, 231.2
+        // available — and Longhorn's default disk is /var/lib/longhorn on
+        // that same filesystem (its `available` read 231.2 too). Longhorn
+        // places no replica on a disk under 25% available, 232.2 GiB here,
+        // so every new worker volume provisioned and never attached. The
+        // floor above (max 16, min(35%, 200)) said 200 and stayed clean.
+        let declared = vec![json!({"id":"w-1","role":"talos-worker","retired":false})];
+        let census = compare(&declared, &cluster_obs("w-1", 929, Some(231)));
+        assert_eq!(census["counts"]["disk_tight"], 1, "{census}");
+        let finding = &census["findings"]["disk_tight"][0];
+        assert_eq!(finding["id"], "w-1");
+        assert_eq!(finding["free_gb"], 231);
+        // Named: the floor it crossed is Longhorn's plus 10%, and the
+        // finding carries Longhorn's own floor beside it.
+        assert_eq!(
+            finding["longhorn_floor_gb"], 233,
+            "ceil(25% of 929): {finding}"
+        );
+        assert_eq!(
+            finding["floor_gb"], 256,
+            "ceil(110% of 25% of 929): {finding}"
+        );
+        // Strict `<` at the margin, as every floor in this file.
+        for (free, want) in [(256, 0), (255, 1), (390, 0)] {
+            let out = compare(&declared, &cluster_obs("w-1", 929, Some(free)));
+            assert_eq!(
+                out["counts"]["disk_tight"], want,
+                "w-1 at {free} free: {out}"
+            );
+        }
+        // A host has no Longhorn disk: the forge's floor is unchanged.
+        let dec_host = vec![json!({"id":"h","role":"forge"})];
+        let host = compare_host(&dec_host, &host_obs("h", 231, 929));
+        assert_eq!(host["counts"]["disk_tight"], 0, "{host}");
+        // A small cluster disk: 35% already sits above Longhorn's margin,
+        // and still rules (w-2, 110 GB: 39 against 31).
+        let small = compare(&declared, &cluster_obs("w-1", 110, Some(35)));
+        assert_eq!(
+            small["findings"]["disk_tight"][0]["floor_gb"], 39,
+            "{small}"
+        );
+        assert_eq!(
+            small["findings"]["disk_tight"][0]["longhorn_floor_gb"], 28,
+            "{small}"
+        );
     }
 
     #[test]
@@ -2845,7 +3223,11 @@ mod tests {
         InvocationContext {
             event_timestamp: None,
             rule_name: "estate-compare-on-observation".into(),
-            triggering_event_id: "evt-test".into(),
+            triggering_event_id: uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_OID,
+                observation.to_string().as_bytes(),
+            )
+            .to_string(),
             triggering_topic: "jobs.estate.observed".into(),
             event_payload: observation,
         }
@@ -2967,6 +3349,78 @@ mod tests {
         assert_eq!(handler.spool.waiting(), 1);
     }
 
+    #[tokio::test]
+    async fn differing_observation_ids_with_one_timestamp_retain_and_replay_both() {
+        let (record, base) = StubRecord::start().await;
+        let dir = SpoolDir::new("same-time-distinct-facts");
+        let handler = EstateCompare::with_spool(&base, Spool::at(&dir.0, 10));
+        let mut first = firing(host_observation("2026-09-05T08:00:00Z"));
+        first.triggering_event_id = "00000000-0000-4000-8000-000000000001".into();
+        let mut second = first.clone();
+        second.triggering_event_id = "00000000-0000-4000-8000-000000000002".into();
+        record.set_down(true);
+        assert!(handler.invoke(&[], &first).await.is_err());
+        assert!(handler.invoke(&[], &second).await.is_err());
+        assert_eq!(
+            handler.spool.waiting(),
+            2,
+            "distinct observation facts cannot overwrite each other at an identical timestamp"
+        );
+        record.set_down(false);
+        let replayed = handler
+            .spool
+            .replay(handler.replayer("test-estate-compare"))
+            .await;
+        assert_eq!(replayed.posted, 2);
+        assert_eq!(replayed.waiting, 0);
+        let recorded = record.recorded.lock().unwrap();
+        let ids: std::collections::BTreeSet<_> = recorded
+            .iter()
+            .map(|row| row["observation_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            std::collections::BTreeSet::from([
+                first.triggering_event_id.as_str(),
+                second.triggering_event_id.as_str()
+            ])
+        );
+        assert!(
+            recorded
+                .iter()
+                .all(|row| row["observed_at"] == "2026-09-05T08:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_spooled_observation_without_identity_is_retained_and_refused() {
+        let (record, base) = StubRecord::start().await;
+        let dir = SpoolDir::new("legacy-no-identity");
+        let handler = EstateCompare::with_spool(&base, Spool::at(&dir.0, 10));
+        let original = host_observation("2026-09-05T08:00:00Z");
+        handler
+            .spool
+            .put("2026-09-05T08:00:00Z", &original)
+            .unwrap();
+        let replay = handler
+            .spool
+            .replay(handler.replayer("test-estate-compare"))
+            .await;
+        assert_eq!(
+            handler.spool.waiting(),
+            1,
+            "an unidentified historical input must remain retained"
+        );
+        assert!(
+            record.recorded.lock().unwrap().is_empty(),
+            "replay must not invent identity or append an unprotected comparison"
+        );
+        assert!(
+            format!("{replay:?}").contains("observation identity"),
+            "the refusal must name the missing fact: {replay:?}"
+        );
+    }
+
     // ----- the forge's talos-nodefs reading (backlog eeac3d56) -----
 
     fn nodefs_observation() -> Json {
@@ -3062,6 +3516,39 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_producer_failure_is_independent_of_live_disk_figures() {
+        let mut row = volume("boss", "boss-backups", "pvc-backup", 20.0, 10.0);
+        row["scheduled_job"] = json!({"id":"boss/boss-pg-backup", "state":"failed", "job_uid":"failed-uid", "cronjob_uid":"cron-uid", "reason":"BackoffLimitExceeded"});
+        let body = compare_volumes(&volumes_observation(vec![row.clone()]));
+        assert_eq!(
+            body["findings"]["scheduled_job_failed"][0]["job_uid"], "failed-uid",
+            "{body}"
+        );
+        assert_eq!(body["counts"]["disk_tight"], 0);
+        for state in ["pending", "unread"] {
+            row["scheduled_job"]["state"] = json!(state);
+            let body = compare_volumes(&volumes_observation(vec![row.clone()]));
+            assert_eq!(
+                body["evaluated"]["scheduled_job_failed"],
+                json!([]),
+                "{body}"
+            );
+            if state == "unread" {
+                assert_eq!(
+                    body["findings"]["scheduled_job_unmeasured"][0]["id"], "boss/boss-pg-backup",
+                    "{body}"
+                );
+            }
+        }
+        row["scheduled_job"]["state"] = json!("succeeded");
+        let body = compare_volumes(&volumes_observation(vec![row]));
+        assert_eq!(
+            body["evaluated"]["scheduled_job_failed"],
+            json!(["boss/boss-pg-backup"])
+        );
+    }
+
+    #[test]
     fn pvc_capacity_intent_compares_request_not_filesystem_and_keeps_namespaces_distinct() {
         // 40 GiB since ops-request b018a106 (2026-10-07): the first growth
         // of this claim by BOSS's own verb, and the approve step David's
@@ -3144,6 +3631,40 @@ mod tests {
     }
 
     #[test]
+    fn standalone_declaration_drift_is_visible_without_a_mounted_filesystem() {
+        let row = json!({
+            "id":"boss/files", "namespace":"boss", "claim":"files",
+            "capacity_bytes":null, "free_bytes":null, "unread":"not mounted",
+            "pvc_capacity_bytes":40_i64 << 30,
+            "standalone_declaration":{
+                "namespace":"boss", "claim":"files", "bytes":20_i64 << 30,
+                "file":"infra/cluster/manifests/boss.yaml", "line":245
+            }
+        });
+        let body = compare_volumes(&volumes_observation(vec![row.clone()]));
+        assert_eq!(ids(&body, "drift"), vec!["boss/files"]);
+        assert_eq!(
+            body["counts"]["drift"], 1,
+            "the existing estate verdict must not render no drift"
+        );
+        assert_eq!(
+            body["findings"]["drift"][0]["fields"]["storage_bytes"]["observed"],
+            40_i64 << 30
+        );
+        assert_eq!(ids(&body, "disk_unmeasured"), vec!["boss/files"]);
+        assert!(ids(&body, "disk_tight").is_empty());
+        let mut equal = row.clone();
+        equal["pvc_capacity_bytes"] = json!(20_i64 << 30);
+        assert!(ids(&compare_volumes(&volumes_observation(vec![equal])), "drift").is_empty());
+        let mut floor = row.clone();
+        floor["standalone_declaration"]["storage_policy"] = json!("floor");
+        assert!(ids(&compare_volumes(&volumes_observation(vec![floor])), "drift").is_empty());
+        let mut other = row;
+        other["standalone_declaration"]["namespace"] = json!("other");
+        assert!(ids(&compare_volumes(&volumes_observation(vec![other])), "drift").is_empty());
+    }
+
+    #[test]
     fn a_volume_under_its_floor_is_disk_tight_naming_its_claim_volume_and_remedy() {
         let body = compare_volumes(&volumes_observation(vec![
             // Incident d3c0a67c's volume, expanded to 30 GiB by hand and
@@ -3188,7 +3709,9 @@ mod tests {
         assert!(
             pg["remedy"]
                 .as_str()
-                .is_some_and(|r| r.contains("expand") && r.contains("requests.storage")),
+                .is_some_and(|r| r.contains("plan-an-instance-volume-expansion")
+                    && r.contains("pgdata-postgres-0")
+                    && !r.contains("no ops verb")),
             "the finding names the act that relieves it: {pg}"
         );
         assert!(

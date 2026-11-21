@@ -1,0 +1,28 @@
+{
+  "about": "READ-ONLY: renders what `move-volume-replica-to-disk` WOULD do to put ONE replica of ONE Longhorn volume on a NAMED disk of the node that already holds it, and does nothing (infra/forge/move-volume-replica.sh --plan-to-disk <volume> <replica> <disk>; backlog b9789705, 2026-11-16: boss/pgdata-postgres-0's w-3 replica sat on w-3's default disk, /var/lib/longhorn, not on u-postgres, /var/mnt/postgres, and plan-a-volume-replica-move only ever names a node holding no replica). It runs every bound the write runs — every bound of plan-a-volume-replica-move but the node rule (the volume attached, robustness healthy, exactly spec.numberOfReplicas replicas each healthy and active on a distinct node, one replica per node, data locality disabled, replica auto-balance resolving to disabled, no eviction requested, every replica disk reported, and the target with ledger headroom for twice the volume passing Longhorn v1.11.3's live placement and next-growth tests) — and: the disk is one of the replica's node's Longhorn disks by name, with a diskUUID, holding no replica of the volume, and carrying tags; under a diskSelector of exactly those tags it is the ONE disk anywhere Longhorn could place the new replica on (a disk already holding a replica of the volume counts); zone anti-affinity resolves to soft (the volume's spec.replicaZoneSoftAntiAffinity, else the setting replica-zone-soft-anti-affinity); and the diskSelector the volume carries now, which the move puts back, admits the disk as Longhorn reads it (allow-empty-disk-selector-volume read, never assumed), so the new replica is not stranded. Then it prints the plan: the volume, the replica and the disk (diskUUID, path, tags), the selector and replicaSoftAntiAffinity before, during and after, the count's path N -> N+1 -> N, the four steps, and every Longhorn disk's verdict under the move's selector. No clock, live free space, actualSize or raw ledger figure in the signed bytes (they ride stderr). Its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1). Every read goes through the forge's ops_kubectl door; a read that could not look is CANNOT ANSWER (exit 1), never a plan. Any refusal renders no plan (exit 78).",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/move-volume-replica.sh",
+    "--plan-to-disk",
+    "{1}",
+    "{2}",
+    "{3}"
+  ],
+  "params": [
+    {
+      "name": "volume",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    {
+      "name": "replica",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-r-[0-9a-f]{8}$"
+    },
+    {
+      "name": "disk",
+      "pattern": "^(u-[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?|default-disk-[0-9a-f]+)$"
+    }
+  ],
+  "timeout": 120
+}

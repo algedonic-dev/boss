@@ -1,0 +1,49 @@
+# seats.tsv — the dev pod's executor seats: every agent CLI the pod runs
+# SUPERVISED, one turn at a time, by infra/dev/factory-loop.sh (backlog
+# b513514c, David's morning plan item 3, 2026-11-17).
+#
+# THE CASE. On 2026-11-17 the factory stood idle 07:10Z-14:45Z (item
+# 5627a4e1): only Codex's loop was supervised, so when the conductor's
+# interactive session ended its last background watch and Claude B sat
+# at its prompt, nothing woke either. A pod roll was worse: nothing
+# started Claude B at all. Every seat here now comes back on boot
+# (`dev-session.sh --boot`, which boss-dev.yaml's /work/dev-factory.sh
+# runs) and runs under the same supervisor: a turn, a pause, the next
+# turn resuming the same conversation, a backoff on a model limit, and
+# a heartbeat on the seat's own work-session at every turn's start and
+# end. A new seat is a row here, never a branch in the boot hook.
+#
+# Item 2 of the same plan (35f828cf, a seated loop per executor seat
+# pulling with `boss dispatch --next`) reads this list too: a seat is
+# where an executor sits, whatever its turn does.
+#
+# Columns, whitespace-separated, one seat per line ('#' starts a comment):
+#   seat    the tmux session the seat runs in, and its name everywhere
+#   cli     codex or claude: which non-interactive mode a turn runs
+#   actor   the `actor` its work-session carries (what the session-start
+#           hook or the factory prompt writes), where the heartbeat and
+#           every restart note land
+#   prompt  every turn's prompt, relative to the checkout
+#   pause   seconds between clean turns
+#   twin    the INTERACTIVE session that signs as the same agent and is
+#           never started beside this seat (two CLIs on one identity race
+#           for one queue, 628dc540), or '-'. The conductor has none:
+#           tmux `dev` stays David's Remote Control door to the same
+#           agent, started idle while this row exists (boss-dev.yaml,
+#           dev-claude.sh), so the drain runs here and nowhere else.
+#   pull    `next`: before a turn the loop judges the seat's one slot and,
+#           when it is free, takes the turn's work with `boss dispatch
+#           --next` from the stations the actor's agents row declares
+#           (35f828cf; factory-loop.sh's header says how). '-': every
+#           turn runs the prompt alone, as before. Every row is '-' until
+#           a reviewed car turns one on, because a pull seat claims work
+#           unattended (factory_loop_sh.rs holds them off).
+#
+# The FIRST row is the loop's default: `factory-loop.sh` with no seat is
+# codex-factory, dev-session option 6's command exactly as agent-pane.sh
+# proves it (`boss factory restart`).
+#
+# seat            cli     actor                   prompt                      pause  twin      pull
+codex-factory     codex   agent-codex             infra/dev/factory-drain.md  60     codex     -
+claude-b-factory  claude  claude-b@algedonic.dev  infra/dev/factory-drain.md  60     claude-b  -
+conductor         claude  claude@algedonic.dev    infra/dev/drain.md          600    -         -

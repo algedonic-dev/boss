@@ -98,7 +98,7 @@ test.describe('a guest sees readonly renders, not live controls that 403', () =>
   test('the composer: Compose is disabled, not a modal that 403s on send', async ({ page }) => {
     await baseMocks(page);
     await guestIdentity(page);
-    await page.goto('/ux/inbox');
+    await page.goto('/me/inbox');
 
     const compose = page.getByRole('button', { name: 'Compose' });
     await expect(compose).toBeVisible();

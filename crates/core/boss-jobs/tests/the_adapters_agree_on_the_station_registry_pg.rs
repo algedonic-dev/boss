@@ -56,7 +56,7 @@ use boss_jobs::registry::WorkflowStatus;
 use boss_jobs::station_queue::{DisciplineKey, StationPredicate, StepMatch};
 use boss_jobs::{
     InMemoryStations, PgStations, StationCapability, StationError, StationKind, StationLens,
-    StationRegistry, StationSpec, StationUpstream,
+    StationRegistry, StationSpec,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
@@ -133,6 +133,7 @@ boss_testing::adapters_agree! {
         publish_promotes_the_newest_draft_and_retires_the_active,
         a_publish_with_no_draft_refuses_and_records_nothing,
         an_unviable_draft_refuses_publish_and_flips_nothing,
+        an_edge_to_no_active_station_refuses_publish_and_flips_nothing,
         retire_is_idempotent_and_keeps_history_readable,
         list_active_is_every_live_name_in_byte_order,
         a_declared_version_lands_as_declared_and_is_never_overwritten,
@@ -159,7 +160,7 @@ fn viable(name: &str) -> StationSpec {
     StationSpec::draft(
         name,
         format!("The {name} queue"),
-        StationKind::Batch,
+        StationKind::Group,
         StationPredicate {
             kind: Some("ship-a-change".into()),
             ..Default::default()
@@ -192,7 +193,6 @@ fn whole(name: &str) -> StationSpec {
         at(0),
     );
     s.discipline = vec![DisciplineKey::Due, DisciplineKey::Age];
-    s.wip_limit = Some(7);
     // A terminal status is viable only with a retention window.
     s.terminal_window_days = Some(14);
     s.capability = Some(StationCapability {
@@ -200,10 +200,6 @@ fn whole(name: &str) -> StationSpec {
         models: vec!["opus-5[1m]".into()],
     });
     s.rollup_parent = Some("suite-department".into());
-    s.upstream = Some(StationUpstream {
-        label: "FEEDBACK".into(),
-        href: "/system/feedback".into(),
-    });
     s.lens = Some(StationLens {
         eyebrow: Some("Suite · Stations".into()),
         title: "Every field".into(),
@@ -470,6 +466,54 @@ async fn an_unviable_draft_refuses_publish_and_flips_nothing<W: World>(w: &W, ad
         "{adapter}"
     );
     assert_eq!(fact_rows(w).await, before, "{adapter}: no fact");
+}
+
+/// An edge must name a station some ACTIVE row declares — the seed's
+/// question, asked by publish itself, against the rows the promotion
+/// sees (backlog 5b80b9f4). An edge to no row, or to a retired one, is
+/// `Unviable` naming the station and the edge, and flips nothing; once
+/// the target is live the same draft publishes.
+async fn an_edge_to_no_active_station_refuses_publish_and_flips_nothing<W: World>(
+    w: &W,
+    adapter: &str,
+) {
+    let mut from = viable("suite-from");
+    from.edges = vec!["suite-to".into()];
+    draft(w, from, 60).await;
+    let before = fact_rows(w).await;
+    let refused = |got: Result<StationSpec, StationError>| match got {
+        Err(StationError::Unviable(problems)) => {
+            assert_eq!(problems.len(), 1, "{adapter}: {problems:?}");
+            let message = problems[0].to_string();
+            assert!(
+                message.contains("[suite-from]") && message.contains("`suite-to`"),
+                "{adapter}: the refusal names both: {message}"
+            );
+        }
+        other => panic!("{adapter}: an edge to no active station must be refused: {other:?}"),
+    };
+    refused(w.repo().publish("suite-from", &author(), at(120)).await);
+    assert_eq!(
+        history(w, "suite-from").await,
+        vec![(1, WorkflowStatus::Draft)],
+        "{adapter}"
+    );
+    assert_eq!(fact_rows(w).await, before, "{adapter}: no fact");
+
+    // A retired row is not a station an edge may name.
+    draft(w, viable("suite-to"), 180).await;
+    publish(w, "suite-to").await;
+    w.repo()
+        .retire("suite-to", &author(), at(240))
+        .await
+        .expect("retire");
+    refused(w.repo().publish("suite-from", &author(), at(300)).await);
+
+    // Live again, and the draft that names it publishes.
+    draft(w, viable("suite-to"), 360).await;
+    publish(w, "suite-to").await;
+    let live = publish(w, "suite-from").await;
+    assert_eq!(live.edges, vec!["suite-to".to_string()], "{adapter}");
 }
 
 /// Retire flips the live row to retired and records one `retired`

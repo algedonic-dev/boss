@@ -26,6 +26,27 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().into()
 }
 
+/// The toolchain the fixture's cargo must run: the one this test runs
+/// under when rustup named it, else the repo's own pin. The fixture
+/// builds in a scratch dir OUTSIDE the repo, so rust-toolchain.toml does
+/// not reach it, and the wide runner hands it CARGO = the rustup proxy
+/// with no RUSTUP_TOOLCHAIN — so it got rustup's DEFAULT toolchain. On
+/// the forge image that is the pin; on GitHub's runner it is the image's
+/// preinstalled stable, and both tests here failed only on the mirror
+/// Gate (backlog f6948792, 2026-11-20). Read from the file, never typed,
+/// so the pin keeps one copy.
+fn pinned_toolchain() -> std::ffi::OsString {
+    if let Some(inherited) = std::env::var_os("RUSTUP_TOOLCHAIN") {
+        return inherited;
+    }
+    let pin = std::fs::read_to_string(repo_root().join("rust-toolchain.toml")).unwrap();
+    let parsed: toml::Table = pin.parse().unwrap();
+    parsed["toolchain"]["channel"]
+        .as_str()
+        .expect("rust-toolchain.toml names [toolchain] channel")
+        .into()
+}
+
 fn build_output(existing_trigger: bool) -> (String, String, bool) {
     let root = scratch_dir("cli-effective-build-stamp");
     let crate_dir = root.join("crates/orchestrators/boss-cli");
@@ -60,12 +81,14 @@ fn build_output(existing_trigger: bool) -> (String, String, bool) {
         &root,
         &["commit", "-q", "--allow-empty", "-m", "first head"],
     );
+    let toolchain = pinned_toolchain();
     let invoke = || {
         // A dependency-free crate runs Cargo's real incremental decision,
         // with its own target and one job, never the workspace's target.
         let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
             .current_dir(&crate_dir)
             .args(["run", "--offline", "--quiet", "--jobs", "1"])
+            .env("RUSTUP_TOOLCHAIN", &toolchain)
             .env("CARGO_TARGET_DIR", root.join("target"))
             .env_remove("CARGO_MAKEFLAGS")
             .output()

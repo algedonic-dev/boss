@@ -1,0 +1,9 @@
+[
+  {
+    "name": "boss-reader",
+    "email": "boss-reader@forge.invalid",
+    "repo": "david/boss",
+    "permission": "read",
+    "holds": "the forge token root on boss-gcp fetches its own tree with (rule broker-rotates-the-boss-gcp-root-tree-token)"
+  }
+]

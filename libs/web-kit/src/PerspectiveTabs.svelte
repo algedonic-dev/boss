@@ -8,10 +8,10 @@
   // is the only fixed furniture. 44px tall — each app's shell offsets
   // its own chrome below it.
   //
-  // The tab list is the host's: apps/web derives it from the tenant's
-  // Class registry and manifest (one tab per declared department,
-  // Simulator only when the `sim` module is on — ce68f137), and
-  // apps/simulator uses the default. Tabs are plain anchors: Simulator
+  // The navigation is the host's. apps/web draws its station trail in
+  // the tabs' place (`nav`; backlog 474e2c1c retired its one tab per
+  // departments-registry row), and apps/simulator uses the default
+  // tabs. Tabs are plain anchors: Simulator
   // is served by a different piece (boss-simulator) so switching to it
   // is a real navigation, and for the same-SPA apps the router picks
   // the change up on popstate.
@@ -24,6 +24,7 @@
   import { manifest } from './session/manifest.svelte';
   import { session } from './session/session.svelte';
   import { safeLinkHref } from './links';
+  import type { Snippet } from 'svelte';
 
   let {
     active,
@@ -31,7 +32,14 @@
     brandName: brandNameProp,
     brandSub: brandSubProp,
     searchAppKinds = [] as ReadonlyArray<string>,
+    nav,
   } = $props<{
+    /// The host's own navigation, drawn where the tabs are, in their
+    /// place. apps/web passes its station trail — Home, then the path
+    /// through the station tree (backlog 474e2c1c, David 2026-11-19:
+    /// "Let's make the Top nav bar the navigation tool through the
+    /// different stations"); apps/simulator passes none and keeps tabs.
+    nav?: Snippet;
     active: AppId;
     /// Every app this host offers. Defaults to Home + Simulator, which
     /// is all apps/simulator has; apps/web passes the full list built
@@ -124,6 +132,9 @@
     <span class="perspective-brand-name">{brandName}</span>
     {#if brandSub}<span class="perspective-brand-sub">{brandSub}</span>{/if}
   </span>
+  {#if nav}
+    {@render nav()}
+  {:else}
   <div class="perspective-tablist">
     {#each pinned as t (t.id)}
       <a
@@ -167,6 +178,7 @@
       </div>
     {/if}
   </div>
+  {/if}
   <div class="perspective-right">
     <GlobalSearch appKinds={searchAppKinds} />
     <FeedbackControl />

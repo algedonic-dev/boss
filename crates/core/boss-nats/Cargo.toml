@@ -15,6 +15,11 @@ thiserror = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]
+# `dark_port`: a refused address held for the test (backlog c0259ecc).
+boss-testing = { path = "../boss-testing" }
+# `start_paused`: keep_bound's reopen ladder walked on a paused clock
+# (backlog 2e45840a, design ad9519bc car 3).
+tokio = { workspace = true, features = ["test-util"] }
 uuid = { workspace = true }
 chrono = { workspace = true }
 

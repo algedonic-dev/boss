@@ -56,6 +56,12 @@
 
   let job = $state<Job | null>(null);
   let step = $state<Step | null>(null);
+  /// The id the step surfaces write with: the one the job read answered
+  /// with, not the route's. A page opened at the eight characters every
+  /// surface prints sent them to the step doors, which refused David's
+  /// ratify of doc-flatten 06170f1c `400 invalid job id` (backlog
+  /// 97f98011, step-write refusal row 27765).
+  const loadedJobId = $derived(job?.id ?? jobId);
   let loading = $state(true);
   let error = $state<string | null>(null);
 
@@ -165,7 +171,7 @@
       <StepPluginMount
         kind={step.kind}
         {step}
-        {jobId}
+        jobId={loadedJobId}
         {currentUser}
         onUpdate={load}
       />
@@ -178,7 +184,7 @@
            dispatcher and lands on GenericSurface, so the route now
            works for any kind rather than only the ones with a bundle. -->
       <div class="step-focus-fallback">
-        <StepSurface step={surfaceStep(step)} {jobId} onUpdate={load} />
+        <StepSurface step={surfaceStep(step)} jobId={loadedJobId} onUpdate={load} />
       </div>
     {/if}
   </div>

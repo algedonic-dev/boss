@@ -1,0 +1,58 @@
+# The publish-workflow verb's answer reaches the publish-a-protocol step
+# it was filed for — on success AND on failure (design b1f319bc,
+# backlog 7955a488).
+#
+# publish-a-protocol-files-its-machine-publish spawns the request with
+# `for_protocol_publish` = the packet. This rule follows that edge with
+# `jobs.complete_linked_step`:
+#
+# - exit 0 and the verb's confirmed line
+#
+#     publish-workflow: <kind> vA -> vB live at <url> — confirmed by
+#     reading the active row back and comparing it to <file> (equal);
+#     packet <request>
+#
+#   completes `publish` with `version` = B, `from_version` = A and
+#   `read_back` = `equal`, each COPIED from that line — what went live
+#   is what the verb read back, never what it was asked to do;
+# - a non-zero exit (a refused hold, a lint that failed, an unconfirmed
+#   publish): the default `annotate-and-alert` — the verb's last FAILED
+#   or REFUSED line lands on the still-open step as `failed`, and an
+#   urgent backlog-item names the verb, the request and the line. The
+#   step stays open, because the row is not live.
+#
+# The pattern carries no backslash: the arg crosses two string lexers
+# (TOML, then boss-expr's, which reads `\d` as `d`). `.` stands for the
+# em dash. The line it reads is publish-workflow.sh's own last line,
+# pinned by crates/core/boss-dispatcher/tests/publish_a_protocol_rules.rs
+# and the script's own test.
+[[rule]]
+name = "complete-protocol-publish-on-publish-workflow-answered"
+why = """
+A CROSS-PROTOCOL REACTOR closing the loop
+publish-a-protocol-files-its-machine-publish opened: ops-request ->
+publish-a-protocol, which no single Workflow consequence can express —
+the request's protocol cannot know which packet asked, and the
+packet's cannot read another packet's execute step. Without it the
+publish step would sit ready behind an `answered` request whatever the
+verb said, the shape publish 254177e2 showed for five hours on
+2026-09-19 (backlog f47861a5). No authority widened: on success the
+only writes are the step's three required fields, copied from the
+verb's read-back line; on failure the step is annotated, never
+completed. Self-filters to this one verb and this one edge; every
+other answered request on the topic is somebody else's, and a
+publish-workflow request with no `for_protocol_publish` (a hand run,
+the Drift tab) has no step to reach.
+"""
+version = 2
+on_event = "jobs.job.closed"
+# `failed` and `indeterminate` are how the ops-request row closes a verb
+# that RAN with a nonzero or an unknown exit (design b7bb1625, backlog
+# 50a1578f); before that row it closed `answered` whatever the exit, so
+# this rule hears exactly the runs it heard before, and its judge still
+# reads the exit off the execute record. Pinned by boss-dispatcher's
+# an_ops_request_rule_that_hears_an_answer_hears_a_failure.
+when = 'kind = "ops-request" AND (outcome = "answered" OR outcome = "failed" OR outcome = "indeterminate")'
+[[rule.do]]
+handler = "jobs.complete_linked_step"
+args = { verb = '"publish-workflow"', verdict_pattern = '"^publish-workflow: (?P<kind>[a-z][a-z0-9-]+) v(?P<from_version>[0-9]+) -> v(?P<version>[0-9]+) live at [^ ]+ . confirmed by reading the active row back and comparing it to [^ ]+ [(](?P<read_back>equal)[)]"', link = '"for_protocol_publish"', steps = '"publish"', done_metadata = '"{\"version\": \"{version}\", \"from_version\": \"{from_version}\", \"read_back\": \"{read_back}\"}"', evidence_key = '"published_by"', on_failure = '"annotate-and-alert"' }

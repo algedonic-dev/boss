@@ -293,6 +293,9 @@ async fn outbox_stats_names_the_undrained_write_behind_the_stats_door() {
         assert_eq!(v["undrained"]["count"], 1, "{v}");
         assert!(v["undrained"]["oldest_created_at"].is_string(), "{v}");
         assert!(v["undrained"]["behind_head_seconds"].is_number(), "{v}");
+        // What the bus still owes, dated (design ad9519bc part c).
+        assert_eq!(v["undelivered"]["count"], 1, "{v}");
+        assert!(v["undelivered"]["oldest_age_seconds"].is_number(), "{v}");
         assert_eq!(v["lag"]["window_hours"], 24, "{v}");
         assert_eq!(v["lag"]["delivered"], 0, "{v}");
         assert!(v["lag"]["p95_seconds"].is_null(), "{v}");

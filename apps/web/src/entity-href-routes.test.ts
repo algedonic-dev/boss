@@ -20,8 +20,16 @@
 
 import { readFileSync } from 'node:fs';
 import { beforeAll, describe, expect, test } from 'bun:test';
-import { ENTITY_KINDS, entityHref, type EntityKind } from '@boss/web-kit/ui/entity-href';
+import {
+  ENTITY_KINDS,
+  PAGE_KINDS,
+  PAGELESS_KINDS,
+  entityHref,
+  hasPage,
+  type EntityKind,
+} from '@boss/web-kit/ui/entity-href';
 import { parseRoute, type Route } from './router';
+import { ADDRESSES } from '../tests/fixtures/station-tree';
 
 // `href` reads window.location.pathname (the /dashboard mount probe),
 // so stub that one field for bun's non-DOM context. parseRoute takes
@@ -38,43 +46,68 @@ beforeAll(() => {
   g.window.location.pathname ??= '/';
 });
 
-// One row per kind — the route its href must resolve to. `Record` over
-// the union makes a new kind a TYPE error here, and the runtime loop
-// below makes it a test failure even under bun's type stripping.
-const EXPECTED: Readonly<Record<EntityKind, Route['kind']>> = {
-  account: 'account',
-  employee: 'employee',
+// One row per kind — the route its href must resolve to, or `null` for a
+// kind with no page (PAGELESS_KINDS): its /ux page went with step 1 of
+// design 01fa5bdf, and a link to it would land on not-found, the defect
+// this pin exists for. `Record` over the union makes a new kind a TYPE
+// error here, and the runtime loop below makes it a test failure even
+// under bun's type stripping.
+const EXPECTED: Readonly<Record<EntityKind, Route['kind'] | null>> = {
   job: 'jobDetail',
   invoice: 'invoice',
-  asset: 'asset',
-  part: 'part',
-  product: 'product',
   vendor: 'vendor',
   po: 'po',
   'vendor-invoice': 'vendorInvoice',
-  shipment: 'shipmentDetail',
   // Both are a query on the Finance page, not a path of their own.
   fact: 'finance',
   'ledger-entry': 'finance',
-  'marketing-asset': 'marketingAsset',
+  account: null,
+  employee: null,
+  asset: null,
+  part: null,
+  product: null,
+  shipment: null,
+  'marketing-asset': null,
 };
 
-describe('entityHref — every kind resolves to its own page', () => {
-  test('every kind in ENTITY_KINDS has a declared route', () => {
-    const undeclared = ENTITY_KINDS.filter(
-      (k) => (EXPECTED as Record<string, string | undefined>)[k] === undefined,
-    );
+/// Where each pageless kind's page was, which must answer nothing now —
+/// so a kind cannot be moved back to PAGE_KINDS without its page.
+const FORMER_PAGES: Readonly<Record<(typeof PAGELESS_KINDS)[number], string>> = {
+  account: '/ux/accounts/id-1',
+  employee: '/ux/people/id-1',
+  asset: '/ux/assets/id-1',
+  part: '/ux/parts/id-1',
+  product: '/ux/products/id-1',
+  shipment: '/ux/shipments/id-1',
+  'marketing-asset': '/ux/marketing-assets/id-1',
+};
+
+describe('entityHref — every kind resolves to its own page, or is drawn as text', () => {
+  test('every kind in ENTITY_KINDS has a declared route or a declared absence', () => {
+    const undeclared = ENTITY_KINDS.filter((k) => !(k in EXPECTED));
     expect(undeclared).toEqual([]);
   });
 
-  for (const kind of ENTITY_KINDS) {
+  test('a kind has a page exactly when its expected route is not null', () => {
+    for (const kind of ENTITY_KINDS) {
+      expect({ kind, page: hasPage(kind) }).toEqual({ kind, page: EXPECTED[kind] !== null });
+    }
+    expect([...PAGE_KINDS, ...PAGELESS_KINDS].sort()).toEqual([...ENTITY_KINDS].sort());
+  });
+
+  for (const kind of PAGE_KINDS) {
     test(`${kind}`, () => {
-      const expected = (EXPECTED as Record<string, Route['kind'] | undefined>)[kind];
-      if (expected === undefined) return; // reported by the test above
       // parseRoute takes a pathname; the query (fact/ledger-entry) is
       // read off window.location by the page, not by the router.
-      const path = entityHref(kind as EntityKind, 'id-1').split('?')[0]!;
-      expect({ kind, route: parseRoute(path).kind }).toEqual({ kind, route: expected });
+      const path = entityHref(kind, 'id-1').split('?')[0]!;
+      expect<{ kind: string; route: string | null }>({ kind, route: parseRoute(path, '', ADDRESSES).kind })
+        .toEqual({ kind, route: EXPECTED[kind] });
+    });
+  }
+
+  for (const kind of PAGELESS_KINDS) {
+    test(`${kind} has no page: its former address is not found`, () => {
+      expect({ kind, route: parseRoute(FORMER_PAGES[kind], '', ADDRESSES).kind }).toEqual({ kind, route: 'notFound' });
     });
   }
 });

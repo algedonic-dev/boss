@@ -31,9 +31,17 @@ const OBSERVED_WITHHELD: &str = "this caller's policy scope reads only some pack
 /// The routes, derived from the registries this API holds, with the
 /// observed counts laid over them. `Err` names the registry that could
 /// not be read.
+///
+/// `pinned` names the versions a judged dispatch was registered under
+/// ([`crate::routes_every_stand::pinned_versions`]); each one that is not the active
+/// row is read by its version and walked beside it, so a dispatch off a
+/// packet pinned to an older version is judged against that version
+/// (backlog df62a1eb). A version that cannot be read is left out, and a
+/// dispatch naming it stays unknown.
 pub(super) async fn derived<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &JobsApiState<R, B>,
     observed: Option<&[RouteCount]>,
+    pinned: &std::collections::BTreeSet<(String, i32)>,
 ) -> Result<RouteMap, String> {
     let kinds = state
         .kind_registry
@@ -43,10 +51,21 @@ pub(super) async fn derived<R: JobsRepository + 'static, B: EventBus + 'static>(
         .stations
         .as_ref()
         .ok_or("no station registry is wired, so no station can hold a packet")?;
-    let specs = kinds
+    let mut specs = kinds
         .list_active(None)
         .await
         .map_err(|e| format!("the workflow registry could not be read: {e}"))?;
+    for (kind, version) in pinned {
+        if specs
+            .iter()
+            .any(|s| s.kind == *kind && s.version == *version)
+        {
+            continue;
+        }
+        if let Ok(spec) = kinds.get_version(kind, *version).await {
+            specs.push(spec);
+        }
+    }
     let stations = super::stations::effective_stations(state, reg)
         .await
         .map_err(|resp| {
@@ -56,7 +75,9 @@ pub(super) async fn derived<R: JobsRepository + 'static, B: EventBus + 'static>(
             )
         })?;
     let now = boss_clock_client::now_from(&state.clock).await;
-    Ok(crate::routes::derive_from(&specs, &stations, observed, now))
+    Ok(crate::routes_every_stand::derive_from(
+        &specs, &stations, observed, now,
+    ))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -104,13 +125,22 @@ pub(super) async fn yard_routes<R: JobsRepository + 'static, B: EventBus + 'stat
     let observed = match state.yard_moves.as_ref() {
         Some(_) if !reads_every_packet => None,
         Some(feed) => {
-            let since = boss_clock_client::wall_now() - chrono::Duration::hours(window_hours);
+            // The injected clock, as `/api/yard/moves` reads the same
+            // crossings (#1190): a window off the machine's clock reads
+            // nothing under a frozen test clock once the real one runs a
+            // window past it, and disagrees with a SIM deployment's own
+            // `now` (backlog 5fb858ea).
+            let since = boss_clock_client::now_from(&state.clock).await
+                - chrono::Duration::hours(window_hours);
             feed.store.crossings(since).await.ok()
         }
         None => None,
     };
     let withheld = (!reads_every_packet).then_some(OBSERVED_WITHHELD);
-    match derived(&state, observed.as_deref()).await {
+    let pinned = crate::routes_every_stand::pinned_versions(
+        observed.iter().flatten().map(|c| c.dispatch.as_ref()),
+    );
+    match derived(&state, observed.as_deref(), &pinned).await {
         Ok(map) => Json(serde_json::json!({
             "window_hours": window_hours,
             "observed": observed.is_some(),

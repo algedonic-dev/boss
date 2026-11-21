@@ -1072,6 +1072,9 @@ fn the_verb_files_bound_what_a_packet_can_ask() {
         ("plan-a-node-shutdown", SHUTDOWN),
         ("talos-get", TALOS_GET),
         ("node-status", NODE_STATUS),
+        // The gate-volume proof (backlog ae59464b) is a node verb too: its
+        // behaviour is pinned by prove_gate_volume_sh.rs.
+        ("prove-gate-volume", "infra/forge/prove-gate-volume.sh"),
     ] {
         let v = verb(name);
         assert_eq!(v["hosts"], json!(["forge"]), "{name} serves the forge only");
@@ -1086,7 +1089,12 @@ fn the_verb_files_bound_what_a_packet_can_ask() {
             "{name} names its node"
         );
     }
-    for name in ["cordon-node", "uncordon-node", "shutdown-node"] {
+    for name in [
+        "cordon-node",
+        "uncordon-node",
+        "shutdown-node",
+        "prove-gate-volume",
+    ] {
         let v = verb(name);
         assert!(
             v["about"].as_str().unwrap_or_default().contains("MUTATING"),

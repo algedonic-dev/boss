@@ -29,6 +29,11 @@ use serde_json::Value;
 
 use crate::port::{Backfill, ClassRepository, NamedBirth, class_differs};
 
+/// The subject kind whose Class codes are roles: an employee row's
+/// `role` is validated against `("employee", code)` (boss-people), and
+/// policy reads it as the caller's role.
+const EMPLOYEE_KIND: &str = "employee";
+
 #[derive(Clone)]
 pub struct ClassesApiState {
     pub classes: Arc<dyn ClassRepository>,
@@ -107,13 +112,18 @@ const STORAGE: &str = "in-memory";
 /// Standard health probe — every boss-*-api binary exposes one
 /// at `/api/<service>/health`. The SPA's MonitoringPage polls
 /// this on every page load; a missing endpoint surfaces as 404
-/// console spam.
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "status": "ok",
-        "service": "boss-classes-api",
-        "storage": STORAGE,
-    }))
+/// console spam. The body is the shared [`health_response`], so it
+/// carries the build commit; until backlog 56f88ada (2026-11-20) it was
+/// a flat hand-built `{status, service, storage}` with none, and no
+/// reader in the tree read those flat keys.
+///
+/// [`health_response`]: boss_core::startup::health_response
+async fn health() -> Json<boss_core::startup::HealthResponse> {
+    Json(boss_core::startup::health_response(
+        "boss-classes-api",
+        env!("CARGO_PKG_VERSION"),
+        STORAGE,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -522,6 +532,20 @@ async fn batch_upsert(
     };
 
     let classes: Vec<Class> = rows.into_iter().map(Into::into).collect();
+    // An employee's role is an `employee` Class code, and the policy
+    // engine finds a caller's rule by `role:resource:action`, so a code
+    // carrying that separator is enforced under another role's rule
+    // (backlog 912da9b7). The policy door refuses such a role in a rule;
+    // this is the door a role is born at, so it is refused here too,
+    // the whole batch, before anything is read or written. Edits cannot
+    // rename a code (the URL wins), so no other door makes one.
+    if let Some(refused) = classes
+        .iter()
+        .filter(|c| c.subject_kind == EMPLOYEE_KIND)
+        .find_map(|c| boss_policy_client::types::refuse_ambiguous_role(&c.code).err())
+    {
+        return (StatusCode::UNPROCESSABLE_ENTITY, refused).into_response();
+    }
     // What the registry already holds of this batch, read BEFORE the
     // insert so a kept row's disagreement is named (design e187198f:
     // the instance is the truth, and a repo row that does not land is
@@ -1238,6 +1262,43 @@ mod tests {
 
         let stored = repo.list_for_subject_kind("employee").await.unwrap();
         assert_eq!(stored.len(), 2);
+    }
+
+    /// Backlog 912da9b7 (re-review of car a8becd52): the policy engine
+    /// finds a caller's rule by `role:resource:action`, so a role code
+    /// carrying the separator is enforced under ANOTHER role's rule —
+    /// role `reviewer:step-signoff` on `x` and role `reviewer` on
+    /// `step-signoff:x` are one id. The policy door refuses such a role
+    /// in a rule; an employee's role is an `employee` Class code, and
+    /// this door is where one is born, so it refuses it here too — the
+    /// whole batch, 422, naming the code, with nothing written.
+    #[tokio::test]
+    async fn batch_refuses_an_employee_code_carrying_the_rule_id_separator() {
+        let repo = Arc::new(InMemoryClasses::new(vec![]));
+        let app = door(repo.clone(), default_policy());
+        let body = json!([
+            {"subject_kind": "employee", "code": "analyst", "display_name": "Analyst", "member_attribute": "role", "sort_order": 32},
+            {"subject_kind": "employee", "code": "reviewer:step-signoff", "display_name": "Disguised", "member_attribute": "role", "sort_order": 33},
+        ]);
+        let resp = app
+            .oneshot(batch_request(Some(&operator_header()), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("reviewer:step-signoff"),
+            "names the code: {text}"
+        );
+        assert!(
+            repo.list_for_subject_kind("employee")
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing written"
+        );
+        assert!(repo.recorded_events().is_empty());
     }
 
     #[tokio::test]

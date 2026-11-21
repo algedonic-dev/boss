@@ -96,7 +96,13 @@ fn one_read_only_declaration_is_fired_by_the_scope_step_and_by_the_hosts_deliver
     assert_eq!(literal(rotate, "secret_namespace"), "boss");
     assert_eq!(literal(rotate, "secret_name"), CREDENTIAL);
     assert_eq!(literal(rotate, "secret_key"), "token");
-    assert_eq!(literal(rotate, "forge_user"), "david");
+    // Not david, a Forgejo site admin whose read:repository token reads
+    // every repository on the forge: boss-reader, a read collaborator on
+    // david/boss only, which the forge converge creates and verifies
+    // (design 0af333ee, question `accounts`, David 2026-11-13;
+    // infra/forge/forge-accounts.json, pinned by boss-testing's
+    // forge_account_sh.rs).
+    assert_eq!(literal(rotate, "forge_user"), "boss-reader");
     assert_eq!(
         literal(rotate, "scopes"),
         "read:repository",

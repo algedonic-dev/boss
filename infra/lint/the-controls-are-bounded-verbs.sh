@@ -220,6 +220,18 @@ for n in nodev:
         else:
             g=code.find("node_require_worker ")
             (g >= 0 and d >= 0 and g < d) or sys.exit(f"FAIL: node verb {n}'s script does not refuse a non-worker (node_require_worker) before it opens a door (node_door)")
+            # A worker verb that patches the machine config too
+            # (retire-a-user-volume, backlog 412d504c: one `$patch: delete`
+            # document) is held to node-converge's rule for the act:
+            # --mode=no-reboot and no other mode, a talosctl that only GETs
+            # or patches the machine config, under a signed plan.
+            if re.search(r"\bpatch\s+machineconfig\b", code):
+                modes=re.findall(r"--mode[= ]([A-Za-z-]+)", code)
+                (modes and all(m=="no-reboot" for m in modes)) or sys.exit(f"FAIL: node verb {n}'s script must patch in --mode=no-reboot and no other mode, got {modes}")
+                calls=re.findall(r'\$T[A-Z]*\s+-n\s+"\$NODE_ADDRESS"\s+(\S+)\s+(\S+)', code)
+                (calls and all(c[0]=="get" or c==("patch","machineconfig") for c in calls)) \
+                    or sys.exit(f"FAIL: node verb {n}'s script hands talosctl something other than a get or patch machineconfig: {calls}")
+                s.get("requires_approval") is True or sys.exit(f"FAIL: node verb {n} changes a node's machine config and must run only under a passkey-signed plan")
         "--force" in code and sys.exit(f"FAIL: node verb {n}'s script passes --force somewhere")
     for p in ps[1:]:
         if p["name"]=="resource":
@@ -240,6 +252,18 @@ nc.get("requires_approval") is True and nc.get("plan_verb")=="plan-a-node-conver
 [p["name"] for p in nc["params"]]==["node","tree_sha","plan_sha256"] \
     or sys.exit(f"FAIL: node-converge must take exactly node, tree_sha and plan_sha256, got {[p['name'] for p in nc['params']]}")
 nc["params"][1].get("pattern")=="^[0-9a-f]{40}$" or sys.exit("FAIL: node-converge's tree_sha must be a full 40-hex commit")
+# wipe-a-partition (backlog c98e3425) destroys a partition's data: only
+# under a passkey-signed plan-a-partition-wipe, and only for one NVMe
+# partition's kernel name — never a whole disk or a list.
+wp=v["wipe-a-partition"]
+wp.get("requires_approval") is True and wp.get("plan_verb")=="plan-a-partition-wipe" \
+    or sys.exit("FAIL: wipe-a-partition destroys a partition and must run only under a passkey-signed plan-a-partition-wipe")
+"--plan" in v["plan-a-partition-wipe"]["argv"] and "plan-a-partition-wipe" not in mutating \
+    or sys.exit("FAIL: plan-a-partition-wipe must be the read-only --plan render")
+[p["name"] for p in wp["params"]]==["node","partition","plan_sha256"] \
+    or sys.exit(f"FAIL: wipe-a-partition must take exactly node, partition and plan_sha256, got {[p['name'] for p in wp['params']]}")
+for bad in ("nvme1n1","sda1","nvme1n1p1,nvme0n1p6","/dev/nvme1n1p1","nvme1n1p"):
+    re.fullmatch(wp["params"][1]["pattern"], bad) and sys.exit(f"FAIL: wipe-a-partition's partition pattern admits {bad!r}")
 print(f"verbs: {len(nodev)} node verb(s) ({', '.join(nodev)}) take one named node on the forge; the MUTATING ones refuse a non-worker before any door opens, node-converge a non-Talos node, under a signed no-reboot plan")
 
 runner=open(f"{repo}/infra/ops/ops-runner.sh").read()
@@ -255,8 +279,11 @@ env -i PATH="$PATH" BOSS_CONVERGE_HOLD="$tmp/hold" bash "$repo/infra/forge/conve
 env -i PATH="$PATH" BOSS_CONVERGE_HOLD="$tmp/hold" bash "$repo/infra/forge/converge-hold.sh" release >/dev/null || fail "release needs HOME"
 env -i PATH="$PATH" bash -n "$repo/infra/forge/rollback-to.sh" || fail "rollback-to.sh does not parse"
 # The node verbs (backlog f0aaa72f) run as root with no HOME too; their
-# behaviour is boss-testing/tests/node_maintenance_verbs_sh.rs.
-for s in cluster-node-lib.sh cordon-node.sh shutdown-node.sh talos-get.sh node-status.sh node-disk-usage.sh node-converge.sh; do
+# behaviour is boss-testing/tests/node_maintenance_verbs_sh.rs (and, for
+# prove-gate-volume, backlog ae59464b, prove_gate_volume_sh.rs; for
+# retire-user-volume, backlog 412d504c, retire_user_volume_sh.rs; for
+# wipe-a-partition, backlog c98e3425, wipe_a_partition_sh.rs).
+for s in cluster-node-lib.sh cordon-node.sh shutdown-node.sh talos-get.sh talos-read-diskstats.sh node-status.sh node-disk-usage.sh node-converge.sh prove-gate-volume.sh retire-user-volume.sh wipe-a-partition.sh; do
     env -i PATH="$PATH" bash -n "$repo/infra/forge/$s" || fail "$s does not parse"
     grep -qE '\$HOME' <<<"$(grep -vE '^\s*#' "$repo/infra/forge/$s")" && fail "$s reads \$HOME (the ops runner has none)"
 done
@@ -421,32 +448,65 @@ env -i PATH="$PATH" bash -n "$dob" || fail "delete-orphan-object.sh does not par
 env -i PATH="$PATH" bash -n "$der" || fail "undeclared-objects.sh does not parse"
 grep -qE '\$HOME' <<<"$(grep -vE '^\s*#' "$dob")" && fail "delete-orphan-object.sh reads \$HOME (the ops runner has none)"
 grep -qE '\$HOME' <<<"$(grep -vE '^\s*#' "$der")" && fail "undeclared-objects.sh reads \$HOME (the ops runner has none)"
-# EVERY git CALL IN THE VERB GOES THROUGH THE OWNER.
+# EVERY git CALL THAT PROVES A DECLARATION SET READS ROOT'S OWN STORE
+# (backlog 1dde630c; review a04e64e9 P1 for the two retire verbs).
 #
-# The ops-runner executes verbs as root and the forge checkout belongs to a
-# user, and git refuses to READ across that boundary ("dubious ownership",
-# 2.35.2+) as firmly as a root WRITE would leave root-owned objects behind.
-# A bare `git -C "$TREE"` is therefore a command that fails on every real
-# invocation while passing every test here, because a fixture is owned by
-# whoever runs the gate — measured, on ops-request c9877f75, 2026-09-10.
-# Structural, for the same reason boss-gcp-converges-itself.sh §2b is: the
-# runuser branch cannot be exercised without a second account.
-bare=$(grep -nE '(^|[^_"])git -C "\$TREE"' "$dob" || true)
-[ -z "$bare" ] || fail "delete-orphan-object.sh calls git outside as_owner:
-$bare
-    Root cannot even READ a checkout it does not own; wrap it:
-      as_owner \"git -C '\$TREE' <args>\""
-grep -q 'as_owner()' "$dob" || fail "delete-orphan-object.sh has no as_owner — its git reads cannot be running as the checkout's owner"
-grep -q 'stat -c %U' "$dob" || fail "delete-orphan-object.sh does not read the owner off the directory (hardcoding an account silently corrupts a host that moves the checkout)"
-grep -q 'UNKNOWN' "$dob" || fail "delete-orphan-object.sh does not handle stat's UNKNOWN (no passwd entry for the owning uid), so it would fall back to reading git as the caller"
+# Three verbs run as root and derive what they may delete from a tree:
+# delete-orphan-object, retire-volume-claim and retire-access-object, each
+# through undeclared-objects.sh --check. That tree is a generation of
+# root's tree, proved against root's bare store beside it, never a
+# checkout an account can edit under root — the defect review a8b752d4 N6
+# named, and review a04e64e9 found again in the retire verbs, whose
+# owner-run `git status` a skip-worktree edit hid from. The proof is ONE
+# definition, infra/lib/root-generation.sh, and its one git invocation is
+# root_store_git's: root's store, no account's config, no system config,
+# no hook. A second `git ` call, a `git -C` into a tree, or a store git
+# that lost its isolation is how a checkout's config or hooks would come
+# back into a root run; and the ownership and write-permission checks on
+# the layout are what make "root's tree" true of a path. So each verb
+# that asks the derivation for a deletion sources the lib, calls no git
+# of its own, reads no BOSS_OPS_CHECKOUT, and does not reach for
+# git-owner.sh, which reads a checkout and proves nothing about it. All
+# structural here: a second uid cannot be fixtured in the gate, and the
+# verbs' own tests exercise everything else.
+rgl="$repo/infra/lib/root-generation.sh"
+env -i PATH="$PATH" bash -n "$rgl" || fail "infra/lib/root-generation.sh does not parse"
+rgl_git=$(grep -vE '^\s*#' "$rgl" | grep -nE '(^|[^-[:alnum:]_.])git[[:space:]]' || true)
+[ "$(printf '%s\n' "$rgl_git" | grep -c .)" = 1 ] \
+    && grep -qF 'git -c core.hooksPath=/dev/null --git-dir="$store" --work-tree="$tree"' <<<"$rgl_git" \
+    || fail "infra/lib/root-generation.sh must call git exactly once, inside root_store_git, against root's store:
+$rgl_git"
+grep -qF 'GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_INDEX_FILE="$scratch/index"' "$rgl" \
+    || fail "infra/lib/root-generation.sh's root_store_git no longer isolates git from every account's config, the system's, and the store's own index"
+grep -qF 'stat -c %u' "$rgl" && grep -qF -- '-perm /0022' "$rgl" \
+    || fail "infra/lib/root-generation.sh no longer checks that root's tree is this uid's and writable by nobody else — another account could rewrite the declaration set under the run"
+deriving_verbs=$(grep -lE '"\$DERIVE" --check' "$repo"/infra/forge/*.sh | sort)
+[ "$(printf '%s\n' "$deriving_verbs" | grep -c .)" -ge 3 ] \
+    || fail "found only these forge verbs asking undeclared-objects.sh --check for a deletion — the walk read the wrong tree:
+$deriving_verbs"
+for v in $deriving_verbs; do
+    vn="${v#"$repo"/}"
+    vcode=$(grep -vE '^\s*#' "$v")
+    grep -qE '^\. "\$(HERE|SELF_DIR)/\.\./lib/root-generation\.sh"$' <<<"$vcode" \
+        && grep -qE '^root_generation_proved "\$TREE" ' <<<"$vcode" \
+        || fail "$vn derives deletion authority and does not prove its tree through infra/lib/root-generation.sh"
+    v_git=$(grep -nE '(^|[^-[:alnum:]_.])git[[:space:]]' <<<"$vcode" || true)
+    [ -z "$v_git" ] || fail "$vn derives deletion authority and calls git itself — only root_store_git reads the store:
+$v_git"
+    grep -qF 'BOSS_OPS_CHECKOUT' <<<"$vcode" \
+        && fail "$vn reads BOSS_OPS_CHECKOUT — the checkout its owner can edit is no declaration set for root (backlog 1dde630c)"
+    grep -qF 'lib/git-owner.sh' <<<"$vcode" \
+        && fail "$vn derives deletion authority and sources git-owner.sh — reading a checkout as its owner proves nothing about its bytes (review a04e64e9 P1)"
+done
 # And the derivation needs none of this, which is only true while it makes
-# no git call and writes nothing under the checkout. Pin both, because the
+# no git call and writes nothing under the tree. Pin both, because the
 # day either changes it acquires the same defect silently.
 der_git=$(grep -vE '^\s*#' "$der" | grep -nE '(^|[^-[:alnum:]_.])git[[:space:]]' || true)
 [ -z "$der_git" ] || fail "undeclared-objects.sh now calls git:
 $der_git
-    It runs as root under the ops-runner against a user-owned checkout, so a
-    git call there needs the same as_owner drop delete-orphan-object.sh uses."
+    It runs as root under the ops-runner against the tree it is handed, and
+    delete-orphan-object.sh has already proved that tree against root's
+    store; a git call of its own would read whatever repository it finds."
 der_writes=$(grep -nE '>[[:space:]]*"?\$(TREE|DIR)' "$der" || true)
 [ -z "$der_writes" ] || fail "undeclared-objects.sh writes under the checkout:
 $der_writes

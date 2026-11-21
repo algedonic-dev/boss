@@ -303,8 +303,9 @@ describe('the lifecycle as packets', () => {
 describe('the reads', () => {
   test('a failed registry read is failed, and names the status', async () => {
     globalThis.fetch = (async () => new Response('', { status: 403 })) as unknown as typeof fetch;
-    expect(await fetchCredentials()).toEqual({ kind: 'failed', error: '/api/credentials: HTTP 403' });
-    expect(await fetchBrokerRules()).toEqual({ kind: 'failed', error: '/api/dispatcher/rules: HTTP 403' });
+    // A 403 is marked a refusal (7abb184f); with no body it names only the status.
+    expect(await fetchCredentials()).toEqual({ kind: 'failed', error: '/api/credentials: HTTP 403', refused: true });
+    expect(await fetchBrokerRules()).toEqual({ kind: 'failed', error: '/api/dispatcher/rules: HTTP 403', refused: true });
   });
 
   test('a registry answering a non-list is failed, not empty', async () => {

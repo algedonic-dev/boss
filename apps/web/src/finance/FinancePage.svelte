@@ -5,11 +5,13 @@
   // list), PO Approvals (draft POs), and the five ledger-derived
   // financial statements. New Invoice / New JE actions render only when
   // the session is off the read-only floor AND policy allows each one
-  // (./readOnly financeOffersWrite; backlog 9dad102c).
+  // (./readOnly financeOffersWrite; backlog 9dad102c). The commerce and
+  // inventory sections draw only for a tenant whose manifest lists that
+  // module (./sections; backlog 801b6a7a, design c2820008 D1).
 
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Link from '@boss/web-kit/ui/Link.svelte';
-  import { formatMoney } from '@boss/web-kit/ui/money';
+  import { appToday } from '@boss/web-kit/sim-clock';
   import IncomeStatementTab from './IncomeStatementTab.svelte';
   import BalanceSheetTab from './BalanceSheetTab.svelte';
   import CashFlowTab from './CashFlowTab.svelte';
@@ -25,6 +27,9 @@
     loadCommerceSummary,
     type CommerceSummary,
   } from './api';
+  import { headlineText, loadHeadline, type Headline } from './ledger';
+  import { trailingYear } from './window';
+  import type { Remote } from '../data/remote';
   import type { PagedResult } from '../data/paginated';
   import { loadingRead, readStateOf, type ReadState } from '../data/readState';
   import { href } from '../router';
@@ -32,7 +37,9 @@
   import { financeOffersWrite } from './readOnly';
   import { permission } from '@boss/web-kit/session/permission.svelte';
 
-  import { FINANCE_TABS, financeSearch, type FinanceTab, type FinanceView } from './financeQuery';
+  import { financeSearch, type FinanceTab, type FinanceView } from './financeQuery';
+  import { manifest } from '@boss/web-kit/session/manifest.svelte';
+  import { financeModules, financeTabs, tabShown } from './sections';
   import { departmentLabel } from '@boss/web-kit/nav';
   import { departments } from '@boss/web-kit/session/departments.svelte';
   import DepartmentThirds from '../departments/DepartmentThirds.svelte';
@@ -63,16 +70,30 @@
   // svelte-ignore state_referenced_locally
   let fact = $state(view.fact);
 
+  // The company-layer modules this tenant runs. AR aging, gross margin,
+  // Invoices and New invoice read boss-commerce; AP aging and PO
+  // Approvals read boss-inventory. Algedonic runs neither, so those
+  // sections answered with a source no protocol of the tenant writes
+  // (backlog 801b6a7a, f6d54f7b). Design c2820008 D1: absent, not zero,
+  // and never read. App renders this page only once the manifest is
+  // ready, so `off` here is the tenant's answer, not an unread one.
+  let modules = $derived(financeModules(manifest.value));
+  let tabs = $derived(financeTabs(modules));
+  // The tab drawn: the one asked for, or the first the tenant runs when
+  // it asked for an absent one (the default Overview, a ?tab=invoices
+  // link). The URL follows what is drawn.
+  let shown = $derived(tabShown(tab, modules));
+
   $effect(() => {
     const { pathname, search, hash } = window.location;
-    const next = financeSearch(search, { tab, entry, fact });
+    const next = financeSearch(search, { tab: shown, entry, fact });
     if (next !== search) window.history.replaceState(window.history.state, '', pathname + next + hash);
   });
 
   /// An entry or a fact is a drill-down of the Trial Balance, so
   /// choosing another tab closes it.
   function chooseTab(t: FinanceTab): void {
-    if (t === tab) return;
+    if (t === shown) return;
     tab = t;
     entry = '';
     fact = '';
@@ -99,10 +120,11 @@
   // authority.
   const mayInvoice = permission('create', 'invoice');
   const mayPost = permission('create', 'ledger');
-  let offerInvoice = $derived(financeOffersWrite(session, mayInvoice.value));
+  let offerInvoice = $derived(modules.commerce && financeOffersWrite(session, mayInvoice.value));
   let offerEntry = $derived(financeOffersWrite(session, mayPost.value));
 
   $effect(() => {
+    if (!modules.commerce) return;
     let cancelled = false;
     summaryLoading = true;
     const load = async () => {
@@ -122,29 +144,22 @@
     };
   });
 
-  function glance(cents: number): string {
-    return formatMoney({ amount_cents: cents, currency: 'USD' }, { precision: 'compact' });
-  }
-
-  let headline = $derived.by(() => {
-    if (!summary) {
-      return {
-        title: 'Finance',
-        subtitle: summaryLoading ? 'Loading…' : 'Summary unavailable',
-      };
-    }
-    const marginPct =
-      summary.total_revenue_ttm_cents > 0
-        ? (summary.total_gross_margin_ttm_cents / summary.total_revenue_ttm_cents) * 100
-        : 0;
-    return {
-      title: `${glance(summary.total_revenue_ttm_cents)} trailing revenue`,
-      subtitle:
-        `${glance(summary.total_gross_margin_ttm_cents)} gross margin ` +
-        `(${marginPct.toFixed(1)}%) · ` +
-        `${glance(summary.total_outstanding_cents)} receivables outstanding`,
+  // The headline is the ledger's income statement over the trailing
+  // year — the window /exec's revenue card reads — not boss-commerce's
+  // summary, which no Algedonic protocol writes (backlog 801b6a7a,
+  // design c2820008 D1). Read once on mount: the ledger moves when a
+  // packet posts, and the Income statement tab does not poll either.
+  let headlineRead = $state<Remote<Headline>>({ kind: 'loading' });
+  $effect(() => {
+    let cancelled = false;
+    void loadHeadline(trailingYear(appToday())).then((r) => {
+      if (!cancelled) headlineRead = r;
+    });
+    return () => {
+      cancelled = true;
     };
   });
+  let headline = $derived(headlineText(headlineRead));
 </script>
 
 <div class="catalog theme-exec">
@@ -156,12 +171,12 @@
 
   <div class="finance-actions" style="display:flex; gap:8px; align-items:flex-start; flex-wrap:wrap">
     {#if offerInvoice}
-      <Link to={href('/ux/finance/new')} className="fin-new-invoice">
+      <Link to={href('/finance/invoices/new')} className="fin-new-invoice">
         + New invoice
       </Link>
     {/if}
     {#if offerEntry}
-      <Link to={href('/ux/finance/journal-entries/new')} className="fin-new-invoice">
+      <Link to={href('/finance/journal-entries/new')} className="fin-new-invoice">
         + New journal entry
       </Link>
     {/if}
@@ -169,12 +184,12 @@
   </div>
 
   <nav class="tabs" role="tablist">
-    {#each FINANCE_TABS as t (t.id)}
+    {#each tabs as t (t.id)}
       <button
         type="button"
         role="tab"
-        aria-selected={tab === t.id}
-        class="tab {tab === t.id ? 'tab-active' : ''}"
+        aria-selected={shown === t.id}
+        class="tab {shown === t.id ? 'tab-active' : ''}"
         onclick={() => chooseTab(t.id)}
       >
         {t.label}
@@ -183,23 +198,29 @@
   </nav>
 
   <div class="tab-panel">
-    {#if tab === 'overview'}
-      <OverviewTab {summary} {summaryRead} loading={summaryLoading} />
-    {:else if tab === 'invoices'}
+    {#if shown === 'overview'}
+      <OverviewTab
+        {summary}
+        {summaryRead}
+        loading={summaryLoading}
+        commerce={modules.commerce}
+        warehouse={modules.warehouse}
+      />
+    {:else if shown === 'invoices'}
       <InvoicesTab
         {invoices}
         read={invoicesRead}
         totalCount={summary?.total_invoice_count ?? invoices.length}
       />
-    {:else if tab === 'approvals'}
+    {:else if shown === 'approvals'}
       <ApprovalsTab />
-    {:else if tab === 'income-statement'}
+    {:else if shown === 'income-statement'}
       <IncomeStatementTab />
-    {:else if tab === 'balance-sheet'}
+    {:else if shown === 'balance-sheet'}
       <BalanceSheetTab />
-    {:else if tab === 'cash-flow'}
+    {:else if shown === 'cash-flow'}
       <CashFlowTab />
-    {:else if tab === 'trial-balance'}
+    {:else if shown === 'trial-balance'}
       <TrialBalanceTab
         linkedEntryId={entry}
         linkedFactId={fact}
@@ -208,7 +229,7 @@
           fact = '';
         }}
       />
-    {:else if tab === 'tax-liability'}
+    {:else if shown === 'tax-liability'}
       <TaxLiabilityTab />
     {/if}
   </div>

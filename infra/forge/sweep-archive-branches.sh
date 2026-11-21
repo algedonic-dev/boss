@@ -153,7 +153,7 @@
 #      before it reaches the packet (the lib's redact_url shape). A
 #      forge that cannot be read is a refusal. The checkout is a
 #      user's and the ops-runner is root, so git runs as the
-#      directory's owner (delete-orphan-object.sh's as_owner).
+#      directory's owner (infra/lib/git-owner.sh's as_owner).
 #   5. THE LIVE RECORD. `boss-sor-read` reads the open ship-a-change
 #      cars (one listing, limit 200) as a read-scoped `audit-readonly`
 #      actor — the identity boss prove --unattended builds for a probe, for
@@ -397,18 +397,11 @@ case "$TREE" in
     *[[:space:]\'\"]*) refuse "the tree path \`$TREE\` contains whitespace or a quote; name one without" ;;
 esac
 [ -d "$TREE" ] || refuse "the tree $TREE does not exist, so the forge cannot be read"
-OWNER="$(stat -c %U "$TREE" 2>/dev/null)"
-if [ -z "$OWNER" ] || [ "$OWNER" = "UNKNOWN" ] || ! id -u "$OWNER" >/dev/null 2>&1; then
-    refuse "cannot resolve the owner of $TREE (stat says '${OWNER:-}'), so there is no account to read its git as"
-fi
-OWNER_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"
-as_owner() { # <command string>
-    if [ "$(id -un)" = "$OWNER" ]; then
-        bash -c "$1"
-    else
-        runuser -u "$OWNER" -- env HOME="${OWNER_HOME:-/}" PATH="$PATH" bash -c "$1"
-    fi
-}
+# Every git call as the checkout's owner: the one definition (backlog 5ff118da).
+# shellcheck source=infra/lib/git-owner.sh
+. "$SELF_DIR/../lib/git-owner.sh"
+git_owner_of "$TREE" \
+    || refuse "cannot resolve the owner of $TREE (stat says '${OWNER:-}'), so there is no account to read its git as"
 # GIT_TERMINAL_PROMPT=0: a unit has no terminal, and a prompt would
 # hang, not fail. The remote's URL is never asked for and never shown.
 if ! as_owner "GIT_TERMINAL_PROMPT=0 git -C '$TREE' ls-remote --heads '$REMOTE'" > "$TMP/heads.tsv" 2> "$TMP/git.err"; then

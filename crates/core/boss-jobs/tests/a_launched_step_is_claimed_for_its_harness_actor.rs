@@ -18,10 +18,11 @@
 //! harness's actor. This file pins, through the real router, the three
 //! writes the launch then makes onto a step it no longer holds:
 //!
-//! 1. The claim for the harness actor is judged on THAT actor's row: at
-//!    its cap it is a 409 naming it, while the coordinator's own claim on
-//!    the same packet would have been admitted (the shape the verb sent).
-//!    Its over-budget reading names the harness actor.
+//! 1. The claim for the harness actor is judged on THAT actor's row: its
+//!    over-budget reading names the harness actor. It was also refused at
+//!    the harness row's concurrency cap until backlog 3e927996 retired that
+//!    cap — a robot is bounded by its `robots:<model>` pool alone — so a
+//!    row still declaring a cap of one, with one run in flight, admits it.
 //! 2. Admitted, the step is held by the harness actor and the marker
 //!    names both (`claimed_by` the coordinator, `claimed_for` the actor).
 //! 3. The coordinator's run-edge PATCH (`agent_run`) and its status-only
@@ -112,14 +113,17 @@ async fn agents(codex_cap: i32) -> Arc<InMemoryAgents> {
     let agents = Arc::new(InMemoryAgents::new());
     let row =
         |id: &str, login: &str, model: &str, cap: Option<i32>, hour: Option<i64>| AgentInput {
+            factory_rotation: Some(true),
             id: id.into(),
             display_name: id.into(),
             default_model: model.into(),
+            model_class: None,
             aliases: vec![login.into()],
             role: Some("platform-admin".into()),
             department: None,
             hourly_budget_usd_micros: hour,
             max_concurrent_runs: cap,
+            stations: None,
         };
     agents
         .publish(
@@ -183,6 +187,16 @@ async fn claim(
     step: &Step,
     claimed_for: Option<&str>,
 ) -> (StatusCode, serde_json::Value) {
+    claim_as(app, step, COORDINATOR, claimed_for).await
+}
+
+/// [`claim`], signed as `signer` — the login or the registered id.
+async fn claim_as(
+    app: &axum::Router,
+    step: &Step,
+    signer: &str,
+    claimed_for: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
     let query = claimed_for
         .map(|who| format!("?claimed_for={who}"))
         .unwrap_or_default();
@@ -190,7 +204,7 @@ async fn claim(
         "/api/jobs/{}/steps/{}/claim{query}",
         step.job_id, step.id
     ))
-    .as_user(COORDINATOR, "platform-admin")
+    .as_user(signer, "platform-admin")
     .send(app)
     .await;
     let body = serde_json::from_slice(&resp.body_bytes).unwrap_or(serde_json::Value::Null);
@@ -215,17 +229,24 @@ async fn the_claim_for_the_harness_actor_is_judged_on_its_own_row() {
     let (status, body) = claim(&app, &mine, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    // The claim FOR the harness is judged on the harness's row.
+    // The claim FOR the harness is judged on the harness's row: its hour
+    // is read, and its declared run cap bounds nothing (backlog 3e927996).
     let (status, body) = claim(&app, &theirs, Some(HARNESS)).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"], "claim past the agent's concurrent-run cap");
-    assert_eq!(body["actor"], HARNESS, "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
     let stored = jobs.get_step(&theirs.id).await.unwrap().unwrap();
-    assert_eq!(
-        stored.status,
-        StepStatus::Ready,
-        "it never entered the race"
-    );
+    assert_eq!(stored.status, StepStatus::Active);
+    assert_eq!(stored.assignee_id.as_deref(), Some(HARNESS));
+    let sid = theirs.id.to_string();
+    let reading = jobs
+        .recorded_events()
+        .iter()
+        .find(|e| {
+            e.kind == boss_jobs::agent_budget::CLAIM_OVER_BUDGET
+                && e.payload["step_id"] == sid.as_str()
+        })
+        .map(|e| e.payload.clone())
+        .expect("the claim for the harness reads the harness's hour");
+    assert_eq!(reading["actor"], HARNESS, "{reading}");
 }
 
 #[tokio::test]
@@ -287,4 +308,48 @@ async fn a_step_claimed_for_the_harness_takes_the_launchers_edge_and_completion(
     let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
     assert_eq!(stored.status, StepStatus::Completed);
     assert_eq!(stored.metadata["agent_run"], RUN, "the edge survives it");
+}
+
+/// A READY STEP NOMINATED TO THE COORDINATOR IS HANDED TO THE HARNESS
+/// (backlog 5487223c, part 3; review d20a3b4c of car bcbabd38). The
+/// tests above sign as the login and launch onto a step nobody holds,
+/// so the case the queue actually makes was never exercised: the
+/// coordinator's nomination stores its REGISTERED id (`agent-claude`,
+/// as on this item's own triage and build steps), and the launch then
+/// claims that step for the harness. Signed in either spelling, the
+/// door takes the step from the coordinator's hold — the registered id
+/// is the caller itself; the login reaches it through the agents row
+/// naming that login — and the marker names the hold it ended.
+#[tokio::test]
+async fn a_step_nominated_to_the_coordinator_is_claimed_for_the_harness() {
+    for signer in [COORDINATOR_ID, COORDINATOR] {
+        let jobs = Arc::new(InMemoryJobs::new());
+        let job = packet();
+        jobs.create_job(&job).await.unwrap();
+        let step = Step {
+            assignee_id: Some(COORDINATOR_ID.into()),
+            ..launched_step(&job, "build")
+        };
+        jobs.add_step(&step).await.unwrap();
+        let app = app(jobs.clone(), agents(1).await);
+
+        let (status, body) = claim_as(&app, &step, signer, Some(HARNESS)).await;
+        assert_eq!(status, StatusCode::OK, "signed as {signer}: {body}");
+        let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, StepStatus::Active, "signed as {signer}");
+        assert_eq!(
+            stored.assignee_id.as_deref(),
+            Some(HARNESS),
+            "signed as {signer}"
+        );
+        let sid = step.id.to_string();
+        let marker = jobs
+            .recorded_events()
+            .into_iter()
+            .find(|e| e.kind.starts_with("step.assigned.") && e.payload["step_id"] == sid.as_str())
+            .map(|e| e.payload)
+            .expect("a claim for someone else records its marker");
+        assert_eq!(marker["claimed_for"], HARNESS, "{marker}");
+        assert_eq!(marker["displaced"], COORDINATOR_ID, "{marker}");
+    }
 }

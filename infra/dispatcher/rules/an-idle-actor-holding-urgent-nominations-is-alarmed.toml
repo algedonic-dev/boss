@@ -1,0 +1,70 @@
+# An actor that holds READY urgent work and has run nothing is an alarm
+# that names it (backlog 861360bc).
+#
+# THE CASE. Measured 2026-10-19 13:47Z by the conductor: from 12:52Z to
+# 13:40Z agent-claude-b had no open agent-run while four urgent build
+# steps were READY and nominated to it (f17627b6, 870dbfe4, bbc13a4e,
+# 3e2c8ddc, all nominated on 10-18), beside 16 ready reviews and 45 ready
+# triages. Nothing fired; the reader was David noticing the yard was
+# still. The session had stopped on a time-boxed chat order — the cause
+# half is backlog 37e3295c, the working window as packet data. This row
+# is the detection half, because a factory also goes dark on a session
+# end, a crash or a context loss, and none of those says so.
+#
+# WHY NO NEIGHBOUR COVERED IT, AND STILL SHOULD NOT.
+#   - `an-urgent-item-is-released-when-unrun-and-rescoped-when-long`
+#     reads a CLAIMED (active) urgent build with no run, and an item
+#     open for days. A READY nomination nobody has claimed is neither.
+#   - `agent-held-real-work-is-watched-hourly` leaves `backlog-item`
+#     undeclared on purpose, and is keyed by step. This defect is a
+#     property of the ACTOR: one alarm per idle actor, never one per
+#     step it holds.
+#
+# THE ARGS ARE THE DECLARATION, as registry data:
+#   - priorities: `urgent,emergency`. A standard nomination never
+#     alarms — the 45 ready triages alone would be the flat list shouted.
+#     The handler's test holds this shipped row to exactly these two.
+#   - idle_minutes, 30: no run of the actor open, and none opened or
+#     closed for thirty minutes. Measured from the run's last movement,
+#     so the 12:52Z close puts the alarm on the first tick past 13:22Z.
+#   - wait_minutes, 1440: every declared wait covers at most one day
+#     from the watch's immutable first STEP record. A rewrite alarms;
+#     a packet must also remain open and cannot name this packet or a
+#     work-session. Person identities must exist in the employee registry.
+#     Old versions without a declared wait bound do not suppress waits.
+#     This is STEP metadata, not
+#     the existing scalar JOB waiting_on edge (backlog 8bc040f6).
+#
+# DEDUP: by the alarm staying OPEN. Closing it re-arms the watch, so the
+# next idle stretch files again.
+#
+# EVERY FIVE MINUTES: the bound is minutes, and an hourly tick would let
+# the stall run up to twice its bound before anything spoke. The steady
+# read is the agents registry, the open runs and the open alarms; an
+# actor's queue is read only when it has no run open, and its run history
+# only when that queue holds a ready urgent nomination.
+[[rule]]
+name = "an-idle-actor-holding-urgent-nominations-is-alarmed"
+why = """
+A TIMER over an ABSENCE, the standing exemption: the condition is runs
+that did NOT open, and no event says "thirty minutes passed and the
+actor holding four urgent builds started none of them". A Workflow can
+say who a step is for; it cannot notice that its holder has stopped.
+Measured 2026-10-19 (backlog 861360bc): agent-claude-b held four ready
+urgent nominations from 12:52Z to 13:40Z with no run, and nothing
+fired. It routes nothing and refuses nothing: one firing files ONE
+urgent alarm per idle actor, naming the actor, every held nomination,
+its last run and its session's last prompt, owned by the platform
+owner and assigned to nobody — never to the actor that stopped, so the
+alarm does not report through its subject. The open alarm holds the
+next tick; closing it re-arms.
+Version3 records the original wait through the existing immutable STEP
+record door and bounds both target kinds from that server observation.
+Changing the declaration cannot renew the bound. The original waiting_on
+field remains the owner's declaration; the watch writes only its own receipt.
+"""
+version = 3
+schedule = { cadence = "every-5-minutes", anchor_date = "2026-10-19" }
+[[rule.do]]
+handler = "jobs.idle_actor_watch"
+args = { priorities = "\"urgent,emergency\"", idle_minutes = "30", wait_minutes = "1440" }

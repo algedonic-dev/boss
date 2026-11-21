@@ -1,0 +1,10 @@
+{
+  "about": "READ-ONLY — plan one declared replica decrement and one named replica retirement, floor 2 for database and non-database volumes (723c0828). The deterministic plan binds volume UID, exact replica names/UIDs/node/disk placements, current and target count, the complete fixed execution-source manifest and bounded actions. Attached volumes require a fresh exact running RW engine roster. Detached volumes are not called healthy from historical healthyAt: the signed plan conditionally authorizes one owned longhorn-api frontend-disabled maintenance ticket, fresh running/RW health before any lower/delete, then a genuinely changed owned attachment annotation with UID/resourceVersion CAS before exact own-ticket reconciliation and detached/stopped readback. Host descendant reaping does not stop requests in remote containers; the attachment fence rejects their old resourceVersion. A final count and all replica identities are retained on stopped operations, including attached volumes; an unread snapshot is UNKNOWN and a snapshot cannot settle an unknown count/delete write. Complete bound-claim Pod/Job/Kubernetes attachment inventories must be idle and relevant live CronJobs must have an explicit Etc/UTC daily schedule outside a 1800-second exclusion on either side. No live mutation is performed by this plan. Actual write re-renders the same exact bytes, uses the shared retirement engine's trim/eviction/growth/count/settle/readback guards and refuses any unknown judgement. Historical offline eligibility never substitutes for fresh health.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/retire-volume-replica.sh", "--lower", "--plan", "{1}", "{2}"],
+  "params": [
+    {"name": "volume", "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    {"name": "replica", "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-r-[0-9a-f]{8}$"}
+  ],
+  "timeout": 600
+}

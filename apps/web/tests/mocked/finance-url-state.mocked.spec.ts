@@ -1,8 +1,8 @@
-// /ux/finance — the tab, and the entry or fact a link opened, live in
+// /finance — the tab, and the entry or fact a link opened, live in
 // the URL (backlog 2ab44d55, page audit 3f964c57 gap 7, measured
 // against origin/main 642c0171).
 //
-// NewJournalEntryPage navigates to /ux/finance?entry=<id> after a post,
+// NewJournalEntryPage navigates to /finance?entry=<id> after a post,
 // and entity-href's ledger-entry and fact kinds target ?entry= and
 // ?fact=. The page read neither, so the operator who had just posted an
 // entry landed on Overview and never saw it; and the active tab lived
@@ -15,7 +15,7 @@ import { mountPage } from './_helpers';
 import { installSmokeMocks, signInWithPolicy } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
 
-const PATH = '/ux/finance';
+const PATH = '/finance';
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
@@ -85,7 +85,7 @@ async function install(
 const tab = (page: Page, name: string) => page.getByRole('tab', { name, exact: true });
 const linked = (page: Page) => page.locator('.tb-linked-entry');
 
-test.describe('/ux/finance — a link to an entry or a fact opens it', () => {
+test.describe('/finance — a link to an entry or a fact opens it', () => {
   test('?entry= opens the Trial Balance on that entry, and mounting rewrites nothing', async ({ page }) => {
     await install(page);
     await mountPage(page, `${PATH}?entry=ent-0001`);
@@ -144,7 +144,7 @@ test.describe('/ux/finance — a link to an entry or a fact opens it', () => {
   });
 });
 
-test.describe('/ux/finance — the tab survives reload and back', () => {
+test.describe('/finance — the tab survives reload and back', () => {
   test('a chosen tab rides in the URL without a history entry, and survives a reload', async ({ page }) => {
     await install(page);
     await mountPage(page, PATH);

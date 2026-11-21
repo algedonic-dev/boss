@@ -134,7 +134,7 @@ pub(super) async fn yard_rule_firings<R: JobsRepository + 'static, B: EventBus +
                     .to_string(),
             ),
         },
-        Err(e) => Err(format!("policy check failed: {e}")),
+        Err(e) => Err(policy_fault(e)),
     };
     // Withheld BY SCOPE, said as a flag (backlog 1805bac0): the web told
     // a refusal from a failed read by matching the reason's opening
@@ -174,6 +174,23 @@ pub(super) async fn yard_rule_firings<R: JobsRepository + 'static, B: EventBus +
         o.insert("withheld".into(), serde_json::Value::Bool(true));
     }
     Json(body).into_response()
+}
+
+/// The reason both halves carry when the policy check itself FAILED, in
+/// fixed words: the policy client's text is reqwest's, which names the
+/// policy service's internal URL, and this formatted it into a 200 body
+/// until backlog 47b1157f — the address fe9d212c removed from every 503
+/// body. The detail is logged here instead. Unreachable keeps its word,
+/// `policy-unreachable`, the one the policy client's own 503 answers.
+fn policy_fault(e: &boss_policy_client::PolicyClientError) -> String {
+    tracing::warn!(error = %e, "yard rule-firings: policy check failed; neither half read");
+    let fault = match e {
+        boss_policy_client::PolicyClientError::Unreachable(_) => "policy-unreachable",
+        boss_policy_client::PolicyClientError::Transport(_) => "policy check failed",
+    };
+    format!(
+        "{fault}: neither the firing record nor the dead-letters are read until policy can answer"
+    )
 }
 
 fn split<T>(r: Result<T, String>) -> (Option<T>, Option<String>) {

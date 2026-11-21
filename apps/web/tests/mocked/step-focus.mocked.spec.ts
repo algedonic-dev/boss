@@ -129,4 +129,30 @@ test.describe('full-page step route without a plugin', () => {
     // wholesale PUT had to carry it back by hand.
     expect('authority_role' in m).toBe(false);
   });
+
+  // Opened at the eight characters a surface printed, the page writes
+  // to the full id the job read answered with (backlog 97f98011: a
+  // ratify sent the route's short id and the step doors refused it
+  // `400 invalid job id`, step-write refusal row 27765).
+  test('opened at a short job id, the surface writes to the full id it loaded', async ({ page }) => {
+    const short = JOB_ID.slice(0, 8);
+    await page.route(new RegExp(`/api/jobs/${short}$`), (r) => r.fulfill({ json: JOB }));
+    const sent: string[] = [];
+    await page.route(/\/api\/jobs\/[^/]+\/steps\/[^/]+(\/metadata)?$/, async (route) => {
+      const method = route.request().method();
+      if (method !== 'PUT' && method !== 'PATCH') return route.fallback();
+      sent.push(`${method} ${new URL(route.request().url()).pathname}`);
+      return route.fulfill({ json: STEP });
+    });
+
+    await mountPage(page, `/jobs/${short}/steps/${STEP_ID}`, { root: '.step-focus' });
+
+    await page.getByLabel(/disposition/i).selectOption('design');
+    await page.getByRole('button', { name: /^complete$/i }).click();
+
+    await expect.poll(() => sent.some((s) => s.startsWith('PUT '))).toBe(true);
+    expect(sent).toContain(`PATCH /api/jobs/${JOB_ID}/steps/${STEP_ID}/metadata`);
+    expect(sent).toContain(`PUT /api/jobs/${JOB_ID}/steps/${STEP_ID}`);
+    expect(sent.filter((s) => s.includes(`/api/jobs/${short}/`))).toEqual([]);
+  });
 });

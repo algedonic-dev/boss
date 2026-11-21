@@ -69,6 +69,17 @@ pub(super) fn keep(path: &Path, value: &Value) -> Result<()> {
     // Validate one row at a time: counting must not clone the whole journal
     // on every append. Inventory refuses oversized input before reading bodies.
     let paths = original_paths(path)?;
+    // Before the bound is judged, so a journal already at it still sheds
+    // the twins an earlier build left (194cb548): the refusal below is
+    // every later pass on such a journal, and pruning only on success
+    // would never reach the one it was measured on.
+    let released = release_published_twins(path, &paths)?;
+    if released > 0 {
+        super::log(format!(
+            "diagnostic journal {}: released {released} staged twin(s) of published rows from pending/ (no byte removed; backlog 194cb548)",
+            path.display()
+        ));
+    }
     let mut remaining = MAX_READ_BYTES;
     for (sequence, file) in paths.iter().enumerate() {
         read_original(file, sequence, &mut remaining)?;
@@ -79,6 +90,33 @@ pub(super) fn keep(path: &Path, value: &Value) -> Result<()> {
             .checked_add(std::fs::symlink_metadata(file)?.len())
             .context("retained journal size overflow")
     })?;
+    // Serialize borrowed data directly: building json!(...) cloned the whole
+    // observation before allocating its second serialized copy.
+    #[derive(serde::Serialize)]
+    struct Row<'a> {
+        observation: &'a Value,
+        sequence: usize,
+    }
+    let row = Row {
+        observation: value,
+        sequence,
+    };
+    // Judge the bound BEFORE anything is written. Checked only after
+    // staging, every refused row stayed in pending/ for good, so a request
+    // at its bound grew by one unread file per pass with no end (53 on
+    // assessment 28e96fbc, measured 2026-10-17, backlog daab12f4). A doomed
+    // append writes nothing and stays UNKNOWN; every original is unchanged.
+    let encoded = {
+        let mut counted = CountingSink(0);
+        serde_json::to_writer(&mut counted, &row)?;
+        counted.0
+    };
+    check_read_bound(
+        sequence + 1,
+        retained_bytes
+            .checked_add(encoded)
+            .context("appended journal size overflow")?,
+    )?;
     let staging = private_directory(&path.join("pending"))?;
     // Leave every interrupted write in staging. An accepted sequence is
     // published only after its complete bytes have reached durable storage.
@@ -86,32 +124,14 @@ pub(super) fn keep(path: &Path, value: &Value) -> Result<()> {
         .prefix("original-")
         .tempfile_in(&staging)?;
     let (mut file, staged_path) = staged.keep()?;
-    // Serialize borrowed data directly to durable staging. Building json!(...)
-    // cloned the whole observation before allocating its second serialized copy.
-    #[derive(serde::Serialize)]
-    struct Row<'a> {
-        observation: &'a Value,
-        sequence: usize,
-    }
-    serde_json::to_writer(
-        &mut file,
-        &Row {
-            observation: value,
-            sequence,
-        },
-    )?;
+    serde_json::to_writer(&mut file, &row)?;
     file.flush()?;
     file.sync_all()?;
     std::fs::File::open(&staging)?.sync_all()?;
     let (bytes, digest) = file_identity(&staged_path)?;
-    // On overflow the COMPLETE encoded stream stays in pending, never a
-    // truncated accepted record or a claimed successful observation.
-    check_read_bound(
-        sequence + 1,
-        retained_bytes
-            .checked_add(bytes)
-            .context("appended journal size overflow")?,
-    )?;
+    if bytes != encoded {
+        bail!("staged diagnostic original differs from its judged size; it stays in pending");
+    }
     let target = path.join(format!("{sequence:020}-{digest}.json"));
     match std::fs::hard_link(&staged_path, &target) {
         Ok(()) => std::fs::File::open(path)?.sync_all()?,
@@ -130,7 +150,83 @@ pub(super) fn keep(path: &Path, value: &Value) -> Result<()> {
         }
         Err(error) => return Err(error.into()),
     }
+    // The published name is durable, so the staged name is only a twin of
+    // the same bytes. Kept, a whole-journal snapshot counted every accepted
+    // row twice and the effective read bound was half the declared one
+    // (evidence 2026-10-19 on daab12f4). An interrupted write never gets
+    // here, so pending/ still holds exactly what never published.
+    std::fs::remove_file(&staged_path)?;
+    std::fs::File::open(&staging)?.sync_all()?;
     Ok(())
+}
+
+/// The (device, inode) of every published row: what a staged twin shares.
+pub(super) fn published_inodes<'a>(
+    published: impl IntoIterator<Item = &'a std::fs::Metadata>,
+) -> std::collections::BTreeSet<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    published.into_iter().map(|m| (m.dev(), m.ino())).collect()
+}
+
+/// A pending/ entry that is a second name for a published row's inode.
+/// It holds no byte the published name does not, so a reader skips it and
+/// the writer may release it. Anything else in pending/ — an interrupted
+/// write, a row refused at the bound — has bytes held nowhere else and is
+/// never matched here (backlog 194cb548).
+pub(super) fn is_published_twin(
+    inodes: &std::collections::BTreeSet<(u64, u64)>,
+    entry: &std::fs::Metadata,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    entry.is_file() && inodes.contains(&(entry.dev(), entry.ino()))
+}
+
+/// Release the staged twins an earlier build left in pending/ (backlog
+/// 194cb548): before daab12f4 every accepted row kept its staged name, so
+/// a journal written then carries one twin per published row and is
+/// counted double by a whole-journal read. Removing a twin unlinks a name,
+/// never bytes — the published name still links the same inode — which is
+/// the act keep() already performs for every row it publishes since
+/// daab12f4. Called only under the journal's exclusive lock, bounded by
+/// the published set (at most MAX_READ_FILES inodes), idempotent: once the
+/// twins are gone it matches nothing and removes nothing.
+fn release_published_twins(path: &Path, published: &[PathBuf]) -> Result<usize> {
+    let staging = path.join("pending");
+    if !staging.exists() {
+        return Ok(0);
+    }
+    private_directory(&staging)?;
+    let published = published
+        .iter()
+        .map(std::fs::symlink_metadata)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let inodes = published_inodes(&published);
+    let mut released = 0usize;
+    for entry in std::fs::read_dir(&staging)? {
+        let file = entry?.path();
+        if is_published_twin(&inodes, &std::fs::symlink_metadata(&file)?) {
+            std::fs::remove_file(&file)?;
+            released += 1;
+        }
+    }
+    if released > 0 {
+        std::fs::File::open(&staging)?.sync_all()?;
+    }
+    Ok(released)
+}
+
+/// Counts the bytes an encoding would write, writing none of them.
+struct CountingSink(u64);
+
+impl Write for CountingSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len() as u64);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn file_identity(path: &Path) -> Result<(u64, String)> {
@@ -338,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_append_keeps_the_whole_staged_stream_and_refuses_publication() {
+    fn oversized_append_refuses_publication_before_staging_anything() {
         let root = tempfile::tempdir().unwrap();
         let path = private_directory(&root.path().join("journal")).unwrap();
         let value = json!({"original":"x".repeat(16 * 1024 * 1024)});
@@ -347,15 +443,180 @@ mod tests {
         };
         assert!(error.to_string().contains("bound"), "{error:#}");
         assert!(originals(&path).unwrap().is_empty());
-        let pending = std::fs::read_dir(path.join("pending"))
-            .unwrap()
-            .map(|p| p.unwrap().path())
-            .collect::<Vec<_>>();
-        assert_eq!(pending.len(), 1);
+        // Judged before staging (daab12f4): a refused row is never written,
+        // so a pass refused at the bound leaves nothing behind.
+        assert_eq!(pending_files(&path), 0);
+    }
+
+    fn pending_files(path: &Path) -> usize {
+        std::fs::read_dir(path.join("pending")).map_or(0, |entries| entries.count())
+    }
+
+    /// Plant `count` valid published originals directly, the shape keep()
+    /// leaves, without paying a durable sync per row.
+    fn plant_originals(path: &Path, count: usize, filler: usize) {
+        use std::os::unix::fs::PermissionsExt;
+        for sequence in 0..count {
+            let raw = serde_json::to_vec(
+                &json!({"observation":{"original":"x".repeat(filler)},"sequence":sequence}),
+            )
+            .unwrap();
+            let digest = hex::encode(Sha256::digest(&raw));
+            let file = path.join(format!("{sequence:020}-{digest}.json"));
+            std::fs::write(&file, &raw).unwrap();
+            // mode-bits-ok: private original journal fixture, never executable.
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    /// Backlog daab12f4 (measured 2026-10-17: 53 never-published files in
+    /// one assessment's pending/, one more every ~2 minutes): a journal
+    /// already at its file bound refused every later row only AFTER staging
+    /// it, so each doomed pass left one more file behind. The bound is
+    /// checked before anything is written, the refusal stays UNKNOWN, and
+    /// however many passes are refused, pending/ does not grow.
+    #[test]
+    fn a_doomed_append_at_the_file_bound_refuses_without_staging_anything() {
+        let root = tempfile::tempdir().unwrap();
+        let path = private_directory(&root.path().join("journal")).unwrap();
+        plant_originals(&path, MAX_READ_FILES, 1);
+        for _ in 0..3 {
+            let Err(error) = keep(&path, &json!({"phase":"native-invocation"})) else {
+                panic!("an append past the file bound must remain UNKNOWN");
+            };
+            assert!(error.to_string().contains("bound"), "{error:#}");
+        }
+        assert_eq!(pending_files(&path), 0, "a refused pass left a staged file");
+        assert_eq!(original_paths(&path).unwrap().len(), MAX_READ_FILES);
+    }
+
+    #[test]
+    fn a_doomed_append_at_the_byte_bound_refuses_without_staging_anything() {
+        let root = tempfile::tempdir().unwrap();
+        let path = private_directory(&root.path().join("journal")).unwrap();
+        plant_originals(&path, 1, MAX_READ_BYTES as usize - 100);
+        let Err(error) = keep(
+            &path,
+            &json!({"phase":"native-invocation","pad":"x".repeat(200)}),
+        ) else {
+            panic!("an append past the byte bound must remain UNKNOWN");
+        };
+        assert!(error.to_string().contains("bound"), "{error:#}");
+        assert_eq!(pending_files(&path), 0, "a refused pass left a staged file");
+        assert_eq!(original_paths(&path).unwrap().len(), 1);
+    }
+
+    /// Evidence 2026-10-19 on daab12f4 (run b186ffca): every accepted row
+    /// stayed in pending/ as a hard-linked twin of its published file, so a
+    /// whole-journal snapshot counted each row twice and the effective read
+    /// bound was half the declared one. Once the publication is durable the
+    /// staged name is released; an interrupted write still stays.
+    #[test]
+    fn a_published_row_leaves_no_staged_twin() {
+        let root = tempfile::tempdir().unwrap();
+        let path = private_directory(&root.path().join("journal")).unwrap();
+        for index in 0..3 {
+            keep(&path, &json!({"row":index})).unwrap();
+        }
+        assert_eq!(originals(&path).unwrap().len(), 3);
         assert_eq!(
-            std::fs::read(&pending[0]).unwrap(),
-            serde_json::to_vec(&json!({"sequence":0,"observation":value})).unwrap()
+            pending_files(&path),
+            0,
+            "a published row kept a staged twin"
         );
+    }
+
+    /// Give every published row the staged twin a build before daab12f4
+    /// left behind: a second name in pending/ for the same inode.
+    fn plant_twins(path: &Path) -> usize {
+        let staging = private_directory(&path.join("pending")).unwrap();
+        let published = original_paths(path).unwrap();
+        for (index, file) in published.iter().enumerate() {
+            std::fs::hard_link(file, staging.join(format!("original-twin{index}"))).unwrap();
+        }
+        published.len()
+    }
+
+    /// A refused row the old order staged and never published: its own
+    /// inode, bytes held nowhere else.
+    fn plant_refused(path: &Path, name: &str, sequence: usize) -> Vec<u8> {
+        use std::os::unix::fs::PermissionsExt;
+        let raw =
+            serde_json::to_vec(&json!({"observation":{"phase":"whoami"},"sequence":sequence}))
+                .unwrap();
+        let file = path.join("pending").join(name);
+        std::fs::write(&file, &raw).unwrap();
+        // mode-bits-ok: private original journal fixture, never executable.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        raw
+    }
+
+    fn pending_names(path: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(path.join("pending"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn published_bytes(path: &Path) -> Vec<Vec<u8>> {
+        original_paths(path)
+            .unwrap()
+            .iter()
+            .map(|file| std::fs::read(file).unwrap())
+            .collect()
+    }
+
+    /// Backlog 194cb548: daab12f4 stopped NEW twins, but a journal written
+    /// by an earlier build keeps one in pending/ for every published row.
+    /// The next append under the lock releases each such second name — no
+    /// byte goes with it, the published name still links the inode — and
+    /// leaves every pending entry that is not a twin exactly as it was.
+    #[test]
+    fn an_append_releases_twins_an_earlier_build_left_and_nothing_else() {
+        let root = tempfile::tempdir().unwrap();
+        let path = private_directory(&root.path().join("journal")).unwrap();
+        plant_originals(&path, 3, 8);
+        assert_eq!(plant_twins(&path), 3);
+        let refused = plant_refused(&path, "original-refused", 3);
+        let before = published_bytes(&path);
+        keep(&path, &json!({"row":"after"})).unwrap();
+        assert_eq!(pending_names(&path), vec!["original-refused".to_string()]);
+        assert_eq!(
+            std::fs::read(path.join("pending").join("original-refused")).unwrap(),
+            refused,
+            "a never-published entry is evidence and stays byte for byte"
+        );
+        let after = published_bytes(&path);
+        assert_eq!(after.len(), 4);
+        assert_eq!(after[..3], before[..], "a published row changed");
+    }
+
+    /// The measured shape (28e96fbc, run 4ec033fd): every row of a journal
+    /// at its file bound has its twin, beside never-published refusals.
+    /// The append still refuses — the bound is the bound — but the twins
+    /// are released on that pass, so the journal stops carrying them.
+    #[test]
+    fn a_journal_at_its_bound_releases_its_twins_even_when_the_append_refuses() {
+        let root = tempfile::tempdir().unwrap();
+        let path = private_directory(&root.path().join("journal")).unwrap();
+        plant_originals(&path, MAX_READ_FILES, 1);
+        assert_eq!(plant_twins(&path), MAX_READ_FILES);
+        plant_refused(&path, "original-refused-a", MAX_READ_FILES);
+        plant_refused(&path, "original-refused-b", MAX_READ_FILES);
+        let Err(error) = keep(&path, &json!({"phase":"whoami"})) else {
+            panic!("an append past the file bound must remain UNKNOWN");
+        };
+        assert!(error.to_string().contains("bound"), "{error:#}");
+        assert_eq!(
+            pending_names(&path),
+            vec![
+                "original-refused-a".to_string(),
+                "original-refused-b".to_string()
+            ]
+        );
+        assert_eq!(original_paths(&path).unwrap().len(), MAX_READ_FILES);
     }
 
     #[test]

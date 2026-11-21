@@ -6,11 +6,11 @@ import { FINANCE_TABS, entrySearch, financeSearch, readFinanceView, type Finance
 // post and entity-href's ledger-entry and fact kinds target those two
 // (backlog 2ab44d55, page audit 3f964c57 gap 7). The read and the write
 // below are the page's URL state; the write is the read's inverse, the
-// /ux/jobs mechanism (filterQuery.ts, f8027805).
+// jobs list's mechanism (f8027805; that list went with design 01fa5bdf).
 const view = (tab: FinanceView['tab'], entry = '', fact = ''): FinanceView => ({ tab, entry, fact });
 
 describe('readFinanceView', () => {
-  test('a bare /ux/finance is the Overview', () => {
+  test('a bare /finance is the Overview', () => {
     expect(readFinanceView('')).toEqual(view('overview'));
   });
 

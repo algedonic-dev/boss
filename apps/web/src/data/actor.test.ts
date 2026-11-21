@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'bun:test';
 
-import { formatActor, isHumanActor } from './actor';
+import { executorKind, formatActor, isHumanActor } from './actor';
 
 describe('isHumanActor', () => {
   it('is true only for an employee id', () => {
@@ -175,5 +175,25 @@ describe('formatActor', () => {
     expect(formatActor(null)).toBe('Platform');
     expect(formatActor(undefined)).toBe('Platform');
     expect(formatActor('')).toBe('Platform');
+  });
+});
+
+describe('executorKind — the TS mirror of ActorId::executor_kind (backlog 8e8d0b1a)', () => {
+  it('reads each spelling the record carries as exactly one kind, as Rust does', () => {
+    const cases: ReadonlyArray<readonly [string, 'person' | 'robot' | 'automaton']> = [
+      ['emp-032', 'person'],
+      ['automation:dispatcher', 'automaton'],
+      ['automation:rule:bill-approve', 'automaton'],
+      ['rule:bill-approve', 'automaton'],
+      ['system', 'automaton'],
+      ['claude:opus-5', 'robot'],
+      ['agent-claude', 'robot'],
+      ['claude@algedonic.dev', 'robot'],
+    ];
+    for (const [id, kind] of cases) expect(`${id} ${executorKind(id)}`).toBe(`${id} ${kind}`);
+  });
+  it('agrees with isHumanActor: person exactly when human', () => {
+    for (const id of ['emp-032', 'agent-claude', 'system', 'rule:x', 'claude@algedonic.dev', 'automation:x'])
+      expect(executorKind(id) === 'person').toBe(isHumanActor(id));
   });
 });

@@ -173,6 +173,21 @@ async function settled() {
   for (let i = 0; i < 48; i++) await Promise.resolve();
 }
 
+async function movedActionsStayLocked(c: FakeNode, calls: FetchCall[], roles: readonly string[]) {
+  const labels = ['Approve', 'Reject', 'Request changes', ...roles.map((r) => `Sign off as ${r}`)];
+  for (const label of labels) {
+    expect(buttonNamed(c, label)).toBeDefined();
+    expect(buttonNamed(c, label)!.disabled).toBe(true);
+  }
+  const before = calls.slice();
+  // FakeNode deliberately fires disabled controls too: stale handlers
+  // must not write another decision or begin another ceremony.
+  for (const label of labels) buttonNamed(c, label)!.fire('click');
+  await settled();
+  expect(calls).toEqual(before);
+  expect(allText(c)).toContain('reopen it to read it as it stands');
+}
+
 // The publish approval's exact shape: sign-off kind, one required
 // string field, no counter-signatures, a brief on the step.
 const publishStep = () => ({
@@ -1051,7 +1066,7 @@ describe('sign-off — a completion refused for presence gets one tap and one re
   test('a recovery ceremony refused 412 asks the host to refresh and leaves no stale "Decision saved"', async () => {
     const step = noRoleStep();
     const server = presenceServer(step);
-    const { mount } = loadBundle((url, init) =>
+    const { mount, calls } = loadBundle((url, init) =>
       url === BEGIN
         ? { __status: 412, __text: 'the step changed since it was shown' }
         : server.routes(url, init),
@@ -1075,13 +1090,17 @@ describe('sign-off — a completion refused for presence gets one tap and one re
     expect(allText(c)).toContain('412');
     expect(allText(c)).toContain('reopen it to read it as it stands');
     expect(allText(c)).not.toContain('Decision saved');
+    await movedActionsStayLocked(c, calls, step.sign_offs_required);
+    const reopened = new FakeNode();
+    mount(reopened, { step: noRoleStep(), jobId: 'job-1', onUpdate() {} });
+    expect(buttonNamed(reopened, 'Approve')!.disabled).toBe(false);
   });
 
   test('a stamp ceremony refused 412 after the decision landed does the same', async () => {
     const step = presenceStep();
     delete (step.metadata as Record<string, unknown>).decision;
     const server = presenceServer(step);
-    const { mount } = loadBundle((url, init) =>
+    const { mount, calls } = loadBundle((url, init) =>
       url === BEGIN
         ? { __status: 412, __text: 'the step changed since it was shown' }
         : server.routes(url, init),
@@ -1104,6 +1123,10 @@ describe('sign-off — a completion refused for presence gets one tap and one re
     expect(updates).toBe(1);
     expect(allText(c)).toContain('reopen it to read it as it stands');
     expect(allText(c)).not.toContain('Decision saved');
+    await movedActionsStayLocked(c, calls, step.sign_offs_required);
+    const reopened = new FakeNode();
+    mount(reopened, { step: presenceStep(), jobId: 'job-1', onUpdate() {} });
+    expect(buttonNamed(reopened, 'Approve')!.disabled).toBe(false);
   });
 
   // "Refused again after a fresh passkey tap" named ANY refusal of the

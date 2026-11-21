@@ -221,12 +221,19 @@
 #                   boss-testing/tests/the_drift_facets_are_one_list.rs
 #                   can run this comparator and `boss tenant publish`'s
 #                   over one bundle and one answer (backlog e5dc276d).
+#                   Given a FILE instead of a directory it reads a
+#                   tenant's bundle — one seeds/workflows.toml of many
+#                   [[workflow]] blocks — under TENANT_FIELD_FLOOR
+#                   (backlog 6db14d0c).
 #
 #   Exit codes:  0 clean (or drift, reported, bare invocation; or the
 #                  static half clean under BOSS_ESTATE=none)
 #                1 a failure of the tree — an unauthored live kind, a
 #                  Rust literal, a stale exemption, an unreadable
-#                  bundle file, or a comparison refused as vacuous
+#                  bundle file, or a comparison refused as vacuous —
+#                  or of a delivered tenant's: a live kind it owns that
+#                  its converged checkout does not author, or a tenant
+#                  file that does not parse (backlog 6db14d0c)
 #                2 field drift, under --require-live only
 #                3 LINT_CANNOT_ANSWER — the live comparison could not
 #                  run (bare invocation; the gate records a refusal)
@@ -236,6 +243,10 @@
 #
 #   BOSS_JOBS_URL  read surface base (default: the in-cluster machine
 #                  door, boss-jobs-internal:7900)
+#   BOSS_FORGE_TENANTS_DIR  where the converge stages each repo-sourced
+#                  instance's tenant checkout, one directory per instance
+#                  name (default: infra/forge/forge-defaults.sh's
+#                  TENANTS_DIR); read, never written, never fetched into
 
 set -uo pipefail
 
@@ -281,6 +292,17 @@ NAME="the-live-protocols-are-the-authored-protocols"
 # How many kinds the field comparison must actually compare before its
 # silence means anything. See the floor's own comment below.
 FIELD_FLOOR=20
+# The same floor for a TENANT's bundle — one seeds/workflows.toml of
+# `[[workflow]]` blocks, compared by `--compare <file>` and by the tenant
+# leg below (backlog 6db14d0c). Twenty refused a nine-kind tenant whole,
+# so a tenant's file is held to comparing at least one kind; the tenant
+# leg raises it to every live kind the tenant owns that its file authors,
+# so a reader that saw a kind and then compared none of them still
+# refuses. Sized to a tenant, not a ratchet: no tenant's count is here.
+TENANT_FIELD_FLOOR=1
+# Where the instances are declared, and so which of them take their
+# tenant from a repository (`tenant_repo` + `tenant_ref`).
+INSTANCES="infra/cluster/instances.toml"
 
 REQUIRE_LIVE=0
 SELF_TEST=0
@@ -323,11 +345,23 @@ problems=0
 # failed"): 0 compared cleanly or with drift, 3 the live answer did not
 # parse, 6 a bundle file did not parse or held no [[workflow]], 7 the
 # non-vacuity floor refused.
+#
+# `fields_report <tenant_file> <live_json> [floor]` is the same
+# comparison over a TENANT's bundle: one file holding many `[[workflow]]`
+# blocks (a tenant repository's seeds/workflows.toml), where the platform
+# bundle is one kind per file. The floor defaults to TENANT_FIELD_FLOOR
+# for a file and FIELD_FLOOR for a directory; the tenant leg passes its
+# own (backlog 6db14d0c).
 fields_report() {
-    python3 - "$1" "$2" "$FIELD_FLOOR" <<'PY'
+    local floor="${3:-}"
+    if [ -z "$floor" ]; then
+        if [ -f "$1" ]; then floor="$TENANT_FIELD_FLOOR"; else floor="$FIELD_FLOOR"; fi
+    fi
+    python3 - "$1" "$2" "$floor" <<'PY'
 import json, sys, tomllib, pathlib
 
 bundle_dir, live_path, floor = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+one_file = bundle_dir.is_file()
 
 # The fields compared, and the reason each one is on the list. All four
 # are SCALAR STRINGS an operator reads, and none of them changes what
@@ -594,8 +628,12 @@ def drift_line(kind, field, row, tree, live):
         window(live if isinstance(live, str) or live is None else str(live), at),
     )
 
-files = sorted(bundle_dir.glob("*.toml"))
+files = [bundle_dir] if one_file else sorted(bundle_dir.glob("*.toml"))
 parsed = compared = drifted = 0
+# How many `[[workflow]]` tables the TOML parser found, summed over the
+# files — the count every block below must be read against. See the
+# floor's comment for why it is counted off the parse, never the text.
+declared = 0
 lines = []
 for f in files:
     try:
@@ -607,6 +645,7 @@ for f in files:
     except Exception as e:
         print(f"{f}: not a readable [[workflow]] file: {e}", file=sys.stderr)
         sys.exit(6)
+    declared += len(blocks)
     for wf in blocks:
         kind = wf.get("kind")
         if not kind:
@@ -662,7 +701,28 @@ print("\n".join(lines)) if lines else None
 # 61085a9e). The floor is deliberately far below the bundle's real size
 # so that adding or retiring a protocol never edits it — it is a
 # parse-sanity floor, not a ratchet with a number to bump (§9a).
-if parsed != len(files):
+#
+# EVERY BLOCK THE PARSER FOUND WAS READ. A tenant's file holds many
+# kinds, so "one per file" is no check on it; the question it stands in
+# for — did the loop above read every block there is — is asked of the
+# PARSED structure: the `[[workflow]]` tables tomllib returned. It used
+# to be asked of the file's TEXT, a regex over its lines, and that
+# refused valid TOML: a multiline description documenting an example
+# holds a literal `[[workflow]]` line that is prose, not a table, so an
+# equal one-workflow file read parsed 1 / compared 1 / drifted 0 and was
+# still refused 7 (review run 23be09ae R1, at 367b6a7f). tomllib drops
+# no table — a malformed or duplicate one is a parse error, exit 6
+# above — so the text knew nothing the parse did not. What this keeps
+# is the guard against the loop itself: a block skipped without being
+# counted (a `continue` added before `parsed += 1`) still refuses.
+if parsed != declared:
+    print(
+        f"REFUSED\tread {parsed} of the {declared} [[workflow]] table(s) the TOML parser "
+        f"found in {bundle_dir} — the reader is broken",
+        file=sys.stderr,
+    )
+    sys.exit(7)
+if not one_file and parsed != len(files):
     print(
         f"REFUSED\tread {parsed} [[workflow]] block(s) from {len(files)} file(s) — "
         "one kind per file is pinned by the loader, so the reader is broken",
@@ -711,7 +771,20 @@ PY
 #                         of the step: `.ready_when`, `.metadata_defaults`…)
 #                 absent: [{kind, field}…] }, the file makes no claim
 #     pending:  [kind…],                      authored, not yet admitted
-#     tenants:  [{file, not_admitted, total}…] }
+#     tenants:  [{file, not_admitted, total}…],
+#     tenant:   { state, owned, absent, unchecked, compared,
+#                 checkouts: [{instance, repo, ref, dir, state, file, head}…],
+#                 drift: […the fields.drift shape…], absent_fields,
+#                 skipped_because } }
+#
+# `tenant` is the delivered tenant's leg (backlog 6db14d0c): `state` is
+# `none` (no repo-sourced instance, or no live kind a tenant owns),
+# `compared` (every repo-sourced instance's checkout was read) or
+# `skipped` (one was not there to read — `unchecked` names the kinds it
+# leaves unjudged and `skipped_because` says why). `owned` is every live
+# kind a delivered tenant owns, `absent` those no checkout authors (the
+# lint's exit 1). Its drift is NOT in `fields`: those are rows of this
+# tree's bundle, and a reader filing them names this tree's files.
 #
 # `verdict` is the exit code THIS invocation goes on to exit with, so a
 # caller filing the report can record it without parsing stderr — and
@@ -727,6 +800,16 @@ write_report() { # <file> <verdict>
     printf '%s\n' "$pending"      > "$t/pending"
     printf '%s\n' "$tenant_lines" > "$t/tenants"
     printf '%s\n' ${EXEMPT[@]+"${EXEMPT[@]}"} > "$t/exempt"
+    # The tenant leg's facts; unset (the self-test, a tree with no
+    # repo-sourced instance) they read as state `none`.
+    printf '%s\n' "${tenant_state:-none}"     > "$t/tenant_state"
+    printf '%s\n' "${tenant_owned:-}"         > "$t/tenant_owned"
+    printf '%s\n' "${tenant_missing:-}"       > "$t/tenant_missing"
+    printf '%s\n' "${tenant_unchecked:-}"     > "$t/tenant_unchecked"
+    printf '%s\n' "${tenant_checkouts:-}"     > "$t/tenant_checkouts"
+    printf '%s\n' "${tenant_fields_out:-}"    > "$t/tenant_fields"
+    printf '%s\n' "${tenant_compared:-0}"     > "$t/tenant_compared"
+    printf '%s\n' "${tenant_skip_reason:-}"   > "$t/tenant_skip"
     python3 - "$t" "$out" "$URL" "$verdict" "$problems" <<'PY' || { rm -rf "$t"; return 1; }
 import json, pathlib, sys, datetime
 
@@ -742,26 +825,48 @@ def num(s, prefix):
     except ValueError:
         return None
 
-counts = {"parsed": None, "compared": None, "drifted": None}
-drift, absent = [], []
-for line in lines("fields"):
-    cells = line.split("\t")
-    tag = cells[0]
-    if tag == "COUNTS":
-        for cell in cells[1:]:
-            k, _, v = cell.partition("=")
-            if k in counts:
-                counts[k] = num(v, "")
-    elif tag == "DRIFT" and len(cells) >= 9:
-        drift.append({
-            "kind": cells[1], "field": cells[2],
-            "live_version": num(cells[3], "v"),
-            "at": num(cells[4], "at="),
-            "tree_len": num(cells[5], "tree="), "live_len": num(cells[6], "live="),
-            "tree_window": cells[7], "live_window": cells[8],
-        })
-    elif tag == "ABSENT" and len(cells) >= 3:
-        absent.append({"kind": cells[1], "field": cells[2]})
+def comparator_lines(name):
+    """The comparator's COUNTS / DRIFT / ABSENT lines, read once for
+    the platform bundle and once for the tenant leg."""
+    counts = {"parsed": None, "compared": None, "drifted": None}
+    drift, absent = [], []
+    for line in lines(name):
+        cells = line.split("\t")
+        tag = cells[0]
+        if tag == "COUNTS":
+            for cell in cells[1:]:
+                k, _, v = cell.partition("=")
+                if k in counts:
+                    counts[k] = num(v, "")
+        elif tag == "DRIFT" and len(cells) >= 9:
+            drift.append({
+                "kind": cells[1], "field": cells[2],
+                "live_version": num(cells[3], "v"),
+                "at": num(cells[4], "at="),
+                "tree_len": num(cells[5], "tree="), "live_len": num(cells[6], "live="),
+                "tree_window": cells[7], "live_window": cells[8],
+            })
+        elif tag == "ABSENT" and len(cells) >= 3:
+            absent.append({"kind": cells[1], "field": cells[2]})
+    return counts, drift, absent
+
+counts, drift, absent = comparator_lines("fields")
+_, tenant_drift, tenant_absent_fields = comparator_lines("tenant_fields")
+tenant_state = (lines("tenant_state") or ["none"])[0]
+tenant = {
+    "state": tenant_state,
+    "owned": lines("tenant_owned"),
+    "absent": lines("tenant_missing"),
+    "unchecked": lines("tenant_unchecked"),
+    "compared": num((lines("tenant_compared") or ["0"])[0], ""),
+    "checkouts": [
+        dict(zip(("instance", "repo", "ref", "dir", "state", "file", "head"), l.split("\t")[1:8]))
+        for l in lines("tenant_checkouts")
+    ],
+    "drift": tenant_drift,
+    "absent_fields": tenant_absent_fields,
+    "skipped_because": "; ".join(lines("tenant_skip")) or None,
+}
 
 tenants = []
 for line in lines("tenants"):
@@ -781,6 +886,7 @@ report = {
     "fields": {**counts, "drift": drift, "absent": absent},
     "pending": lines("pending"),
     "tenants": tenants,
+    "tenant": tenant,
 }
 if len(drift) != (counts["drifted"] or 0):
     print(f"the report would carry {len(drift)} DRIFT line(s) against a drifted={counts['drifted']} count — the comparator's lines and its count disagree, so nothing was written", file=sys.stderr)
@@ -1097,6 +1203,20 @@ FX
 
     FIELD_FLOOR="$FIELD_FLOOR_SAVED"
 
+    # 7b. A TENANT'S FILE (backlog 6db14d0c): many [[workflow]] blocks in
+    #    one file, compared under the tenant floor rather than refused by
+    #    the platform bundle's twenty — and a file comparing NOTHING is
+    #    still refused, because a tenant's floor is low, not absent.
+    cat "$t/bundle/alpha.toml" "$t/bundle/beta.toml" > "$t/tenant-workflows.toml"
+    out=$(fields_report "$t/tenant-workflows.toml" "$t/drift.json" 2>&1); rc=$?
+    [ "$rc" -eq 0 ] || { echo "self-test FAILED: a two-kind tenant file exited $rc under the tenant floor: $out" >&2; rm -rf "$t"; return 1; }
+    grep -qF "COUNTS	parsed=2	compared=2	drifted=1" <<< "$out" \
+        || { echo "self-test FAILED: a tenant file's two blocks were not both read and compared: $out" >&2; rm -rf "$t"; return 1; }
+    grep -qF "DRIFT	beta	description	v3" <<< "$out" \
+        || { echo "self-test FAILED: a tenant file's drift was not named by kind, field and live version: $out" >&2; rm -rf "$t"; return 1; }
+    out=$(fields_report "$t/tenant-workflows.toml" "$t/elsewhere.json" 2>&1); rc=$?
+    [ "$rc" -eq 7 ] || { echo "self-test FAILED: a tenant file comparing nothing exited $rc, expected the floor's 7: $out" >&2; rm -rf "$t"; return 1; }
+
     # 9. THE JSON REPORT carries the comparator's facts, not a retelling
     #    of them: driven from the SAME drift fixture as case 2, in a
     #    subshell that stands in for the live half's variables, it must
@@ -1157,7 +1277,7 @@ PY
     fi
 
     rm -rf "$t"
-    [ "$SELF_TEST" -eq 1 ] && echo "$NAME: self-test ok — agreement is silent and counted, a drifting description is named by kind/field/version with an excerpt, a field the file does not claim is named and not counted as drift, a step the file lacks is named by count and title list and a required field or step label that differs is named by its step, a live step lacking the agent block its file declares is named by its step while the same block on both sides agrees with the budget as 5 and 5.0, a tree revision the registry never took (an optional field, a procedure, a predicate, the workflow metadata) is named by its key while a value the publish path fills in when the file is silent is not, a comparison below the floor and a retired-only row are refused, an unparseable answer and an unreadable bundle file each refuse distinctly, and --require-live exits 75 naming the target it could not reach, and the JSON report carries the same kind/field/version/excerpt, counts and verdict as the text"
+    [ "$SELF_TEST" -eq 1 ] && echo "$NAME: self-test ok — agreement is silent and counted, a drifting description is named by kind/field/version with an excerpt, a field the file does not claim is named and not counted as drift, a step the file lacks is named by count and title list and a required field or step label that differs is named by its step, a live step lacking the agent block its file declares is named by its step while the same block on both sides agrees with the budget as 5 and 5.0, a tree revision the registry never took (an optional field, a procedure, a predicate, the workflow metadata) is named by its key while a value the publish path fills in when the file is silent is not, a comparison below the floor and a retired-only row are refused, an unparseable answer and an unreadable bundle file each refuse distinctly, a tenant's one-file bundle is compared under its own floor and refused when it compares nothing, and --require-live exits 75 naming the target it could not reach, and the JSON report carries the same kind/field/version/excerpt, counts and verdict as the text"
     return 0
 }
 
@@ -1387,7 +1507,7 @@ command -v python3 >/dev/null 2>&1 || skip "python3 is not on this box"
 
 body=$(mktemp) || exit 1
 trap 'rm -f "$body"' EXIT
-code=$(lint_sor_read "$NAME" "the jobs API" "$URL" "$body")
+code=$(lint_sor_read "$NAME" "the jobs API" "$URL" "$body" BOSS_JOBS_URL)
 # 000 is curl's "never got an answer" — no route, refused, timed out.
 [ "$code" = "200" ] || skip "$URL answered HTTP $code"
 
@@ -1447,20 +1567,190 @@ esac
 # read as that tenant's, not as unauthored; it is listed, never
 # silently passed. A tree with no repo-sourced instance keeps the old
 # reading in full.
-repo_tenants=$(awk '/^[[:space:]]*#/ { next } $1 == "tenant_repo" { sub(/^[^=]*=[[:space:]]*/, ""); gsub(/"/, ""); print }' infra/cluster/instances.toml 2>/dev/null | LC_ALL=C sort -u)
-delivered_tenant_kinds=""
-if [ -n "$repo_tenants" ]; then
-    delivered_tenant_kinds=$(python3 - "$body" <(printf '%s\n' "$authored") <<'PY'
-import json, sys
-doc = json.load(open(sys.argv[1]))
+#
+# "READ AS THAT TENANT'S" MEANT EXCUSED, until 2026-11-05: the kinds
+# were listed as "read from the tenant's own repo" by a lint that never
+# opened it. `publish-a-blog-post` (owning_team algedonic, v2 and v3
+# published straight into the registry, authoring_job_id null) went two
+# days with no source in the tenant's repository and nothing here
+# noticed (backlog 6db14d0c; found by tenant-builder run e1204903). So a
+# delivered tenant's live rows are held to this lint's two properties
+# against the checkout the CONVERGE delivered them from —
+# `$TENANTS_DIR/<instance>` (infra/forge/forge-defaults.sh, the one
+# definition the converge and retire-example-reference-rows.sh read;
+# BOSS_FORGE_TENANTS_DIR overrides it), a fresh shallow clone of
+# `tenant_repo`@`tenant_ref` on every converge (cluster-deploy-runner.sh
+# converge_tenant):
+#
+#   1. every live kind the tenant owns is a `[[workflow]]` of that
+#      checkout's seeds/workflows.toml, or the lint FAILS naming it —
+#      the unauthored rule, one repository over;
+#   2. every one that is gets `fields_report` over the tenant's file,
+#      under a floor sized to the tenant, and a drift is NAMED: reported
+#      bare, a verdict under --require-live, as a platform row's is.
+#
+# IT NEVER FETCHES. A tenant's repository may be private, and the hosts
+# this runs on hold no credential for it; the converge's clone is the one
+# copy read, and it is the copy the instance was built from. So the leg
+# runs where a converge stages tenants — the forge host, where
+# registry-drift.sh runs this after every converge — and is SKIPPED
+# everywhere else, IN WORDS: "SKIPPED the tenant comparison", the
+# directory it looked in, every owned kind it left unjudged, `tenant.
+# state = skipped` in the report, and no OK line. The exit is left to the
+# halves that did run. Refusing the whole comparison (3, or 75 under
+# --require-live) over an input this host never has would discard the
+# platform half's true answer on every run here and on boss-gcp, whose
+# daily measurement would stop recording anything at all.
+tenants_dir=$( . infra/forge/forge-defaults.sh >/dev/null 2>&1 || exit 1; printf '%s' "${TENANTS_DIR:-}" ) || tenants_dir=""
+tenant_live=$(mktemp) || exit 1
+trap 'rm -f "$body" "$tenant_live"' EXIT
+tenant_plan=$(python3 - "$body" <(printf '%s\n' "$authored") "$INSTANCES" "$tenants_dir" "$tenant_live" <<'PY'
+import json, pathlib, subprocess, sys, tomllib
+
+body, authored_path, instances_path, tenants_dir, live_out = sys.argv[1:6]
+doc = json.load(open(body))
 rows = doc.get("workflows") if isinstance(doc, dict) else doc
-authored = set(l.strip() for l in open(sys.argv[2]) if l.strip())
-rows = [r for r in rows if r.get("status", "active") == "active" and "kind" in r]
+authored = {l.strip() for l in open(authored_path) if l.strip()}
+rows = [r for r in rows if isinstance(r, dict) and r.get("status", "active") == "active" and "kind" in r]
+
+# Which instances take their tenant from a repository. A file that is
+# not there declares none (the old reading); one that does not parse is
+# a finding, not an absence.
+try:
+    with open(instances_path, "rb") as fh:
+        instances = tomllib.load(fh)
+except FileNotFoundError:
+    instances = {}
+except Exception as e:
+    print(f"PROBLEM\t{instances_path} does not parse ({e}), so which instances take their tenant from a repository cannot be read")
+    instances = {}
+repo_instances = [
+    (name, str(t["tenant_repo"]), str(t.get("tenant_ref", "")))
+    for name, t in sorted(instances.items())
+    if isinstance(t, dict) and t.get("tenant_repo")
+]
+if not repo_instances:
+    print("STATE\tnone")
+    sys.exit(0)
+
+# A live kind is a delivered tenant's when no file here authors it and its
+# owning team is one this tree authors nothing for (the 2026-09-17 rule).
 tree_teams = {r.get("owning_team") for r in rows if r["kind"] in authored}
-print("\n".join(sorted(r["kind"] for r in rows if r["kind"] not in authored and r.get("owning_team") and r.get("owning_team") not in tree_teams)))
-PY
+owned = sorted(
+    r["kind"] for r in rows
+    if r["kind"] not in authored and r.get("owning_team") and r.get("owning_team") not in tree_teams
 )
-fi
+for k in owned:
+    print(f"OWNED\t{k}")
+for name, repo, ref in repo_instances:
+    print(f"REPO\t{name}\t{repo}\t{ref}")
+if not owned:
+    print("STATE\tnone")
+    sys.exit(0)
+# The comparator is handed only the rows a tenant owns, so a tenant file
+# can never be compared against a platform row of the same name.
+with open(live_out, "w") as fh:
+    json.dump([r for r in rows if r["kind"] in set(owned)], fh)
+
+found, skipped = set(), []
+for name, repo, ref in repo_instances:
+    head = "-"
+    if not tenants_dir:
+        where, wf = "?", "?"
+        state = "absent"
+        skipped.append(f"infra/forge/forge-defaults.sh named no TENANTS_DIR, so [{name}] {repo}@{ref} has no checkout to read")
+    else:
+        where = pathlib.Path(tenants_dir) / name
+        wf = where / "seeds" / "workflows.toml"
+        if not where.is_dir():
+            state = "absent"
+            skipped.append(
+                f"no tenant checkout at {where} for [{name}] {repo}@{ref} — the converge stages one there "
+                "(cluster-deploy-runner.sh converge_tenant; BOSS_FORGE_TENANTS_DIR overrides the directory), "
+                "and this host has none"
+            )
+        else:
+            try:
+                got = subprocess.run(["git", "-C", str(where), "rev-parse", "--short=12", "HEAD"],
+                                     capture_output=True, text=True, timeout=10)
+                head = got.stdout.strip() if got.returncode == 0 and got.stdout.strip() else "-"
+            except Exception:
+                head = "-"
+            if not wf.is_file():
+                # A checkout with no workflows file authors no protocol:
+                # every kind its tenant owns is then absent from it.
+                state = "nofile"
+            else:
+                try:
+                    with open(wf, "rb") as fh:
+                        blocks = tomllib.load(fh).get("workflow", [])
+                    kinds = {str(b["kind"]) for b in blocks if isinstance(b, dict) and b.get("kind")}
+                    state = "present"
+                except Exception as e:
+                    state = "unreadable"
+                    print(f"PROBLEM\t{wf} does not parse ({e}), so what [{name}] {repo}@{ref} authors cannot be read")
+                    skipped.append(f"{wf} could not be read")
+                if state == "present":
+                    mine = sorted(set(owned) & kinds)
+                    found |= set(mine)
+                    if mine:
+                        print(f"COMPARE\t{name}\t{wf}\t{len(mine)}")
+    print(f"CHECKOUT\t{name}\t{repo}\t{ref}\t{where}\t{state}\t{wf}\t{head}")
+
+# Absence is judged only when EVERY repo-sourced instance's checkout was
+# read: a kind missing from one checkout may be authored in the one this
+# host does not have, and saying so would be the confident wrong answer.
+if skipped:
+    print("STATE\tskipped")
+    for s in skipped:
+        print(f"SKIP\t{s}")
+    for k in owned:
+        if k not in found:
+            print(f"UNCHECKED\t{k}")
+else:
+    print("STATE\tcompared")
+    for k in owned:
+        if k not in found:
+            print(f"MISSING\t{k}")
+PY
+) || { fail "the delivered tenant's leg could not plan its read: $tenant_plan"; tenant_plan="STATE	none"; }
+tenant_field() { LC_ALL=C awk -F'\t' -v tag="$1" '$1 == tag { print $2 }' <<<"$tenant_plan"; }
+tenant_state=$(LC_ALL=C awk -F'\t' '$1 == "STATE" { print $2; exit }' <<<"$tenant_plan")
+tenant_owned=$(tenant_field OWNED)
+tenant_missing=$(tenant_field MISSING)
+tenant_unchecked=$(tenant_field UNCHECKED)
+tenant_skip_reason=$(tenant_field SKIP)
+tenant_checkouts=$(LC_ALL=C awk -F'\t' '$1 == "CHECKOUT"' <<<"$tenant_plan")
+repo_tenants=$(LC_ALL=C awk -F'\t' '$1 == "REPO" { print "[" $2 "] " $3 "@" $4 }' <<<"$tenant_plan")
+while IFS=$'\t' read -r _ why; do
+    [ -n "$why" ] && fail "$why"
+done < <(LC_ALL=C awk -F'\t' '$1 == "PROBLEM"' <<<"$tenant_plan")
+delivered_tenant_kinds="$tenant_owned"
+
+# The tenant rows' field comparison, one checkout at a time. Each DRIFT /
+# ABSENT / NOROW line is kept with the file it was read from, because a
+# finding a reader cannot place is one they must re-derive.
+tenant_fields_out=""
+tenant_found=""
+tenant_compared=0
+while IFS=$'\t' read -r _ tname tfile tfloor; do
+    [ -n "$tfile" ] || continue
+    tout=$(fields_report "$tfile" "$tenant_live" "$tfloor" 2>&1)
+    trc=$?
+    case "$trc" in
+        0) tenant_fields_out=$(printf '%s\n%s' "$tenant_fields_out" "$tout" | LC_ALL=C sed '/^$/d')
+           tenant_found=$(printf '%s\n%s' "$tenant_found" \
+               "$(LC_ALL=C awk -F'\t' -v f="$tfile" 'BEGIN { OFS = "\t" } $1 == "DRIFT" || $1 == "ABSENT" || $1 == "NOROW" { $1 = $1 "\t" f; print }' <<<"$tout")" \
+               | LC_ALL=C sed '/^$/d')
+           c=$(LC_ALL=C sed -n 's/.*\tcompared=\([0-9]*\).*/\1/;T;p;q' <<<"$tout")
+           tenant_compared=$((tenant_compared + ${c:-0})) ;;
+        7) fail "the field comparison of [$tname]'s $tfile refused rather than report a vacuous clean bill: $(LC_ALL=C sed -n 's/^REFUSED\t//p' <<<"$tout")" ;;
+        *) fail "the field comparison of [$tname]'s $tfile exited $trc: $(head -1 <<<"$tout")" ;;
+    esac
+done < <(LC_ALL=C awk -F'\t' '$1 == "COMPARE"' <<<"$tenant_plan")
+tenant_drift_lines=$(LC_ALL=C awk -F'\t' 'BEGIN { OFS = "\t" } $1 == "DRIFT" { $1 = ""; sub(/^\t/, ""); print }' <<<"$tenant_found")
+tenant_drift_n=0
+[ -z "$tenant_drift_lines" ] || tenant_drift_n=$(printf '%s\n' "$tenant_drift_lines" | wc -l | tr -d ' ')
 
 unauthored=$(
     LC_ALL=C comm -23 <(printf '%s\n' "$live_kinds") <(printf '%s\n' "$authored") \
@@ -1470,7 +1760,50 @@ unauthored=$(
 )
 if [ -n "$delivered_tenant_kinds" ]; then
     n=$(printf '%s\n' "$delivered_tenant_kinds" | wc -l | tr -d ' ')
-    echo "$NAME: $n kind(s) authored by a delivered tenant (instances.toml tenant_repo: $(printf '%s' "$repo_tenants" | tr '\n' ' ')), read from the tenant's own repo, not this tree: $(printf '%s' "$delivered_tenant_kinds" | tr '\n' ' ')"
+    echo "$NAME: $n kind(s) owned by a delivered tenant (instances.toml tenant_repo: $(printf '%s' "$repo_tenants" | tr '\n' ' ')), judged against that tenant's checkout, not this tree: $(printf '%s' "$delivered_tenant_kinds" | tr '\n' ' ')"
+    printf '%s\n' "$tenant_checkouts" | while IFS=$'\t' read -r _ iname trepo tref tdir tstate tfile thead; do
+        [ -n "$iname" ] || continue
+        echo "  [$iname] $trepo@$tref: $tstate at $tdir (file $tfile, checkout HEAD $thead)"
+    done
+fi
+
+# A LIVE KIND ITS TENANT'S CHECKOUT DOES NOT AUTHOR — the unauthored rule
+# one repository over, and the defect this leg exists for (6db14d0c).
+if [ -n "$tenant_missing" ]; then
+    n=$(printf '%s\n' "$tenant_missing" | wc -l | tr -d ' ')
+    fail "the registry admits $n kind(s) owned by a delivered tenant that its checkout does not author:"
+    printf '    %s\n' $tenant_missing >&2
+    echo "" >&2
+    echo "  Read from the checkout the converge delivered the tenant from:" >&2
+    printf '%s\n' "$tenant_checkouts" | while IFS=$'\t' read -r _ iname trepo tref tdir tstate tfile thead; do
+        [ -n "$iname" ] || continue
+        echo "    [$iname] $trepo@$tref — $tfile ($tstate, checkout HEAD $thead)" >&2
+    done
+    echo "" >&2
+    echo "  Each reached the registry with no file in the tenant's repository:" >&2
+    echo "  a change to it is a live publish with no diff and no second reader," >&2
+    echo "  and a fresh instance of that tenant will not have it. Write it down" >&2
+    echo "  IN THE TENANT'S REPOSITORY, as a [[workflow]] in seeds/workflows.toml," >&2
+    echo "  rendered from GET $URL/<kind> rather than retyped — never in this" >&2
+    echo "  tree, which carries no tenant's business (fcc1d57b). The next" >&2
+    echo "  converge checks it out and this reads it." >&2
+fi
+
+# NO CHECKOUT TO READ: said, never passed (see the block comment above).
+if [ "$tenant_state" = "skipped" ]; then
+    n=$(printf '%s\n' "$tenant_unchecked" | LC_ALL=C sed '/^$/d' | wc -l | tr -d ' ')
+    echo "$NAME: SKIPPED the tenant comparison — $(LC_ALL=C awk 'NF { printf "%s%s", sep, $0; sep = "; " }' <<<"$tenant_skip_reason")" >&2
+    if [ "$n" -gt 0 ]; then
+        echo "  NOTHING IS CLAIMED about these $n kind(s) a delivered tenant owns —" >&2
+        echo "  neither that its repository authors them nor that a live row still" >&2
+        echo "  says what its file says: $(printf '%s' "$tenant_unchecked" | tr '\n' ' ')" >&2
+    else
+        echo "  NOTHING IS CLAIMED about the checkout that could not be read; every" >&2
+        echo "  owned kind was found in the ones that could." >&2
+    fi
+    echo "  The leg runs where the converge stages tenant checkouts (the forge" >&2
+    echo "  host, after every converge: infra/forge/registry-drift.sh); this" >&2
+    echo "  lint never fetches a tenant's repository itself." >&2
 fi
 
 # A stale exemption in the other direction: named here, not admitted
@@ -1692,6 +2025,32 @@ if [ -n "$absent_lines" ]; then
     done
 fi
 
+# THE DELIVERED TENANT'S ROWS, compared above against its checkout.
+# Same tolerance as this tree's rows — reported bare, a verdict under
+# --require-live — and a different remedy: the file is in the tenant's
+# repository, so nothing about it is a change to this tree.
+if [ -n "$tenant_drift_lines" ]; then
+    echo "$NAME: $tenant_drift_n field(s) or step facet(s) where a delivered tenant's live row disagrees with its checkout:" >&2
+    printf '%s\n' "$tenant_drift_lines" | while IFS=$'\t' read -r tfile kind field ver at tlen llen twin lwin; do
+        echo "    $kind.$field — live $ver, first differs $at ($tlen vs $llen chars), file $tfile" >&2
+        echo "      file: $twin" >&2
+        echo "      live: $lwin" >&2
+    done
+    echo "" >&2
+    echo "  Decide which copy is the record. If the tenant's file is right, the" >&2
+    echo "  tenant's own publish (boss tenant publish, run from its checkout)" >&2
+    echo "  moves the row; if the live row is ahead, fold it into the tenant's" >&2
+    echo "  seeds/workflows.toml in ITS repository first, or that publish" >&2
+    echo "  deletes what the row gained. Neither is a change to this tree." >&2
+fi
+tenant_absent_lines=$(LC_ALL=C awk -F'\t' '$1 == "ABSENT" { print $2 "\t" $3 "\t" $4 }' <<<"$tenant_found")
+if [ -n "$tenant_absent_lines" ]; then
+    echo "  $(printf '%s\n' "$tenant_absent_lines" | wc -l | tr -d ' ') field(s) a delivered tenant's file does not claim, and so cannot be compared:" >&2
+    printf '%s\n' "$tenant_absent_lines" | while IFS=$'\t' read -r tfile kind field; do
+        echo "    $tfile gives \`$kind\` no \`$field\`" >&2
+    done
+fi
+
 # Two derived lists the tail prints, computed here so the JSON report
 # can carry them too. Neither is a failure (their comment is below,
 # where they are printed).
@@ -1705,9 +2064,11 @@ tenant_lines=$(for f in "${tenant_files[@]}"; do
 done)
 
 # The verdict, decided once so the report and the exit cannot disagree.
+# A delivered tenant's drift weighs exactly as this tree's does.
+all_drift=$((drift_n + tenant_drift_n))
 verdict=0
 if [ "$problems" -gt 0 ]; then verdict=1
-elif [ "$drift_n" -gt 0 ] && [ "$REQUIRE_LIVE" -eq 1 ]; then verdict=2
+elif [ "$all_drift" -gt 0 ] && [ "$REQUIRE_LIVE" -eq 1 ]; then verdict=2
 fi
 if [ -n "$REPORT_JSON" ]; then
     write_report "$REPORT_JSON" "$verdict" || {
@@ -1719,17 +2080,26 @@ fi
 [ "$problems" -eq 0 ] || exit 1
 
 # A drift is a verdict only for a caller that can act on it.
-if [ "$drift_n" -gt 0 ] && [ "$REQUIRE_LIVE" -eq 1 ]; then
-    echo "$NAME: $fields_compared kinds compared, $drift_n field(s) adrift — exiting 2 because --require-live was asked for a verdict" >&2
+if [ "$all_drift" -gt 0 ] && [ "$REQUIRE_LIVE" -eq 1 ]; then
+    echo "$NAME: $fields_compared kinds compared, $drift_n field(s) adrift; $tenant_compared delivered-tenant row(s) compared, $tenant_drift_n adrift — exiting 2 because --require-live was asked for a verdict" >&2
     exit 2
 fi
 
 live_n=$(printf '%s\n' "$live_kinds" | wc -l | tr -d ' ')
 authored_n=$(printf '%s\n' "$authored" | wc -l | tr -d ' ')
-if [ "$drift_n" -eq 0 ]; then
-    msg="$NAME: OK — $live_n admitted kinds, $authored_n authored, $fields_compared live rows agree with their file"
+# What the tenant leg judged, said on the summary itself: a run that
+# could not read a tenant's checkout must not end on an OK line.
+tenant_said=""
+case "${tenant_state:-none}" in
+    compared) tenant_said=", $tenant_compared delivered-tenant row(s) compared against their tenant's checkout" ;;
+    skipped)  tenant_said=" — the tenant leg was SKIPPED, so $(printf '%s\n' "$tenant_unchecked" | LC_ALL=C sed '/^$/d' | wc -l | tr -d ' ') kind(s) a delivered tenant owns are NOT checked (named above)" ;;
+esac
+if [ "$tenant_state" = "skipped" ]; then
+    msg="$NAME: $live_n admitted kinds, $authored_n authored, $drift_n field(s) or step facet(s) adrift across $fields_compared compared$tenant_said"
+elif [ "$all_drift" -eq 0 ]; then
+    msg="$NAME: OK — $live_n admitted kinds, $authored_n authored, $fields_compared live rows agree with their file$tenant_said"
 else
-    msg="$NAME: $live_n admitted kinds, $authored_n authored — $drift_n field(s) or step facet(s) adrift across $fields_compared compared (named above; REPORTED, not failed)"
+    msg="$NAME: $live_n admitted kinds, $authored_n authored — $all_drift field(s) or step facet(s) adrift across $fields_compared compared$tenant_said (named above; REPORTED, not failed)"
 fi
 [ ${#EXEMPT[@]} -eq 0 ] || msg="$msg, ${#EXEMPT[@]} exempt (${EXEMPT[*]})"
 lint_scanned "$NAME" "$authored_n" "authored kind(s) compared against $live_n admitted"
@@ -1746,4 +2116,8 @@ echo "$msg"
 [ -z "$tenant_lines" ] || printf '%s\n' "$tenant_lines" | while IFS=$'\t' read -r f absent total; do
     [ "$absent" -eq 0 ] || printf '  %s: %s of %s kinds not admitted here (a tenant this deployment does not run)\n' "$f" "$absent" "$total"
 done
+# A delivered tenant's file ahead of the registry: the same window as a
+# pending bundle kind, between the tenant's merge and its publish.
+LC_ALL=C awk -F'\t' '$1 == "NOROW" { n[$2]++; k[$2] = k[$2] " " $3 }
+    END { for (f in n) printf "  %s: %d kind(s) authored with no live row a delivered tenant owns here (awaiting its publish):%s\n", f, n[f], k[f] }' <<<"$tenant_found"
 exit 0

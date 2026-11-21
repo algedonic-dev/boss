@@ -72,6 +72,10 @@ const ALLOWANCE: &[(&str, &str)] = &[
         "the broker's `verify_repo` for the publish token (backlog d2b7c947), a rule-row literal the dispatcher reads in-cluster where no sor.env exists; held equal to the declared mirror by boss-dispatcher's github_app_installation_token_rules.rs, because the token is narrowed to exactly that repository",
     ),
     (
+        "infra/dispatcher/rules/broker-mints-the-algedonic-dev-checks-token-when-a-checks-read-is-filed.toml",
+        "the broker's `verify_repo` for the read-only checks token (backlog b7a74610), a rule-row literal the dispatcher reads in-cluster where no sor.env exists; held equal to the declared mirror by boss-dispatcher's github_app_installation_token_rules.rs, because the token is narrowed to exactly that repository",
+    ),
+    (
         "infra/sim/boss-brewery-sim.service",
         "a systemd Documentation= URL: prose for `systemctl status`, read by no machine",
     ),

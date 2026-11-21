@@ -453,38 +453,185 @@ fn a_refused_rotation_packet_read_is_refused_naming_its_status() {
     installed_delivery_case("packet-refused");
 }
 
-/// EVERY REFUSAL NAMES ITS CHECK (backlog b675ad09). Read off the
-/// receiver itself: no `refuse` call is bare, so a check added later
-/// cannot fall back to a sentence that says only THAT it refused.
+/// INSTALLED FLIPS AT THE RENAME, NOT BEFORE IT (backlog a61cce40, a low
+/// of review run e5d18320 on car 7b2daccc). The workdir case above pins
+/// the earliest failure, the directory-sync case below the first one
+/// after the rename, and the delivery cases the acknowledgment's; nothing
+/// pinned the window between, and with the flip moved up
+/// to just before the staging mktemp every case here still passed, while
+/// staging-file, staging-write, staging-mode, staging-owner, staging-sync
+/// and install-rename would each have told the operator the delivered
+/// credential IS installed with the old one still in place. Planted
+/// without editing the receiver: the destination is a DIRECTORY, so the
+/// door resolves, the packet read answers, the staging file is written
+/// and synced, and `mv -fT` refuses to put a file over it — the last act
+/// before the flip, so a flip placed anywhere ahead of the rename reads
+/// wrong here. The staging file is cleaned up, not left beside it.
 #[test]
-fn every_refusal_in_the_receiver_names_its_check() {
+fn a_failed_rename_says_the_installed_credential_is_unchanged() {
+    installed_delivery_case("rename-refused");
+}
+
+/// ...AND NOT AFTER THE DIRECTORY SYNC THAT FOLLOWS IT (backlog 533bc37c,
+/// from review run eb565e75 of car 06935c9d). The comment above once said
+/// the delivery cases pinned every failure after the rename; they pin
+/// only the acknowledgment's, which come after `sync -- "$DIR"`. With the
+/// flip moved one line late, below that sync, all 27 cases stayed green
+/// while an install-directory-sync failure would tell the operator the
+/// installed credential was unchanged — with the delivered one already
+/// in place. Planted without editing the receiver: a `sync` on PATH that
+/// refuses a directory and passes a file, so the staging sync and the
+/// rename succeed and the directory sync is the one that fails.
+#[test]
+fn a_failed_directory_sync_says_the_delivered_credential_is_installed() {
+    installed_delivery_case("directory-sync-failed");
+}
+
+/// EVERY REFUSAL AND EVERY FAILURE NAMES ITS CHECK, AND NO TWO SHARE A
+/// WORD (backlog b675ad09; backlog e317cbe2, from review 9bbf4e03 of car
+/// b970a8fd). Read off the receiver itself: no `refuse` and no `fail`
+/// call is bare, so a check added later cannot fall back to a sentence
+/// that says only THAT it refused or failed. The scan covered `refuse`
+/// alone until e317cbe2, and eleven bare `fail`s survived it — among
+/// them the staging, rename and directory sync that can leave a
+/// credential installed and unacknowledged with no cause on the record.
+/// And a word two calls share names neither: `not-one-document`,
+/// `unread` and `envelope-unread` each stood for two or three checks.
+#[test]
+fn every_refusal_and_every_failure_in_the_receiver_names_its_own_check() {
     let body =
         std::fs::read_to_string(repo_root().join("infra/gcp/runner-credential-recv.sh")).unwrap();
-    let call = regex::Regex::new(r"(^|[|&;{(]\s*)refuse(\s|$)(?P<rest>.*)").unwrap();
-    let mut calls = 0;
-    let mut bare = Vec::new();
-    for (n, line) in body.lines().enumerate() {
-        let live = line.trim_start();
-        if live.starts_with('#') || live.starts_with("refuse()") {
-            continue;
-        }
-        for c in call.captures_iter(line) {
-            calls += 1;
-            let rest = c["rest"].trim_start();
-            if rest.is_empty() || rest.starts_with([';', '}', '|', '&', ')']) {
-                bare.push(format!("line {}: {line}", n + 1));
+    let mut words: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
+    for (verb, floor) in [("refuse", 20), ("fail", 12)] {
+        // `|| fail; fi` is a call too: the word ends at a separator as
+        // well as at a space, and the first draft of this scan missed
+        // line 171's chown for want of it.
+        let call = regex::Regex::new(&format!(r"(^|[|&;{{(]\s*){verb}(?P<rest>([\s;}}|&)].*)?)$"))
+            .unwrap();
+        let mut calls = 0;
+        let mut bare = Vec::new();
+        for (n, line) in body.lines().enumerate() {
+            let live = line.trim_start();
+            if live.starts_with('#') || live.starts_with(&format!("{verb}()")) {
+                continue;
+            }
+            for c in call.captures_iter(line) {
+                calls += 1;
+                let rest = c["rest"].trim_start();
+                if rest.is_empty() || rest.starts_with([';', '}', '|', '&', ')']) {
+                    bare.push(format!("line {}: {line}", n + 1));
+                    continue;
+                }
+                let word = rest
+                    .split(|ch: char| ch.is_whitespace() || ch == ';' || ch == '}')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                words.entry(word).or_default().push(n + 1);
             }
         }
+        assert!(
+            calls >= floor,
+            "the scan found {calls} {verb} calls — the fixture is not reading the receiver"
+        );
+        assert!(
+            bare.is_empty(),
+            "a {verb} that does not name its check:\n{}",
+            bare.join("\n")
+        );
     }
+    let shared: Vec<String> = words
+        .iter()
+        .filter(|(_, lines)| lines.len() > 1)
+        .map(|(word, lines)| format!("{word} on lines {lines:?}"))
+        .collect();
     assert!(
-        calls >= 20,
-        "the scan found {calls} refuse calls — the fixture is not reading the receiver"
+        shared.is_empty(),
+        "a reason word more than one check answers with names neither:\n{}",
+        shared.join("\n")
     );
+}
+
+/// A FAILURE SAYS WHETHER THE CREDENTIAL WAS REPLACED (backlog e317cbe2).
+/// Before the rename nothing is installed, and the line says the
+/// installed credential is unchanged; after it, every failure line says
+/// the delivered credential IS installed and unacknowledged, which the
+/// delivery cases below read. Planted here: a temp directory the
+/// receiver cannot make, its first act.
+#[test]
+fn a_failure_before_installation_says_the_installed_credential_is_unchanged() {
+    let root = scratch_dir("runner-recv-no-workdir");
+    let destination = root.join("credential");
+    write_file(&destination, "fake-existing-host-value");
+    let output = without_proxy(&mut Command::new("bash"))
+        .arg(repo_root().join("infra/gcp/runner-credential-recv.sh"))
+        .env("TMPDIR", root.join("absent"))
+        .env("BOSS_RUNNER_CREDENTIAL_FILE", &destination)
+        .env("BOSS_JOBS_URL", "http://127.0.0.1:1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(
-        bare.is_empty(),
-        "a refusal that does not name its check:\n{}",
-        bare.join("\n")
+        stderr.contains(
+            "runner-credential-recv: failed (workdir); installed credential unchanged; delivery not acknowledged"
+        ),
+        "{stderr}"
     );
+    assert_eq!(
+        std::fs::read_to_string(&destination).unwrap(),
+        "fake-existing-host-value"
+    );
+}
+
+/// The id the receiver signs as, and the row that answers for it
+/// (backlog e317cbe2): its own, not the forge deposit's.
+const RECV_ACTOR: &str = "automation:runner-credential-recv";
+
+/// THE RECEIVER SIGNS UNDER A ROW THAT DESCRIBES IT (backlog e317cbe2,
+/// from review 9bbf4e03 of car b970a8fd). It signed as
+/// automation:runner-credential-deposit, whose row describes the FORGE's
+/// deposit script, so a reader of that row learned nothing about
+/// boss-gcp. The delivery fixture reads the id off every request.
+#[test]
+fn the_receiver_signs_as_its_own_registered_automation() {
+    let rows = boss_jobs::agents::automations::load_automations_dir(
+        &repo_root().join("infra/platform/automations"),
+    )
+    .unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.id == RECV_ACTOR)
+        .unwrap_or_else(|| panic!("no automation row answers for {RECV_ACTOR}"));
+    assert!(
+        row.description
+            .contains("infra/gcp/runner-credential-recv.sh"),
+        "the row names the script that signs as it: {}",
+        row.description
+    );
+    assert_eq!(row.role, "platform-admin");
+}
+
+/// THE DELIVERY OWNER REFUSES ANY TIER BUT OPERATOR, AND SO DOES THE
+/// FIXTURE (backlog e317cbe2, from review 9bbf4e03 of car b970a8fd).
+/// `record_delivery` (boss-jobs credentials/http.rs) answers 403 unless
+/// the request asserts `access_tier: operator`; the fixture answered 202
+/// to anything, so a receiver with the tier removed passed every case
+/// here and would fail every live delivery. Planted in an installed copy
+/// with the tier cut out of its x-boss-user: the owner refuses, nothing
+/// is acknowledged, and the line says so with the status.
+#[test]
+fn a_delivery_asserting_no_operator_tier_is_refused_as_the_owner_refuses_it() {
+    let dir = scratch_dir("runner-recv-no-operator-tier");
+    let out = install_runner_receiver(&dir, true, "david");
+    assert!(out.status.success(), "{}", both(&out));
+    let receiver = installed_receiver(&dir.join("libexec"));
+    let text = std::fs::read_to_string(&receiver).unwrap();
+    let tier = r#""access_tier":"operator","#;
+    assert!(text.contains(tier), "the plant needs the tier");
+    write_file(&receiver, &text.replace(tier, ""));
+    installed_delivery_case_at(&receiver, "tier-dropped");
 }
 
 /// The reason a refusal names, read off its one stderr line.
@@ -508,7 +655,13 @@ fn installed_delivery_case_at(receiver: &std::path::Path, mode: &'static str) {
     use std::io::{BufRead, BufReader, Read};
     let root = scratch_dir("authenticated-runner-install");
     let destination = root.join("credential");
-    write_file(&destination, "fake-existing-host-value");
+    if mode == "rename-refused" {
+        // A directory at the destination: `mv -fT` cannot replace it.
+        std::fs::create_dir(&destination).unwrap();
+        write_file(&destination.join("held"), "fake-existing-host-value");
+    } else {
+        write_file(&destination, "fake-existing-host-value");
+    }
     let value = "fake-sensitive-input-000000000000000000";
     let job = "00000000-0000-4000-8000-000000000001";
     let attempt = "00000000-0000-4000-8000-000000000002";
@@ -528,9 +681,15 @@ fn installed_delivery_case_at(receiver: &std::path::Path, mode: &'static str) {
     let server = std::thread::spawn(move || {
         let mut paths = Vec::new();
         let receipt = serde_json::json!({"version":1,"credential_id":credential,"phase":"verified","actor":"automation:ops-runner","observation_id":format!("{attempt}:delivered"),"event_id":"original-event","timestamp":"original-time","evidence_json":serde_json::json!({"purpose":"authenticated-runner-delivery","job_id":job,"host":"boss-gcp","attempt":attempt}).to_string()});
-        for index in 0..if mode == "packet-refused" {
+        for index in 0..if mode == "packet-refused"
+            || mode == "rename-refused"
+            || mode == "directory-sync-failed"
+        {
             2
-        } else if mode == "owner-refusal" || mode.starts_with("completed-") {
+        } else if mode == "owner-refusal"
+            || mode == "tier-dropped"
+            || mode.starts_with("completed-")
+        {
             5
         } else {
             6
@@ -559,6 +718,8 @@ fn installed_delivery_case_at(receiver: &std::path::Path, mode: &'static str) {
             let mut length = 0;
             let mut presented = false;
             let mut asserted_role = None;
+            let mut asserted_tier = None;
+            let mut asserted_id = None;
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
@@ -575,6 +736,8 @@ fn installed_delivery_case_at(receiver: &std::path::Path, mode: &'static str) {
                     if name.eq_ignore_ascii_case("x-boss-user") {
                         let actor: serde_json::Value = serde_json::from_str(raw.trim()).unwrap();
                         asserted_role = actor["role"].as_str().map(str::to_string);
+                        asserted_tier = actor["access_tier"].as_str().map(str::to_string);
+                        asserted_id = actor["id"].as_str().map(str::to_string);
                     }
                 }
             }
@@ -582,13 +745,26 @@ fn installed_delivery_case_at(receiver: &std::path::Path, mode: &'static str) {
                 presented,
                 "request {index} must authenticate the delivered value"
             );
-            // The credential door keeps the role a request asserts and
-            // only binds its actor (boss-jobs runner_credential.rs), so a
-            // request asserting none is the guest role, which holds no job
-            // read: the live jobs API answered the rotation packet read
-            // 403 for exactly that on both boss-gcp deliveries (backlog
-            // b675ad09). The fixture answers it the same way.
-            let reads_packets = asserted_role.as_deref() == Some("platform-admin");
+            assert_eq!(
+                asserted_id.as_deref(),
+                Some(RECV_ACTOR),
+                "request {index} signs as the receiver's own row (backlog e317cbe2)"
+            );
+            // The credential door keeps the role and tier a request
+            // asserts and only binds its actor (boss-jobs
+            // runner_credential.rs), so the fixture refuses on them as the
+            // live jobs API does, on EVERY request rather than the packet
+            // read alone (backlog e317cbe2). A request asserting no role is
+            // the guest, which holds no job read or write: the live API
+            // answered the rotation packet read 403 for exactly that on
+            // both boss-gcp deliveries (backlog b675ad09). And the delivery
+            // owner, `record_delivery` in credentials/http.rs, refuses any
+            // tier but operator.
+            let refused_by_policy = match index {
+                1 | 3 | 5 => asserted_role.as_deref() != Some("platform-admin"),
+                4 => asserted_tier.as_deref() != Some("operator"),
+                _ => false,
+            };
             let mut bytes = vec![0; length];
             reader.read_exact(&mut bytes).unwrap();
             if index >= 2 {
@@ -631,7 +807,7 @@ fn installed_delivery_case_at(receiver: &std::path::Path, mode: &'static str) {
             if (index == 4 && mode == "owner-refusal") || (index == 5 && mode == "cas-refusal") {
                 status = 409;
             }
-            if index == 1 && (mode == "packet-refused" || !reads_packets) {
+            if (index == 1 && mode == "packet-refused") || refused_by_policy {
                 status = 403;
             }
             assert!(!String::from_utf8_lossy(&bytes).contains(value));
@@ -644,29 +820,48 @@ fn installed_delivery_case_at(receiver: &std::path::Path, mode: &'static str) {
             .unwrap();
         }
         assert_eq!(paths[0], "/api/jobs/runner-credential");
-        if mode == "packet-refused" {
+        if mode == "packet-refused" || mode == "rename-refused" || mode == "directory-sync-failed" {
             assert_eq!(paths[1], format!("/api/jobs/{job}"));
             return;
         }
         assert_eq!(paths[2], "/api/jobs/runner-credential");
         assert_eq!(paths[4], format!("/api/credentials/{credential}/delivery"));
-        if mode != "owner-refusal" && !mode.starts_with("completed-") {
+        if mode != "owner-refusal" && mode != "tier-dropped" && !mode.starts_with("completed-") {
             assert_eq!(
                 paths[5],
                 format!("/api/jobs/{job}/steps/{step}/complete-if")
             );
         }
     });
-    let mut child = without_proxy(&mut Command::new("bash"))
+    let mut command = Command::new("bash");
+    without_proxy(&mut command)
         .arg(receiver)
         .env("BOSS_RUNNER_CREDENTIAL_FILE", &destination)
         .env("BOSS_JOBS_URL", format!("http://{address}"))
         .env("BOSS_MACHINE_TOKEN_DIR", root.join("no-machine-token"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    if mode == "directory-sync-failed" {
+        // A `sync` that refuses a DIRECTORY and passes a file: the
+        // staging sync of the file succeeds and the rename runs, then the
+        // sync of the destination's directory is the one that fails. It
+        // records every argument it was handed, so the case below can
+        // say the file sync ran too, not only that one call failed.
+        let bin = scratch_dir("runner-recv-directory-sync-stub");
+        write_exec(
+            &bin.join("sync"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nfor a; do last=$a; done\n[ ! -d \"$last\" ]\n",
+                root.join("sync-calls").display()
+            ),
+        );
+        command.env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        );
+    }
+    let mut child = command.spawn().unwrap();
     let wire = if mode == "duplicate-envelope" {
         format!("{{\"host\":\"forge\",{}", &input.to_string()[1..])
     } else {
@@ -717,6 +912,54 @@ fn installed_delivery_case_at(receiver: &std::path::Path, mode: &'static str) {
         assert!(!String::from_utf8_lossy(&output.stderr).contains(value));
         return;
     }
+    if mode == "rename-refused" {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            stderr.contains(
+                "runner-credential-recv: failed (install-rename); installed credential unchanged; delivery not acknowledged"
+            ),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("IS installed"), "{stderr}");
+        assert!(!stderr.contains(value));
+        assert_eq!(
+            std::fs::read_to_string(destination.join("held")).unwrap(),
+            "fake-existing-host-value"
+        );
+        let staged: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".runner-recv."))
+            .collect();
+        assert!(staged.is_empty(), "staging left behind: {staged:?}");
+        return;
+    }
+    if mode == "directory-sync-failed" {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let calls = std::fs::read_to_string(root.join("sync-calls")).unwrap();
+        assert_eq!(
+            calls.lines().count(),
+            2,
+            "the staging file's sync and the directory's, nothing else: {calls}"
+        );
+        assert!(
+            stderr.contains(
+                "runner-credential-recv: failed (install-directory-sync); the delivered credential IS installed; delivery not acknowledged"
+            ),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("installed credential unchanged"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains(value));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(value));
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), value);
+        return;
+    }
     if mode != "positive" && mode != "completed-replay" {
         assert!(!String::from_utf8_lossy(&output.stdout).contains("delivery recorded"));
         // The acknowledgment's own sentence rides the failure, so the
@@ -727,6 +970,23 @@ fn installed_delivery_case_at(receiver: &std::path::Path, mode: &'static str) {
             "{mode}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        // After the rename the line says the credential WAS replaced, so
+        // an installed-but-unacknowledged host is on the record as one
+        // (backlog e317cbe2).
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("; the delivered credential IS installed; delivery not acknowledged"),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if mode == "tier-dropped" {
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("authenticated delivery owner refused or its original receipt is unavailable (HTTP 403)"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     } else {
         let returned = receipt_after_greeting(&output.stdout);
         assert_eq!(

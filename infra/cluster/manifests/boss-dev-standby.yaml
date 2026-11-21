@@ -1,0 +1,359 @@
+# boss-dev-standby — a small shell inside the LAN for when the dev pod
+# cannot be scheduled.
+#
+# WHY THIS EXISTS (design 0491591b, backlog 47601829, both questions
+# decided by David 2026-11-07). During the w-1 drive window of
+# 2026-11-06/07 (packet 08402e19) the dev pod sat Pending for about 80
+# minutes: it only PREFERS the build node, so the scheduler tried w-2,
+# and w-2 could not hold its requests (cpu 4, memory 8Gi,
+# ephemeral-storage 150Gi in boss-dev.yaml). Every ssh connection through
+# the bastion was refused and the dev-ssh door was dark from 00:17Z to
+# 01:35Z (alarm 33ddb615). The system of record, the forge, the conductor
+# and the gates on w-2 were all up, but David had no shell inside the LAN
+# and had to diagnose from outside. The dev pod was the build environment
+# AND the only interactive foothold. This pod is a second foothold: it
+# does not build anything.
+#
+# WHAT IT IS. One small pod (well under 1 CPU and 1Gi requested) that is
+# always present, required off the control planes AND off the node the
+# dev pod is on, with no /work volume. It carries sshd on David's key,
+# kubectl as the dev-session ServiceAccount, boss-api, and a shallow clone
+# of main taken from the forge at boot into an emptyDir and refreshed on
+# every login. Its login banner (infra/dev/standby-banner.sh, versioned
+# in that clone so a banner edit rides a train and never rolls this pod)
+# prints the dev pod's phase, its node and the last event the scheduler
+# recorded for it, the newest door comparison, and the open
+# work-sessions. So an operator who lands here because the dev pod
+# refused reads the cause in the first lines.
+#
+# WHAT IT HOLDS — Q1, David 2026-11-07: "the same dev-session
+# ServiceAccount and machine token as the dev pod for reads and for the
+# ops doors (which are passkey-gated anyway), but NOT the forge write
+# token: the standby reads and files, it never pushes." So the volumes
+# below are the forge READ token (for the clone), David's public key,
+# and the machine token. Nothing in this pod's spec names Secret
+# boss-dev-forge-token, by volume, projected source or env;
+# crates/core/boss-testing/tests/the_standby_stands_off_the_dev_pods_node.rs
+# refuses it, the /work claim, a request that grows to 1 CPU or 1Gi, a
+# placement rule that allows the standby onto the dev pod's node or the
+# node the dev pod prefers, and an sshd with forwarding on.
+#
+# THAT IS A MOUNT, NOT AN AUTHORITY (review run 75a760c9, finding 2). The
+# dev-session Role creates batch Jobs in boss-dev and no admission policy
+# shapes them, so a root shell here can start a Job that mounts the write
+# token and read it back through pods/log. That is no escalation today:
+# the same key reaches the dev pod, which mounts the token outright. It
+# is owed before this door gets a public hostname (Q2), as an admission
+# policy holding dev-session's Jobs to the gate runner's shape or a
+# read-only ServiceAccount for this pod.
+#
+# WHAT THIS CAR DOES NOT DO YET (the later cars of design 0491591b):
+#   - The Service below is a LoadBalancer the pool assigns an address to.
+#     The address is measured once it is assigned, then pinned, and is
+#     declared as the door `dev-standby-ssh` in infra/estate/doors.toml so
+#     the forge's observer probes it. Pinning an address nobody has read
+#     from the pool would be a guess.
+#   - The public hostname standby.algedonic.dev (Q2), its tunnel origin,
+#     its Cloudflare Access SSH application and that application's CA
+#     Secret, and the login menu option on the dev pod.
+#   - The `boss` CLI. boss-api, kubectl and git are here. The CLI comes
+#     from the converged image, which this pod does not install yet.
+#   - allocateLoadBalancerNodePorts: false on the Service. Like the dev
+#     pod's boss-dev-ssh, this LoadBalancer also opens a NodePort on every
+#     node (review run 75a760c9, finding 3). Turning that off is unmeasured
+#     against the address pool here, so it is owed with the public
+#     hostname rather than guessed now.
+#   - BOSS_ACTOR. Reads go out as operator:unidentified. A write is
+#     refused until the operator names themselves, because who signs a
+#     write made on this foothold is not decided by this car.
+#
+# NOT A BUILD WORKLOAD. It runs no cargo and holds no target directory or
+# worker binding. Its limits (2 CPU, 4Gi) are what a shell, kubectl and
+# git need, not what a build needs.
+#
+# ROOT, like the dev pod: sshd's privsep child chroots and setuids, and
+# openssh-server is apt-installed at boot because the image does not
+# include it. The four capabilities are the dev container's, with the
+# reasons written there (boss-dev.yaml, container `dev`).
+# infra/lint/a-workload-declares-the-user-it-runs-as.sh exempts this file
+# for that reason.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: boss-dev-standby
+  namespace: boss-dev
+  labels: {app.kubernetes.io/part-of: boss, app: boss-dev-standby}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: boss-dev-standby}
+  # RollingUpdate (the default), unlike the dev pod's Recreate: this pod
+  # holds no ReadWriteOnce volume, so a new pod can start before the old
+  # one stops, and the foothold is not lost during its own roll.
+  template:
+    metadata:
+      # NOT `app: boss-dev`. The dev pod's Deployment and its ssh Service
+      # both select that label, and the anti-affinity below matches it,
+      # so this pod must not carry it. The pin holds that.
+      labels: {app: boss-dev-standby}
+    spec:
+      affinity:
+        nodeAffinity:
+          # REQUIRED off the control planes. It is the same term as the dev
+          # pod and the gate runner, and a control plane is where etcd runs.
+          # REQUIRED off every node whose purpose the dev pod PREFERS
+          # (boss-dev.yaml prefers boss.dev/purpose=build; the pin reads the
+          # value from there). The anti-affinity below holds both ways, so
+          # a standby placed on that node while the dev pod was elsewhere
+          # (cordoned, mid-Recreate) would bar the dev pod from the node it
+          # wants until something moved the standby, and nothing does:
+          # IgnoredDuringExecution, and the dev-session Role cannot delete a
+          # pod (review run 75a760c9, finding 1, 2026-11-15). Whenever the
+          # dev pod is on that node the standby is barred from it anyway,
+          # so this bar costs nothing.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: node-role.kubernetes.io/control-plane, operator: DoesNotExist}
+                  - {key: boss.dev/purpose, operator: NotIn, values: ["build"]}
+          # PREFERS the data node, which infra/estate/estate.toml names the
+          # dev pod standby host (David, 2026-11-10: the standby's placement
+          # targets the Dell once it joins; it joined 2026-11-11). Preferred,
+          # not required, so a data node that is down or full leaves the
+          # standby on any other worker rather than Pending.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - {key: boss.dev/purpose, operator: In, values: ["database"]}
+        # REQUIRED NOT on the dev pod's node. A foothold on the same node
+        # is lost with it, and losing the dev pod's node is the case this
+        # pod exists for. The scheduler applies a required anti-affinity
+        # term in both directions: this pod is never placed beside the dev
+        # pod, and the dev pod is never placed beside this one. So the rule
+        # is: the dev pod cannot use whichever node holds the standby, and
+        # the bar above keeps that node from ever being the one it prefers.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: {app: boss-dev}
+              topologyKey: kubernetes.io/hostname
+      imagePullSecrets:
+        - {name: forgejo-registry}
+      # The dev session's ServiceAccount (Q1): the dev-session-gates Role
+      # in boss-dev.yaml. It can read pods, their logs and the namespace's
+      # events, which is what the banner reads. It can also run gate Jobs,
+      # the same grant the dev pod already holds.
+      serviceAccountName: dev-session
+      automountServiceAccountToken: true
+      # Outranks gate Jobs under node pressure and never preempts, as the
+      # dev pod does. On w-2 the gates are what this pod sits beside.
+      priorityClassName: boss-dev-session
+      # PID 1 must reap: the container runs `sleep`, and sshd's sessions
+      # are its children (the dev pod's reason, 2026-08-30).
+      shareProcessNamespace: true
+      securityContext:
+        # The machine token is mode 0440 and readable through this group.
+        fsGroup: 1500
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: standby
+          # The dev pod's image, so the tools match: git, curl, jq,
+          # kubectl, tmux and ssh-keygen are in its required-tools.txt.
+          image: 10.20.0.15:3000/david/boss-ci:rust1.96
+          # IfNotPresent, unlike the dev pod's Always. A foothold has to
+          # start on the day something is broken, and a dark registry is
+          # one of those days: under Always the kubelet refuses to start
+          # an image it has cached when it cannot reach the registry.
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          # BEST-EFFORT, every step: a step that fails is named in
+          # `kubectl logs -n boss-dev deploy/boss-dev-standby` and the
+          # container stays up. The readiness probe below is what reports
+          # whether the door is open.
+          args:
+            - |
+              say() { echo "standby: $*"; }
+              export DEBIAN_FRONTEND=noninteractive
+              printf '#!/bin/sh\nexit 0\n' > /var/lib/dpkg/info/systemd.postinst 2>/dev/null || true
+              printf 'APT::Sandbox::User "root";\n' > /etc/apt/apt.conf.d/99-pod-no-sandbox
+              mkdir -p /tmp/apt /standby/ssh /standby/tools/bin /root/.ssh
+              # sshd, retried: a single apt run that failed on a resolver
+              # miss would leave the foothold without a door on the day it
+              # is needed (the dev pod's claude install, backlog 56ac2a36).
+              for i in 1 2 3 4 5 6 7 8 9 10; do
+                [ -x /usr/sbin/sshd ] && break
+                apt-get -o Dir::Cache::archives=/tmp/apt update -qq \
+                  && apt-get -o Dir::Cache::archives=/tmp/apt install -y --no-install-recommends openssh-server \
+                  || say "sshd install: attempt $i failed"
+                [ -x /usr/sbin/sshd ] || sleep 15
+              done
+              getent passwd sshd >/dev/null || useradd --system --no-create-home --home-dir /run/sshd --shell /usr/sbin/nologin sshd || true
+              mkdir -p /run/sshd && chmod 0755 /run/sshd
+              # A host key per pod: this pod has no volume to keep one on.
+              # The fingerprint is logged so a changed key can be checked
+              # before it is trusted.
+              ssh-keygen -q -t ed25519 -N '' -f /standby/ssh/ssh_host_ed25519_key
+              chmod 600 /standby/ssh/ssh_host_ed25519_key
+              say "host key $(ssh-keygen -l -f /standby/ssh/ssh_host_ed25519_key.pub)"
+              cp /etc/ssh-authorized/authorized_keys /root/.ssh/authorized_keys || say "no authorized_keys in Secret boss-dev-ssh-authorized-keys - the key door refuses every login"
+              chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys 2>/dev/null
+              # The tree, shallow, on the forge READ token. Retried and
+              # bounded so a dark forge cannot hold the door closed: sshd
+              # starts below whether or not the clone succeeded.
+              for i in 1 2 3 4 5; do
+                [ -d /standby/boss/.git ] && break
+                rm -rf /standby/boss
+                timeout 120 git clone -q --depth 1 --branch main "$FORGE_URL" /standby/boss \
+                  || { say "clone: attempt $i failed"; sleep 10; }
+              done
+              [ -d /standby/boss/.git ] && say "tree: main at $(git -C /standby/boss rev-parse --short HEAD)"
+              ln -sf /standby/boss/infra/dev/boss-api /standby/tools/bin/boss-api
+              # An ssh session starts with a clean environment (UsePAM
+              # no), so every variable this container is given is written
+              # into the login's .bashrc. The value is defined once, in env
+              # below. KUBERNETES_SERVICE_* is what makes kubectl use the
+              # in-cluster ServiceAccount.
+              {
+                for v in BOSS_MACHINE_TOKEN_DIR BOSS_MACHINE_TOKEN_HOSTS GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 FORGE_URL KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT; do
+                  printf 'export %s=%q\n' "$v" "${!v}"
+                done
+                echo 'export PATH=/standby/tools/bin:$PATH'
+                echo 'cd /standby/boss 2>/dev/null || cd /standby'
+              } > /root/.bashrc
+              # Each login takes main again before the banner runs, so the
+              # banner and the doors are the tree's current ones. The fetch
+              # is bounded, and a failure leaves the copy that was there.
+              # The banner runs only when it exists and parses, so a bad
+              # edit cannot block a login.
+              {
+                echo '[ -f ~/.bashrc ] && . ~/.bashrc'
+                echo 'case $- in *i*)'
+                echo '  timeout 20 git -C /standby/boss fetch -q --depth 1 origin main 2>/dev/null && git -C /standby/boss reset -q --hard FETCH_HEAD'
+                echo '  b=/standby/boss/infra/dev/standby-banner.sh'
+                echo '  [ -f "$b" ] && bash -n "$b" 2>/dev/null && bash "$b"'
+                echo ';; esac'
+              } > /root/.profile
+              # The dev pod's sshd_config without its Access CA, and with
+              # forwarding OFF (review run 75a760c9, finding 3): a shell
+              # that reads the record and the cluster needs no tunnel into
+              # the cluster network, and OpenSSH's default would give one
+              # to every key that logs in.
+              cat > /standby/ssh/sshd_config <<'SD'
+              Port 22
+              HostKey /standby/ssh/ssh_host_ed25519_key
+              PidFile /standby/ssh/sshd.pid
+              LogLevel INFO
+              ClientAliveInterval 30
+              ClientAliveCountMax 4
+              UsePAM no
+              PermitRootLogin yes
+              PasswordAuthentication no
+              KbdInteractiveAuthentication no
+              PubkeyAuthentication yes
+              AuthorizedKeysFile /root/.ssh/authorized_keys
+              AllowTcpForwarding no
+              AllowStreamLocalForwarding no
+              AcceptEnv LANG LC_*
+              Subsystem sftp /usr/lib/openssh/sftp-server
+              SD
+              if /usr/sbin/sshd -f /standby/ssh/sshd_config -E /standby/ssh/sshd.log; then
+                say "ssh door: sshd started on :22"
+              else
+                say "ssh door: CLOSED - sshd refused to start (exit $?); its log follows"
+                tail -n 20 /standby/ssh/sshd.log
+              fi
+              exec sleep infinity
+          env:
+            - {name: FORGE_URL, value: "http://10.20.0.15:3000/david/boss.git"}
+            # The forge read token, through git's env-var config channel
+            # (the dev pod's reason: a helper set by hand on a volume is
+            # state a roll forgets; this one exists when the container
+            # starts).
+            - {name: GIT_CONFIG_COUNT, value: "1"}
+            - {name: GIT_CONFIG_KEY_0, value: "credential.http://10.20.0.15:3000.helper"}
+            - {name: GIT_CONFIG_VALUE_0, value: "!f() { echo username=david; echo password=$(cat /etc/forge/token); }; f"}
+            # The machine token, for the doors in the clone (boss-api
+            # reads infra/dev/machine-token-dir otherwise, which names the
+            # dev pod's directory). Named in the environment here, unlike
+            # the dev pod, because nothing on this pod runs tree code that
+            # could print it: no builds, no tests.
+            - {name: BOSS_MACHINE_TOKEN_DIR, value: /etc/boss/machine-token}
+            - {name: BOSS_MACHINE_TOKEN_HOSTS, value: ".boss.svc.cluster.local"}
+          ports:
+            - {name: ssh, containerPort: 22}
+          # The door is open when sshd answers. Until then the Service
+          # routes nothing to this pod.
+          readinessProbe:
+            tcpSocket: {port: 22}
+            periodSeconds: 10
+          # A door that never opens, or closes later, is retried rather than
+          # left doorless (review run 75a760c9, finding 4). The startup probe
+          # gives the boot 30 minutes (180 x 10 s), which covers a slow run
+          # of the boot above: ten apt attempts 15 s apart, then five clones
+          # bounded at 120 s with a 10 s pause each. When it
+          # runs out the kubelet restarts the container and the boot runs
+          # again. After the start, the liveness probe restarts a container
+          # whose sshd has not answered for two minutes. Neither probe can
+          # restart this pod more often than the boot it waits for.
+          startupProbe:
+            tcpSocket: {port: 22}
+            periodSeconds: 10
+            failureThreshold: 180
+          livenessProbe:
+            tcpSocket: {port: 22}
+            periodSeconds: 30
+            failureThreshold: 4
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["SETGID", "SETUID", "SYS_CHROOT", "AUDIT_WRITE"]
+          # Sized to stay small. w-2 refused the dev pod's 150Gi disk and
+          # 8Gi memory, not half a gigabyte. The disk request is the
+          # writable layer after apt (openssh-server), plus the shallow
+          # clone in the emptyDir.
+          resources:
+            requests: {cpu: 250m, memory: 512Mi, ephemeral-storage: 4Gi}
+            limits: {cpu: "2", memory: 4Gi}
+          volumeMounts:
+            - {name: standby, mountPath: /standby}
+            - {name: forge-token, mountPath: /etc/forge, readOnly: true}
+            - {name: ssh-authorized, mountPath: /etc/ssh-authorized, readOnly: true}
+            - {name: machine-token, mountPath: /etc/boss/machine-token, readOnly: true}
+      volumes:
+        # The clone, the host key and sshd's files. Nothing in this volume
+        # is lost on a reschedule: all of it is created again at boot.
+        - name: standby
+          emptyDir: {}
+        # The forge READ token, the dev pod's Secret. Optional, because an
+        # absent Secret should leave a pod with no clone, not a pod stuck
+        # in ContainerCreating.
+        - name: forge-token
+          secret: {secretName: forge-read, optional: true, defaultMode: 0400}
+        # David's public key, the Secret the dev pod's LAN door reads.
+        - name: ssh-authorized
+          secret: {secretName: boss-dev-ssh-authorized-keys, optional: true, defaultMode: 0400}
+        # The estate machine token, boss-dev's copy (Q1). The whole Secret,
+        # so a rotation reaches the mount, and optional, as on every holder.
+        - name: machine-token
+          secret: {secretName: boss-machine-token, optional: true, defaultMode: 0440}
+---
+# The standby's ssh door on the LAN. The pool assigns the address. A later
+# car of design 0491591b reads that address, pins it here and declares it
+# in infra/estate/doors.toml as `dev-standby-ssh`. Until then, read the
+# address with `kubectl get svc -n boss-dev boss-dev-standby-ssh`.
+apiVersion: v1
+kind: Service
+metadata:
+  name: boss-dev-standby-ssh
+  namespace: boss-dev
+spec:
+  type: LoadBalancer
+  selector:
+    app: boss-dev-standby
+  ports:
+    - name: ssh
+      port: 22
+      targetPort: 22

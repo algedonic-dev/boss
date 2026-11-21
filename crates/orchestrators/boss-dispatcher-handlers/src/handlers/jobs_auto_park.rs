@@ -29,8 +29,8 @@ use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 use boss_jobs::car::{self, Receipt};
 
 use super::common::{
-    StepEvent, api_client, dispatcher_actor_header, get_json, owner_for_filing, rows_or_refuse,
-    write_json,
+    Judged, StepEvent, api_client, dispatcher_actor_header, get_json, owner_for_filing,
+    rows_or_refuse, write_json, write_json_expecting,
 };
 
 pub struct JobsAutoPark {
@@ -58,31 +58,261 @@ impl JobsAutoPark {
         self.jobs_base.trim_end_matches('/')
     }
 
+    /// Every open car, paged on `total` — see [`open_cars_url`] for why
+    /// it does not narrow by subject. `full` keeps each step's metadata,
+    /// which the gate hand-back reads its gate-run off.
+    async fn open_cars(&self, full: bool, rule: &str) -> Result<Vec<Value>, HandlerError> {
+        list_open_cars(&self.client, self.base(), full, rule).await
+    }
+
+    /// A GATE THAT DID NOT GO GREEN HANDS ITS CAR'S GATE STEP BACK
+    /// (backlog 68a8726e, design 689d1f7f car 1). `boss gate` moved the
+    /// branch's car into its `gate` step when it launched; a failed,
+    /// lost, refused or withdrawn verdict ends that hold, so the step
+    /// goes back to READY with the verdict recorded beside it
+    /// (`car::gate_return`) — the car stands waiting for its next gate,
+    /// not in one that has ended. Only the car whose gate step THIS
+    /// gate-run holds is moved; a redelivery finds the step no longer
+    /// held and writes nothing.
+    ///
+    /// Ownership is judged AT EACH WRITE, not only on the read (Codex
+    /// review of car 0d04ee3e, R3): a gate launched on the branch after
+    /// the read restamps the step to its own gate-run, and both writes
+    /// then land on nothing (`car::gate_return`'s expectations).
+    async fn hand_gate_back(
+        &self,
+        gate_run: &str,
+        verdict: &str,
+        rule: &str,
+    ) -> Result<(), HandlerError> {
+        let cars = self.open_cars(true, rule).await?;
+        let Some(held) = car::car_in_gate_run(&cars, gate_run) else {
+            return Ok(());
+        };
+        let car_id = held.get("id").and_then(Value::as_str).unwrap_or("?");
+        for w in car::gate_return(held, gate_run, verdict) {
+            if self.send_judged(&w, rule).await? == Judged::Moved {
+                tracing::info!(rule = %rule, car = %car_id, gate_run = %gate_run,
+                    verdict = %verdict, "the car's gate step changed hands after this \
+                    verdict's read — a newer gate-run holds it, so nothing is handed back");
+                return Ok(());
+            }
+        }
+        tracing::info!(rule = %rule, car = %car_id, gate_run = %gate_run, verdict = %verdict,
+            "the gate ended {verdict}: the car's gate step is handed back and waits for its \
+             next gate");
+        Ok(())
+    }
+
+    /// A NON-GREEN VERDICT FOLLOWS ITS EDGE (design 689d1f7f car 2,
+    /// backlog a3a367e4). A gate-run `boss gate` admitted as the child of
+    /// a car's gate step names that step (`boss_jobs::fulfils`), so its
+    /// verdict reads the one car instead of every open car. A gate-run
+    /// with no edge — every one launched before this car deployed — is
+    /// handed back by the scan, as before. So is one whose edge cannot be
+    /// read: a hand-back is judged on the holder alone and can only put
+    /// the step back to READY, so the scan is the safe reader there.
+    ///
+    /// THE OUTCOME DECIDES, NOT THE CLOSE. Nothing on this path completes
+    /// the step: `car::edge_return` is `car::gate_return`'s judged pair,
+    /// and the edge is not `parent_step_id`, so the subjob rule that
+    /// completes a parent on ANY close never sees this gate-run.
+    async fn return_gate(
+        &self,
+        gate_run: &str,
+        verdict: &str,
+        rule: &str,
+    ) -> Result<(), HandlerError> {
+        let run = get_json(
+            &self.client,
+            &format!("{}/api/jobs/{gate_run}", self.base()),
+            rule,
+        )
+        .await?;
+        let edge = match boss_jobs::fulfils::of(run.get("metadata").unwrap_or(&Value::Null)) {
+            Ok(Some(edge)) => edge,
+            Ok(None) => return self.hand_gate_back(gate_run, verdict, rule).await,
+            Err(why) => {
+                tracing::warn!(rule = %rule, gate_run = %gate_run,
+                    "{why} — handing the gate back by the scan, which is judged on the holder");
+                return self.hand_gate_back(gate_run, verdict, rule).await;
+            }
+        };
+        let held = get_json(
+            &self.client,
+            &format!("{}/api/jobs/{}", self.base(), edge.job),
+            rule,
+        )
+        .await?;
+        let writes = match car::edge_return(&held, &edge, gate_run, verdict) {
+            Ok(writes) => writes,
+            Err(why) => {
+                tracing::warn!(rule = %rule, gate_run = %gate_run, verdict = %verdict,
+                    "the gate ended {verdict} and its edge names no gate to hand back: {why}");
+                return Ok(());
+            }
+        };
+        if writes.is_empty() {
+            tracing::info!(rule = %rule, car = %edge.job, gate_run = %gate_run,
+                "the gate ended {verdict}, and its car's gate step is no longer held by it — \
+                 nothing is handed back");
+            return Ok(());
+        }
+        for w in writes {
+            if self.send_judged(&w, rule).await? == Judged::Moved {
+                tracing::info!(rule = %rule, car = %edge.job, gate_run = %gate_run,
+                    "the car's gate step changed hands after this verdict's read — nothing is \
+                     handed back");
+                return Ok(());
+            }
+        }
+        tracing::info!(rule = %rule, car = %edge.job, gate_run = %gate_run, verdict = %verdict,
+            "the gate ended {verdict}: the gate step its edge names is handed back and waits \
+             for its next gate");
+        Ok(())
+    }
+
+    /// One [`car::JudgedWrite`], sent with its expectation.
+    async fn send_judged(&self, w: &car::JudgedWrite, rule: &str) -> Result<Judged, HandlerError> {
+        let method = match w.method {
+            "PUT" => reqwest::Method::PUT,
+            _ => reqwest::Method::PATCH,
+        };
+        write_json_expecting(
+            &self.client,
+            method,
+            &format!("{}{}", self.base(), w.path),
+            &w.body,
+            &w.expect,
+            rule,
+        )
+        .await
+    }
+
+    /// The writes that finish a car's steps on a green, in order — the
+    /// `gate` step's two ALWAYS carrying `gate_expect`
+    /// (`car::green_binding`, Codex review of car 0d04ee3e R2): the
+    /// holder and head when the car was bound, the binding's ABSENCE when
+    /// it was not, so a launch that stamped or restamped the step after
+    /// the binding was judged makes them land on nothing.
+    /// [`Judged::Moved`] when that happened; the steps before the gate
+    /// were written. A green that took the step over from a lost run
+    /// renames its holder in the same merge (`car::green_gate_writes`,
+    /// backlog 84e46932).
+    async fn finish_steps(
+        &self,
+        car_id: &str,
+        writes: Vec<car::StepWrite>,
+        gate_expect: &serde_json::Map<String, Value>,
+        gate_run: &str,
+        rule: &str,
+    ) -> Result<Judged, HandlerError> {
+        for w in writes {
+            if w.title == car::GATE {
+                for jw in car::green_gate_writes(car_id, &w, gate_expect, gate_run) {
+                    if self.send_judged(&jw, rule).await? == Judged::Moved {
+                        return Ok(Judged::Moved);
+                    }
+                }
+                continue;
+            }
+            let (merge_path, status_path) = (w.merge_path(car_id), w.status_path(car_id));
+            let sends = [
+                (reqwest::Method::PATCH, merge_path, w.metadata),
+                (reqwest::Method::PUT, status_path, w.status_body),
+            ];
+            for (method, path, body) in sends {
+                write_json(
+                    &self.client,
+                    method,
+                    &format!("{}{path}", self.base()),
+                    &body,
+                    rule,
+                )
+                .await?;
+            }
+        }
+        Ok(Judged::Written)
+    }
+
+    /// A green that may not finish the car it found — another gate-run
+    /// holds its gate step — files nothing and says so ON THE GATE-RUN,
+    /// the way a landed or boarded branch's green does: the verdict
+    /// names why it moved no car, so nobody re-derives it.
+    async fn green_held_elsewhere(
+        &self,
+        gate_run: &str,
+        why: &str,
+        rule: &str,
+    ) -> Result<(), HandlerError> {
+        tracing::warn!(rule = %rule, gate_run = %gate_run, "{why}");
+        write_json(
+            &self.client,
+            reqwest::Method::PATCH,
+            &format!("{}/api/jobs/{gate_run}/metadata", self.base()),
+            &held_elsewhere_skip(why),
+            rule,
+        )
+        .await
+    }
+
     /// Put the gate's `--hold` onto `car`'s review step ([`hold_write`]),
-    /// or do nothing for an unheld gate. A car that cannot carry the hold
+    /// or, for an unheld gate, carry a live review hold to the refreshed
+    /// head (backlog 6b12a70f) or do nothing. A car that cannot carry the hold
     /// is a PERMANENT refusal — redelivering cannot give it a review
     /// step — and a failed write propagates, so either way the caller
     /// stops before anything makes the car boardable.
+    ///
+    /// A write that carries a hold's head was decided on this handler's
+    /// read of the car, and it is sent with the hold and head it read
+    /// (backlog cd1f68c6). A review step that moved in between — a
+    /// release, a person's hold, a red-train hold — refuses it and keeps
+    /// what it holds: nothing is written, and the refusal is retryable,
+    /// so a redelivery reads the car again and judges the hold it now
+    /// carries.
     async fn hold_car(
         &self,
         car: &Value,
         inputs: &AutoParkInputs,
         rule: &str,
     ) -> Result<(), HandlerError> {
-        let Some((path, body)) = hold_write(car, inputs).map_err(HandlerError::Permanent)? else {
+        let Some((path, body, judged)) =
+            hold_write(car, inputs).map_err(HandlerError::Permanent)?
+        else {
             return Ok(());
         };
-        write_json(
-            &self.client,
-            reqwest::Method::PATCH,
-            &format!("{}{path}", self.base()),
-            &body,
-            rule,
-        )
-        .await?;
-        tracing::info!(rule = %rule, branch = %inputs.branch,
-            hold = %inputs.hold.as_deref().unwrap_or_default(),
-            "the gate carried --hold: the car stands at the dock held until boss release");
+        let url = format!("{}{path}", self.base());
+        match judged {
+            None => write_json(&self.client, reqwest::Method::PATCH, &url, &body, rule).await?,
+            Some(judged) => {
+                let landed = write_json_expecting(
+                    &self.client,
+                    reqwest::Method::PATCH,
+                    &url,
+                    &body,
+                    &judged,
+                    rule,
+                )
+                .await?;
+                if landed == Judged::Moved {
+                    let car_id = car.get("id").and_then(Value::as_str).unwrap_or_default();
+                    return Err(HandlerError::Downstream(format!(
+                        "car {car_id}'s review step changed between this refresh's read and its \
+                         hold write — its hold or hold_sha is no longer the one judged \
+                         ({judged:?}), so nothing was written and the car was not refreshed; a \
+                         redelivery judges the hold it carries now (backlog cd1f68c6)"
+                    )));
+                }
+            }
+        }
+        match inputs.hold.as_deref() {
+            Some(hold) => tracing::info!(rule = %rule, branch = %inputs.branch, hold = %hold,
+                "the gate carried --hold: the car stands at the dock held until boss release"),
+            None => tracing::info!(rule = %rule, branch = %inputs.branch,
+                head = %inputs.receipt.head,
+                "the car's review hold now names the refreshed head: a review of it releases \
+                 the car (backlog 6b12a70f)"),
+        }
         Ok(())
     }
 
@@ -235,8 +465,14 @@ struct AutoParkInputs {
     hold_bound: bool,
 }
 
+/// A review-step merge write: its path, its body, and the review-step
+/// keys it was judged on, if it was judged on any ([`hold_write`]).
+type HoldWrite = (String, Value, Option<serde_json::Map<String, Value>>);
+
 /// PURE: the review-step merge write that puts a gate's `--hold` onto
-/// its car — `(path, body)` — or `None` when the gate carried no hold.
+/// its car — `(path, body, judged)` — or `None` when the gate carried no hold.
+/// An unheld green over a car already held for a review writes that
+/// hold's new head instead (`car::hold_follows_head`, backlog 6b12a70f).
 ///
 /// THE REVIEW STEP, BECAUSE THAT IS WHERE A HOLD IS READ. `boss hold`
 /// writes `hold: <reason>` there; the conductor's `parked_ready`, the
@@ -251,10 +487,13 @@ struct AutoParkInputs {
 /// case REFUSES rather than parking the car as though it were held,
 /// because a hold that silently did not land is a trust-boundary car
 /// boarding unreviewed.
-fn hold_write(car: &Value, inputs: &AutoParkInputs) -> Result<Option<(String, Value)>, String> {
-    let Some(reason) = inputs.hold.as_deref() else {
-        return Ok(None);
-    };
+///
+/// The third element is what the write was JUDGED on, when its body
+/// depends on the review step this read: every write whose `hold_sha`
+/// `car::hold_follows_head` decided carries `car::hold_as_judged`, and
+/// the merge door lands it only on a step that still reads so (backlog
+/// cd1f68c6). A gate's own bound hold names its own head and needs none.
+fn hold_write(car: &Value, inputs: &AutoParkInputs) -> Result<Option<HoldWrite>, String> {
     let car_id = car.get("id").and_then(Value::as_str).unwrap_or_default();
     let open = car::find_step(car, car::REVIEW_SLUG, car::REVIEW).filter(|s| {
         !matches!(
@@ -265,6 +504,24 @@ fn hold_write(car: &Value, inputs: &AutoParkInputs) -> Result<Option<(String, Va
     let review = open
         .and_then(|s| s.get("id").and_then(Value::as_str))
         .filter(|_| !car_id.is_empty());
+    let review_md = open.and_then(|s| s.get("metadata")).unwrap_or(&Value::Null);
+    let head = inputs.receipt.head.trim();
+    // A REFRESH MOVES A LIVE REVIEW HOLD'S HEAD (backlog 6b12a70f): a
+    // green with no hold of its own, refreshing a car already held for a
+    // review, carries that hold to the head the green vouches for, so the
+    // review of that head releases it. `car::hold_follows_head` decides
+    // it for `boss rerail --finish` too.
+    let Some(reason) = inputs.hold.as_deref() else {
+        return Ok(review.and_then(|step_id| {
+            car::hold_follows_head(review_md, head).map(|body| {
+                (
+                    format!("/api/jobs/{car_id}/steps/{step_id}/metadata"),
+                    body,
+                    Some(car::hold_as_judged(review_md)),
+                )
+            })
+        }));
+    };
     let Some(step_id) = review else {
         return Err(format!(
             "the gate carried --hold ({reason}) but car {car_id} has no open review step to \
@@ -279,14 +536,23 @@ fn hold_write(car: &Value, inputs: &AutoParkInputs) -> Result<Option<(String, Va
     // An unbound hold over a released car deletes the `hold_sha` that
     // release lifted, so it is not read as judged there (backlog
     // 6c463c66, `car::hold_body`).
-    let review_md = open.and_then(|s| s.get("metadata")).unwrap_or(&Value::Null);
     let mut body = car::hold_body(review_md, reason);
-    if inputs.hold_bound && !inputs.receipt.head.trim().is_empty() {
-        body[car::HOLD_SHA] = json!(inputs.receipt.head.trim());
+    let mut judged = None;
+    if inputs.hold_bound && !head.is_empty() {
+        body[car::HOLD_SHA] = json!(head);
+    } else if let Some(moved) = car::hold_follows_head(review_md, head) {
+        // An unbound hold written over a live review hold keeps it a
+        // review hold (`car::hold_body`), so its head follows the refresh
+        // too (backlog 6b12a70f) — but only over the review hold this
+        // read: a release landing first leaves a hold this write must
+        // not bind to the new head (backlog cd1f68c6).
+        body[car::HOLD_SHA] = moved[car::HOLD_SHA].clone();
+        judged = Some(car::hold_as_judged(review_md));
     }
     Ok(Some((
         format!("/api/jobs/{car_id}/steps/{step_id}/metadata"),
         body,
+        judged,
     )))
 }
 
@@ -501,6 +767,22 @@ fn auto_park_inputs(
     })
 }
 
+/// PURE: why this green may NOT leave a car at the dock — the shared
+/// predicate `car::unproven_park` (backlog 031a3ca9), asked of the proof
+/// the gate-run's park stated and the car it lands on (`None` for a car
+/// this green would file). `boss gate` refuses such a park at launch;
+/// this is the second door, for an intent stamped before that refusal
+/// existed or by anything other than the verb.
+fn unproven_refusal(existing: Option<&Value>, inputs: &AutoParkInputs) -> Option<String> {
+    car::unproven_park(existing, &inputs.proof).map(|why| {
+        format!(
+            "auto-park: no car parked for {}: {why}\n\nRe-gate it with its park flags and \
+             a probe; this green stays on its gate-run.",
+            inputs.branch
+        )
+    })
+}
+
 /// PURE: the `agent_run` stamp a gate-run carries, as the map the three
 /// park paths merge — one entry, or none. A blank value is none: `boss
 /// gate` refuses to stamp one, and this is the second door on the rule.
@@ -589,6 +871,35 @@ fn boarded_skip(cars: &[Value], branch: &str) -> Option<Value> {
     }))
 }
 
+/// PURE: the record written on the gate-run when its green may not
+/// finish the branch's car because another gate-run holds that car's
+/// gate step (`car::green_binding`).
+fn held_elsewhere_skip(why: &str) -> Value {
+    json!({
+        "park_skipped": "gate-held-elsewhere",
+        "park_skipped_note": format!(
+            "no car finished: {why} (Codex review of car 0d04ee3e, R2)"
+        ),
+    })
+}
+
+/// PURE: the record written on the gate-run when its green FOLLOWED its
+/// edge and may not finish what the edge names — the car is not open or
+/// not on the branch this gate-run gated, the step is not its gate, or
+/// this gate-run does not hold that gate. Nothing
+/// is filed instead: one car per branch is the invariant the edge exists
+/// for, and the verdict that holds the step moves the car.
+fn edge_refused_skip(edge: &boss_jobs::fulfils::Fulfils, why: &str) -> Value {
+    json!({
+        "park_skipped": "edge-refused",
+        "park_skipped_note": format!(
+            "no car finished: this green followed its edge to car {} and {why} (backlog \
+             a3a367e4)",
+            &edge.job[..8.min(edge.job.len())],
+        ),
+    })
+}
+
 /// PURE: what this green does about `branch` — the whole decision, in
 /// one place, so "does it ever file a second car" is a unit test rather
 /// than a live incident.
@@ -612,7 +923,23 @@ enum ParkAction<'a> {
     File,
 }
 
-fn park_action<'a>(open: &'a [Value], all: &[Value], branch: &str) -> ParkAction<'a> {
+fn park_action<'a>(open: &'a [Value], all: &[Value], branch: &str, edged: bool) -> ParkAction<'a> {
+    // A GATE-RUN THAT CARRIES AN EDGE IS FINISHED BY ITS VERDICT, never
+    // by this scan (design 689d1f7f car 2, backlog a3a367e4). The handler
+    // follows a readable edge before it reaches here, so the one edged
+    // gate-run that does is one whose edge cannot be read — and the
+    // answer is still Skip, first, before any car is looked at: the edge
+    // path and an Adopt must never both finish one gate step, and a
+    // half-written edge must not quietly become a scan that refreshes or
+    // files a second car for the branch.
+    if edged {
+        return ParkAction::Skip(json!({
+            "park_skipped": "finished-by-its-verdict",
+            "park_skipped_note": "no car filed, refreshed or adopted: this gate-run carries a \
+                `fulfils` edge, so its verdict is followed to the step it names and never \
+                matched to a car by branch — and this edge could not be read (backlog a3a367e4)",
+        }));
+    }
     if let Some(patch) = landed_skip(all, branch) {
         return ParkAction::Skip(patch);
     }
@@ -671,6 +998,19 @@ fn adopt_patch(car: &Value, inputs: &AutoParkInputs) -> Value {
     patch.extend(clear_stale_item_answer(car, inputs));
     if let Some(dc) = inputs.delivery_channel.as_deref() {
         patch.insert("delivery_channel".to_string(), json!(dc));
+    }
+    // A CAR ADMITTED BY DISPATCH WAS SCOPED BEFORE ITS BUILDER WROTE THE
+    // BOUNDARY (backlog 68a8726e): its scope step carries the item's
+    // title and a "not yet stated" excludes, and a completed step cannot
+    // be rewritten. The builder's own summary and excludes arrive here,
+    // with the green, and ride the car's metadata — so the boundary is on
+    // the car, not only on the gate-run.
+    if car
+        .pointer(&format!("/metadata/{}", car::ADMITTED_BY))
+        .is_some()
+    {
+        patch.insert("summary".to_string(), json!(inputs.summary));
+        patch.insert("excludes".to_string(), json!(inputs.excludes));
     }
     // LAST, so the id `supersede` preserves wins over a clear: the two
     // overlap only on a hand-edited packet, and keeping the id is the
@@ -883,6 +1223,45 @@ fn boards_after_patch(existing: Option<&Value>, inputs: &AutoParkInputs) -> Opti
 /// the trains together hold 22 open cars today, so one page answers —
 /// but a page is still a page, and the read below walks `total`
 /// (a-limit-is-not-a-filter).
+/// Every open car, paged on `total` — see [`open_cars_url`] for why it
+/// does not narrow by subject. `full` keeps each step's metadata. Shared
+/// with `jobs.end_unlaunched_car`, which reads the same set.
+pub(crate) async fn list_open_cars(
+    client: &boss_core::machine_token::Client,
+    base: &str,
+    full: bool,
+    rule: &str,
+) -> Result<Vec<Value>, HandlerError> {
+    let mut cars: Vec<Value> = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let mut url = open_cars_url(base, offset);
+        if full {
+            url.push_str("&full=true");
+        }
+        let page = get_json(client, &url, rule).await?;
+        // A page with no `data` array is NO ANSWER. Read as zero
+        // cars it sent `park_action` to `File` — a twin of the car
+        // at the dock — so this read fails toward a write, and it
+        // refuses rather than guess (backlog 37fc5837).
+        let rows: Vec<Value> = rows_or_refuse(&page, "the open-car read (GET /api/jobs)")
+            .map_err(HandlerError::Downstream)?;
+        let got = rows.len();
+        cars.extend(rows);
+        let total = page
+            .get("total")
+            .and_then(Value::as_u64)
+            .unwrap_or(cars.len() as u64) as usize;
+        // Stop on a short page as well as on the count: a `total`
+        // that never shrinks would otherwise spin forever.
+        if got == 0 || cars.len() >= total {
+            break;
+        }
+        offset += CARS_PAGE;
+    }
+    Ok(cars)
+}
+
 const CARS_PAGE: usize = 200;
 
 /// PURE: the listing query for the open cars a park decision reads.
@@ -979,9 +1358,15 @@ impl Handler for JobsAutoPark {
     ) -> Result<(), HandlerError> {
         let ev = StepEvent::from_payload(&ctx.event_payload)?;
 
-        // Cheap reject before the fetch: only a green verdict parks.
-        if ev.metadata.get("verdict").and_then(Value::as_str) != Some("green") {
-            return Ok(());
+        // Only a green verdict parks. Any other verdict hands back the
+        // gate step of the car this gate-run holds, if it holds one
+        // (backlog 68a8726e) — and parks nothing.
+        match ev.metadata.get("verdict").and_then(Value::as_str) {
+            Some("green") => {}
+            Some(verdict) => {
+                return self.return_gate(ev.job_id, verdict, &ctx.rule_name).await;
+            }
+            None => return Ok(()),
         }
 
         // A green whose live comparisons were declared away is not a
@@ -998,6 +1383,13 @@ impl Handler for JobsAutoPark {
             &ctx.rule_name,
         )
         .await?;
+        // THE EDGE IS READ OFF THE RAW METADATA, before the projection
+        // below narrows it to the immutable submission source: `boss gate`
+        // writes it AFTER the submission is accepted, once the car reads
+        // back holding the gate (design 689d1f7f car 2). It is a locator,
+        // not an authority — every write it leads to is judged on the
+        // holder the launch stamped on the car's step (`car::edge_green`).
+        let edge = boss_jobs::fulfils::of(gate_run.get("metadata").unwrap_or(&Value::Null));
         let source = boss_jobs::gate_reservation::source_metadata(
             gate_run.get("metadata").unwrap_or(&Value::Null),
         )
@@ -1045,6 +1437,60 @@ impl Handler for JobsAutoPark {
             return Ok(());
         };
 
+        // THE VERDICT COMPLETES THE STEP ITS GATE-RUN FULFILS (design
+        // 689d1f7f car 2, backlog a3a367e4). A gate launched on a car
+        // records the R8 edge to that car's gate step, so its green reads
+        // the ONE car the edge names — no open-car scan, no landed or
+        // boarded read, no refresh, no filing — and finishes it through
+        // the same writes an Adopt makes, the gate step's judged on the
+        // holder the launch stamped. A gate-run with no edge (launched
+        // before this deployed, or whose edge write was lost) takes the
+        // scan below, unchanged until car 3.
+        let relaunch_of = gate_run
+            .pointer(&format!("/metadata/{}", boss_jobs::lost_gate::RELAUNCH_OF))
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string);
+        let by_edge = match &edge {
+            Ok(Some(edge)) => {
+                let full = get_json(
+                    &self.client,
+                    &format!("{}/api/jobs/{}", self.base(), edge.job),
+                    &ctx.rule_name,
+                )
+                .await?;
+                match car::edge_green(
+                    &full,
+                    edge,
+                    &inputs.branch,
+                    ev.job_id,
+                    relaunch_of.as_deref(),
+                    &inputs.receipt.head,
+                ) {
+                    Ok(car::EdgeGreen::Finish(expect)) => Some((full, expect)),
+                    Ok(car::EdgeGreen::Finished) => {
+                        tracing::info!(rule = %ctx.rule_name, gate_run = %ev.job_id,
+                            car = %edge.job, "the gate step this green fulfils is already \
+                            finished — nothing to do");
+                        return Ok(());
+                    }
+                    Err(why) => {
+                        tracing::warn!(rule = %ctx.rule_name, gate_run = %ev.job_id, "{why}");
+                        write_json(
+                            &self.client,
+                            reqwest::Method::PATCH,
+                            &format!("{}/api/jobs/{}/metadata", self.base(), ev.job_id),
+                            &edge_refused_skip(edge, &why),
+                            &ctx.rule_name,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(None) | Err(_) => None,
+        };
+
         // A RE-GATE NEVER FILES A TWIN. Measured 2026-09-05 (backlog
         // d052afad): this handler filed a car per green gate, so the dock
         // held 10 cars for 6 branches and each first car sat with a
@@ -1057,35 +1503,12 @@ impl Handler for JobsAutoPark {
         //
         // ONE READ OF THE OPEN CARS serves all three questions below.
         // Every open car, paged — see `open_cars_url` for why it does
-        // not narrow by subject.
-        let mut cars: Vec<Value> = Vec::new();
-        let mut offset = 0usize;
-        loop {
-            let page = get_json(
-                &self.client,
-                &open_cars_url(self.base(), offset),
-                &ctx.rule_name,
-            )
-            .await?;
-            // A page with no `data` array is NO ANSWER. Read as zero
-            // cars it sent `park_action` to `File` — a twin of the car
-            // at the dock — so this read fails toward a write, and it
-            // refuses rather than guess (backlog 37fc5837).
-            let rows: Vec<Value> = rows_or_refuse(&page, "the open-car read (GET /api/jobs)")
-                .map_err(HandlerError::Downstream)?;
-            let got = rows.len();
-            cars.extend(rows);
-            let total = page
-                .get("total")
-                .and_then(Value::as_u64)
-                .unwrap_or(cars.len() as u64) as usize;
-            // Stop on a short page as well as on the count: a `total`
-            // that never shrinks would otherwise spin forever.
-            if got == 0 || cars.len() >= total {
-                break;
-            }
-            offset += CARS_PAGE;
-        }
+        // not narrow by subject. A green that follows its edge reads
+        // neither list: the edge already named its car.
+        let cars = match by_edge {
+            Some(_) => Vec::new(),
+            None => self.open_cars(false, &ctx.rule_name).await?,
+        };
 
         // A LANDED BRANCH GETS NO TWIN — checked before the parked-car
         // refresh, because a still-parked car for a landed branch IS a
@@ -1104,41 +1527,61 @@ impl Handler for JobsAutoPark {
         // while it is still open, and `landed_car_for` reads that
         // marker off the open page above — and it has not been
         // measured. Say so rather than pay for it.
-        let closed = get_json(
-            &self.client,
-            &format!(
-                "{}/api/jobs?kind=ship-a-change&status=closed&subject_id={}&limit=50",
-                self.base(),
-                inputs.branch
-            ),
-            &ctx.rule_name,
-        )
-        .await?;
-        // The same refusal, for the same reason: read as "nothing
-        // landed", an error-shaped body files a car for work already on
-        // main (backlog 37fc5837).
-        let landed: Vec<Value> = rows_or_refuse(&closed, "the landed-car read (GET /api/jobs)")
-            .map_err(HandlerError::Downstream)?;
-        let all: Vec<Value> = cars.iter().cloned().chain(landed).collect();
-        // ONE DECISION, taken on what the SoR holds: skip (landed, or
-        // aboard a train), refresh the car at the dock, finish the car a
-        // builder opened, or file.
-        let (parked, adopt) = match park_action(&cars, &all, &inputs.branch) {
-            ParkAction::Skip(patch) => {
-                write_json(
+        let landed: Vec<Value> = match by_edge {
+            Some(_) => Vec::new(),
+            None => {
+                let closed = get_json(
                     &self.client,
-                    reqwest::Method::PATCH,
-                    &format!("{}/api/jobs/{}/metadata", self.base(), ev.job_id),
-                    &patch,
+                    &format!(
+                        "{}/api/jobs?kind=ship-a-change&status=closed&subject_id={}&limit=50",
+                        self.base(),
+                        inputs.branch
+                    ),
                     &ctx.rule_name,
                 )
                 .await?;
-                return Ok(());
+                // The same refusal, for the same reason: read as "nothing
+                // landed", an error-shaped body files a car for work
+                // already on main (backlog 37fc5837).
+                rows_or_refuse(&closed, "the landed-car read (GET /api/jobs)")
+                    .map_err(HandlerError::Downstream)?
             }
-            ParkAction::Refresh(car) => (Some(car), None),
-            ParkAction::Adopt(car) => (None, Some(car.clone())),
-            ParkAction::File => (None, None),
         };
+        let all: Vec<Value> = cars.iter().cloned().chain(landed).collect();
+        // ONE DECISION, taken on what the SoR holds: follow the edge,
+        // skip (landed, or aboard a train, or an edge that cannot be
+        // read), refresh the car at the dock, finish the car a builder
+        // opened, or file.
+        let (parked, adopt, edge_expect) = match by_edge {
+            Some((full, expect)) => (None, Some(full), Some(expect)),
+            None => match park_action(&cars, &all, &inputs.branch, edge.is_err()) {
+                ParkAction::Skip(patch) => {
+                    write_json(
+                        &self.client,
+                        reqwest::Method::PATCH,
+                        &format!("{}/api/jobs/{}/metadata", self.base(), ev.job_id),
+                        &patch,
+                        &ctx.rule_name,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                ParkAction::Refresh(car) => (Some(car), None, None),
+                ParkAction::Adopt(car) => (None, Some(car.clone()), None),
+                ParkAction::File => (None, None, None),
+            },
+        };
+
+        // NO CAR REACHES THE DOCK OWING A PROOF NOTHING CAN SETTLE
+        // (backlog 031a3ca9). Judged on the car this green lands on —
+        // the edge's, the parked one, the one the builder opened — or on
+        // the intent alone for a car it would file, and refused like a
+        // declared-away estate: a permanent error whose dead-letter lands
+        // on the gate-run, before any write to any car.
+        if let Some(why) = unproven_refusal(parked.or(adopt.as_ref()), &inputs) {
+            tracing::error!(rule = %ctx.rule_name, gate_run = %ev.job_id, "{why}");
+            return Err(HandlerError::Permanent(why));
+        }
 
         if let Some(parked) = parked {
             let id = parked.get("id").and_then(Value::as_str).ok_or_else(|| {
@@ -1192,6 +1635,53 @@ impl Handler for JobsAutoPark {
             }
             return Ok(());
         }
+
+        // A GREEN FINISHES ONLY THE GATE ITS RUN HOLDS (Codex review of car
+        // 0d04ee3e, R2). A car `boss gate` moved into its gate names the
+        // gate-run holding the step and the head it launched at; a green
+        // from any other gate-run — an older one delivered after a re-gate
+        // launched — finishes nothing and says so on its gate-run. Judged
+        // on a FULL read of the car (the open list is slim, without step
+        // metadata), BEFORE any write to it; and the gate step's own writes
+        // carry the same judgement to the jobs API, so a launch landing
+        // after this read makes them land on nothing. A car with no
+        // binding is judged on that ABSENCE (round 2 R2): a launch that
+        // binds it after this read is a change of hands too. A car this
+        // green files below has never been launched on, so it is judged
+        // on absence as well.
+        let gate_expect = match (edge_expect, &adopt) {
+            // Judged already, on the car the edge named (`car::edge_green`).
+            (Some(expect), _) => expect,
+            (None, Some(existing)) => {
+                let id = existing
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let full = get_json(
+                    &self.client,
+                    &format!("{}/api/jobs/{id}", self.base()),
+                    &ctx.rule_name,
+                )
+                .await?;
+                // A machine relaunch names the lost gate-run it replaces,
+                // and succeeds to the gate step that run held (backlog
+                // 64d417ca, `car::green_binding`).
+                match car::green_binding(
+                    &full,
+                    ev.job_id,
+                    relaunch_of.as_deref(),
+                    &inputs.receipt.head,
+                ) {
+                    Ok(expect) => expect,
+                    Err(why) => {
+                        return self
+                            .green_held_elsewhere(ev.job_id, &why, &ctx.rule_name)
+                            .await;
+                    }
+                }
+            }
+            (None, None) => car::unbound_gate(),
+        };
 
         // THE CAR'S STAMPS ARE THE GREEN'S INSTANT (backlog 2b03a2df).
         // The gate step's `completed_at` is one end of the dock-queue-time
@@ -1343,7 +1833,7 @@ impl Handler for JobsAutoPark {
         // a builder opened. Each is the evidence through the step merge
         // door, THEN a status-only PUT — a PUT carrying metadata replaces
         // the step's stored keys wholesale (backlog e39a9d2a).
-        for w in car::finish_writes(
+        let writes = car::finish_writes(
             &car,
             &inputs.summary,
             &inputs.excludes,
@@ -1352,24 +1842,23 @@ impl Handler for JobsAutoPark {
             &inputs.receipt,
             now,
         )
-        .map_err(HandlerError::Downstream)?
+        .map_err(HandlerError::Downstream)?;
+        if self
+            .finish_steps(car_id, writes, &gate_expect, ev.job_id, &ctx.rule_name)
+            .await?
+            == Judged::Moved
         {
-            write_json(
-                &self.client,
-                reqwest::Method::PATCH,
-                &format!("{}{}", self.base(), w.merge_path(car_id)),
-                &w.metadata,
-                &ctx.rule_name,
-            )
-            .await?;
-            write_json(
-                &self.client,
-                reqwest::Method::PUT,
-                &format!("{}{}", self.base(), w.status_path(car_id)),
-                &w.status_body,
-                &ctx.rule_name,
-            )
-            .await?;
+            return self
+                .green_held_elsewhere(
+                    ev.job_id,
+                    &format!(
+                        "car {}'s gate step changed hands after this green judged it — a \
+                         newer gate-run holds it, and the gate writes landed on nothing",
+                        &car_id[..8.min(car_id.len())]
+                    ),
+                    &ctx.rule_name,
+                )
+                .await;
         }
 
         // THE CAR IS THE ITEM'S BUILD — say so on the item, last, so a
@@ -1991,16 +2480,21 @@ mod tests {
         assert_eq!(blank.boards_after, None);
     }
 
-    /// An event-bound car records the event; a car with no proof
-    /// intent records nothing (no `proof_probe: null` for a reader to
-    /// trip on).
+    /// An event-bound car records the event and no probe key; a park
+    /// with NO proof intent is REFUSED (backlog 031a3ca9). This test
+    /// pinned the opposite until 2026-11-15 — the plain intent parked,
+    /// and the car carried no proof key at all, which is how 65 of 81
+    /// landed cars owed a proof came to carry nothing that could settle
+    /// it. On a car that already carries its probe (the dock's own
+    /// re-gate stamps only a summary) the same bare intent is a refresh.
     #[test]
-    fn an_event_bound_or_unprobed_car_records_exactly_what_it_was_given() {
+    fn an_event_bound_car_records_its_event_and_an_unprobed_park_is_refused() {
         let gr = gate_run(json!({
             "park_summary": "s", "park_excludes": "e", "park_test": "t", "park_verified": "v",
             "park_proof_event": "event-bound — needs a stalled train",
         }));
         let got = auto_park_inputs(&gr, &green_step_meta()).expect("parks");
+        assert_eq!(unproven_refusal(None, &got), None);
         let md = car_body_with_proof(&got, "emp-owner")["metadata"].clone();
         assert_eq!(md[car::PROOF_EVENT], "event-bound — needs a stalled train");
         assert!(md.get(car::PROOF_PROBE).is_none());
@@ -2008,12 +2502,21 @@ mod tests {
         let plain = gate_run(json!({
             "park_summary": "s", "park_excludes": "e", "park_test": "t", "park_verified": "v",
         }));
-        let got = auto_park_inputs(&plain, &green_step_meta()).expect("parks");
+        let got = auto_park_inputs(&plain, &green_step_meta()).expect("reads the intent");
         assert!(got.proof.is_empty());
-        let md = car_body_with_proof(&got, "emp-owner")["metadata"].clone();
-        for k in [car::PROOF_PROBE, car::PROOF_EXPECT, car::PROOF_EVENT] {
-            assert!(md.get(k).is_none(), "{k} must be absent, not null");
-        }
+        let why = unproven_refusal(None, &got).expect("no car is filed without a proof");
+        assert!(why.contains("fix/x"), "the refusal names the branch: {why}");
+        assert!(why.contains(car::UNPROVEN_PARK), "{why}");
+
+        let probed_car =
+            json!({"metadata": {car::PROOF_PROBE: "echo ok", car::PROOF_EXPECT: "ok"}});
+        assert_eq!(
+            unproven_refusal(Some(&probed_car), &got),
+            None,
+            "a bare re-gate of a probed car refreshes it"
+        );
+        let bare_car = json!({"metadata": {"branch": "fix/x"}});
+        assert!(unproven_refusal(Some(&bare_car), &got).is_some());
     }
 
     /// THE PARTIAL EDGE RIDES ONTO THE CAR, AND THE CLOSING KEY DOES
@@ -2293,7 +2796,7 @@ mod twin_tests {
     #[test]
     fn a_boarded_car_is_never_twinned() {
         let open = vec![boarded()];
-        match park_action(&open, &open, BRANCH) {
+        match park_action(&open, &open, BRANCH, false) {
             ParkAction::Skip(patch) => {
                 assert_eq!(patch["park_skipped"], "boarded");
                 let note = patch["park_skipped_note"].as_str().unwrap();
@@ -2311,7 +2814,7 @@ mod twin_tests {
     #[test]
     fn a_parked_car_is_refreshed_never_duplicated() {
         let open = vec![parked()];
-        match park_action(&open, &open, BRANCH) {
+        match park_action(&open, &open, BRANCH, false) {
             ParkAction::Refresh(car) => {
                 assert_eq!(car["id"], "ad54e95c-b48a-4a4c-87f8-7aa8e4e19eff")
             }
@@ -2321,17 +2824,20 @@ mod twin_tests {
         // 20:31:20 state — the answer is still never `File`.
         let both = vec![parked(), boarded()];
         assert!(
-            !matches!(park_action(&both, &both, BRANCH), ParkAction::File),
+            !matches!(park_action(&both, &both, BRANCH, false), ParkAction::File),
             "a branch with any live car never files a second one"
         );
     }
 
     #[test]
     fn a_branch_with_no_car_files_one() {
-        assert!(matches!(park_action(&[], &[], BRANCH), ParkAction::File));
+        assert!(matches!(
+            park_action(&[], &[], BRANCH, false),
+            ParkAction::File
+        ));
         let elsewhere = vec![boarded()];
         assert!(matches!(
-            park_action(&elsewhere, &elsewhere, "feat/other"),
+            park_action(&elsewhere, &elsewhere, "feat/other", false),
             ParkAction::File
         ));
     }
@@ -2353,7 +2859,7 @@ mod twin_tests {
             ]
         });
         let all = vec![landed];
-        match park_action(&all, &all, BRANCH) {
+        match park_action(&all, &all, BRANCH, false) {
             ParkAction::Skip(patch) => {
                 assert_eq!(patch["park_skipped"], "landed");
                 assert!(
@@ -2436,7 +2942,7 @@ mod a_moved_head_tests {
     #[test]
     fn a_parked_car_whose_head_moved_is_refreshed_not_twinned() {
         let page = [someone_elses_car(), rerailed_parked_car()];
-        match park_action(&page, &page, BRANCH) {
+        match park_action(&page, &page, BRANCH, false) {
             ParkAction::Refresh(car) => assert_eq!(
                 car["id"], "538775dd-64ee-4897-b9d6-b49137eb6512",
                 "the moved-head car at the dock is the one refreshed"
@@ -2463,7 +2969,7 @@ mod a_moved_head_tests {
         );
         assert!(
             matches!(
-                park_action(&subject_keyed, &subject_keyed, BRANCH),
+                park_action(&subject_keyed, &subject_keyed, BRANCH, false),
                 ParkAction::File
             ),
             "the subject-narrowed page files a twin — which is what happened at 21:53"
@@ -2725,12 +3231,280 @@ mod building_car_tests {
         })
     }
 
+    /// A car `boss dispatch --started` admitted and `boss gate` moved
+    /// into its gate: build completed at launch, gate ACTIVE and held by
+    /// the gate-run (backlog 68a8726e).
+    fn at_gate(gate_run: &str) -> Value {
+        let mut c = building();
+        c["metadata"][car::ADMITTED_BY] = json!("boss dispatch --started");
+        c["steps"][2]["status"] = json!("completed");
+        c["steps"][3]["status"] = json!("active");
+        c["steps"][3]["metadata"] = json!({ car::GATE_RUN: gate_run });
+        c
+    }
+
+    /// THE GREEN FINISHES THE CAR IN THE GATE — one car at review, no
+    /// twin (backlog 68a8726e). A car whose gate step is ACTIVE is still
+    /// the branch's building car, so the decision is Adopt, and the only
+    /// write the green owes it is the gate step itself.
+    #[test]
+    fn a_green_adopts_the_car_standing_at_its_gate() {
+        let open = [at_gate("gr-1")];
+        let adopted = match park_action(&open, &open, BRANCH, false) {
+            ParkAction::Adopt(c) => c,
+            other => panic!("the car in the gate is finished, not twinned: {other:?}"),
+        };
+        let receipt = Receipt {
+            raw: "{}".into(),
+            head: "deadbeef".into(),
+            mode: "full".into(),
+        };
+        let writes =
+            car::finish_writes(adopted, "s", "e", "t", "v", &receipt, chrono::Utc::now()).unwrap();
+        assert_eq!(
+            writes
+                .iter()
+                .map(|w| w.step_id.as_str())
+                .collect::<Vec<_>>(),
+            ["s-gate"],
+            "build was handed in at launch; the green completes the gate alone"
+        );
+    }
+
+    /// AUTO-PARK IS A NO-OP FOR A GATE-RUN THAT CARRIES AN EDGE (design
+    /// 689d1f7f car 2, backlog a3a367e4). Its verdict finishes the step
+    /// the edge names, so the scan never adopts, refreshes or files for
+    /// it — whatever the dock holds — and the edge path and an Adopt
+    /// cannot both finish one gate. Without the edge — an old dispatcher
+    /// reading an edged gate-run, which ignores the key — the same car
+    /// is still Adopted: the edge is additive at the cutover.
+    #[test]
+    fn an_edged_gate_run_is_never_adopted_refreshed_or_filed_by_the_scan() {
+        let open = [at_gate("gr-1")];
+        for (cars, what) in [(&open[..], "a car at its gate"), (&[][..], "no car at all")] {
+            match park_action(cars, cars, BRANCH, true) {
+                ParkAction::Skip(patch) => {
+                    assert_eq!(patch["park_skipped"], "finished-by-its-verdict", "{what}")
+                }
+                other => panic!("{what}: an edged gate-run is the verdict's: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            park_action(&open, &open, BRANCH, false),
+            ParkAction::Adopt(_)
+        ));
+    }
+
+    /// THE GREEN FOLLOWS THE EDGE AND READS NO DOCK. A stub whose open-
+    /// and closed-car listings answer 500: a green that scanned would
+    /// fail, so passing proves the edge path reads only the gate-run and
+    /// the one car it names — and writes only that car.
+    #[tokio::test]
+    async fn a_green_with_an_edge_reads_the_car_it_names_and_no_listing() {
+        use axum::{
+            Json, Router,
+            extract::Request,
+            http::{Method, StatusCode},
+            response::IntoResponse,
+        };
+        const G1: &str = "1a1d2e3f-4a5b-4c6d-8e7f-0000000000e1";
+        let car_id = "be025b44-0000-0000-0000-000000000000";
+        let mut held = at_gate(G1);
+        held["steps"][3]["metadata"]["gated_head"] = json!("1111111aaaa");
+        let gate_run = json!({
+            "id": G1, "kind": "gate-run",
+            "metadata": {
+                "branch": BRANCH, "sha": "1111111aaaa",
+                "park_summary": "s", "park_excludes": "e", "park_test": "t",
+                "park_verified": "v",
+                "park_probe": "echo ok", "park_expect": "ok",
+                "park_partial_item": "b8e75382-0000-0000-0000-000000000000",
+                boss_jobs::fulfils::KEY: {"job": car_id, "step": "s-gate"},
+            },
+        });
+        type Writes = Arc<std::sync::Mutex<Vec<(String, String, Value)>>>;
+        let writes: Writes = Arc::default();
+        let retained = writes.clone();
+        let app = Router::new().fallback(move |request: Request| {
+            let (held, gate_run, writes) = (held.clone(), gate_run.clone(), retained.clone());
+            async move {
+                let method = request.method().clone();
+                let path = request.uri().path().to_string();
+                if method == Method::GET {
+                    return if path == format!("/api/jobs/{G1}") {
+                        Json(gate_run).into_response()
+                    } else if path == format!("/api/jobs/{car_id}") {
+                        Json(held).into_response()
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    };
+                }
+                let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                writes
+                    .lock()
+                    .unwrap()
+                    .push((method.to_string(), path, body));
+                StatusCode::NO_CONTENT.into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let handler = JobsAutoPark::new(
+            base,
+            Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
+        );
+        let receipt = r#"{"verdict":"green","head":"1111111aaaa","mode":"full"}"#;
+        let ctx = InvocationContext {
+            rule_name: "auto-park-on-gate-green".into(),
+            triggering_event_id: "evt-edge-green".into(),
+            triggering_topic: "step.done.gate-verdict".into(),
+            event_timestamp: Some(chrono::Utc::now()),
+            event_payload: json!({"job_id": G1, "step_id": "verdict", "kind": "gate-verdict",
+                "metadata": {"verdict": "green", "receipt": receipt}}),
+        };
+        let result = handler.invoke(&[], &ctx).await;
+        server.abort();
+        result.expect("the edge path reads no listing");
+        let writes = writes.lock().unwrap().clone();
+        assert!(
+            writes
+                .iter()
+                .all(|(_, path, _)| path.starts_with(&format!("/api/jobs/{car_id}"))),
+            "only the car the edge names is written: {writes:#?}"
+        );
+        assert_eq!(
+            writes
+                .last()
+                .map(|(m, p, b)| (m.as_str(), p.as_str(), b.clone())),
+            Some((
+                "PUT",
+                format!("/api/jobs/{car_id}/steps/s-gate").as_str(),
+                json!({"status": "completed"})
+            )),
+            "{writes:#?}"
+        );
+    }
+
+    /// An ADMITTED car was scoped before its builder wrote the boundary,
+    /// so the green carries the builder's summary and excludes onto it.
+    /// A car a builder opened by hand already has them, and keeps them.
+    #[test]
+    fn an_admitted_car_takes_its_builders_boundary_at_green() {
+        let inputs = AutoParkInputs {
+            branch: BRANCH.to_string(),
+            summary: "what it does".into(),
+            excludes: "what it leaves out".into(),
+            test: "t".into(),
+            verified: "v".into(),
+            backlog_item: None,
+            item_provenance: serde_json::Map::new(),
+            boards_after: None,
+            delivery_channel: None,
+            receipt: Receipt {
+                raw: "{}".into(),
+                head: "deadbeef".into(),
+                mode: "full".into(),
+            },
+            proof: serde_json::Map::new(),
+            flake: serde_json::Map::new(),
+            agent_run: serde_json::Map::new(),
+            tiers: serde_json::Map::new(),
+            waits_on: None,
+            hold: None,
+            hold_bound: true,
+        };
+        let patch = adopt_patch(&at_gate("gr-1"), &inputs);
+        assert_eq!(patch["summary"], "what it does");
+        assert_eq!(patch["excludes"], "what it leaves out");
+        let opened = adopt_patch(&building(), &inputs);
+        assert!(opened.get("summary").is_none(), "{opened:#}");
+    }
+
+    /// A RED HANDS THE GATE BACK (backlog 68a8726e), through the
+    /// handler's own invoke: the car whose gate step this gate-run holds
+    /// gets the verdict merged onto that step and is PUT back to ready —
+    /// nothing is filed, and a car another gate-run holds is untouched.
+    #[tokio::test]
+    async fn a_red_verdict_hands_back_only_the_gate_its_run_holds() {
+        use axum::{
+            Json, Router,
+            extract::Request,
+            http::{Method, StatusCode},
+            response::IntoResponse,
+        };
+        let mut other = at_gate("gr-other");
+        other["id"] = json!("other-car");
+        let cars = json!({"data": [at_gate("gr-red"), other], "total": 2});
+        type Writes = Arc<std::sync::Mutex<Vec<(String, String, Value)>>>;
+        let writes: Writes = Arc::default();
+        let retained = writes.clone();
+        let app = Router::new().fallback(move |request: Request| {
+            let (cars, writes) = (cars.clone(), retained.clone());
+            async move {
+                let method = request.method().clone();
+                let path = request.uri().path().to_string();
+                if method == Method::GET {
+                    return Json(cars).into_response();
+                }
+                let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                writes
+                    .lock()
+                    .unwrap()
+                    .push((method.to_string(), path, body));
+                StatusCode::NO_CONTENT.into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let handler = JobsAutoPark::new(
+            base,
+            Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
+        );
+        let ctx = InvocationContext {
+            rule_name: "auto-park-on-gate-green".into(),
+            triggering_event_id: "evt-red".into(),
+            triggering_topic: "step.done.gate-verdict".into(),
+            event_timestamp: None,
+            event_payload: json!({"job_id": "gr-red", "step_id": "verdict",
+                "kind": "gate-verdict", "metadata": {"verdict": "failed"}}),
+        };
+        let result = handler.invoke(&[], &ctx).await;
+        server.abort();
+        result.unwrap();
+        let writes = writes.lock().unwrap().clone();
+        let car_id = "be025b44-0000-0000-0000-000000000000";
+        assert_eq!(
+            writes,
+            vec![
+                (
+                    "PATCH".to_string(),
+                    format!("/api/jobs/{car_id}/steps/s-gate/metadata"),
+                    json!({car::LAST_VERDICT: {car::GATE_RUN: "gr-red", "verdict": "failed"}}),
+                ),
+                (
+                    "PUT".to_string(),
+                    format!("/api/jobs/{car_id}/steps/s-gate"),
+                    json!({"status": "ready"}),
+                ),
+            ],
+            "the held car's gate goes back to ready; nothing is filed, the other car is left"
+        );
+    }
+
     /// THE CAR THIS CAR EXISTS FOR. A green whose branch already has a
     /// building car ADOPTS it — it does not file a second.
     #[test]
     fn a_green_adopts_the_car_the_builder_opened() {
         let open = [building()];
-        match park_action(&open, &open, BRANCH) {
+        match park_action(&open, &open, BRANCH, false) {
             ParkAction::Adopt(car) => {
                 assert_eq!(car["id"], "be025b44-0000-0000-0000-000000000000")
             }
@@ -3205,14 +3979,17 @@ mod building_car_tests {
         boarded["steps"][4]["status"] = json!("ready");
         let open = [building(), boarded];
         assert!(
-            matches!(park_action(&open, &open, BRANCH), ParkAction::Skip(_)),
+            matches!(
+                park_action(&open, &open, BRANCH, false),
+                ParkAction::Skip(_)
+            ),
             "a branch in transit is still skipped"
         );
 
         let mut landed = building();
         landed["metadata"]["merged"] = json!("true");
         let all = [landed];
-        match park_action(&all, &all, BRANCH) {
+        match park_action(&all, &all, BRANCH, false) {
             ParkAction::Skip(p) => assert_eq!(p["park_skipped"], "landed"),
             other => panic!("a landed branch records the landing: {other:?}"),
         }
@@ -3226,7 +4003,7 @@ mod building_car_tests {
         let mut rerailed = building();
         rerailed["metadata"]["branch"] = json!("feat/rerailed");
         let open = [rerailed];
-        match park_action(&open, &open, "feat/rerailed") {
+        match park_action(&open, &open, "feat/rerailed", false) {
             ParkAction::Adopt(c) => {
                 assert_eq!(c["id"], "be025b44-0000-0000-0000-000000000000");
                 assert_eq!(
@@ -3333,6 +4110,36 @@ mod no_data_array_tests {
         );
         assert_refused_by_name(res, "the landed-car read");
     }
+
+    /// END TO END: a green whose park stated neither a probe nor an
+    /// event files NO car, and says why loudly — a permanent error,
+    /// whose dead-letter lands on the gate-run (backlog 031a3ca9).
+    #[tokio::test]
+    async fn a_green_whose_park_states_no_proof_files_no_car() {
+        let stub = serve(vec![
+            (
+                "/api/jobs/0c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f",
+                green_gate_run(),
+            ),
+            ("/api/jobs?status=open", empty_listing()),
+            ("/api/jobs?status=closed", empty_listing()),
+        ])
+        .await;
+        let res = handler(stub.base.clone())
+            .invoke(&[], &green_verdict())
+            .await;
+        assert_eq!(
+            stub.writes(),
+            Vec::<String>::new(),
+            "no unprovable car filed"
+        );
+        match res {
+            Err(HandlerError::Permanent(why)) => {
+                assert!(why.contains(car::UNPROVEN_PARK), "{why}")
+            }
+            other => panic!("an unprobed park must be refused, got {other:?}"),
+        }
+    }
 }
 
 /// A GATE THAT CARRIES PARK INTENT AND A HOLD FILES A HELD CAR (backlog
@@ -3363,6 +4170,7 @@ mod held_park_tests {
                 "park_excludes": "not that",
                 "park_test": "ran it",
                 "park_verified": "seen",
+                "park_probe": "echo ok", "park_expect": "ok",
                 "park_partial_item": "b8e75382-0000-0000-0000-000000000000",
                 "hold": REASON,
             },
@@ -3410,14 +4218,14 @@ mod held_park_tests {
     #[test]
     fn the_hold_lands_on_the_review_step_in_the_shape_every_reader_reads() {
         let inputs = auto_park_inputs(&held_gate_run(), &green_meta()).unwrap();
-        let (path, body) = hold_write(&fresh_car(), &inputs)
+        let (path, body, judged) = hold_write(&fresh_car(), &inputs)
             .expect("a pending review takes the hold")
             .expect("a held gate owes the car its hold");
         assert_eq!(path, "/api/jobs/stub-created/steps/s-review/metadata");
         // Read back by the ONE definition of the marker — the function the
         // conductor's `parked_ready`, the dock row and orient all call.
         assert_eq!(
-            boss_jobs::stranded::hold_reason(&body).as_deref(),
+            boss_jobs::stranded::marked(&body, "hold").as_deref(),
             Some(REASON)
         );
         assert_eq!(
@@ -3425,6 +4233,7 @@ mod held_park_tests {
             json!({ "hold": REASON, car::HOLD_SHA: inputs.receipt.head }),
             "the head the hold was judged at rides in the same write (b7b02024)"
         );
+        assert_eq!(judged, None, "a gate's own bound hold names its own head");
         assert!(
             !inputs.receipt.head.is_empty(),
             "the fixture's receipt names a head"
@@ -3433,6 +4242,14 @@ mod held_park_tests {
         let mut parked = fresh_car();
         parked["steps"][3]["status"] = json!("ready");
         assert!(hold_write(&parked, &inputs).unwrap().is_some());
+        // afc5147c: a green refresh must move an existing hold, too.
+        parked["steps"][3]["metadata"] = json!({"hold":"old reason", car::HOLD_SHA:"old-head"});
+        let (_, refreshed, _) = hold_write(&parked, &inputs).unwrap().unwrap();
+        parked["steps"][3]["metadata"] = refreshed;
+        assert_eq!(
+            boss_jobs::car_release::hold_sha(&parked),
+            Some(inputs.receipt.head.as_str())
+        );
     }
 
     /// A gate whose hold is only an UNREAD diff (no --hold, the judge
@@ -3445,8 +4262,9 @@ mod held_park_tests {
         gr["metadata"][car::HOLD_UNBOUND] = json!(true);
         let inputs = auto_park_inputs(&gr, &green_meta()).unwrap();
         assert!(!inputs.hold_bound);
-        let (_, body) = hold_write(&fresh_car(), &inputs).unwrap().unwrap();
+        let (_, body, judged) = hold_write(&fresh_car(), &inputs).unwrap().unwrap();
         assert_eq!(body, json!({ "hold": REASON }));
+        assert_eq!(judged, None, "nothing to carry, so nothing judged");
         // Over a car already released at the dock, it deletes the head
         // that release lifted rather than leave it to read as this
         // hold's (backlog 6c463c66).
@@ -3454,7 +4272,7 @@ mod held_park_tests {
         released["steps"][3]["status"] = json!("ready");
         released["steps"][3]["metadata"] =
             json!({ car::HOLD_SHA: "1111", car::RELEASE: {"sha": "1111"} });
-        let (_, body) = hold_write(&released, &inputs).unwrap().unwrap();
+        let (_, body, _) = hold_write(&released, &inputs).unwrap().unwrap();
         assert_eq!(body, json!({ "hold": REASON, car::HOLD_SHA: null }));
         // The mark absent, or false: a review hold, bound.
         gr["metadata"][car::HOLD_UNBOUND] = json!(false);
@@ -3478,6 +4296,68 @@ mod held_park_tests {
             let inputs = auto_park_inputs(&gr, &green_meta()).unwrap();
             assert_eq!(hold_write(&fresh_car(), &inputs), Ok(None));
         }
+    }
+
+    /// A REFRESH THAT MOVES THE CAR'S HEAD MOVES ITS HOLD'S HEAD (backlog
+    /// 6b12a70f) — the same sequence `boss rerail --finish` is pinned on
+    /// (`a_refresh_carries_the_review_hold_to_the_head_it_refreshed`),
+    /// through this path's `ParkAction::Refresh`. Car eb86ac0c, released
+    /// at R, held by the conductor's re-judge for a review of A, is
+    /// refreshed by an UNHELD green at B. The hold stays, and names B, so
+    /// the review of B releases it at the head the hold names (the yard's
+    /// and the release rule's head-less ask).
+    #[test]
+    fn an_unheld_refresh_carries_the_review_hold_to_the_head_it_refreshed() {
+        let mut gr = held_gate_run();
+        gr["metadata"].as_object_mut().unwrap().remove("hold");
+        let inputs = auto_park_inputs(&gr, &green_meta()).unwrap();
+        let b = inputs.receipt.head.clone();
+        let reason = "conductor re-judge at 299433653fb1: released at 2b1591c1983f, head is \
+                      299433653fb1: waits for a review of this head";
+        let mut parked = fresh_car();
+        parked["steps"][3]["status"] = json!("ready");
+        parked["steps"][3]["metadata"] = json!({
+            "hold": reason,
+            car::HOLD_SHA: "299433653fb1",
+            car::RELEASE: { "sha": "2b1591c1983f", "review": "2c4bad6a" },
+        });
+        let run = json!({
+            "id": "7cb2438c-0000-4000-8000-000000000000",
+            "kind": "agent-run",
+            "metadata": { "review": { "car": "stub-created", "verdict": "release",
+                                      "reviewed_sha": b } },
+        });
+        let stale = boss_jobs::car_release::hold_sha(&parked).unwrap();
+        assert!(boss_jobs::car_release::vouches(&run, &parked, stale).is_err());
+        let (path, body, judged) = hold_write(&parked, &inputs)
+            .unwrap()
+            .expect("a refresh that moves the car's head moves the hold's head");
+        assert_eq!(path, "/api/jobs/stub-created/steps/s-review/metadata");
+        assert_eq!(
+            body,
+            json!({ car::HOLD_SHA: b }),
+            "the head alone: the hold's reason is not rewritten"
+        );
+        assert_eq!(
+            judged,
+            Some(car::hold_as_judged(&parked["steps"][3]["metadata"])),
+            "the head moves only on the hold it read (backlog cd1f68c6)"
+        );
+        let md = parked["steps"][3]["metadata"].as_object_mut().unwrap();
+        md.extend(body.as_object().unwrap().clone());
+        assert_eq!(boss_jobs::car_release::hold_sha(&parked), Some(b.as_str()));
+        assert_eq!(
+            boss_jobs::stranded::marked(&parked["steps"][3]["metadata"], "hold").as_deref(),
+            Some(reason)
+        );
+        boss_jobs::car_release::vouches(&run, &parked, &b)
+            .expect("the review of B releases the car refreshed to B");
+        // Already at B: nothing to move.
+        assert_eq!(hold_write(&parked, &inputs), Ok(None));
+        // A hold bound to no head (a hand hold, a red-train hold) binds
+        // none on a refresh either: it is not a review's.
+        parked["steps"][3]["metadata"] = json!({ "hold": "David only" });
+        assert_eq!(hold_write(&parked, &inputs), Ok(None));
     }
 
     /// A held gate whose car has no open review cannot be held, and must
@@ -3631,5 +4511,1130 @@ mod held_park_tests {
             "nothing filed: {:?}",
             dark.writes()
         );
+    }
+
+    // -- the refresh writes only on the hold it judged (cd1f68c6) -------
+    //
+    // The REAL jobs router over an in-memory store on a local socket, so
+    // the judgement is enforced by the merge door itself, not by a stub
+    // that answers the way it is hoped to. The handler judges the car it
+    // READ; a concurrent writer moves the review step after that read and
+    // before the write — Codex's injection (review 5d605949) — and the
+    // write must be refused and land nothing.
+
+    const HELD_AT: &str = "299433653fb1";
+    const REVIEW_HOLD: &str = "conductor re-judge at 299433653fb1 — waits for a review of this \
+                               head (backlog b7b02024)";
+
+    /// The car as the handler read it (the judged snapshot), and the
+    /// store it lives in, served.
+    async fn held_car_served() -> (
+        String,
+        Arc<boss_jobs::InMemoryJobs>,
+        Value,
+        boss_core::job::StepId,
+    ) {
+        use boss_jobs::JobsRepository as _;
+        use boss_policy_client::{Action, FakePolicyClient, PolicyClient, Resource, Scope};
+        let jobs = Arc::new(boss_jobs::InMemoryJobs::new());
+        let mut job = boss_core::job::Job::new(
+            "ship-a-change",
+            boss_core::job::Subject::new("custom", "fix/x"),
+            "A held car",
+            "emp-owner",
+            boss_core::job::Priority::Standard,
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 5).unwrap(),
+        );
+        job.status = boss_core::job::JobStatus::Open;
+        jobs.create_job(&job).await.unwrap();
+        let review_md = held_car_metadata();
+        let mut step = boss_core::job::Step::new(job.id, "task", car::REVIEW, 4);
+        step.spec_slug = Some(car::REVIEW_SLUG.into());
+        step.status = boss_core::job::StepStatus::Ready;
+        step.metadata = review_md.clone();
+        jobs.add_step(&step).await.unwrap();
+        let mut policy = FakePolicyClient::builder();
+        for (action, resource) in [
+            (Action::Read, Resource::job()),
+            (Action::Update, Resource::job()),
+            (Action::Update, Resource::step()),
+        ] {
+            policy = policy.allow("platform-admin", action, resource, Scope::All);
+        }
+        let policy: Arc<dyn PolicyClient> = Arc::new(policy.build());
+        let bus = boss_testing::RecordingEventBus::new();
+        let bus_dyn: Arc<dyn boss_core::port::EventBus> = bus.clone();
+        let app = boss_jobs::http::router(boss_jobs::http::JobsApiState::minimal(
+            jobs.clone(),
+            bus,
+            boss_core::publisher::DomainPublisher::new(bus_dyn, "jobs"),
+            policy,
+            Arc::new(boss_clock_client::WallClockClient),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let judged = json!({
+            "id": job.id.to_string(),
+            "kind": "ship-a-change",
+            "status": "open",
+            "metadata": { "branch": "fix/x" },
+            "steps": [{ "id": step.id.to_string(), "spec_slug": car::REVIEW_SLUG,
+                        "title": car::REVIEW, "status": "ready", "metadata": review_md }],
+        });
+        (base, jobs, judged, step.id)
+    }
+
+    /// Refresh the judged car through `hold_car` after `concurrent` lands
+    /// on its review step (if any); the handler's answer and the review
+    /// step's metadata as it then stands.
+    async fn refresh_after(
+        concurrent: Option<Value>,
+        inputs: &AutoParkInputs,
+    ) -> (Result<(), HandlerError>, Value) {
+        use boss_jobs::JobsRepository as _;
+        let (base, jobs, judged, step_id) = held_car_served().await;
+        if let Some(Value::Object(write)) = concurrent {
+            jobs.merge_step_metadata_at(
+                &step_id,
+                &write,
+                &boss_core::publisher::EventStamp::new(
+                    "jobs",
+                    boss_core::actor::ActorId::Automation("concurrent".into()),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        let handler = JobsAutoPark::new(
+            base,
+            Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
+        );
+        let answer = handler.hold_car(&judged, inputs, "jobs.auto-park").await;
+        let md = jobs.get_step(&step_id).await.unwrap().unwrap().metadata;
+        (answer, md)
+    }
+
+    fn unheld_refresh() -> AutoParkInputs {
+        let mut gr = held_gate_run();
+        gr["metadata"].as_object_mut().unwrap().remove("hold");
+        auto_park_inputs(&gr, &green_meta()).unwrap()
+    }
+
+    fn unbound_refresh() -> AutoParkInputs {
+        let mut gr = held_gate_run();
+        gr["metadata"][car::HOLD_UNBOUND] = json!(true);
+        auto_park_inputs(&gr, &green_meta()).unwrap()
+    }
+
+    /// The control: nothing moved since the read, so the hold follows the
+    /// refresh to its head (backlog 6b12a70f), through both writers.
+    #[tokio::test]
+    async fn a_refresh_on_the_hold_it_judged_carries_it_to_the_new_head() {
+        let (answer, md) = refresh_after(None, &unheld_refresh()).await;
+        answer.expect("the row reads as judged");
+        assert_eq!(md[car::HOLD_SHA], "deadbeef");
+        assert_eq!(md["hold"], REVIEW_HOLD, "the reason stands");
+        let (answer, md) = refresh_after(None, &unbound_refresh()).await;
+        answer.expect("the row reads as judged");
+        assert_eq!(md[car::HOLD_SHA], "deadbeef");
+        assert_eq!(md["hold"], REASON);
+    }
+
+    /// An unheld refresh (the `hold_follows_head` write alone) whose hold
+    /// was released, or replaced by a person's, after it was read: the
+    /// refresh is refused in words and nothing is written, so no
+    /// `hold_sha` is left beside no hold and no person's hold is bound to
+    /// a head a reviewer could release.
+    #[tokio::test]
+    async fn an_unheld_refresh_does_not_rebind_a_hold_that_moved_after_its_read() {
+        for concurrent in [
+            json!({ "hold": null, car::RELEASE: { "sha": HELD_AT, "review": "7cb2438c" } }),
+            json!({ "hold": "David reads this one first" }),
+        ] {
+            let mut expected = held_car_metadata();
+            expected
+                .as_object_mut()
+                .unwrap()
+                .extend(concurrent.as_object().unwrap().clone());
+            expected
+                .as_object_mut()
+                .unwrap()
+                .retain(|_, v| !v.is_null());
+            let (answer, md) = refresh_after(Some(concurrent.clone()), &unheld_refresh()).await;
+            let err = answer.expect_err("a hold that moved since the read is not carried");
+            assert!(!err.is_permanent(), "a redelivery judges again: {err}");
+            let said = err.to_string();
+            assert!(
+                said.contains("changed") && said.contains("nothing was written"),
+                "{said}"
+            );
+            assert_eq!(md, expected, "{concurrent}: nothing written");
+            assert_eq!(md[car::HOLD_SHA], HELD_AT);
+        }
+    }
+
+    /// The gate's unbound hold over a live review hold carries that hold's
+    /// head too (`hold_follows_head`, the second writer). A release that
+    /// lands between the read and the write must not have its lifted
+    /// hold re-bound to the new head: an unread diff's hold is a person's
+    /// to judge again, never a reviewer's to release.
+    #[tokio::test]
+    async fn an_unbound_refresh_does_not_bind_its_hold_over_a_release_it_did_not_read() {
+        let released =
+            json!({ "hold": null, car::RELEASE: { "sha": HELD_AT, "review": "7cb2438c" } });
+        let (answer, md) = refresh_after(Some(released), &unbound_refresh()).await;
+        let err = answer.expect_err("the release landed after the read");
+        assert!(err.to_string().contains("nothing was written"), "{err}");
+        assert!(md.get("hold").is_none(), "{md}");
+        assert_eq!(md[car::HOLD_SHA], HELD_AT, "{md}");
+    }
+
+    fn held_car_metadata() -> Value {
+        json!({
+            "hold": REVIEW_HOLD,
+            car::HOLD_SHA: HELD_AT,
+            car::RELEASE: { "sha": "2b1591c1983f", "review": "2c4bad6a" },
+        })
+    }
+}
+
+/// THE GATE STEP MOVES ONLY FOR THE GATE-RUN THAT HOLDS IT (Codex review
+/// of car 0d04ee3e, R2 and R3). Two gates on one branch: G1 launched,
+/// then G2 restamped the car's gate step to itself. Neither G1's green
+/// nor G1's red may move what G2 now holds — judged on the read, and
+/// again at every write, by the jobs API's own merge door and step PUT
+/// over a real router, so the judgement is the server's, not a stub's.
+#[cfg(test)]
+mod gate_binding_tests {
+    use super::*;
+    use boss_jobs::JobsRepository as _;
+
+    const G1: &str = "1a1d2e3f-4a5b-4c6d-8e7f-000000000001";
+    const G2: &str = "2a1d2e3f-4a5b-4c6d-8e7f-000000000002";
+    const H1: &str = "1111111aaaa";
+    const H2: &str = "2222222bbbb";
+    const BRANCH: &str = "feat/two-gates-one-car";
+
+    struct Served {
+        base: String,
+        jobs: Arc<boss_jobs::InMemoryJobs>,
+        car_id: String,
+        build: boss_core::job::StepId,
+        gate: boss_core::job::StepId,
+        armed: Armed,
+    }
+
+    /// A launch armed to land INSIDE a handler's `invoke`: once the served
+    /// router has answered the request `(method, path)` — and before that
+    /// answer reaches the handler — `merge` lands on the car's gate step,
+    /// as `boss gate`'s own restamp does. One-shot. It is how a test puts a
+    /// restamp between the read a verdict judged and the writes it sends
+    /// without driving those writes by hand (review 01fe1c71 of car
+    /// 3a7ab114: the edge path reaches the gate writes by its own route,
+    /// so only a test through `invoke` pins what that route carries).
+    type Armed = Arc<std::sync::Mutex<Option<(axum::http::Method, String, Value)>>>;
+
+    /// Arm `s`: after the router answers `method path`, `merge` lands on
+    /// the gate step.
+    fn arm(s: &Served, method: axum::http::Method, path: String, merge: Value) {
+        *s.armed.lock().unwrap() = Some((method, path, merge));
+    }
+
+    /// A car at its gate, ACTIVE and held by `holder` at `head`, in an
+    /// in-memory store behind the real jobs router.
+    async fn car_held_by(holder: &str, head: &str) -> Served {
+        car_with(
+            boss_core::job::StepStatus::Completed,
+            boss_core::job::StepStatus::Active,
+            json!({ car::GATE_RUN: holder, "gated_head": head }),
+        )
+        .await
+    }
+
+    /// A car still AT BUILD — build claimed, gate pending and UNBOUND:
+    /// the car `boss dispatch --started` admits, before any launch.
+    async fn car_at_build() -> Served {
+        car_with(
+            boss_core::job::StepStatus::Active,
+            boss_core::job::StepStatus::Pending,
+            json!({}),
+        )
+        .await
+    }
+
+    async fn car_with(
+        build_status: boss_core::job::StepStatus,
+        gate_status: boss_core::job::StepStatus,
+        gate_md: Value,
+    ) -> Served {
+        use boss_policy_client::{Action, FakePolicyClient, PolicyClient, Resource, Scope};
+        let jobs = Arc::new(boss_jobs::InMemoryJobs::new());
+        let mut job = boss_core::job::Job::new(
+            "ship-a-change",
+            boss_core::job::Subject::new("custom", BRANCH),
+            "A car at its gate",
+            "emp-owner",
+            boss_core::job::Priority::Standard,
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 9).unwrap(),
+        );
+        job.status = boss_core::job::JobStatus::Open;
+        job.metadata = json!({ "branch": BRANCH, car::ADMITTED_BY: "boss dispatch --started" });
+        jobs.create_job(&job).await.unwrap();
+        let mut scope = boss_core::job::Step::new(job.id, "task", car::SCOPE, 1);
+        scope.spec_slug = Some(car::SCOPE_SLUG.into());
+        scope.status = boss_core::job::StepStatus::Completed;
+        jobs.add_step(&scope).await.unwrap();
+        let mut build = boss_core::job::Step::new(job.id, "task", car::BUILD, 2);
+        build.spec_slug = Some(car::BUILD_SLUG.into());
+        build.status = build_status;
+        jobs.add_step(&build).await.unwrap();
+        let mut gate = boss_core::job::Step::new(job.id, "task", car::GATE, 3);
+        gate.spec_slug = Some(car::GATE_SLUG.into());
+        gate.status = gate_status;
+        gate.metadata = gate_md;
+        jobs.add_step(&gate).await.unwrap();
+        let mut policy = FakePolicyClient::builder();
+        for (action, resource) in [
+            (Action::Read, Resource::job()),
+            (Action::Update, Resource::job()),
+            (Action::Update, Resource::step()),
+        ] {
+            policy = policy.allow("platform-admin", action, resource, Scope::All);
+        }
+        let policy: Arc<dyn PolicyClient> = Arc::new(policy.build());
+        let bus = boss_testing::RecordingEventBus::new();
+        let bus_dyn: Arc<dyn boss_core::port::EventBus> = bus.clone();
+        let app = boss_jobs::http::router(boss_jobs::http::JobsApiState::minimal(
+            jobs.clone(),
+            bus,
+            boss_core::publisher::DomainPublisher::new(bus_dyn, "jobs"),
+            policy,
+            Arc::new(boss_clock_client::WallClockClient),
+        ));
+        let armed: Armed = Arc::default();
+        let app = {
+            let (armed, jobs, gate_id) = (armed.clone(), jobs.clone(), gate.id);
+            app.layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let (armed, jobs) = (armed.clone(), jobs.clone());
+                    async move {
+                        let fired = {
+                            let mut slot = armed.lock().unwrap();
+                            let hit = slot.as_ref().is_some_and(|(m, p, _)| {
+                                m == request.method() && p == request.uri().path()
+                            });
+                            if hit { slot.take() } else { None }
+                        };
+                        let answer = next.run(request).await;
+                        if let Some((_, _, merge)) = fired {
+                            jobs.merge_step_metadata_at(
+                                &gate_id,
+                                merge.as_object().unwrap(),
+                                &boss_core::publisher::EventStamp::new(
+                                    "jobs",
+                                    boss_core::actor::ActorId::Automation("boss-gate".into()),
+                                ),
+                            )
+                            .await
+                            .unwrap();
+                        }
+                        answer
+                    }
+                },
+            ))
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Served {
+            base,
+            jobs,
+            car_id: job.id.to_string(),
+            build: build.id,
+            gate: gate.id,
+            armed,
+        }
+    }
+
+    fn handler(base: &str) -> Arc<JobsAutoPark> {
+        JobsAutoPark::new(
+            base.to_string(),
+            Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
+        )
+    }
+
+    /// The car as a handler reads it: `GET /api/jobs/{id}`.
+    async fn read(s: &Served) -> Value {
+        get_json(
+            &handler(&s.base).client,
+            &format!("{}/api/jobs/{}", s.base, s.car_id),
+            "test",
+        )
+        .await
+        .unwrap()
+    }
+
+    /// G2's launch, landing between a handler's read and its write: the
+    /// step restamped to G2 and left ACTIVE — `boss gate`'s own merge.
+    async fn g2_launches(s: &Served) {
+        s.jobs
+            .merge_step_metadata_at(
+                &s.gate,
+                json!({ car::GATE_RUN: G2, "gated_head": H2 })
+                    .as_object()
+                    .unwrap(),
+                &boss_core::publisher::EventStamp::new(
+                    "jobs",
+                    boss_core::actor::ActorId::Automation("boss-gate".into()),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A step's status moved under the store's own version compare — the
+    /// launch's build completion and gate claim, as a test can drive them.
+    async fn set_status(
+        s: &Served,
+        id: &boss_core::job::StepId,
+        status: boss_core::job::StepStatus,
+    ) {
+        let (mut step, read) = s.jobs.get_step_versioned(id).await.unwrap().unwrap();
+        step.status = status;
+        s.jobs
+            .update_step_if_unchanged_at(&step, read, chrono::Utc::now(), &[])
+            .await
+            .unwrap();
+    }
+
+    async fn gate_step(s: &Served) -> boss_core::job::Step {
+        s.jobs.get_step(&s.gate).await.unwrap().unwrap()
+    }
+
+    fn held_by_g2_untouched(step: &boss_core::job::Step) {
+        assert_eq!(step.status, boss_core::job::StepStatus::Active, "{step:?}");
+        assert_eq!(step.metadata[car::GATE_RUN], G2, "{:?}", step.metadata);
+        assert!(
+            step.metadata.get(car::LAST_VERDICT).is_none(),
+            "{:?}",
+            step.metadata
+        );
+        assert!(
+            step.metadata.get("receipt").is_none(),
+            "{:?}",
+            step.metadata
+        );
+    }
+
+    /// R3, the first window: G2 restamps between G1's read and its MERGE.
+    #[tokio::test]
+    async fn a_red_does_not_hand_back_a_gate_restamped_before_its_merge() {
+        let s = car_held_by(G1, H1).await;
+        let judged = read(&s).await;
+        g2_launches(&s).await;
+        let h = handler(&s.base);
+        for w in car::gate_return(&judged, G1, "failed") {
+            if h.send_judged(&w, "test").await.unwrap() == Judged::Moved {
+                break;
+            }
+        }
+        held_by_g2_untouched(&gate_step(&s).await);
+    }
+
+    /// R3, the second window: G1's merge lands, THEN G2 restamps, THEN
+    /// G1's status PUT — refused, so G2's step stays ACTIVE.
+    #[tokio::test]
+    async fn a_red_does_not_hand_back_a_gate_restamped_between_its_writes() {
+        let s = car_held_by(G1, H1).await;
+        let judged = read(&s).await;
+        let writes = car::gate_return(&judged, G1, "failed");
+        assert_eq!(writes.len(), 2);
+        let h = handler(&s.base);
+        assert_eq!(
+            h.send_judged(&writes[0], "test").await.unwrap(),
+            Judged::Written
+        );
+        g2_launches(&s).await;
+        assert_eq!(
+            h.send_judged(&writes[1], "test").await.unwrap(),
+            Judged::Moved,
+            "the PUT is judged on the holder the merge was"
+        );
+        let step = gate_step(&s).await;
+        assert_eq!(step.status, boss_core::job::StepStatus::Active, "{step:?}");
+        assert_eq!(step.metadata[car::GATE_RUN], G2);
+    }
+
+    /// The control: nobody moved, so G1's red hands its own gate back.
+    #[tokio::test]
+    async fn a_red_hands_back_the_gate_it_still_holds() {
+        let s = car_held_by(G1, H1).await;
+        handler(&s.base)
+            .hand_gate_back(G1, "failed", "test")
+            .await
+            .unwrap();
+        let step = gate_step(&s).await;
+        assert_eq!(step.status, boss_core::job::StepStatus::Ready, "{step:?}");
+        assert_eq!(step.metadata[car::LAST_VERDICT][car::GATE_RUN], G1);
+    }
+
+    /// R2 at write time: G1's green judged the binding while G1 held the
+    /// step, then G2 launched before the gate writes. They land on
+    /// nothing; G2 still holds the step, with no receipt from G1.
+    #[tokio::test]
+    async fn a_green_judged_before_a_restamp_lands_nothing_on_the_gate() {
+        let s = car_held_by(G1, H1).await;
+        let judged = read(&s).await;
+        let expect = car::green_binding(&judged, G1, None, H1)
+            .expect("G1 holds the step when the green reads it");
+        let receipt = Receipt {
+            raw: format!("{{\"verdict\":\"green\",\"head\":\"{H1}\"}}"),
+            head: H1.into(),
+            mode: "full".into(),
+        };
+        let writes =
+            car::finish_writes(&judged, "s", "e", "t", "v", &receipt, chrono::Utc::now()).unwrap();
+        g2_launches(&s).await;
+        let landed = handler(&s.base)
+            .finish_steps(&s.car_id, writes, &expect, G1, "test")
+            .await
+            .unwrap();
+        assert_eq!(landed, Judged::Moved);
+        held_by_g2_untouched(&gate_step(&s).await);
+    }
+
+    /// R2 from UNBOUND (Codex review of car 0d04ee3e, round 2): G1's
+    /// green reads a car still at build — no gate-run binds its gate
+    /// step — then G2 launches (build completed, gate stamped G2 and
+    /// claimed) before either of G1's finishing writes. The binding G1
+    /// judged is ABSENCE, and its writes carry it: they land on nothing,
+    /// so G1 never completes G2's gate with G1's receipt.
+    #[tokio::test]
+    async fn a_green_that_read_an_unbound_gate_lands_nothing_once_another_run_binds_it() {
+        let s = car_at_build().await;
+        let expect = car::green_binding(&read(&s).await, G1, None, H1).unwrap();
+        assert_eq!(expect, car::unbound_gate(), "G1 read the gate unbound");
+        // G2's launch: build handed in, the gate stamped and claimed.
+        set_status(&s, &s.build, boss_core::job::StepStatus::Completed).await;
+        g2_launches(&s).await;
+        set_status(&s, &s.gate, boss_core::job::StepStatus::Active).await;
+        // G1's handler re-reads the full car before deciding its writes,
+        // as `invoke` does, and finds G2's ACTIVE gate to finish.
+        let receipt = Receipt {
+            raw: format!("{{\"verdict\":\"green\",\"head\":\"{H1}\"}}"),
+            head: H1.into(),
+            mode: "full".into(),
+        };
+        let writes = car::finish_writes(
+            &read(&s).await,
+            "s",
+            "e",
+            "t",
+            "v",
+            &receipt,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        assert!(writes.iter().any(|w| w.title == car::GATE), "{writes:?}");
+        let landed = handler(&s.base)
+            .finish_steps(&s.car_id, writes, &expect, G1, "test")
+            .await
+            .unwrap();
+        assert_eq!(landed, Judged::Moved);
+        held_by_g2_untouched(&gate_step(&s).await);
+    }
+
+    /// R2, both orderings Codex named. G1's green while G2 holds the step
+    /// is refused before any write; G2's red then hands G2's gate back.
+    /// And once G2's red has handed it back, a late G1 green is still not
+    /// G2's verdict and finishes nothing.
+    #[tokio::test]
+    async fn a_stale_green_never_finishes_a_gate_another_run_holds_in_either_order() {
+        let s = car_held_by(G2, H2).await;
+        let stale = car::green_binding(&read(&s).await, G1, None, H1).unwrap_err();
+        assert!(stale.contains("held by gate-run"), "{stale}");
+        held_by_g2_untouched(&gate_step(&s).await);
+
+        handler(&s.base)
+            .hand_gate_back(G2, "failed", "test")
+            .await
+            .unwrap();
+        let step = gate_step(&s).await;
+        assert_eq!(step.status, boss_core::job::StepStatus::Ready);
+        assert_eq!(step.metadata[car::LAST_VERDICT][car::GATE_RUN], G2);
+
+        assert!(car::green_binding(&read(&s).await, G1, None, H1).is_err());
+    }
+
+    /// A gate-run filed for `BRANCH` at `H1` with park intent, as the
+    /// conductor's lost-car relaunch files one when `relaunch_of` names
+    /// the lost run (`lost_gate::relaunch_marks`), else as a hand gate.
+    async fn gate_run_filed(s: &Served, id: &str, relaunch_of: Option<&str>) {
+        gate_run_filed_with(s, id, relaunch_of, json!({})).await
+    }
+
+    /// [`gate_run_filed`], with `extra` merged onto its metadata — the
+    /// `fulfils` edge a launch on a car writes (backlog a3a367e4).
+    async fn gate_run_filed_with(s: &Served, id: &str, relaunch_of: Option<&str>, extra: Value) {
+        let mut md = json!({
+            "branch": BRANCH, "sha": H1,
+            "park_summary": "s", "park_excludes": "e", "park_test": "t",
+            "park_verified": "v",
+            "park_probe": "echo ok", "park_expect": "ok",
+            "park_partial_item": "b8e75382-0000-0000-0000-000000000000",
+        });
+        if let Some(lost) = relaunch_of {
+            md[boss_jobs::lost_gate::RELAUNCH_OF] = json!(lost);
+        }
+        for (k, v) in extra.as_object().cloned().unwrap_or_default() {
+            md[k] = v;
+        }
+        let mut run = boss_core::job::Job::new(
+            "gate-run",
+            boss_core::job::Subject::new("custom", BRANCH),
+            "A gate-run",
+            "emp-owner",
+            boss_core::job::Priority::Standard,
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 10).unwrap(),
+        )
+        .with_id(boss_core::job::JobId::from_uuid(
+            uuid::Uuid::parse_str(id).unwrap(),
+        ));
+        run.status = boss_core::job::JobStatus::Open;
+        run.metadata = md;
+        s.jobs.create_job(&run).await.unwrap();
+    }
+
+    /// `gate_run`'s green verdict at `H1`, through the handler's own invoke.
+    async fn green_of(s: &Served, gate_run: &str) {
+        let receipt = format!("{{\"verdict\":\"green\",\"head\":\"{H1}\",\"mode\":\"full\"}}");
+        let ctx = InvocationContext {
+            rule_name: "auto-park-on-gate-green".into(),
+            triggering_event_id: format!("evt-{gate_run}-green"),
+            triggering_topic: "step.done.gate-verdict".into(),
+            event_timestamp: Some(chrono::Utc::now()),
+            event_payload: json!({"job_id": gate_run, "step_id": "verdict",
+                "kind": "gate-verdict",
+                "metadata": {"verdict": "green", "receipt": receipt}}),
+        };
+        handler(&s.base).invoke(&[], &ctx).await.unwrap();
+    }
+
+    /// `gate_run`'s NON-green verdict, through the handler's own invoke.
+    async fn verdict_of(s: &Served, gate_run: &str, verdict: &str) {
+        let ctx = InvocationContext {
+            rule_name: "auto-park-on-gate-green".into(),
+            triggering_event_id: format!("evt-{gate_run}-{verdict}"),
+            triggering_topic: "step.done.gate-verdict".into(),
+            event_timestamp: Some(chrono::Utc::now()),
+            event_payload: json!({"job_id": gate_run, "step_id": "verdict",
+                "kind": "gate-verdict", "metadata": {"verdict": verdict}}),
+        };
+        handler(&s.base).invoke(&[], &ctx).await.unwrap();
+    }
+
+    /// The R8 edge `boss gate` writes onto a gate-run it launched on
+    /// `s`'s car (`car::gate_edge`, backlog a3a367e4).
+    fn edge_to(s: &Served) -> Value {
+        boss_jobs::fulfils::Fulfils {
+            job: s.car_id.clone(),
+            step: s.gate.to_string(),
+        }
+        .patch()
+    }
+
+    /// THE ONE-CAR INVARIANT: every car carrying `BRANCH`, in ANY status.
+    /// This fixture's car has no review step, so a completed gate closes
+    /// it; counting only open cars would read that as "no car" — the
+    /// very misreading that filed three twins — and miss a twin filed
+    /// beside it.
+    async fn cars_on_branch(s: &Served) -> usize {
+        let all = get_json(
+            &handler(&s.base).client,
+            &format!("{}/api/jobs?kind=ship-a-change&limit=200", s.base),
+            "test",
+        )
+        .await
+        .unwrap();
+        rows_or_refuse::<Value>(&all, "test")
+            .unwrap()
+            .iter()
+            .filter(|c| c.pointer("/metadata/branch").and_then(Value::as_str) == Some(BRANCH))
+            .count()
+    }
+
+    async fn run_metadata(s: &Served, id: &str) -> Value {
+        let id = boss_core::job::JobId::from_uuid(uuid::Uuid::parse_str(id).unwrap());
+        s.jobs.get_job(&id).await.unwrap().unwrap().metadata
+    }
+
+    /// THE VERDICT COMPLETES THE STEP ITS GATE-RUN FULFILS (design
+    /// 689d1f7f car 2, backlog a3a367e4). A park-intent gate launched on
+    /// the branch's open car carries the edge to that car's gate step;
+    /// its green completes that step with the receipt, leaves the car at
+    /// review, and the branch still has exactly one open car. A
+    /// redelivery of the same green finds the step finished and writes
+    /// nothing more.
+    #[tokio::test]
+    async fn a_green_follows_its_edge_and_leaves_one_car_with_its_gate_complete() {
+        let s = car_held_by(G1, H1).await;
+        gate_run_filed_with(&s, G1, None, edge_to(&s)).await;
+        assert_eq!(cars_on_branch(&s).await, 1);
+        green_of(&s, G1).await;
+        let step = gate_step(&s).await;
+        assert_eq!(
+            step.status,
+            boss_core::job::StepStatus::Completed,
+            "{:?}",
+            step.metadata
+        );
+        let receipt = step.metadata["receipt"].as_str().unwrap_or_default();
+        assert!(receipt.contains(H1), "{:?}", step.metadata);
+        assert_eq!(step.metadata[car::GATE_RUN], G1);
+        assert_eq!(cars_on_branch(&s).await, 1, "one car, no twin");
+        assert_eq!(run_metadata(&s, G1).await.get("park_skipped"), None);
+
+        green_of(&s, G1).await;
+        assert_eq!(gate_step(&s).await.metadata, step.metadata, "redelivered");
+        assert_eq!(cars_on_branch(&s).await, 1);
+    }
+
+    /// A GREEN REPLAYED AFTER ITS CAR CLOSED WRITES NO FALSE RECORD
+    /// (review 01fe1c71 of car 3a7ab114, finding 3). This fixture's car
+    /// has no review step, so the green that completes its gate closes it
+    /// — the shape of a car that has since landed. A redelivery then
+    /// finds the step it fulfils COMPLETED on a car no longer open: that
+    /// green DID finish the car, so the answer is "already finished", not
+    /// an "edge-refused, no car finished" note on the gate-run whose green
+    /// finished it. The scan wrote a truthful "landed" skip in the same
+    /// case; the edge must not be less truthful.
+    #[tokio::test]
+    async fn a_green_replayed_after_its_car_closed_records_no_refusal() {
+        let s = car_held_by(G1, H1).await;
+        gate_run_filed_with(&s, G1, None, edge_to(&s)).await;
+        green_of(&s, G1).await;
+        assert!(
+            !car::is_open(&read(&s).await),
+            "the fixture's car closes on its gate: {}",
+            read(&s).await["status"]
+        );
+        let finished = gate_step(&s).await;
+        assert_eq!(finished.status, boss_core::job::StepStatus::Completed);
+
+        green_of(&s, G1).await;
+        assert_eq!(
+            run_metadata(&s, G1).await.get("park_skipped"),
+            None,
+            "a replay of the green that finished the car is not a refusal: {}",
+            run_metadata(&s, G1).await
+        );
+        assert_eq!(gate_step(&s).await.metadata, finished.metadata);
+        assert_eq!(cars_on_branch(&s).await, 1);
+    }
+
+    /// THE EDGE-GREEN WRITE IS JUDGED ON THE HOLDER (review 01fe1c71 of
+    /// car 3a7ab114, finding 1 — R2 of the Codex review of car 0d04ee3e,
+    /// on the edge's own route). G1's green follows its edge and reads the
+    /// car held by G1 at H1; G2 is then launched on the same branch at the
+    /// SAME head — a re-gate after a suspected flake — and restamps the
+    /// step, ACTIVE. Only the holder now tells the two apart, so G1's merge
+    /// and PUT must land on nothing: G2's gate is never completed with G1's
+    /// receipt, and G1's gate-run says why. Driven through `invoke`, with
+    /// G2's launch landing the moment the router has answered the read
+    /// `car::edge_green` judged.
+    #[tokio::test]
+    async fn an_edge_green_judged_before_a_same_head_restamp_lands_nothing() {
+        let s = car_held_by(G1, H1).await;
+        gate_run_filed_with(&s, G1, None, edge_to(&s)).await;
+        arm(
+            &s,
+            axum::http::Method::GET,
+            format!("/api/jobs/{}", s.car_id),
+            json!({ car::GATE_RUN: G2, "gated_head": H1 }),
+        );
+        green_of(&s, G1).await;
+        assert!(s.armed.lock().unwrap().is_none(), "G2's launch landed");
+        let step = gate_step(&s).await;
+        held_by_g2_untouched(&step);
+        assert_eq!(step.metadata["gated_head"], H1, "the same head");
+        assert_eq!(
+            run_metadata(&s, G1).await["park_skipped"],
+            "gate-held-elsewhere"
+        );
+        assert_eq!(cars_on_branch(&s).await, 1);
+    }
+
+    /// THE EDGE-RED SEND LOOP IS JUDGED ON THE HOLDER, in both windows R3
+    /// named (review 01fe1c71 of car 3a7ab114: `return_gate`'s loop was
+    /// pinned only through `hand_gate_back`). G2 restamps at the same
+    /// head after G1's red read the car — before the merge, then, on a
+    /// fresh car, between the merge and the PUT. Either way G2's gate
+    /// stays ACTIVE and G2's: a red never hands back a gate another run
+    /// holds.
+    #[tokio::test]
+    async fn an_edge_red_hands_back_nothing_once_a_same_head_restamp_lands() {
+        let s = car_held_by(G1, H1).await;
+        gate_run_filed_with(&s, G1, None, edge_to(&s)).await;
+        arm(
+            &s,
+            axum::http::Method::GET,
+            format!("/api/jobs/{}", s.car_id),
+            json!({ car::GATE_RUN: G2, "gated_head": H1 }),
+        );
+        verdict_of(&s, G1, "failed").await;
+        assert!(s.armed.lock().unwrap().is_none(), "G2's launch landed");
+        held_by_g2_untouched(&gate_step(&s).await);
+
+        let s = car_held_by(G1, H1).await;
+        gate_run_filed_with(&s, G1, None, edge_to(&s)).await;
+        arm(
+            &s,
+            axum::http::Method::PATCH,
+            format!("/api/jobs/{}/steps/{}/metadata", s.car_id, s.gate),
+            json!({ car::GATE_RUN: G2, "gated_head": H1 }),
+        );
+        verdict_of(&s, G1, "failed").await;
+        assert!(s.armed.lock().unwrap().is_none(), "G2's launch landed");
+        let step = gate_step(&s).await;
+        assert_eq!(step.status, boss_core::job::StepStatus::Active, "{step:?}");
+        assert_eq!(step.metadata[car::GATE_RUN], G2, "{:?}", step.metadata);
+    }
+
+    /// A HALF-WRITTEN EDGE ON A GREEN FINISHES NOTHING BY THE SCAN (review
+    /// 01fe1c71 of car 3a7ab114, finding 2). A gate-run whose `fulfils` is
+    /// present but cannot be followed is still an edged gate-run: the
+    /// handler tells `park_action` so, which answers Skip before it looks
+    /// at any car — so the scan neither adopts the branch's car nor
+    /// refreshes nor files one. Nothing is written to any car.
+    #[tokio::test]
+    async fn a_green_with_a_half_written_edge_is_skipped_and_moves_no_car() {
+        let s = car_held_by(G1, H1).await;
+        gate_run_filed_with(
+            &s,
+            G1,
+            None,
+            json!({ boss_jobs::fulfils::KEY: { "job": s.car_id } }),
+        )
+        .await;
+        let before = read(&s).await;
+        green_of(&s, G1).await;
+        assert_eq!(
+            run_metadata(&s, G1).await["park_skipped"],
+            "finished-by-its-verdict"
+        );
+        let step = gate_step(&s).await;
+        assert_eq!(step.status, boss_core::job::StepStatus::Active, "{step:?}");
+        assert!(
+            step.metadata.get("receipt").is_none(),
+            "{:?}",
+            step.metadata
+        );
+        assert_eq!(
+            read(&s).await["metadata"],
+            before["metadata"],
+            "no car write"
+        );
+        assert_eq!(cars_on_branch(&s).await, 1);
+    }
+
+    /// AN EDGE TO AN UNBOUND GATE FINISHES NOTHING, through `invoke`
+    /// (review 01fe1c71, beside finding 2: `car::edge_green`'s refusal of
+    /// an unbound step was pinned only as a unit). The car is still at
+    /// build — no launch has stamped its gate step — so no gate-run holds
+    /// it, and an edge naming it is a locator with nothing to locate.
+    #[tokio::test]
+    async fn an_edge_to_an_unbound_gate_moves_nothing() {
+        let s = car_at_build().await;
+        gate_run_filed_with(&s, G1, None, edge_to(&s)).await;
+        green_of(&s, G1).await;
+        assert_eq!(run_metadata(&s, G1).await["park_skipped"], "edge-refused");
+        let step = gate_step(&s).await;
+        assert_eq!(step.status, boss_core::job::StepStatus::Pending, "{step:?}");
+        assert!(
+            step.metadata.get("receipt").is_none(),
+            "{:?}",
+            step.metadata
+        );
+        let build = s.jobs.get_step(&s.build).await.unwrap().unwrap();
+        assert_eq!(build.status, boss_core::job::StepStatus::Active);
+    }
+
+    /// AN EDGE IS AT LEAST AS STRICT AS THE SCAN ABOUT THE BRANCH (review
+    /// 01fe1c71 of car 3a7ab114, finding 4). The scan finds a car only by
+    /// the branch its gate-run gated; the edge names the car outright, so
+    /// it must check the same thing — a gate-run that gated another branch
+    /// finishes nothing here, even with the holder and the head matching,
+    /// and its park prose never lands on this car.
+    #[tokio::test]
+    async fn an_edge_from_a_gate_run_on_another_branch_finishes_nothing() {
+        let s = car_held_by(G1, H1).await;
+        gate_run_filed_with(
+            &s,
+            G1,
+            None,
+            json!({
+                "branch": "feat/some-other-branch",
+                boss_jobs::fulfils::KEY: { "job": s.car_id, "step": s.gate.to_string() },
+            }),
+        )
+        .await;
+        let before = read(&s).await;
+        green_of(&s, G1).await;
+        assert_eq!(run_metadata(&s, G1).await["park_skipped"], "edge-refused");
+        let note = run_metadata(&s, G1).await["park_skipped_note"].clone();
+        assert!(
+            note.as_str().unwrap_or_default().contains("branch"),
+            "{note}"
+        );
+        let step = gate_step(&s).await;
+        assert_eq!(step.status, boss_core::job::StepStatus::Active, "{step:?}");
+        assert_eq!(step.metadata[car::GATE_RUN], G1);
+        assert!(
+            step.metadata.get("receipt").is_none(),
+            "{:?}",
+            step.metadata
+        );
+        assert_eq!(
+            read(&s).await["metadata"],
+            before["metadata"],
+            "no car write"
+        );
+    }
+
+    /// A RED BY EDGE LEAVES THE GATE READY, NEVER COMPLETED — the trust
+    /// boundary of backlog a3a367e4: a completed gate step boards. The
+    /// verdict sits beside the step, the branch keeps its one car, and
+    /// the outcome-blind subjob resolve — which completes a parent step
+    /// on ANY close of a child naming `parent_step_id` — finds no parent
+    /// to complete when this gate-run closes, because the edge is not
+    /// spelled that way.
+    #[tokio::test]
+    async fn a_red_follows_its_edge_and_leaves_the_gate_ready_not_completed() {
+        let s = car_held_by(G1, H1).await;
+        gate_run_filed_with(&s, G1, None, edge_to(&s)).await;
+        verdict_of(&s, G1, "failed").await;
+        let step = gate_step(&s).await;
+        assert_eq!(step.status, boss_core::job::StepStatus::Ready, "{step:?}");
+        assert_eq!(step.metadata[car::LAST_VERDICT][car::GATE_RUN], G1);
+        assert_eq!(step.metadata[car::LAST_VERDICT]["verdict"], "failed");
+        assert!(
+            step.metadata.get("receipt").is_none(),
+            "{:?}",
+            step.metadata
+        );
+        assert_eq!(cars_on_branch(&s).await, 1, "one car, no twin");
+
+        // The gate-run closes on its red; the subjob rule's handler, run
+        // on that close, finds no parent edge of its own and writes
+        // nothing.
+        crate::handlers::jobs_subjob_resolve::JobsSubjobResolve::new(&s.base)
+            .invoke(
+                &[],
+                &InvocationContext {
+                    rule_name: "resolve-subjob-on-child-job-closed".into(),
+                    triggering_event_id: "evt-g1-closed".into(),
+                    triggering_topic: "jobs.job.closed".into(),
+                    event_timestamp: Some(chrono::Utc::now()),
+                    event_payload: json!({"id": G1, "outcome": "failed",
+                        "parent_step_id": null}),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            gate_step(&s).await.status,
+            boss_core::job::StepStatus::Ready
+        );
+    }
+
+    /// AN EDGE NEVER FINISHES A GATE ITS RUN DOES NOT HOLD. G1's edge
+    /// names the car, but G2 relaunched the gate since: G1's green moves
+    /// nothing, says why on G1's gate-run, and files no second car; G1's
+    /// red hands nothing back from under G2.
+    #[tokio::test]
+    async fn an_edge_to_a_gate_another_run_holds_moves_nothing() {
+        let s = car_held_by(G2, H2).await;
+        gate_run_filed_with(&s, G1, None, edge_to(&s)).await;
+        green_of(&s, G1).await;
+        assert_eq!(run_metadata(&s, G1).await["park_skipped"], "edge-refused");
+        held_by_g2_untouched(&gate_step(&s).await);
+        verdict_of(&s, G1, "failed").await;
+        held_by_g2_untouched(&gate_step(&s).await);
+        assert_eq!(cars_on_branch(&s).await, 1);
+    }
+
+    /// THE CUTOVER, NEW DISPATCHER: a gate-run launched before this car
+    /// deployed carries no edge, and its verdict still finds the car by
+    /// the scan — a green finishes it, a red hands it back.
+    #[tokio::test]
+    async fn an_edge_less_gate_run_is_still_finished_or_handed_back_by_the_scan() {
+        let s = car_held_by(G1, H1).await;
+        gate_run_filed(&s, G1, None).await;
+        verdict_of(&s, G1, "failed").await;
+        let step = gate_step(&s).await;
+        assert_eq!(step.status, boss_core::job::StepStatus::Ready, "{step:?}");
+
+        let s = car_held_by(G1, H1).await;
+        gate_run_filed(&s, G1, None).await;
+        green_of(&s, G1).await;
+        let step = gate_step(&s).await;
+        assert_eq!(step.status, boss_core::job::StepStatus::Completed);
+        assert_eq!(cars_on_branch(&s).await, 1);
+    }
+
+    /// A LOST GATE'S RELAUNCH FINISHES ITS CAR (backlog 64d417ca).
+    /// Measured 2026-11-10 on car 88645b17: gate-run cdd2f3d9 was LOST,
+    /// its red handed the car's gate step back READY still naming
+    /// cdd2f3d9, and the conductor's relaunch fc5d6d2e — carrying
+    /// `relaunch_of: cdd2f3d9` — went green on the same head. This
+    /// handler recorded `gate-held-elsewhere` and moved nothing, so an
+    /// urgent fix sat about 20 hours off the dock with a valid green, and
+    /// the hand step that followed (`boss rerail --finish`) made it look
+    /// parked without moving it. Through the real router and the
+    /// handler's own invoke: a green that is NOT the lost run's relaunch
+    /// still moves nothing (the control), and the relaunch's green
+    /// completes the gate step with its receipt, with no hand step.
+    #[tokio::test]
+    async fn a_lost_gates_relaunch_that_goes_green_finishes_its_car() {
+        const STRANGER: &str = "3a1d2e3f-4a5b-4c6d-8e7f-000000000003";
+        let s = car_with(
+            boss_core::job::StepStatus::Completed,
+            boss_core::job::StepStatus::Ready,
+            json!({
+                car::GATE_RUN: G1, "gated_head": H1,
+                car::LAST_VERDICT: {car::GATE_RUN: G1, "verdict": "lost"},
+            }),
+        )
+        .await;
+        let skipped = |id: &str| {
+            let jobs = s.jobs.clone();
+            let id = boss_core::job::JobId::from_uuid(uuid::Uuid::parse_str(id).unwrap());
+            async move { jobs.get_job(&id).await.unwrap().unwrap().metadata["park_skipped"].clone() }
+        };
+
+        // The control: a hand gate on the same head is not the lost run's
+        // relaunch, and the binding still refuses it.
+        gate_run_filed(&s, STRANGER, None).await;
+        green_of(&s, STRANGER).await;
+        assert_eq!(skipped(STRANGER).await, "gate-held-elsewhere");
+        let step = gate_step(&s).await;
+        assert_eq!(step.status, boss_core::job::StepStatus::Ready, "{step:?}");
+
+        // The relaunch: its green finishes the gate the lost run held.
+        gate_run_filed(&s, G2, Some(G1)).await;
+        green_of(&s, G2).await;
+        assert_eq!(
+            skipped(G2).await,
+            Value::Null,
+            "the relaunch's green is not skipped"
+        );
+        let step = gate_step(&s).await;
+        assert_eq!(
+            step.status,
+            boss_core::job::StepStatus::Completed,
+            "{:?}",
+            step.metadata
+        );
+        let receipt = step.metadata["receipt"].as_str().unwrap_or_default();
+        assert!(receipt.contains(H1), "{:?}", step.metadata);
+        // The step names the run whose receipt it carries, and keeps the
+        // run it took over from (backlog 84e46932): the receipt names no
+        // gate-run, so a step still naming G1 sent every reader of the
+        // car to a LOST run and hid the green one behind a search.
+        assert_eq!(step.metadata[car::GATE_RUN], G2, "{:?}", step.metadata);
+        assert_eq!(step.metadata[car::LOST_GATE_RUN], G1, "{:?}", step.metadata);
+    }
+
+    /// R2 through the handler's own invoke: G1's green, with G2 holding
+    /// the car's gate step, writes ONE thing — the skip on G1's gate-run,
+    /// naming the holder — and nothing on the car.
+    #[tokio::test]
+    async fn a_green_whose_gate_another_run_holds_records_a_skip_and_moves_no_car() {
+        use axum::{
+            Json, Router,
+            extract::Request,
+            http::{Method, StatusCode},
+            response::IntoResponse,
+        };
+        let car_id = "be025b44-0000-0000-0000-0000000000a2";
+        let held = json!({
+            "id": car_id, "kind": "ship-a-change", "status": "open",
+            "subject": {"subject_kind": "custom", "id": BRANCH},
+            "metadata": {"branch": BRANCH, car::ADMITTED_BY: "boss dispatch --started"},
+            "steps": [
+                {"id": "s-scope", "spec_slug": "scope", "title": car::SCOPE, "status": "completed"},
+                {"id": "s-build", "spec_slug": "build", "title": car::BUILD, "status": "completed"},
+                {"id": "s-gate", "spec_slug": "gate", "title": car::GATE, "status": "active",
+                 "metadata": {car::GATE_RUN: G2, "gated_head": H2}},
+                {"id": "s-review", "spec_slug": "review", "title": car::REVIEW, "status": "pending"},
+            ],
+        });
+        let gate_run = json!({
+            "id": G1, "kind": "gate-run",
+            "metadata": {
+                "branch": BRANCH, "sha": H1,
+                "park_summary": "s", "park_excludes": "e", "park_test": "t",
+                "park_verified": "v",
+                "park_probe": "echo ok", "park_expect": "ok",
+                "park_partial_item": "b8e75382-0000-0000-0000-000000000000",
+            },
+        });
+        type Writes = Arc<std::sync::Mutex<Vec<(String, String, Value)>>>;
+        let writes: Writes = Arc::default();
+        let retained = writes.clone();
+        let app = Router::new().fallback(move |request: Request| {
+            let (held, gate_run, writes) = (held.clone(), gate_run.clone(), retained.clone());
+            async move {
+                let method = request.method().clone();
+                let path = request.uri().path().to_string();
+                let query = request.uri().query().unwrap_or_default().to_string();
+                if method == Method::GET {
+                    return if path == format!("/api/jobs/{G1}") {
+                        Json(gate_run).into_response()
+                    } else if path == format!("/api/jobs/{car_id}") {
+                        Json(held).into_response()
+                    } else if query.contains("status=open") {
+                        Json(json!({"data": [held], "total": 1})).into_response()
+                    } else {
+                        Json(json!({"data": [], "total": 0})).into_response()
+                    };
+                }
+                let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                writes
+                    .lock()
+                    .unwrap()
+                    .push((method.to_string(), path, body));
+                StatusCode::NO_CONTENT.into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let receipt = format!("{{\"verdict\":\"green\",\"head\":\"{H1}\",\"mode\":\"full\"}}");
+        let ctx = InvocationContext {
+            rule_name: "auto-park-on-gate-green".into(),
+            triggering_event_id: "evt-g1-green".into(),
+            triggering_topic: "step.done.gate-verdict".into(),
+            event_timestamp: None,
+            event_payload: json!({"job_id": G1, "step_id": "verdict", "kind": "gate-verdict",
+                "metadata": {"verdict": "green", "receipt": receipt}}),
+        };
+        let result = handler(&base).invoke(&[], &ctx).await;
+        server.abort();
+        result.unwrap();
+        let writes = writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1, "{writes:#?}");
+        let (method, path, body) = &writes[0];
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("PATCH", format!("/api/jobs/{G1}/metadata").as_str())
+        );
+        assert_eq!(body["park_skipped"], "gate-held-elsewhere");
+        let note = body["park_skipped_note"].as_str().unwrap();
+        assert!(note.contains("held by gate-run 2a1d2e3f"), "{note}");
     }
 }

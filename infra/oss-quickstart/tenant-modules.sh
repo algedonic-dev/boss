@@ -84,9 +84,11 @@ tenant_module_on() {
 # The module that shows a surface and the module that starts its service
 # are one fact (CLAUDE.md §9a), so a service's row names every module
 # it serves.
-# boss-commerce-api is the invoices + A/R surface behind /ux/finance,
-# which every tenant's always-on `finance` asks for, so it is not
-# listed; boss-ml-api serves the IT monitoring panel alone (Tier 1
+# boss-commerce-api is the invoice book. /finance draws its sections
+# only under `commerce` since backlog 801b6a7a, but the account pages
+# and the billing step surface still read and write it with no module
+# gate, so stopping it on `commerce` would break them; it is not
+# listed until they are gated too. boss-ml-api serves the IT monitoring panel alone (Tier 1
 # core, no module in the contract), so it is not listed either.
 service_modules() {
     case "$1" in

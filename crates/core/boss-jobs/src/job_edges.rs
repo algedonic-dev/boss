@@ -1,5 +1,5 @@
 //! The job_edges registry, read side — which Job metadata fields
-//! reference other Jobs (department-flow-dashboards Q1; migration
+//! reference other Jobs (department-flow-dashboards Q1, in the decision record; migration
 //! 104 owns the table + write-path guard, 105 the abort default).
 //!
 //! Read-only by design: edges are declared in migrations the way

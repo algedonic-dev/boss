@@ -56,6 +56,10 @@ CSS="apps/web/src/styles.css"
 # but a git that could not answer is not an absent ref, and skipping on
 # it exits 0, which a gate records as a pass on a tree nothing read
 # (measured 2026-09-11, backlog 6b2f4a1a).
+#
+# The public mirror declares it has no per-car trunk (BOSS_TRUNK=none,
+# lib/trunk-ref.sh; backlog 2d28df78): the forge judged each car's styles.
+lint_no_trunk "$LINT" "which styles this change added" && exit 0
 BASE=$(resolve_trunk_ref "$LINT"); rc=$?
 if [ "$rc" -eq "$LINT_CANNOT_ANSWER" ]; then
     exit "$LINT_CANNOT_ANSWER"

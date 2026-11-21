@@ -1,5 +1,23 @@
 import { afterEach, describe, it, expect } from 'bun:test';
-import { ENTRIES_PER_ACCOUNT_CAP, loadEntriesForAccount, loadPeriods } from './ledger';
+import {
+  ENTRIES_PER_ACCOUNT_CAP,
+  headlineText,
+  loadEntriesForAccount,
+  loadHeadline,
+  loadPeriods,
+} from './ledger';
+import { trailingYear } from './window';
+
+// Moved here from exec/ExecPage.test.ts with the function, when the Exec
+// page went (design 01fa5bdf step 1).
+describe('trailingYear — the headline window', () => {
+  it('is the trailing year ending today', () => {
+    expect(trailingYear('2026-09-27')).toEqual({ from: '2025-09-27', to: '2026-09-27' });
+  });
+  it('a date it cannot read is a one-day window on that date, never a throw', () => {
+    expect(trailingYear('not-a-date')).toEqual({ from: 'not-a-date', to: 'not-a-date' });
+  });
+});
 
 // Backlog 1a2b67c9 (page audit 3f964c57, /ux/finance, 2026-09-23):
 // loadPeriods and loadEntriesForAccount folded a failed read into [],
@@ -55,6 +73,69 @@ describe('loadPeriods', () => {
     const res = await loadPeriods();
     expect(res.read).toEqual({ kind: 'ok' });
     expect(res.periods.map((p) => p.id)).toEqual(['per-2026-09']);
+  });
+});
+
+// Backlog 801b6a7a (page audit 3f964c57 gap 3; design c2820008 D1): the
+// /finance headline read boss-commerce's trailing revenue, which no
+// Algedonic protocol writes, so it could not agree with the ledger's own
+// income statement on the same page. It now reads that statement over
+// the trailing year, and a failed or malformed read is named, never a
+// number.
+describe('loadHeadline', () => {
+  const WINDOW = { from: '2025-09-23', to: '2026-09-23' };
+  const STATEMENT = {
+    from: WINDOW.from, to: WINDOW.to, revenue: [], total_revenue_cents: 4_500_000,
+    cogs: [], total_cogs_cents: 1_500_000, gross_profit_cents: 3_000_000,
+    operating_expenses: [], total_operating_expenses_cents: 2_200_000,
+    net_income_cents: 800_000, currency: 'USD',
+  };
+
+  it('reads the ledger income statement over the window, never commerce', async () => {
+    const seen: string[] = [];
+    stubFetch(async (url) => {
+      seen.push(url);
+      return new Response(JSON.stringify(STATEMENT), { status: 200 });
+    });
+    const res = await loadHeadline(WINDOW);
+    expect(seen).toEqual(['/api/ledger/income-statement?from=2025-09-23&to=2026-09-23']);
+    expect(res).toEqual({
+      kind: 'ready',
+      data: { revenue: 4_500_000, grossProfit: 3_000_000, netIncome: 800_000, currency: 'USD' },
+    });
+  });
+
+  it('keeps a refusal as a failed read', async () => {
+    stubFetch(async () => new Response('ledger down', { status: 503 }));
+    const res = await loadHeadline(WINDOW);
+    expect(res.kind).toBe('failed');
+  });
+
+  it('a statement missing its totals is a failed read, never a NaN headline', async () => {
+    stubFetch(async () => new Response(JSON.stringify({ ...STATEMENT, gross_profit_cents: null }), { status: 200 }));
+    const res = await loadHeadline(WINDOW);
+    expect(res.kind).toBe('failed');
+  });
+});
+
+describe('headlineText', () => {
+  it('names the ledger figures', () => {
+    expect(headlineText({
+      kind: 'ready',
+      data: { revenue: 4_500_000, grossProfit: 3_000_000, netIncome: 800_000, currency: 'USD' },
+    })).toEqual({ title: '$45K trailing revenue', subtitle: '$30K gross profit (66.7%) · $8K net income' });
+  });
+
+  it('a year with no revenue is a zero margin, not a division by zero', () => {
+    expect(headlineText({
+      kind: 'ready', data: { revenue: 0, grossProfit: 0, netIncome: -4_000, currency: 'USD' },
+    })).toEqual({ title: '$0 trailing revenue', subtitle: '$0 gross profit (0.0%) · -$40 net income' });
+  });
+
+  it('says it is loading, and names the read that failed', () => {
+    expect(headlineText({ kind: 'loading' })).toEqual({ title: 'Finance', subtitle: 'Loading…' });
+    expect(headlineText({ kind: 'failed', error: 'HTTP 503' }))
+      .toEqual({ title: 'Finance', subtitle: 'Income statement unavailable' });
   });
 });
 

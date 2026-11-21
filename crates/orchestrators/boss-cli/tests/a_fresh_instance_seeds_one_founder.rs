@@ -149,6 +149,8 @@ async fn serve(pool: PgPool) -> String {
         registry: Arc::new(boss_jobs::agents::PgAgents::new(pool.clone())),
         classes: None,
         departments: None,
+        pools: None,
+        stations: None,
     });
     // The tenant publish stamp door (backlog 42da8bd2): the real router
     // over the same pool, so the row `boss tenant published` reads is
@@ -465,6 +467,12 @@ async fn the_real_tenant_verbatim_lands_its_location_before_its_founder() {
                 "received 1, inserted 0; kept: agent-claude differs on display_name, role, \
                  department (the instance is the truth; --take agents overwrites)"
             ),
+        "{agents_line}"
+    );
+    // The tenant declares no model class, so the publish line names the
+    // robot no `model:<class>` step can reach (backlog 3317f4db).
+    assert!(
+        agents_line.contains("no model class: agent-claude"),
         "{agents_line}"
     );
     let agent_row = || async {

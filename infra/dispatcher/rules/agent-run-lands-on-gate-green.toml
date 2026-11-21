@@ -30,6 +30,14 @@
 # written. A red or lost gate closes with a different outcome and does
 # not match; the run stays at `building` until the builder re-gates, the
 # operator records a refusal, or the silence rule ages it out.
+#
+# TWO STEPS, ONE OPEN (backlog 87d1ae40). A run admitted under agent-run
+# with a `verdict` step completes `building` as `handed` when `boss gate`
+# hands its car over, freeing its robots:<class> slot at the hand-off, and
+# waits on `verdict` with no claim. `steps` names both, and the handler
+# completes whichever is open: `building` on a run admitted before that
+# version, `verdict` on one handed to its gate. Never both — a run's
+# `verdict` opens only once `building` is done.
 [[rule]]
 name = "agent-run-lands-on-gate-green"
 why = """
@@ -43,9 +51,9 @@ pipeline: the edge is declared by the gate at launch
 behalf, and not one of those builds had a packet of its own to land —
 the run existed in a terminal transcript and nowhere in the record.
 """
-version = 2
+version = 3
 on_event = "jobs.job.closed"
 when = "kind = \"gate-run\" AND outcome = \"completed\""
 [[rule.do]]
 handler = "jobs.complete_linked_step"
-args = { link = "\"agent_run\"", steps = "\"building\"", evidence_key = "\"gate_run\"", done_metadata = '"{\"result\": \"gated\"}"', metadata_envelope = '"gate_submission"', metadata_pointer = '"/source"', metadata_version = '"1"', metadata_equal = '"branch,sha,agent_run,worktree"' }
+args = { link = "\"agent_run\"", steps = "\"building,verdict\"", evidence_key = "\"gate_run\"", done_metadata = '"{\"result\": \"gated\"}"', metadata_envelope = '"gate_submission"', metadata_pointer = '"/source"', metadata_version = '"1"', metadata_equal = '"branch,sha,agent_run,worktree"' }

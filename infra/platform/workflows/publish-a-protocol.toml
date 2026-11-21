@@ -1,0 +1,245 @@
+# ---------------------------------------------------------------------------
+# publish-a-protocol — a registry row publish that needs a person is a
+# packet on that person (design b1f319bc, decided by David 2026-11-05;
+# backlog 7955a488). Since backlog f399458f (David 2026-11-08: "we should
+# be able to make these registry changes via a different protocol than
+# the code changes") the row it publishes is a PROTOCOL row or a RESOURCE
+# POOL row; `registry` on the packet says which.
+#
+# WHY IT EXISTS. On 2026-11-05 the platform owner's queue held one step
+# while the conductor's handoff note listed three publishes waiting on
+# him: the HELD ops-request row, a registry-side draft, and two tenant
+# merges' rows. None had a packet. A held platform protocol could be
+# published only by `boss workflow publish <kind> <file>` typed by a
+# person from a checkout, and nothing put "publish <kind> vN" in front
+# of that person: grep found the command only in comments. A belief in
+# a handoff note is not a record, and it is not inherited by the next
+# shift (CLAUDE.md, "mostly sure vs. absolutely sure").
+#
+# WHY A POOL ROW RIDES IT (backlog f399458f, ask 2). Raising robots:opus
+# from 4 to 6 (item 89b17d21) was a value change, and it rode a code car,
+# a gate and a train, because a pool row reached the registry only
+# through the platform seed on a converge. Ask 1 built the live pools
+# door (POST /api/pools/{name}/publish, `boss pool publish`); this row is
+# the approval in front of it. A pool packet carries the row's own bytes
+# as `row_toml`, so the publish reads them from the RECORD, not from a
+# checkout that has not received them yet: no train is needed for the
+# value to go live, and the tree write-back is the drift comparator's car
+# afterwards. A STATION row is not here yet: the stations door has no
+# CLI verb to run, so its road waits for the write-back car.
+#
+# THE PACKET IS THE DELIBERATE DOOR (Q held-kind). The filer names ONE
+# publish: the registry, the row's name, the tree path it lives at, its
+# sha256, the live version the diff was rendered against, the tree
+# commit, the rendered diff and the dry-run lint receipt. They are packet
+# metadata, rendered onto `approve` by the templates below, so the
+# owner's passkey signs THOSE BYTES: a presence stamp binds
+# step_shape_hash(title, metadata) of the step it signed (ops-request.toml
+# says how), and a stamp dies with its shape.
+#
+# ONE AUTOMATON STEP PER DOOR, chosen by `registry`. `publish` (registry
+# workflow) runs infra/gcp/publish-workflow.sh <kind> on boss-gcp through
+# an ops-request the dispatcher files (rule
+# publish-a-protocol-files-its-machine-publish); `publish-pool` (registry
+# pool) runs infra/gcp/publish-pool.sh <name> the same way (rule
+# publish-a-protocol-files-its-pool-publish). Each script reads this
+# packet back before it writes: approve completed `approved`, a live
+# presence stamp per required role bound to approve's CURRENT shape and
+# made by an employee its verb file names in `approvers`, the signed
+# sha256 equal to the bytes it is about to publish, the signed live
+# version equal to the one it reads, and its own step not yet done. The
+# signature check is ONE jq program both scripts run,
+# infra/lib/signed-publish.jq. A flag cannot do that, and no argv
+# carries it: the edge is the request's `for_protocol_publish`, written
+# by the rule. The terminal `boss workflow publish` / `boss pool
+# publish` stay only as the fallback when the API is dark.
+#
+# WHO IT FILES ITSELF FOR (Q when-filed). A landed edit of a HELD
+# protocol file: boss-gcp's checkout moving files `publish-drift
+# --file-held` (rule file-protocol-publishes-on-boss-gcp-converge-moved),
+# which files one packet per held kind whose tree is ahead of live,
+# deduped on the exact spec (kind + sha256) across every packet ever
+# filed. A pool row is filed by the builder who changed it, with `boss
+# pool request <name> <file>`; the drift comparator files it later.
+#
+# WHAT WENT LIVE IS WRITTEN BY THE VERB'S OWN LINE. The rules
+# complete-protocol-publish-on-publish-workflow-answered and
+# complete-pool-publish-on-publish-pool-answered complete their step with
+# the version and the read-back the script confirmed; a refusal or an
+# unconfirmed publish leaves the step open, annotated, with an urgent
+# alert — never a success reported off a word.
+#
+# `protocol_kind` is the workflow road's own key, kept beside the generic
+# `row_name`: the publish step's ops-request argument, the held-kind
+# filer's dedup and every packet filed under v1 read it, and v1 packets
+# stay pinned to v1. A pool packet carries none.
+#
+# THE ROW HOLDS NO WRITER AND NO EXECUTOR on purpose: the step that
+# completes either publish step is the dispatcher's linked-step handler,
+# which no writer reservation names. It is HELD out of the drift publish
+# by its own file, infra/platform/workflow-holds/publish-a-protocol.toml:
+# a row that adds a road to a live registry goes live at the platform
+# owner's deliberate publish.
+# ---------------------------------------------------------------------------
+
+[[workflow]]
+kind = "publish-a-protocol"
+label = "Publish a registry row"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "One registry row publish that needs a person, as a packet on that person (design b1f319bc; widened to resource pools by backlog f399458f). The filer names the registry (`workflow` for a protocol row, `pool` for a resource pool row), the row's name, the tree path it lives at and its sha256, the live version the rendered diff was taken against, the tree commit, the diff and the dry-run lint receipt; `approve` carries all of them, and the owner's passkey signs exactly those bytes. On approval the dispatcher files the matching door's automaton step on boss-gcp — infra/gcp/publish-workflow.sh for a protocol, infra/gcp/publish-pool.sh for a pool — which publishes only after reading this packet back: signed by a named approver, bound to approve's current shape, the signed sha256 equal to the bytes it publishes (a protocol from the converged tree, a pool from the packet's own `row_toml`, so a value change needs no train), the signed live version equal to live; the answer's rule completes the step with the version that went live and the read-back. A held protocol's landed edit files its packet by itself; a pool row is filed by `boss pool request`. `declined` is an approval the owner did not give; `superseded` is a newer edit of the same row."
+metadata = { owner = "00b04483-90c6-46b9-b911-8e19d2a0b410", department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
+metadata_schema = { type = "object", required = ["registry", "row_name", "spec_path", "spec_sha256", "live_version", "tree_sha", "dry_run", "diff"], properties = { registry = { type = "string", enum = ["workflow", "pool"], description = "Which registry the row lives in: `workflow` (a protocol row, published from the converged tree) or `pool` (a resource pool row, published from row_toml)." }, row_name = { type = "string", description = "The row's name in its registry: a protocol's kind, a pool's name." }, protocol_kind = { type = "string", description = "Registry workflow only: the protocol kind again, the key the workflow publish step and the held-kind filer read (v1 packets carry only this)." }, row_toml = { type = "string", description = "Registry pool only: the row file's text. Its sha256 is spec_sha256, and the pool publish reads these bytes from the packet, never from a checkout." }, spec_path = { type = "string", description = "Where the row lives in the tree: infra/platform/workflows/<kind>.toml or infra/platform/pools/<name>.toml." }, spec_sha256 = { type = "string", description = "sha256 of the row's bytes; the publish refuses any other bytes." }, live_version = { type = "string", description = "The live version the diff was rendered against; the publish refuses when live has moved." }, tree_sha = { type = "string", description = "The checkout commit the filer read." }, dry_run = { type = "string", description = "The dry-run lint receipt, as the filer's run printed it." }, diff = { type = "string", description = "The rendered diff of the row against live, field by field." } } }
+
+[[workflow.step]]
+title = "filed"
+kind = "trigger"
+ready_when = "true"
+title_template = "Publish requested: {metadata.registry} row {metadata.row_name} over live v{metadata.live_version}"
+metadata_defaults = { trigger_kind = "event", trigger_name = "a-registry-rows-tree-moved-ahead-of-live" }
+
+[[workflow.step]]
+title = "approve"
+kind = "sign-off"
+ready_when = "steps.filed.done"
+assurance_required = "presence"
+sign_offs_required = ["platform-admin"]
+title_template = "Approve publishing {metadata.registry} row {metadata.row_name} over live v{metadata.live_version}"
+authority_role = "platform-admin"
+metadata_defaults = { human_only = true, human_presentation = { ask = "Decide whether this exact registry row goes live", why_person = "Your passkey authorizes one publish of the named row's exact bytes over the named live version.", action = "Read the diff and the dry-run receipt, then approve or reject", after = "Approval lets boss-gcp publish exactly these bytes once, through the named registry's door, and read them back; it does not publish anything else, and a newer edit needs a new approval.", evidence = "current-step" }, registry = "{metadata.registry}", row_name = "{metadata.row_name}", spec_path = "{metadata.spec_path}", spec_sha256 = "{metadata.spec_sha256}", live_version = "{metadata.live_version}", tree_sha = "{metadata.tree_sha}", dry_run = "{metadata.dry_run}", diff = "{metadata.diff}", procedure = "YOUR PASSKEY SIGNS THIS STEP'S CONTENT, and you type nothing: every key was filled by the run that filed it. `registry` names the door (`workflow`, a protocol row; `pool`, a resource pool row) and `row_name` the row. `diff` is the row against live v`live_version`, field by field; `dry_run` is the lint the CLI ran over the row, whose bytes hash to `spec_sha256` (for a pool, the bytes ride on this packet; for a protocol, the file `spec_path` at commit `tree_sha`). Approve only a change you mean to put live. boss-gcp then publishes those bytes ONCE, and refuses if they no longer hash to what you signed, if live is no longer v`live_version`, or if anyone but a named approver stamped this step. Reject to close it declined: the same bytes are never asked again." }
+
+[[workflow.step.fields]]
+name = "registry"
+field_type = "workflow|pool"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "row_name"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "spec_path"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "spec_sha256"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "live_version"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "tree_sha"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "dry_run"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "diff"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "decision"
+field_type = "approved|rejected"
+required = true
+
+# THE PROTOCOL ROW'S AUTOMATON STEP. `ops_verb` is the marker the filing
+# rule reads off the `step.ready.task` payload (step.ready payloads carry
+# the step's metadata, not its slug — publish-to-github's open-pr is the
+# worked case), and `protocol_kind` is the one arg the publish-workflow
+# verb takes, rendered from the packet so the rule can hand it on. The
+# guard is `registry != "pool"`, not `= "workflow"`: a packet that names
+# no registry is a protocol row, as every packet was before f399458f,
+# and the fork lint (which synthesizes no packet metadata) then sees an
+# approved decision handled.
+[[workflow.step]]
+title = "publish"
+kind = "task"
+ready_when = "steps.approve.done AND steps.approve.metadata.decision = \"approved\" AND job.metadata.registry != \"pool\""
+title_template = "Publish protocol {metadata.row_name} on boss-gcp and read it back (by automaton)"
+authority_role = "platform-admin"
+metadata_defaults = { ops_verb = "publish-workflow", protocol_kind = "{metadata.protocol_kind}", procedure = "AN AUTOMATON STEP. The dispatcher files publish-workflow for this protocol on boss-gcp the moment approve is signed, and completes this step from the verb's own confirmed line: `version` is the active version it read back, `from_version` the one it replaced, `read_back` is `equal` when that row compares equal to the signed file. If the verb refused or did not confirm, this step stays open with `failed` on it and an urgent alert names why; read the request it names before filing anything again." }
+
+[[workflow.step.fields]]
+name = "version"
+field_type = "string"
+required = true
+
+[[workflow.step.fields]]
+name = "from_version"
+field_type = "string"
+required = true
+
+[[workflow.step.fields]]
+name = "read_back"
+field_type = "string"
+required = true
+
+# THE POOL ROW'S AUTOMATON STEP (backlog f399458f). Same marker idea:
+# rule publish-a-protocol-files-its-pool-publish reads `ops_verb` and
+# hands `pool` to the publish-pool verb as its one arg.
+[[workflow.step]]
+title = "publish-pool"
+kind = "task"
+ready_when = "steps.approve.done AND steps.approve.metadata.decision = \"approved\" AND job.metadata.registry = \"pool\""
+title_template = "Publish pool {metadata.row_name} through the pools door and read it back (by automaton)"
+authority_role = "platform-admin"
+metadata_defaults = { ops_verb = "publish-pool", pool = "{metadata.row_name}", procedure = "AN AUTOMATON STEP. The dispatcher files publish-pool for this pool on boss-gcp the moment approve is signed. The verb reads this packet back, checks the signature and that row_toml hashes to the signed sha256, and publishes those bytes through the live pools door over the signed live version (boss pool publish --over). This step completes from the verb's confirmed line: `version` is the version the lineage read back, `from_version` the one it replaced, `read_back` is `equal`. If the verb refused or did not confirm, this step stays open with `failed` on it and an urgent alert names why. The tree write-back is a later car." }
+
+[[workflow.step.fields]]
+name = "version"
+field_type = "string"
+required = true
+
+[[workflow.step.fields]]
+name = "from_version"
+field_type = "string"
+required = true
+
+[[workflow.step.fields]]
+name = "read_back"
+field_type = "string"
+required = true
+
+[[workflow.step]]
+title = "published"
+kind = "outcome"
+ready_when = "steps.publish.done OR steps.publish-pool.done"
+title_template = "Published: {metadata.registry} row {metadata.row_name} is live and read back equal"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "published" }
+
+[[workflow.step]]
+title = "declined"
+kind = "outcome"
+ready_when = "steps.approve.done AND steps.approve.metadata.decision != \"approved\""
+title_template = "Not published: the owner did not approve"
+metadata_defaults = { outcome_kind = "aborted" }
+terminal = { outcome = "declined" }
+
+[[workflow.step]]
+title = "superseded"
+kind = "outcome"
+ready_when = "steps.filed.done AND job.metadata.superseded_by > \"\" AND job.metadata.supersession_translation > \"\""
+title_template = "Superseded by a newer edit of the same row"
+metadata_defaults = { outcome_kind = "withdrawn" }
+terminal = { outcome = "superseded" }

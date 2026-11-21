@@ -31,11 +31,45 @@
 # Optional:
 #   GATE_MODE          "--auto" for scoped gates, empty for full
 #   GATE_VERDICT_CARRIER  "pod-log": leave the verdict, write nothing
-#   FORGE_URL          default http://10.20.0.15:3000/david/boss.git
+#   FORGE_URL          default: forge-repository data in the script ConfigMap,
+#                      derived from infra/estate/estate.toml (8456a6cc)
 #   JOBS_API           default http://10.20.0.34:7900 (old layout only)
 set -euo pipefail
 
-FORGE_URL="${FORGE_URL:-http://10.20.0.15:3000/david/boss.git}"
+# --- runner timeline (begin) ---
+# WHERE THE TIME WENT BEFORE THE CHECKS (backlog d777b20a). Green car
+# gates went from a median 6.0 minutes (W38) to 34.6 (W41), measured
+# over 3,535 gate-runs on 2026-10-15, and the record could not say how
+# much of that was the queue, this runner's setup or the checks: the
+# packet keeps `launched_at` and the receipt each check's seconds, but
+# this script's own start, its seed copy, its seed-order walk and the
+# rest went to stdout only, and the runtime evidence's `runner-start`
+# sample is taken after all of them, with intervals that are relative.
+# So each phase stamps the UTC instant it begins, here first, and the
+# receipt summary turns the marks into `timeline` (runner_started_at,
+# every phase's start and seconds, setup_s, ended_at). A clock that
+# cannot be read leaves that mark with no instant, and the receipt says
+# null for the phases it bounds: it never fails the run, and it is
+# never a zero. The seed REFRESH is not here: it runs after the verdict
+# is left, in the seed-refresh container whose own record the conductor
+# keeps as `seed_maintenance`.
+SETUP_MARKS=""
+setup_mark() { # <the phase that begins now>
+    local at
+    at=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ 2>/dev/null) || at=""
+    SETUP_MARKS+="$1=$at "
+}
+setup_mark prepare
+# --- runner timeline (end) ---
+
+# --- forge repository (begin) ---
+if [ -z "${FORGE_URL:-}" ]; then
+    FORGE_URL=$(cat "${GATE_FORGE_REPOSITORY_FILE:-/repo-script/forge-repository}") \
+        || { echo 'gate-runner: cannot read the declared forge repository from the script ConfigMap' >&2; exit 78; }
+    [ -n "$FORGE_URL" ] \
+        || { echo 'gate-runner: the declared forge repository is empty' >&2; exit 78; }
+fi
+# --- forge repository (end) ---
 JOBS_API="${JOBS_API:-http://10.20.0.34:7900}"
 ACTOR='{"id":"automation:gate-runner","role":"platform-admin","access_tier":"operator"}'
 
@@ -370,6 +404,42 @@ retain_runtime_raw() {
 }
 # --- raw-runtime retention (end) ---
 
+# --- gate-log retention (begin) ---
+# GATE.LOG IS FRAMED WHOLE BEFORE ANYTHING REDUCES IT (backlog 7c49bd38;
+# design 5a274e7c car 1, decided 2026-11-13). The failure-detail extractor
+# below keeps failure blocks, a 300-line tail per failed check and a
+# 24,000-character excerpt, and the EXIT trap then deletes gate.log with
+# the workspace: a reduction before storing, the only copy thrown away
+# (CLAUDE.md §Diagnosis, "Quiet is not free"). Train dc3f2ee7's outer log
+# held none of the trace records its source emitted, because only the
+# replay reached stdout. So the collector writes gate.log to this pod's
+# stdout as ordered, hashed, gzipped `gate-runner-log:` frames and one
+# `gate-runner: log-end v1` trailer, and binds the same facts into the
+# receipt as `log_retention.gate_log` - before the receipt is left, so
+# the record the conductor takes already names the log's hash. Over the
+# collector's 4 MiB gzip bound the frames hold a prefix and the trailer
+# says `partial` beside the whole's size and hash; nothing is dropped
+# quietly. The runner holds no token, so storing the frames durably is
+# the conductor's (car 2); until then they live as long as the pod log.
+#
+# NEVER FATAL, NEVER SILENT. A collector that is absent, or too old to
+# know `retain-log`, or that dies, leaves an `unavailable` trailer with
+# the reason, and the run goes on to deliver its verdict.
+retain_gate_log() { # <gate.log> <receipt>
+    local helper=/gate-target/repo/infra/gate-runner/runtime-evidence.py why
+    if [ ! -f "$helper" ]; then
+        why='the collector has not been cloned'
+    elif python3 "$helper" retain-log "$1" "$2"; then
+        return 0
+    else
+        why='the collector failed (its own line is above); gate.log was not framed'
+    fi
+    printf 'gate-runner: log-end v1 job=%s stream=gate.log bytes=- sha256=- kept_bytes=- kept_sha256=- gz_bytes=- gz_sha256=- frames=0 state=unavailable reason=%s\n' \
+        "${NATIVE_JOB_NAME:--}" "$why"
+    return 0
+}
+# --- gate-log retention (end) ---
+
 # --- verdict carrier (begin) ---
 # THE RUNNER LEAVES ITS VERDICT; IT DOES NOT WRITE IT (backlog 934ccad1;
 # design bdc60b65, question gate-verdict, decided 2026-10-06).
@@ -433,6 +503,24 @@ GATE_TERMINATION_LOG="${GATE_TERMINATION_LOG:-/dev/termination-log}"
 export -n GATE_VERDICT_CARRIER GATE_TERMINATION_LOG
 carried() { [ "$GATE_VERDICT_CARRIER" = pod-log ]; }
 
+# THE JUDGED-INIT LAYOUT (backlog 3e2c8ddc; design b4bf8bba, approved
+# 2026-10-16). The manifest that runs this script as an INIT container,
+# with seed-refresh.sh as the regular container after it, says so with
+# GATE_LAYOUT=judged-init. Then a green ENDS on its verdict: it leaves
+# its seed decision as one line for the helper and does not refresh or
+# empty its workspace, because the conductor reads a verdict only from a
+# container that has ended and the helper does both after it. Any other
+# value - every manifest rendered before that layout - is the old one,
+# which refreshes and cleans here, before the end, as it always did. It
+# is the carried layout's alone: a runner that reports for itself has no
+# end to hurry. Kept from the children for the carrier's reason above.
+GATE_LAYOUT="${GATE_LAYOUT:-}"
+export -n GATE_LAYOUT
+judged_init() { carried && [ "$GATE_LAYOUT" = judged-init ]; }
+# Set by THIS script, never read from a file a branch could write, once
+# the handoff is left: then the workspace belongs to the helper.
+HANDED_OFF=0
+
 # The two lines, and - carried - the second of them as the termination
 # message. All builtins but the digest, so a 500 KB receipt never meets
 # the 128 KB one argv string may weigh (the old report's own ceiling).
@@ -459,11 +547,28 @@ leave_verdict() { # <verdict> <one-line receipt>
 # verdict word, the reason under the key its readers already read
 # (`refused_because` for a refusal, `error` for a death), and the head
 # when there was one.
+# A run that dies AFTER the seed cache roots were looked at carries what
+# the look found, as `seed_refusals` (review f545c047 of car 041ba501,
+# backlog cb78e618): the download caches block's SEED_REFUSALS, three
+# words per refused root, once SEED_ROOTS_CHECKED says the check finished
+# or the list holds a refusal — a planted root the runner could not
+# replace dies HERE, and dropping the list then is the one time it
+# matters most, since that root kills every gate after it. Before the
+# check there is no key, as on the summary path. The words ride after
+# --args, so a planted link's text stays one field.
 early_receipt() { # <verdict> <key> <why>
     jq -nc --arg v "$1" --arg k "$2" --arg w "$3" --arg h "${HEAD_SHA:-}" \
         --arg rs "${RUNNER_SOURCE:-}" --arg rh "${RUNNER_SHA256:-}" \
-        '{verdict: $v, head: $h} + {($k): $w}
-         + (if $rs == "" then {} else {runner_source: $rs, runner_sha256: $rh} end)' 2>/dev/null \
+        --arg checked "${SEED_ROOTS_CHECKED:-}" \
+        '$ARGS.positional as $r
+         | {verdict: $v, head: $h} + {($k): $w}
+         + (if $rs == "" then {} else {runner_source: $rs, runner_sha256: $rh} end)
+         + (if $checked == "yes" or ($r | length) > 0
+            then {seed_refusals: [range(0; ($r | length) - 2; 3) as $i
+                  | {path: $r[$i], found: $r[$i + 1],
+                     changed_at: (if $r[$i + 2] == "" then null else $r[$i + 2] end)}]}
+            else {} end)' \
+        --args ${SEED_REFUSALS[@]+"${SEED_REFUSALS[@]}"} 2>/dev/null \
         || printf '{"verdict":"%s"}' "$1"
 }
 
@@ -534,7 +639,14 @@ SEED_LOCK="$SEED/.seed.lock"
 mkdir -p /gate-target
 exec 8>>/gate-target/.alive
 flock -s 8
-empty_workspace() { find /gate-target -mindepth 1 -delete 2>/dev/null || true; }
+empty_workspace() {
+    # A green on the judged-init layout has handed its workspace to the
+    # seed-refresh container, which copies the target out of it and then
+    # empties it (seed-refresh.sh): emptying it here would delay the
+    # verdict by the delete and leave the helper nothing to copy.
+    if [ "$HANDED_OFF" = 1 ]; then return 0; fi
+    find /gate-target -mindepth 1 -delete 2>/dev/null || true
+}
 
 # --- gate-disk guard (begin) ---
 # A GATE ON THE INSTALL DISK REFUSES; IT DOES NOT RUN (review a79746c6,
@@ -686,8 +798,8 @@ fi
 # rebuilds only the workspace crates, which is the ~14-minute warm
 # gate this rig is known for. The copy runs under a SHARED flock:
 # many seeding readers may overlap freely, but none may overlap the
-# refresher rewriting the snapshot (exclusive lock, end of this
-# script) — a half-rewritten seed under a reader is how you get
+# refresher rewriting the snapshot (exclusive lock, seed-refresh.sh)
+# — a half-rewritten seed under a reader is how you get
 # corrupt rlibs beneath fresh-looking fingerprints, a red that is
 # nobody's code. On any failure or a 15-minute lock timeout, fall
 # back to a cold build: slow and correct.
@@ -737,14 +849,20 @@ seed_target() { # <destination target dir>
               cp -a --reflink=auto "$SEED/target/." "$1/" || exit 1
               cat "$SEED/.seed-head" 2>/dev/null || echo '<unrecorded>'
             ) 9>>"$SEED_LOCK" ) || rc=$?
+    # SEED_COPY is what the copy did, for the receipt's `timeline`.
     case $rc in
-        0) echo "gate-runner: target seeded from head $head in $((SECONDS - t0))s" ;;
-        3) echo "gate-runner: no warm seed at $SEED/target — cold build (~4 min extra, measured 2026-09-28)" ;;
-        *) echo "gate-runner: seed copy failed or lock timed out after $((SECONDS - t0))s — cold build instead"
+        0) SEED_COPY="seeded $head"
+           echo "gate-runner: target seeded from head $head in $((SECONDS - t0))s" ;;
+        3) SEED_COPY=no-seed
+           echo "gate-runner: no warm seed at $SEED/target — cold build (~4 min extra, measured 2026-09-28)" ;;
+        *) SEED_COPY=failed
+           echo "gate-runner: seed copy failed or lock timed out after $((SECONDS - t0))s — cold build instead"
            rm -rf "$1"
            mkdir -p "$1" ;;
     esac
 }
+SEED_COPY=unmounted
+setup_mark seed-copy
 if [ -d "$SEED" ]; then seed_target /gate-target/target; fi
 
 # THE ORDER, MEASURED (646c0ade). One line of JSON for the receipt: the
@@ -795,39 +913,83 @@ else
     echo "gate-runner: /etc/forge/token missing - the clone will fail" >&2
 fi
 
+setup_mark tree
+# --- the gate's tree (begin) ---
 # Own clone: no dependency on the dev pod's PVC, so this Job schedules
 # wherever its nodeSelector says — deliberately NOT the etcd node.
-git clone --depth 50 "$FORGE_URL" /gate-target/repo
+#
+# ONE FETCH, NOT A CLONE AND A FETCH (backlog a531f508). This was
+# `git clone --depth 50` of main and then `git fetch` of the branch:
+# two connections to the forge and two transfers on every gate (about
+# 122 a day), the second asking where the branch is after the
+# bootstrap had already resolved it. Measured from the dev pod against
+# the forge on 2026-10-18, five rounds each, checkout excluded: the
+# clone and the fetch took 2.09-2.16 s and started git-remote-http 4
+# times, the one fetch 1.77-1.87 s and 2. The repository is made empty
+# and the one fetch brings both things the run reads: main (the trunk
+# `gate.sh --auto` derives a car's scope from, and the seed decision
+# compares against) and the commit being gated. `-t main` gives origin
+# the single-branch refspec the clone wrote, so a later `git fetch
+# origin` still means main.
+t_tree=$SECONDS
+git init -q /gate-target/repo
 cd /gate-target/repo
-# Explicit refspec. `git fetch origin <branch>` on a shallow clone
-# updates FETCH_HEAD but creates no remote-tracking ref, so the
-# checkout below died with "origin/<branch> is not a commit" - the
-# second reason this rig had never completed a run.
+git remote add -t main origin "$FORGE_URL"
 # --- gated sha (begin) ---
-git fetch origin "$GATE_BRANCH:refs/remotes/origin/$GATE_BRANCH"
 # ONE SHA FOR THE SCRIPT AND THE TREE (design 1d7a1669). bootstrap.sh
 # resolved the branch once and fetched THIS script from that commit, so
-# the gate checks out that commit, not whatever the branch says now: a
-# push in between would otherwise gate one tree with another tree's
-# runner. A sha the forge no longer has (a force-push beyond the 50 the
-# clone holds) ends the run lost, by name - never a different tree.
-# Started without the bootstrap (no GATE_SHA), the branch head as before.
-GATE_TREE="origin/$GATE_BRANCH"
+# the gate fetches and checks out that commit, not whatever the branch
+# says now: a push in between would otherwise gate one tree with
+# another tree's runner. A sha the forge no longer has (a force-push)
+# fails the fetch and ends the run lost, by name - never a different
+# tree. Started without the bootstrap (no GATE_SHA), the branch head as
+# before, resolved once, here. The explicit refspec is still why
+# origin/<branch> exists at all: a bare `git fetch origin <branch>`
+# writes only FETCH_HEAD, and the checkout died on "origin/<branch> is
+# not a commit" - the second reason this rig never completed a run.
 if [ -n "$GATE_SHA" ]; then
-    if ! git cat-file -e "$GATE_SHA^{commit}" 2>/dev/null; then
-        git fetch --depth 50 origin "$GATE_SHA" \
-            || fail_lost "the gated sha $GATE_SHA of $GATE_BRANCH is not on the forge"
+    GATE_WANT="$GATE_SHA"
+else
+    GATE_WANT="+refs/heads/$GATE_BRANCH:refs/remotes/origin/$GATE_BRANCH"
+fi
+git fetch --depth 50 origin "+refs/heads/main:refs/remotes/origin/main" "$GATE_WANT" \
+    || fail_lost "could not fetch main and ${GATE_SHA:-the head of $GATE_BRANCH} from the forge (a gated sha the forge no longer has, or a forge that did not answer)"
+FORGE_FETCHES=1
+GATE_TREE=$(git rev-parse --verify "${GATE_SHA:-origin/$GATE_BRANCH}^{commit}") \
+    || fail_lost "fetched $GATE_BRANCH but ${GATE_SHA:-origin/$GATE_BRANCH} is not a commit"
+# THE MERGE BASE IS THE SCOPE. The fetch is shallow from both tips, so
+# a branch with 50 commits of its own, or one cut from a main more than
+# 50 behind, arrives with no commit in common with main - and
+# `gate.sh --auto` then derives no scope and refuses the car as having
+# changed nothing. The clone this replaced fetched the branch without a
+# depth, which found the long branch's base and still lost the old
+# one's. Here both get the full history, on a second fetch named in the
+# log; a deepen that fails leaves the run as it was, and says so.
+if ! git merge-base origin/main "$GATE_TREE" >/dev/null 2>&1; then
+    echo "gate-runner: $GATE_TREE shares no commit with main within depth 50 - fetching the full history"
+    if git fetch -q --unshallow origin "+refs/heads/main:refs/remotes/origin/main" "$GATE_TREE"; then
+        FORGE_FETCHES=2
+    else
+        echo "gate-runner: WARN: could not deepen; a scoped gate will find no merge base with main" >&2
     fi
-    GATE_TREE="$GATE_SHA"
 fi
 git checkout -B "$GATE_BRANCH" "$GATE_TREE"
 HEAD_SHA=$(git rev-parse HEAD)
 # --- gated sha (end) ---
+# The tree's cost rides the receipt as `clone` (the summary block):
+# seconds from the empty directory to the checkout, and the forge
+# fetches it took. The bootstrap's own fetch is a separate process and
+# is not counted here; the seed decision's re-read of main is added as
+# `seed_fetches` before the receipt (9f3a6107).
+CLONE_JSON="{\"s\":$((SECONDS - t_tree)),\"fetches\":$FORGE_FETCHES}"
+echo "gate-runner: tree $GATE_BRANCH@$HEAD_SHA in $((SECONDS - t_tree))s, $FORGE_FETCHES forge fetch(es)"
+# --- the gate's tree (end) ---
 # The checkout is the last write to the sources and nothing has built
 # yet, so this is the order cargo will judge. It rides the receipt as
 # `seed_order` (the summary block below); a failed measurement is an
 # absent field, never a failed gate.
 t_order=$SECONDS
+setup_mark seed-order
 SEED_ORDER=$(seed_order_json /gate-target/target /gate-target/repo) || SEED_ORDER=""
 echo "gate-runner: seed order ${SEED_ORDER:-<unmeasured>} (measured in $((SECONDS - t_order))s)"
 
@@ -903,13 +1065,20 @@ export CARGO_TARGET_DIR=/gate-target/target
 # one-week-old cache was 658M, 376M of it .tmp. In /gate-target that
 # died with the run; on the seed it grows without bound. So each gate
 # removes the .tmp entries whose CTIME is over 240 minutes old. ctime,
-# not mtime: a swapped-out directory keeps its old mtime while another
-# install may still be copying out of it, but the rename that swapped
-# it stamped its ctime. 240 minutes is past the Job's
-# activeDeadlineSeconds (10800 s), so no live install can own an entry
-# that old, and the pin holds the two apart. Errors are tolerated — two
-# gates sweeping at once race for the same entries, and a sweep is
-# never worth a gate. Measured 2026-10-16 (run 797f3b9b, bun 1.3.14,
+# not mtime: the rename that swaps a directory out stamps its ctime on
+# every filesystem, while whether it stamps the mtime too depends on
+# the filesystem — xfs (the gate volume) does, ext4 keeps the old one
+# (review 40731bb5, N1) — and an -mmin sweep on ext4 would take a
+# directory another install may still be copying out of. 240 minutes
+# is a full hour past the Job's activeDeadlineSeconds (10800 s) and the
+# grace its pod gets to die, so no live install can own an entry that
+# old, and the pin holds the hour. Only .tmp's ENTRIES (-mindepth 1):
+# .tmp itself is as old as the cache. The count is of what rm REMOVED,
+# and rm's errors stay on stderr (review 40731bb5, N2: it counted
+# find's matches with the errors discarded, so a refused entry read as
+# swept). Neither is ever fatal — two gates sweeping at once race for
+# the same entries, and may each count one the other removed, and a
+# sweep is never worth a gate. Measured 2026-10-16 (run 797f3b9b, bun 1.3.14,
 # cache and project on different devices): six installs with no sweep
 # left 18 entries and 15M, growing by 3 each; eight installs each behind
 # this block, its age scaled to 30 s, held .tmp at 6. Its cost, on a
@@ -924,6 +1093,33 @@ export CARGO_TARGET_DIR=/gate-target/target
 # The [ -d ] probe is a SKEW guard: a session gating from a stale
 # checkout renders the old manifest, which mounts no /gate-seed. That
 # run must cost speed, not the gate — cold and loud beats dead.
+#
+# A CACHE ROOT IS A REAL DIRECTORY, OR IT IS REPLACED (backlog
+# 822223ec, review 40731bb5 N5). Every gate runs branch code as the gate
+# uid with /gate-seed writable, so a branch can leave a symlink or a
+# file where a cache root should be. A live link sent every later gate's
+# cache, and the .tmp sweep above, into the directory it named; a
+# dangling one, or a file, killed every later gate at mkdir -p ("File
+# exists") until a human removed it — both measured on a scratch seed.
+# So each root, and the .tmp that bun unpacks into and the sweep reads,
+# is checked before anything uses it, link first, since [ -d ] answers
+# yes THROUGH a link: anything but a real directory is named on the log
+# with its ctime (when it was planted, which places the gate that did
+# it), removed — the link itself, never what it names — and a real
+# directory made in its place.
+# OWNERSHIP IS NOT CHECKED, deliberately: a branch runs as the gate uid
+# without CAP_CHOWN, so all it can plant is owned by the gate uid, and
+# an owner check cannot tell a planted root from a real one. The only
+# root it would single out is one an older root-run gate made, and
+# "recreating" that means deleting a cache other gates are reading.
+# What this does NOT close is the rest of the writable-seed class, whose
+# answer is a seed branch code cannot write, not a check at start: a
+# branch gated BESIDE another can swap a root under it mid-run, and what
+# is planted INSIDE a real root (a cached package, a file cargo reads
+# from its home) is used as it stands.
+# The `environment` phase: these caches and their sweep, the CPU bound,
+# and the runtime evidence's start, up to the checks.
+setup_mark environment
 # --- download caches (begin) ---
 if [ -d "$SEED" ]; then
     export CARGO_HOME="$SEED/cargo"
@@ -933,11 +1129,111 @@ else
     export CARGO_HOME=/gate-target/cargo
     export BUN_INSTALL_CACHE_DIR=/gate-target/.bun/install/cache
 fi
-mkdir -p "$CARGO_HOME" "$BUN_INSTALL_CACHE_DIR"
-bun_tmp_swept=$(find "$BUN_INSTALL_CACHE_DIR/.tmp" -mindepth 1 -maxdepth 1 -cmin +240 \
-    -print -exec rm -rf {} + 2>/dev/null | wc -l) || true
-echo "gate-runner: download caches CARGO_HOME=$CARGO_HOME BUN_INSTALL_CACHE_DIR=$BUN_INSTALL_CACHE_DIR (swept ${bun_tmp_swept:-0} stale .tmp entries)"
+# EACH REFUSAL RIDES THE RECEIPT, not only this log (backlog cb78e618).
+# The REFUSED line below died with the pod log, so a gate that replaced
+# a planted root read exactly like one that found nothing, and the one
+# fact that should reach a human — a branch planted something on the
+# seed — reached nobody. SEED_REFUSALS keeps (path, what, ctime) per
+# refusal as separate array words, so what a planted link names (the
+# planting branch's own text) stays one field, and the receipt summary
+# carries them as `seed_refusals`. Valid UTF-8 is retained; invalid bytes
+# become replacement characters so Rust can read the JSON receipt.
+# SEED_ROOTS_CHECKED is what makes an empty list mean "looked, all real" rather than "never
+# looked": a runner that died before this point leaves no key at all.
+# A root it CANNOT replace — a planted link under a seed directory the
+# branch owned and chmodded 0555 — ends the run through fail_lost, whose
+# early receipt carries the list and whose error names the root (review
+# f545c047, F1: the ERR trap's receipt used to drop both, and said only
+# a line number). The link's text is read past a sentinel, since a
+# command substitution strips trailing newlines and the text is the
+# planting branch's own (F2); the ctime is the UTC instant every other
+# receipt time is, not stat's local text (F3).
+SEED_REFUSALS=()
+real_cache_dir() { # <path>: a real directory when it returns 0
+    local what changed target
+    if [ -L "$1" ]; then
+        target=$(readlink -- "$1" || true; printf .)
+        target=${target%.}
+        target=${target%$'\n'}
+        what="a symbolic link to '$target'"
+    elif [ -e "$1" ] && [ ! -d "$1" ]; then
+        what="a $(stat -c %F -- "$1" || true)"
+    else
+        mkdir -p -- "$1"
+        return
+    fi
+    changed=$(date -u -d "@$(stat -c %Z -- "$1")" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || changed=""
+    SEED_REFUSALS+=("$1" "$what" "$changed")
+    echo "gate-runner: REFUSED $1: $what, not a real directory, changed $changed — gated branch code can plant one on the shared seed (backlog 822223ec); removing it and making a real one"
+    rm -f -- "$1" && mkdir -p -- "$1" \
+        || fail_lost "could not replace the planted seed root $1 ($what) — every gate on this seed dies here until it is removed (backlog cb78e618)"
+}
+real_cache_dir "$CARGO_HOME"
+real_cache_dir "$BUN_INSTALL_CACHE_DIR"
+real_cache_dir "$BUN_INSTALL_CACHE_DIR/.tmp"
+SEED_ROOTS_CHECKED=yes
+bun_tmp_swept=0
+bun_tmp_stuck=0
+while IFS= read -r -d '' entry; do
+    if rm -rf -- "$entry"; then
+        bun_tmp_swept=$((bun_tmp_swept + 1))
+    else
+        bun_tmp_stuck=$((bun_tmp_stuck + 1))
+    fi
+done < <(find "$BUN_INSTALL_CACHE_DIR/.tmp" -mindepth 1 -maxdepth 1 -cmin +240 -print0)
+bun_tmp_note="swept $bun_tmp_swept stale .tmp entries"
+if [ "$bun_tmp_stuck" -gt 0 ]; then
+    bun_tmp_note="$bun_tmp_note, $bun_tmp_stuck could not be removed — rm's errors on stderr name them"
+fi
+echo "gate-runner: download caches CARGO_HOME=$CARGO_HOME BUN_INSTALL_CACHE_DIR=$BUN_INSTALL_CACHE_DIR ($bun_tmp_note)"
 # --- download caches (end) ---
+
+# WHAT THE CACHES HELD, ON THE RECEIPT (backlog e30098d3, finding 3 of
+# review 2f67531c). The line above names the caches this gate uses and
+# dies with the pod log when the Job is reaped; nothing durable said a
+# gate ran on the seed's caches, or that they held anything. Nor can
+# `web install`'s seconds stand in: measured 2026-10-19 over 52
+# gate-runs of 2026-10-16, the install took 0-3 s on an empty per-run
+# cache (runner 5185619e) and 0-1 s on the seed's (runner a5281011). So
+# each cache is COUNTED here, before the checks, and again after them
+# (CACHE_END, at `setup_mark checks-end`), and the receipt carries both
+# as `caches`: crate archives under CARGO_HOME's registry/cache, and
+# bun's `<name>@<version>@@@<n>` package directories, at the top or
+# under a scope — not the per-name directories of symlinks bun keeps
+# beside them, not .tmp. A count that cannot be read is `-`, which the
+# receipt carries as null, never as a zero. Two finds of a few hundred
+# directories each; no gate ever waits on this.
+#
+# WHAT IT DOES NOT PROVE: that what is cached is whole. bun 1.3.14
+# renames an extracted package into place without an fsync first
+# (sys.zig), so a node reset right after a cache miss could leave
+# zero-length files at a final path that every later gate then copies
+# from, since a hit is only "the directory exists" — and cargo's
+# registry cache has the same residual in principle. Accepted, not
+# fixed (e30098d3): no such reset-after-miss has been measured, a
+# verify-on-hit would mean re-checking every package on every gate, and
+# the repair is cheap and total — remove the seed's bun-install-cache
+# (or cargo/) and the next gate refills it. The counts are what place
+# such a fault: the first gate after the reset whose installs fail,
+# beside a start count that did not grow.
+# --- cache evidence (begin) ---
+cache_counts() { # "<crate archives> <bun packages>", each `-` when unreadable
+    local crates=- packages=-
+    if [ -d "$CARGO_HOME/registry/cache" ]; then
+        crates=$(find "$CARGO_HOME/registry/cache" -mindepth 2 -maxdepth 2 -name '*.crate' | wc -l) || crates=-
+    elif [ -d "$CARGO_HOME" ]; then
+        crates=0
+    fi
+    if [ -d "$BUN_INSTALL_CACHE_DIR" ]; then
+        packages=$(find "$BUN_INSTALL_CACHE_DIR" -mindepth 1 -maxdepth 2 -path "$BUN_INSTALL_CACHE_DIR/.tmp" -prune \
+            -o -type d -name '*@@@*' -print | wc -l) || packages=-
+    fi
+    echo "$crates $packages"
+}
+CACHE_START="$SEED $CARGO_HOME $BUN_INSTALL_CACHE_DIR $(cache_counts)"
+read -r _ _ _ start_crates start_packages <<<"$CACHE_START"
+echo "gate-runner: cache contents at start: $start_crates crate archive(s) in CARGO_HOME, $start_packages package(s) in BUN_INSTALL_CACHE_DIR"
+# --- cache evidence (end) ---
 
 # Build parallelism follows the CPU the container was actually GIVEN.
 # It was pinned at 4, so raising the gate ceiling from 6 CPU to 20 in
@@ -970,9 +1266,12 @@ CPUS=$(gate_cpus)
 # unattributable. Widen it as a separate, measured change.
 #
 # What WAS widened is the number of test BINARIES at a time (backlog
-# 2d234222): infra/cargo-test-wide.sh runs a quarter of CARGO_BUILD_JOBS
-# of them at once, at most four, each still 2 threads — its header says
-# why four, and the receipt's `test_binaries` says what it cost.
+# 2d234222): infra/cargo-test-wide.sh runs half of CARGO_BUILD_JOBS of
+# them at once, at most four (the gate drive's bound, measured at eight
+# by gate 62826a81) and no more than the sidecar's max_connections
+# admits (62435ba1), each still 2 threads — its header says why, and the
+# receipt's `test_binaries` says what it cost and, as `width_bound`,
+# which bound set the width.
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$CPUS}" RUST_TEST_THREADS="${RUST_TEST_THREADS:-2}"
 export BOSS_GATE_RUNTIME_EVIDENCE=/gate-target/runtime-evidence.jsonl
 export BOSS_GATE_SOURCE_HEAD="$HEAD_SHA"
@@ -1032,15 +1331,23 @@ echo "gate-runner: web budgets scaled for gate load (BOSS_WEB_GATE_LOAD=1; the f
 # the_gate_builds_the_web_app_once.rs holds that.
 
 RECEIPT=/gate-target/receipt.json
+setup_mark checks
 if BOSS_GATE_RECEIPT="$RECEIPT" ./infra/gate.sh ${GATE_MODE:-} > /gate-target/gate.log 2>&1; then
     VERDICT=green
 else
     VERDICT=failed
 fi
+setup_mark checks-end
+# The caches counted again, every check done (the "cache evidence"
+# block says what the pair shows and what it does not).
+CACHE_END=$(cache_counts)
 python3 infra/gate-runner/runtime-evidence.py sample "$BOSS_GATE_RUNTIME_EVIDENCE" runner-finish \
     || { echo 'gate-runtime-evidence: runner-finish collection failed'; printf '%s\n' runner-finish >> "${BOSS_GATE_RUNTIME_EVIDENCE}.failed"; }
 python3 infra/gate-runner/runtime-evidence.py merge "$BOSS_GATE_RUNTIME_EVIDENCE" "$RECEIPT" \
     || { echo 'gate-runtime-evidence: final receipt merge failed; original receipt preserved'; printf '%s\n' receipt-merge >> "${BOSS_GATE_RUNTIME_EVIDENCE}.failed"; }
+# The whole of gate.log, before the extractor below reduces it (the
+# gate-log retention block says why).
+retain_gate_log /gate-target/gate.log "$RECEIPT"
 retain_runtime_raw
 # THE VERDICT COMES FROM THE RECEIPT, not from a second reading of the
 # exit status (backlog c67bdbae). gate.sh already decided and wrote it
@@ -1205,7 +1512,17 @@ RE_PANIC_NEW = re.compile(r"^thread '([^']*)'(?: \(\d+\))? panicked at (\S+):$")
 # Where a panic's message stops: cargo's hint, a captured backtrace, or
 # the `failures:` roll-call that follows the last block.
 RE_MESSAGE_END = re.compile(r"^(note: run with `RUST_BACKTRACE|stack backtrace:$|failures:$)")
-RE_ERROR = re.compile(r"^\s*(error(\[E\d{4}\])?|Error|ERROR)\b[: ]")
+# No `\b` before `[: ]`: that class is already a non-word character, so
+# the boundary only ever refused something - the coded `error[E0308]:`,
+# whose `]` and `:` are both non-word, so `\b` could not sit between
+# them. Every coded rustc error was dropped, and red train 1042cc8a
+# (2026-10-19) quoted cargo's `could not compile` summary as its only
+# error line while the E0308 and its file:line sat in the log tail
+# (backlog 6e2709ab).
+RE_ERROR = re.compile(r"^\s*(error(\[E\d{4}\])?|Error|ERROR)[: ]")
+# Cargo's own summary of the errors above it. It names the crate, never
+# the cause, so error_lines ranks it after every line that does.
+RE_ERROR_SUMMARY = re.compile(r"^\s*error: (could not compile|aborting due to)\b")
 RE_ARROW = re.compile(r"^\s*--> (\S+)")
 
 
@@ -1244,13 +1561,15 @@ def failing_tests(body):
 
 
 def panics(body):
-    """(test or None, location, message) for each panic cargo printed.
+    """(test or None, location, message, thread) for each panic cargo
+    printed.
 
     Attributed to the `---- <test> stdout ----` block it appeared in,
     falling back to the panicking thread's name - which for a plain
     `#[test]` IS the test name. Both cargo panic formats are read: the
     current two-line one (location, then the message) and the older
-    single-line `panicked at 'msg', location`.
+    single-line `panicked at 'msg', location`. The thread is kept
+    because a block can hold more than one panic (see `own_panic`).
     """
     out, block = [], None
     for i, line in enumerate(body):
@@ -1260,12 +1579,39 @@ def panics(body):
             continue
         m = RE_PANIC_OLD.match(line)
         if m:
-            out.append((block or m.group(1) or None, m.group(3), m.group(2)))
+            out.append((block or m.group(1) or None, m.group(3), m.group(2), m.group(1)))
             continue
         m = RE_PANIC_NEW.match(line)
         if m:
-            out.append((block or m.group(1) or None, m.group(2), message_after(body, i)))
+            out.append((block or m.group(1) or None, m.group(2), message_after(body, i),
+                        m.group(1)))
     return out
+
+
+THREAD_CHARS = 60      # characters of another thread's name quoted in an entry
+
+
+def own_panic(test, found):
+    """(location, message, the panics on other threads printed before it)
+    for the panic that failed `test`, or None when its block has none.
+
+    THE TEST THREAD'S PANIC, NOT THE FIRST ONE (backlog 33728b07). libtest
+    runs each test on a thread named after it, and a task the test spawns
+    panics into the same `---- <test> stdout ----` block. A test whose
+    EXPECTED path panics in a spawned task prints that panic first: train
+    gate-runs 73ec4f20 and 07c90481 (2026-11-04) named a deliberate
+    `RecvError` on 'tokio-rt-worker' as the failure, and the assertion
+    that failed sat on the test's own thread two lines below. Every
+    reader of `fails` takes the first `panicked at` in an entry
+    (failure_facts' classifier, the judged-red and drift readers), so the
+    own thread's panic is chosen; with none on that thread (a harness
+    that runs the test elsewhere) the first panic stands, as before."""
+    mine = [(loc, msg, thread) for t, loc, msg, thread in found if t == test]
+    if not mine:
+        return None
+    at = next((i for i, (_, _, thread) in enumerate(mine) if thread == test), 0)
+    loc, msg, _ = mine[at]
+    return loc, msg, [thread for _, _, thread in mine[:at]]
 
 
 def message_after(body, i):
@@ -1306,18 +1652,26 @@ DIFF_SCAN = 60         # lines read past a diff header before giving up on its e
 def error_lines(body):
     """Error lines with their `-->` location, for checks that are not
     cargo-test-shaped: a compile error, clippy, svelte-check. This is as
-    far as the evidence goes - no test name is invented from them."""
+    far as the evidence goes - no test name is invented from them.
+    Cargo's `could not compile` / `aborting due to` summaries come last
+    (stable, so each group keeps log order): with several crates failing
+    they interleave with the causes, and PER_CHECK would otherwise quote
+    summaries in place of a later crate's real error (backlog 6e2709ab)."""
     out = []
     for i, line in enumerate(body):
         if RE_ERROR.match(line):
             where = ""
             for nxt in body[i + 1:i + 3]:
+                if RE_ERROR.match(nxt):
+                    break
                 m = RE_ARROW.match(nxt)
                 if m:
                     where = " (%s)" % m.group(1)
                     break
-            out.append(line.strip() + where)
-    return out
+            out.append((bool(RE_ERROR_SUMMARY.match(line)), line.strip() + where))
+    # The same cause can be emitted by both lib and lib-test builds.
+    # Keep distinct locations, but spend only one quoted slot per cause.
+    return list(dict.fromkeys(e for _, e in sorted(out, key=lambda p: p[0])))
 
 
 # A `✘` is printed for every test whose status is not `passed` - and
@@ -1752,19 +2106,37 @@ def detail(name, got):
     out = []
     tests = failing_tests(body)
     found = panics(body)
-    where = {}
-    for test, loc, msg in found:
-        if test is not None and test not in where:
-            where[test] = (loc, msg)
 
     if tests:
         for test in tests[:PER_CHECK]:
-            loc, msg = where.get(test, (None, None))
-            if loc is None:
+            own = own_panic(test, found)
+            if own is None:
                 out.append("%s: %s - FAILED, with no panic line for it in this check's "
                            "output" % (name, test))
-            else:
+                continue
+            loc, msg, before = own
+            if not before:
                 out.append("%s: %s - panicked at %s: %s" % (name, test, loc, msg))
+                continue
+            # The earlier panics are context, so they are counted and the
+            # first one's thread named AHEAD of the located rung, where no
+            # reader takes a location or a message from: their own
+            # `panicked at` and message stay in the excerpt, whole, and a
+            # second one here would read as a second located failure.
+            # A thread's name is the spawner's free text, so one named
+            # `panicked at x.rs:1:1: deadline exhausted` would put the
+            # entry's FIRST delimiter inside this quote and every reader
+            # would take its location and message from the name (review
+            # 78a9d826 R1: failure_facts read the equipment phrase and
+            # waived a branch's assertion as the drive's). The quote
+            # spells the phrase `panicked-at`, before the cut so a cut
+            # cannot leave a whole one; the excerpt prints the name as is.
+            first = before[0].replace("panicked at", "panicked-at")
+            if len(first) > THREAD_CHARS:
+                first = first[:THREAD_CHARS] + "..."
+            out.append("%s: %s - after %d panic(s) on other threads ('%s' first, quoted in the "
+                       "excerpt), its own thread panicked at %s: %s" % (
+                           name, test, len(before), first, loc, msg))
         if len(tests) > PER_CHECK:
             out.append("%s: + %d more failing test(s) not named here (%d failed in all) - the "
                        "Job log replay lists them" % (name, len(tests) - PER_CHECK, len(tests)))
@@ -1784,7 +2156,7 @@ def detail(name, got):
                            name, len(unit) - PER_CHECK, len(unit)))
         return out
 
-    loose = [(loc, msg) for _, loc, msg in found]
+    loose = [(loc, msg) for _, loc, msg, _ in found]
     if loose:
         for loc, msg in loose[:PER_CHECK]:
             out.append("%s: panicked at %s: %s (no failing test name in this check's "
@@ -2041,6 +2413,43 @@ if [ -s "$RECEIPT" ] && [ "$(jq -r '.verdict // empty' "$RECEIPT" 2>/dev/null ||
     VERDICT=refused
 fi
 
+# --- main, re-read for the seed (begin) ---
+# THE SEED DECISION'S FETCH IS COUNTED (backlog 9f3a6107). The decision
+# at the end asks the forge whether main moved during the gate, which is
+# a deliberate second fetch of main; it used to make it inside
+# `$(seed_decision)`, after this receipt was written, so `clone.fetches`
+# read 1 on a run that had gone to the forge twice. It is made here
+# instead, by the same rule the decision applied (a seed to refresh, a
+# green verdict - the verdict is final above), and rides the receipt as
+# `clone.seed_fetches`, beside the tree's own `fetches`: one is what the
+# tree cost, the other what the seed check cost, and their sum is every
+# trip the run made but one: a --unshallow deepen above that FAILS is not
+# counted in `fetches` (review 1527ebca, N2; the tree's count is left as
+# it is here). The decision then reads SEED_MAIN and fetches
+# nothing. A failed fetch was still a trip, so it is counted too.
+#
+# BOUNDED, BECAUSE THE VERDICT IS NOT LEFT YET (review 1527ebca, B2).
+# This runs before `leave_verdict`; inside seed_decision it ran after.
+# Unbounded, a forge that accepts and never answers held a green gate's
+# receipt line and termination message unwritten for as long as it
+# stalled, and a container that ended meanwhile was settled `lost`. So
+# the trip has 60 s (KILL 5 s later), and a fetch the bound stopped is
+# a failed one: the seed is not refreshed, and the trip is counted.
+# Pinned against a listener that accepts and never answers
+# (a_stalled_forge_cannot_hold_the_verdict).
+SEED_MAIN=not-needed
+SEED_FETCHES=0
+if [ -d "${SEED:-}" ] && [ "${VERDICT:-}" = green ]; then
+    SEED_FETCHES=1
+    if timeout -k 5 60 git fetch --depth 50 origin "+main:refs/remotes/origin/main" >/dev/null 2>&1; then
+        SEED_MAIN=fetched
+    else
+        SEED_MAIN=fetch-failed
+    fi
+fi
+[ -z "${CLONE_JSON:-}" ] || CLONE_JSON="${CLONE_JSON%\}},\"seed_fetches\":$SEED_FETCHES}"
+# --- main, re-read for the seed (end) ---
+
 # --- receipt summary (begin) ---
 # THE PACKET KEEPS THE WHOLE RECEIPT.
 #
@@ -2081,15 +2490,120 @@ fi
 # `runner_source` / `runner_sha256` (and `runner_fallback_reason` when
 # there is one) name the script that produced this receipt — the
 # "runner provenance" block at the top (backlog e3100bc8).
+#
+# `clone` is what the gate's tree cost: `s`, seconds from the empty
+# directory to the checkout, and `fetches`, the forge fetches it took
+# (the "the gate's tree" block; backlog a531f508), so the one-fetch
+# claim is read off every receipt rather than believed; `seed_fetches`,
+# the seed decision's re-read of main (0 or 1; backlog 9f3a6107).
+#
+# `timeline` is the "runner timeline" marks at the top (backlog
+# d777b20a): `runner_started_at`, each phase's `at` and `s` (the next
+# mark's instant less its own, so the checks' seconds end at
+# `ended_at`), the seed copy's `outcome` and `seed_head`, and `setup_s`,
+# runner start to the checks. Beside the packet's `queued_at` and
+# `launched_at` it divides a gate's wall time into queue, pod start,
+# setup and checks. An unread instant is null, and so is every number
+# it would have entered; no marks at all is no key.
+#
+# `caches` is the "cache evidence" block (backlog e30098d3): the two
+# cache paths, `on_seed` when both are under the seed, and each cache's
+# count at the start and the end of the checks. An unread count is null;
+# a runner that counted nothing adds no key.
+#
+# `seed_refusals` is the "download caches" block's SEED_REFUSALS
+# (backlog cb78e618): one {path, found, changed_at} per seed cache root
+# that was not a real directory and was replaced — `changed_at` is its
+# ctime as a UTC instant, which places the gate that planted it. An empty
+# list is a runner that checked every root and found each real; no key
+# is a runner that never reached the check (a run that died after it
+# carries the list on early_receipt's lost). The words come after the
+# fixed arguments, three per refusal, so nothing a planted link names
+# can split into a second entry.
 SUMMARY=$(python3 - "$RECEIPT" "$HEAD_SHA" "${SEED_ORDER:-}" \
-    "${RUNNER_SOURCE:-}" "${RUNNER_SHA256:-}" "${RUNNER_FALLBACK_REASON:-}" <<'PY'
-import json, sys
+    "${RUNNER_SOURCE:-}" "${RUNNER_SHA256:-}" "${RUNNER_FALLBACK_REASON:-}" \
+    "${CLONE_JSON:-}" "${SETUP_MARKS:-}" "${SEED_COPY:-}" \
+    "${CACHE_START:-}" "${CACHE_END:-}" "${SEED_ROOTS_CHECKED:-}" \
+    ${SEED_REFUSALS[@]+"${SEED_REFUSALS[@]}"} <<'PY'
+import datetime, json, sys
+def instant(at):
+    try:
+        return datetime.datetime.strptime(at, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError:
+        return None
+def seconds(start, end):
+    a, b = instant(start or ""), instant(end or "")
+    return round((b - a).total_seconds(), 3) if a and b else None
+def timeline():
+    marks = [(m.split("=", 1) + [""])[:2] for m in sys.argv[8].split()]
+    if not marks:
+        return None
+    ats = {name: (at if instant(at) else None) for name, at in marks}
+    phases = []
+    for i, (name, at) in enumerate(marks):
+        if name == "checks-end":
+            continue
+        following = marks[i + 1][1] if i + 1 < len(marks) else ""
+        phase = {"phase": name, "at": ats[name], "s": seconds(at, following)}
+        if name == "seed-copy" and sys.argv[9]:
+            outcome, _, head = sys.argv[9].partition(" ")
+            phase["outcome"] = outcome
+            if head:
+                phase["seed_head"] = head
+        phases.append(phase)
+    return {"runner_started_at": ats.get("prepare"),
+            "setup_s": seconds(ats.get("prepare"), ats.get("checks")),
+            "ended_at": ats.get("checks-end"),
+            "phases": phases,
+            "method": "date -u at each phase boundary of infra/gate-runner/run.sh, to the "
+                      "millisecond; a phase's s runs to the next mark"}
+def caches():
+    start, end = sys.argv[10].split(), sys.argv[11].split()
+    if len(start) < 3:
+        return None
+    seed, cargo, bun = start[:3]
+    def count(words, i):
+        try:
+            return int(words[i])
+        except (IndexError, ValueError):
+            return None
+    under = seed.rstrip("/") + "/"
+    return {"cargo_home": cargo, "bun_install_cache_dir": bun,
+            "on_seed": cargo.startswith(under) and bun.startswith(under),
+            "cargo_crates": {"start": count(start, 3), "end": count(end, 0)},
+            "bun_packages": {"start": count(start, 4), "end": count(end, 1)},
+            "method": "crate archives under CARGO_HOME/registry/cache and bun package "
+                      "directories under BUN_INSTALL_CACHE_DIR, counted before and after the "
+                      "checks; a start above zero began on a populated cache, an end equal to "
+                      "it downloaded nothing into it (concurrent gates share the seed's), and "
+                      "neither says the cached files are whole: no integrity is checked"}
+def seed_refusals():
+    if sys.argv[12] != "yes":
+        return None
+    words = [word.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+             for word in sys.argv[13:]]
+    return [{"path": words[i], "found": words[i + 1], "changed_at": words[i + 2] or None}
+            for i in range(0, len(words) - 2, 3)]
 def with_order(body):
+    marked = timeline()
+    if isinstance(body, dict) and marked:
+        body["timeline"] = marked
+    cached = caches()
+    if isinstance(body, dict) and cached:
+        body["caches"] = cached
+    refused = seed_refusals()
+    if isinstance(body, dict) and refused is not None:
+        body["seed_refusals"] = refused
     if isinstance(body, dict) and sys.argv[3]:
         try:
             body["seed_order"] = json.loads(sys.argv[3])
         except ValueError:
             body["seed_order"] = {"unparsed": sys.argv[3]}
+    if isinstance(body, dict) and sys.argv[7]:
+        try:
+            body["clone"] = json.loads(sys.argv[7])
+        except ValueError:
+            body["clone"] = {"unparsed": sys.argv[7]}
     if isinstance(body, dict) and sys.argv[4]:
         body["runner_source"] = sys.argv[4]
         body["runner_sha256"] = sys.argv[5] or None
@@ -2245,14 +2759,10 @@ if [ "$VERDICT" != green ]; then
     echo "=== end of failed-check replay ==="
 fi
 
-# REFRESH THE SEED — the housekeeping that keeps parallel gates warm.
-# Runs AFTER the verdict is reported (a refresh must never delay a
-# `--wait`), and only from a run whose target is worth inheriting.
-# (CARRIED, IT DOES DELAY ONE, and that is the price of the layout: the
-# conductor reads the verdict only once this container has ended, so a
-# green waits out its refresh before the packet says so. The verdict is
-# already safe - the frame and the termination message were written
-# above - only later.)
+# --- seed housekeeping (begin) ---
+# REFRESH THE SEED — the housekeeping that keeps parallel gates warm —
+# AND EMPTY THE WORKSPACE. Both run AFTER the verdict is left, and only a
+# run whose target is worth inheriting refreshes:
 #
 #   - GREEN only. A red run's target is usually fine (test failures
 #     still compile), but a compile-error red would seed broken
@@ -2263,82 +2773,84 @@ fi
 #     in the common case and small when a train merged mid-gate. Past
 #     2 the branch is stale-based and its target would seed the
 #     distance to main into every later gate.
-#   - EXCLUSIVE, NON-BLOCKING lock. Readers hold the lock shared while
-#     copying; a second refresher just skips (-n) — best-effort
-#     housekeeping does not queue.
-#   - STAGE THEN RENAME. The copy lands in target.partial and is
-#     mv-ed into place; a pod that dies mid-refresh (w-1 has reset
-#     mid-gate before) leaves a MISSING seed — next gate cold, slow,
-#     correct — never a torn one under a fresh-looking marker. The
-#     old seed is removed first because two targets (~74G each) do
-#     not fit the 120Gi volume; the cold window is the price of
-#     fitting, and it only opens on a mid-refresh death.
-# PRUNE THE STALE BINARIES BEFORE THE SEED IS RENAMED INTO PLACE.
-# Measured 2026-09-17 17:58Z, the day the seed grew past the workspace:
-# /gate-seed/target was 154G, 153G of it debug/deps, and 3,226 of those
-# files were TEST AND BIN EXECUTABLES — 138 builds of `boss`, 195 of
-# `boss_dispatcher`, 126 of `rebuild_e2e`, each 50–110 MB, one per
-# gate that ever relinked them. Cargo names an executable
-# <stem>-<16 hex> and never deletes a superseded one, so the seed
-# grows by every relink and a reflink copy of it is measured by the
-# kubelet at full size: the train gate for #424 was evicted two minutes
-# in ("Usage of EmptyDir volume gate-workspace exceeds the limit
-# 160Gi") before a single check ran, and settled LOST. An executable is
-# never reused across source changes — the next gate relinks it in
-# seconds — so the seed keeps ONE per stem (the newest) and drops the
-# rest. Libraries (.rlib/.rmeta/.so/.d) are untouched: those ARE the
-# warmth. Pure over its argument; the refresh calls it on the staged
-# copy, so a torn prune can only ever touch target.partial.
-prune_seed_binaries() { # <deps dir> — prints "pruned N binaries, M MiB"
-    local deps="$1" n=0 bytes=0 f stem
-    [ -d "$deps" ] || { echo "pruned 0 binaries, 0 MiB"; return 0; }
-    # newest first, so the first of each stem is the keeper
-    while IFS= read -r f; do
-        case "$f" in *.*) continue ;; esac
-        [ -f "$deps/$f" ] && [ -x "$deps/$f" ] || continue
-        stem=$(printf '%s' "$f" | sed -E 's/-[0-9a-f]{16}$//')
-        [ "$stem" = "$f" ] && continue
-        case " $KEPT " in *" $stem "*)
-            bytes=$((bytes + $(stat -c %s "$deps/$f")))
-            rm -f -- "$deps/$f" "$deps/$f.d" && n=$((n + 1)) ;;
-        *) KEPT="$KEPT $stem" ;;
-        esac
-    done < <(ls -t "$deps" 2>/dev/null)
-    echo "pruned $n binaries, $((bytes / 1048576)) MiB"
-}
+#   - NOT ALREADY CURRENT: a seed at this very head is not rewritten.
+# The refresh itself - the exclusive non-blocking lock, the staged copy,
+# the prune, the rename - is seed-refresh.sh's, ONE definition for both
+# layouts (that file says why each part is there).
+#
+# WHERE IT RUNS IS THE LAYOUT'S (backlog 3e2c8ddc; design b4bf8bba). The
+# conductor reads the verdict only once this container has ENDED, so on
+# the old layout a green waited out its refresh and its workspace delete
+# before the packet said so: 638 s of copy on gate-run 86dd2d48, about
+# eight minutes of a delete in uninterruptible I/O on 4aad01a9 (82ffaff3).
+# On the judged-init layout this container is an init container and the
+# decision below is all it does: one line, `refresh <head>` or
+# `skip <why>`, left where the seed-refresh container reads it, and then
+# it ends on its verdict. The decision needs git and the branch's clone,
+# so it is made here, before the end, in seconds; the helper takes no git
+# and no branch file as code. A red ends nonzero, the helper never
+# starts, and the EXIT trap empties the workspace here as before.
+SEED_REFRESH_SH="$(dirname "${BASH_SOURCE[0]}")/seed-refresh.sh"
+# Under the bootstrap (design 1d7a1669) this script runs from the gated
+# sha's checkout, which holds no sibling: main's copy is the ConfigMap's.
+[ -f "$SEED_REFRESH_SH" ] || SEED_REFRESH_SH=/repo-script/seed-refresh.sh
 
-refresh_seed() {
-    if [ ! -d "$SEED" ]; then return 0; fi
-    if ! [ "$VERDICT" = "green" ]; then return 0; fi
-    git fetch --depth 50 origin "+main:refs/remotes/origin/main" >/dev/null 2>&1 || {
-        echo "gate-runner: seed not refreshed — could not re-fetch origin/main"; return 0; }
+# PURE: the seed decision, as the one line the helper accepts. Its
+# reasons go to the log; it never fails the script. Main was re-read
+# before the receipt, where the fetch could be counted (9f3a6107).
+seed_decision() {
+    if [ ! -d "$SEED" ]; then echo "skip no-seed"; return 0; fi
+    if [ "$VERDICT" != green ]; then echo "skip not-green"; return 0; fi
+    if [ "${SEED_MAIN:-unread}" != fetched ]; then
+        echo "gate-runner: seed not refreshed — could not re-fetch origin/main" >&2
+        echo "skip fetch-failed"; return 0
+    fi
     local behind
     # rev-list prints a count or fails (shallow clone, no merge base
     # within depth) — 999 makes "cannot measure" read as "too far".
     behind=$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 999)
+    case "$behind" in ''|*[!0-9]*) behind=999 ;; esac
     if [ "$behind" -gt 2 ]; then
-        echo "gate-runner: seed not refreshed — HEAD is $behind commit(s) behind origin/main"
-        return 0
+        echo "gate-runner: seed not refreshed — HEAD is $behind commit(s) behind origin/main" >&2
+        echo "skip behind-main"; return 0
     fi
     if [ "$(cat "$SEED/.seed-head" 2>/dev/null || true)" = "$HEAD_SHA" ]; then
-        echo "gate-runner: seed already at $HEAD_SHA — not refreshed"
-        return 0
+        echo "gate-runner: seed already at $HEAD_SHA — not refreshed" >&2
+        echo "skip already-current"; return 0
     fi
-    local t0=$SECONDS
-    if ( flock -x -n 9 &&
-         rm -f "$SEED/.seed-head" &&
-         rm -rf "$SEED/target" "$SEED/target.partial" &&
-         cp -a --reflink=auto /gate-target/target "$SEED/target.partial" &&
-         { KEPT=""; prune_seed_binaries "$SEED/target.partial/debug/deps"; } &&
-         mv "$SEED/target.partial" "$SEED/target" &&
-         echo "$HEAD_SHA" > "$SEED/.seed-head"
-       ) 9>>"$SEED_LOCK"; then
-        echo "gate-runner: seed refreshed to $HEAD_SHA in $((SECONDS - t0))s"
-    else
-        echo "gate-runner: seed refresh skipped (another writer holds the lock) or failed after $((SECONDS - t0))s — the previous seed stands"
+    if ! [[ "${HEAD_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "skip no-head"; return 0
     fi
+    echo "refresh $HEAD_SHA"
 }
-refresh_seed || true
+
+SEED_DECISION=$(seed_decision) || SEED_DECISION="skip decision-failed"
+if judged_init && [ "$VERDICT" = green ] && [ "$REPORTED" = 1 ]; then
+    if printf '%s\n' "$SEED_DECISION" > /gate-target/.seed-handoff 2>/dev/null; then
+        HANDED_OFF=1
+        echo "gate-runner: seed housekeeping handed to the seed-refresh container ($SEED_DECISION) — this container ends on its verdict"
+    else
+        echo "gate-runner: WARN: the seed handoff could not be written — this container empties its own workspace and the helper will say no-handoff"
+    fi
+else
+    case "$SEED_DECISION" in
+        refresh\ *)
+            t0=$SECONDS
+            # Each of refresh's exits by its own name: this read every
+            # nonzero as "the lock or failed", so a seed already at this
+            # head was logged as one or the other (backlog 010054b6).
+            seed_rc=0
+            bash "$SEED_REFRESH_SH" refresh "$HEAD_SHA" || seed_rc=$?
+            case "$seed_rc" in
+                0) echo "gate-runner: seed refreshed to $HEAD_SHA in $((SECONDS - t0))s" ;;
+                2) echo "gate-runner: seed refresh skipped — another writer holds the seed lock — the previous seed stands" ;;
+                3) echo "gate-runner: seed refresh skipped — the seed already at $HEAD_SHA stands" ;;
+                *) echo "gate-runner: seed refresh failed (exit $seed_rc) after $((SECONDS - t0))s — the previous seed stands, or none does" ;;
+            esac
+            ;;
+    esac
+fi
+# --- seed housekeeping (end) ---
 
 tail -5 /gate-target/gate.log || true
 echo "gate-runner: $GATE_BRANCH@${HEAD_SHA:0:10} -> $VERDICT"

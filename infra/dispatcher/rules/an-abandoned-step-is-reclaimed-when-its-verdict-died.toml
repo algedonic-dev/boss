@@ -1,0 +1,32 @@
+# The second half of `an-abandoned-step-is-reclaimed-when-its-run-died`,
+# for a run that died waiting on its verdict (backlog 87d1ae40).
+#
+# Since agent-run carries a `verdict` step, a run handed to its gate
+# completes `building` as `handed` and waits on `verdict`; if that gate
+# never returns one, `agent-run-dies-when-its-verdict-never-comes`
+# writes the death there, not on `building`. The reclaim reads ONE step
+# per rule (`run_step`), so the step the run was executing on its item —
+# still claimed, still active — would never be freed by the building
+# reclaim. This is that reclaim aimed at `verdict`: every other arg is
+# the building reclaim's, pinned equal by platform_bundle_agent_run.rs,
+# so the split between "the run is dead" and "its work is free" and
+# every guard that protects a slow-but-alive executor carry over
+# unchanged. A run whose `building` ended `handed` is never dead to the
+# building reclaim (it reads `handed`, not `died`), and a run with no
+# `verdict` step is never dead to this one, so neither rule acts twice.
+[[rule]]
+name = "an-abandoned-step-is-reclaimed-when-its-verdict-died"
+why = """
+A TIMER, the standing exemption: the condition is a step whose run
+died waiting on a gate verdict that never came, and no event says "the
+run that claimed this has been dead for two hours". Backlog 87d1ae40
+moved a handed run's death off `building` onto `verdict`; without this
+the reclaim that `an-abandoned-step-is-reclaimed-when-its-run-died`
+performs for a silent build would never reach a run that died there,
+and its item's step would stay claimed by a dead run forever.
+"""
+version = 1
+schedule = { cadence = "hourly", anchor_date = "2026-11-09" }
+[[rule.do]]
+handler = "jobs.reclaim_abandoned_step"
+args = { run_kind = "\"agent-run\"", run_step = "\"verdict\"", dead_result = "\"died\"", link = "\"agent_run\"", after_hours = "\"2\"" }

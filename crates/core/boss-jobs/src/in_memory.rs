@@ -34,6 +34,17 @@ pub struct InMemoryJobs {
     /// 82448947).
     step_plugins: Option<std::sync::Arc<dyn crate::step_plugins::StepPluginRegistry>>,
     workflows: Option<std::sync::Arc<dyn crate::registry::WorkflowRegistry>>,
+    resource_pools: std::sync::Arc<crate::pools::InMemoryPools>,
+    /// Each robot's recorded `model_class`, by agent id — this adapter's
+    /// `agents.model_class` column, read by a from-run bill at the claim
+    /// (backlog 7750d37d). Empty is a registry where no one records a
+    /// class, so every from-run bill reads the run's declared model.
+    agent_classes: std::collections::BTreeMap<String, String>,
+    /// The ACTIVE station rows — this adapter's `stations` table, read by
+    /// a from-run bill billing vCPU for its owner's floating host share
+    /// (backlog 5608c1a2). Empty is a tree where no station floats a
+    /// host, so such a bill is refused `owner-floats-no-host`.
+    station_rows: Vec<crate::stations::StationSpec>,
 }
 
 #[derive(Default)]
@@ -71,15 +82,36 @@ struct State {
     /// Packets whose steps read fails, set by
     /// [`InMemoryJobs::fail_steps_read`].
     unreadable_steps: BTreeSet<String>,
+    /// How many times each packet's steps were read, failed reads
+    /// included, for [`InMemoryJobs::steps_reads`].
+    steps_reads: HashMap<String, usize>,
+    /// How many passes over the log the flow cube has made, for
+    /// [`InMemoryJobs::flow_cube_passes`].
+    flow_cube_passes: usize,
     /// Packets whose close write fails, set by
     /// [`InMemoryJobs::fail_job_close`].
     unclosable_jobs: BTreeSet<String>,
     /// Packets whose own row read fails, set by
     /// [`InMemoryJobs::fail_job_read`].
     unreadable_jobs: BTreeSet<String>,
+    /// How many more steps reads of a packet answer before every later
+    /// one fails, set by [`InMemoryJobs::fail_steps_read_after`].
+    steps_reads_left: HashMap<String, usize>,
+    /// How many more row reads of a packet answer before every later
+    /// one fails, set by [`InMemoryJobs::fail_job_read_after`].
+    job_reads_left: HashMap<String, usize>,
+    /// How many times each packet's own row was read, failed reads
+    /// included, for [`InMemoryJobs::job_reads`].
+    job_reads: HashMap<String, usize>,
+    /// Steps whose judged writes fail, and how, set by
+    /// [`InMemoryJobs::fault_step_write`].
+    step_write_faults: HashMap<String, StepWriteFault>,
     /// Kind/offset list reads that fail, set by
     /// [`InMemoryJobs::fail_jobs_list`].
     unreadable_job_pages: BTreeSet<(String, i64)>,
+    /// Whether the queue-age read fails, set by
+    /// [`InMemoryJobs::fail_queue_age`].
+    unreadable_queue_age: bool,
     /// Packets the next `get_job` does not see yet, set by
     /// [`InMemoryJobs::miss_next_job_read`].
     unseen_once: BTreeSet<String>,
@@ -88,7 +120,7 @@ struct State {
     merge_after_read: HashMap<String, serde_json::Map<String, serde_json::Value>>,
     /// Changes that land just before a step's next judged write, set by
     /// [`InMemoryJobs::change_before_next_judged_write`].
-    change_before_write: HashMap<String, StepChange>,
+    change_before_write: HashMap<String, std::collections::VecDeque<StepChange>>,
     /// Changes that land on a job row the moment it is next read, set
     /// by [`InMemoryJobs::change_job_after_next_read`].
     job_change_after_read: HashMap<String, JobChange>,
@@ -100,13 +132,33 @@ struct State {
     discarded_versions: std::collections::HashSet<(String, i32)>,
 }
 
+/// How a step's judged writes fail, set by
+/// [`InMemoryJobs::fault_step_write`] — the three ways the skip a
+/// packet's end owes each of its open steps could not land, each of
+/// which the skip only logged while its caller closed the packet anyway
+/// (backlog 0887d2a9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepWriteFault {
+    /// Every judged write of the step is refused with a storage error.
+    Refused,
+    /// Every judged write answers that another writer moved the row
+    /// since it was read, and writes nothing — a row that keeps moving
+    /// under every retry the writer has.
+    KeepsMoving,
+    /// As [`StepWriteFault::KeepsMoving`], and the re-read the writer
+    /// then takes of the step fails with a storage error.
+    MovedThenUnreadable,
+}
+
 /// A change another writer lands on a step row (test hook).
 type StepChange = Box<dyn FnOnce(&mut Step) + Send>;
 /// A change another writer lands on a job row (test hook).
 type JobChange = Box<dyn FnOnce(&mut Job) + Send>;
 
-fn verify_memory_deadline(deadline: std::time::Instant) -> Result<(), JobsError> {
-    if std::time::Instant::now() >= deadline {
+/// The ingress deadline is read on tokio's clock, as every reader of it is
+/// (f10419f9, review a0fd6902).
+fn verify_memory_deadline(deadline: tokio::time::Instant) -> Result<(), JobsError> {
+    if tokio::time::Instant::now() >= deadline {
         Err(JobsError::SelectionConflict(
             "selection ingress deadline expired before commit dispatch".into(),
         ))
@@ -115,9 +167,9 @@ fn verify_memory_deadline(deadline: std::time::Instant) -> Result<(), JobsError>
     }
 }
 
-async fn retry_memory_owners(deadline: std::time::Instant) -> Result<(), JobsError> {
+async fn retry_memory_owners(deadline: tokio::time::Instant) -> Result<(), JobsError> {
     let remaining = deadline
-        .checked_duration_since(std::time::Instant::now())
+        .checked_duration_since(tokio::time::Instant::now())
         .ok_or_else(|| {
             JobsError::SelectionConflict(
                 "selection ingress deadline expired during owner acquisition".into(),
@@ -128,6 +180,145 @@ async fn retry_memory_owners(deadline: std::time::Instant) -> Result<(), JobsErr
 }
 
 impl InMemoryJobs {
+    pub fn with_resource_pools(
+        mut self,
+        pools: std::sync::Arc<crate::pools::InMemoryPools>,
+    ) -> Self {
+        self.resource_pools = pools;
+        self
+    }
+
+    /// The `model_class` each agent id records (backlog 7750d37d).
+    pub fn with_agent_classes(
+        mut self,
+        classes: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.agent_classes = classes.into_iter().collect();
+        self
+    }
+
+    /// The active station rows a run's host draw reads (backlog 5608c1a2).
+    pub fn with_station_rows(
+        mut self,
+        rows: impl IntoIterator<Item = crate::stations::StationSpec>,
+    ) -> Self {
+        self.station_rows = rows.into_iter().collect();
+        self
+    }
+
+    async fn resource_protocol(
+        &self,
+        id: &StepId,
+    ) -> Result<Option<crate::registry::WorkflowSpec>, JobsError> {
+        let registry = self
+            .workflows
+            .as_ref()
+            .or_else(|| self.native_selection.as_ref().map(|s| &s.workflows));
+        let Some(registry) = registry else {
+            return Ok(None);
+        };
+        let job = {
+            let state = self
+                .inner
+                .lock()
+                .map_err(|_| JobsError::Storage("job state unavailable".into()))?;
+            let step = state
+                .steps
+                .get(&step_key(id))
+                .ok_or(JobsError::StepNotFound(*id))?;
+            state
+                .jobs
+                .get(&job_key(&step.job_id))
+                .cloned()
+                .ok_or(JobsError::NotFound(step.job_id))?
+        };
+        match registry.get_version(&job.kind, job.workflow_version).await {
+            Ok(spec) => Ok(Some(spec)),
+            Err(crate::registry::WorkflowError::NotFound(_))
+                if registry
+                    .list_versions(&job.kind)
+                    .await
+                    .map_err(|e| JobsError::Storage(e.to_string()))?
+                    .is_empty() =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(JobsError::Storage(format!(
+                "pinned resource protocol unavailable: {error}"
+            ))),
+        }
+    }
+
+    /// What a claim's bay count reads besides the state (backlog
+    /// 5a571b1a): the station the claimed step's pinned `protocol`
+    /// demands, its bays when `actor` operates it (this adapter's
+    /// `stations` rows), and the pinned spec of every hold `actor` has on
+    /// an open packet now. Read BEFORE the state lock, because the
+    /// registry is async; [`take_bay_in_state`] counts under the lock
+    /// the claim writes through. `None` when the claim takes no bay.
+    async fn bay_count(
+        &self,
+        protocol: Option<&crate::registry::WorkflowSpec>,
+        step_id: &StepId,
+        actor: &str,
+    ) -> Result<Option<BayCount>, JobsError> {
+        let unavailable = || JobsError::Storage("job state unavailable".into());
+        let slug = {
+            let state = self.inner.lock().map_err(|_| unavailable())?;
+            state
+                .steps
+                .get(&step_key(step_id))
+                .ok_or(JobsError::StepNotFound(*step_id))?
+                .spec_slug
+                .clone()
+        };
+        let Some(station) = crate::step_executor::equipment_demanded(protocol, slug.as_deref())
+        else {
+            return Ok(None);
+        };
+        let Some(bays) = self
+            .station_rows
+            .iter()
+            .find(|row| row.name == station)
+            .and_then(|row| crate::step_executor::bays_for(row, actor))
+        else {
+            return Ok(None);
+        };
+        // A pinned protocol was read, so a registry is wired.
+        let registry = self
+            .workflows
+            .as_ref()
+            .or_else(|| self.native_selection.as_ref().map(|s| &s.workflows))
+            .ok_or_else(|| JobsError::Storage("no workflow registry to count bays".into()))?;
+        let keys: BTreeSet<(String, i32)> = {
+            let state = self.inner.lock().map_err(|_| unavailable())?;
+            state
+                .steps
+                .values()
+                .filter_map(|hold| bay_hold(&state, hold, step_id, actor))
+                .map(|(job, _)| (job.kind.clone(), job.workflow_version))
+                .collect()
+        };
+        let mut specs = std::collections::BTreeMap::new();
+        for (kind, version) in keys {
+            let spec = match registry.get_version(&kind, version).await {
+                Ok(spec) => Some(spec),
+                Err(crate::registry::WorkflowError::NotFound(_)) => None,
+                Err(error) => {
+                    return Err(JobsError::Storage(format!(
+                        "{kind}@{version}: {error}; {station}'s bays cannot be counted"
+                    )));
+                }
+            };
+            specs.insert((kind, version), spec);
+        }
+        Ok(Some(BayCount {
+            station,
+            bays,
+            specs,
+        }))
+    }
+
     async fn claim_station_native_at(
         &self,
         context: &crate::station_claim::SelectionContext,
@@ -199,8 +390,25 @@ impl InMemoryJobs {
                 ),
             },
         ));
-        let deadline =
-            observation.ingress.started() + crate::station_claim::SELECTION_PRE_COMMIT_BUDGET;
+        let deadline = observation.ingress.deadline();
+        let protocol =
+            tokio::time::timeout_at(deadline, self.resource_protocol(&context.validated_step.id))
+                .await
+                .map_err(|_| {
+                    JobsError::SelectionConflict(
+                        "selection ingress deadline expired reading pinned resources".into(),
+                    )
+                })??;
+        let bay = tokio::time::timeout_at(
+            deadline,
+            self.bay_count(protocol.as_ref(), &context.validated_step.id, actor),
+        )
+        .await
+        .map_err(|_| {
+            JobsError::SelectionConflict(
+                "selection ingress deadline expired counting equipment bays".into(),
+            )
+        })??;
         let mut predicted = context.validated_step.clone();
         predicted.assignee_id = Some(actor.to_owned());
         if crate::calendar_hook::start_request(&predicted, actor)
@@ -221,6 +429,8 @@ impl InMemoryJobs {
                 stamp,
                 events,
                 deadline,
+                protocol.as_ref(),
+                bay.as_ref(),
             ) {
                 Ok(Some(result)) => return Ok(result),
                 Ok(None) => retry_memory_owners(deadline).await?,
@@ -251,7 +461,9 @@ impl InMemoryJobs {
         displaceable: &[String],
         stamp: &boss_core::publisher::EventStamp,
         events: &[boss_core::event::Event],
-        deadline: std::time::Instant,
+        deadline: tokio::time::Instant,
+        protocol: Option<&crate::registry::WorkflowSpec>,
+        bay: Option<&BayCount>,
     ) -> Result<Option<crate::station_claim::SelectionResult>, JobsError> {
         use crate::station_claim::SelectionResult;
         verify_memory_deadline(deadline)?;
@@ -357,55 +569,9 @@ impl InMemoryJobs {
                 "native step update is outside its actual grant scope".into(),
             ));
         }
-        owner_consumption["run_population"] = serde_json::json!({"applicable": false, "method": "actual Jobs writer lock", "reason": "validated step or actor declares no run cap"});
-        // This population is owned by the Jobs writer lock already held,
-        // not a second HTTP count or a cached authorization observation.
-        if let Some(row) = context
-            .actor_observation
-            .as_ref()
-            .and_then(|observation| observation.row.as_ref())
-        {
-            let resolved = crate::agent_spec::resolved_steps(
-                std::slice::from_ref(&context.validated_step),
-                context.active_workflows.get(&context.validated_job.kind),
-            );
-            if resolved
-                .first()
-                .is_some_and(|step| crate::agent_budget::declares_an_agent_run(&step.metadata))
-                && let Some(cap) = row
-                    .max_concurrent_runs
-                    .and_then(|cap| u32::try_from(cap).ok())
-            {
-                let held_by: Vec<String> = std::iter::once(row.id.clone())
-                    .chain(row.aliases.iter().cloned())
-                    .collect();
-                let mut runs: Vec<_> = state
-                    .jobs
-                    .values()
-                    .filter(|job| job.kind == crate::agent_budget::RUN_KIND)
-                    .cloned()
-                    .collect();
-                runs.sort_by_key(|run| *run.id.inner().as_uuid());
-                let count = crate::agent_budget::in_flight_runs(&runs, &held_by);
-                let reading = crate::agent_budget::Concurrency::measure(&row.id, Some(cap), count);
-                owner_consumption["run_population"] = serde_json::json!({
-                    "applicable": true, "method": "actual Jobs writer lock", "actor": row,
-                    "held_by": held_by, "query": {"kind": crate::agent_budget::RUN_KIND, "status": "open"},
-                    "rows_predicate": {"agent_in":held_by,"status":"open"},
-                    "rows": runs.iter().filter(|run| crate::agent_budget::counted_run(run,&held_by))
-                        .map(|run| serde_json::json!({"id":run.id,"kind":run.kind,"status":run.status,
-                            "agent":run.metadata.get(crate::agent_budget::RUN_AGENT_KEY),
-                            "owner_id":run.owner_id,"subject":run.subject})).collect::<Vec<_>>(),
-                    "count": count, "reading": reading,
-                });
-                if !reading.decision.is_allowed() {
-                    return Err(JobsError::SelectionConflict(
-                        serde_json::to_string(&reading.refusal_body())
-                            .map_err(|error| JobsError::Storage(error.to_string()))?,
-                    ));
-                }
-            }
-        }
+        // No run population is counted here since backlog 3e927996: the
+        // agents row's `max_concurrent_runs` bounds nothing, and a robot
+        // is bounded by its `robots:<model>` pool alone (design a3c5e58a Q3).
 
         let mut packets = Vec::new();
         for job in state
@@ -429,8 +595,9 @@ impl InMemoryJobs {
             packets.push((job.clone(), steps));
         }
         packets.sort_by_key(|(job, _)| *job.id.inner().as_uuid());
-        context.revalidate(&packets)?;
-        owner_consumption["open_population"] = serde_json::json!(packets);
+        for (key, evidence) in context.revalidated_evidence(&packets)? {
+            owner_consumption[key.as_str()] = evidence;
+        }
         let mut recorded = match self.recorded.try_lock() {
             Ok(recorded) => recorded,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
@@ -438,7 +605,7 @@ impl InMemoryJobs {
                 return Err(JobsError::Storage("event log unavailable".into()));
             }
         };
-        let (step, invalidated) = prepare_claim_in_state(
+        let (mut step, mut invalidated) = prepare_claim_in_state(
             &state,
             &context.validated_step.id,
             actor,
@@ -446,6 +613,68 @@ impl InMemoryJobs {
             stamp,
             events,
         )?;
+        take_bay_in_state(&state, &context.validated_step.id, actor, bay)?;
+        let before = state
+            .steps
+            .get(&step_key(&step.id))
+            .cloned()
+            .ok_or(JobsError::StepNotFound(step.id))?;
+        let Some(mut pools) = self.resource_pools.try_resource_lock()? else {
+            return Ok(None);
+        };
+        let resource = match crate::flow_resources_memory::prepare(
+            &pools,
+            &before,
+            protocol,
+            actor,
+            self.agent_classes.get(actor).map(String::as_str),
+            &self.station_rows,
+            state.jobs.get(&job_key(&before.job_id)),
+            stamp.timestamp,
+        ) {
+            Ok(claim) => claim,
+            Err(JobsError::ResourceRefused(reason)) => {
+                let (refused, facts) =
+                    crate::flow_resources::refused_step(&before, &reason, stamp)?;
+                let (receipt, receipt_events) = context.record_attempt_consumed(
+                    actor,
+                    stamp,
+                    &refused,
+                    owner_consumption,
+                    Some(&reason),
+                )?;
+                _owners.verify_at_commit()?;
+                crate::station_claim::require_native_step_authority(
+                    observation,
+                    &context.validated_step,
+                    boss_policy_client::engine::expiry_now(),
+                )?;
+                verify_memory_deadline(deadline)?;
+                state.steps.insert(step_key(&refused.id), refused.clone());
+                touch_step(&mut state, step_key(&refused.id), stamp.timestamp);
+                state
+                    .station_receipts
+                    .insert(context.request_id, receipt.clone());
+                recorded.extend(facts);
+                recorded.extend(receipt_events);
+                return Ok(Some(SelectionResult::Refused { receipt }));
+            }
+            Err(error) => return Err(error),
+        };
+        let fresh = crate::flow_resources_memory::attach(&mut step, resource.as_ref())?;
+        if resource.is_some() {
+            step.sign_offs = before.sign_offs.clone();
+            invalidated =
+                crate::events::void_stamps_if_moved(stamp, &before.shape_hash(), &mut step);
+        }
+        let mut resource_events = if resource.is_some() {
+            crate::flow_resources::state_events(events, &step, stamp)?
+        } else {
+            events.to_vec()
+        };
+        if fresh && let Some(claim) = &resource {
+            resource_events.push(crate::flow_resources::reserved_event(claim, &step, stamp));
+        }
         let (receipt, event) = context.record_consumed(actor, stamp, &step, owner_consumption)?;
         _owners.verify_at_commit()?;
         crate::station_claim::require_native_executor(observation, &step, &context.validated_job)?;
@@ -473,13 +702,16 @@ impl InMemoryJobs {
         // The applied guard retains both actual calendar writers until every
         // joined Job/receipt/event effect is in place. No fallible work follows.
         let _applied_calendar = calendar_plan.map(|plan| plan.apply());
+        if let Some(claim) = &resource {
+            crate::flow_resources_memory::apply(&mut pools, claim);
+        }
         let key = step_key(&step.id);
         state.steps.insert(key.clone(), step.clone());
         touch_step(&mut state, key, stamp.timestamp);
         state
             .station_receipts
             .insert(context.request_id, receipt.clone());
-        recorded.extend_from_slice(events);
+        recorded.extend(resource_events);
         recorded.extend(invalidated);
         recorded.extend(event);
         if let Some(event) = calendar_event {
@@ -498,6 +730,8 @@ impl InMemoryJobs {
         displaceable: &[String],
         stamp: &boss_core::publisher::EventStamp,
         events: &[boss_core::event::Event],
+        protocol: Option<&crate::registry::WorkflowSpec>,
+        bay: Option<&BayCount>,
     ) -> Result<crate::station_claim::SelectionResult, JobsError> {
         use crate::station_claim::SelectionResult;
         {
@@ -555,52 +789,10 @@ impl InMemoryJobs {
                 )?;
                 return Ok(SelectionResult::Replayed(receipt.clone()));
             }
-            let mut owner_consumption = _owners.verify_at_commit()?;
-            owner_consumption["run_population"] = serde_json::json!({"applicable": false, "method": "actual Jobs writer lock", "reason": "validated step or actor declares no run cap"});
-            // This population is owned by the Jobs writer lock already held,
-            // not a second HTTP count or a cached authorization observation.
-            if let Some(row) = context
-                .actor_observation
-                .as_ref()
-                .and_then(|observation| observation.row.as_ref())
-            {
-                let resolved = crate::agent_spec::resolved_steps(
-                    std::slice::from_ref(&context.validated_step),
-                    context.active_workflows.get(&context.validated_job.kind),
-                );
-                if resolved
-                    .first()
-                    .is_some_and(|step| crate::agent_budget::declares_an_agent_run(&step.metadata))
-                    && let Some(cap) = row
-                        .max_concurrent_runs
-                        .and_then(|cap| u32::try_from(cap).ok())
-                {
-                    let held_by: Vec<String> = std::iter::once(row.id.clone())
-                        .chain(row.aliases.iter().cloned())
-                        .collect();
-                    let runs: Vec<_> = state
-                        .jobs
-                        .values()
-                        .filter(|job| job.kind == crate::agent_budget::RUN_KIND)
-                        .cloned()
-                        .collect();
-                    let count = crate::agent_budget::in_flight_runs(&runs, &held_by);
-                    let reading =
-                        crate::agent_budget::Concurrency::measure(&row.id, Some(cap), count);
-                    owner_consumption["run_population"] = serde_json::json!({
-                        "applicable": true, "method": "actual Jobs writer lock", "actor": row,
-                        "held_by": held_by, "query": {"kind": crate::agent_budget::RUN_KIND, "status": "open"},
-                        "rows": runs.iter().filter(|run| run.status == JobStatus::Open).collect::<Vec<_>>(),
-                        "count": count, "reading": reading,
-                    });
-                    if !reading.decision.is_allowed() {
-                        return Err(JobsError::SelectionConflict(
-                            serde_json::to_string(&reading.refusal_body())
-                                .map_err(|error| JobsError::Storage(error.to_string()))?,
-                        ));
-                    }
-                }
-            }
+            let owner_consumption = _owners.verify_at_commit()?;
+            // No run population is counted here since backlog 3e927996: the
+            // agents row's `max_concurrent_runs` bounds nothing, and a robot
+            // is bounded by its `robots:<model>` pool alone (design a3c5e58a Q3).
 
             let mut packets = Vec::new();
             for job in state
@@ -627,7 +819,7 @@ impl InMemoryJobs {
                 .recorded
                 .lock()
                 .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
-            let (step, invalidated) = prepare_claim_in_state(
+            let (mut step, mut invalidated) = prepare_claim_in_state(
                 &state,
                 &context.validated_step.id,
                 actor,
@@ -635,15 +827,73 @@ impl InMemoryJobs {
                 stamp,
                 events,
             )?;
+            take_bay_in_state(&state, &context.validated_step.id, actor, bay)?;
+            let before = state
+                .steps
+                .get(&step_key(&step.id))
+                .cloned()
+                .ok_or(JobsError::StepNotFound(step.id))?;
+            let mut pools = self.resource_pools.resource_lock()?;
+            let resource = match crate::flow_resources_memory::prepare(
+                &pools,
+                &before,
+                protocol,
+                actor,
+                self.agent_classes.get(actor).map(String::as_str),
+                &self.station_rows,
+                state.jobs.get(&job_key(&before.job_id)),
+                stamp.timestamp,
+            ) {
+                Ok(claim) => claim,
+                Err(JobsError::ResourceRefused(reason)) => {
+                    let (refused, facts) =
+                        crate::flow_resources::refused_step(&before, &reason, stamp)?;
+                    let (receipt, receipt_events) = context.record_attempt_consumed(
+                        actor,
+                        stamp,
+                        &refused,
+                        owner_consumption,
+                        Some(&reason),
+                    )?;
+                    _owners.verify_at_commit()?;
+                    state.steps.insert(step_key(&refused.id), refused.clone());
+                    touch_step(&mut state, step_key(&refused.id), stamp.timestamp);
+                    state
+                        .station_receipts
+                        .insert(context.request_id, receipt.clone());
+                    recorded.extend(facts);
+                    recorded.extend(receipt_events);
+                    return Ok(SelectionResult::Refused { receipt });
+                }
+                Err(error) => return Err(error),
+            };
+            let fresh = crate::flow_resources_memory::attach(&mut step, resource.as_ref())?;
+            if resource.is_some() {
+                step.sign_offs = before.sign_offs.clone();
+                invalidated =
+                    crate::events::void_stamps_if_moved(stamp, &before.shape_hash(), &mut step);
+            }
+            let mut resource_events = if resource.is_some() {
+                crate::flow_resources::state_events(events, &step, stamp)?
+            } else {
+                events.to_vec()
+            };
+            if fresh && let Some(claim) = &resource {
+                resource_events.push(crate::flow_resources::reserved_event(claim, &step, stamp));
+            }
             let (receipt, event) =
                 context.record_consumed(actor, stamp, &step, owner_consumption)?;
+            _owners.verify_at_commit()?;
+            if let Some(claim) = &resource {
+                crate::flow_resources_memory::apply(&mut pools, claim);
+            }
             let key = step_key(&step.id);
             state.steps.insert(key.clone(), step.clone());
             touch_step(&mut state, key, stamp.timestamp);
             state
                 .station_receipts
                 .insert(context.request_id, receipt.clone());
-            recorded.extend_from_slice(events);
+            recorded.extend(resource_events);
             recorded.extend(invalidated);
             recorded.extend(event);
             Ok(SelectionResult::Claimed {
@@ -731,12 +981,25 @@ impl InMemoryJobs {
                     "pinned metadata declaration unavailable: {error}"
                 ))
             })?;
-        if spec.status == crate::registry::WorkflowStatus::Draft {
+        if !spec.status.was_published() {
             return Err(JobsError::ImmutableMetadata(
-                "draft workflow cannot authorize metadata binding".into(),
+                "unpublished workflow cannot authorize metadata binding".into(),
             ));
         }
         Ok(Some((job.kind, job.workflow_version, spec.metadata_schema)))
+    }
+
+    /// The packets pinned to `(kind, version)`, counted and spending
+    /// nothing — what a reject asks (backlog 50ded63d). Called under
+    /// the registry's rows hold, as the discard's spend is. `None` is a
+    /// poisoned store, which the caller refuses rather than reads as 0.
+    pub(crate) fn workflow_version_pins(
+        &self,
+        kind: &str,
+        version: i32,
+    ) -> Option<crate::port::PinnedJobs> {
+        let state = self.inner.lock().ok()?;
+        Some(pinned_to_workflow_locked(&state, kind, version))
     }
 
     /// The discard's half of the admission/discard ordering (backlog
@@ -823,12 +1086,113 @@ impl InMemoryJobs {
         }
     }
 
+    /// How many times this packet's steps have been read, failed reads
+    /// included. It exists so a reader that must NOT read steps is
+    /// testable: a cut page of open runs reads as unread whether or not
+    /// its steps were fetched first, so only the count tells a reader
+    /// that discards the page before reading it from one that reads
+    /// every run's steps and then discards them (backlog 1927aca5).
+    pub fn steps_reads(&self, job_id: &JobId) -> usize {
+        self.inner
+            .lock()
+            .map(|state| {
+                state
+                    .steps_reads
+                    .get(&job_key(job_id))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    }
+
+    /// How many passes over the log the step-events flow cube has made —
+    /// one per statement the Pg adapter would run. It exists so a
+    /// reader's FREQUENCY is testable (backlog 29f7e897): since item
+    /// ab09f1af's car 2 it pins that the IT map never reads the cube.
+    pub fn flow_cube_passes(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|state| state.flow_cube_passes)
+            .unwrap_or(0)
+    }
+
     /// Restore step reads after an injected temporary storage failure.
     /// A retry test must recover the same store, not build a fresh one.
     pub fn restore_steps_read(&self, job_id: &JobId) {
         if let Ok(mut state) = self.inner.lock() {
             state.unreadable_steps.remove(&job_key(job_id));
+            state.steps_reads_left.remove(&job_key(job_id));
         }
+    }
+
+    /// Let the next `reads` steps reads of this packet answer, and fail
+    /// every one after them with a storage error until
+    /// [`InMemoryJobs::restore_steps_read`]. The counted twin of
+    /// [`InMemoryJobs::fail_steps_read`], which fails the FIRST read: a
+    /// step write reads its packet's steps several times — the readiness
+    /// pass first, then the declared-terminal close, then the catch-all
+    /// — so only a counted failure reaches a read behind the first, and
+    /// the terminal close's read answered a failure by closing the
+    /// packet with its open steps left open (backlog 140e7984).
+    pub fn fail_steps_read_after(&self, job_id: &JobId, reads: usize) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.steps_reads_left.insert(job_key(job_id), reads);
+        }
+    }
+
+    /// Let the next `reads` row reads of this packet answer, and fail
+    /// every one after them with a storage error until
+    /// [`InMemoryJobs::restore_job_read`]. The counted twin of
+    /// [`InMemoryJobs::fail_job_read`], for the same reason as
+    /// [`InMemoryJobs::fail_steps_read_after`]: the settle's catch-all
+    /// reads the packet after the step write has read it already, and
+    /// read a failure there as "nothing to close" (backlog 140e7984).
+    pub fn fail_job_read_after(&self, job_id: &JobId, reads: usize) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.job_reads_left.insert(job_key(job_id), reads);
+        }
+    }
+
+    /// Restore row reads after [`InMemoryJobs::fail_job_read`] or
+    /// [`InMemoryJobs::fail_job_read_after`], so a test can send the
+    /// retry a failed read's 500 asks for against the same store.
+    pub fn restore_job_read(&self, job_id: &JobId) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.unreadable_jobs.remove(&job_key(job_id));
+            state.job_reads_left.remove(&job_key(job_id));
+        }
+    }
+
+    /// Make every later judged write of this STEP fail as `fault` says,
+    /// until [`InMemoryJobs::restore_step_write`]. Judged writes are the
+    /// version-checked ones (`update_step_if_unchanged_at`) — the write
+    /// a packet's end skips each open step through — so a test can fail
+    /// one step's skip while every other write lands: the terminal close
+    /// and the job door's end each logged a skip that did not land and
+    /// closed the packet around the step anyway (backlog 0887d2a9).
+    pub fn fault_step_write(&self, step_id: &StepId, fault: StepWriteFault) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.step_write_faults.insert(step_key(step_id), fault);
+        }
+    }
+
+    /// Restore a step's writes after [`InMemoryJobs::fault_step_write`],
+    /// so a test can send the retry a refused skip's 500 asks for
+    /// against the same store.
+    pub fn restore_step_write(&self, step_id: &StepId) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.step_write_faults.remove(&step_key(step_id));
+        }
+    }
+
+    /// How many times this packet's own row has been read, failed reads
+    /// included — what a sweep over [`InMemoryJobs::fail_job_read_after`]
+    /// counts its positions from.
+    pub fn job_reads(&self, job_id: &JobId) -> usize {
+        self.inner
+            .lock()
+            .map(|state| state.job_reads.get(&job_key(job_id)).copied().unwrap_or(0))
+            .unwrap_or(0)
     }
 
     /// Make every later `close_job_at` of this packet fail with a
@@ -839,6 +1203,15 @@ impl InMemoryJobs {
     pub fn fail_job_close(&self, job_id: &JobId) {
         if let Ok(mut state) = self.inner.lock() {
             state.unclosable_jobs.insert(job_key(job_id));
+        }
+    }
+
+    /// Restore closes after [`InMemoryJobs::fail_job_close`], so a test
+    /// can send the retry a failed close's 500 asks for against the same
+    /// store (backlog 657c9200).
+    pub fn restore_job_close(&self, job_id: &JobId) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.unclosable_jobs.remove(&job_key(job_id));
         }
     }
 
@@ -860,6 +1233,17 @@ impl InMemoryJobs {
     pub fn fail_jobs_list(&self, kind: &str, offset: i64) {
         if let Ok(mut state) = self.inner.lock() {
             state.unreadable_job_pages.insert((kind.into(), offset));
+        }
+    }
+
+    /// Make every later `queue_age` read fail with a storage error, so a
+    /// reader's answer to onsets it could not read is testable: the map
+    /// read it with `.ok()`, so a failed read told every standing step
+    /// its ready instant was not on the record — blaming the record for
+    /// a read that failed (backlog 35d29890).
+    pub fn fail_queue_age(&self) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.unreadable_queue_age = true;
         }
     }
 
@@ -928,7 +1312,18 @@ impl InMemoryJobs {
         if let Ok(mut state) = self.inner.lock() {
             state
                 .change_before_write
-                .insert(step_key(step_id), Box::new(change));
+                .insert(step_key(step_id), [Box::new(change) as StepChange].into());
+        }
+    }
+
+    /// A bounded sequence of real competing row writes, each interrupted
+    /// before its own settle. Unlike a synthetic `StepChanged`, every
+    /// refusal comes from the adapter's actual version comparison.
+    pub fn changes_before_judged_writes(&self, step_id: &StepId, changes: Vec<StepChange>) {
+        if let Ok(mut state) = self.inner.lock() {
+            state
+                .change_before_write
+                .insert(step_key(step_id), changes.into());
         }
     }
 
@@ -942,6 +1337,7 @@ impl InMemoryJobs {
         read: Option<StepVersion>,
         now: chrono::DateTime<chrono::Utc>,
         events: &[boss_core::event::Event],
+        protocol: Option<&crate::registry::WorkflowSpec>,
     ) -> Result<(), JobsError> {
         let mut state = self.inner.lock().expect("poisoned");
         let mut recorded = self
@@ -950,7 +1346,23 @@ impl InMemoryJobs {
             .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
         let key = step_key(&step.id);
         if read.is_some()
-            && let Some(change) = state.change_before_write.remove(&key)
+            && let Some(fault) = state.step_write_faults.get(&key)
+        {
+            return Err(match fault {
+                StepWriteFault::Refused => JobsError::Storage(format!(
+                    "step {} unwritable (injected by fault_step_write)",
+                    step.id
+                )),
+                StepWriteFault::KeepsMoving | StepWriteFault::MovedThenUnreadable => {
+                    JobsError::StepChanged { id: step.id }
+                }
+            });
+        }
+        if read.is_some()
+            && let Some(change) = state
+                .change_before_write
+                .get_mut(&key)
+                .and_then(|changes| changes.pop_front())
             && let Some(row) = state.steps.get_mut(&key)
         {
             // Another writer's write: it moves the version as any does.
@@ -960,6 +1372,34 @@ impl InMemoryJobs {
         let Some(existing) = state.steps.get(&key) else {
             return Err(JobsError::StepNotFound(step.id));
         };
+        if let Some(protocol) = protocol {
+            let job = state
+                .jobs
+                .get(&job_key(&existing.job_id))
+                .ok_or(JobsError::NotFound(existing.job_id))?;
+            if job.kind != protocol.kind || job.workflow_version != protocol.version {
+                return Err(JobsError::JobChanged { id: job.id });
+            }
+            if existing.status != StepStatus::Active
+                && step.status == StepStatus::Active
+                && protocol
+                    .steps
+                    .iter()
+                    .find(|spec| Some(spec.title.as_str()) == existing.spec_slug.as_deref())
+                    .and_then(|spec| spec.resources.as_ref())
+                    .is_some_and(|bill| {
+                        bill.pools().iter().any(|(_, quantity)| {
+                            quantity.amount().is_ok_and(|amount| !amount.is_zero())
+                        })
+                    })
+            {
+                return Err(JobsError::ResourceRefused(crate::flow_resources::Refusal {
+                    pool: "acquisition".into(),
+                    reason: "claim-door-required".into(),
+                    observed: Vec::new(),
+                }));
+            }
+        }
         crate::first_record::preserve(
             state
                 .first_records
@@ -1023,6 +1463,9 @@ impl InMemoryJobs {
             next.assignee_id = existing.assignee_id.clone();
             next.notes = existing.notes.clone();
         }
+        let mut pools = self.resource_pools.resource_lock()?;
+        let release =
+            crate::flow_resources_memory::exit_plan(&pools, existing, &next, events, false)?;
         // The ready stamp is written once, at the write that lands the
         // step in Ready, and no later write moves it — the COALESCE in
         // the Pg adapter's UPDATE.
@@ -1031,11 +1474,17 @@ impl InMemoryJobs {
         }
         touch_step(&mut state, key.clone(), now);
         state.steps.insert(key, next);
+        if let Some((claim, _, obligations)) = &release {
+            crate::flow_resources_memory::release(&mut pools, claim, obligations);
+        }
         #[cfg(test)]
         if let Some(pause) = self.before_step_events.lock().unwrap().take() {
             pause();
         }
         recorded.extend_from_slice(events);
+        if let Some((_, event, _)) = release {
+            recorded.push(event);
+        }
         Ok(())
     }
 
@@ -1066,6 +1515,128 @@ impl InMemoryJobs {
             v.extend_from_slice(events);
         }
     }
+
+    /// Everything admission judges and stamps before its lock: the
+    /// pinned protocol's metadata declaration, the first-write keys no
+    /// body may carry, the step/event pairing, and each step's plugin
+    /// version. Shared by plain admission and guarded admission, so a
+    /// guarded child is refused exactly where a plain one would be.
+    async fn prepare_admission(
+        &self,
+        job: &Job,
+        steps: &[Step],
+        step_events: &[boss_core::event::Event],
+    ) -> Result<Vec<Step>, JobsError> {
+        if let Some(registry) = self.workflows.as_ref() {
+            let spec = registry
+                .get_version(&job.kind, job.workflow_version)
+                .await
+                .map_err(|error| {
+                    JobsError::ImmutableMetadata(format!(
+                        "pinned admission declaration unavailable: {error}"
+                    ))
+                })?;
+            crate::metadata_immutability::validate_protocol(
+                &spec.metadata_schema,
+                &serde_json::json!({}),
+                &job.metadata,
+                None,
+            )
+            .map_err(JobsError::ImmutableMetadata)?;
+        }
+        if [
+            crate::metadata_immutability::KEY,
+            crate::metadata_immutability::GUARDED_KEY,
+        ]
+        .iter()
+        .any(|key| job.metadata.get(key).is_some())
+        {
+            return Err(JobsError::ImmutableMetadata(
+                "first-write bindings are created only by the conditional metadata door".into(),
+            ));
+        }
+        // Same refusal as the Pg adapter, before the lock: nothing is
+        // written for a graph whose events do not pair with its rows.
+        if steps.len() != step_events.len() {
+            return Err(JobsError::Storage(format!(
+                "create_job_with_steps_at: {} step(s) but {} step event(s) — one \
+                 STEP_CREATED per step, index-aligned",
+                steps.len(),
+                step_events.len()
+            )));
+        }
+        let mut stamped = Vec::with_capacity(steps.len());
+        for step in steps {
+            stamped.push(self.stamp_plugin_version(step).await?);
+        }
+        Ok(stamped)
+    }
+}
+
+/// The admission write under the adapter's one lock. One lock held
+/// across the job AND every step is this adapter's one transaction: a
+/// reader sees the whole graph or none of it, as the Pg commit
+/// guarantees (backlog f2ba226e). Mirror the Pg replay guard per row: an
+/// existing id is a no-op that records nothing — and keeps its original
+/// admission instant. The events to record are appended to `recorded`.
+fn admit_locked(
+    state: &mut State,
+    job: &Job,
+    stamped: &[Step],
+    now: DateTime<Utc>,
+    job_events: &[boss_core::event::Event],
+    step_events: &[boss_core::event::Event],
+    recorded: &mut Vec<boss_core::event::Event>,
+) -> Result<Admission, JobsError> {
+    // A NUMBER A DISCARD SPENT ADMITS NO PACKET (backlog ce8b7d66, part
+    // 4), judged under the lock the insert below takes and the discard's
+    // spend took — the Pg adapter's `FOR KEY SHARE` on the row, in
+    // memory.
+    if state
+        .discarded_versions
+        .contains(&(job.kind.clone(), job.workflow_version))
+    {
+        return Err(JobsError::VersionDiscarded {
+            kind: job.kind.clone(),
+            version: job.workflow_version,
+        });
+    }
+    let key = job_key(&job.id);
+    let inserted = match state.jobs.entry(key.clone()) {
+        std::collections::hash_map::Entry::Occupied(_) => false,
+        std::collections::hash_map::Entry::Vacant(v) => {
+            v.insert(job.clone());
+            true
+        }
+    };
+    // The job row decides for the whole graph, as it does in the Pg
+    // adapter (backlog 9d2af748): the steps carry fresh ids, so an
+    // existing packet under this id takes no step and records nothing.
+    if !inserted {
+        return Ok(Admission::AlreadyAdmitted);
+    }
+    state.job_created_at.insert(key, now);
+    recorded.extend_from_slice(job_events);
+    for (step, event) in stamped.iter().zip(step_events) {
+        if insert_step_locked(state, step, now) {
+            recorded.push(event.clone());
+        }
+    }
+    Ok(Admission::Admitted)
+}
+
+/// The decided `due` step written over its row, as one step write.
+fn write_due_locked(state: &mut State, due: &Step, now: DateTime<Utc>) {
+    let key = step_key(&due.id);
+    state.steps.insert(key.clone(), due.clone());
+    touch_step(state, key, now);
+}
+
+/// Steps in id order — the order the Pg adapter reads and locks them in.
+fn sorted_steps(steps: impl Iterator<Item = Step>) -> Vec<Step> {
+    let mut steps: Vec<Step> = steps.collect();
+    steps.sort_by_key(|s| *s.id.inner().as_uuid());
+    steps
 }
 
 fn job_key(id: &JobId) -> String {
@@ -1258,6 +1829,237 @@ fn pinned_to_workflow_locked(state: &State, kind: &str, version: i32) -> crate::
 
 #[async_trait]
 impl JobsRepository for InMemoryJobs {
+    async fn resource_pool_version(
+        &self,
+        name: &str,
+        version: i32,
+    ) -> Result<Option<crate::pools::PoolSpec>, JobsError> {
+        crate::pools::PoolRegistry::list_versions(self.resource_pools.as_ref(), name)
+            .await
+            .map(|rows| rows.into_iter().find(|p| p.version == version))
+            .map_err(|e| JobsError::Storage(e.to_string()))
+    }
+    async fn active_resource_pools(&self) -> Result<Vec<crate::pools::PoolSpec>, JobsError> {
+        crate::pools::PoolRegistry::list_active(self.resource_pools.as_ref())
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))
+    }
+    async fn resource_pool_is_active(&self, name: &str) -> Result<bool, JobsError> {
+        crate::pools::PoolRegistry::list_versions(self.resource_pools.as_ref(), name)
+            .await
+            .map(|rows| {
+                rows.iter()
+                    .any(|p| p.status == crate::registry::WorkflowStatus::Active)
+            })
+            .map_err(|e| JobsError::Storage(e.to_string()))
+    }
+    async fn bind_resource_identity_at(
+        &self,
+        step: &StepId,
+        actor: &str,
+        binding: &crate::resource_leases::IdentityBinding,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), JobsError> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| JobsError::Storage("jobs unavailable".into()))?;
+        let row = state
+            .steps
+            .get(&step_key(step))
+            .ok_or(JobsError::StepNotFound(*step))?;
+        let mut pools = self.resource_pools.resource_lock()?;
+        let (claim, active) = pools
+            .claims
+            .get(&step.to_string())
+            .ok_or_else(|| crate::resource_leases::error("resource-acquisition-unknown"))?;
+        crate::resource_leases::validate_binding(claim, *active, actor, binding, stamp.timestamp)?;
+        if row.status != StepStatus::Active || row.assignee_id.as_deref() != Some(actor) {
+            return Err(crate::resource_leases::error(
+                "resource-binding-holder-mismatch",
+            ));
+        }
+        if pools.identities.contains_key(&claim.id) {
+            return Err(crate::resource_leases::error(
+                "resource-identity-already-bound",
+            ));
+        }
+        let event=stamp.event(crate::resource_leases::IDENTITY_BOUND,serde_json::json!({"job_id":claim.job_id,"step_id":claim.step_id,"claim":claim,"binding":binding,"observed_at":stamp.timestamp}));
+        let mut recorded = self
+            .recorded
+            .lock()
+            .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
+        pools
+            .identities
+            .insert(binding.acquisition, binding.clone());
+        recorded.push(event);
+        Ok(())
+    }
+    async fn sweep_resource_leases_at(
+        &self,
+        stamp: &boss_core::publisher::EventStamp,
+        limit: usize,
+    ) -> Result<crate::resource_leases::SweepResult, JobsError> {
+        if limit == 0 || limit > crate::resource_leases::MAX_SWEEP {
+            return Err(crate::resource_leases::error(
+                "resource-sweep-bound-invalid",
+            ));
+        }
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| JobsError::Storage("jobs unavailable".into()))?;
+        let mut pools = self.resource_pools.resource_lock()?;
+        // Mirror the Pg adapter: each expiry is its packet's fact, under
+        // the partition the packet was admitted into, read through the
+        // step the lease is on (Codex review e7a414ae, R1 P2).
+        let partition_of = |claim: &crate::flow_resources::Claim| {
+            state
+                .steps
+                .get(&step_key(&claim.step_id))
+                .and_then(|step| state.jobs.get(&job_key(&step.job_id)))
+                .map(|job| job.partition)
+                .ok_or_else(|| crate::resource_leases::error("resource-expiry-index-inconsistent"))
+        };
+        let due: Vec<_> = pools
+            .lease_expiry
+            .iter()
+            .take_while(|(until, _)| *until <= stamp.timestamp)
+            .take(limit)
+            .map(|(_, id)| {
+                pools
+                    .claims
+                    .get(id)
+                    .filter(|(_, active)| *active)
+                    .map(|(claim, _)| claim.clone())
+                    .ok_or_else(|| {
+                        crate::resource_leases::error("resource-expiry-index-inconsistent")
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        let mut effects = Vec::new();
+        for claim in &due {
+            let obligations = crate::resource_leases::obligations_for(
+                claim,
+                pools.identities.get(&claim.id).map(|b| b.identity.clone()),
+                &pools.rows.values().cloned().collect::<Vec<_>>(),
+            )?;
+            let stamp = stamp.clone().with_partition(partition_of(claim)?);
+            effects.push((claim.clone(),stamp.event(crate::resource_leases::LEASE_EXPIRED,serde_json::json!({"job_id":claim.job_id,"step_id":claim.step_id,"claim":claim,"stock_obligations":obligations,"observed_at":stamp.timestamp})),obligations));
+        }
+        let mut recorded = self
+            .recorded
+            .lock()
+            .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
+        for (claim, event, obligations) in effects {
+            crate::flow_resources_memory::release(&mut pools, &claim, &obligations);
+            recorded.push(event);
+        }
+        Ok(crate::resource_leases::SweepResult {
+            observed_at: stamp.timestamp,
+            expired: due.len(),
+        })
+    }
+    async fn stock_obligations(
+        &self,
+        acquisition: uuid::Uuid,
+    ) -> Result<Vec<crate::resource_leases::StockObligation>, JobsError> {
+        Ok(self
+            .resource_pools
+            .resource_lock()?
+            .obligations
+            .values()
+            .filter(|o| o.claim.id == acquisition)
+            .cloned()
+            .collect())
+    }
+    async fn resource_waiting_rows(
+        &self,
+        pool: &str,
+    ) -> Result<Vec<crate::flow_resources::WaitingRow>, JobsError> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| JobsError::Storage("jobs unavailable".into()))?;
+        Ok(state
+            .steps
+            .values()
+            .filter(|step| step.status == StepStatus::Ready)
+            .filter(|step| {
+                step.metadata
+                    .get(crate::flow_resources::WAITING_KEY)
+                    .and_then(|wait| wait.get("resource"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(pool)
+            })
+            .filter(|step| {
+                state.jobs.get(&job_key(&step.job_id)).is_some_and(|job| {
+                    !matches!(job.status, JobStatus::Closed | JobStatus::Cancelled)
+                })
+            })
+            .map(|step| {
+                (
+                    step.job_id,
+                    step.id,
+                    step.assignee_id.clone(),
+                    step.metadata[crate::flow_resources::WAITING_KEY].clone(),
+                )
+            })
+            .collect())
+    }
+    async fn discharge_stock_at(
+        &self,
+        acquisition: uuid::Uuid,
+        pool: &str,
+        actor: &str,
+        evidence: uuid::Uuid,
+        verifier: &dyn crate::resource_leases::ResourceReturnVerifier,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), JobsError> {
+        let key = (acquisition, pool.to_owned());
+        let before = self
+            .resource_pools
+            .resource_lock()?
+            .obligations
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| crate::resource_leases::error("stock-obligation-unknown"))?;
+        if before.reclaimer != actor {
+            return Err(crate::resource_leases::error("stock-reclaimer-mismatch"));
+        }
+        if before.returned_by == Some(evidence) {
+            return Ok(());
+        }
+        let verified = verifier.verify(&before, evidence).await?;
+        crate::resource_leases::validate_return(&before, actor, evidence, &verified)?;
+        let mut pools = self.resource_pools.resource_lock()?;
+        let current = pools
+            .obligations
+            .get(&key)
+            .ok_or_else(|| crate::resource_leases::error("stock-obligation-unknown"))?;
+        if current.returned_by == Some(evidence) {
+            return Ok(());
+        }
+        if *current != before
+            || current.returned_by.is_some()
+            || pools.return_evidence.contains_key(&evidence)
+        {
+            return Err(crate::resource_leases::error(
+                "stock-return-evidence-already-consumed",
+            ));
+        }
+        let mut after = before;
+        after.returned_by = Some(evidence);
+        let event=stamp.event(crate::resource_leases::STOCK_RETURNED,serde_json::json!({"job_id":after.claim.job_id,"step_id":after.claim.step_id,"obligation":after,"evidence":evidence}));
+        let mut recorded = self
+            .recorded
+            .lock()
+            .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
+        pools.obligations.insert(key.clone(), after);
+        pools.return_evidence.insert(evidence, key);
+        recorded.push(event);
+        Ok(())
+    }
     fn native_selection_requires_ingress(&self) -> bool {
         !self.is_selection_fixture()
     }
@@ -1272,7 +2074,7 @@ impl JobsRepository for InMemoryJobs {
             .native_selection
             .as_ref()
             .ok_or_else(|| JobsError::Storage("native memory owners unavailable".into()))?;
-        let deadline = ingress.started() + crate::station_claim::SELECTION_PRE_COMMIT_BUDGET;
+        let deadline = ingress.deadline();
         loop {
             verify_memory_deadline(deadline)?;
             let result = store.try_read(ingress, |user, scope| {
@@ -1321,7 +2123,7 @@ impl JobsRepository for InMemoryJobs {
             .native_selection
             .as_ref()
             .ok_or_else(|| JobsError::Storage("native memory owners unavailable".into()))?;
-        let deadline = ingress.started() + crate::station_claim::SELECTION_PRE_COMMIT_BUDGET;
+        let deadline = ingress.deadline();
         loop {
             verify_memory_deadline(deadline)?;
             if let Some(observation) =
@@ -1341,54 +2143,7 @@ impl JobsRepository for InMemoryJobs {
         job_events: &[boss_core::event::Event],
         step_events: &[boss_core::event::Event],
     ) -> Result<Admission, JobsError> {
-        if let Some(registry) = self.workflows.as_ref() {
-            let spec = registry
-                .get_version(&job.kind, job.workflow_version)
-                .await
-                .map_err(|error| {
-                    JobsError::ImmutableMetadata(format!(
-                        "pinned admission declaration unavailable: {error}"
-                    ))
-                })?;
-            crate::metadata_immutability::validate_protocol(
-                &spec.metadata_schema,
-                &serde_json::json!({}),
-                &job.metadata,
-                None,
-            )
-            .map_err(JobsError::ImmutableMetadata)?;
-        }
-        if [
-            crate::metadata_immutability::KEY,
-            crate::metadata_immutability::GUARDED_KEY,
-        ]
-        .iter()
-        .any(|key| job.metadata.get(key).is_some())
-        {
-            return Err(JobsError::ImmutableMetadata(
-                "first-write bindings are created only by the conditional metadata door".into(),
-            ));
-        }
-        // Same refusal as the Pg adapter, before the lock: nothing is
-        // written for a graph whose events do not pair with its rows.
-        if steps.len() != step_events.len() {
-            return Err(JobsError::Storage(format!(
-                "create_job_with_steps_at: {} step(s) but {} step event(s) — one \
-                 STEP_CREATED per step, index-aligned",
-                steps.len(),
-                step_events.len()
-            )));
-        }
-        // One lock held across the job AND every step is this
-        // adapter's one transaction: a reader sees the whole graph or
-        // none of it, as the Pg commit guarantees (backlog f2ba226e).
-        // Mirror the Pg replay guard per row: an existing id is a
-        // no-op that records nothing — and keeps its original
-        // admission instant.
-        let mut stamped = Vec::with_capacity(steps.len());
-        for step in steps {
-            stamped.push(self.stamp_plugin_version(step).await?);
-        }
+        let stamped = self.prepare_admission(job, steps, step_events).await?;
         let mut recorded = Vec::with_capacity(job_events.len() + step_events.len());
         let (admission, mut event_log) = {
             let mut state = self.inner.lock().expect("poisoned");
@@ -1396,54 +2151,166 @@ impl JobsRepository for InMemoryJobs {
                 .recorded
                 .lock()
                 .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
-            // A NUMBER A DISCARD SPENT ADMITS NO PACKET (backlog
-            // ce8b7d66, part 4), judged under the lock the insert below
-            // takes and the discard's spend took — the Pg adapter's
-            // `FOR KEY SHARE` on the row, in memory.
-            if state
-                .discarded_versions
-                .contains(&(job.kind.clone(), job.workflow_version))
-            {
-                return Err(JobsError::VersionDiscarded {
-                    kind: job.kind.clone(),
-                    version: job.workflow_version,
-                });
-            }
-            let key = job_key(&job.id);
-            let inserted = match state.jobs.entry(key.clone()) {
-                std::collections::hash_map::Entry::Occupied(_) => false,
-                std::collections::hash_map::Entry::Vacant(v) => {
-                    v.insert(job.clone());
-                    true
-                }
-            };
-            // The job row decides for the whole graph, as it does in
-            // the Pg adapter (backlog 9d2af748): the steps carry fresh
-            // ids, so an existing packet under this id takes no step
-            // and records nothing.
-            if inserted {
-                state.job_created_at.insert(key, now);
-                recorded.extend_from_slice(job_events);
-                for (step, event) in stamped.iter().zip(step_events) {
-                    if insert_step_locked(&mut state, step, now) {
-                        recorded.push(event.clone());
-                    }
-                }
-                (Admission::Admitted, event_log)
-            } else {
-                (Admission::AlreadyAdmitted, event_log)
-            }
+            let admission = admit_locked(
+                &mut state,
+                job,
+                &stamped,
+                now,
+                job_events,
+                step_events,
+                &mut recorded,
+            )?;
+            (admission, event_log)
         };
         event_log.extend(recorded);
         Ok(admission)
     }
 
+    /// The whole decision under this adapter's ONE lock, which every
+    /// writer of these rows — the step write door, the close door —
+    /// also takes: the fence the Pg adapter builds from row locks is the
+    /// mutex here, so the guard read and the writes below cannot be
+    /// separated by any writer (backlog 84a010cb, car 3).
+    async fn guarded_admission_at(
+        &self,
+        request: &crate::guarded_admission::Request,
+        due_events: &(dyn for<'s> Fn(&'s Step) -> Vec<boss_core::event::Event> + Send + Sync),
+    ) -> Result<crate::guarded_admission::Outcome, JobsError> {
+        use crate::guarded_admission::{self as ga, Decision, Outcome};
+        // The child graph's lock-free checks and stamps, as admission
+        // takes them; refused here, nothing is judged or written.
+        let stamped = self
+            .prepare_admission(
+                &request.child,
+                &request.child_steps,
+                &request.child_step_events,
+            )
+            .await?;
+        let mut recorded = Vec::new();
+        let (outcome, mut event_log) = {
+            let mut state = self.inner.lock().expect("poisoned");
+            let event_log = self
+                .recorded
+                .lock()
+                .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
+            let intent = state.jobs.get(&job_key(&request.intent)).cloned();
+            let due_steps: Vec<Step> = sorted_steps(
+                state
+                    .steps
+                    .values()
+                    .filter(|s| {
+                        s.job_id == request.intent && s.spec_slug.as_deref() == Some(ga::DUE_STEP)
+                    })
+                    .cloned(),
+            );
+            let (binding, due) = match ga::preflight(intent.as_ref(), &due_steps, request) {
+                Ok(bound) => bound,
+                Err(outcome) => return Ok(*outcome),
+            };
+            // An unreadable guard is an error, never a verdict: the
+            // injected faults the plain reads honour, honoured here.
+            let source_id = binding.guard.source_job;
+            if state.unreadable_jobs.contains(&job_key(&source_id)) {
+                return Err(JobsError::Storage(format!(
+                    "job {source_id} unreadable (injected by fail_job_read)"
+                )));
+            }
+            if state.unreadable_steps.contains(&job_key(&source_id)) {
+                return Err(JobsError::Storage(format!(
+                    "steps of {source_id} unreadable (injected by fail_steps_read)"
+                )));
+            }
+            let source = state.jobs.get(&job_key(&source_id)).cloned();
+            let named: BTreeSet<&str> = binding
+                .guard
+                .steps
+                .iter()
+                .map(|g| g.step.as_str())
+                .collect();
+            let source_steps = sorted_steps(
+                state
+                    .steps
+                    .values()
+                    .filter(|s| {
+                        s.job_id == source_id
+                            && s.spec_slug
+                                .as_deref()
+                                .is_some_and(|slug| named.contains(slug))
+                    })
+                    .cloned(),
+            );
+            // A packet already under the child id, with its whole step
+            // graph: reconciled only when both are the requested child's
+            // (review b12f08eb, P1).
+            let existing = state.jobs.get(&job_key(&binding.child_id)).cloned();
+            let existing_steps = sorted_steps(
+                state
+                    .steps
+                    .values()
+                    .filter(|s| s.job_id == binding.child_id)
+                    .cloned(),
+            );
+            let judged = ga::judge(&binding.guard, source.as_ref(), &source_steps);
+            let standing = existing.as_ref().map(|job| ga::Existing {
+                job,
+                steps: &existing_steps,
+            });
+            let outcome = match ga::decide(judged, &due, &binding, standing, request) {
+                Decision::Answer(outcome) => return Ok(outcome),
+                Decision::Suppress { reason, due } => {
+                    write_due_locked(&mut state, &due, request.now);
+                    recorded.extend(due_events(&due));
+                    Outcome::Suppressed { reason, due }
+                }
+                Decision::Admit { reconciled, due } => {
+                    if !reconciled {
+                        let admission = admit_locked(
+                            &mut state,
+                            &request.child,
+                            &stamped,
+                            request.now,
+                            &request.child_job_events,
+                            &request.child_step_events,
+                            &mut recorded,
+                        )?;
+                        // The existence read above was under this lock.
+                        if admission != Admission::Admitted {
+                            return Err(JobsError::Storage(format!(
+                                "child {} appeared under the admission lock",
+                                binding.child_id
+                            )));
+                        }
+                    }
+                    write_due_locked(&mut state, &due, request.now);
+                    recorded.extend(due_events(&due));
+                    Outcome::Admitted {
+                        child: binding.child_id,
+                        reconciled,
+                        due,
+                    }
+                }
+            };
+            (outcome, event_log)
+        };
+        event_log.extend(recorded);
+        Ok(outcome)
+    }
+
     async fn get_job(&self, id: &JobId) -> Result<Option<Job>, JobsError> {
         let mut state = self.inner.lock().expect("poisoned");
+        *state.job_reads.entry(job_key(id)).or_default() += 1;
         if state.unreadable_jobs.contains(&job_key(id)) {
             return Err(JobsError::Storage(format!(
                 "job {id} unreadable (injected by fail_job_read)"
             )));
+        }
+        if let Some(left) = state.job_reads_left.get_mut(&job_key(id)) {
+            if *left == 0 {
+                return Err(JobsError::Storage(format!(
+                    "job {id} unreadable (injected by fail_job_read_after)"
+                )));
+            }
+            *left -= 1;
         }
         if state.unseen_once.remove(&job_key(id)) {
             return Ok(None);
@@ -1475,6 +2342,18 @@ impl JobsRepository for InMemoryJobs {
         &self,
         job: &Job,
         read: JobStatus,
+        now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<(), JobsError> {
+        self.update_job_expecting_at(job, read, None, now, events)
+            .await
+    }
+
+    async fn update_job_expecting_at(
+        &self,
+        job: &Job,
+        read: JobStatus,
+        expect: Option<&serde_json::Map<String, serde_json::Value>>,
         _now: chrono::DateTime<chrono::Utc>,
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
@@ -1485,6 +2364,13 @@ impl JobsRepository for InMemoryJobs {
             let Some(existing) = state.jobs.get(&key) else {
                 return Err(JobsError::NotFound(job.id));
             };
+            // The writer's precondition, judged under the same lock as
+            // the write (backlog 87fe090d) — the Pg adapter's FOR UPDATE.
+            if let Some(expect) = expect
+                && !crate::step_metadata_write::metadata_still_reads(&existing.metadata, expect)
+            {
+                return Err(JobsError::JobChanged { id: job.id });
+            }
             crate::metadata_immutability::preserve(&existing.metadata, &job.metadata, false)
                 .map_err(JobsError::ImmutableMetadata)?;
             if let Some((kind, version, schema)) = declaration {
@@ -1511,6 +2397,10 @@ impl JobsRepository for InMemoryJobs {
                     status: format!("{:?}", existing.status).to_lowercase(),
                 });
             }
+            // The packet budget, the Pg adapter's, under the same lock
+            // (backlog 4f8783fb).
+            crate::packet_budget::admit_whole_row(events, job.status != read, &existing.metadata)
+                .map_err(JobsError::OverBudget)?;
             // Mirror the Pg adapter: the partition and the admission
             // instant are decided at admission and immutable — an
             // update carries no authority over either. The storage
@@ -1525,9 +2415,28 @@ impl JobsRepository for InMemoryJobs {
             // moves through `repin_workflow_version_at`, never here.
             next.kind = existing.kind.clone();
             next.workflow_version = existing.workflow_version;
+            let mut pools = self.resource_pools.resource_lock()?;
+            let mut releases = Vec::new();
+            if matches!(next.status, JobStatus::Cancelled | JobStatus::Closed) {
+                for step in state.steps.values().filter(|step| step.job_id == job.id) {
+                    if let Some(release) =
+                        crate::flow_resources_memory::exit_plan(&pools, step, step, events, true)?
+                    {
+                        releases.push(release);
+                    }
+                }
+            }
+            let mut recorded = self
+                .recorded
+                .lock()
+                .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
+            for (claim, event, obligations) in releases {
+                crate::flow_resources_memory::release(&mut pools, &claim, &obligations);
+                recorded.push(event);
+            }
             state.jobs.insert(key, next);
+            recorded.extend_from_slice(events);
         }
-        self.record_all(events);
         Ok(())
     }
 
@@ -1545,6 +2454,23 @@ impl JobsRepository for InMemoryJobs {
             .conditional_receipts
             .get(&(job_key(id), actor.to_owned(), command_id))
             .cloned())
+    }
+
+    async fn conditional_job_metadata_receipts(
+        &self,
+        id: &JobId,
+    ) -> Result<Vec<crate::conditional_metadata::Receipt>, JobsError> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| JobsError::Storage("conditional state lock poisoned".into()))?;
+        let job = job_key(id);
+        Ok(state
+            .conditional_receipts
+            .iter()
+            .filter(|((packet, _, _), _)| *packet == job)
+            .map(|(_, receipt)| receipt.clone())
+            .collect())
     }
 
     async fn conditional_job_metadata_decision_at(
@@ -1590,9 +2516,9 @@ impl JobsRepository for InMemoryJobs {
                         "pinned first-binding declaration unavailable: {error}"
                     ))
                 })?;
-            if spec.status == crate::registry::WorkflowStatus::Draft {
+            if !spec.status.was_published() {
                 return Err(JobsError::ImmutableMetadata(
-                    "draft workflow cannot authorize first binding".into(),
+                    "unpublished workflow cannot authorize first binding".into(),
                 ));
             }
             Some((
@@ -1631,6 +2557,22 @@ impl JobsRepository for InMemoryJobs {
         {
             return Err(JobsError::JobChanged { id: *id });
         }
+        // Freshness judged inside the same state lock as the write, as
+        // the transactional adapter judges it under its row lock (backlog
+        // 301b9060).
+        if command.patch.contains_key(crate::gate_reservation::ATTEMPT) {
+            let receipts: Vec<_> = state
+                .conditional_receipts
+                .iter()
+                .filter(|((packet, _, _), _)| *packet == job_key(id))
+                .map(|(_, receipt)| receipt.clone())
+                .collect();
+            crate::gate_reservation::refuse_a_written_attempt_id(
+                command,
+                &crate::gate_reservation::attempt_ids_written(&receipts),
+            )
+            .map_err(JobsError::ImmutableMetadata)?;
+        }
         let job = command.apply(current)?;
         if let Some((kind, version, schema)) = declaration {
             if current.kind != kind || current.workflow_version != version {
@@ -1646,6 +2588,11 @@ impl JobsRepository for InMemoryJobs {
         }
         let (receipt, pair) =
             crate::conditional_metadata::recorded_pair(stamp, command, job.clone())?;
+        // The packet budget, against the row as found (backlog 4f8783fb).
+        for event in pair.iter().filter(|e| e.kind == crate::events::JOB_UPDATED) {
+            crate::packet_budget::admit_against(event, &current.metadata)
+                .map_err(JobsError::OverBudget)?;
+        }
         state.jobs.insert(job_key(id), job);
         state.conditional_receipts.insert(key, receipt.clone());
         // Keep state exclusion until BOTH events are recorded, matching
@@ -1664,13 +2611,25 @@ impl JobsRepository for InMemoryJobs {
         judged_on: Option<&Job>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Job, JobsError> {
+        self.merge_job_metadata_expecting_at(id, patch, judged_on, None, stamp)
+            .await
+    }
+
+    async fn merge_job_metadata_expecting_at(
+        &self,
+        id: &JobId,
+        patch: &serde_json::Map<String, serde_json::Value>,
+        judged_on: Option<&Job>,
+        expect: Option<&serde_json::Map<String, serde_json::Value>>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<Job, JobsError> {
         // Mirror the Pg adapter: merge under the lock against the row
         // as it stands, null removes, no envelope field moves, and the
         // JOB_UPDATED event is built from the post-merge row. A merge
         // judged on a read refuses once the row's status or metadata
         // moved (finding B of the review of car 06973644).
         let declaration = self.metadata_declaration(id).await?;
-        let merged = {
+        let (merged, event) = {
             let mut state = self.inner.lock().expect("poisoned");
             let Some(job) = state.jobs.get_mut(&job_key(id)) else {
                 return Err(JobsError::NotFound(*id));
@@ -1693,6 +2652,12 @@ impl JobsRepository for InMemoryJobs {
             {
                 return Err(JobsError::JobChanged { id: *id });
             }
+            // The writer's precondition, under the same lock (87fe090d).
+            if let Some(expect) = expect
+                && !crate::step_metadata_write::metadata_still_reads(&job.metadata, expect)
+            {
+                return Err(JobsError::JobChanged { id: *id });
+            }
             let mut md = match &job.metadata {
                 serde_json::Value::Object(m) => m.clone(),
                 _ => serde_json::Map::new(),
@@ -1704,15 +2669,106 @@ impl JobsRepository for InMemoryJobs {
                     md.insert(k.clone(), v.clone());
                 }
             }
+            // The packet budget, judged under the lock against the row
+            // as found, before the row moves (backlog 4f8783fb).
+            let merged = Job {
+                metadata: serde_json::Value::Object(md),
+                ..job.clone()
+            };
+            let event = stamp.event(
+                crate::events::JOB_UPDATED,
+                serde_json::to_value(&merged).unwrap_or_default(),
+            );
+            crate::packet_budget::admit_against(&event, &job.metadata)
+                .map_err(JobsError::OverBudget)?;
+            *job = merged.clone();
+            (merged, event)
+        };
+        self.record_all(&[event]);
+        Ok(merged)
+    }
+
+    async fn set_priority_at(
+        &self,
+        id: &JobId,
+        to: boss_core::job::Priority,
+        why: &str,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<crate::priority::PriorityMove, JobsError> {
+        self.set_priority_expecting_at(id, to, why, None, stamp)
+            .await
+    }
+
+    async fn set_priority_expecting_at(
+        &self,
+        id: &JobId,
+        to: boss_core::job::Priority,
+        why: &str,
+        expected: Option<&crate::priority::PriorityExpectation>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<crate::priority::PriorityMove, JobsError> {
+        // Mirror the Pg adapter: judged and written under one lock,
+        // against the row as it stands; a finished row refuses, a row
+        // already at `to` writes nothing (backlog eb26059d).
+        let declaration = self.metadata_declaration(id).await?;
+        let (moved, from) = {
+            let mut state = self.inner.lock().expect("poisoned");
+            let Some(job) = state.jobs.get_mut(&job_key(id)) else {
+                return Err(JobsError::NotFound(*id));
+            };
+            if matches!(job.status, JobStatus::Closed | JobStatus::Cancelled) {
+                return Err(JobsError::TerminalJob {
+                    id: *id,
+                    status: format!("{:?}", job.status).to_lowercase(),
+                });
+            }
+            if expected.is_some_and(|expected| !expected.matches(job)) {
+                return Err(JobsError::JobChanged { id: *id });
+            }
+            let from = job.priority;
+            if from == to {
+                return Ok(crate::priority::PriorityMove {
+                    job: job.clone(),
+                    from,
+                    changed: false,
+                });
+            }
+            let entry =
+                crate::priority::record(from, to, &stamp.actor().to_string(), why, stamp.timestamp);
+            let patch = crate::priority::appended(&job.metadata, entry)
+                .map_err(JobsError::ImmutableMetadata)?;
+            crate::metadata_immutability::patch(&job.metadata, &patch)
+                .map_err(JobsError::ImmutableMetadata)?;
+            if let Some((kind, version, schema)) = declaration {
+                if job.kind != kind || job.workflow_version != version {
+                    return Err(JobsError::JobChanged { id: *id });
+                }
+                crate::metadata_immutability::validate_protocol_patch(
+                    &schema,
+                    &job.metadata,
+                    &patch,
+                )
+                .map_err(JobsError::ImmutableMetadata)?;
+            }
+            let mut md = match &job.metadata {
+                serde_json::Value::Object(m) => m.clone(),
+                _ => serde_json::Map::new(),
+            };
+            md.extend(patch);
             job.metadata = serde_json::Value::Object(md);
-            job.clone()
+            job.priority = to;
+            (job.clone(), from)
         };
         let event = stamp.event(
             crate::events::JOB_UPDATED,
-            serde_json::to_value(&merged).unwrap_or_default(),
+            serde_json::to_value(&moved).unwrap_or_default(),
         );
         self.record_all(&[event]);
-        Ok(merged)
+        Ok(crate::priority::PriorityMove {
+            job: moved,
+            from,
+            changed: true,
+        })
     }
 
     async fn close_job_at(
@@ -1726,7 +2782,7 @@ impl JobsRepository for InMemoryJobs {
         let declaration = self.metadata_declaration(id).await?;
         // Mirror the Pg adapter's one UPDATE: under the lock, only an
         // open row closes, and only the close's own fields move.
-        let closed = {
+        let (closed, state_event) = {
             let mut state = self.inner.lock().expect("poisoned");
             if state.unclosable_jobs.contains(&job_key(id)) {
                 return Err(JobsError::Storage(format!(
@@ -1758,15 +2814,21 @@ impl JobsRepository for InMemoryJobs {
                 )
                 .map_err(JobsError::ImmutableMetadata)?;
             }
-            job.metadata = serde_json::Value::Object(md);
-            job.status = JobStatus::Closed;
-            job.closed_on = Some(closed_on);
-            job.clone()
+            let closed = Job {
+                metadata: serde_json::Value::Object(md),
+                status: JobStatus::Closed,
+                closed_on: Some(closed_on),
+                ..job.clone()
+            };
+            // Never refused by the budget (backlog 4f8783fb); over the
+            // bound, the bounded delta instead of the whole row, as the
+            // Pg adapter stages (backlog b96df4f8).
+            let state_event = crate::packet_budget::close_event(stamp, &closed, owned)
+                .map_err(JobsError::OverBudget)?;
+            *job = closed.clone();
+            (closed, state_event)
         };
-        let mut events = vec![stamp.event(
-            crate::events::JOB_UPDATED,
-            serde_json::to_value(&closed).unwrap_or_default(),
-        )];
+        let mut events = vec![state_event];
         events.extend(markers(&closed));
         self.record_all(&events);
         Ok(Some(closed))
@@ -1780,24 +2842,63 @@ impl JobsRepository for InMemoryJobs {
     ) -> Result<(Job, usize), JobsError> {
         // Under the lock, against the row as it stands — the Pg
         // adapter's one UPDATE, as Rust.
-        let (job, index) = {
+        let (job, index, updated) = {
             let mut state = self.inner.lock().expect("poisoned");
             let Some(job) = state.jobs.get_mut(&job_key(id)) else {
                 return Err(JobsError::NotFound(*id));
             };
             let (md, index) = crate::corrections::appended(&job.metadata, entry);
-            job.metadata = md;
-            (job.clone(), index)
+            let appended = Job {
+                metadata: md,
+                ..job.clone()
+            };
+            // An append only ever grows the packet (backlog 4f8783fb).
+            let updated = stamp.event(
+                crate::events::JOB_UPDATED,
+                serde_json::to_value(&appended).unwrap_or_default(),
+            );
+            crate::packet_budget::admit(&updated, true).map_err(JobsError::OverBudget)?;
+            *job = appended.clone();
+            (appended, index, updated)
         };
-        let updated = stamp.event(
-            crate::events::JOB_UPDATED,
-            serde_json::to_value(&job).unwrap_or_default(),
-        );
         let corrected = stamp.event(
             crate::events::STEP_CORRECTED,
             crate::corrections::corrected_payload(&id.to_string(), entry, index),
         );
         self.record_all(&[updated, corrected]);
+        Ok((job, index))
+    }
+
+    async fn append_input_classification_at(
+        &self,
+        id: &JobId,
+        entry: &serde_json::Value,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(Job, usize), JobsError> {
+        let (job, index, updated) = {
+            let mut state = self.inner.lock().expect("poisoned");
+            let Some(job) = state.jobs.get_mut(&job_key(id)) else {
+                return Err(JobsError::NotFound(*id));
+            };
+            let (md, index) = crate::execution_inputs::appended(&job.metadata, entry);
+            let appended = Job {
+                metadata: md,
+                ..job.clone()
+            };
+            // An append only ever grows the packet (backlog 4f8783fb).
+            let updated = stamp.event(
+                crate::events::JOB_UPDATED,
+                serde_json::to_value(&appended).unwrap_or_default(),
+            );
+            crate::packet_budget::admit(&updated, true).map_err(JobsError::OverBudget)?;
+            *job = appended.clone();
+            (appended, index, updated)
+        };
+        let classified = stamp.event(
+            crate::events::JOB_INPUT_CLASSIFIED,
+            crate::execution_inputs::classified_payload(&id.to_string(), entry, index),
+        );
+        self.record_all(&[updated, classified]);
         Ok((job, index))
     }
 
@@ -1819,11 +2920,17 @@ impl JobsRepository for InMemoryJobs {
         declared: &[crate::port::EstateNodeInput],
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<crate::port::EstateBatchOutcome, JobsError> {
+        declared
+            .iter()
+            .try_for_each(crate::port::validate_estate_disk_capacity)
+            .map_err(JobsError::Storage)?;
+        crate::port::validate_estate_node_ids(declared).map_err(JobsError::Storage)?;
         let mut st = self
             .inner
             .lock()
             .map_err(|_| JobsError::Storage("lock".into()))?;
         let mut inserted = 0;
+        let mut updated = 0;
         let mut roles_inserted = 0;
         let mut events = Vec::new();
         for n in declared {
@@ -1840,6 +2947,7 @@ impl JobsRepository for InMemoryJobs {
                     disk_gb: n.disk_gb,
                     notes: n.notes.clone(),
                     retired: false,
+                    disks: n.disks.clone().unwrap_or_default(),
                 });
                 inserted += 1;
             }
@@ -1848,6 +2956,21 @@ impl JobsRepository for InMemoryJobs {
                 .iter_mut()
                 .find(|e| e.id == n.id)
                 .ok_or_else(|| JobsError::Storage("the node just landed".into()))?;
+            let disk = (!node_new)
+                .then(|| crate::port::estate_disk_change(row.disk_gb, n.disk_gb))
+                .flatten();
+            if let Some(change) = &disk {
+                row.disk_gb = Some(change.after);
+            }
+            let disks = (!node_new)
+                .then(|| crate::port::estate_disks_change(&row.disks, n.disks.as_ref()))
+                .flatten();
+            if let Some(change) = &disks {
+                row.disks = change.after.clone();
+            }
+            if disk.is_some() || disks.is_some() {
+                updated += 1;
+            }
             let landed: Vec<String> = n
                 .roles
                 .iter()
@@ -1857,9 +2980,14 @@ impl JobsRepository for InMemoryJobs {
             row.roles.extend(landed.iter().cloned());
             row.roles.sort();
             roles_inserted += landed.len();
-            if node_new || !landed.is_empty() {
-                events.push(crate::port::node_declared_event(
-                    stamp, n, node_new, &landed,
+            if node_new || !landed.is_empty() || disk.is_some() || disks.is_some() {
+                events.push(crate::port::node_declared_event_with_disk(
+                    stamp,
+                    n,
+                    node_new,
+                    &landed,
+                    disk.as_ref(),
+                    disks.as_ref(),
                 )?);
             }
         }
@@ -1868,6 +2996,7 @@ impl JobsRepository for InMemoryJobs {
         Ok(crate::port::EstateBatchOutcome {
             received: declared.len(),
             inserted,
+            updated,
             roles_inserted,
         })
     }
@@ -1888,6 +3017,22 @@ impl JobsRepository for InMemoryJobs {
         // fix, and would do it only in this adapter — a divergence the
         // Pg pairing test in estate_readers_pg.rs is there to catch.
         // `total` is counted over the same filtered set, before `take`.
+        //
+        // A payload value as `->>` reads it: JSON null is SQL NULL.
+        let text = |v: &serde_json::Value| match v {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(s) => Some(s.clone()),
+            other => Some(other.to_string()),
+        };
+        // The row's host as the SQL's ROW_HOST reads it: its `host`
+        // stamp, else its first node's id (111996f5) — for the `host`
+        // filter AND the `latest_per=host` group (4579f9b5).
+        let row_host = |e: &boss_core::event::Event| {
+            e.payload
+                .get("host")
+                .and_then(text)
+                .or_else(|| e.payload.pointer("/nodes/0/id").and_then(text))
+        };
         let matched: Vec<boss_core::event::Event> = self
             .recorded_events()
             .into_iter()
@@ -1898,22 +3043,11 @@ impl JobsRepository for InMemoryJobs {
                     e.payload.get("scope").and_then(|s| s.as_str()) == Some(want)
                 })
             })
-            // The row's host as the SQL's COALESCE reads it: its `host`
-            // stamp, else its first node's id (111996f5).
             .filter(|e| {
-                window.host.as_deref().is_none_or(|want| {
-                    let text = |v: &serde_json::Value| match v {
-                        serde_json::Value::Null => None,
-                        serde_json::Value::String(s) => Some(s.clone()),
-                        other => Some(other.to_string()),
-                    };
-                    let host = e
-                        .payload
-                        .get("host")
-                        .and_then(text)
-                        .or_else(|| e.payload.pointer("/nodes/0/id").and_then(text));
-                    host.as_deref() == Some(want)
-                })
+                window
+                    .host
+                    .as_deref()
+                    .is_none_or(|want| row_host(e).as_deref() == Some(want))
             })
             .filter(|e| window.since.is_none_or(|since| e.timestamp >= since))
             .filter(|e| window.until.is_none_or(|until| e.timestamp < until))
@@ -1921,8 +3055,10 @@ impl JobsRepository for InMemoryJobs {
         // `latest_per` (backlog 725532ab): the first row of each group
         // is its newest, because `matched` is already newest-first —
         // and it runs before `take`, as `DISTINCT ON` runs before the
-        // Pg LIMIT. The group is the key's value as `->>` reads it: a
-        // JSON null or an absent key is the one NULL group.
+        // Pg LIMIT. The group is the key's value as `->>` reads it — a
+        // JSON null or an absent key is the one NULL group — except
+        // `host`, which is the row's host (4579f9b5: every observation
+        // carries none, and fell into that one group).
         let matched: Vec<boss_core::event::Event> = match window.latest_per.as_deref() {
             None => matched,
             Some(key) => {
@@ -1930,10 +3066,9 @@ impl JobsRepository for InMemoryJobs {
                 matched
                     .into_iter()
                     .filter(|e| {
-                        let group = match e.payload.get(key) {
-                            None | Some(serde_json::Value::Null) => None,
-                            Some(serde_json::Value::String(s)) => Some(s.clone()),
-                            Some(other) => Some(other.to_string()),
+                        let group = match key {
+                            "host" => row_host(e),
+                            _ => e.payload.get(key).and_then(text),
                         };
                         seen.insert(group)
                     })
@@ -1969,11 +3104,10 @@ impl JobsRepository for InMemoryJobs {
         //
         // DISTINCT on the step id, matching the SQL: a step re-promoted
         // to ready records a second event and is still one obligation.
-        let state = self.inner.lock().expect("poisoned");
-        let mut cube: HashMap<
-            (String, String, String, String),
-            (BTreeSet<String>, BTreeSet<String>),
-        > = HashMap::new();
+        type Cube = HashMap<(String, String, String, String), (BTreeSet<String>, BTreeSet<String>)>;
+        let mut state = self.inner.lock().expect("poisoned");
+        state.flow_cube_passes += 1;
+        let mut cube: Cube = Default::default();
         for event in self.recorded_events() {
             if event.timestamp <= since {
                 continue;
@@ -2024,6 +3158,37 @@ impl JobsRepository for InMemoryJobs {
                 },
             )
             .collect())
+    }
+
+    async fn scope_census(
+        &self,
+        scope: &JobScope,
+        limit: i64,
+    ) -> Result<Option<BTreeSet<String>>, JobsError> {
+        if *scope == JobScope::All {
+            return Ok(None);
+        }
+        if *scope == JobScope::None || !(1..=1_000_000).contains(&limit) {
+            return Err(JobsError::Storage(
+                "invalid scope census scope or bound".into(),
+            ));
+        }
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| JobsError::Storage("in-memory scope census lock poisoned".into()))?;
+        let ids: BTreeSet<_> = state
+            .jobs
+            .values()
+            .filter(|job| scope.admits(job))
+            .map(|job| job.id.to_string())
+            .collect();
+        if ids.len() as i64 > limit {
+            return Err(JobsError::Storage(
+                "the scope's packet census exceeds its bound".into(),
+            ));
+        }
+        Ok(Some(ids))
     }
 
     async fn historical_events(
@@ -2395,6 +3560,11 @@ impl JobsRepository for InMemoryJobs {
     ) -> Result<Option<(Step, StepVersion)>, JobsError> {
         let mut state = self.inner.lock().expect("poisoned");
         let key = step_key(id);
+        if state.step_write_faults.get(&key) == Some(&StepWriteFault::MovedThenUnreadable) {
+            return Err(JobsError::Storage(format!(
+                "step {id} unreadable (injected by fault_step_write)"
+            )));
+        }
         let read = state
             .steps
             .get(&key)
@@ -2425,7 +3595,8 @@ impl JobsRepository for InMemoryJobs {
         now: chrono::DateTime<chrono::Utc>,
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
-        self.write_step(step, None, now, events)
+        let protocol = self.resource_protocol(&step.id).await?;
+        self.write_step(step, None, now, events, protocol.as_ref())
     }
 
     async fn update_step_if_unchanged_at(
@@ -2435,7 +3606,8 @@ impl JobsRepository for InMemoryJobs {
         now: chrono::DateTime<chrono::Utc>,
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
-        self.write_step(step, Some(read), now, events)
+        let protocol = self.resource_protocol(&step.id).await?;
+        self.write_step(step, Some(read), now, events, protocol.as_ref())
     }
 
     async fn first_step_record(
@@ -2553,7 +3725,7 @@ impl JobsRepository for InMemoryJobs {
         patch: &serde_json::Map<String, serde_json::Value>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Step, JobsError> {
-        self.merge_step_metadata_guarded_at(id, patch, stamp, None)
+        self.merge_step_metadata_guarded_at(id, patch, stamp, None, None)
             .await
     }
     async fn merge_step_metadata_guarded_at(
@@ -2562,6 +3734,19 @@ impl JobsRepository for InMemoryJobs {
         patch: &serde_json::Map<String, serde_json::Value>,
         stamp: &boss_core::publisher::EventStamp,
         guard: Option<&crate::signer_write::SignerWriteGuard>,
+        expect: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<Step, JobsError> {
+        self.merge_step_metadata_checked_at(id, patch, stamp, guard, expect, None)
+            .await
+    }
+    async fn merge_step_metadata_checked_at(
+        &self,
+        id: &StepId,
+        patch: &serde_json::Map<String, serde_json::Value>,
+        stamp: &boss_core::publisher::EventStamp,
+        guard: Option<&crate::signer_write::SignerWriteGuard>,
+        expect: Option<&serde_json::Map<String, serde_json::Value>>,
+        read: Option<StepVersion>,
     ) -> Result<Step, JobsError> {
         // Mirror the Pg adapter: merge under the lock against the row
         // as it stands, null removes, no other field moves, a terminal
@@ -2569,7 +3754,7 @@ impl JobsRepository for InMemoryJobs {
         // STEP_UPDATED event is built from the post-merge row — with
         // the stamps a moved shape killed voided on it, and their
         // invalidation event recorded after it (design 87329a13).
-        let (merged, invalidated, mut recorded) = {
+        let (merged, invalidated, mut recorded, event) = {
             let mut state = self
                 .inner
                 .lock()
@@ -2579,6 +3764,9 @@ impl JobsRepository for InMemoryJobs {
                 .lock()
                 .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
             let key = step_key(id);
+            if read.is_some_and(|read| version_of(&state, &key) != read) {
+                return Err(JobsError::StepChanged { id: *id });
+            }
             if let Some(guard) = guard {
                 guard.check_job(state.jobs.get(&guard.job().id.to_string()), stamp)?;
             }
@@ -2594,6 +3782,14 @@ impl JobsRepository for InMemoryJobs {
             let Some(step) = state.steps.get_mut(&key) else {
                 return Err(JobsError::StepNotFound(*id));
             };
+            // The caller's precondition, under the same lock as the
+            // write (review 792b871a N1), and before the terminal check,
+            // in the Pg adapter's order.
+            if let Some(expect) = expect
+                && !crate::step_metadata_write::metadata_still_reads(&step.metadata, expect)
+            {
+                return Err(JobsError::StepChanged { id: *id });
+            }
             if matches!(step.status, StepStatus::Completed | StepStatus::Skipped) {
                 return Err(JobsError::TerminalStep {
                     id: *id,
@@ -2612,21 +3808,31 @@ impl JobsRepository for InMemoryJobs {
                 }
             }
             crate::first_record::preserve(records.iter(), &serde_json::Value::Object(md.clone()))?;
+            crate::flow_resources::preserve_token(
+                &step.metadata,
+                &serde_json::Value::Object(md.clone()),
+            )?;
             if let Some(guard) = guard {
                 guard.check_before_dispatch(stamp)?;
             }
             let shape_before = step.shape_hash();
-            step.metadata = serde_json::Value::Object(md);
-            let invalidated = crate::events::void_stamps_if_moved(stamp, &shape_before, step);
-            let merged = step.clone();
+            let mut merged = step.clone();
+            merged.metadata = serde_json::Value::Object(md);
+            let invalidated =
+                crate::events::void_stamps_if_moved(stamp, &shape_before, &mut merged);
+            // The packet budget, judged against the metadata as found,
+            // before the row moves (backlog 4f8783fb).
+            let event = stamp.event(
+                crate::events::STEP_UPDATED,
+                crate::events::step_state_payload(&merged),
+            );
+            crate::packet_budget::admit_against(&event, &step.metadata)
+                .map_err(JobsError::OverBudget)?;
+            *step = merged.clone();
             // Mirrors the SQL's `updated_at = stamp.timestamp`.
             touch_step(&mut state, key, stamp.timestamp);
-            (merged, invalidated, recorded)
+            (merged, invalidated, recorded, event)
         };
-        let event = stamp.event(
-            crate::events::STEP_UPDATED,
-            crate::events::step_state_payload(&merged),
-        );
         recorded.push(event);
         recorded.extend(invalidated);
         Ok(merged)
@@ -2653,7 +3859,28 @@ impl JobsRepository for InMemoryJobs {
     ) -> Result<crate::station_claim::SelectionResult, JobsError> {
         #[cfg(feature = "test-support")]
         if self.is_selection_fixture() {
-            return self.claim_station_fixture_at(context, actor, displaceable, stamp, events);
+            if let Some(original) = self.station_claim_receipt(context.request_id).await? {
+                crate::station_claim::replay(
+                    &original,
+                    actor,
+                    &context.station.name,
+                    context.request_id,
+                )?;
+                return Ok(crate::station_claim::SelectionResult::Replayed(original));
+            }
+            let protocol = self.resource_protocol(&context.validated_step.id).await?;
+            let bay = self
+                .bay_count(protocol.as_ref(), &context.validated_step.id, actor)
+                .await?;
+            return self.claim_station_fixture_at(
+                context,
+                actor,
+                displaceable,
+                stamp,
+                events,
+                protocol.as_ref(),
+                bay.as_ref(),
+            );
         }
         self.claim_station_native_at(context, actor, displaceable, stamp, events)
             .await
@@ -2667,18 +3894,69 @@ impl JobsRepository for InMemoryJobs {
         stamp: &boss_core::publisher::EventStamp,
         events: &[boss_core::event::Event],
     ) -> Result<Step, JobsError> {
-        let (claimed, invalidated, mut recorded) = {
+        let protocol = self.resource_protocol(step_id).await?;
+        let bay = self.bay_count(protocol.as_ref(), step_id, actor).await?;
+        let (claimed, facts, mut recorded) = {
             let mut state = self.inner.lock().expect("poisoned");
-            let recorded = self
+            let mut recorded = self
                 .recorded
                 .lock()
                 .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
-            let (claimed, invalidated) =
-                claim_in_state(&mut state, step_id, actor, displaceable, stamp, events)?;
-            (claimed, invalidated, recorded)
+            let (mut claimed, mut invalidated) =
+                prepare_claim_in_state(&state, step_id, actor, displaceable, stamp, events)?;
+            take_bay_in_state(&state, step_id, actor, bay.as_ref())?;
+            let before = state
+                .steps
+                .get(&step_key(step_id))
+                .cloned()
+                .ok_or(JobsError::StepNotFound(*step_id))?;
+            let mut pools = self.resource_pools.resource_lock()?;
+            let resource = match crate::flow_resources_memory::prepare(
+                &pools,
+                &before,
+                protocol.as_ref(),
+                actor,
+                self.agent_classes.get(actor).map(String::as_str),
+                &self.station_rows,
+                state.jobs.get(&job_key(&before.job_id)),
+                stamp.timestamp,
+            ) {
+                Ok(claim) => claim,
+                Err(JobsError::ResourceRefused(reason)) => {
+                    let (refused, facts) =
+                        crate::flow_resources::refused_step(&before, &reason, stamp)?;
+                    state.steps.insert(step_key(step_id), refused);
+                    touch_step(&mut state, step_key(step_id), stamp.timestamp);
+                    recorded.extend(facts);
+                    return Err(JobsError::ResourceRefused(reason));
+                }
+                Err(error) => return Err(error),
+            };
+            let fresh = crate::flow_resources_memory::attach(&mut claimed, resource.as_ref())?;
+            if resource.is_some() {
+                claimed.sign_offs = before.sign_offs.clone();
+                invalidated =
+                    crate::events::void_stamps_if_moved(stamp, &before.shape_hash(), &mut claimed);
+            }
+            let mut facts = if resource.is_some() {
+                crate::flow_resources::state_events(events, &claimed, stamp)?
+            } else {
+                events.to_vec()
+            };
+            facts.extend(invalidated);
+            if fresh && let Some(claim) = &resource {
+                facts.push(crate::flow_resources::reserved_event(
+                    claim, &claimed, stamp,
+                ));
+            }
+            if let Some(claim) = &resource {
+                crate::flow_resources_memory::apply(&mut pools, claim);
+            }
+            state.steps.insert(step_key(step_id), claimed.clone());
+            touch_step(&mut state, step_key(step_id), stamp.timestamp);
+            (claimed, facts, recorded)
         };
-        recorded.extend_from_slice(events);
-        recorded.extend(invalidated);
+        recorded.extend(facts);
         Ok(claimed)
     }
 
@@ -2738,6 +4016,29 @@ impl JobsRepository for InMemoryJobs {
         Ok(())
     }
 
+    async fn record_estate_comparison_once(
+        &self,
+        observation: uuid::Uuid,
+        event: &boss_core::event::Event,
+    ) -> Result<bool, JobsError> {
+        let mut recorded = self
+            .recorded
+            .lock()
+            .map_err(|_| JobsError::Storage("comparison record lock poisoned".into()))?;
+        let id = observation.to_string();
+        if recorded.iter().any(|e| {
+            e.kind == crate::events::ESTATE_COMPARED
+                && e.payload
+                    .get("observation_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(id.as_str())
+        }) {
+            return Ok(false);
+        }
+        recorded.push(event.clone());
+        Ok(true)
+    }
+
     /// This adapter holds no step-plugin registry, so no plugin serves
     /// any kind: 0, which is what its step insert stores (backlog
     /// aba364fe).
@@ -2758,12 +4059,21 @@ impl JobsRepository for InMemoryJobs {
         &self,
         job_id: &JobId,
     ) -> Result<Vec<(Step, StepVersion)>, JobsError> {
-        let state = self.inner.lock().expect("poisoned");
+        let mut state = self.inner.lock().expect("poisoned");
         let job_key = job_id.to_string();
+        *state.steps_reads.entry(job_key.clone()).or_default() += 1;
         if state.unreadable_steps.contains(&job_key) {
             return Err(JobsError::Storage(format!(
                 "steps of job {job_key} unreadable (injected by fail_steps_read)"
             )));
+        }
+        if let Some(left) = state.steps_reads_left.get_mut(&job_key) {
+            if *left == 0 {
+                return Err(JobsError::Storage(format!(
+                    "steps of job {job_key} unreadable (injected by fail_steps_read_after)"
+                )));
+            }
+            *left -= 1;
         }
         let mut steps: Vec<(Step, StepVersion)> = state
             .steps
@@ -2788,6 +4098,11 @@ impl JobsRepository for InMemoryJobs {
             ..Default::default()
         };
         let state = self.inner.lock().expect("poisoned");
+        if state.unreadable_queue_age {
+            return Err(JobsError::Storage(
+                "queue-age rows unreadable (injected by fail_queue_age)".into(),
+            ));
+        }
         let mut rows: Vec<crate::port::QueueAgeRow> = state
             .steps
             .values()
@@ -2834,6 +4149,45 @@ impl JobsRepository for InMemoryJobs {
                 .then_with(|| a.step_id.to_string().cmp(&b.step_id.to_string()))
         });
         Ok(rows)
+    }
+
+    async fn station_window_packets(
+        &self,
+        since: DateTime<Utc>,
+        scope: &crate::port::JobScope,
+    ) -> Result<Vec<crate::station_window::WindowPacket>, JobsError> {
+        // Scope through `matches_filter`, as `queue_age` reads it, and
+        // the ready flip from the same mirror of `became_ready_at`.
+        let filter = JobFilter {
+            scope: scope.clone(),
+            ..Default::default()
+        };
+        let state = self.inner.lock().expect("poisoned");
+        let ready = |s: &Step| state.step_ready_at.get(&step_key(&s.id)).copied();
+        let touched: std::collections::HashSet<JobId> = state
+            .steps
+            .values()
+            .filter(|s| {
+                ready(s).is_some_and(|t| t >= since) || s.completed_at.is_some_and(|t| t >= since)
+            })
+            .map(|s| s.job_id)
+            .collect();
+        let jobs: Vec<Job> = touched
+            .iter()
+            .filter_map(|id| state.jobs.get(&job_key(id)))
+            .filter(|job| matches_filter(job, &filter))
+            .cloned()
+            .collect();
+        let mut steps: Vec<Step> = state
+            .steps
+            .values()
+            .filter(|s| touched.contains(&s.job_id))
+            .cloned()
+            .collect();
+        steps.sort_by_key(|s| s.sort_order);
+        Ok(crate::station_window::packets_of(jobs, steps, |id| {
+            state.step_ready_at.get(&step_key(id)).copied()
+        }))
     }
 
     async fn count_in_flight_steps_by_kind(&self, step_kind: &str) -> Result<i64, JobsError> {
@@ -2977,20 +4331,72 @@ pub fn compute_job_status(steps: &[Step]) -> JobStatus {
     JobStatus::Open
 }
 
-fn claim_in_state(
-    state: &mut State,
-    step_id: &StepId,
+/// A claim's bay count, prepared by `InMemoryJobs::bay_count`: the
+/// station, its bays, and the pinned spec of each `(kind, version)` the
+/// claimant's holds were pinned to when it was read (`None`: a version
+/// the registry no longer holds, which declares nothing).
+struct BayCount {
+    station: String,
+    bays: i32,
+    specs: std::collections::BTreeMap<(String, i32), Option<crate::registry::WorkflowSpec>>,
+}
+
+/// `hold` with its packet when it is one of `actor`'s holds a bay count
+/// reads: ACTIVE, held by `actor` by exact spelling, on an open packet,
+/// and not the claimed step — the rows the Pg adapter's count and the
+/// door's `list_assignments` read.
+fn bay_hold<'s>(
+    state: &'s State,
+    hold: &'s Step,
+    claimed: &StepId,
     actor: &str,
-    displaceable: &[String],
-    stamp: &boss_core::publisher::EventStamp,
-    events: &[boss_core::event::Event],
-) -> Result<(Step, Option<boss_core::event::Event>), JobsError> {
-    let (claimed, invalidated) =
-        prepare_claim_in_state(state, step_id, actor, displaceable, stamp, events)?;
-    let key = step_key(step_id);
-    state.steps.insert(key.clone(), claimed.clone());
-    touch_step(state, key, stamp.timestamp);
-    Ok((claimed, invalidated))
+) -> Option<(&'s Job, &'s Step)> {
+    if hold.status != StepStatus::Active
+        || hold.assignee_id.as_deref() != Some(actor)
+        || hold.id == *claimed
+    {
+        return None;
+    }
+    let job = state.jobs.get(&job_key(&hold.job_id))?;
+    (job.status == JobStatus::Open).then_some((job, hold))
+}
+
+/// The bay count inside the claim's write (backlog 5a571b1a), under the
+/// state lock the claim then writes through, so two concurrent claims
+/// cannot both see the last bay free. A hold whose pinned version was
+/// not read beforehand began after the count was prepared; it is not
+/// counted short — the claim is refused and may be sent again.
+fn take_bay_in_state(
+    state: &State,
+    claimed: &StepId,
+    actor: &str,
+    count: Option<&BayCount>,
+) -> Result<(), JobsError> {
+    let Some(count) = count else {
+        return Ok(());
+    };
+    let mut occupied = 0u32;
+    for (job, hold) in state
+        .steps
+        .values()
+        .filter_map(|hold| bay_hold(state, hold, claimed, actor))
+    {
+        let Some(spec) = count.specs.get(&(job.kind.clone(), job.workflow_version)) else {
+            return Err(JobsError::Storage(format!(
+                "{actor} took a hold on {}@{} after this claim's count of {}'s bays was \
+                 prepared; it is not counted short — claim again",
+                job.kind, job.workflow_version, count.station
+            )));
+        };
+        if crate::step_executor::occupies_bay(
+            spec.as_ref(),
+            hold.spec_slug.as_deref(),
+            &count.station,
+        ) {
+            occupied = occupied.saturating_add(1);
+        }
+    }
+    crate::step_executor::take_bay(&count.station, occupied, count.bays)
 }
 
 fn prepare_claim_in_state(
@@ -3074,6 +4480,72 @@ mod tests {
 
     use super::*;
     use crate::port::DepartmentFilter;
+
+    /// A MERGE WITH A PRECONDITION LANDS ONLY ON THE ROW IT WAS JUDGED
+    /// ON (review 792b871a N1). The release door judges a car, then
+    /// writes `{hold: null, release}`; a hold rewritten between that read
+    /// and the write must not be lifted. The precondition (`hold`,
+    /// `hold_sha` as read) is judged under the same lock as the write: a
+    /// row that no longer reads so is refused as `StepChanged`, with
+    /// neither row nor event written; an unrelated key written since
+    /// does not refuse it. The Pg half:
+    /// `tests/a_release_lifts_only_the_hold_it_read_pg.rs`.
+    #[tokio::test]
+    async fn a_merge_with_a_precondition_lands_only_on_the_row_it_read() {
+        let repo = InMemoryJobs::new();
+        let job = Job::new(
+            "ship-a-change",
+            Subject::new("custom", "car"),
+            "A held car",
+            "automation:test",
+            Priority::Standard,
+            test_date(),
+        );
+        repo.create_job(&job).await.unwrap();
+        let mut step = Step::new(job.id, "task", "Open for review", 0);
+        step.metadata = serde_json::json!({"hold": "trust-boundary car", "hold_sha": "h1"});
+        repo.add_step(&step).await.unwrap();
+        let stamp = boss_core::publisher::EventStamp::new(
+            "jobs",
+            boss_core::actor::ActorId::Automation("test".into()),
+        );
+        let obj = |v: serde_json::Value| v.as_object().cloned().unwrap();
+        let as_read = obj(serde_json::json!({"hold": "trust-boundary car", "hold_sha": "h1"}));
+        let release = obj(serde_json::json!({"hold": null, "release": {"sha": "h1"}}));
+
+        // A person's `boss hold` lands after the read, keeping the head.
+        let hand = obj(serde_json::json!({"hold": "David reads it first"}));
+        repo.merge_step_metadata_at(&step.id, &hand, &stamp)
+            .await
+            .unwrap();
+        let before = repo.recorded_events().len();
+        let refused = repo
+            .merge_step_metadata_guarded_at(&step.id, &release, &stamp, None, Some(&as_read))
+            .await;
+        assert!(
+            matches!(refused, Err(JobsError::StepChanged { .. })),
+            "{refused:?}"
+        );
+        let now = repo.get_step(&step.id).await.unwrap().unwrap();
+        assert_eq!(now.metadata["hold"], "David reads it first", "not lifted");
+        assert!(now.metadata.get("release").is_none(), "nothing written");
+        assert_eq!(repo.recorded_events().len(), before, "no event");
+
+        // Judged on the row as it stands, with an unrelated key written
+        // since, the same write lands.
+        let note = obj(serde_json::json!({"note": "unrelated"}));
+        repo.merge_step_metadata_at(&step.id, &note, &stamp)
+            .await
+            .unwrap();
+        let as_read_now =
+            obj(serde_json::json!({"hold": "David reads it first", "hold_sha": "h1"}));
+        let landed = repo
+            .merge_step_metadata_guarded_at(&step.id, &release, &stamp, None, Some(&as_read_now))
+            .await
+            .expect("lands on the row it read");
+        assert!(landed.metadata.get("hold").is_none(), "{}", landed.metadata);
+        assert_eq!(landed.metadata["release"]["sha"], "h1");
+    }
 
     #[tokio::test]
     async fn first_record_admission_cannot_expose_rows_without_their_events() {
@@ -3268,6 +4740,7 @@ mod tests {
                 Some(version),
                 stamp.timestamp,
                 &[writer_event],
+                None,
             )
         });
         paused_rx

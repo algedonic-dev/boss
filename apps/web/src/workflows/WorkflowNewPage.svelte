@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { pageLink } from '../shell/stationAddresses.svelte';
   // /it/registry/new — name a new kind, then open the authoring
   // workspace. Under D6 a Workflow is authored *through* a
   // `workflow-design` Job: this page collects the identity + headline
@@ -154,7 +155,7 @@
       const jobId = await startDesignJob(seed, ownerId, appToday(), {
         title: forkSource ? `Fork ${forkSource} → ${kindSlug}` : `Design ${kindSlug}`,
       });
-      navigate(href(`/it/registry/authoring/${encodeURIComponent(jobId)}`));
+      navigate(pageLink('workflows', {}, `/authoring/${encodeURIComponent(jobId)}`));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
       starting = false;
@@ -163,7 +164,7 @@
 </script>
 
 <div class="catalog theme-exec">
-  <Breadcrumb to={href('/it/registry')}>← All job kinds</Breadcrumb>
+  <Breadcrumb to={pageLink('workflows')}>← All job kinds</Breadcrumb>
   <PageHeader
     eyebrow="Platform · Job kind"
     title={forkSource ? `New job kind (forked from ${forkSource})` : 'New job kind'}

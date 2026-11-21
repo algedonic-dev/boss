@@ -29,8 +29,57 @@ GIT=(/usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent GIT_CONFIG_GLOBAL=/dev
 . "$HERE/../estate/registry-manifest.sh"
 forge_need REGISTRY_BASE
 IMAGE_REPO="$REGISTRY_BASE/boss-agent-codex-exec"
+# kernel_path e|m <path> — where the KERNEL reaches <path>, one component
+# at a time: each name is asked of the kernel (`[ -L ]` is lstat(2)) on a
+# prefix already resolved physically, a symlink's target from readlink is
+# put back in front of what remains, and `..` climbs from the resolved
+# prefix, never from the spelling — never `realpath`, whose -e/-m is
+# GNU's and which a host may ship as one that collapses `..` as text
+# first (backlog 9b74c84b, after restore-shared's 920f4fd5). `e` refuses
+# a missing component, or a non-directory with more path after it; `m`
+# spells a missing name as written and keeps walking, so a link AFTER a
+# cancelled missing prefix (`gone/../link`) is still followed, as GNU -m
+# follows it — the first text folded the missing prefix and appended the
+# rest unresolved (review 5e3eb6f3). More than 40 links is a refusal in
+# both modes: no answer exists, and a spelling would pass a guard. One
+# text in every root verb that carries it, held to GNU's answers by
+# gcp_root_paths_resolve_through_the_kernel.rs.
+kernel_path() {
+    local mode=$1 rest=$2 r c t more links=0
+    [ -n "$rest" ] || return 1
+    case $rest in
+        /*) r= ;;
+        *) r=$(pwd -P) || return 1; r=${r%/} ;;
+    esac
+    while [ -n "$rest" ]; do
+        case $rest in
+            */*) c=${rest%%/*}; rest=${rest#*/}; more=1 ;;
+            *) c=$rest; rest=; more= ;;
+        esac
+        case $c in
+            '' | .) continue ;;
+            ..) r=${r%/*}; continue ;;
+        esac
+        if [ -L "$r/$c" ]; then
+            links=$((links + 1))
+            [ "$links" -le 40 ] || return 1
+            t=$(readlink -- "$r/$c" && printf .) || return 1
+            t=${t%.}; t=${t%$'\n'}
+            [ -n "$t" ] || return 1
+            case $t in /*) r= ;; esac
+            rest=$t${more:+/$rest}
+        elif [ "$mode" = m ]; then
+            r=$r/$c
+        elif [ -e "$r/$c" ] && { [ -z "$more" ] || [ -d "$r/$c" ]; }; then
+            r=$r/$c
+        else
+            return 1
+        fi
+    done
+    printf '%s\n' "${r:-/}"
+}
 install -d -m 0700 -- "$STORE"
-[ ! -L "$STORE" ] && [ "$(realpath -e -- "$STORE")" = "$STORE" ] && [ "$(stat -c %u -- "$STORE")" = 0 ] && [ -z "$(find "$STORE" -maxdepth 0 -perm /022 -print)" ] || { echo 'agent-image: publication store is not private root-owned' >&2; exit 78; }
+[ ! -L "$STORE" ] && [ "$(kernel_path e "$STORE")" = "$STORE" ] && [ "$(stat -c %u -- "$STORE")" = 0 ] && [ -z "$(find "$STORE" -maxdepth 0 -perm /022 -print)" ] || { echo 'agent-image: publication store is not private root-owned' >&2; exit 78; }
 /usr/bin/python3 -I "$HERE/image-witness.py" trusted-path "$STORE"
 [ ! -L "$STORE/.lock" ] || { echo 'agent-image: lock is linked' >&2; exit 78; }
 [ ! -e "$STORE/.lock" ] || /usr/bin/python3 -I "$HERE/image-witness.py" trusted-path "$STORE/.lock"
@@ -66,7 +115,7 @@ http_get() {
     local args=(--silent --show-error --connect-timeout 10 --max-time 360 --max-filesize 2147483648 --dump-header "$headers" --output "$body" --write-out '%{http_code}')
     [ -z "$accept" ] || args+=(-H "Accept: $accept")
     [ -z "${TOKEN_HDR:-}" ] || args+=(-H "$TOKEN_HDR")
-    code=$(/usr/bin/env -i PATH=/usr/bin:/bin HOME="$stage/home" /usr/bin/curl "${args[@]}" "$registry_url") || rc=$?
+    code=$(/usr/bin/env -i PATH=/usr/bin:/bin HOME="$stage/home" /usr/bin/curl -q "${args[@]}" "$registry_url") || rc=$?
     printf '%s\n' "$code"; return "$rc"
 }
 fetch_image() {

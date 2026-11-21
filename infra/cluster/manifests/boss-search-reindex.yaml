@@ -10,10 +10,16 @@
 # or text alike). The rule this fixes into place: a chore reports to
 # the jobs API of the instance whose DATA it maintains.
 #
-# Same cadence contract as the boss-gcp timer (see
-# infra/boss-search-reindex.timer): a full TRUNCATE-and-replay every
-# ten minutes — there is no watermark that makes an append correct,
-# and a missed window just runs late.
+# Full TRUNCATE-and-replay hourly at minute 7, away from top-of-hour
+# maintenance (8837710e, conductor decision 20261101T005013Z). Measured
+# rewrites used more temp I/O and ran slower, so sixfold fewer scheduled
+# rebuilds accept search staleness up to an hour before a rebuild starts.
+# The per-run sort of the whole log is gone since backlog 832386eb: the
+# events half walks event_facts' subject index and sorts nothing (it
+# wrote 13.0 GB of temp per run before). An incremental rebuild is
+# separate work.
+# There is no watermark that makes an append correct, and Forbid keeps
+# a late run from overlapping the next scheduled rebuild.
 #
 # The image tag is a placeholder; cluster-deploy-runner.sh sets the
 # real one alongside deploy/boss on every converge, so the chore
@@ -30,7 +36,7 @@ metadata:
     # manifest, never a runner edit.
     boss-chore: "true"
 spec:
-  schedule: "*/10 * * * *"
+  schedule: "7 * * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
@@ -101,5 +107,11 @@ spec:
                 # this completes is the SoR's own.
                 - name: BOSS_JOBS_URL
                   value: http://boss-jobs-internal.boss.svc.cluster.local:7900
+                # The packet open tries 3 times, not the wrap's default 1
+                # (backlog a2ae9f39: one failed read lost the backup's
+                # packet on 10-26 and 10-27). Pinned by
+                # every_maintenance_wrap_caller_retries_its_open.rs.
+                - name: BOSS_WRAP_OPEN_RETRY
+                  value: "3"
                 - name: BOSS_MACHINE_TOKEN_HOSTS
                   value: ".boss.svc.cluster.local"

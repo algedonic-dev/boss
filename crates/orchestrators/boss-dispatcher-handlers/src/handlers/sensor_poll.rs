@@ -79,14 +79,17 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use boss_dispatcher::rules::expr::Value;
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
-use boss_jobs::sensors::{NewReading, PollStamp, Reading, SensorRow};
+use boss_jobs::sensors::{
+    MAX_POLL_REFUSALS, NewReading, PollRefusalClasses, PollRefusals, PollStamp,
+    READINGS_HTTP_BODY_LIMIT_BYTES, Reading, RefusedMessage, SensorRow,
+};
 use chrono::{DateTime, Utc};
 use serde_json::{Value as Json, json};
 
+use super::alarm_item::{self, Occurrence, Plan};
 use super::common::{
     RECOVERED_AT, Retraction, api_client, dispatcher_reader_header, get_json, owner_for_filing,
-    post_json, recovery_note, relapse_patch, retraction, rows_or_refuse, sim_origin_value,
-    step_completion_writes,
+    post_json, recovery_note, retraction, rows_or_refuse, sim_origin_value, step_completion_writes,
 };
 
 /// The two standing conditions a sensor alarms on. Each is its own
@@ -208,6 +211,7 @@ fn sensor_actor_header(sensor_id: &str) -> String {
 /// which is why the read asks only for those, c5ac71de); a truncated
 /// page HOLDS the raise (never twins blind).
 const DEDUP_PAGE: usize = 1000;
+const READINGS_BOUND_VERSION: &str = "readings-json-v1";
 
 // ---------------------------------------------------------------------------
 // The port — one source adapter per `source`
@@ -221,6 +225,8 @@ const DEDUP_PAGE: usize = 1000;
 pub enum SourceError {
     Unreadable(String),
     Transient(String),
+    /// A bounded refused SOURCE poll; no typed reading has been recorded.
+    RefusedPoll(PollRefusals),
 }
 
 /// One observation as the source reports it. `payload` is the source's
@@ -243,6 +249,11 @@ pub struct Described {
 
 #[async_trait]
 pub trait SensorSource: Send + Sync {
+    /// Intrinsic input capability, not authority. Legacy sources keep both
+    /// their read arguments and their existing poll-mark behavior.
+    fn supports_read_context(&self) -> bool {
+        false
+    }
     /// Every observation at or after `since` (inclusive — the caller
     /// dedups), in any order. `credential` is the value to send.
     async fn read(
@@ -251,8 +262,25 @@ pub trait SensorSource: Send + Sync {
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<Observation>, SourceError>;
 
+    /// Optional A211233 context. Existing sources retain their original read;
+    /// bounded sources consume witnesses before their own count/byte bounds.
+    async fn read_with_context(
+        &self,
+        credential: &str,
+        since: Option<DateTime<Utc>>,
+        _context: Option<&SourceReadContext>,
+    ) -> Result<Vec<Observation>, SourceError> {
+        self.read(credential, since).await
+    }
+
     /// The packet one recorded payload opens. Pure.
     fn describe(&self, payload: &Json) -> Described;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceReadContext {
+    pub witnessed: Vec<boss_jobs::sensors::CursorWitness>,
 }
 
 /// In-memory source: the readings it will answer, or the error it
@@ -504,6 +532,8 @@ pub struct OpenAlarm {
     /// a routed alarm told the condition cleared, which a relapse must
     /// withdraw (backlog 6072ff60).
     pub told: bool,
+    /// The packet as the dedup read listed it, for `alarm_item::plan`.
+    pub row: Json,
 }
 
 /// Does this packet carry a standing recovery note? One reading of the
@@ -539,10 +569,8 @@ pub fn open_alarm(listing: &Json, key: &str) -> Result<Option<OpenAlarm>, String
             ));
         }
     }
-    Ok(rows
-        .iter()
-        .find(|j| j.pointer("/metadata/estate_finding").and_then(Json::as_str) == Some(key))
-        .and_then(|j| {
+    Ok(
+        alarm_item::open_item(&rows, "estate_finding", key).and_then(|j| {
             Some(OpenAlarm {
                 id: j.get("id")?.as_str()?.to_string(),
                 reason: j
@@ -551,8 +579,10 @@ pub fn open_alarm(listing: &Json, key: &str) -> Result<Option<OpenAlarm>, String
                     .unwrap_or_default()
                     .to_string(),
                 told: told(j),
+                row: j.clone(),
             })
-        }))
+        }),
+    )
 }
 
 /// Who a sensor alarm's retraction is stamped as.
@@ -615,6 +645,8 @@ pub enum PollOutcome {
     Read { recorded: usize, opened: usize },
     /// The alarm was raised, refreshed, or left as it was.
     Unreadable(&'static str),
+    /// A permanent readings-POST refusal, retained on the poll mark.
+    Refused,
     /// The source read, but a packet open was refused: what happened
     /// to the alarm, and what was recorded and opened before it.
     Unopenable {
@@ -625,6 +657,68 @@ pub enum PollOutcome {
 }
 
 impl SensorPoll {
+    async fn write_poll_mark(
+        &self,
+        sensor: &SensorRow,
+        stamp: &PollStamp,
+    ) -> Result<(), HandlerError> {
+        let path = format!("/api/sensors/{}/polled", sensor.id);
+        let body = serde_json::to_value(stamp)
+            .map_err(|e| HandlerError::Downstream(format!("encoding poll mark: {e}")))?;
+        let (status, text) = self
+            .send(reqwest::Method::POST, &path, &body, &sensor.id)
+            .await?;
+        if status == reqwest::StatusCode::BAD_REQUEST {
+            // A191726 M3 applies only to this merge door, not reading or
+            // packet admission/configuration failures on other endpoints.
+            let shown: String = text.chars().take(REFUSAL_BOUND).collect();
+            let reason =
+                format!("sensor poll mark logic refusal: POST {path} returned 400: {shown}");
+            self.raise_or_refresh(sensor, &Alarm::unreadable(&reason), stamp.polled_at)
+                .await?;
+            return Err(HandlerError::Permanent(reason));
+        }
+        if !status.is_success() {
+            let reason = format!("POST {path} returned {status}: {text}");
+            return Err(if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+                HandlerError::Permanent(reason)
+            } else {
+                HandlerError::Downstream(reason)
+            });
+        }
+        Ok(())
+    }
+
+    async fn mark_refused(
+        &self,
+        sensor: &SensorRow,
+        now: DateTime<Utc>,
+        cursor: Option<DateTime<Utc>>,
+        mut refused: PollRefusals,
+    ) -> Result<(), HandlerError> {
+        // Old absent measurements are read-only. The locked backend retains
+        // these exact held witnesses; only new measured entries cross the
+        // strict write door. An unknown unmeasured entry is NOT dropped.
+        refused.entries.retain(|entry| {
+            entry.limit.is_measured()
+                || !sensor
+                    .refused
+                    .iter()
+                    .flat_map(|w| &w.entries)
+                    .any(|old| old == entry)
+        });
+        self.write_poll_mark(
+            sensor,
+            &PollStamp {
+                polled_at: now,
+                cursor_at: cursor,
+                refused: Some(refused),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
     pub fn new(
         jobs_base: impl Into<String>,
         sources: HashMap<String, Arc<dyn SensorSource>>,
@@ -726,14 +820,9 @@ impl SensorPoll {
         let stamp = PollStamp {
             polled_at,
             cursor_at,
+            refused: None,
         };
-        self.write(
-            reqwest::Method::POST,
-            &format!("/api/sensors/{}/polled", sensor.id),
-            &serde_json::to_value(stamp).unwrap_or(Json::Null),
-            &sensor.id,
-        )
-        .await?;
+        self.write_poll_mark(sensor, &stamp).await?;
         Ok(())
     }
 
@@ -763,61 +852,63 @@ impl SensorPoll {
     /// estate.recover withdraw theirs (a2d8bad3). It is one write, on
     /// the first failing read only: after it the packet is no longer
     /// told, and the held path is silent again.
+    ///
+    /// The decision is the one every alarm raises by (backlog f4b0ad41,
+    /// `alarm_item::plan`): a relapse is an occurrence on the open
+    /// alarm, recorded beside the withdrawal of its note. Only the
+    /// transport is this handler's own, because a sensor's writes are
+    /// signed as the sensor.
     async fn raise_or_refresh(
         &self,
         sensor: &SensorRow,
         alarm: &Alarm,
+        now: DateTime<Utc>,
     ) -> Result<&'static str, HandlerError> {
         let key = alarm.condition.key(&sensor.id);
         let reason = &alarm.reason;
         let owner = owner_for_filing(self.owner.as_ref(), self.name()).await;
-        match self.open_alarm_for(&key).await? {
-            Some(open) if open.reason == *reason => {
-                let id = &open.id;
-                if open.told {
-                    self.write(
-                        reqwest::Method::PATCH,
-                        &format!("/api/jobs/{id}/metadata"),
-                        &relapse_patch(),
-                        &sensor.id,
-                    )
-                    .await?;
-                    tracing::warn!(finding = %key, packet = %id, "sensor.poll: the condition is back; withdrew the recovery note");
-                } else {
-                    tracing::info!(finding = %key, packet = %id, "sensor.poll: alarm already open with this reason");
-                }
-                Ok("held")
+        let open = self.open_alarm_for(&key).await?;
+        let body = alarm_body(sensor, alarm, &owner);
+        // A moved reason refreshes the open alarm with the fresh body's
+        // metadata, whole, so every key the reason moved with (the
+        // detail, the reading's id) moves with it.
+        let refresh = match &open {
+            Some(o) if o.reason != *reason => {
+                body["metadata"].as_object().cloned().unwrap_or_default()
             }
-            Some(OpenAlarm { id, .. }) => {
-                // The fresh body's metadata, whole: a merge on the
-                // packet, so every key the reason moved with (the
-                // detail, the reading's id) moves with it — and the
-                // nulls that withdraw a standing recovery note, since
-                // a new failure is a relapse too.
-                let mut patch = alarm_body(sensor, alarm, &owner)["metadata"].clone();
-                if let (Some(m), Json::Object(relapse)) = (patch.as_object_mut(), relapse_patch()) {
-                    m.extend(relapse);
-                }
+            _ => Default::default(),
+        };
+        let refreshed = !refresh.is_empty();
+        let occ = Occurrence::new(now.to_rfc3339(), reason.as_str());
+        match alarm_item::plan(open.as_ref().map(|o| &o.row), body, &occ, refresh) {
+            Plan::File(body) => {
+                self.write(reqwest::Method::POST, "/api/jobs", &body, &sensor.id)
+                    .await?;
+                tracing::warn!(finding = %key, reason = %reason, "sensor.poll raised an alarm");
+                Ok("raised")
+            }
+            Plan::Patch {
+                id,
+                merge,
+                appended,
+            } => {
                 self.write(
                     reqwest::Method::PATCH,
                     &format!("/api/jobs/{id}/metadata"),
-                    &patch,
+                    &Json::Object(merge),
                     &sensor.id,
                 )
                 .await?;
-                tracing::info!(finding = %key, packet = %id, "sensor.poll refreshed the open alarm");
-                Ok("refreshed")
+                if appended {
+                    tracing::warn!(finding = %key, packet = %id, "sensor.poll: the condition is back; recorded the occurrence and withdrew the recovery note");
+                } else {
+                    tracing::info!(finding = %key, packet = %id, "sensor.poll refreshed the open alarm");
+                }
+                Ok(if refreshed { "refreshed" } else { "held" })
             }
-            None => {
-                self.write(
-                    reqwest::Method::POST,
-                    "/api/jobs",
-                    &alarm_body(sensor, alarm, &owner),
-                    &sensor.id,
-                )
-                .await?;
-                tracing::warn!(finding = %key, reason = %reason, "sensor.poll raised an alarm");
-                Ok("raised")
+            Plan::Hold(id) => {
+                tracing::info!(finding = %key, packet = %id, "sensor.poll: alarm already open with this reason");
+                Ok("held")
             }
         }
     }
@@ -888,7 +979,7 @@ impl SensorPoll {
     ) -> Result<PollOutcome, HandlerError> {
         let unreadable = |reason: String| async move {
             let what = self
-                .raise_or_refresh(sensor, &Alarm::unreadable(reason))
+                .raise_or_refresh(sensor, &Alarm::unreadable(reason), now)
                 .await?;
             self.mark_polled(sensor, now, None).await?;
             Ok::<_, HandlerError>(PollOutcome::Unreadable(what))
@@ -905,7 +996,92 @@ impl SensorPoll {
             ))
             .await;
         };
-        let observations = match source.read(&credential, sensor.cursor_at).await {
+        let context_aware = source.supports_read_context();
+        let context = context_aware.then(|| SourceReadContext {
+            witnessed: sensor
+                .refused
+                .iter()
+                .flat_map(|w| {
+                    w.processed.iter().cloned().chain(
+                        w.entries
+                            .iter()
+                            .filter(|e| e.reason.starts_with("readings_post_413"))
+                            .map(|e| boss_jobs::sensors::CursorWitness {
+                                message_key: e.message_key.clone(),
+                                at: e.at,
+                            }),
+                    )
+                })
+                .filter(|key| Some(key.at) == sensor.cursor_at)
+                .collect(),
+        });
+        let observations = match source
+            .read_with_context(&credential, sensor.cursor_at, context.as_ref())
+            .await
+        {
+            Err(SourceError::RefusedPoll(mut witness)) => {
+                witness.validate().map_err(HandlerError::Permanent)?;
+                let count = witness.entries.len() as u64 + witness.truncated;
+                for entry in &mut witness.entries {
+                    entry.reason = format!("source_poll:{}", entry.reason);
+                }
+                let permanent = sensor
+                    .refused
+                    .iter()
+                    .flat_map(|w| &w.entries)
+                    .filter(|e| {
+                        e.reason.starts_with("readings_post_413")
+                            && sensor.cursor_at.is_none_or(|cursor| e.at >= cursor)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let permanent_count = permanent.len() as u64;
+                let processed = sensor
+                    .refused
+                    .iter()
+                    .flat_map(|w| &w.processed)
+                    .filter(|key| Some(key.at) == sensor.cursor_at)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if permanent_count > 0 || !processed.is_empty() {
+                    // The source only supplies its first64 names. Its omitted
+                    // cohort may overlap permanent refusals: do not add counts.
+                    let mut entries = permanent
+                        .into_iter()
+                        .map(|e| ((e.at, e.message_key.clone()), e))
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    for entry in &witness.entries {
+                        if entries.len() + processed.len() == MAX_POLL_REFUSALS {
+                            break;
+                        }
+                        entries
+                            .entry((entry.at, entry.message_key.clone()))
+                            .or_insert_with(|| entry.clone());
+                    }
+                    witness.entries = entries.into_values().collect();
+                    witness.classes = Some(PollRefusalClasses {
+                        source_count: count,
+                        permanent_413_count: permanent_count,
+                        union_count: None,
+                    });
+                    // No union omitted-count can be derived. The fixed class
+                    // summary itself holds the latch, not a fabricated count.
+                    witness.truncated = 0;
+                }
+                witness.entries.retain(|entry| {
+                    !processed
+                        .iter()
+                        .any(|key| key.at == entry.at && key.message_key == entry.message_key)
+                });
+                let processed_count = processed.len();
+                witness.processed = processed;
+                witness.validate().map_err(HandlerError::Permanent)?;
+                self.mark_refused(sensor, now, None, witness).await?;
+                self.raise_or_refresh(sensor, &Alarm::unreadable(format!(
+                    "source poll refused: source count={count}, witnessed permanent413 count={permanent_count}, processed count={processed_count}, union {}; cursor={:?}; bounded identities retained; remeasurement required, valid tied messages remain owed", if permanent_count>0 || processed_count>0 {"unknown".into()} else {count.to_string()}, sensor.cursor_at
+                )), now).await?;
+                return Ok(PollOutcome::Refused);
+            }
             Ok(o) => o,
             Err(SourceError::Unreadable(why)) => return unreadable(why).await,
             Err(SourceError::Transient(why)) => {
@@ -915,6 +1091,69 @@ impl SensorPoll {
                 )));
             }
         };
+        let mut measured_sensor = sensor.clone();
+        if sensor
+            .refused
+            .as_ref()
+            .is_some_and(PollRefusals::is_latched)
+        {
+            let source_latch = sensor.refused.as_ref().is_some_and(|w| {
+                w.classes.as_ref().is_some_and(|c| c.source_count > 0)
+                    || (!w.entries.is_empty()
+                        && w.entries
+                            .iter()
+                            .all(|e| e.reason.starts_with("source_poll:")))
+            });
+            if source_latch {
+                let cleared = PollRefusals {
+                    processed: sensor
+                        .refused
+                        .iter()
+                        .flat_map(|w| &w.processed)
+                        .cloned()
+                        .collect(),
+                    classes: None,
+                    entries: sensor
+                        .refused
+                        .iter()
+                        .flat_map(|w| &w.entries)
+                        .filter(|e| {
+                            e.reason.starts_with("readings_post_413")
+                                && sensor.cursor_at.is_none_or(|cursor| e.at >= cursor)
+                        })
+                        .cloned()
+                        .collect(),
+                    truncated: 0,
+                    cleared: Some(format!(
+                        "cleared at {}: source certified readable bounded cohort of {} keys at cursor {:?}",
+                        now.to_rfc3339(),
+                        observations.len(),
+                        sensor.cursor_at
+                    )),
+                };
+                self.mark_refused(sensor, now, None, cleared.clone())
+                    .await?;
+                measured_sensor.refused = Some(cleared);
+            }
+        }
+        let sensor = &measured_sensor;
+        // The cursor is inclusive. Only witnessed identities are excluded;
+        // a new valid message at the SAME instant is still eligible.
+        let observations: Vec<_> = observations
+            .into_iter()
+            .filter(|observation| {
+                !sensor.refused.as_ref().is_some_and(|witness| {
+                    witness.processed.iter().any(|key| {
+                        key.at == observation.observed_at
+                            && key.message_key == observation.external_id
+                    }) || witness.entries.iter().any(|entry| {
+                        entry.reason.starts_with("readings_post_413")
+                            && entry.at == observation.observed_at
+                            && entry.message_key == observation.external_id
+                    })
+                })
+            })
+            .collect();
         let readings: Vec<NewReading> = observations
             .iter()
             .map(|o| NewReading {
@@ -924,20 +1163,175 @@ impl SensorPoll {
             })
             .collect();
         let mut recorded = 0;
-        if !readings.is_empty() {
-            let out = self
-                .write(
+        let mut acknowledged = Vec::new();
+        let was_latched = sensor
+            .refused
+            .as_ref()
+            .is_some_and(PollRefusals::is_latched);
+        let mut refused_keys = sensor
+            .refused
+            .as_ref()
+            .into_iter()
+            .flat_map(|w| &w.entries)
+            .filter(|e| {
+                e.reason.starts_with("readings_post_413")
+                    && sensor.cursor_at.is_none_or(|cursor| e.at >= cursor)
+            })
+            .map(|e| ((e.at, e.message_key.clone()), e.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let prior_keys = refused_keys
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut chunks = if readings.is_empty() {
+            vec![]
+        } else {
+            vec![readings]
+        };
+        while let Some(chunk) = chunks.pop() {
+            let body = serde_json::to_value(&chunk)
+                .map_err(|e| HandlerError::Downstream(format!("encoding readings: {e}")))?;
+            let size = serde_json::to_vec(&body)
+                .map_err(|e| HandlerError::Downstream(format!("sizing readings: {e}")))?
+                .len();
+            let (status, text) = self
+                .send(
                     reqwest::Method::POST,
                     &format!("/api/sensors/{}/readings", sensor.id),
-                    &serde_json::to_value(&readings).unwrap_or(Json::Null),
+                    &body,
                     &sensor.id,
                 )
                 .await?;
-            recorded = out
+            if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+                if chunk.len() > 1 {
+                    // A114958: an opaque batch refusal is not evidence that
+                    // any one message is invalid. Measure singleton outcomes.
+                    chunks.extend(chunk.into_iter().rev().map(|r| vec![r]));
+                    continue;
+                }
+                for reading in chunk {
+                    refused_keys.insert(
+                        (reading.observed_at, reading.external_id.clone()),
+                        RefusedMessage {
+                            message_key: reading.external_id.clone(),
+                            size_bytes: size as u64,
+                            limit: boss_jobs::sensors::RefusalLimit::bytes(
+                                READINGS_HTTP_BODY_LIMIT_BYTES as u64,
+                                size as u64,
+                            ),
+                            reason: format!("readings_post_413:{READINGS_BOUND_VERSION}"),
+                            at: reading.observed_at,
+                        },
+                    );
+                }
+                continue;
+            }
+            if !status.is_success() {
+                let why = format!(
+                    "POST {}/api/sensors/{}/readings returned {status}: {text}",
+                    self.base(),
+                    sensor.id
+                );
+                return Err(if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+                    HandlerError::Permanent(why)
+                } else {
+                    HandlerError::Downstream(why)
+                });
+            }
+            let out: Json = serde_json::from_str(&text).unwrap_or(Json::Null);
+            if context_aware
+                && (out.get("received").and_then(Json::as_u64) != Some(chunk.len() as u64)
+                    || out
+                        .get("inserted")
+                        .and_then(Json::as_u64)
+                        .is_none_or(|n| n > chunk.len() as u64))
+            {
+                return Err(HandlerError::Downstream(format!(
+                    "sensor {}: readings POST answered without a complete BatchOutcome; processing witness withheld",
+                    sensor.id
+                )));
+            }
+            acknowledged.extend(chunk.iter().map(|r| boss_jobs::sensors::CursorWitness {
+                message_key: r.external_id.clone(),
+                at: r.observed_at,
+            }));
+            recorded += out
                 .get("inserted")
                 .and_then(Json::as_u64)
                 .map(|n| n as usize)
                 .unwrap_or(0);
+        }
+        let has_refusals = !refused_keys.is_empty();
+        if !context_aware && (has_refusals || was_latched) {
+            let count = refused_keys.len();
+            let truncated = count.saturating_sub(MAX_POLL_REFUSALS) as u64;
+            let mut entries = refused_keys
+                .iter()
+                .filter(|(key, _)| prior_keys.contains(*key))
+                .map(|(_, entry)| entry.clone())
+                .collect::<Vec<_>>();
+            entries.extend(
+                refused_keys
+                    .iter()
+                    .filter(|(key, _)| !prior_keys.contains(*key))
+                    .take(MAX_POLL_REFUSALS.saturating_sub(entries.len()))
+                    .map(|(_, entry)| entry.clone()),
+            );
+            entries.sort_by(|a, b| (a.at, &a.message_key).cmp(&(b.at, &b.message_key)));
+            let keys = entries
+                .iter()
+                .map(|e| e.message_key.as_str())
+                .collect::<Vec<_>>();
+            let reason = format!(
+                "sensor configuration fault: single-reading POST413, bound version {READINGS_BOUND_VERSION}, limit {} bytes; retained {} witnessed keys {keys:?}, known/measured refusal count {count}, omitted {truncated}; only witnessed keys are suppressed",
+                READINGS_HTTP_BODY_LIMIT_BYTES,
+                entries.len()
+            );
+            self.mark_refused(sensor,now,None,PollRefusals { processed: Vec::new(),entries,truncated,classes:None,cleared:if was_latched && truncated==0 {Some(format!("cleared at {}: source remeasured; singleton POSTs resolved every unwitnessed key; {count} current refused keys fit",now.to_rfc3339()))} else {None}}).await?;
+            if has_refusals {
+                self.raise_or_refresh(sensor, &Alarm::unreadable(reason), now)
+                    .await?;
+            }
+            if truncated > 0 {
+                return Ok(PollOutcome::Refused);
+            }
+        }
+        let cursor = observations.iter().map(|o| o.observed_at).max();
+        if context_aware {
+            // The reading ACK makes a durable owed obligation. Commit its
+            // inclusive-source witness before attempting the separate packet
+            // open, so a recoverable packet failure cannot strand a suffix.
+            let at = cursor.or(sensor.cursor_at);
+            let mut processed = sensor
+                .refused
+                .iter()
+                .flat_map(|w| &w.processed)
+                .cloned()
+                .chain(acknowledged)
+                .filter(|key| Some(key.at) == at)
+                .collect::<std::collections::BTreeSet<_>>();
+            let entries = refused_keys
+                .values()
+                .filter(|e| at.is_none_or(|at| e.at >= at))
+                .cloned()
+                .collect::<Vec<_>>();
+            processed.retain(|key| {
+                !entries
+                    .iter()
+                    .any(|e| e.at == key.at && e.message_key == key.message_key)
+            });
+            let witness = PollRefusals {
+                processed: processed.into_iter().collect(),
+                entries,
+                truncated: 0,
+                classes: None,
+                cleared: None,
+            };
+            witness.validate().map_err(HandlerError::Permanent)?;
+            self.mark_refused(sensor, now, cursor, witness).await?;
+            if has_refusals {
+                self.raise_or_refresh(sensor,&Alarm::unreadable(format!("sensor configuration fault: single-reading POST413, bound version {READINGS_BOUND_VERSION}; witnessed keys retained")), now).await?;
+            }
         }
         // Open a packet per reading still owed one — the ones just
         // recorded and any an earlier firing recorded but could not
@@ -958,7 +1352,6 @@ impl SensorPoll {
         // The cursor is the newest observation whether or not every
         // packet opens: the readings are recorded, and an owed one is
         // found by its missing stamp, not by re-reading the source.
-        let cursor = observations.iter().map(|o| o.observed_at).max();
         let mut opened = 0;
         for r in &owed {
             let described = source.describe(&r.payload);
@@ -976,7 +1369,7 @@ impl SensorPoll {
                 // unstamped (still owed), and the source having read
                 // is itself the unreadable alarm's recovery.
                 let alarm = Alarm::unopenable(&r.external_id, status.as_u16(), &text);
-                let what = self.raise_or_refresh(sensor, &alarm).await?;
+                let what = self.raise_or_refresh(sensor, &alarm, now).await?;
                 self.mark_polled(sensor, now, cursor).await?;
                 self.recover(sensor, Condition::Unreadable, now).await?;
                 return Ok(PollOutcome::Unopenable {
@@ -1016,7 +1409,9 @@ impl SensorPoll {
             opened += 1;
         }
         self.mark_polled(sensor, now, cursor).await?;
-        self.recover(sensor, Condition::Unreadable, now).await?;
+        if !has_refusals {
+            self.recover(sensor, Condition::Unreadable, now).await?;
+        }
         self.recover(sensor, Condition::Unopenable, now).await?;
         Ok(PollOutcome::Read { recorded, opened })
     }
@@ -1098,6 +1493,7 @@ mod tests {
             published_at: at("2026-09-17T00:00:00Z"),
             last_polled_at: None,
             cursor_at: None,
+            refused: None,
         }
     }
 
@@ -1173,6 +1569,7 @@ mod tests {
                 id: "alarm-1".into(),
                 reason: "401".into(),
                 told: false,
+                row: listing["data"][1].clone(),
             })
         );
         assert_eq!(
@@ -1294,6 +1691,10 @@ mod tests {
         /// When set, every packet open (a POST /api/jobs that is not
         /// a backlog-item) is answered with this status and body.
         refuse_opens: Arc<Mutex<Option<(u16, String)>>>,
+        refuse_readings: Arc<Mutex<bool>>,
+        split_readings_refusal: Arc<Mutex<Option<String>>>,
+        refuse_poll_mark: Arc<Mutex<bool>>,
+        unreadable_reading_ack: Arc<Mutex<bool>>,
     }
 
     impl Stub {
@@ -1328,6 +1729,15 @@ mod tests {
         let alarms = Arc::new(Mutex::new(open_alarms));
         let refuse_opens: Arc<Mutex<Option<(u16, String)>>> = Default::default();
         let refuse = refuse_opens.clone();
+        let refuse_readings = Arc::new(Mutex::new(false));
+        let reading_refusal = refuse_readings.clone();
+        let split_readings_refusal = Arc::new(Mutex::new(None::<String>));
+        let split_refusal = split_readings_refusal.clone();
+        let reading_calls = captured.clone();
+        let refuse_poll_mark = Arc::new(Mutex::new(false));
+        let poll_refusal = refuse_poll_mark.clone();
+        let unreadable_reading_ack = Arc::new(Mutex::new(false));
+        let unreadable_ack = unreadable_reading_ack.clone();
         let (c1, c2, c3, c4) = (
             captured.clone(),
             captured.clone(),
@@ -1386,7 +1796,11 @@ mod tests {
                                     .into_response();
                             }
                             c.lock().unwrap().push(("POST /api/jobs".into(), b));
-                            let n = c.lock().unwrap().len();
+                            // Reading captures are independent evidence, not
+                            // job-create attempts. Keep fixture job identity
+                            // stable when another HTTP endpoint is observed.
+                            let n = c.lock().unwrap().iter().filter(|(verb,_)|
+                                verb=="POST /api/jobs" || verb=="POST /api/jobs (refused)").count();
                             let id = format!("job-{n}");
                             if body["kind"] == "backlog-item" {
                                 let mut row = body.clone();
@@ -1504,7 +1918,39 @@ mod tests {
                     },
                 ),
             )
-            .route("/health", post(|| async { "" }));
+            .route("/health", post(|| async { "" }))
+            .layer(axum::middleware::from_fn(move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let refuse = reading_refusal.clone();
+                let calls = reading_calls.clone();
+                let split=split_refusal.clone();
+                let poll=poll_refusal.clone();
+                let unreadable_ack=unreadable_ack.clone();
+                async move {
+                    if request.method() == axum::http::Method::POST
+                        && request.uri().path().ends_with("/polled") && *poll.lock().unwrap()
+                    {
+                        calls.lock().unwrap().push((format!("POST {} (400)",request.uri().path()),json!({})));
+                        return (axum::http::StatusCode::BAD_REQUEST,"invalid poll refusal witness").into_response();
+                    }
+                    if request.method() == axum::http::Method::POST
+                        && request.uri().path().ends_with("/readings")
+                    {
+                        let path = request.uri().path().to_string();
+                        let (parts, input)=request.into_parts();
+                        let bytes = axum::body::to_bytes(input, 2 * 1024 * 1024).await.unwrap();
+                        let body: Json = serde_json::from_slice(&bytes).unwrap();
+                        let rejected=*refuse.lock().unwrap() || split.lock().unwrap().as_ref().is_some_and(|id|body.as_array().unwrap().len()>1 || body[0]["external_id"].as_str()==Some(id.as_str()));
+                        if rejected {
+                            calls.lock().unwrap().push((format!("POST {path} (refused)"), body));
+                            return (axum::http::StatusCode::PAYLOAD_TOO_LARGE, "readings body exceeds limit").into_response();
+                        }
+                        calls.lock().unwrap().push((format!("POST {path}"),body));
+                        let response=next.run(axum::extract::Request::from_parts(parts,axum::body::Body::from(bytes))).await;
+                        return if *unreadable_ack.lock().unwrap() {AxJson(json!({})).into_response()} else {response};
+                    }
+                    next.run(request).await
+                }
+            }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1514,6 +1960,10 @@ mod tests {
             sensors,
             alarms,
             refuse_opens,
+            refuse_readings,
+            split_readings_refusal,
+            refuse_poll_mark,
+            unreadable_reading_ack,
         }
     }
 
@@ -1525,6 +1975,436 @@ mod tests {
             triggering_topic: "clock.tick".into(),
             event_payload: json!({"_day": "2026-09-17", "_at": "2026-09-17T10:05:00+00:00"}),
         }
+    }
+
+    #[tokio::test]
+    async fn review_read_context_preserves_real_reading_packet_and_poll_progress_once() {
+        struct BoundedSource {
+            observations: Vec<Observation>,
+            contexts: std::sync::Mutex<Vec<Option<SourceReadContext>>>,
+        }
+        impl BoundedSource {
+            fn select(
+                &self,
+                since: Option<DateTime<Utc>>,
+                context: Option<&SourceReadContext>,
+            ) -> Vec<Observation> {
+                let mut used = 2;
+                let mut output = Vec::new();
+                for observation in &self.observations {
+                    if since.is_some_and(|cut| observation.observed_at < cut)
+                        || context.is_some_and(|c| {
+                            c.witnessed.iter().any(|w| {
+                                w.message_key == observation.external_id
+                                    && w.at == observation.observed_at
+                            })
+                        })
+                    {
+                        continue;
+                    }
+                    let bytes = serde_json::to_vec(&json!({"external_id":observation.external_id,
+                        "observed_at":observation.observed_at,"payload":observation.payload}))
+                    .unwrap()
+                    .len();
+                    if used + bytes + 1 > 1536 * 1024 {
+                        break;
+                    }
+                    used += bytes + 1;
+                    output.push(observation.clone());
+                }
+                output
+            }
+        }
+        #[async_trait]
+        impl SensorSource for BoundedSource {
+            fn supports_read_context(&self) -> bool {
+                true
+            }
+            async fn read(
+                &self,
+                _credential: &str,
+                since: Option<DateTime<Utc>>,
+            ) -> Result<Vec<Observation>, SourceError> {
+                self.contexts.lock().unwrap().push(None);
+                Ok(self.select(since, None))
+            }
+            async fn read_with_context(
+                &self,
+                _credential: &str,
+                since: Option<DateTime<Utc>>,
+                context: Option<&SourceReadContext>,
+            ) -> Result<Vec<Observation>, SourceError> {
+                self.contexts.lock().unwrap().push(context.cloned());
+                Ok(self.select(since, context))
+            }
+            fn describe(&self, payload: &Json) -> Described {
+                Described {
+                    title: payload["id"].as_str().unwrap().into(),
+                    metadata: json!({"amount_cents":1}),
+                }
+            }
+        }
+        for general in [false, true] {
+            let stub = stub_jobs_api(vec![]).await;
+            declare(&stub).await;
+            let mut observations = (0..3)
+                .map(|i| {
+                    let mut value = obs(&format!("message-{i}"), "2026-09-17T09:00:00Z", 1);
+                    value.payload["body"] =
+                        json!("p".repeat(if general { 500 * 1024 } else { 600 * 1024 }));
+                    value
+                })
+                .collect::<Vec<_>>();
+            if general {
+                let mut later = obs("later", "2026-09-17T09:00:01Z", 1);
+                later.payload["body"] = json!("p".repeat(500 * 1024));
+                observations.push(later);
+            }
+            let expected = observations.len();
+            let source = Arc::new(BoundedSource {
+                observations,
+                contexts: Default::default(),
+            });
+            let h = SensorPoll::new(
+                &stub.base,
+                HashMap::from([("stripe".into(), source.clone() as Arc<dyn SensorSource>)]),
+                CredentialValues::new().with(
+                    "stripe-restricted-read",
+                    "SYNTHETIC",
+                    Some("fixture".into()),
+                ),
+                Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
+            );
+            for instant in [
+                "2026-09-17T10:05:00Z",
+                "2026-09-17T10:20:00Z",
+                "2026-09-17T10:35:00Z",
+            ] {
+                h.invoke(&[], &ctx_at(instant)).await.unwrap();
+            }
+            assert_eq!(
+                stub.sensors.readings().await.len(),
+                expected,
+                "general={general}: no valid suffix stranded"
+            );
+            assert_eq!(
+                stub.packets().len(),
+                expected,
+                "general={general}: each packet opens once"
+            );
+            let posted: usize = stub
+                .writes("POST /api/sensors/stripe-sponsorships/readings")
+                .iter()
+                .map(|(_, b)| b.as_array().map_or(0, Vec::len))
+                .sum();
+            assert_eq!(
+                posted, expected,
+                "general={general}: successful source messages must not be reposted"
+            );
+            assert!(
+                source
+                    .contexts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .skip(1)
+                    .any(|c| c.as_ref().is_some_and(|c| !c.witnessed.is_empty()))
+            );
+        }
+        for status in [400, 422, 503] {
+            let stub = stub_jobs_api(vec![]).await;
+            declare(&stub).await;
+            let source = Arc::new(BoundedSource {
+                observations: vec![obs("owed", "2026-09-17T09:00:00Z", 1)],
+                contexts: Default::default(),
+            });
+            let h = SensorPoll::new(
+                &stub.base,
+                HashMap::from([("stripe".into(), source as Arc<dyn SensorSource>)]),
+                CredentialValues::new().with(
+                    "stripe-restricted-read",
+                    "SYNTHETIC",
+                    Some("fixture".into()),
+                ),
+                Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
+            );
+            *stub.refuse_opens.lock().unwrap() =
+                Some((status, "recoverable packet admission fixture".into()));
+            let first = h.invoke(&[], &ctx()).await;
+            assert_eq!(
+                first.is_err(),
+                status == 503,
+                "status={status}: existing packet error classification"
+            );
+            let row = stub.sensors.list().await.unwrap().remove(0);
+            assert_eq!(row.cursor_at, Some(at("2026-09-17T09:00:00Z")));
+            assert_eq!(row.refused.unwrap().processed[0].message_key, "owed");
+            let readings = stub.sensors.readings().await;
+            assert_eq!(readings.len(), 1);
+            assert!(
+                readings[0].packet_id.is_none(),
+                "recorded reading remains durably owed"
+            );
+            *stub.refuse_opens.lock().unwrap() = None;
+            h.invoke(&[], &ctx_at("2026-09-17T10:20:00Z"))
+                .await
+                .unwrap();
+            h.invoke(&[], &ctx_at("2026-09-17T10:35:00Z"))
+                .await
+                .unwrap();
+            assert_eq!(
+                stub.packets()
+                    .iter()
+                    .filter(|p| p["kind"] == "receive-a-sponsorship")
+                    .count(),
+                1,
+                "status={status}: original owed packet opens once after recovery; alarm is separate"
+            );
+            assert_eq!(
+                stub.writes("POST /api/sensors/stripe-sponsorships/readings")
+                    .len(),
+                1,
+                "status={status}: ACKed reading not resent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn review_source_latch_keeps_processed_keys_and_names_unknown_union() {
+        let stub = stub_jobs_api(vec![]).await;
+        declare(&stub).await;
+        let at = at("2026-09-17T09:00:00Z");
+        let mut processed = (0..32)
+            .map(|i| boss_jobs::sensors::CursorWitness {
+                message_key: format!("done-{i}"),
+                at,
+            })
+            .collect::<Vec<_>>();
+        processed.sort();
+        let witness = PollRefusals {
+            processed: Vec::new(),
+            entries: (0..64)
+                .map(|i| RefusedMessage {
+                    message_key: format!("pending-{i}"),
+                    at,
+                    size_bytes: 50,
+                    limit: boss_jobs::sensors::RefusalLimit::Count {
+                        value: 64,
+                        observed: 65,
+                    },
+                    reason: "cursor_witness_bound".into(),
+                })
+                .collect(),
+            truncated: 1,
+            classes: None,
+            cleared: None,
+        };
+        let source = InMemorySource::failing(SourceError::RefusedPoll(witness));
+        let h = handler(&stub, source.clone(), Some("synthetic-read-only-key"));
+        h.mark_refused(
+            &sensor(),
+            at,
+            Some(at),
+            PollRefusals {
+                processed: processed.clone(),
+                entries: vec![],
+                truncated: 0,
+                classes: None,
+                cleared: None,
+            },
+        )
+        .await
+        .unwrap();
+        h.invoke(&[], &ctx()).await.unwrap();
+        let row = stub.sensors.list().await.unwrap().remove(0);
+        let held = row.refused.unwrap();
+        assert_eq!(held.processed, processed);
+        assert_eq!(held.entries.len() + held.processed.len(), 64);
+        assert_eq!(held.classes.unwrap().union_count, None);
+        assert!(
+            stub.packets()[0]["metadata"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("union unknown")
+        );
+        assert!(stub.sensors.readings().await.is_empty());
+        source.set(Ok(vec![
+            obs("done-0", "2026-09-17T09:00:00Z", 1),
+            obs("new-valid", "2026-09-17T09:00:00Z", 1),
+        ]));
+        h.invoke(&[], &ctx_at("2026-09-17T10:20:00Z"))
+            .await
+            .unwrap();
+        let held = stub
+            .sensors
+            .list()
+            .await
+            .unwrap()
+            .remove(0)
+            .refused
+            .unwrap();
+        assert_eq!(held.processed, processed);
+        assert!(!held.is_latched());
+        assert!(held.entries.is_empty());
+        let rows = stub.sensors.readings().await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].external_id, "new-valid");
+    }
+
+    #[tokio::test]
+    async fn review_context_never_mints_processed_witness_from_an_unreadable_recording_ack() {
+        struct OneSource;
+        #[async_trait]
+        impl SensorSource for OneSource {
+            fn supports_read_context(&self) -> bool {
+                true
+            }
+            async fn read(
+                &self,
+                _: &str,
+                _: Option<DateTime<Utc>>,
+            ) -> Result<Vec<Observation>, SourceError> {
+                Ok(vec![obs("one", "2026-09-17T09:00:00Z", 1)])
+            }
+            fn describe(&self, _: &Json) -> Described {
+                Described {
+                    title: "one".into(),
+                    metadata: json!({"amount_cents":1}),
+                }
+            }
+        }
+        let stub = stub_jobs_api(vec![]).await;
+        declare(&stub).await;
+        *stub.unreadable_reading_ack.lock().unwrap() = true;
+        let h = SensorPoll::new(
+            &stub.base,
+            HashMap::from([(
+                "stripe".into(),
+                Arc::new(OneSource) as Arc<dyn SensorSource>,
+            )]),
+            CredentialValues::new().with(
+                "stripe-restricted-read",
+                "SYNTHETIC",
+                Some("fixture".into()),
+            ),
+            Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
+        );
+        let error = h
+            .invoke(&[], &ctx())
+            .await
+            .expect_err("HTTP200 without a BatchOutcome is not proof of processing");
+        assert!(matches!(error, HandlerError::Downstream(_)), "{error}");
+        let row = stub.sensors.list().await.unwrap().remove(0);
+        assert_eq!(
+            (row.last_polled_at, row.cursor_at, row.refused),
+            (None, None, None)
+        );
+        assert_eq!(
+            stub.sensors.readings().await.len(),
+            1,
+            "fixture effect exists but its acknowledgement is unknown to caller"
+        );
+        assert!(stub.packets().is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_small_source_byte_cohort_latches_without_processing_and_clears_on_remeasurement()
+     {
+        let stub = stub_jobs_api(vec![]).await;
+        declare(&stub).await;
+        let witness = PollRefusals {
+            processed: Vec::new(),
+            entries: (0..3)
+                .map(|i| RefusedMessage {
+                    message_key: format!("tied-{i}"),
+                    size_bytes: 600 * 1024,
+                    limit: boss_jobs::sensors::RefusalLimit::bytes(1536 * 1024, 1800 * 1024),
+                    reason: "timestamp_tie_read_byte_bound".into(),
+                    at: at("2026-09-17T09:00:00Z"),
+                })
+                .collect(),
+            truncated: 0,
+            cleared: None,
+            classes: None,
+        };
+        let source = InMemorySource::failing(SourceError::RefusedPoll(witness));
+        let h = handler(&stub, source.clone(), Some("synthetic-read-only-key"));
+        h.invoke(&[], &ctx()).await.unwrap();
+        let row = stub.sensors.list().await.unwrap().remove(0);
+        assert!(
+            row.refused.as_ref().unwrap().is_latched(),
+            "known byte overflow is a latch even below64 keys"
+        );
+        assert_eq!(row.cursor_at, None);
+        assert!(stub.sensors.readings().await.is_empty());
+        source.set(Ok(vec![obs(
+            "valid-after-remeasurement",
+            "2026-09-17T09:00:00Z",
+            1,
+        )]));
+        h.invoke(&[], &ctx_at("2026-09-17T10:20:00+00:00"))
+            .await
+            .unwrap();
+        let row = stub.sensors.list().await.unwrap().remove(0);
+        assert!(!row.refused.as_ref().unwrap().is_latched());
+        assert!(row.refused.as_ref().unwrap().entries.is_empty());
+        assert_eq!(stub.sensors.readings().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn review_historical_measurement_is_not_invented_or_reposted_as_a_new_witness() {
+        let stub = stub_jobs_api(vec![]).await;
+        let old=PollRefusals::from_stored_json(json!({"entries":[{"message_key":"old", "size_bytes":80,
+            "limit_bytes":64,"reason":"readings_post_413:v1","at":"2026-09-17T09:00:00Z"}],"truncated":0})).unwrap();
+        declare(&stub).await;
+        let h = handler(
+            &stub,
+            InMemorySource::answering(vec![]),
+            Some("synthetic-read-only-key"),
+        );
+        let mut row = sensor();
+        row.refused = Some(old.clone());
+        h.mark_refused(&row, at("2026-09-17T10:05:00Z"), None, old)
+            .await
+            .unwrap();
+        // The backend retains old facts under its lock; this caller must not
+        // invent or resubmit an absent observation as a new measured fact.
+        assert_eq!(
+            stub.sensors.list().await.unwrap()[0].refused,
+            None,
+            "the controlled empty backend must not receive a new invented historical witness"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_poll_mark_400_is_named_permanent_with_the_existing_sensor_alarm() {
+        let stub = stub_jobs_api(vec![]).await;
+        declare(&stub).await;
+        *stub.refuse_poll_mark.lock().unwrap() = true;
+        let source = InMemorySource::answering(vec![]);
+        let h = handler(&stub, source, Some("synthetic-read-only-key"));
+        let error = h.invoke(&[], &ctx()).await.unwrap_err();
+        assert!(matches!(error, HandlerError::Permanent(_)), "{error}");
+        assert!(error.to_string().contains("/polled"), "{error}");
+        assert!(error.to_string().contains("400"), "{error}");
+        assert_eq!(
+            stub.writes("POST /api/sensors/stripe-sponsorships/polled (400)")
+                .len(),
+            1
+        );
+        let alarms = stub.packets();
+        assert_eq!(alarms.len(), 1);
+        assert_eq!(
+            alarms[0]["metadata"]["estate_finding"],
+            "sensor_unreadable:stripe-sponsorships"
+        );
+        assert!(
+            alarms[0]["metadata"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("/polled")
+        );
+        assert_eq!(stub.sensors.list().await.unwrap()[0].last_polled_at, None);
     }
 
     fn ctx_at(s: &str) -> InvocationContext {
@@ -1953,7 +2833,10 @@ mod tests {
         let reason = patches[0].1["reason"].as_str().unwrap();
         assert!(reason.contains("422"), "{reason}");
         assert!(reason.contains("amount_cents"), "{reason}");
-        assert_eq!(patches[0].1["external_id"], "ch_1");
+        // The reading's id is unchanged, so the refresh does not re-send
+        // it: `alarm_item::plan` writes only what moved (f4b0ad41).
+        assert!(patches[0].1.get("external_id").is_none(), "{patches:?}");
+        assert_eq!(stub.packets()[0]["metadata"]["external_id"], "ch_1");
 
         // The open succeeds: the packet opens, the reading is stamped,
         // the alarm is closed through its triage step.
@@ -1987,6 +2870,451 @@ mod tests {
             .unwrap();
         assert_eq!(stub.packets().len(), 2);
         assert_eq!(stub.writes("PUT").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_business_packet_413_keeps_the_existing_owed_reading_contract() {
+        let stub = stub_jobs_api(vec![]).await;
+        declare(&stub).await;
+        let source =
+            InMemorySource::answering(vec![obs("message-413", "2026-09-17T09:00:00Z", 500)]);
+        let h = handler(&stub, source, Some("synthetic-read-only-key"));
+        *stub.refuse_opens.lock().unwrap() = Some((413, "body permanently too large".into()));
+        h.invoke(&[], &ctx()).await.unwrap();
+        let packets = stub.packets();
+        assert_eq!(packets.len(), 1, "one named refusal record");
+        assert_eq!(packets[0]["metadata"]["external_id"], "message-413");
+        assert!(
+            packets[0]["metadata"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("413")
+        );
+        assert_eq!(
+            stub.sensors.list().await.unwrap()[0].cursor_at,
+            Some(at("2026-09-17T09:00:00Z"))
+        );
+        h.invoke(&[], &ctx_at("2026-09-17T10:20:00+00:00"))
+            .await
+            .unwrap();
+        // A110647 narrows the new terminal poll refusal to READINGS POSTs;
+        // business packet-open recovery retains the pre-existing contract.
+        assert_eq!(stub.writes("POST /api/jobs (refused)").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_readings_413_is_durable_once_and_keeps_new_equal_timestamp_messages() {
+        let stub = stub_jobs_api(vec![]).await;
+        declare(&stub).await;
+        let source =
+            InMemorySource::answering(vec![obs("message-413", "2026-09-17T09:00:00Z", 500)]);
+        let h = handler(&stub, source.clone(), Some("synthetic-read-only-key"));
+        *stub.refuse_readings.lock().unwrap() = true;
+        h.invoke(&[], &ctx())
+            .await
+            .expect("a permanent readings refusal is recorded, not NAKed");
+        let packets = stub.packets();
+        assert_eq!(packets.len(), 1, "one durable named poll refusal");
+        let reason = packets[0]["metadata"]["reason"].as_str().unwrap();
+        assert!(reason.contains("message-413") && reason.contains("413"));
+        assert!(reason.contains("bytes") && reason.contains("limit"));
+        assert_eq!(
+            stub.sensors.list().await.unwrap()[0].cursor_at,
+            Some(at("2026-09-17T09:00:00Z"))
+        );
+        h.invoke(&[], &ctx_at("2026-09-17T10:20:00+00:00"))
+            .await
+            .unwrap();
+        assert_eq!(
+            stub.writes("POST /api/sensors/stripe-sponsorships/readings (refused)")
+                .len(),
+            1
+        );
+        *stub.refuse_readings.lock().unwrap() = false;
+        source.set(Ok(vec![
+            obs("message-413", "2026-09-17T09:00:00Z", 500),
+            obs("new-same-time", "2026-09-17T09:00:00Z", 10),
+        ]));
+        h.invoke(&[], &ctx_at("2026-09-17T10:35:00+00:00"))
+            .await
+            .unwrap();
+        let readings = stub.sensors.readings().await;
+        assert_eq!(
+            readings.len(),
+            1,
+            "skip the refused identity, not the entire timestamp"
+        );
+        assert_eq!(readings[0].external_id, "new-same-time");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_overflow_latches_without_skipping_and_remeasures_before_clearing() {
+        let stub = stub_jobs_api(vec![]).await;
+        declare(&stub).await;
+        let tied = (0..65)
+            .map(|i| obs(&format!("message-{i}"), "2026-09-17T09:00:00Z", 500))
+            .collect::<Vec<_>>();
+        let source = InMemorySource::answering(tied.clone());
+        let h = handler(&stub, source.clone(), Some("synthetic-read-only-key"));
+        *stub.refuse_readings.lock().unwrap() = true;
+        h.invoke(&[], &ctx()).await.unwrap();
+        let row = stub.sensors.list().await.unwrap().remove(0);
+        assert_eq!(row.cursor_at, None, "unwitnessed tied messages remain owed");
+        let witness = row.refused.expect("durable named latch");
+        assert_eq!(witness.entries.len(), 64);
+        assert_eq!(witness.truncated, 1);
+        assert!(stub.sensors.readings().await.is_empty());
+        h.invoke(&[], &ctx_at("2026-09-17T10:20:00+00:00"))
+            .await
+            .unwrap();
+        assert_eq!(source.reads.lock().unwrap().len(), 2, "remeasure each poll");
+        assert_eq!(
+            stub.writes("POST /api/sensors/stripe-sponsorships/readings (refused)")
+                .len(),
+            67,
+            "one batch,65 singleton measurements, then only the omitted/unwitnessed key is remeasured"
+        );
+        let witnessed = stub.sensors.list().await.unwrap()[0]
+            .refused
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.message_key.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        for key in witnessed {
+            assert_eq!(
+                stub.writes("POST /api/sensors/stripe-sponsorships/readings (refused)")
+                    .iter()
+                    .filter(|(_, body)| body.as_array().unwrap().len() == 1
+                        && body[0]["external_id"].as_str() == Some(&key))
+                    .count(),
+                1,
+                "never retries a witnessed refused key"
+            );
+        }
+        assert_eq!(stub.sensors.list().await.unwrap()[0].cursor_at, None);
+        // An existing mail-side operation changes the observed window. No
+        // BOSS manual-clear verb is invented; these valid ties were never lost.
+        source.set(Ok(vec![
+            obs("remaining-valid-a", "2026-09-17T09:00:00Z", 1),
+            obs("remaining-valid-b", "2026-09-17T09:00:00Z", 1),
+        ]));
+        *stub.refuse_readings.lock().unwrap() = false;
+        h.invoke(&[], &ctx_at("2026-09-17T10:35:00+00:00"))
+            .await
+            .unwrap();
+        let rows = stub.sensors.list().await.unwrap();
+        assert_eq!(rows[0].cursor_at, Some(at("2026-09-17T09:00:00Z")));
+        let value = serde_json::to_value(&rows[0].refused).unwrap();
+        assert_eq!(value["truncated"], 0);
+        assert!(
+            value["cleared"]
+                .as_str()
+                .unwrap()
+                .contains("singleton POSTs")
+        );
+        assert_eq!(stub.sensors.readings().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_batch_413_is_split_and_only_a_refused_single_key_is_witnessed() {
+        let stub = stub_jobs_api(vec![]).await;
+        declare(&stub).await;
+        *stub.split_readings_refusal.lock().unwrap() = Some("bad".into());
+        let source = InMemorySource::answering(vec![
+            obs("good-a", "2026-09-17T09:00:00Z", 1),
+            obs("bad", "2026-09-17T09:00:00Z", 1),
+            obs("good-b", "2026-09-17T09:00:00Z", 1),
+        ]);
+        let h = handler(&stub, source, Some("synthetic-read-only-key"));
+        h.invoke(&[], &ctx()).await.unwrap();
+        let readings = stub.sensors.readings().await;
+        assert_eq!(
+            readings.len(),
+            2,
+            "successful singleton siblings must be conserved"
+        );
+        assert!(readings.iter().all(|r| r.external_id != "bad"));
+        let row = stub.sensors.list().await.unwrap().remove(0);
+        let witness = row.refused.unwrap();
+        assert_eq!(witness.entries.len(), 1);
+        assert_eq!(witness.entries[0].message_key, "bad");
+        assert!(
+            witness.entries[0].reason.contains("v1"),
+            "configured bound version is part of refusal evidence"
+        );
+        assert!(stub.packets().iter().any(|p| {
+            p["metadata"]["reason"]
+                .as_str()
+                .is_some_and(|s| s.contains("configuration") && s.contains("v1"))
+        }));
+        h.invoke(&[], &ctx_at("2026-09-17T10:20:00+00:00"))
+            .await
+            .unwrap();
+        assert_eq!(
+            stub.writes("POST /api/sensors/stripe-sponsorships/readings (refused)")
+                .iter()
+                .filter(|(_, body)| body.as_array().unwrap().len() == 1
+                    && body[0]["external_id"] == "bad")
+                .count(),
+            1,
+            "never retries a witnessed refused key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mixed_source_cohort_and_permanent_refusals_latch_without_a_nak() {
+        let stub = stub_jobs_api(vec![]).await;
+        declare(&stub).await;
+        let source = InMemorySource::answering(
+            (0..64)
+                .map(|i| obs(&format!("permanent-{i}"), "2026-09-17T09:00:00Z", 1))
+                .collect(),
+        );
+        let h = handler(&stub, source.clone(), Some("synthetic-read-only-key"));
+        *stub.refuse_readings.lock().unwrap() = true;
+        h.invoke(&[], &ctx()).await.unwrap();
+        let before = stub.sensors.list().await.unwrap().remove(0);
+        let keys = before
+            .refused
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.message_key.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        source.set(Err(SourceError::RefusedPoll(PollRefusals {
+            processed: Vec::new(),
+            entries: (0..64)
+                .map(|i| RefusedMessage {
+                    message_key: format!("source-{i}"),
+                    size_bytes: 10,
+                    limit: boss_jobs::sensors::RefusalLimit::Count {
+                        value: 256,
+                        observed: 257,
+                    },
+                    reason: "timestamp_tie_bound".into(),
+                    at: at("2026-09-17T09:00:00Z"),
+                })
+                .collect(),
+            truncated: 193,
+            cleared: None,
+            classes: None,
+        })));
+        h.invoke(&[], &ctx_at("2026-09-17T10:20:00+00:00"))
+            .await
+            .expect("mixed union unknown is a durable named latch, never a NAK");
+        let row = stub.sensors.list().await.unwrap().remove(0);
+        assert_eq!(row.cursor_at, before.cursor_at);
+        assert_eq!(
+            row.refused
+                .as_ref()
+                .unwrap()
+                .entries
+                .iter()
+                .filter(|e| e.reason.starts_with("readings_post_413"))
+                .map(|e| e.message_key.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            keys
+        );
+        assert!(
+            stub.writes("PATCH /api/jobs/")
+                .iter()
+                .any(|(_, p)| p.to_string().contains("union unknown")),
+            "the existing alarm refresh names the unknown union rather than adding class counts"
+        );
+        assert_eq!(stub.sensors.readings().await.len(), 0);
+        let classes = row.refused.as_ref().unwrap().classes.as_ref().unwrap();
+        assert_eq!(
+            (
+                classes.source_count,
+                classes.permanent_413_count,
+                classes.union_count
+            ),
+            (257, 64, None)
+        );
+        assert_eq!(
+            row.refused.as_ref().unwrap().truncated,
+            0,
+            "unknown union cannot carry a fabricated omitted union count"
+        );
+        source.set(Ok(vec![
+            obs("permanent-0", "2026-09-17T09:00:00Z", 1),
+            obs(
+                "valid-after-source-remeasurement",
+                "2026-09-17T09:00:00Z",
+                1,
+            ),
+        ]));
+        *stub.refuse_readings.lock().unwrap() = false;
+        h.invoke(&[], &ctx_at("2026-09-17T10:35:00+00:00"))
+            .await
+            .unwrap();
+        let row = stub.sensors.list().await.unwrap().remove(0);
+        assert!(row.refused.as_ref().unwrap().classes.is_none());
+        assert_eq!(
+            row.refused
+                .as_ref()
+                .unwrap()
+                .entries
+                .iter()
+                .map(|e| e.message_key.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            keys
+        );
+        assert_eq!(
+            stub.sensors.readings().await.len(),
+            1,
+            "certified readable source clears only source latch; valid tie remains owed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_refused_tie_is_named_durable_and_clears_only_after_remeasurement() {
+        let stub = stub_jobs_api(vec![]).await;
+        declare(&stub).await;
+        let witness = PollRefusals {
+            processed: Vec::new(),
+            classes: None,
+            entries: (0..64)
+                .map(|i| RefusedMessage {
+                    message_key: format!("<message-{i}@example.invalid>"),
+                    size_bytes: 100,
+                    limit: boss_jobs::sensors::RefusalLimit::Count {
+                        value: 256,
+                        observed: 257,
+                    },
+                    reason: "timestamp_tie_bound".into(),
+                    at: at("2026-09-17T09:00:00Z"),
+                })
+                .collect(),
+            truncated: 193,
+            cleared: None,
+        };
+        let source = InMemorySource::failing(SourceError::RefusedPoll(witness));
+        let h = handler(&stub, source.clone(), Some("synthetic-read-only-key"));
+        h.invoke(&[], &ctx())
+            .await
+            .expect("source refusal is a durable poll outcome");
+        let row = stub.sensors.list().await.unwrap().remove(0);
+        assert_eq!(row.cursor_at, None);
+        assert_eq!(row.refused.as_ref().unwrap().truncated, 193);
+        assert!(stub.sensors.readings().await.is_empty());
+        h.invoke(&[], &ctx_at("2026-09-17T10:20:00+00:00"))
+            .await
+            .unwrap();
+        assert_eq!(stub.packets().len(), 1, "same named refusal is not twinned");
+        // The SOURCE now certifies its bound:180 valid tied messages, not
+        //180 refused keys. Do not confuse a source cap with the64-key witness.
+        source.set(Ok((0..180)
+            .map(|i| obs(&format!("now-valid-{i}"), "2026-09-17T09:00:00Z", 1))
+            .collect()));
+        h.invoke(&[], &ctx_at("2026-09-17T10:35:00+00:00"))
+            .await
+            .unwrap();
+        assert_eq!(stub.sensors.readings().await.len(), 180);
+        let row = stub.sensors.list().await.unwrap().remove(0);
+        assert_eq!(row.refused.as_ref().unwrap().truncated, 0);
+        assert!(row.refused.unwrap().cleared.unwrap().contains("source"));
+    }
+
+    #[tokio::test]
+    async fn retained_boundary_keys_cannot_make_the_next_413_unrecordable() {
+        let stub = stub_jobs_api(vec![]).await;
+        declare(&stub).await;
+        let tied = (0..64)
+            .map(|i| obs(&format!("old-{i}"), "2026-09-17T09:00:00Z", 1))
+            .collect::<Vec<_>>();
+        let source = InMemorySource::answering(tied.clone());
+        let h = handler(&stub, source.clone(), Some("synthetic-read-only-key"));
+        *stub.refuse_readings.lock().unwrap() = true;
+        h.invoke(&[], &ctx()).await.unwrap();
+        let prior_keys = stub.sensors.list().await.unwrap()[0]
+            .refused
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.message_key.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut expanded = tied.clone();
+        expanded.push(obs("new-valid-tie", "2026-09-17T09:00:00Z", 1));
+        source.set(Ok(expanded));
+        h.invoke(&[], &ctx_at("2026-09-17T10:20:00+00:00"))
+            .await
+            .expect("actual single413 is a bounded named latch, not a mark400");
+        assert_eq!(
+            stub.writes("POST /api/sensors/stripe-sponsorships/readings (refused)")
+                .len(),
+            66,
+            "first batch+64singletons, then one new actual single413"
+        );
+        let row = stub.sensors.list().await.unwrap().remove(0);
+        let retained = row.refused.unwrap();
+        assert_eq!(retained.truncated, 1);
+        assert_eq!(
+            retained
+                .entries
+                .iter()
+                .map(|e| e.message_key.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            prior_keys,
+            "a new lexically earlier refusal cannot evict an already witnessed still-present key"
+        );
+        h.invoke(&[], &ctx_at("2026-09-17T10:35:00+00:00"))
+            .await
+            .unwrap();
+        for key in &prior_keys {
+            assert_eq!(
+                stub.writes("POST /api/sensors/stripe-sponsorships/readings (refused)")
+                    .iter()
+                    .filter(|(_, body)| body.as_array().unwrap().len() == 1
+                        && body[0]["external_id"].as_str() == Some(key.as_str()))
+                    .count(),
+                1,
+                "a previously witnessed key cannot be retried after overflow"
+            );
+        }
+        // Mail-side removal reduces the measured cohort. The new valid tie
+        // remains owed; a bounded witness must never discard it silently.
+        source.set(Ok(vec![obs("remaining-valid", "2026-09-17T09:00:00Z", 1)]));
+        *stub.refuse_readings.lock().unwrap() = false;
+        h.invoke(&[], &ctx_at("2026-09-17T10:50:00+00:00"))
+            .await
+            .unwrap();
+        assert_eq!(stub.sensors.readings().await.len(), 1);
+        assert_eq!(
+            stub.sensors.readings().await[0].external_id,
+            "remaining-valid"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_refusals_do_not_block_a_successful_new_tied_post() {
+        let stub = stub_jobs_api(vec![]).await;
+        declare(&stub).await;
+        let tied = (0..64)
+            .map(|i| obs(&format!("old-{i}"), "2026-09-17T09:00:00Z", 1))
+            .collect::<Vec<_>>();
+        let source = InMemorySource::answering(tied.clone());
+        let h = handler(&stub, source.clone(), Some("synthetic-read-only-key"));
+        *stub.refuse_readings.lock().unwrap() = true;
+        h.invoke(&[], &ctx()).await.unwrap();
+        let mut expanded = tied;
+        expanded.push(obs("new-valid-tie", "2026-09-17T09:00:00Z", 1));
+        source.set(Ok(expanded));
+        *stub.refuse_readings.lock().unwrap() = false;
+        h.invoke(&[], &ctx_at("2026-09-17T10:20:00+00:00"))
+            .await
+            .unwrap();
+        let rows = stub.sensors.readings().await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "retained refusals must not block a successful new POST"
+        );
+        assert_eq!(rows[0].external_id, "new-valid-tie");
     }
 
     /// The payouts source (backlog 21eb9516) through the whole handler:
@@ -2355,7 +3683,15 @@ mod tests {
         assert!(stub.packets().is_empty(), "held, never twinned");
         let patches = stub.writes("PATCH /api/jobs/alarm-r/metadata");
         assert_eq!(patches.len(), 1, "{patches:?}");
-        assert_eq!(patches[0].1, super::super::common::relapse_patch());
+        for (key, withdrawn) in super::super::common::relapse_patch().as_object().unwrap() {
+            assert_eq!(&patches[0].1[key], withdrawn, "{key}: {patches:?}");
+        }
+        // The relapse is an occurrence on the open alarm (backlog f4b0ad41).
+        assert_eq!(patches[0].1[super::super::alarm_item::OCCURRENCES], 2);
+        assert_eq!(
+            patches[0].1[super::super::alarm_item::OCCURRENCE_LOG][0]["evidence"],
+            "stripe answered 401"
+        );
 
         source.set(Err(SourceError::Unreadable("stripe answered 403".into())));
         h.invoke(&[], &ctx_at("2026-09-17T10:20:00+00:00"))

@@ -152,6 +152,24 @@ impl Converge {
                 log = log.display()
             ),
         );
+        // The forge accounts (design 0af333ee; forge_account_sh.rs pins
+        // the script itself): records the header it was handed, like
+        // protect-main, and leaves `forge-account-rc` as its exit and
+        // `forge-account-red` as its summary red line when a test asks.
+        write_exec(
+            &infra.join("forge/forge-account.sh"),
+            &format!(
+                "#!/bin/bash\nR='{root}'\nf=\"$BOSS_FORGE_AUTH_HEADER_FILE\"\n\
+                 echo \"forge-account header=$f\" >> '{log}'\n\
+                 [ -f \"$f\" ] && echo \"forge-account mode=$(stat -c %a \"$f\") body=$(cat \"$f\")\" >> '{log}'\n\
+                 if [ -f \"$R/forge-account-red\" ] && [ -n \"${{BOSS_RUN_SUMMARY_FILE:-}}\" ]; then\n\
+                 jq --arg v \"$(cat \"$R/forge-account-red\")\" '. + {{forge_account_red: $v}}' \"$BOSS_RUN_SUMMARY_FILE\" > \"$BOSS_RUN_SUMMARY_FILE.new\" && mv \"$BOSS_RUN_SUMMARY_FILE.new\" \"$BOSS_RUN_SUMMARY_FILE\"\n\
+                 fi\n\
+                 exit \"$(cat \"$R/forge-account-rc\" 2>/dev/null || echo 0)\"\n",
+                root = root.display(),
+                log = log.display()
+            ),
+        );
         write_exec(
             &infra.join("forge/offsite-push.sh"),
             &format!(
@@ -324,6 +342,17 @@ fn the_forge_header_is_made_in_the_runtime_directory() {
         calls.contains(&format!("offsite-push header={header}")),
         "offsite-push reads the same header file: {calls}"
     );
+    // The forge accounts are granted and verified with the same header
+    // (design 0af333ee, question `create`): the repository grant and the
+    // read of every other repository are API calls as the checkout's
+    // owner, who owns david/boss.
+    assert!(
+        calls.contains(&format!("forge-account header={header}"))
+            && calls.contains(&format!(
+                "forge-account mode=600 body=Authorization: token {TOKEN}"
+            )),
+        "forge-account reads the same 0600 header: {calls}"
+    );
     assert_eq!(
         entries(&c.run_dir),
         0,
@@ -398,7 +427,12 @@ fn the_new_script_under_the_old_unit_still_installs() {
                  header, and install.sh is what brings the unit that carries it: {calls}"
             );
         }
-        for skipped in ["protect-main", "offsite-push", "runuser-read"] {
+        for skipped in [
+            "protect-main",
+            "offsite-push",
+            "forge-account",
+            "runuser-read",
+        ] {
             assert!(
                 !calls.lines().any(|l| l.starts_with(skipped)),
                 "[{leg}] `{skipped}` must not run without the directory (no header, no token \
@@ -691,7 +725,7 @@ fn a_probe_reader_deposit_that_never_returns_is_stopped() {
 fn a_tree(c: &Converge, sha: &str) -> PathBuf {
     let tree_gen = c.root.join("tree/gen").join(sha);
     create_dir(&tree_gen.join("infra/forge"));
-    for name in ["install", "protect-main", "offsite-push"] {
+    for name in ["install", "protect-main", "offsite-push", "forge-account"] {
         write_exec(
             &tree_gen.join("infra/forge").join(format!("{name}.sh")),
             &format!(
@@ -767,6 +801,55 @@ fn a_tree_that_could_not_be_refreshed_still_installs_and_reds_the_run() {
     );
     assert!(!calls.contains("root-tree-mark-good"), "{calls}");
     assert_eq!(c.summary()["root_tree"], "root-tree: fixture refresh");
+}
+
+/// A FORGE ACCOUNT THAT IS A SITE ADMIN, OR HOLDS ANOTHER REPOSITORY, REDS
+/// THE CONVERGE AND IS FILED (design 0af333ee, question `create`: "the
+/// converge goes red if the account is admin or holds any other
+/// repository"). It stands until a person acts — the converge never
+/// demotes an account or removes a grant on a guess — so its line is
+/// copied into `output` for the judge, and the exit is the script's. A
+/// cannot-answer (4) reds the run and files nothing: it may pass by
+/// itself on the next tick. A generation from before the accounts carries
+/// no script and declares no account, so it is skipped, not red.
+#[test]
+fn a_forge_account_red_reaches_the_judge_and_the_exit() {
+    let c = Converge::new("account-red");
+    write_file(&c.root.join("forge-account-rc"), "1\n");
+    write_file(
+        &c.root.join("forge-account-red"),
+        "RED forge-converge/forge-account refused: boss-reader is a site admin (is_admin true)",
+    );
+    let out = c.cmd().output().expect("forge-converge.sh runs");
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let s = c.summary();
+    assert_eq!(
+        s["output"].as_str(),
+        Some(
+            "RED forge-converge/forge-account refused: boss-reader is a site admin (is_admin true)"
+        ),
+        "{s}"
+    );
+
+    let c = Converge::new("account-cannot-answer");
+    write_file(&c.root.join("forge-account-rc"), "4\n");
+    let out = c.cmd().output().expect("forge-converge.sh runs");
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    assert!(c.summary().get("output").is_none(), "{}", c.summary());
+
+    let c = Converge::new("account-pre-car-generation");
+    let tree_gen = a_tree(&c, "89abcdef0123456789abcdef0123456789abcdef");
+    std::fs::remove_file(tree_gen.join("infra/forge/forge-account.sh"))
+        .expect("remove the generation's forge-account.sh");
+    let out = c.cmd().output().expect("forge-converge.sh runs");
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        c.summary()["forge_accounts"]
+            .as_str()
+            .is_some_and(|v| v.contains("no forge-account.sh")),
+        "the skip is said on the packet: {}",
+        c.summary()
+    );
 }
 
 /// A RED THAT STANDS UNTIL A PERSON ACTS SAYS SO ON A LINE THE JUDGE
@@ -881,6 +964,22 @@ fn a_red_from_boss_gcps_runner_push_leaves_a_line_for_the_judge() {
         .unwrap_or_else(|| panic!("no `output` on the packet: {s}"));
     assert_eq!(output, RED, "{s}");
 
+    // THE WHOLE LINE, HOWEVER LONG (backlog 3f7d5f23, (e)). The copy was
+    // cut at 600 characters, and the sender's key-unconfined line runs
+    // 738-797: the filed item lost the forced command to place and the
+    // closing "No credential byte was sent." The sender bounds every
+    // part it did not write itself, so the line is copied as it is.
+    let long = format!(
+        "RED runner-credential-send/key-unconfined refused: this key reaches a shell on boss-gcp. {}it forces: exec sudo -n /usr/local/libexec/boss/runner-delivery/infra/gcp/runner-credential-recv.sh. No credential byte was sent.",
+        "REMOVE THAT LINE NOW, then place the whole line. ".repeat(14)
+    );
+    assert!(long.len() > 800, "{}", long.len());
+    let c = Converge::new("gcp-runner-red-long");
+    push_says(&c, &long, 1);
+    let out = c.cmd().output().expect("forge-converge.sh runs");
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert_eq!(c.summary()["output"].as_str(), Some(long.as_str()));
+
     // Not yet passes by itself: nothing for the judge.
     let c = Converge::new("gcp-runner-not-yet");
     push_says(
@@ -891,6 +990,48 @@ fn a_red_from_boss_gcps_runner_push_leaves_a_line_for_the_judge() {
     let out = c.cmd().output().expect("forge-converge.sh runs");
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert!(c.summary().get("output").is_none(), "{}", c.summary());
+}
+
+/// THE ROOT-TREE LINE IS COPIED WHOLE, HOWEVER LONG (backlog 80e5d9d8).
+/// The RED line the judge files from and the `root_tree` summary field
+/// both cut root-tree.sh's own words at 600 characters, so a long
+/// refusal reached the filed item without its tail, the same reduction
+/// 3f7d5f23 removed from the runner-credential line.
+#[test]
+fn a_long_root_tree_refusal_reaches_the_judge_whole() {
+    let c = Converge::new("root-tree-red-long");
+    a_tree(&c, "89abcdef0123456789abcdef0123456789abcdef");
+    let long = format!(
+        "root-tree: REFUSED: the forge main is at 0123456789ab, which is NOT a descendant of the commit root last accepted; {}current stays at 89abcdef0123 until a person runs refresh --accept-rewind",
+        "the rewind would drop landed commits. ".repeat(20)
+    );
+    assert!(long.len() > 800, "{}", long.len());
+    write_exec(
+        &c.root.join("infra/forge/root-tree.sh"),
+        &format!(
+            "#!/bin/sh\nR='{root}'\ncase \"$1\" in\n\
+             refresh) echo '{long}'; exit 3 ;;\n\
+             path) cat \"$R/tree-path\" ;;\n\
+             head) cat \"$R/tree-head\" ;;\n\
+             esac\nexit 0\n",
+            root = c.root.display()
+        ),
+    );
+    let _ = c.cmd().output().expect("forge-converge.sh runs");
+    let s = c.summary();
+    let output = s["output"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no `output` on the packet: {s}"));
+    let want = format!("RED forge-converge/root-tree refused: {long}");
+    assert!(
+        output.lines().any(|l| l == want),
+        "the judge's line must carry root-tree.sh's words whole: {output}"
+    );
+    assert_eq!(
+        s["root_tree"].as_str(),
+        Some(long.as_str()),
+        "and so must the packet's root_tree field: {s}"
+    );
 }
 
 /// THE OWNER'S CHECKOUT IS NO LONGER WHAT THE RUN DEPENDS ON. A fetch or

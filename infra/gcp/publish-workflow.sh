@@ -56,6 +56,9 @@
 # THE SEQUENCE, each step checked rather than assumed
 # ---------------------------------------------------------------------
 #   1. the kind's file exists in the tree               else exit 3
+#   1'. its bytes are read ONCE into this run's own copy, and every
+#      step below reads that copy, re-hashed before each use (review R1
+#      of car 214ae147)              else exit 78; moved later, exit 75
 #   1b. the host's CLI can read a bundle: `boss --version` names a
 #      commit at or after the loader's arrival (the floor) else exit 78
 #   2. the live active row is read                       else exit 75 / 8
@@ -64,6 +67,9 @@
 #      said is refused unless --force-tree               else exit 6
 #   4. `boss workflow publish <kind> <file> --dry-run` lints the row and
 #      refuses a dirty registry (a stale draft)          else exit 4
+#   4'. the server says whether the live row is passkey-protected;
+#      a protected one is the owner's to sign, as a held kind is
+#      (unread: 75)                                       else exit 9
 #   5. --check stops here, exit 0, saying what it would do
 #   6. `boss workflow publish <kind> <file>` — the CLI's own checked
 #      sequence: create the draft, read it back, publish, confirm
@@ -117,7 +123,12 @@
 #                                RUNNING it, the identity rule every
 #                                `boss` verb applies; the approving
 #                                human is the ops-request's filer)
-#   OPS_REQUEST_ID               the packet, from the runner; printed
+#   OPS_REQUEST_ID               the packet, from the runner; printed —
+#                                and, for a HELD kind in real mode, READ:
+#                                its metadata.for_protocol_publish names
+#                                the publish-a-protocol packet whose
+#                                signature is the only thing that lifts
+#                                the hold for one publish (see 1a)
 #   BOSS_PUBLISH_HISTORY_LIMIT   commits walked at most (default 500)
 #
 # EXIT
@@ -131,13 +142,23 @@
 #   8  the kind has no live active row (the seed admits new kinds)
 #   9  REFUSED: the kind is HELD out of every unattended publish
 #      (infra/platform/workflow-holds/, or a row that declares a writer
-#      or an executor) — in real mode and --force-tree before anything
-#      is read; under --check, where `--check ok` would have been
-#  75  cannot answer: the registry could not be read
+#      or an executor) — under --force-tree before anything is read; in
+#      real mode unless the request names a publish-a-protocol packet
+#      signed for exactly this publish (the refusal says which check
+#      failed), and again when live moved off the version it signed;
+#      under --check, where `--check ok` would have been. AND a kind the
+#      SERVER judges passkey-protected (GET /api/workflows/<kind>/passkey,
+#      backlog 5af64799), the same way where a publish would follow:
+#      `--check HELD`, refused under --force-tree, and in real mode
+#      unless the request names a packet that signs this publish
+#  75  cannot answer: the registry could not be read, or this run's one
+#      copy of the kind's file changed before a later step read it (the
+#      bytes judged are not the bytes in hand; after the publish, 7)
 #  78  configuration: no BOSS_JOBS_URL, no `boss`, a `boss` older than
 #      the bundle loader (or of unknown provenance), no python3/tomllib,
-#      no comparator beside this script, or holds that cannot be read
-#      (REFUSED in every mode)
+#      no comparator beside this script, holds that cannot be read, a
+#      copy of the bundle that cannot be taken, or a tenant manifest
+#      above that copy (REFUSED in every mode)
 #
 # Runs as root under the ops-runner with NO HOME; every git read drops
 # to the checkout's owner (root cannot even READ a checkout it does not
@@ -221,6 +242,10 @@ HISTORY_LIMIT="${BOSS_PUBLISH_HISTORY_LIMIT:-500}"
 # its own SoR calls as automation:ops-runner; the `boss` binary refuses
 # an unnamed write, and there is no HOME here for the actor file.
 export BOSS_ACTOR="${BOSS_ACTOR:-automation:ops-runner}"
+# The same identity, as the header the jobs API reads: the held-kind
+# door below READS the request and its packet, and an unauthenticated
+# read is handed a smaller world (total: 0) rather than an error.
+BOSS_USER="{\"id\":\"$BOSS_ACTOR\",\"role\":\"platform-admin\",\"access_tier\":\"operator\",\"territory_account_ids\":[],\"direct_report_ids\":[],\"department\":\"platform\"}"
 
 TMP=$(mktemp -d) || exit 1
 trap 'rm -rf "$TMP"' EXIT
@@ -247,6 +272,58 @@ if [ ! -f "$KIND_FILE" ]; then
     refuse 3 "the tree has no $KIND_FILE_REL (checkout $REPO), so there is nothing to publish for '$KIND'. A NEW kind is admitted by the seed (insert-if-missing) once its file lands; this verb republishes kinds the tree already authors."
 fi
 
+# --- 1'. the bytes are read ONCE ---------------------------------------------
+# Review R1 of car 214ae147 (Codex run 753b6bd7, 2026-11-05). The
+# signature check hashed the CHECKOUT's file, and the lint, the publish
+# and the read-back each read that mutable path again — so a file that
+# moved during the lint (a converge pulling the next edit) was published
+# under the old signature: signed 7708bbb7, published 4da8ebc8, and read
+# back "equal" to the new bytes. So the bytes are taken once, into this
+# run's own copy, hashed once, and EVERY reader below takes that copy:
+# the hold reader, the signature, the compare, the lint, the publish and
+# the read-back. The copy is re-hashed before each use; a copy that
+# changed is not the bytes that were judged, and the run stops.
+#
+# The hold reader reads the bundle and the holds directory, so both are
+# copied (-H follows only a link named here, -R keeps the links inside);
+# the kind's own file is then read through any link, once, by cat.
+HOLDS_REL="infra/platform/workflow-holds"
+SNAP="$(cd "$TMP" && pwd -P)/tree"
+SPEC="$SNAP/$KIND_FILE_REL"
+if ! mkdir -p "$SNAP/infra/platform" \
+    || ! cp -RH "$REPO/$BUNDLE_REL" "$SNAP/$BUNDLE_REL" 2>"$TMP/snap.err" \
+    || [ -L "$SNAP/$BUNDLE_REL" ] || [ ! -d "$SNAP/$BUNDLE_REL" ] \
+    || { { [ -e "$REPO/$HOLDS_REL" ] || [ -L "$REPO/$HOLDS_REL" ]; } \
+         && ! cp -RH "$REPO/$HOLDS_REL" "$SNAP/$HOLDS_REL" 2>>"$TMP/snap.err"; } \
+    || ! rm -f "$SPEC" || ! cat "$KIND_FILE" > "$SPEC" 2>>"$TMP/snap.err"; then
+    refuse 78 "this run could not take its one copy of $BUNDLE_REL and $HOLDS_REL out of $REPO ($(head -c 300 "$TMP/snap.err" | tr '\n' ' ')), and bytes read more than once are not the bytes that were judged — nothing compared, nothing published"
+fi
+SPEC_SHA="$(sha256sum "$SPEC" | cut -c1-64)"
+spec_unchanged() { # <before what> <exit>: refuses <exit> when the copy moved
+    local now
+    now="$(sha256sum "$SPEC" 2>/dev/null | cut -c1-64)"
+    [ "$now" = "$SPEC_SHA" ] && return 0
+    refuse "$2" "this run's copy of $KIND_FILE_REL was read once at sha256 ${SPEC_SHA:0:12} and hashes to ${now:-nothing} before $1: the bytes judged are not the bytes in hand — nothing published past this point (packet ${OPS_REQUEST_ID:-none})"
+}
+# The copy sits outside the checkout, so the CLI's tenant lookup (the
+# nearest ancestor holding one of these — boss-cli tenant.rs
+# manifest_of, held equal to this list by publish_workflow_sh.rs) walks
+# the TEMP directory's ancestry instead of the checkout's. A manifest
+# there (a shared /tmp) would publish a platform row as that tenant's,
+# and the compare leaves the loader-stamped owning_team out. Refused.
+TENANT_MANIFESTS="tenant.toml seeds/tenant.toml"
+up="$(dirname "$SPEC")"
+while :; do
+    for manifest in $TENANT_MANIFESTS; do
+        if [ -f "$up/$manifest" ]; then
+            refuse 78 "$up/$manifest sits above this run's copy of $KIND_FILE_REL, so the CLI would read the platform row as that tenant's — move it or point TMPDIR elsewhere; nothing compared, nothing published"
+        fi
+    done
+    [ "$up" = / ] && break
+    up="$(dirname "$up")"
+done
+say "spec: $KIND_FILE_REL read once into this run's copy, sha256 $SPEC_SHA — the holds, the signature, the compare, the lint, the publish and the read-back all read that copy"
+
 # --- 1a. a HELD kind is not published by any machine road -------------------
 # Backlog 083d240e; review R1 of the signer car (run 7cee49b9,
 # 2026-10-06). A row that turns on a REFUSAL goes live at a deliberate
@@ -270,17 +347,111 @@ fi
 #   - a held kind, --check: says HELD here, goes on to say what the
 #     registry holds, and where it would have answered `--check ok` it
 #     answers `--check HELD`, exit 9.
-# The one door left is the deliberate one: `boss workflow publish <kind>
-# <file>`, run by a person from a checkout. It is not bound by a hold
-# (it is also the rollback), and it does not lift one.
+# THE DELIBERATE DOOR IS A PACKET (design b1f319bc Q held-kind, David
+# 2026-11-05: "the packet IS the deliberate door; the terminal command
+# stays as the fallback when the API is dark"). In real mode a held
+# kind is published when, and only when, the ops-request this run
+# answers (OPS_REQUEST_ID, handed by the runner) names a
+# `publish-a-protocol` packet through `metadata.for_protocol_publish` —
+# the edge the dispatcher writes when that packet's `publish` step
+# becomes ready — and the packet, READ BACK HERE from the record, is a
+# signature of exactly this publish:
+#   - the packet is an open publish-a-protocol for a `workflow` row
+#     (`registry`, absent on a v1 packet, reads as workflow) whose
+#     `row_name` (or v1's `protocol_kind`) is this kind, and its
+#     `publish` step is not done (single use);
+#   - `approve` is completed `approved`, declares presence and a
+#     required role, carries no live stamp by anyone this verb file's
+#     `approvers` does not name, and the NEWEST stamp per required role
+#     is presence-assured, carries a nonce, is by a named approver and
+#     is bound to approve's shape AS IT STANDS NOW (infra/lib/
+#     step-shape.sh, the ops-runner's one copy) — so every key below is
+#     one the passkey signed;
+#   - the signed `spec_path` is this kind's file and the signed
+#     `spec_sha256` is the sha256 of the bytes about to be published;
+#   - the signed `live_version` is the live version read in step 2: a
+#     diff signed against vN is no approval to publish over vM.
+# Nothing here is a flag: the request is read, never trusted, and a
+# hand-filed request naming a signed packet can publish only the bytes
+# that packet signed, once. Any check that fails refuses 9, naming it.
+# `boss workflow publish <kind> <file>`, run by a person from a
+# checkout, is the fallback when the API is dark; a hold does not bind
+# it (it is also the rollback) and it does not lift one.
+#
+# signed_publish: sets SIGNED_WHY empty when the request's packet signs
+# this publish (and SIGNED_PACKET / _BY / _AT / _SHA / _LIVE), else to
+# why not, in words. It reads; it writes nothing.
+SIGNED_WHY=""; SIGNED_PACKET=""; SIGNED_BY=""; SIGNED_AT=""; SIGNED_SHA=""; SIGNED_LIVE=""
+UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+read_job() { # <id> <out>: 0 with the job written, else SIGNED_WHY set
+    local code
+    code=$(curl -q -sS -m 20 -o "$2" -w '%{http_code}' -H "x-boss-user: $BOSS_USER" \
+        ${PW_MT_HDR:+-H "$PW_MT_HDR"} "$BOSS_JOBS_URL/api/jobs/$1" 2>"$TMP/job-curl.err")
+    # A 200 with no body is no document (jq-1.6 passes silence; d96e38ab).
+    if [ "$code" != "200" ] || ! jq_doc_file "$2" || ! jq -e 'type == "object"' "$2" >/dev/null 2>&1; then
+        SIGNED_WHY="packet ${1:0:8} could not be read from $BOSS_JOBS_URL (HTTP ${code:-000}: $(head -c 200 "$TMP/job-curl.err" | tr '\n' ' ')), and a signature that cannot be read is not one"
+        return 1
+    fi
+    jq '(if has("data") and (.data | type) == "object" then .data else . end)' "$2" > "$2.job" && mv "$2.job" "$2"
+}
+signed_publish() {
+    local req="$TMP/request.json" pkt="$TMP/packet.json" approve verb_file approvers shape verdict
+    if ! [[ ${OPS_REQUEST_ID:-} =~ $UUID_RE ]]; then
+        SIGNED_WHY="OPS_REQUEST_ID ('${OPS_REQUEST_ID:0:40}') names no ops-request, so no packet can be followed from it"
+        return 0
+    fi
+    read_job "$OPS_REQUEST_ID" "$req" || return 0
+    SIGNED_PACKET=$(jq -r '.metadata.for_protocol_publish // empty | strings' "$req")
+    if ! [[ $SIGNED_PACKET =~ $UUID_RE ]]; then
+        SIGNED_WHY="request ${OPS_REQUEST_ID:0:8} names no publish-a-protocol packet (metadata.for_protocol_publish is '${SIGNED_PACKET:0:40}')"
+        return 0
+    fi
+    read_job "$SIGNED_PACKET" "$pkt" || return 0
+    approve=$(jq -c '((.steps // []) | map(select(.spec_slug == "approve")) | .[0]) // empty' "$pkt")
+    if [ -z "$approve" ]; then
+        SIGNED_WHY="packet ${SIGNED_PACKET:0:8} has no approve step, so nothing on it signed a publish"
+        return 0
+    fi
+    # shellcheck source=infra/lib/step-shape.sh
+    . "$SELF_DIR/../lib/step-shape.sh" || { SIGNED_WHY="infra/lib/step-shape.sh is missing, so no stamp can be checked against its shape"; return 0; }
+    shape=$(shape_hash_of "$approve") || { SIGNED_WHY="the shape of ${SIGNED_PACKET:0:8}'s approve step could not be computed"; return 0; }
+    # WHO MAY SIGN IS A NAMED LIST, NEVER A ROLE (design 03451237 q2):
+    # this verb's own file, reviewed with it, and no env knob.
+    verb_file="$SELF_DIR/../ops/verbs/publish-workflow.json"
+    approvers=$(jq -c '.approvers // empty
+        | select(type == "array" and length > 0 and all(.[]; type == "string" and . != ""))' \
+        "$verb_file" 2>/dev/null) || approvers=""
+    if [ -z "$approvers" ]; then
+        SIGNED_WHY="$verb_file names no approvers (a non-empty list of employee ids), so no passkey can sign a held publish"
+        return 0
+    fi
+    # The run's one copy, hashed once at 1' — never the checkout again.
+    SIGNED_SHA="$SPEC_SHA"
+    # The judgement is ONE jq program, shared with publish-pool.sh
+    # (backlog f399458f): what a signature is lives once.
+    verdict=$(jq -c -f "$SELF_DIR/../lib/signed-publish.jq" --arg shape "$shape" \
+        --argjson approvers "$approvers" --arg verb_file "infra/ops/verbs/publish-workflow.json" \
+        --arg registry workflow --arg name "$KIND" --arg path "$KIND_FILE_REL" \
+        --arg sha "$SIGNED_SHA" --arg step publish "$pkt" 2>"$TMP/signed.err") \
+        || { SIGNED_WHY="packet ${SIGNED_PACKET:0:8} could not be judged — jq failed over it ($(head -c 200 "$TMP/signed.err" | tr '\n' ' '))"; return 0; }
+    SIGNED_WHY=$(printf '%s' "$verdict" | jq -r '.refuse // empty')
+    if [ -n "$SIGNED_WHY" ]; then
+        SIGNED_WHY="publish-a-protocol ${SIGNED_PACKET:0:8} is not a signature of this publish: $SIGNED_WHY"
+        return 0
+    fi
+    SIGNED_BY=$(printf '%s' "$verdict" | jq -r '.by')
+    SIGNED_AT=$(printf '%s' "$verdict" | jq -r '.at')
+    SIGNED_LIVE=$(printf '%s' "$verdict" | jq -r '.live')
+}
 HOLDS_PY="$SELF_DIR/workflow-holds.py"
-HOLDS_REL="infra/platform/workflow-holds"
 HELD_SOURCE=""; HELD_WHY=""; HELD_LIFTS=""
 if [ ! -f "$HOLDS_PY" ]; then
     refuse 78 "the hold reader $HOLDS_PY is missing, so whether '$KIND' is held out of every unattended publish cannot be read, and a hold that cannot be read is not a hold that is absent — nothing compared, nothing published"
 fi
-if ! python3 "$HOLDS_PY" "$REPO" > "$TMP/holds.tsv" 2>"$TMP/holds.err"; then
-    say "the tree's holds cannot be read ($HOLDS_REL, and each row's writers and executors):"
+# Read over the run's copy (1'), so whether the kind declares a writer
+# or an executor is judged on the bytes that will be published.
+if ! python3 "$HOLDS_PY" "$SNAP" > "$TMP/holds.tsv" 2>"$TMP/holds.err"; then
+    say "the tree's holds cannot be read ($HOLDS_REL, and each row's writers, executors and bills):"
     awk -F'\t' '$1 == "problem" { print "  " $2 }' "$TMP/holds.tsv"
     sed 's/^/  /' "$TMP/holds.err"
     refuse 78 "whether '$KIND' is held out of every unattended publish cannot be read, and a hold that cannot be read is not a hold that is absent — nothing compared, nothing published, in any mode. Fix the file named above in a car."
@@ -289,27 +460,46 @@ HELD_SOURCE="$(awk -F'\t' -v k="$KIND" '$1 == "held" && $2 == k { print $3; exit
 if [ -n "$HELD_SOURCE" ]; then
     HELD_WHY="$(awk -F'\t' -v k="$KIND" '$1 == "held" && $2 == k { print $4; exit }' "$TMP/holds.tsv")"
     HELD_LIFTS="$(awk -F'\t' -v k="$KIND" '$1 == "held" && $2 == k { print $5; exit }' "$TMP/holds.tsv")"
-    HELD_SAYS="'$KIND' is HELD out of every unattended publish ($HELD_SOURCE): $HELD_WHY — lifts: $HELD_LIFTS. The deliberate door is \`boss workflow publish $KIND $KIND_FILE_REL\`, run by a person from a checkout; it is not bound by the hold and does not lift it"
-    if [ "$MODE" != "--check" ]; then
-        refuse 9 "$HELD_SAYS. This verb does not publish a held kind${MODE:+, and $MODE forces the tree over a live edit, never over a hold} — nothing compared, nothing published (packet ${OPS_REQUEST_ID:-none})."
+    HELD_SAYS="'$KIND' is HELD out of every unattended publish ($HELD_SOURCE): $HELD_WHY — lifts: $HELD_LIFTS. The deliberate door is a publish-a-protocol packet its owner signs with a passkey (design b1f319bc); when the API is dark, \`boss workflow publish $KIND $KIND_FILE_REL\`, run by a person from a checkout, which the hold does not bind and does not lift"
+    if [ "$MODE" = "--force-tree" ]; then
+        refuse 9 "$HELD_SAYS. This verb does not publish a held kind, and --force-tree forces the tree over a live edit, never over a hold — nothing compared, nothing published (packet ${OPS_REQUEST_ID:-none})."
     fi
-    say "HELD: $HELD_SAYS. --check goes on to say what the registry holds; a publish through this verb would be REFUSED (exit 9)."
+    if [ "$MODE" = "" ]; then
+        signed_publish
+        if [ -n "$SIGNED_WHY" ]; then
+            refuse 9 "$HELD_SAYS. This verb publishes a held kind only for the request of a publish-a-protocol packet its owner signed for exactly this publish, and $SIGNED_WHY — nothing compared, nothing published (packet ${OPS_REQUEST_ID:-none})."
+        fi
+        say "HELD ($HELD_SOURCE), and lifted for this one publish by publish-a-protocol $SIGNED_PACKET: signed with a passkey by $SIGNED_BY at $SIGNED_AT over $KIND_FILE_REL sha256 ${SIGNED_SHA:0:12} against live v$SIGNED_LIVE (the hold itself stands)"
+    else
+        say "HELD: $HELD_SAYS. --check goes on to say what the registry holds; a publish through this verb would be REFUSED (exit 9) unless its request names a signed publish-a-protocol packet."
+    fi
+fi
+
+# --- 1a'. the passkey travels to the SERVER, which judges it -----------------
+# Backlog a4b57aca. POST /api/workflows/{kind}/publish now refuses a
+# publish over a passkey-protected LIVE row (a presence step on it, or a
+# protected child it admits or fulfils) unless the request names the
+# publish-a-protocol packet that signed it, with the signed bytes; the
+# server reads the packet back and judges it with the Rust port of
+# infra/lib/signed-publish.jq (pinned equal to it). So the signature is
+# no longer only a hold's: whenever this run's request names a packet
+# that signs this publish, the CLI hands it on. The check above stays as
+# the early refusal of a held kind; the server's is the boundary.
+PUBLISH_SIGNED_ARGS=()
+if [ "$MODE" = "" ] && [ -z "$HELD_SOURCE" ] && [[ ${OPS_REQUEST_ID:-} =~ $UUID_RE ]]; then
+    signed_publish
+fi
+if [ "$MODE" = "" ] && [ -n "$SIGNED_PACKET" ] && [ -z "$SIGNED_WHY" ]; then
+    PUBLISH_SIGNED_ARGS=(--approval "$SIGNED_PACKET" --signed-path "$KIND_FILE_REL")
+    say "the publish carries publish-a-protocol $SIGNED_PACKET to the server, signed by $SIGNED_BY over $KIND_FILE_REL sha256 ${SIGNED_SHA:0:12}"
 fi
 
 # --- git, as the checkout's owner -------------------------------------------
-OWNER="$(stat -c %U "$REPO" 2>/dev/null)"
-OWNER_UID="$(stat -c %u "$REPO" 2>/dev/null)"
-if [ -z "$OWNER" ] || [ "$OWNER" = "UNKNOWN" ]; then
-    refuse 78 "cannot resolve the owner of $REPO (stat says '${OWNER:-}', uid ${OWNER_UID:-?}) — no passwd entry, so there is no account to read git as"
-fi
-OWNER_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"
-as_owner() { # <command string>
-    if [ "$(id -un)" = "$OWNER" ]; then
-        bash -c "$1"
-    else
-        runuser -u "$OWNER" -- env HOME="${OWNER_HOME:-/}" PATH="$PATH" bash -c "$1"
-    fi
-}
+# The one definition of that bound, infra/lib/git-owner.sh (backlog 5ff118da).
+# shellcheck source=infra/lib/git-owner.sh
+. "$SELF_DIR/../lib/git-owner.sh" || refuse 78 "$SELF_DIR/../lib/git-owner.sh is missing, so there is no way to read git as the checkout's owner"
+git_owner_of "$REPO" \
+    || refuse 78 "cannot resolve the owner of $REPO (stat says '${OWNER:-}', uid ${OWNER_UID:-?}) — no passwd entry, so there is no account to read git as"
 
 # --- 1b. the host's CLI can read what it will publish ---------------------------
 # `boss --version` prints `boss <crate> built from <sha>` (built_from.rs).
@@ -359,7 +549,7 @@ fi
 # registry surface and answered 86 rows to a bare GET on 2026-09-15.
 read_live() { # <out file>; exit 0 with the active row written, 75 otherwise
     local body="$TMP/live.raw" code
-    code=$(curl -sS -m 20 -o "$body" -w '%{http_code}' ${PW_MT_HDR:+-H "$PW_MT_HDR"} "$BOSS_JOBS_URL/api/workflows/$KIND" 2>"$TMP/curl.err")
+    code=$(curl -q -sS -m 20 -o "$body" -w '%{http_code}' ${PW_MT_HDR:+-H "$PW_MT_HDR"} "$BOSS_JOBS_URL/api/workflows/$KIND" 2>"$TMP/curl.err")
     if [ "$code" != "200" ]; then
         printf '%s: could not read %s/api/workflows/%s — HTTP %s. %s\n' "$NAME" "$BOSS_JOBS_URL" "$KIND" "${code:-000}" "$(tr '\n' ' ' <"$TMP/curl.err")" >&2
         say "cannot answer: nothing compared, nothing published (a verdict from an unread registry would be the confident wrong answer)"
@@ -391,12 +581,22 @@ case "$rc" in
     *) exit "$rc" ;;
 esac
 LIVE_VERSION=$(jq -r '.version' "$TMP/live.json")
+# A held kind's signature names the live version its diff was rendered
+# against; live having moved since is no approval to publish over it.
+if [ -n "$HELD_SOURCE" ] && [ "$MODE" = "" ] && [ "$SIGNED_LIVE" != "$LIVE_VERSION" ]; then
+    refuse 9 "$HELD_SAYS. publish-a-protocol ${SIGNED_PACKET:0:8} signed a diff against live v$SIGNED_LIVE, and live is v$LIVE_VERSION now: what was signed is not what this publish would overwrite — nothing published (packet ${OPS_REQUEST_ID:-none}). The next landed edit files a fresh packet; until then read the live row."
+fi
 
 # --- 3. tree vs live ------------------------------------------------------------
-python3 "$COMPARE_PY" "$KIND_FILE" "$TMP/live.json" "$KIND" > "$TMP/diff.txt"; cmp_rc=$?
+spec_unchanged "the compare" 75
+python3 "$COMPARE_PY" "$SPEC" "$TMP/live.json" "$KIND" > "$TMP/diff.txt"; cmp_rc=$?
 case "$cmp_rc" in
     0)
         if [ "$MODE" != "--force-tree" ]; then
+            # Reconciliation consumes the exact snapshot compared, not a
+            # later hash of a checkout that may have changed underneath it.
+            spec_unchanged "the equality witness" 75
+            say "EQUAL: $KIND v$LIVE_VERSION; spec sha256 $SPEC_SHA"
             refuse 5 "nothing to publish — the live $KIND v$LIVE_VERSION already says what $KIND_FILE_REL says (every key either side states compared equal, each step and each field's writer among them). A publish now would mint an identical version; --force-tree does that anyway."
         fi
         say "FORCED: live $KIND v$LIVE_VERSION equals the tree on every compared field; publishing an identical row because the request said --force-tree"
@@ -448,19 +648,85 @@ SHAS
 esac
 
 # --- 4. lint, and refuse a dirty registry, without writing -----------------------
-if ! "$BOSS_BIN" workflow publish "$KIND" "$KIND_FILE" --dry-run > "$TMP/lint.out" 2>&1; then
+spec_unchanged "the lint" 75
+if ! "$BOSS_BIN" workflow publish "$KIND" "$SPEC" --dry-run > "$TMP/lint.out" 2>&1; then
     say "boss workflow publish --dry-run refused the tree's row; its output, whole:"
     sed 's/^/  /' "$TMP/lint.out"
     refuse 4 "the tree's $KIND_FILE_REL does not lint clean (or the registry holds a stale draft — see above), so nothing was written"
 fi
 say "$(grep -m1 'lints clean' "$TMP/lint.out" || tail -n1 "$TMP/lint.out")"
 
+# --- 4'. a passkey-protected live row is the owner's, as a held kind is ------------
+# Backlog 5af64799. Measured 2026-11-18 01:29Z: David approved
+# publish-to-github from the Drift tab; publish-drift --for-real
+# (ops-request 489680c9) ran this verb for it, the CLI created draft v18,
+# and the server refused the unsigned publish 409 — publish-to-github's
+# approve step declares presence (rule a4b57aca), though no hold names
+# it — stranding v18. A kind the server will refuse unsigned is the
+# owner's to sign exactly as a held kind is, so it answers 9 here like
+# one: --check says `--check HELD`, which publish-drift --file-held
+# files as a publish-a-protocol packet and --for-real skips by name;
+# real mode publishes it only with a signature that request carries.
+#
+# THE SERVER JUDGES, THIS VERB ASKS (CLAUDE.md §9a). The rule —
+# presence on a step of the live row, or an admission/fulfilment edge
+# into a protected kind, closed transitively, a retired row standing in
+# for a kind with none active — lives once, in boss_jobs::publish_passkey,
+# and GET /api/workflows/{kind}/passkey answers it. Asked signed, as the
+# held-kind door reads a packet: the edges come from the dispatcher's
+# rules, which it withholds from a caller that cannot read every packet.
+# Asked only where this verb would publish, and only for a kind not held
+# (a held kind is already on the passkey road). An answer that cannot be
+# read is not "unprotected": 75, nothing written.
+PASSKEY_WHY=""
+if [ -z "$HELD_SOURCE" ]; then
+    code=$(curl -q -sS -m 20 -o "$TMP/passkey.json" -w '%{http_code}' -H "x-boss-user: $BOSS_USER" \
+        ${PW_MT_HDR:+-H "$PW_MT_HDR"} "$BOSS_JOBS_URL/api/workflows/$KIND/passkey" 2>"$TMP/passkey.err")
+    if [ "$code" != "200" ] || ! jq_doc_file "$TMP/passkey.json" \
+        || ! jq -e '(.protected | type) == "boolean"' "$TMP/passkey.json" >/dev/null 2>&1; then
+        say "cannot answer: whether live $KIND v$LIVE_VERSION is passkey-protected could not be read from $BOSS_JOBS_URL/api/workflows/$KIND/passkey (HTTP ${code:-000}: $(head -c 300 "$TMP/passkey.json" 2>/dev/null | tr '\n' ' ')$(head -c 200 "$TMP/passkey.err" | tr '\n' ' ')), and an unread judgement is not an unprotected row — nothing written (packet ${OPS_REQUEST_ID:-none})"
+        exit 75
+    fi
+    judged_v=$(jq -r '.live_version // empty' "$TMP/passkey.json")
+    if [ "$(jq -r '.protected' "$TMP/passkey.json")" = "true" ]; then
+        if [ "$judged_v" != "$LIVE_VERSION" ]; then
+            say "cannot answer: the server judged $KIND's passkey on live v${judged_v:-none} and this run read live v$LIVE_VERSION — live moved between the two reads; nothing written (packet ${OPS_REQUEST_ID:-none})"
+            exit 75
+        fi
+        PASSKEY_WHY=$(jq -r '.why // "the server names no reason"' "$TMP/passkey.json")
+        say "PASSKEY-PROTECTED (judged by the server, GET /api/workflows/$KIND/passkey): $PASSKEY_WHY"
+    fi
+fi
+if [ -n "$PASSKEY_WHY" ] && [ "$MODE" = "--force-tree" ]; then
+    refuse 9 "live $KIND v$LIVE_VERSION is passkey-protected, and --force-tree forces the tree over a live edit, never over a passkey: the server refuses this publish unsigned, so nothing was written. The owner's road is a publish-a-protocol packet signed with a passkey (publish-drift --file-held files it) (packet ${OPS_REQUEST_ID:-none})."
+fi
+if [ -n "$PASSKEY_WHY" ] && [ "$MODE" = "" ]; then
+    if [ -z "$SIGNED_PACKET" ] || [ -n "$SIGNED_WHY" ]; then
+        unsigned_why="$SIGNED_WHY"
+        [ -n "$unsigned_why" ] || unsigned_why="OPS_REQUEST_ID (${OPS_REQUEST_ID:0:40}) names no ops-request, so no packet can be followed from it"
+        refuse 9 "live $KIND v$LIVE_VERSION is passkey-protected, so the server publishes it only with a publish-a-protocol packet its owner signed for exactly this publish, and $unsigned_why — nothing written, no draft created (packet ${OPS_REQUEST_ID:-none}). publish-drift --file-held files that packet."
+    fi
+    if [ "$SIGNED_LIVE" != "$LIVE_VERSION" ]; then
+        refuse 9 "live $KIND v$LIVE_VERSION is passkey-protected, and publish-a-protocol ${SIGNED_PACKET:0:8} signed a diff against live v$SIGNED_LIVE: what was signed is not what this publish would overwrite — nothing written (packet ${OPS_REQUEST_ID:-none})."
+    fi
+fi
+
 # --- 5. --check stops here ------------------------------------------------------------
+if [ "$MODE" = "--check" ] && [ -n "$PASSKEY_WHY" ]; then
+    # The held answer's own shape, so publish-drift files it on the same
+    # line: the version phrase and the spec sha256 the owner signs.
+    spec_unchanged "the answer" 75
+    refuse 9 "--check HELD: would NOT publish $KIND_FILE_REL over live v$LIVE_VERSION at $BOSS_JOBS_URL — the tree is ahead of live and the kind is passkey-protected; nothing written; packet ${OPS_REQUEST_ID:-none}; spec sha256 $SPEC_SHA"
+fi
 if [ "$MODE" = "--check" ] && [ -n "$HELD_SOURCE" ]; then
     # Not `--check ok`: the verb file's effect pattern, and every reader
     # of this line, must not take a held kind for one this verb would
     # publish. The version phrase is the one publish-drift.sh reads.
-    refuse 9 "--check HELD: would NOT publish $KIND_FILE_REL over live v$LIVE_VERSION at $BOSS_JOBS_URL — the tree is ahead of live and the kind is held ($HELD_SOURCE); nothing written; packet ${OPS_REQUEST_ID:-none}"
+    # `spec sha256` is the hash of the copy this answer's diff and lint
+    # read: publish-drift --file-held signs THAT, never a fresh hash of a
+    # checkout that may have moved since.
+    spec_unchanged "the answer" 75
+    refuse 9 "--check HELD: would NOT publish $KIND_FILE_REL over live v$LIVE_VERSION at $BOSS_JOBS_URL — the tree is ahead of live and the kind is held ($HELD_SOURCE); nothing written; packet ${OPS_REQUEST_ID:-none}; spec sha256 $SPEC_SHA"
 fi
 if [ "$MODE" = "--check" ]; then
     say "--check ok: would publish $KIND_FILE_REL over live v$LIVE_VERSION at $BOSS_JOBS_URL (nothing written; packet ${OPS_REQUEST_ID:-none})"
@@ -468,8 +734,9 @@ if [ "$MODE" = "--check" ]; then
 fi
 
 # --- 6. the publish — the CLI's own checked sequence --------------------------------
-say "publishing $KIND_FILE_REL as $BOSS_ACTOR for packet ${OPS_REQUEST_ID:-none} (boss: $BOSS_BIN)"
-if ! "$BOSS_BIN" workflow publish "$KIND" "$KIND_FILE" > "$TMP/publish.out" 2>&1; then
+spec_unchanged "the publish" 75
+say "publishing $KIND_FILE_REL (sha256 ${SPEC_SHA:0:12}, this run's copy) as $BOSS_ACTOR for packet ${OPS_REQUEST_ID:-none} (boss: $BOSS_BIN)"
+if ! "$BOSS_BIN" workflow publish "$KIND" "$SPEC" "${PUBLISH_SIGNED_ARGS[@]}" > "$TMP/publish.out" 2>&1; then
     say "boss workflow publish failed; its output, whole:"
     sed 's/^/  /' "$TMP/publish.out"
     say "NOT CONFIRMED — the CLI did not report $KIND live; read GET $BOSS_JOBS_URL/api/workflows/$KIND/versions before retrying (a failed create can leave a draft armed — the v16 regression)"
@@ -485,7 +752,9 @@ if [ "$NEW_VERSION" -le "$LIVE_VERSION" ]; then
     say "NOT CONFIRMED — the active row is still v$NEW_VERSION after a publish over v$LIVE_VERSION; the CLI's report above is not borne out by the registry"
     exit 7
 fi
-if ! python3 "$COMPARE_PY" "$KIND_FILE" "$TMP/after.json" "$KIND" > "$TMP/after-diff.txt"; then
+# The publish already ran, so a copy that moved now is NOT CONFIRMED (7).
+spec_unchanged "the read-back" 7
+if ! python3 "$COMPARE_PY" "$SPEC" "$TMP/after.json" "$KIND" > "$TMP/after-diff.txt"; then
     say "NOT CONFIRMED — v$NEW_VERSION is live but does not equal $KIND_FILE_REL:"
     sed 's/^DIFF\t/  /; s/\t/  /g' "$TMP/after-diff.txt"
     exit 7

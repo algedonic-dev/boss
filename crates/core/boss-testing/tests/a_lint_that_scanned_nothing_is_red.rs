@@ -113,6 +113,10 @@ const NOT_SCANNERS: &[(&str, &str)] = &[
         "self-test of the converge's rollback against a planted bricked head",
     ),
     (
+        "the-converge-watches-postgres",
+        "self-test of PostgreSQL rollout and recovery against planted converge and API fixtures",
+    ),
+    (
         "the-executor-never-waits-on-its-visibility",
         "self-test of the chore wrapper against an unreachable API",
     ),
@@ -539,6 +543,9 @@ fn a_live_reading_lint_that_cannot_reach_its_registry_exits_3_and_scans_nothing(
             // read the estate at all; this case is about a run that
             // declares nothing.
             .env_remove("BOSS_ESTATE")
+            // Nor its BOSS_TRUNK=none (backlog 2d28df78), under which the
+            // edit-level lint judges no path and reads nothing.
+            .env_remove("BOSS_TRUNK")
             .output()
             .unwrap_or_else(|e| panic!("run {rel}: {e}"));
         let code = out.status.code().unwrap_or(-1);

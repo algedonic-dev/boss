@@ -1,8 +1,10 @@
 # automation:dispatcher — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 14,684 (plus 235,788 by 74 rule ids under automation:rule:) audit-log facts.
-# Signs as platform-admin today: crates/core/boss-dispatcher/src/dispatcher.rs (default header) and src/rules/actor.rs (each rule as rule:<name>).
+# Signs as platform-admin today: crates/orchestrators/boss-dispatcher-handlers/src/handlers/common.rs (default header) and crates/core/boss-dispatcher/src/rules/actor.rs (each rule as rule:<name>). The matchmaker that also signed here was retired by backlog e1eaf72b.
 
 [[automation]]
 id = "automation:dispatcher"
 role = "platform-admin"
 description = 'The dispatcher: runs the dispatcher_rules registry. Every write a rule fires is signed as automation:rule:<name> (rule:<name> on the wire), so that family, tenant-declared rules included, signs as this row.'
 signs_for = "automation:rule:"
+# Host station: algedonic (backlog 6ecb5480, station-tree.md section 6).
+station = "00b04483-90c6-46b9-b911-8e19d2a0b410"

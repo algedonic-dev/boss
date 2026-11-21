@@ -52,12 +52,12 @@ const STORAGE: &str = "postgres";
 const STORAGE: &str = "in-memory";
 
 /// Standard health probe — see boss-classes/src/http.rs for context.
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "status": "ok",
-        "service": "boss-subject-kinds-api",
-        "storage": STORAGE,
-    }))
+async fn health() -> Json<boss_core::startup::HealthResponse> {
+    Json(boss_core::startup::health_response(
+        "boss-subject-kinds-api",
+        env!("CARGO_PKG_VERSION"),
+        STORAGE,
+    ))
 }
 
 async fn list_active(State(state): State<SubjectKindsApiState>) -> Response {

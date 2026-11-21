@@ -257,7 +257,23 @@ pub struct HttpCoverageRead {
 
 impl HttpCoverageRead {
     pub fn new(policy_base: impl Into<String>, jobs_base: impl Into<String>) -> Self {
-        let (policy_base, http) = boss_core::http_client::base(policy_base);
+        Self::with_timeout(
+            policy_base,
+            jobs_base,
+            boss_core::http_client::CLIENT_TIMEOUT,
+        )
+    }
+
+    /// [`Self::new`] with a per-call timeout the caller owns, so a test
+    /// reading an in-process stub over loopback waits on its own clock
+    /// rather than the drive's 5 s (backlog 2a30b1c3: train b7bdf190's
+    /// gate read that expiry as a snapshot that was not there).
+    pub fn with_timeout(
+        policy_base: impl Into<String>,
+        jobs_base: impl Into<String>,
+        timeout: std::time::Duration,
+    ) -> Self {
+        let (policy_base, http) = boss_core::http_client::base_with_timeout(policy_base, timeout);
         Self {
             policy_base,
             jobs_base: jobs_base.into().trim_end_matches('/').to_owned(),
@@ -278,7 +294,12 @@ impl HttpCoverageRead {
             .header("x-boss-user", &self.user)
             .send()
             .await
-            .map_err(|_| PeopleError::Unavailable(format!("{source} is unreachable")))?;
+            .map_err(|e| {
+                PeopleError::Unavailable(format!(
+                    "{source} is unreachable: {}",
+                    with_causes(&e.without_url())
+                ))
+            })?;
         if !response.status().is_success() {
             return Err(PeopleError::Unavailable(format!(
                 "{source} answered {}",
@@ -320,6 +341,18 @@ impl HttpCoverageRead {
         }
         Ok(rows)
     }
+}
+
+/// An error and every cause beneath it, `: `-joined. reqwest's own text
+/// stops at "error sending request", so a read that timed out said only
+/// that it failed, and train b7bdf190's red could not say which (backlog
+/// 2a30b1c3). The URL is dropped before this: the refusal reaches the
+/// caller's 503 body, and the source name already says which read.
+fn with_causes(error: &dyn std::error::Error) -> String {
+    std::iter::successors(Some(error), |e| e.source())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 #[async_trait]
@@ -407,6 +440,14 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// The wait every stub read below holds: the test's own, not the
+    /// production 5 s a loaded gate drive outlived (backlog 2a30b1c3).
+    const TEST_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+    fn reader(base: &str) -> HttpCoverageRead {
+        HttpCoverageRead::with_timeout(base, base, TEST_WAIT)
+    }
+
     /// The policy and jobs services in one stub: the coverage snapshot
     /// over `roster`, the workflow registry, and the single-employee
     /// override read — counting every request it answers.
@@ -483,7 +524,7 @@ mod tests {
             json!({"error":"unavailable"}),
         ] {
             let (base, task) = server(workflows, json!([]), axum::http::StatusCode::OK).await;
-            let source = HttpCoverageRead::new(&base, &base);
+            let source = reader(&base);
             assert!(matches!(
                 source.standing(&["emp-founder".into()]).await,
                 Err(PeopleError::Unavailable(_))
@@ -497,9 +538,7 @@ mod tests {
         )
         .await;
         assert!(matches!(
-            HttpCoverageRead::new(&base, &base)
-                .standing(&["emp-founder".into()])
-                .await,
+            reader(&base).standing(&["emp-founder".into()]).await,
             Err(PeopleError::Unavailable(_))
         ));
         task.abort();
@@ -509,7 +548,7 @@ mod tests {
     async fn the_native_reader_keeps_dynamic_presence_controls_and_valid_empty_override_reads() {
         let workflows = json!([{"kind":"review-work","status":"active","steps":[{"title":"Approve","assurance_required":"presence","audience":{"individual":"emp-founder"}}]}]);
         let (base, task) = server(workflows, json!([]), axum::http::StatusCode::OK).await;
-        let standing = HttpCoverageRead::new(&base, &base)
+        let standing = reader(&base)
             .standing(&["emp-founder".into()])
             .await
             .unwrap();
@@ -532,9 +571,7 @@ mod tests {
             axum::http::StatusCode::OK,
         )
         .await;
-        let result = HttpCoverageRead::new(&base, &base)
-            .standing(&["emp-newcomer".into()])
-            .await;
+        let result = reader(&base).standing(&["emp-newcomer".into()]).await;
         match result {
             Err(PeopleError::Unavailable(message)) => {
                 assert!(message.contains("another employee"), "{message}")
@@ -559,7 +596,7 @@ mod tests {
             axum::http::StatusCode::OK,
         )
         .await;
-        let source = HttpCoverageRead::new(&base, &base);
+        let source = reader(&base);
         source.standing(&roster).await.unwrap();
         let started = std::time::Instant::now();
         let rounds = 20;
@@ -597,10 +634,7 @@ mod tests {
             axum::http::StatusCode::OK,
         )
         .await;
-        match HttpCoverageRead::new(&base, &base)
-            .standing(&["emp-founder".into()])
-            .await
-        {
+        match reader(&base).standing(&["emp-founder".into()]).await {
             Err(PeopleError::Unavailable(message)) => {
                 assert!(message.contains("not on its roster"), "{message}")
             }
@@ -638,13 +672,65 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             });
             assert!(matches!(
-                HttpCoverageRead::new(&base, &base)
-                    .standing(&["emp-founder".into()])
-                    .await,
+                reader(&base).standing(&["emp-founder".into()]).await,
                 Err(PeopleError::Unavailable(_))
             ));
             task.abort();
         }
+    }
+
+    /// Backlog 2a30b1c3: train b7bdf190's gate red on "policy coverage
+    /// snapshot is unreachable" from two stubs on loopback — the cause
+    /// discarded, the wait the production 5 s. A snapshot that answers
+    /// only after that wait must say the read timed out under the
+    /// production clock, and answer under the clock its caller gives it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_waits_its_callers_timeout_and_names_the_expiry() {
+        let slow = boss_core::http_client::CLIENT_TIMEOUT + std::time::Duration::from_millis(500);
+        let snapshot = json!({"rules":[],"overrides":[],"roster":[{"id":"emp-founder","role":"service-tech","active":true}],"keys":[]});
+        let app = Router::new()
+            .route(
+                coverage::SNAPSHOT_PATH,
+                get(move || {
+                    let value = snapshot.clone();
+                    async move {
+                        tokio::time::sleep(slow).await;
+                        Json(value)
+                    }
+                }),
+            )
+            .route(
+                "/api/workflows",
+                get(|| async { Json(json!([{"kind":"real-work","steps":[]}])) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        match HttpCoverageRead::new(&base, &base)
+            .standing(&["emp-founder".into()])
+            .await
+        {
+            Err(PeopleError::Unavailable(message)) => assert!(
+                message.starts_with("policy coverage snapshot is unreachable")
+                    && message.contains("timed out")
+                    && !message.contains(&base),
+                "a {slow:?} snapshot past the production wait must say it timed out, \
+                 naming no URL; got {message}"
+            ),
+            Err(other) => panic!("a {slow:?} snapshot must refuse as unavailable; got {other:?}"),
+            Ok(_) => panic!("a {slow:?} snapshot past the production wait must refuse"),
+        }
+
+        match reader(&base).standing(&["emp-founder".into()]).await {
+            Ok(standing) => assert!(standing.employee_ids.contains("emp-founder")),
+            Err(e) => panic!(
+                "the same {slow:?} snapshot inside the caller's {TEST_WAIT:?} wait answers; got {e:?}"
+            ),
+        }
+        task.abort();
     }
 
     // -----------------------------------------------------------------

@@ -75,8 +75,10 @@ was closed red by David and the region alarmed on it for 22 hours,
 because only the daily drift verb asked GitHub. It adds no routing: it
 files the same ops-request the step-ready rule files, and what happens
 next is the publish protocol's own row (read-checks -> judge-checks ->
-pr-opened). No authority widened: the verb holds no credential and
-writes only publish packets' own readings, steps and `pr_state`.
+pr-opened). No authority widened: the verb's one credential is a
+read-only actions:read token on the mirror, for a failing check's job
+log (backlog b7a74610), and it writes only publish packets' own
+readings, steps and `pr_state`.
 """
 schedule = { cadence = "every-15-minutes", anchor_date = "2026-09-26" }
 [[rule.do]]

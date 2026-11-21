@@ -403,3 +403,65 @@ async fn host_selects_one_hosts_series_before_the_limit() {
         assert_eq!(none.total, 0, "{kind}: an unknown host matches nothing");
     }
 }
+
+/// The SQL half of `latest_per=host` on OBSERVATIONS (backlog
+/// 4579f9b5), pinned against the in-memory reader's numbers in
+/// `estate_readers_http.rs`: an observation carries no `host` stamp, so
+/// grouping by the bare key put every one of them in the ONE NULL group
+/// and the live door answered total 1 for a two-host estate. The group
+/// is the row's host as the `host` filter reads it — the stamp, else
+/// the first node's id — so two hosts' observations are two groups,
+/// each its newest, and `total` counts them.
+#[tokio::test(flavor = "multi_thread")]
+async fn latest_per_host_groups_an_observation_by_its_first_node() {
+    let db = TestDb::new().await;
+    let repo = PgJobs::new(db.pool.clone());
+
+    let t0: chrono::DateTime<chrono::Utc> = "2026-09-25T00:00:00Z".parse().unwrap();
+    let obs = |host: &str, i: i64, at: chrono::DateTime<chrono::Utc>| {
+        Event::new(
+            "jobs",
+            "jobs.estate.observed",
+            serde_json::json!({"scope": "host", "marker": format!("{host}-{i}"),
+                               "nodes": [{"id": host}]}),
+            at,
+        )
+    };
+    let mut events: Vec<Event> = (0..8)
+        .map(|i| obs("forge", i, t0 + chrono::Duration::minutes(15 * (i + 1))))
+        .collect();
+    events.push(obs(
+        "boss-gcp",
+        0,
+        t0 + chrono::Duration::minutes(10 * 60 + 25),
+    ));
+    repo.record_events(&events).await.expect("events record");
+    drain_outbox(&db.pool).await;
+
+    let markers = |rows: &[serde_json::Value]| -> Vec<String> {
+        rows.iter()
+            .map(|r| r["payload"]["marker"].as_str().unwrap_or("?").to_string())
+            .collect()
+    };
+    let per_host = EventWindow {
+        latest_per: Some("host".to_string()),
+        ..in_scope("host")
+    };
+
+    let latest = repo
+        .recent_events_by_kind("jobs.estate.observed", &per_host, 10)
+        .await
+        .expect("read back");
+    assert_eq!(markers(&latest.rows), vec!["boss-gcp-0", "forge-7"]);
+    assert_eq!(latest.total, 2, "total counts hosts, not one NULL group");
+
+    let one = repo
+        .recent_events_by_kind("jobs.estate.observed", &per_host, 1)
+        .await
+        .expect("read back");
+    assert_eq!(markers(&one.rows), vec!["boss-gcp-0"]);
+    assert_eq!(
+        one.total, 2,
+        "a limit below the host count shows as rows < total"
+    );
+}

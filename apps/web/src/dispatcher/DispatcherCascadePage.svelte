@@ -13,6 +13,8 @@
   each node a CascadeNode sized to the box dagre laid out.
 -->
 <script lang="ts">
+  import { safeLinkHref } from '@boss/web-kit/links';
+  import { pageLink } from '../shell/stationAddresses.svelte';
   import { onMount } from 'svelte';
   import { SvelteFlow, Background, Controls, MiniMap, MarkerType } from '@xyflow/svelte';
   import type { Node, Edge } from '@xyflow/svelte';
@@ -185,18 +187,18 @@
     <div class="dx-head-right">
       {#if data && !error}
         <div class="dx-stats">
-          <span>{counts.rules} rules</span>
-          <span>{counts.handlers} handlers</span>
+          <span>{counts.rules} {counts.rules === 1 ? 'rule' : 'rules'}</span>
+          <span>{counts.handlers} {counts.handlers === 1 ? 'handler' : 'handlers'}</span>
           <span class="dx-stat-cycle">{counts.cycleNodes} in cycles</span>
         </div>
       {/if}
       <a
         class="dx-edit-link"
-        href={href('/it/registry/rules')}
+        href={safeLinkHref(pageLink('system-dispatcher-rules'))}
         onclick={(e) => {
           if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
           e.preventDefault();
-          navigate(href('/it/registry/rules'));
+          navigate(pageLink('system-dispatcher-rules'));
         }}
       >
         Edit rules →
@@ -344,7 +346,7 @@
             <dt>version</dt>
             <dd>{detail.rule.version}</dd>
           </dl>
-          <Link to={href(`/it/registry/rules/${encodeURIComponent(detail.rule.name)}`)}>Open rule →</Link>
+          <Link to={pageLink('system-dispatcher-rule', { ruleName: detail.rule.name })}>Open rule →</Link>
         {:else if detail.kind === 'handler'}
           <h2>handler · {detail.handler}</h2>
           <dt>emits</dt>
@@ -466,7 +468,7 @@
     border-radius: 999px;
     padding: 2px 4px 2px 10px;
     color: var(--signal);
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: var(--font-mono);
     font-size: 0.72rem;
   }
   .dx-chip-x {

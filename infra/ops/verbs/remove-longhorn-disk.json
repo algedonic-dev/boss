@@ -1,0 +1,33 @@
+{
+  "about": "MUTATING — take ONE disk add-longhorn-disk placed back out of a node's Longhorn disks (infra/forge/remove-longhorn-disk.sh <node> <volume> <plan_sha256>) through the forge's ops_kubectl door (the admin kubeconfig David placed, infra/estate/ops-credentials.sh). Filed as backlog b791c5b4 on 2026-10-19 by run cfaad67f, building add-longhorn-disk (item 493a02b6): that door adds u-<volume> at /var/mnt/<volume> to nodes.longhorn.io spec.disks, and no door took one out — a disk Longhorn never read Ready after the add stayed in spec.disks for good. AUTHORISED PER RUN BY DAVID'S PASSKEY in design 17835005's shape, as add-longhorn-disk is: it declares requires_approval with the read-only plan-a-longhorn-disk-removal (this script's --plan) as its plan_verb, so the runner renders the plan onto the request's approve step, runs this only after a passkey on the approvers list signs those bytes, and hands the script sha256 of the SIGNED plan; the script re-renders and patches nothing unless today's plan hashes to it. The node's disks before are in the bytes, so a second run of an applied plan is refused (the disk is gone): at most once. THE BOUND IS THE SCRIPT'S, NEVER A PARAM: a registry node whose role is talos-worker, with the cluster agreeing on its address and carrying no control-plane label (refused before any door opens); a Longhorn node reading Ready=True; a disk named u-<volume> at exactly /var/mnt/<volume>, the add door's shape — the packet names a volume, never a disk or a path, so a default disk cannot be reached; and a disk that holds NOTHING by four readings (no replica on its diskUUID or on its node and path, no scheduledReplica or scheduledBackingImage in Longhorn's diskStatus, storageScheduled 0, no backing image file on its UUID) — or nothing is done (exit 78). Eviction is not done here: a disk holding a replica is refused, and the replica is moved first with move-volume-replica or retire-volume-replica. THE WRITE is two kubectl patch --type=json compare-and-sets: (1) TEST spec.disks is exactly the map the plan read and REPLACE spec.disks/u-<volume>/allowScheduling with false (skipped when already false), so Longhorn places nothing new there; then, after a 15 s settle, the holdings are read AGAIN, and anything now on the disk stops the run (exit 1) with the disk left unschedulable and nothing removed, as the signed plan says; (2) TEST spec.disks is the plan's map with that disk unschedulable and REMOVE spec.disks/u-<volume>. Nothing else is written: the Talos user volume stays mounted with its files, and every other disk is untouched. THE EFFECT IS READ BACK: every 10 s for up to 180 s, the Longhorn node; only when spec.disks holds no u-<volume>, every other disk's spec reads as the plan did, and Longhorn's status.diskStatus no longer reports u-<volume> is the effect line printed, and otherwise the run exits 1 saying the removal is NOT proven with what it read. Timeout 720: the plan's reads again (up to ~300 s with a first image pull), two patches (20 s each), the settle (15 s) and the script's own 180 s read-back, which gives its verdict before the runner's kill.",
+  "hosts": [
+    "forge"
+  ],
+  "requires_approval": true,
+  "plan_verb": "plan-a-longhorn-disk-removal",
+  "approvers": [
+    "emp-david"
+  ],
+  "argv": [
+    "infra/forge/remove-longhorn-disk.sh",
+    "{1}",
+    "{2}",
+    "{3}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    {
+      "name": "volume",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$"
+    },
+    {
+      "name": "plan_sha256",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  ],
+  "timeout": 720,
+  "effect": "^remove-longhorn-disk: [a-z0-9-]+ no longer has Longhorn disk u-[a-z0-9-]+ at /var/mnt/[a-z0-9-]+ — read back: gone from spec\\.disks and from Longhorn's diskStatus, and its [0-9]+ other disk\\(s\\) unchanged \\(after [0-9]+s\\)$"
+}

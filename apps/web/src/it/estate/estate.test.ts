@@ -86,6 +86,30 @@ function obsEvent(scope: string, observed_at: string, nodes: unknown[] = [{ id: 
 }
 
 describe('parseNodes', () => {
+  test('every declared disk survives, including equal models and an unmeasured size', () => {
+    const disks = [
+      { model: 'Fixture NVMe', size_bytes: 1000204886016 },
+      { model: 'Fixture NVMe', size_bytes: 250059350016 },
+      { model: 'Older disk with no byte reading' },
+    ];
+    expect(parseNodes([node({ disks })])[0]).toMatchObject({ disks: [
+      { model: 'Fixture NVMe', size_bytes: 1000204886016 },
+      { model: 'Fixture NVMe', size_bytes: 250059350016 },
+      { model: 'Older disk with no byte reading', size_bytes: null },
+    ] });
+    expect(parseNodes([node()])[0]).toMatchObject({ disks: [] });
+    expect(parseNodes([node({ disks: [] })])[0]).toMatchObject({ disks: [] });
+  });
+
+  test('a disk size is not guessed from a rounded, invalid or absent reading', () => {
+    for (const size_bytes of [null, '931.5G', 0, -1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(parseNodes([node({ disks: [{ model: 'Known model', size_bytes }] })])[0])
+        .toMatchObject({ disks: [{ model: 'Known model', size_bytes: null }] });
+    }
+    expect(() => parseNodes([node({ disks: [{ size_bytes: 1000 }] })])).toThrow();
+    expect(() => parseNodes([node({ disks: 'unread' })])).toThrow();
+  });
+
   test('the synthetic node uses a reserved address and the parser preserves it', () => {
     const raw = node();
     expect(raw.address).toBe(testNet1(14));
@@ -374,6 +398,20 @@ describe('observations and comparisons', () => {
     expect(v.ok).toBe(false);
     expect(v.text).toContain('1 short of disk');
     expect(v.text).toContain('1 with no free-space reading');
+  });
+
+  test('an unread standalone declaration cannot render no drift or no free-space reading', () => {
+    const rows = parseComparisons([{ payload: {
+      scope: 'instance-volumes', observed_at: '', counts: {
+        observed: 1, participating_declared: 0, observed_not_declared: 0,
+        declared_not_observed: 0, drift: 0, disk_tight: 0, disk_unmeasured: 0,
+        pvc_declaration_unmeasured: 1,
+      },
+    } }]);
+    const verdict = comparisonVerdict(rows[0] as Comparison);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.text).toContain('1 standalone declaration unmeasured');
+    expect(verdict.text).not.toContain('free-space');
   });
 
   test('a comparison recorded before the disk counts existed still reads clean', () => {
@@ -875,7 +913,11 @@ describe('the loops the page reads are in the registry', () => {
     const declared = new Set(
       kinds.flatMap((k) => [...workflow(k).matchAll(/terminal = \{ outcome = "([^"]+)" \}/g)].map((m) => m[1]!)),
     );
-    expect([...declared].sort()).toEqual(['answered', 'completed', 'failed', 'nothing-to-do', 'refused']);
+    // `indeterminate` (design b7bb1625, backlog 50a1578f): an ops-request
+    // whose verb ran with no exit recorded. It is trouble, never ok. The
+    // row's `failed` is the same word the loops already declared, and its
+    // `not-yet` closes on `answered`, so neither adds a word here.
+    expect([...declared].sort()).toEqual(['answered', 'completed', 'failed', 'indeterminate', 'nothing-to-do', 'refused']);
     expect([...LOOP_OK_OUTCOMES].sort()).toEqual(['answered', 'completed', 'nothing-to-do']);
   });
 });
@@ -1373,6 +1415,9 @@ describe('registryFailure', () => {
       expect(said).toStartWith('The registry refused this session: /api/estate/nodes: HTTP ');
       expect(said).not.toContain('did not answer');
     }
+    // With the server's reason kept after the status (7abb184f).
+    expect(registryFailure('/api/estate/nodes: HTTP 403: policy: read estate denied'))
+      .toStartWith('The registry refused this session: /api/estate/nodes: HTTP 403: policy: read estate denied.');
   });
   test('anything else is the unreachable registry it always was', () => {
     expect(registryFailure('/api/estate/nodes: HTTP 503')).toBe(

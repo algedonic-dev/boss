@@ -64,7 +64,7 @@ test('consumed quantity keeps the shared field look and its numeric alignment', 
 
 test('the selected step inspector shares the field look for text, select and textarea', async ({ page }) => {
   await installAuthoringMocks(page);
-  await mountPage(page, `/it/registry/authoring/${JOB_ID}`, { titleMatch: /Authoring/i });
+  await mountPage(page, `/engineering/registry/authoring/${JOB_ID}`, { titleMatch: /Authoring/i });
   await expect(page.locator('.jk-node')).toHaveCount(2);
   await page.locator('.jk-node').first().click();
   const inspector = page.locator('.jk-inspector');
@@ -77,7 +77,7 @@ test('the selected step inspector shares the field look for text, select and tex
 
 test('the inspector terminal checkbox retains its geometry and interaction', async ({ page }) => {
   await installAuthoringMocks(page);
-  await mountPage(page, `/it/registry/authoring/${JOB_ID}`, { titleMatch: /Authoring/i });
+  await mountPage(page, `/engineering/registry/authoring/${JOB_ID}`, { titleMatch: /Authoring/i });
   await expect(page.locator('.jk-node')).toHaveCount(2);
   await page.locator('.jk-node').first().click();
   const checkbox = page.locator('.jk-inspector .jk-check input[type="checkbox"]');

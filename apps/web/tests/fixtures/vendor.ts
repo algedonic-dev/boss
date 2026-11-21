@@ -7,4 +7,4 @@ export const CRAWL_VENDOR: Readonly<Vendor> = {
   contact_email: null, city: null, state: null, lead_time_days: 7,
   payment_terms: null, category: null, behavior: null,
 };
-export const VENDOR_CRAWL_PATH = `/ux/vendors/${CRAWL_VENDOR.id}`;
+export const VENDOR_CRAWL_PATH = `/finance/vendors/${CRAWL_VENDOR.id}`;

@@ -1279,8 +1279,15 @@ mod tests {
             let url = format!("http://{first_at}/api/x");
             let status = if follows {
                 // The control: a plain blocking client carrying the
-                // header follows, and the other host sees the token.
-                reqwest::blocking::Client::new()
+                // header follows, and the other host sees the token. It
+                // opts out of the environment's proxy as the stamped
+                // client does, so a proxy exported in the shell that runs
+                // the suite cannot fail the control instead of the claim
+                // (backlog bf5f21b2).
+                reqwest::blocking::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap()
                     .get(url)
                     .header(HEADER, "estate-token-value")
                     .send()
@@ -1325,9 +1332,13 @@ mod tests {
         //
         // The control first: a plain reqwest client carrying the header
         // DOES follow, and the other host DOES see the token — so the
-        // fixture below can see a leak when there is one.
+        // fixture below can see a leak when there is one. It follows no
+        // proxy, like the stamped client (backlog bf5f21b2).
         let (status, reached) = redirected(|url| {
-            reqwest::Client::new()
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
                 .get(url)
                 .header(HEADER, "estate-token-value")
         })

@@ -327,6 +327,10 @@ export type InboundRow = Readonly<{
   /** Where it came from and its area, as the server read them ([`originOf`]). */
   source: SourceRead;
   area: string | null;
+  /** The steps an actor has CLAIMED and not finished, each with its
+   *  claimant (`assignee_id`, which the claim CAS records): the holder
+   *  reads them beside the ready ones (backlog 37f77b79). */
+  active: ReadonlyArray<ReadyStep>;
   ready: ReadonlyArray<ReadyStep>;
   /** An actor has picked it up: a step other than its trigger has
    *  completed ([`takenIn`]). From then on it is marshalling's, not
@@ -350,6 +354,17 @@ export function takenIn(steps: ReadonlyArray<Readonly<Record<string, unknown>>>)
 }
 
 export type JobsPage = Readonly<{ rows: ReadonlyArray<InboundRow>; total: number }>;
+
+/** One open step as the board reads it — a ready one or a claimed one. */
+function readStep(s: Readonly<Record<string, unknown>>): ReadyStep {
+  return {
+    kind: str(s.kind) ?? '',
+    who: str(s.assignee_id),
+    // The server's reading of the note (`failed_verbs=true`),
+    // off a SLIM step — backlog ea80b5fd.
+    failed: failedVerb(s.failed_verb),
+  };
+}
 
 export function parseJobsPage(raw: unknown): JobsPage {
   const env = raw as { data?: unknown; total?: unknown } | null;
@@ -377,14 +392,11 @@ export function parseJobsPage(raw: unknown): JobsPage {
         laneBasis: ln.basis,
         source: origin.source,
         area: origin.area,
+        active: steps.filter((s) => s.status === 'active').map(readStep),
         ready: steps
           .filter((s) => s.status === 'ready')
           .map((s) => ({
-            kind: str(s.kind) ?? '',
-            who: str(s.assignee_id),
-            // The server's reading of the note (`failed_verbs=true`),
-            // off a SLIM step — backlog ea80b5fd.
-            failed: failedVerb(s.failed_verb),
+            ...readStep(s),
           })),
         takenIn: takenIn(steps),
       },
@@ -399,15 +411,28 @@ export function parseJobsPage(raw: unknown): JobsPage {
 
 export type Holder = Readonly<{ who: 'agent' | 'human' | 'nobody'; label: string }>;
 
-/** Who the packet waits on. A person on any ready step outranks the
- *  agent: the packet is standing for THEIR answer. */
+/** Who the packet waits on, read off its ready AND its active steps:
+ *  the claimant of an active step holds the packet (backlog 37f77b79,
+ *  decided 2026-09-24) — reading ready steps alone drew a claimed
+ *  packet on nobody and sent the reader to pick up work an actor was
+ *  already doing. A person on any of them outranks the agent: the
+ *  packet is standing for THEIR answer. */
 export function holderOf(row: InboundRow): Holder {
-  if (row.ready.length === 0) return { who: 'nobody', label: 'no ready step' };
-  const human = row.ready.find((s) => s.who !== null && isHumanActor(s.who));
+  const open = [...row.active, ...row.ready];
+  if (open.length === 0) return { who: 'nobody', label: 'no ready or active step' };
+  const human = open.find((s) => s.who !== null && isHumanActor(s.who));
   if (human?.who) return { who: 'human', label: human.who };
-  const agent = row.ready.find((s) => s.who !== null);
+  const agent = open.find((s) => s.who !== null);
   if (agent) return { who: 'agent', label: 'the agent' };
   return { who: 'nobody', label: 'unassigned' };
+}
+
+/** The manifest's step column: the claimed steps, each marked active,
+ *  then the ready ones — so a packet drawn on its claimant also names
+ *  the step it is held at (backlog 37f77b79). */
+export function manifestSteps(row: InboundRow): string {
+  const shown = [...row.active.map((s) => `${s.kind} (active)`), ...row.ready.map((s) => s.kind)];
+  return shown.join(', ') || '—';
 }
 
 /** The first ready step whose verb FAILED, or null for a packet with
@@ -584,4 +609,30 @@ export async function loadEveryPage(
       : read(next, rows);
   };
   return read(0, []);
+}
+
+/** A kind whose read, taken to its total, kept fewer rows than that
+ *  total: the listing moved under the read (backlog 3e96fe11). */
+export type ShortRead = Readonly<{ kind: string; rows: number; total: number }>;
+
+/** The kinds whose read came up short, each with the rows it kept and
+ *  the total the server said. `pages[i]` is `kinds[i]`'s read. Since
+ *  every kind is read to its total, a short read can only mean a page
+ *  shifted during it — never a page limit. */
+export function shortReads(
+  kinds: ReadonlyArray<string>,
+  pages: ReadonlyArray<JobsPage>,
+): ReadonlyArray<ShortRead> {
+  return kinds.flatMap((kind, i) => {
+    const p = pages[i];
+    return p && p.total > p.rows.length ? [{ kind, rows: p.rows.length, total: p.total }] : [];
+  });
+}
+
+/** The notice's words for one short kind (decided 2026-09-24 on
+ *  backlog 3e96fe11). It used to say "only 500 were read … the counts
+ *  below are floors", false whenever it appeared: a notice whose words
+ *  are wrong is worse than none. */
+export function shortReadSentence(s: ShortRead): string {
+  return `${s.rows} of ${s.total} read — the listing moved during the read`;
 }

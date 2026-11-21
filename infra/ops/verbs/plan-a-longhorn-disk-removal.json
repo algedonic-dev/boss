@@ -1,0 +1,23 @@
+{
+  "about": "READ-ONLY: renders what `remove-longhorn-disk` WOULD do to take ONE disk add-longhorn-disk placed back out of a node's Longhorn disks, and does nothing (infra/forge/remove-longhorn-disk.sh --plan <node> <volume>; backlog b791c5b4, found 2026-10-19 by run cfaad67f while building the add door: nothing removed a disk it placed, not even one Longhorn never read Ready). It runs every bound the write runs — the node is one the estate registry declares, not retired, as a talos-worker with one IPv4 address, and the cluster agrees on its address and carries no control-plane label; the node's Longhorn node reads Ready=True and holds a disk named u-<volume> at exactly /var/mnt/<volume>, the shape the add door places (so a default disk, or any disk made another way, cannot be named); and the disk holds NOTHING by four readings — no replicas.longhorn.io whose diskID is the disk's diskUUID or whose node and diskPath are the disk's, no scheduledReplica or scheduledBackingImage in Longhorn's diskStatus for it, storageScheduled 0, and no backingimages.longhorn.io keeping a file on its UUID — and then prints the plan: the node, its address, role and Node uid, the Longhorn node's disks now (spec only), the disk to remove with its diskUUID, what it holds (nothing), the two compare-and-set patches (allowScheduling false, a second read of the holdings, then the removal) and the read-back. No clock and no live free space in the bytes (storageAvailable rides stderr); its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1). Every read goes through the forge's ops_kubectl door; a read that could not look is CANNOT ANSWER (exit 1), never a plan. Any refusal renders no plan (exit 78). Timeout 300: the registry read (15 s), a bounded first pull of the door's image (120 s), and the Node, Longhorn node, replica and backing-image reads (20-30 s each).",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/remove-longhorn-disk.sh",
+    "--plan",
+    "{1}",
+    "{2}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    {
+      "name": "volume",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$"
+    }
+  ],
+  "timeout": 300
+}

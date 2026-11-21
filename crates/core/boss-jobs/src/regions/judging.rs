@@ -92,6 +92,10 @@ impl Windows {
     pub(crate) fn previous(&self, t: Instant) -> bool {
         t >= self.before && t < self.since
     }
+    /// Where this window ends — the instant a count over it was taken.
+    pub(crate) fn now(&self) -> Instant {
+        self.now
+    }
     /// A count as a per-day rate over one window.
     #[allow(clippy::cast_precision_loss)]
     pub(crate) fn per_day(&self, n: usize) -> f64 {

@@ -91,8 +91,11 @@ why = """
 A TIMER, the standing exemption: "an hour passed" is no packet's event,
 so no Workflow consequence can fire it. It adds no routing: it files the
 same ops-request the arrival rule files, for cars whose probe already
-ran and failed, so the proof a builder recorded is re-read by machine
-instead of by a human remembering to. One request per car per hour at
+ran and failed, and for cars past their train's arrival whose recorded
+probe never ran at all (a probe added by boss prove --record-probe
+after landing; 66 of 83 on 2026-11-11, backlog a0c62719), so the proof
+a builder recorded is read by machine instead of by a human
+remembering to. One request per car per hour at
 most, and none for a car with a request still open — and a car already
 proven is nothing to run, exit 0. Hourly because that is the rate the
 events these probes wait on actually fire; daily left cars provable and

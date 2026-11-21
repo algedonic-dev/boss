@@ -119,15 +119,35 @@
 # by this explicit throughput decision. Live publication and native
 # departure evidence are separate acceptance steps after source review.
 #
+# VERSION 12 MOVES TO HOURLY DEPARTURES (backlog a74d06d3, David,
+# 2026-11-02): "Let's move to hourly departures for the train, and skip
+# if no cars are ready." Measured that morning: over 21 train gates,
+# median run 47 min and wait 0 min; over 53 car gates, median run 53 min
+# and wait 127 min, with two bays under delivery policy v11. The old
+# warm-gate estimate of 2-10 min no longer describes that measurement.
+#
+# Depth 1 with no cooldown since v11 meant nearly every train carried
+# one car, then its train gate re-tested the tree its car gate tested.
+# Cooldown 60 gives ready cars time to batch without changing depth 1.
+# The queue-depth basis already skips an empty dock, and a firing that
+# boards nothing still does not start the cooldown; neither behavior
+# needs a new rule. Live lineage read before authoring: v8-v10 retired,
+# v11 active at depth 1 / cooldown 0, so v12 is above it. Publication
+# from main and native departure evidence remain separate after LAND.
+#
+# WHAT WOULD CHANGE IT: cars per train staying near 1 (arrivals too
+# slow to batch), or car-gate wait not falling within a day. Compare
+# departure gaps, empty-dock skips and cars per train after publication.
+#
 # To change this rule, bump `version` — and check the LIVE lineage
 # first (`GET /api/cadence/rules/<name>/versions`), not just this file.
 # ---------------------------------------------------------------------------
 
 [[cadence_rule]]
 name = "train-board-on-dock-depth"
-version = 11
+version = 12
 status = "active"
 verb = "board"
 basis = "queue-depth"
 min_dock_depth = 1
-cooldown_minutes = 0
+cooldown_minutes = 60

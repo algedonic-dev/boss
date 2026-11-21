@@ -29,16 +29,69 @@ fn source_keys() -> Vec<String> {
     .collect()
 }
 
-pub(super) fn canonical_actor(http: &Doors<'_>, packet: &str) -> Result<String> {
+pub(super) async fn canonical_actor(http: &Doors<'_>, packet: &str) -> Result<String> {
     let actor = identity::apply(identity::signature_for(
         &reqwest::Method::POST,
         &format!("/api/jobs/{packet}/metadata/conditional"),
         http.caller.clone(),
     ))?;
+    let actor = resolve_signer(&actor, registry_rows(http).await)?;
     Ok(match boss_policy_client::types::automation_slug(&actor) {
         Some(slug) => boss_core::actor::ActorId::Automation(slug.into()).to_string(),
         None => actor.parse::<boss_core::actor::ActorId>()?.to_string(),
     })
+}
+
+/// The agents registry, whole or refused: a page shorter than its own
+/// `total` is not the registry.
+async fn registry_rows(http: &Doors<'_>) -> Result<Vec<Value>> {
+    let registry = api(http, reqwest::Method::GET, "/api/agents", None)
+        .await?
+        .context("canonical actor registry is unavailable")?;
+    let total = registry
+        .get("total")
+        .and_then(Value::as_u64)
+        .context("canonical actor registry lacks its full total")?;
+    let agents = rows(Some(registry))?;
+    if agents.len() as u64 != total {
+        bail!("canonical actor registry is incomplete");
+    }
+    Ok(agents)
+}
+
+/// The actor a signer's name resolves to, the way the server's write
+/// middleware (`validate_actor_bindings`) resolves it: through the
+/// registry, for ANY alias, not only one carrying `@` (backlog 3f5dde02,
+/// review 7e8a2723 N1).
+/// - A login carrying `@` must resolve: an asserted email is not the actor
+///   its original receipt records, so an unreadable registry, or a login no
+///   single row names, refuses. The jobs API's login door still ADMITS such
+///   a login while its migration window is open, so the refusal says so and
+///   names the door that adds the row, rather than leaving the operator to
+///   re-derive why the gate refuses what the API took (review 7e8a2723 N2,
+///   held by review 6eb83ad0 P2). Only the message changed; the
+///   refusal stays.
+/// - Any other name resolves when exactly one row names it. A name no row
+///   names, or a registry that cannot be read, passes as signed. The server
+///   is the judge of that, and its refusal (409) writes nothing, so passing
+///   is never a guess written down.
+pub(super) fn resolve_signer(actor: &str, registry: Result<Vec<Value>>) -> Result<String> {
+    if actor.contains('@') {
+        let agents = registry.context("canonical actor registry is unavailable")?;
+        return crate::dispatch::resolve_agent(&agents, actor).with_context(|| {
+            format!(
+                "canonical actor: no single agents registry row names the login {actor}. \
+                 The jobs API still admits an unrowed login while its migration window is open, \
+                 but a gate receipt records the actor, so the gate refuses it. \
+                 Add the login to its agent's aliases in the tenant's seeds/agents.toml \
+                 and run boss tenant publish (POST /api/agents/batch)"
+            )
+        });
+    }
+    Ok(registry
+        .ok()
+        .and_then(|agents| crate::dispatch::resolve_agent(&agents, actor))
+        .unwrap_or_else(|| actor.to_string()))
 }
 
 pub(super) async fn submit_on(
@@ -63,6 +116,7 @@ pub(super) async fn submit_on(
     {
         bail!("prior native intent/attempt/settlement prevents a new durable submission");
     }
+    let actor = canonical_actor(http, &intent.packet).await?;
     let mut patch = overrides
         .as_object()
         .context("submission source patch is not an object")?
@@ -158,7 +212,7 @@ pub(super) async fn submit_on(
         if let Some(claim) = &original
             && !source_claim::same_actor(
                 http,
-                &canonical_actor(http, &intent.packet)?,
+                &actor,
                 claim["holder"]
                     .as_str()
                     .context("original source holder is unreadable")?,
@@ -168,15 +222,27 @@ pub(super) async fn submit_on(
         {
             bail!("requesting actor cannot borrow another worker's source run");
         }
+        if let Some(claim) = &original {
+            source_claim::bind_request(http, claim, &intent.packet, &actor, &mut source_reads)
+                .await?;
+        }
         Ok(original)
     }
     .await;
     let original_claim = match qualified {
         Ok(claim) => claim,
         Err(error) => {
-            let evidence=retain(http,&intent.packet,&serde_json::to_vec(&json!({
-                "operation":"source-claim-admission-refusal","reads":source_reads,"error":format!("{error:#}")
-            }))?).await?;
+            let evidence = retain(
+                http,
+                &intent.packet,
+                &serde_json::to_vec(&source_claim::evidence(
+                    "source-claim-admission-refusal",
+                    &intent.packet,
+                    &source_reads,
+                    Some(format!("{error:#}")),
+                ))?,
+            )
+            .await?;
             return Err(error.context(format!(
                 "complete source qualification retained as {} sha256 {}",
                 evidence.file_id, evidence.sha256
@@ -190,7 +256,7 @@ pub(super) async fn submit_on(
     let submission = Submission {
         contract_version: 1,
         command,
-        submitted_by: canonical_actor(http, &intent.packet)?,
+        submitted_by: actor,
         supervisor: identity::CONDUCTOR.into(),
         intent: intent.clone(),
         source,
@@ -230,6 +296,16 @@ fn verify_receipt(submission: &Submission, receipt: &Receipt) -> Result<()> {
 /// Read-only admission time and immutable intent. No POST, heartbeat,
 /// claim, native command or current process identity can establish it.
 pub(super) async fn original_on(http: &Doors<'_>, packet: &str) -> Result<(Submission, Receipt)> {
+    let (submission, receipt, _) = accepted_on(http, packet).await?;
+    Ok((submission, receipt))
+}
+
+/// [`original_on`] with the packet as it was read for it, so a reader
+/// that also judges the packet does not read it twice (backlog 48b1b7b4).
+pub(super) async fn accepted_on(
+    http: &Doors<'_>,
+    packet: &str,
+) -> Result<(Submission, Receipt, Value)> {
     let row = read_on(http, packet).await?;
     let submission = model::submission(row.get("metadata").context("packet has no metadata")?)
         .map_err(anyhow::Error::msg)?
@@ -247,9 +323,9 @@ pub(super) async fn original_on(http: &Doors<'_>, packet: &str) -> Result<(Submi
             .context("original durable acceptance receipt is unavailable")?,
     )?;
     verify_receipt(&submission, &receipt)?;
-    let current: boss_core::job::Job = serde_json::from_value(row)?;
+    let current: boss_core::job::Job = serde_json::from_value(row.clone())?;
     model::acceptance(&current, &receipt).map_err(anyhow::Error::msg)?;
-    Ok((submission, receipt))
+    Ok((submission, receipt, row))
 }
 
 /// Every path capable of recording native acceptance or spending a
@@ -264,7 +340,7 @@ pub(super) async fn require_owner_on(
     }
     model::source_metadata(metadata).map_err(anyhow::Error::msg)?;
     let (submission, _) = original_on(http, packet).await?;
-    if canonical_actor(http, packet)? != submission.supervisor {
+    if canonical_actor(http, packet).await? != submission.supervisor {
         bail!("only the declared resident supervisor may originate or consume this native launch");
     }
     Ok(Some(submission))
@@ -276,7 +352,7 @@ pub(super) async fn launch_on(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<String> {
     let (submission, _receipt) = original_on(http, packet).await?;
-    if canonical_actor(http, packet)? != submission.supervisor {
+    if canonical_actor(http, packet).await? != submission.supervisor {
         bail!("only the declared resident supervisor may originate this launch");
     }
     let row = read_on(http, packet).await?;
@@ -288,4 +364,72 @@ pub(super) async fn launch_on(
     intent.transition_generation = Some(reservation_generation(md)?);
     let bytes = request_bytes(http, &intent).await?;
     create_on(http, &intent, &bytes, now).await
+}
+
+#[cfg(test)]
+mod resolve_signer_tests {
+    use super::*;
+
+    fn registry() -> Result<Vec<Value>> {
+        Ok(vec![
+            json!({"id": "agent-claude-b", "aliases": ["claude-b@algedonic.dev", "claude-b"]}),
+            json!({"id": "agent-codex", "aliases": ["codex@algedonic.dev"]}),
+        ])
+    }
+
+    #[test]
+    fn a_plain_alias_resolves_through_the_registry_like_a_login() {
+        assert_eq!(
+            resolve_signer("claude-b", registry()).unwrap(),
+            "agent-claude-b"
+        );
+        assert_eq!(
+            resolve_signer("claude-b@algedonic.dev", registry()).unwrap(),
+            "agent-claude-b"
+        );
+    }
+
+    #[test]
+    fn an_id_or_an_unnamed_plain_name_passes_as_signed() {
+        assert_eq!(
+            resolve_signer("agent-codex", registry()).unwrap(),
+            "agent-codex"
+        );
+        assert_eq!(
+            resolve_signer("emp-david", registry()).unwrap(),
+            "emp-david"
+        );
+        assert_eq!(
+            resolve_signer("emp-david", Err(anyhow::anyhow!("registry unreadable"))).unwrap(),
+            "emp-david",
+            "a plain name never waits on the registry; the server judges it"
+        );
+    }
+
+    #[test]
+    fn a_login_carrying_at_still_refuses_unresolved() {
+        assert!(resolve_signer("nobody@algedonic.dev", registry()).is_err());
+        assert!(resolve_signer("claude-b@algedonic.dev", Err(anyhow::anyhow!("down"))).is_err());
+    }
+
+    /// Review 7e8a2723 N2, held by review 6eb83ad0 P2: the refusal for a
+    /// login no row names stays strict, and says why the jobs API admits
+    /// what the gate refuses (the migration window) and which door adds
+    /// the row, so the operator is not left to re-derive either.
+    #[test]
+    fn the_no_row_refusal_names_the_migration_window_and_the_registry_door() {
+        let why = format!(
+            "{:#}",
+            resolve_signer("nobody@algedonic.dev", registry()).unwrap_err()
+        );
+        for needle in [
+            "nobody@algedonic.dev",
+            "agents registry",
+            "migration window",
+            "seeds/agents.toml",
+            "boss tenant publish",
+        ] {
+            assert!(why.contains(needle), "refusal lacks {needle:?}: {why}");
+        }
+    }
 }

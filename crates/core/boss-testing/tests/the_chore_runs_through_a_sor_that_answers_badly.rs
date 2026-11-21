@@ -36,7 +36,7 @@
 //! to this crate, so every scoped gate runs it whatever its scope
 //! (`tree_wide_pins` in infra/gate.sh; backlog c87ad472).
 
-use boss_testing::{dark_port, repo_root, scratch_dir, without_proxy};
+use boss_testing::{dark_port, repo_root, scratch_dir, with_default_signals, without_proxy};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -47,6 +47,26 @@ use std::sync::{Arc, Mutex};
 const WRAP: &str = "infra/boss-maintenance-wrap.sh";
 const CONVERGE_UNIT: &str = "infra/forge/cluster-deploy-runner.service";
 const LEDGER_DIR: &str = ".boss-maintenance-unrecorded";
+
+/// What a loaded gate bay may add to a call the fixture ANSWERS: longer
+/// than the 2 s BOSS_WRAP_MAX_TIME a test once set, which was one
+/// deadline for the answered read and the stalled POST alike (backlog
+/// 39f5bf22, the shape 10184588 fixed for BOSS_STEP_MAX_TIME).
+const ANSWER_STALL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What one ANSWERED fixture call may take on a loaded gate bay, and so
+/// the BOSS_WRAP_MAX_TIME a test sets when its fixture answers some calls
+/// and stalls another past the deadline. Sized to the answer, the stalled
+/// call still ends on it, which is what such a test pins. A fixture that
+/// answers nothing (`Sor::hanging`) keeps its short deadline: no answered
+/// call shares it.
+const FIXTURE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+const _: () = assert!(ANSWER_STALL.as_secs() < FIXTURE_BUDGET.as_secs());
+
+/// BOSS_WRAP_MAX_TIME, read off the fixture's budget.
+fn max_time() -> String {
+    FIXTURE_BUDGET.as_secs().to_string()
+}
 
 /// One request the listener saw: method, path, body.
 #[derive(Clone, Debug)]
@@ -863,7 +883,9 @@ fn a_sigterm_mid_post_marks_the_rows() {
         }
         _ => (200, r#"{"data":[]}"#.to_string()),
     }));
-    let mut child = without_proxy(&mut Command::new("bash"))
+    // Every signal at its default, so the TERM below is the one the
+    // wrap traps, whatever the runner handed the suite (backlog 5f6a2cde).
+    let mut child = without_proxy(&mut with_default_signals("bash"))
         .arg(repo_root().join(WRAP))
         .args([kind, "x"])
         .env("BOSS_JOBS_URL", &sor.url)
@@ -1293,19 +1315,24 @@ fn an_ambiguous_exit_marks_the_rows_and_the_build_dedupes() {
             row("b", "2026-09-27T00:00:01Z"),
         ],
     );
-    // Commits the packet, then answers after the wrap's deadline.
+    // Commits the packet, then answers after the wrap's deadline. The
+    // open-packet read is ANSWERED, after a loaded bay's ANSWER_STALL.
     let committed = Sor::start(Box::new(|method: &str, _: &str| match method {
         "POST" => {
-            std::thread::sleep(std::time::Duration::from_secs(4));
+            std::thread::sleep(FIXTURE_BUDGET * 2);
             (200, r#"{"id":"job-1"}"#.to_string())
         }
-        _ => (200, r#"{"data":[]}"#.to_string()),
+        _ => {
+            std::thread::sleep(ANSWER_STALL);
+            (200, r#"{"data":[]}"#.to_string())
+        }
     }));
+    let deadline = max_time();
     let out = wrap_with(
         Some(&committed.url),
         &home,
         kind,
-        &[("BOSS_WRAP_MAX_TIME", "2")],
+        &[("BOSS_WRAP_MAX_TIME", deadline.as_str())],
     );
     assert_eq!(out.rc, 0, "{}", out.text);
     let first = posts(&committed);
@@ -1436,6 +1463,8 @@ fn a_hanging_sor_is_abandoned_and_the_chore_runs() {
     let home = scratch_dir("sor-hanging");
     let url = Sor::hanging();
     let started = std::time::Instant::now();
+    // Every call here hangs, so this short deadline shares no answered
+    // call (backlog 39f5bf22 read it and left it).
     let out = wrap_with(Some(&url), &home, kind, &[("BOSS_WRAP_MAX_TIME", "2")]);
     let took = started.elapsed();
     assert_eq!(out.rc, 0, "{}", out.text);

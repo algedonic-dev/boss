@@ -17,8 +17,9 @@ import { DEPARTMENT_CLASSES, installApiFloor } from './_smokeMocks';
 
 /// Surfaces that render the chrome through different code paths:
 /// a normal AppShell route, the full-page step route (rendered
-/// OUTSIDE AppShell), and an IT surface.
-const SURFACES = ['/ux/jobs', '/it', '/ux/inbox'] as const;
+/// OUTSIDE AppShell), and an IT surface. The Home one was /ux/jobs
+/// until the jobs list went with step 1 of design 01fa5bdf.
+const SURFACES = ['/me/calendar', '/it', '/me/inbox'] as const;
 
 /// The playground tenant: named, and with a simulation to drive — a
 /// module is on only when listed true (ce68f137), and the Simulator
@@ -72,7 +73,7 @@ test.describe('chrome bar', () => {
   test('every chrome control stays legible in light theme', async ({ page }) => {
     // Light is the theme it broke in: `inherit` resolves dark there.
     await page.emulateMedia({ colorScheme: 'light' });
-    await mountPage(page, '/ux/jobs');
+    await mountPage(page, '/me/calendar');
 
     const measured = await measureContrast(
       page.locator('.perspective-tabs').first(),
@@ -96,7 +97,7 @@ test.describe('chrome bar', () => {
   // the words the bar carries OUTSIDE a button or link (the brand, the
   // system time) are measured too, since a band inverts every one of them.
   test('is an enamel band, and every word on it stays legible', async ({ page }) => {
-    await mountPage(page, '/ux/jobs');
+    await mountPage(page, '/me/calendar');
     const bar = page.locator('.perspective-tabs').first();
     await expect(bar).toHaveCSS('background-color', 'rgb(14, 27, 46)');
 
@@ -113,45 +114,21 @@ test.describe('chrome bar', () => {
     ).toEqual([]);
   });
 
-  test('offers the same app tabs everywhere', async ({ page }) => {
-    // The bar must not change shape as you navigate. Apps are
-    // departments now, so the full list is as long as the org chart —
-    // the bar pins Home, Simulator and YOUR department, and folds the
-    // rest into More.
-    //
-    // The count assertion is the point: an earlier version of that
-    // design also pinned whichever app you were currently in, which
-    // made the set grow by one whenever you left your own department.
-    // That is a second, drifted bar by another name, and this caught
-    // it.
-    const counts: number[] = [];
+  test('draws Home and the station path everywhere, and no department tab', async ({ page }) => {
+    // The bar moves between stations (backlog 474e2c1c, David
+    // 2026-11-19): Home, then the path from the company root to the
+    // station being viewed. It was one tab per row of the departments
+    // registry, folded into More past your own, and drew departments
+    // the company no longer has. Its shape now follows WHERE you are,
+    // by design — so the pin is the furniture every surface keeps:
+    // Home, the root, and no department tab.
     for (const path of SURFACES) {
       await mountPage(page, path);
-      counts.push(await page.locator('.perspective-tabs a[href]').count());
+      const bar = page.locator('.perspective-tabs').first();
+      await expect(bar.locator('[data-trail-home]'), path).toHaveAttribute('href', '/me');
+      await expect(bar.locator('[data-trail-stop="company"]'), path).toHaveCount(1);
+      await expect(bar.locator('.perspective-tab'), path).toHaveCount(0);
     }
-    expect(new Set(counts).size, `tab counts differed across surfaces: ${counts}`).toBe(
-      1,
-    );
-    // Home + Simulator at minimum; a signed-in operator also gets
-    // their own department. This used to assert `> 4`, which encoded
-    // the old seven-invented-app bar rather than anything true.
-    expect(counts[0]).toBeGreaterThanOrEqual(2);
-  });
-
-  test('folds the other departments into More rather than dropping them', async ({
-    page,
-  }) => {
-    // The apps not on the bar must still be reachable in one click —
-    // "very few people need most of the Apps" is a reason to demote
-    // them, never a reason to hide them.
-    await mountPage(page, '/ux/jobs');
-    const more = page.locator('.perspective-more-btn');
-    await expect(more).toBeVisible();
-    await more.click();
-    const items = page.locator('.perspective-more-item');
-    await expect(items.first()).toBeVisible();
-    // Every department app that is not pinned shows up here.
-    expect(await items.count()).toBeGreaterThan(4);
   });
 
   test('falls back to BOSS when the tenant has not named itself', async ({ page }) => {
@@ -161,7 +138,7 @@ test.describe('chrome bar', () => {
     await page.route(/\/api\/tenant\/manifest$/, (r) =>
       r.fulfill({ json: { modules: {}, labels: {} } }),
     );
-    await mountPage(page, '/ux/jobs');
+    await mountPage(page, '/me/calendar');
     const bar = page.locator('.perspective-tabs').first();
     await expect(bar).toContainText('BOSS');
     await expect(bar).not.toContainText('Algedonic');

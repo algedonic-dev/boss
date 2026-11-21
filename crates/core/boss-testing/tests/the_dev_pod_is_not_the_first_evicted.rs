@@ -246,3 +246,40 @@ fn the_workspace_is_not_reowned_on_every_mount() {
         "without OnRootMismatch every restart walks the whole workspace PVC"
     );
 }
+
+/// The quantity a flow-mapping resource line names for `key`.
+fn quantity<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    line.split(['{', '}', ','])
+        .filter_map(|kv| kv.split_once(':'))
+        .find(|(k, _)| k.trim() == key)
+        .map(|(_, v)| v.trim().trim_matches('"'))
+}
+
+/// Backlog 6279669c (and 89f94c28, the same container): the reclaim
+/// sidecar was OOMKilled at its 256Mi limit on 2026-11-06T16:18Z and four
+/// times on pod boss-dev-858b849c4c-mz6gq by 2026-11-07T04:04Z. Its rings
+/// under /work/telemetry/dev-memory/kills read the cgroup at its ceiling
+/// with anon up to 138 MB (a python3 controller or inventory read), file
+/// up to 97 MB and kernel up to 163 MB: the dentry and inode slab its
+/// filesystem walks charge to the walker. The cgroup limit counts all
+/// three, and a 15 s sampler saw none of the spikes that killed it. The
+/// floor is their sum, ~400 MB, with room for the walk to grow with
+/// /scratch: a sidecar killed mid-pass leaves the hour's reclaim undone.
+#[test]
+fn the_reclaim_sidecar_limit_holds_its_walks_and_its_reads() {
+    let text = manifest();
+    let deployment = document(&text, "Deployment", "boss-dev");
+    let all = containers(deployment);
+    let (_, reclaim) = all
+        .iter()
+        .find(|(n, _)| *n == "reclaim")
+        .expect("the reclaim sidecar is declared");
+    let limit = resource_line(reclaim, "limits:")
+        .and_then(|l| quantity(l, "memory"))
+        .expect("the reclaim sidecar declares a memory limit");
+    assert!(
+        bytes(limit) >= bytes("1Gi"),
+        "the reclaim sidecar's memory limit {limit} is under 1Gi: its kills read anon 138 MB, \
+         file 97 MB and kernel 163 MB at a 256Mi ceiling, all three charged to it (6279669c)"
+    );
+}

@@ -80,13 +80,39 @@ fn catalog_apps(catalog: &str) -> BTreeSet<String> {
         .skip(1)
         .filter_map(|rest| rest.split_once('\'').map(|(code, _)| code.to_string()))
         .collect();
-    assert!(
-        apps.len() > 5,
-        "{CATALOG} yielded {} owner codes — the spelling changed and this test is reading nothing",
-        apps.len()
-    );
+    // A control on codes the catalog is known to assign, not a count:
+    // the count fell from fourteen to four when step 1 of design 01fa5bdf
+    // removed the /ux business pages, and a count is what a parser that
+    // read the wrong thing could still satisfy.
+    for known in ["home", "it", "finance"] {
+        assert!(
+            apps.contains(known),
+            "{CATALOG} yielded no `{known}` owner (read {apps:?}) — the spelling changed and \
+             this test is reading nothing"
+        );
+    }
     apps
 }
+
+/// DEPARTMENTS WITH NO PAGE (step 1 of design 01fa5bdf, David
+/// 2026-11-17: "the /ux business pages are removed"). Each is a
+/// registry row whose catalog surfaces all went, so no page-audit packet
+/// can carry it until a station's page is built for it; its tab lands on
+/// its jobs view (nav-catalog `departmentLanding`). A named set, never a
+/// count: a code here that regains a catalog surface fails the test
+/// below and must leave the list.
+const PAGELESS_DEPARTMENTS: &[&str] = &[
+    "distribution",
+    "executive",
+    "maintenance",
+    "marketing",
+    "people",
+    "production",
+    "qa",
+    "service",
+    "support",
+    "warehouse",
+];
 
 /// `departmentFor` in the opener, in Rust: the department a route's
 /// packet carries, given the `owner` the catalog assigned it.
@@ -119,12 +145,23 @@ async fn codes(db: &TestDb, sql: &str) -> BTreeSet<String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_rows_are_exactly_the_codes_the_page_march_carries() {
     let db = TestDb::new().await;
+    let carried = expected_departments();
+    let pageless: BTreeSet<String> = PAGELESS_DEPARTMENTS.iter().map(|c| c.to_string()).collect();
+    let both: Vec<&String> = carried.intersection(&pageless).collect();
+    assert!(
+        both.is_empty(),
+        "{both:?} own a catalog surface again — take them off PAGELESS_DEPARTMENTS"
+    );
     assert_eq!(
         codes(&db, "SELECT id FROM departments WHERE retired_at IS NULL").await,
-        expected_departments(),
-        "the department registry and the codes page-audit packets carry have drifted — \
-         a packet whose department matches no row reads as a normal packet, which is why \
-         this is a test and not a comment ({CATALOG} + {OPENER})"
+        carried
+            .union(&pageless)
+            .cloned()
+            .collect::<BTreeSet<String>>(),
+        "the department registry and the codes page-audit packets carry (plus the named \
+         departments with no page) have drifted — a packet whose department matches no row \
+         reads as a normal packet, which is why this is a test and not a comment \
+         ({CATALOG} + {OPENER})"
     );
 }
 

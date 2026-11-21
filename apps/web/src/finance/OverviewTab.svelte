@@ -1,7 +1,8 @@
 <script lang="ts">
   // Overview tab — AR aging + AP aging + gross margin by product line.
   // Port of the OverviewTab sub-component from
-  // apps/web/src/finance/FinancePage.tsx.
+  // apps/web/src/finance/FinancePage.tsx. Each section draws only when
+  // the tenant runs its module (commerce, warehouse; ./sections).
 
   import { revenueCategoryLabel } from './types';
   import {
@@ -25,13 +26,20 @@
     summary: CommerceSummary | null;
     loading: boolean;
     summaryRead: ReadState;
+    /// Whether the tenant runs boss-commerce (AR aging, gross margin)
+    /// and boss-inventory (AP aging). A section whose module the tenant
+    /// does not run is absent and never read, not a zero (backlog
+    /// 801b6a7a, design c2820008 D1; ./sections).
+    commerce: boolean;
+    warehouse: boolean;
   };
-  let { summary, loading, summaryRead }: Props = $props();
+  let { summary, loading, summaryRead, commerce, warehouse }: Props = $props();
 
   let ap = $state<ApAging | null>(null);
   let apLoading = $state(true);
 
   $effect(() => {
+    if (!warehouse) return;
     let cancelled = false;
     apLoading = true;
     (async () => {
@@ -77,20 +85,16 @@
   }
 </script>
 
-{#if loading && !summary}
+{#if commerce && loading && !summary}
   <p class="empty">Loading finance summary…</p>
-{:else if !summary}
+{:else if commerce && !summary}
   <p class="empty load-failed" role="alert">Finance summary unavailable.{#if summaryRead.kind === 'failed'} {summaryRead.error}{/if}</p>
 {:else}
-  {@const s = summary}
-  {@const arTotalCount = s.ar_aging.reduce((acc, b) => acc + b.count, 0)}
-  {@const currency = s.currency || 'USD'}
-  {@const revTotalCents = s.total_revenue_ttm_cents}
-  {@const cogsTotalCents = s.total_cogs_ttm_cents}
-  {@const gmTotalCents = s.total_gross_margin_ttm_cents}
-  {@const gmPct = revTotalCents > 0 ? (gmTotalCents / revTotalCents) * 100 : 0}
-
   <div class="tab-grid finance-print-area">
+    {#if commerce && summary}
+    {@const s = summary}
+    {@const arTotalCount = s.ar_aging.reduce((acc, b) => acc + b.count, 0)}
+    {@const currency = s.currency || 'USD'}
     <section class="tab-section tab-section-wide">
       <div style="display:flex; align-items:baseline; gap:12px; margin-bottom:6px">
         <h3 style="margin:0">Accounts receivable aging</h3>
@@ -126,7 +130,9 @@
         </tbody>
       </table>
     </section>
+    {/if}
 
+    {#if warehouse}
     <section class="tab-section tab-section-wide">
       <div style="display:flex; align-items:baseline; gap:12px; margin-bottom:6px">
         <h3 style="margin:0">Accounts payable aging</h3>
@@ -171,7 +177,15 @@
         vendor-terms join in a follow-up.
       </p>
     </section>
+    {/if}
 
+    {#if commerce && summary}
+    {@const s = summary}
+    {@const currency = s.currency || 'USD'}
+    {@const revTotalCents = s.total_revenue_ttm_cents}
+    {@const cogsTotalCents = s.total_cogs_ttm_cents}
+    {@const gmTotalCents = s.total_gross_margin_ttm_cents}
+    {@const gmPct = revTotalCents > 0 ? (gmTotalCents / revTotalCents) * 100 : 0}
     <section class="tab-section tab-section-wide">
       <h3>Gross margin by product line (trailing 12 months)</h3>
       <table class="data-table">
@@ -206,5 +220,6 @@
         </tbody>
       </table>
     </section>
+    {/if}
   </div>
 {/if}

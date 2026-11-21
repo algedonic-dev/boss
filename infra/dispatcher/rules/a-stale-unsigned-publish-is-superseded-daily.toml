@@ -1,0 +1,59 @@
+# An unsigned publish packet left on an older tree is superseded by a
+# fresh one, every day (design 62f27539 C1, backlog 44caee88).
+#
+# THE CASE. Packet d91c2b7b measured forge tree d88cf723 on 2026-11-08.
+# David held its approval on 2026-11-10 until a tree carrying the mirror
+# Gate fix (c1c49677) was measured; the fix landed on 2026-11-11, and
+# `refresh-publish-drift-daily` wrote a reading of a newer tree onto the
+# packet every morning after (2766f12b on 2026-11-16, which carries it).
+# Nothing moved the packet: `publish-measure-lands-the-drift-reading`
+# writes nothing once `measure` is complete, the step door refuses
+# metadata on a completed step, `approve` stays bound to the first
+# tree's shas, and `publish-to-github-daily` files nothing while a
+# publish packet is open. Publishing stalled seven days, until the drain
+# superseded it by hand at 17:03Z with d2e189f5.
+#
+# WHAT IT DOES. For each open publish-to-github packet on the mirror:
+# when `approve` is NOT completed, `measure` IS completed with a
+# `source_sha`, and the packet's own `drift_refresh` names a different
+# `source_sha` read after that measurement, it files a fresh packet (the
+# stale one's title, subject, `target` and `area`, plus `supersedes`)
+# and merges `superseded_by` and `supersession_translation` — naming
+# both shas — onto the stale one, whose existing `superseded` terminal
+# closes it. A SIGNED packet is never superseded: once David has signed,
+# the packet runs to its own terminal.
+#
+# THE ARGS ARE THE PROTOCOL'S OWN WORDS. The steps, the measured field
+# and the reading pointers are the row's and the copy rule's, so the
+# handler holds no slug; its shipped-rule test holds `reading_sha` and
+# `reading_at` equal to what publish-measure-lands-the-drift-reading
+# copies into `source_sha`, `subject` to the daily rule's subject, and
+# every `carry` key to one the daily rule files with.
+#
+# WHY NOT INSIDE publish-to-github-daily. That rule's `when` is the
+# dedup question the silence sweep can ask for itself
+# (`cadence_roster::parse_guard`); a guard that also asked whether the
+# open packet is stale would be a condition on the world, which the
+# roster refuses (backlog fbcac8b4). So the daily cadence stays one
+# packet per mirror, and this rule is the transition that frees it.
+# Whichever of the two fires first on a tick, one fresh packet results.
+[[rule]]
+name = "a-stale-unsigned-publish-is-superseded-daily"
+why = """
+A TIMER over a STATE no event announces: a held packet emits nothing
+while it waits for a sign-off, and the reading that makes it stale lands
+as an ordinary metadata merge. The Workflow row already declares the
+`superseded` terminal; it cannot file the successor that terminal must
+name, nor judge a reading against a completed step's sha. Measured on
+backlog 44caee88: d91c2b7b sat seven days frozen on d88cf723 while each
+day's reading named a newer tree, and the daily publish filed nothing
+behind it. No authority widened: it never touches a packet whose
+approve is completed, it publishes nothing (the successor starts at its
+own measure), and its only writes are the successor's create and the
+two supersession keys on the stale packet.
+"""
+version = 1
+schedule = { cadence = "daily", anchor_date = "2026-11-17" }
+[[rule.do]]
+handler = "jobs.supersede_stale_unsigned"
+args = { kind = "\"publish-to-github\"", subject = "\"github-mirror\"", measured_step = "\"measure\"", measured_sha = "\"source_sha\"", signed_step = "\"approve\"", reading_sha = "\"/drift_refresh/source_sha\"", reading_at = "\"/drift_refresh/measured_at\"", carry = "\"target,area\"" }

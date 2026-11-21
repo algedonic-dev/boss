@@ -206,6 +206,162 @@ fn read_argv(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The boot with the switch on, the drain prompt in the checkout, and
+/// `/work/drain-seat` holding `drain_seat` (or absent): the decision
+/// the postStart made once, before dev-claude.sh ran (review ce8970ce
+/// N2).
+fn boot_seated(drain_seat: Option<&str>) -> Booted {
+    let root = scratch_dir("drain-on-boot-seated");
+    let work = root.join("work");
+    let rooted = |p: &str| -> PathBuf { root.join(p.trim_start_matches('/')) };
+    let bin = work.join("home/.local/bin");
+    create_dir(&bin);
+    create_dir(&work.join("ssh"));
+    write_exec(
+        &bin.join("claude"),
+        "#!/usr/bin/env bash\nprintf '%s\\0' \"$@\" > \"$HOME/argv\"\n",
+    );
+    let switch = rooted(SWITCH);
+    create_dir(switch.parent().expect("switch has a parent"));
+    write_file(&switch, "");
+    create_dir(&work.join("boss/infra/dev"));
+    write_file(&rooted(PROMPT), &drain_prompt());
+    if let Some(seat) = drain_seat {
+        write_file(&work.join("drain-seat"), &format!("{seat}\n"));
+    }
+    let script = root.join("dev-claude.sh");
+    let body = dev_claude_sh().replace("/work/", &format!("{}/", work.display()));
+    write_exec(&script, &body);
+    let out = Command::new("bash")
+        .arg(&script)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CEILING_DIRECTORIES", &root)
+        .output()
+        .unwrap_or_else(|e| panic!("run {}: {e}", script.display()));
+    assert!(
+        out.status.success(),
+        "dev-claude.sh exited {:?}",
+        out.status.code()
+    );
+    Booted {
+        argv: read_argv(&work.join("home/argv")),
+        log: std::fs::read_to_string(rooted(BOOT_LOG)).unwrap_or_default(),
+    }
+}
+
+/// The drain moves to its supervised seat (backlog b513514c): when the
+/// boot gave the drain to the conductor's seat, `dev-session.sh --boot`
+/// runs it in tmux `conductor` under factory-loop.sh, so `dev` starts
+/// as David's Remote Control door with no prompt — one drain, never two
+/// on one agent — and the log says where the drain went. dev-claude.sh
+/// reads the boot's ONE decision, /work/drain-seat, never the checkout
+/// a fast-forward may have moved since (review ce8970ce N2).
+#[test]
+fn with_a_conductor_seat_the_drain_runs_in_its_seat_and_dev_starts_idle() {
+    let b = boot_seated(Some("conductor"));
+    assert_eq!(
+        b.argv,
+        ["--remote-control", "boss-dev"],
+        "the drain runs in its seat; dev is the idle Remote Control door"
+    );
+    assert!(
+        b.log
+            .contains("the drain runs supervised in tmux conductor"),
+        "{}",
+        b.log
+    );
+    let unseated = boot_seated(None);
+    assert_eq!(
+        unseated.argv[..2],
+        ["--remote-control", "boss-dev"],
+        "{:?}",
+        unseated.argv
+    );
+    assert_eq!(
+        unseated.argv.len(),
+        3,
+        "without the boot's decision for the seat the drain prompt is dev's first prompt, as before"
+    );
+    assert!(
+        !dev_claude_sh().contains("seats.tsv"),
+        "dev-claude.sh never reads the checkout's seat list for itself: the boot decided once"
+    );
+}
+
+/// The postStart lines that decide, once, where the drain runs — from
+/// `rm -f /work/drain-seat` to the `fi` that closes the decision — with
+/// the YAML block's indentation taken off.
+fn drain_seat_decision() -> String {
+    let m = manifest();
+    let lines: Vec<&str> = m.lines().collect();
+    let first = lines
+        .iter()
+        .position(|l| l.trim() == "rm -f /work/drain-seat")
+        .expect("the postStart decides where the drain runs, once, into /work/drain-seat");
+    let indent = lines[first].len() - lines[first].trim_start().len();
+    let len = lines[first..]
+        .iter()
+        .position(|l| l.trim() == "fi")
+        .expect("the decision closes with fi")
+        + 1;
+    lines[first..first + len]
+        .iter()
+        .map(|l| l.get(indent..).unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
+/// The decision itself (review ce8970ce N1, N2): the drain goes to the
+/// conductor's seat only when the switch is on AND the CHECKOUT's door
+/// can start seats AND its seat list holds a conductor — the checkout,
+/// because the seat runs the checkout's scripts, so a roll whose
+/// checkout predates `--boot` drains in dev exactly as before. Every
+/// other case leaves no file, which both boot scripts read as `dev`.
+#[test]
+fn the_boot_gives_the_drain_to_the_seat_only_when_the_checkout_can_run_it() {
+    let seats_with = "conductor claude claude@algedonic.dev infra/dev/drain.md 600 -\n";
+    let seats_without = "codex-factory codex agent-codex p 60 codex\n";
+    for (label, switch_on, boot_door, seats, want) in [
+        ("seated", true, true, seats_with, Some("conductor")),
+        ("old checkout", true, false, seats_with, None),
+        ("no conductor row", true, true, seats_without, None),
+        ("switch off", false, true, seats_with, None),
+    ] {
+        let root = scratch_dir("drain-seat-decision");
+        let work = root.join("work");
+        let dev = work.join("boss/infra/dev");
+        create_dir(&dev);
+        if switch_on {
+            let switch = root.join(SWITCH.trim_start_matches('/'));
+            create_dir(switch.parent().expect("switch has a parent"));
+            write_file(&switch, "");
+        }
+        let door = if boot_door {
+            "if [ \"${1:-}\" = --boot ]; then :; fi\n"
+        } else {
+            "if [ \"${1:-}\" = --detached ]; then :; fi\n"
+        };
+        write_file(&dev.join("dev-session.sh"), door);
+        write_file(&dev.join("seats.tsv"), seats);
+        write_file(&work.join("drain-seat"), "stale\n");
+        let script = root.join("decide.sh");
+        let body = drain_seat_decision().replace("/work/", &format!("{}/", work.display()));
+        write_exec(&script, &body);
+        let out = Command::new("bash")
+            .arg(&script)
+            .output()
+            .unwrap_or_else(|e| panic!("run {}: {e}", script.display()));
+        assert!(out.status.success(), "{label}: {out:?}");
+        let got = std::fs::read_to_string(work.join("drain-seat")).ok();
+        assert_eq!(
+            got.as_deref().map(str::trim),
+            want,
+            "{label}: a stale decision never survives a boot"
+        );
+    }
+}
+
 #[test]
 fn without_the_switch_the_boot_is_unchanged() {
     assert_eq!(
@@ -408,6 +564,574 @@ fn the_drain_prompt_names_its_verbs_and_cannot_be_read_as_a_flag() {
     }
 }
 
+/// The drain keeps its state on packets, never in agent memory (backlog
+/// 38db9ebe, 2026-10-18). Until this car the prompt told a cold session
+/// to read MEMORY.md and its READ FIRST overnight entry, to take its
+/// owed post-land acts from that entry, and to append a line to it on
+/// every wake — the session-state class the decision record deletes
+/// outright ("Agent memory and the record", design a5368918), and the
+/// opposite of David's 2026-10-09 rule that handoff state lives on the
+/// item packets and the work-session packet. A memory file is
+/// unversioned, outside the log and mutable in place; the next session
+/// inherits it only if it happens to load the same file. So the prompt
+/// names no memory at all, and names the packet doors instead: the
+/// work-session list it reads the last handoff from, the one `handoff`
+/// key, and the metadata merge door it writes it through.
+///
+/// One key, REPLACED each wake (backlog e18b0b44, design e17c81c9,
+/// 2026-11-16): a `handoff_<YYYYMMDD>_<HHMM>Z` key per wake grew session
+/// 2d013092 to 738,325 bytes, 97% of its metadata handoffs, until the
+/// packet budget refused the very write this prompt requires. Every
+/// write's `jobs.job.updated` carries the whole row, so the wakes before
+/// are in the log, not lost.
+#[test]
+fn the_drain_keeps_its_state_on_packets_not_in_memory() {
+    let p = drain_prompt();
+    let memory: Vec<&str> = p
+        .lines()
+        .filter(|l| l.to_lowercase().contains("memory"))
+        .collect();
+    assert!(
+        memory.is_empty(),
+        "drain.md reads or writes agent memory; session state lives on packets:\n{}",
+        memory.join("\n")
+    );
+    for needle in [
+        "kind=work-session",
+        "`handoff`",
+        "PATCH /api/jobs/",
+        "/metadata",
+    ] {
+        assert!(
+            p.contains(needle),
+            "drain.md no longer names `{needle}`: the packet door its state goes through"
+        );
+    }
+    assert!(
+        !p.contains("handoff_<YYYYMMDD>_<HHMM>Z"),
+        "drain.md still writes a new handoff key every wake; the session keeps ONE `handoff`, replaced"
+    );
+}
+
+/// The reader decides by which keys are present and newer, never by the
+/// day a session opened (review 2f225d2e of car a9e8e486, finding 1).
+/// Measured 2026-11-16 ~15:25Z: session 48c007cc, opened that morning,
+/// held 7 `handoff_*` keys and no `handoff`, so a fallback reserved for
+/// sessions "opened before 2026-11-16" left tomorrow's drain reading an
+/// empty handoff. A session writes the old keys until it loads the new
+/// text — a merge, a fast-forward and a relaunch later — not at midnight.
+///
+/// And the drain is the coordinator, the conductor of these sessions, so
+/// it is told where its own orders go (finding 2): a session-wide order
+/// is the session's ONE `order` key, an order about an item a
+/// nomination on it. Until this text the only writer told about `order`
+/// was roll-the-dev-pod's quiesce step, and the conductor wrote
+/// `conductor_order_add_20261116_1509Z` onto the factory's session the
+/// same afternoon.
+#[test]
+fn the_drain_reads_handoffs_by_key_and_writes_one_order() {
+    // Whitespace collapsed, so a needle the prose wraps still matches.
+    let p = drain_prompt()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !p.contains("opened before 2026-"),
+        "drain.md keys its fallback on a session's opening date; key it on which keys are present and newer"
+    );
+    for needle in ["newest `handoff_*`", "absent or older"] {
+        assert!(
+            p.contains(needle),
+            "drain.md no longer names `{needle}`: the fallback to the per-wake keys a session still holds"
+        );
+    }
+    for needle in [
+        "ONE `order` key",
+        "`{by, at, text}`",
+        "boss step nominate",
+        "never a new `conductor_order_add_*`",
+    ] {
+        assert!(
+            p.contains(needle),
+            "drain.md no longer names `{needle}`: where the conductor writes an order"
+        );
+    }
+    // The successor path names its door and the field the next drain
+    // finds it by (review 2f225d2e, non-blocking).
+    for needle in ["boss job file --kind work-session", "`started_at`"] {
+        assert!(
+            p.contains(needle),
+            "drain.md's successor path no longer names `{needle}`"
+        );
+    }
+}
+
+/// A CAPACITY REFUSAL IS A QUEUE, NOT A STOP (backlog a3bb1743, measured
+/// 2026-11-16 03:31Z). Section 7 said "never bypass or retry around a
+/// refusal" with no line between the claim door's 409 "resource claim
+/// refused" (pool exhausted, the step queued in its line) and a policy or
+/// permission refusal, and the factory read the first as the second for
+/// hours while slots stood free. The section names the difference and the
+/// act: other ready work now, the claim again on the next wake.
+///
+/// The TEST is the body's `queued` field, never the 409 text (backlog
+/// dfc9884e, review of car b8584ecb): every reason the claim door refuses
+/// other than capacity-exhausted answers the same "resource claim refused"
+/// with no `queued`, and matching the text would retry one every wake and
+/// never file it. The old text-keyed sentence and the refuted closed count
+/// ("five declaration defects", review b46744de) are refused outright, so
+/// the needles are not vocabulary alone. Only a scheduler's
+/// Insufficient cpu or memory (dev-build.py's CAPACITY_MISS) is a worker
+/// queue; affinity or taints are a placement defect to file. The prompt
+/// names that class by CAPACITY_MISS and "cpu or RAM", never by the
+/// scheduler's own words: the test above refuses any line of drain.md
+/// carrying the word for RAM, and the first gate of this car went red
+/// on exactly that (gate-run 64151038).
+#[test]
+fn the_drain_names_a_capacity_refusal_a_queue_not_a_stop() {
+    let raw = drain_prompt();
+    let p = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let never = p
+        .split_once("## 7. Never")
+        .map(|(_, rest)| rest.split("## ").next().unwrap_or(rest))
+        .expect("drain.md has its Never section");
+    for needle in [
+        "resource claim refused",
+        "a capacity refusal is a queue",
+        "other ready work",
+        "next wake",
+        "a `queued` field",
+        "no `queued` field",
+        "every other reason the claim door refuses",
+        "CAPACITY_MISS",
+        "a refusal to file",
+    ] {
+        assert!(
+            never.contains(needle),
+            "section 7 must carry `{needle}`: a capacity refusal is a queue, not a refusal to \
+             file and stop on:\n{never}"
+        );
+    }
+    for stale in [
+        "When the claim door answers 409 \"resource claim refused\" because",
+        "five declaration defects",
+    ] {
+        assert!(
+            !never.contains(stale),
+            "section 7 must not carry `{stale}`: the `queued` field is the test, and the \
+             refusals without it are not a closed set:\n{never}"
+        );
+    }
+}
+
+/// THE CONDUCTOR RECOVERS WHAT STANDS BELOW IT (backlog de37ea3d, car A;
+/// David, 2026-11-18: "I want that seat to be able to recover agents or
+/// sessions assigned to lower-level stations"). Until this text section 7
+/// said "Never hand-delete, hand-restart, stop, or kill anything" and
+/// section 2 said a run that died with the pod is never closed by hand,
+/// so every stalled seat and dead run waited on David — measured that
+/// day: Claude B's seat not started after the 13:19Z roll, Codex's seat
+/// running with BOSS_ACTOR blank since boot, dead run f7b9c25b holding a
+/// step for three hours. The grant is three acts, each through its door
+/// and each recorded with its reason; a turn that is running is never
+/// interrupted (576de803: a seat stopped mid-turn loses the turn), and
+/// what policy calls destructive stays out. The turn-boundary verb is
+/// car B of the same item; until it lands the two reads of act 2 are
+/// the wait.
+///
+/// Review 9db36fe8 (Claude B, 2026-11-19) held the first text to four
+/// more lines, each pinned below. B1: a boot without `--except
+/// conductor` starts tmux `conductor`, a SECOND drain beside the one in
+/// tmux `dev` (boss-dev.yaml adds the flag at boot; the conductor row
+/// has no twin to refuse it). B2: "between turns" is read off the
+/// seat's own loop log and its pane, never off the `factory_turn`
+/// heartbeat alone, which the loop writes best-effort and an unsigned
+/// seat cannot write at all — a stale `end` on a running turn read as a
+/// boundary is silence counted as a pass. B3: a run that died with its
+/// pod ends `died` with `host_gone`, the observer's terminal for the
+/// same fact; `refused` counts it cancelled, not failed, and says no
+/// work was done. N1: David's sentence is copied, and the act list is
+/// marked as the conductor's reading of it.
+#[test]
+fn the_conductor_recovers_the_seats_and_runs_below_its_root_station() {
+    let raw = drain_prompt();
+    let p = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let never = p
+        .split_once("## 7. Never")
+        .map(|(_, rest)| rest.split("## ").next().unwrap_or(rest))
+        .expect("drain.md has its Never section");
+    for needle in [
+        "THE RECOVERY GRANT",
+        "the root station, `algedonic`",
+        "de37ea3d",
+        // N1: the grant's words are David's, copied, not retyped.
+        "\"yes, restart the codex seat, and I don't need that to be restricted to me. I am \
+         thinking that we should consider this session to allocated to the whole company \
+         system, i.e. sitting in the Algedonic station, and I want that seat to be able to \
+         recover agents or sessions assigned to lower-level stations.\"",
+        "the conductor's reading of that sentence",
+        // N2: the registry row is not written yet, and the text says so.
+        "pending",
+        // B1: every boot the grant names leaves the drain where it is.
+        "infra/dev/dev-session.sh --boot --except conductor",
+        "Never start the conductor seat.",
+        "seat-off",
+        "only between its turns",
+        // B2: the boundary is read from the seat's own loop, not the API.
+        "factory-loop-<seat>.log",
+        "turn <N> ended cleanly",
+        "turn <N> FAILED",
+        "no `timeout`",
+        "is a running turn",
+        "never decides",
+        "576de803",
+        "Never your own seat.",
+        // R1 (review a2e4bbce): the reads that justify the record never
+        // decide the kill; one command re-reads the pane and kills only
+        // if that read holds. Its behaviour is pinned below.
+        "a2e4bbce",
+        "ONE command",
+        "at least 10 seconds of it left",
+        "under 20 ms",
+        "Only after `killed`",
+        // N3: an unsigned seat is restarted only once the registry names it.
+        "boss-api GET /api/agents",
+        // N-C: by the predicate the boot itself uses, the twin's alias.
+        "`codex@algedonic.dev`",
+        "`claude-b@algedonic.dev`",
+        "`aliases`",
+        // N-B: the boot's own restart hint is not the door.
+        "never that line",
+        // N-D: a seat David turned off is left off, not stopped.
+        "the restart would become a stop",
+        // N-A: the report verb's advice for a no-terminal run is not this one's.
+        "disregard it",
+        // N5: tmux's exact-name target.
+        "tmux kill-session -t =<seat>",
+        // B3 and N4: the observer's terminal, judged the observer's way.
+        "boss step complete <run> --step building --field result=died",
+        "`host_gone`",
+        "estate observer",
+        "phase `Failed` or `Succeeded`",
+        "open or green",
+        "no answer is not \"no gate\"",
+        "never pushed",
+        // N6: the record comes first.
+        "Record each act BEFORE you take it",
+        "`recovered_<YYYYMMDD>_<HHMM>Z`",
+        "boss dispatch <run> --report",
+        "Destructive-by-policy acts stay excluded",
+        "starting a second drain",
+        "killing or interrupting a turn that is running",
+        "bypassing a refusal",
+        "credentials",
+        "publishing a held protocol",
+    ] {
+        assert!(
+            never.contains(needle),
+            "section 7 must carry `{needle}`: the conductor's recovery grant, its doors, \
+             its record and its exclusions:\n{never}"
+        );
+    }
+    assert!(
+        !never.contains("Never hand-delete, hand-restart"),
+        "section 7 still forbids every restart outright, which the grant of de37ea3d \
+         replaced:\n{never}"
+    );
+    // B1: not one boot in the grant may omit the flag — a bare
+    // `--boot` anywhere in it is the second drain.
+    let boots = never.matches("dev-session.sh --boot").count();
+    let guarded = never
+        .matches("dev-session.sh --boot --except conductor")
+        .count();
+    assert!(
+        boots > 0 && boots == guarded,
+        "section 7 names `dev-session.sh --boot` {boots} time(s) and only {guarded} with \
+         `--except conductor`; a boot without it starts tmux `conductor`, a second drain \
+         beside the one in tmux `dev` (review 9db36fe8 B1):\n{never}"
+    );
+    // B3: a pod-dead run is never ended `refused` by this grant.
+    assert!(
+        !never.contains("result=refused"),
+        "section 7 ends a pod-dead run `refused`, which counts it cancelled where the \
+         observer's `died` counts it failed (review 9db36fe8 B3):\n{never}"
+    );
+    // B2: the heartbeat may corroborate, never decide.
+    assert!(
+        !never.contains("read `factory_turn.phase` as `end` immediately before you act"),
+        "section 7 still judges the turn boundary off the best-effort heartbeat alone \
+         (review 9db36fe8 B2):\n{never}"
+    );
+    // N5: tmux's bare target matches by prefix and pattern.
+    assert!(
+        !never.contains("tmux kill-session -t <seat>"),
+        "section 7 names a tmux target without `=`, which matches by prefix \
+         (review 9db36fe8 N5):\n{never}"
+    );
+    // R1: a margin read before the record is spent by the record; the
+    // margin lives in the guarded command now, read at the kill.
+    assert!(
+        !never.contains("at least 20 seconds must remain"),
+        "section 7 still sets the turn margin on a read taken before the record, \
+         which a record written between the read and the kill can spend \
+         (review a2e4bbce R1):\n{never}"
+    );
+    // N-E: only `refused` maps to cancelled; `handed` has no outcome.
+    assert!(
+        !never.contains("Ended any other way"),
+        "section 7 says any other terminal counts a pod death cancelled; only \
+         `refused` does (review a2e4bbce N-E):\n{never}"
+    );
+    let roll = p
+        .split_once("## 2. Close what the roll left open")
+        .map(|(_, rest)| rest.split("## ").next().unwrap_or(rest))
+        .expect("drain.md has its roll section");
+    assert!(
+        !roll.contains("Do not close them by hand"),
+        "section 2 still forbids ending a run that died with the pod, which section 7 \
+         now grants when the estate observer has not:\n{roll}"
+    );
+    assert!(
+        roll.contains("section 7"),
+        "section 2 points a dead run the observer missed at section 7's grant:\n{roll}"
+    );
+}
+
+/// R1 of review a2e4bbce (Claude B, 2026-11-20): act 2 read the seat's
+/// log and pane, then wrote its record, then killed. A lower seat waits
+/// 60 s between turns and the conductor's tool calls ran 10-22 s apart,
+/// so read, record and kill could straddle the next turn's start and
+/// kill a turn 8 s old. The deciding read and the kill are now ONE
+/// command of drain.md, run after the record, that reads the pane again
+/// and kills only if that read holds. These tests run the two commands
+/// exactly as drain.md prints them, against a fake `tmux` whose pane is
+/// a real process of the shape factory-loop.sh gives a seat: `sleep
+/// <wait>` in its wait, `timeout … <cli>` in a turn.
+fn act_two_guards() -> (String, String) {
+    let raw = drain_prompt();
+    let never = raw
+        .split_once("## 7. Never")
+        .map(|(_, rest)| rest.split("\n## ").next().unwrap_or(rest))
+        .expect("drain.md has its Never section");
+    let guards: Vec<&str> = never
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("tmux list-panes -t =<seat>") && l.contains("tmux kill-session"))
+        .collect();
+    assert_eq!(
+        guards.len(),
+        2,
+        "section 7 prints two guarded kills, one for a seat in its wait and one for a \
+         stalled seat, each ONE line that reads the pane and kills (review a2e4bbce R1); \
+         found {guards:?}"
+    );
+    let pick = |needle: &str| {
+        guards
+            .iter()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no guarded kill in section 7 carries `{needle}`"))
+            .to_string()
+    };
+    (pick("sleep <wait>"), pick("turn <N+1>: "))
+}
+
+/// A real process standing in for a seat's pane: a bash whose one child
+/// is what `script` runs, in its own process group so the whole pane
+/// is ended when the test is.
+struct Pane(std::process::Child);
+
+impl Pane {
+    fn running(script: &str) -> Pane {
+        use std::os::unix::process::CommandExt;
+        // Owned by the Pane at once, so every path out of here, the
+        // panic below included, ends and reaps it through Drop.
+        let pane = Pane(
+            Command::new("bash")
+                .args(["-c", script])
+                .process_group(0)
+                .spawn()
+                .expect("spawn the stand-in pane"),
+        );
+        let pid = pane.0.id().to_string();
+        // Wait until bash has forked the child the guard reads.
+        for _ in 0..100 {
+            let kids = Command::new("ps")
+                .args(["-o", "args=", "--ppid", &pid])
+                .output()
+                .expect("ps");
+            if !kids.stdout.is_empty() {
+                return pane;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("the stand-in pane `{script}` never forked its child");
+    }
+}
+
+impl Drop for Pane {
+    fn drop(&mut self) {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", self.0.id())])
+            .status();
+        let _ = self.0.wait();
+    }
+}
+
+/// What one guarded command did: what it printed, and the
+/// `kill-session` the fake tmux received, if any.
+struct Guarded {
+    out: String,
+    killed: Option<String>,
+}
+
+fn run_guard(guard: &str, pane: &Pane, wait: &str, log: &str, seat_off: bool) -> Guarded {
+    let root = scratch_dir("act-two-guard");
+    let bin = root.join("bin");
+    create_dir(&bin);
+    // Answers only the exact-name target: a guard that drops the `=`
+    // reads no pane and so kills nothing.
+    write_exec(
+        &bin.join("tmux"),
+        "#!/bin/bash\ncase $1 in\n  list-panes) [ \"$3\" = =codex-factory ] && echo \"$FAKE_PANE_PID\" ;;\n  kill-session) echo \"$*\" > \"$FAKE_KILLED\" ;;\n  *) exit 1 ;;\nesac\n",
+    );
+    let home = root.join("home");
+    create_dir(&home.join(".config/boss/seat-off"));
+    if seat_off {
+        write_file(&home.join(".config/boss/seat-off/codex-factory"), "");
+    }
+    let log_path = root.join("factory-loop.log");
+    if log != MISSING {
+        write_file(&log_path, log);
+    }
+    let killed = root.join("killed");
+    let cmd = guard
+        .replace("<seat>", "codex-factory")
+        .replace("<wait>", wait)
+        .replace("<N+1>", "381")
+        .replace("<N>", "380")
+        .replace("<log>", &log_path.display().to_string());
+    let out = Command::new("bash")
+        .args(["-c", &cmd])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("HOME", &home)
+        .env("FAKE_PANE_PID", pane.0.id().to_string())
+        .env("FAKE_KILLED", &killed)
+        .output()
+        .expect("run the guarded command");
+    Guarded {
+        out: String::from_utf8_lossy(&out.stdout).into_owned(),
+        killed: std::fs::read_to_string(&killed).ok(),
+    }
+}
+
+/// A `log` argument that leaves the loop log unwritten.
+const MISSING: &str = "\0missing";
+
+const ENDED: &str = "factory-loop 2026-11-20T02:41:03Z: turn 380: codex exec -\n\
+                     factory-loop 2026-11-20T02:49:12Z: turn 380 ended cleanly; next turn in 60s\n";
+
+#[test]
+fn the_act_two_kill_lands_only_in_a_seats_wait_with_time_left() {
+    let (wait_guard, _) = act_two_guards();
+
+    let waiting = Pane::running("sleep 60; true");
+    let g = run_guard(&wait_guard, &waiting, "60", ENDED, false);
+    assert_eq!(
+        g.killed.as_deref().map(str::trim),
+        Some("kill-session -t =codex-factory"),
+        "a seat whose pane's one child is `sleep 60`, seconds into it, is in its wait and \
+         is restarted; the guard printed: {}",
+        g.out
+    );
+    assert!(
+        g.out.starts_with("killed"),
+        "the guard says it killed: {}",
+        g.out
+    );
+
+    let in_turn = Pane::running("timeout 60 sleep 60; true");
+    let g = run_guard(&wait_guard, &in_turn, "60", ENDED, false);
+    assert_eq!(
+        g.killed, None,
+        "a pane running `timeout` is a turn, whatever the log said a minute ago"
+    );
+    assert!(
+        g.out.starts_with("NOT killed"),
+        "the guard says it did not: {}",
+        g.out
+    );
+
+    // A wait with less than 10 s left: the next turn could start between
+    // the read and the kill, so the guard refuses.
+    let ending = Pane::running("sleep 9; true");
+    let g = run_guard(&wait_guard, &ending, "9", ENDED, false);
+    assert_eq!(
+        g.killed, None,
+        "a wait with under 10 s left is too close to the next turn to kill in; the \
+         guard printed: {}",
+        g.out
+    );
+
+    // N-D: a seat David turned off is left off, not stopped.
+    let off = Pane::running("sleep 60; true");
+    let g = run_guard(&wait_guard, &off, "60", ENDED, true);
+    assert_eq!(
+        g.killed, None,
+        "a seat with a seat-off file is David's to restart; the boot after a kill would \
+         skip it and the restart would become a stop (review a2e4bbce N-D)"
+    );
+}
+
+#[test]
+fn the_act_two_kill_of_a_stalled_seat_holds_off_any_turn() {
+    let (_, stall_guard) = act_two_guards();
+
+    let stuck = Pane::running("sleep 60; true");
+    let g = run_guard(&stall_guard, &stuck, "60", ENDED, false);
+    assert_eq!(
+        g.killed.as_deref().map(str::trim),
+        Some("kill-session -t =codex-factory"),
+        "a stalled seat, no turn in its pane and none begun in its log, is restarted; the \
+         guard printed: {}",
+        g.out
+    );
+
+    let in_turn = Pane::running("timeout 60 sleep 60; true");
+    let g = run_guard(&stall_guard, &in_turn, "60", ENDED, false);
+    assert_eq!(
+        g.killed, None,
+        "a pane running `timeout` is a turn: {}",
+        g.out
+    );
+
+    let moved_on = format!("{ENDED}factory-loop 2026-11-20T03:30:00Z: turn 381: codex exec -\n");
+    let g = run_guard(&stall_guard, &stuck, "60", &moved_on, false);
+    assert_eq!(
+        g.killed, None,
+        "a seat whose log began turn 381 since the record is no longer stalled: {}",
+        g.out
+    );
+
+    // An unreadable log is no answer, and no answer is a running turn.
+    let g = run_guard(&stall_guard, &stuck, "60", MISSING, false);
+    assert_eq!(
+        g.killed, None,
+        "a log the guard cannot read kills nothing: {}",
+        g.out
+    );
+
+    let off = Pane::running("sleep 60; true");
+    let g = run_guard(&stall_guard, &off, "60", ENDED, true);
+    assert_eq!(g.killed, None, "a seat-off seat is left off: {}", g.out);
+}
+
 /// The drain's post-land acts name `boss workflow publish` for a row a
 /// car changed — and the hand publish is the ONE door a hold does not
 /// bind (infra/platform/workflow-holds/README.md). A session resuming
@@ -446,4 +1170,46 @@ fn the_drain_never_publishes_a_held_kind() {
         1,
         "a second place naming the publish needs the same exception"
     );
+}
+
+/// The prompt drifted from the tree it drives (backlog abd1c796,
+/// measured 2026-11-09 on origin/main 6c9f2d0cd). Last edited
+/// 2026-10-18, it still said a row declaring a `writer` or an
+/// `executor` is held "by default because" of it — a default a4b57aca
+/// retired, so a cold session would hold kinds nothing holds. It never
+/// named the shared checkout's renewal door under dev isolation, it
+/// ordered work oldest-first against the urgent-first door (90bff1f3),
+/// and it capped builders at 5 where David set 8 on 2026-11-09. Each
+/// claim is pinned to the words a resuming session acts on.
+#[test]
+fn the_drain_follows_the_tree_it_drives() {
+    let p = drain_prompt();
+    let at = p
+        .find("boss workflow publish")
+        .expect("drain.md names the publish among its post-land acts");
+    let publish = p[at..].split("\n\n").next().unwrap();
+    assert!(
+        !publish.contains("by default because"),
+        "drain.md still holds writer/executor rows by default, which a4b57aca retired:\n{publish}"
+    );
+    assert!(
+        publish.contains("a4b57aca"),
+        "the publish paragraph names the item that retired the default hold:\n{publish}"
+    );
+    for needle in ["renew-checkout", "boss dispatch --next"] {
+        assert!(p.contains(needle), "drain.md no longer names `{needle}`");
+    }
+    let force = p
+        .lines()
+        .find(|l| l.contains("--force-standard"))
+        .expect("drain.md names `--force-standard`, the urgent-first door's escape");
+    assert!(
+        force.contains("Never pass"),
+        "`--force-standard` is named only to forbid it:\n{force}"
+    );
+    assert!(
+        p.contains("up to 8 builder") && p.contains("The cap is 8"),
+        "the builder cap is 8 (David, 2026-11-09)"
+    );
+    assert!(!p.contains("at most 5 builder"), "the old cap of 5 is gone");
 }

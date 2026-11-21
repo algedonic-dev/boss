@@ -86,12 +86,17 @@ use boss_jobs::cadence::{CadenceRuleSpec, PgCadence};
 use boss_jobs::cadence_seed::{cadence_beside, seed_cadence_rules};
 use boss_jobs::delivery::{DeliveryPolicySpec, PgDeliveryPolicy};
 use boss_jobs::delivery_policy_seed::{delivery_policy_beside, seed_delivery_policies};
+use boss_jobs::pools::{
+    PgPools, PoolSpec, load_pools, pools_beside, seed_pools, validate_pool_stations,
+    validate_step_declarations,
+};
 use boss_jobs::registry::PgWorkflows;
 use boss_jobs::seed_loader::{
     SeedLoaderError, load_cadence_rules, load_delivery_policies, load_stations, load_step_plugins,
     load_workflows,
 };
 use boss_jobs::station_seed::{seed_stations, stations_beside};
+use boss_jobs::step_executor::{Declarations, RoleVocabulary, declares_a_role, live_role_codes};
 use boss_jobs::step_plugin_seed::{seed_step_plugins, step_plugins_beside};
 use boss_jobs::workflow_seed::seed_workflows;
 use boss_jobs::{PgStations, PgStepPlugins, StationSpec, StepPluginSpec};
@@ -120,6 +125,9 @@ struct Cli {
     /// launchers that already pass `--seed-path` needed no edit.
     #[arg(long)]
     stations_path: Option<PathBuf>,
+    /// Factory pools beside the workflow directory; no capacity is inferred.
+    #[arg(long)]
+    pools_path: Option<PathBuf>,
 
     /// The step-plugin bundle: a directory of `<kind>.toml` files.
     /// Defaults to the `step-plugins` directory BESIDE `--seed-path`
@@ -204,6 +212,18 @@ fn load_station_bundle(cli: &Cli) -> Result<Option<(PathBuf, Vec<StationSpec>)>>
     )
 }
 
+fn load_pool_bundle(cli: &Cli) -> Result<Option<(PathBuf, Vec<PoolSpec>)>> {
+    load_sibling_bundle(
+        cli,
+        "platform-pool-seed",
+        "pools",
+        "--pools-path",
+        &cli.pools_path,
+        pools_beside,
+        |dir| load_pools(dir),
+    )
+}
+
 fn load_step_plugin_bundle(cli: &Cli) -> Result<Option<(PathBuf, Vec<StepPluginSpec>)>> {
     load_sibling_bundle(
         cli,
@@ -275,6 +295,88 @@ async fn main() -> Result<()> {
     // published, so a half-seeded deployment is not a state this binary
     // can leave behind.
     let stations = load_station_bundle(&cli)?;
+    let resource_pools = load_pool_bundle(&cli)?;
+    let declared_pools = resource_pools
+        .as_ref()
+        .map(|(_, p)| p.as_slice())
+        .unwrap_or_default();
+    let declared_stations = stations
+        .as_ref()
+        .map(|(_, s)| s.as_slice())
+        .unwrap_or_default();
+    // The declaration lint, on what the tree declares: pools for a
+    // `resources` block and a `model:` executor, station rows for an
+    // `equipment:` executor (factory taxonomy M3, item 0a78f8f8). A
+    // `role:` executor waits for the Class registry, read below.
+    let tree_declarations = Declarations {
+        pools: declared_pools,
+        stations: declared_stations,
+        roles: RoleVocabulary::NotReadHere,
+    };
+    let failures = validate_step_declarations(&specs, &tree_declarations);
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "resource-pool declaration lint failed before any publish:\n{}",
+            failures.join("\n")
+        );
+    }
+    // A pool's `station` names a row of the same station bundle (pass
+    // item 3 of design ccfe87ff, backlog 56efd9c2). This seed is the one
+    // door a pool row is published through, so an unknown station is
+    // refused here, by name, before any row of any registry is written.
+    let failures = validate_pool_stations(declared_pools, declared_stations);
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "pool station lint failed before any publish:\n{}",
+            failures.join("\n")
+        );
+    }
+    // A station's `edges` name rows of the same bundle (pass item 4 of
+    // design ccfe87ff, backlog 1bb8c479), refused here for the same
+    // reason a pool's station is: this seed is the one door a platform
+    // station row is published through. The live authoring door asks
+    // the same function of each row it publishes (backlog 5b80b9f4).
+    let failures =
+        boss_jobs::stations::validate_station_edges(declared_stations, declared_stations);
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "station edge lint failed before any publish:\n{}",
+            failures
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+    // A station's placement overlaps no sibling's on its parent's floor
+    // (backlog e3a927c3), refused here for the reason an edge is: this
+    // seed is the one door a platform station row is published through,
+    // and the live door asks the same function of each row it publishes.
+    let failures =
+        boss_jobs::stations::validate_station_placements(declared_stations, declared_stations);
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "station placement lint failed before any publish:\n{}",
+            failures
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+    // The station tree (T2 of design 4b27a65a, backlog 3f58c823): one
+    // root, every parent declared, no cycle, and no station holding more
+    // of a pool than the station it stands in. Judged across the station
+    // and pool bundles here, at the one door both are published through,
+    // before any row of any registry is written.
+    let failures =
+        boss_jobs::station_tree::validate_station_tree(declared_stations, declared_pools);
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "station tree lint failed before any publish:\n{}",
+            failures.join("\n")
+        );
+    }
     let step_plugins = load_step_plugin_bundle(&cli)?;
     let cadence = load_cadence_bundle(&cli)?;
     let delivery_policy = load_delivery_policy_bundle(&cli)?;
@@ -288,6 +390,60 @@ async fn main() -> Result<()> {
         .connect(&cli.database_url)
         .await
         .context("connecting to Postgres")?;
+    // A `role:` executor names an employee role Class, and roles live in
+    // the `classes` table — some declared through its door and in no
+    // migration — so they are judged here, against the live rows, still
+    // before any publish. Read only when a step declares one, so a
+    // bundle declaring none adds nothing to the boot path.
+    if declares_a_role(&specs) {
+        let roles = live_role_codes(&pool)
+            .await
+            .context("reading the employee role Classes a role executor names")?;
+        let live_declarations = Declarations {
+            roles: RoleVocabulary::Read(&roles),
+            ..tree_declarations
+        };
+        let failures = validate_step_declarations(&specs, &live_declarations);
+        if !failures.is_empty() {
+            anyhow::bail!(
+                "executor declaration lint failed before any publish:\n{}",
+                failures.join("\n")
+            );
+        }
+    }
+    // An equipment station's automaton is a REGISTERED automation
+    // (backlog d0cf2cdc): the question the live publish door asks, asked
+    // of every station row here, still before any publish. Registered
+    // means what `automation_actors` holds once this run has declared the
+    // automations bundle: the rows held now and the rows about to land
+    // (the automations are declared after the stations below).
+    if !declared_stations.is_empty() {
+        let mut registered: Vec<String> = PgAgents::new(pool.clone())
+            .list_automations()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("reading the automations registry an equipment station names")?
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        registered.extend(
+            automations
+                .iter()
+                .flat_map(|(_, rows)| rows.iter().map(|a| a.id.clone())),
+        );
+        let failures =
+            boss_jobs::stations::validate_station_automatons(declared_stations, &registered);
+        if !failures.is_empty() {
+            anyhow::bail!(
+                "station automaton lint failed before any publish:\n{}",
+                failures
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+    }
     let registry = PgWorkflows::for_bootstrap(pool.clone());
     let actor = ActorId::Automation(SEED_ACTOR.trim_start_matches("automation:").to_string());
     // Bootstrap runs before the clock-api is necessarily up, so this
@@ -301,6 +457,14 @@ async fn main() -> Result<()> {
     let clock: std::sync::Arc<dyn boss_clock_client::ClockClient> =
         std::sync::Arc::new(boss_clock_client::WallClockClient);
     let now = boss_clock_client::now_from(&clock).await;
+
+    if let Some((_, pool_specs)) = resource_pools {
+        let registry = PgPools::new(pool.clone());
+        let report = seed_pools(&registry, &pool_specs, &actor, now, cli.dry_run)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!("{report}");
+    }
 
     // Present means ANY version — the decision is `bundle_seed`'s, the
     // same table the stations and step plugins below read. Until

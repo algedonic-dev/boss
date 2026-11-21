@@ -31,11 +31,11 @@ import { scaled } from '../../src/dev-load';
 // read parses its shape in src/exec/exec.ts and answers a wrong one as
 // a failed read, so the catch-all paints a failure line, not a crash.
 //
-// /ux/finance LEFT THIS GROUP on 2026-09-25 (page audit 3f964c57): its
+// /ux/finance (now /finance) LEFT THIS GROUP on 2026-09-25 (page audit 3f964c57): its
 // statements have faithful fixtures in _smokeMocks.ts (COMMERCE_SUMMARY,
 // AP_AGING, LEDGER_STATEMENTS), so it is crawled from ROUTES.
 //
-// /it/operate/audit LEFT THIS GROUP on 2026-09-23 (page audit 65a273d5):
+// /operations/audit LEFT THIS GROUP on 2026-09-23 (page audit 65a273d5):
 // its stats read now has a faithful fixture, EVENTS_STATS in
 // _smokeMocks.ts, so it is crawled from ROUTES.
 //
@@ -139,7 +139,7 @@ test.describe('route smoke — every surface renders without a runtime crash', (
     const errors: string[] = [];
     page.on('pageerror', (e) => errors.push(e.message));
 
-    await page.goto(`/it/registry/authoring/${JOB_ID}`);
+    await page.goto(`/engineering/registry/authoring/${JOB_ID}`);
     await expect(page.locator('.app-shell')).toBeVisible();
     // Wait for the lazy graph + the step-authoring surface (which mounts
     // StepDagEditor) to render the seeded spec — or for the throw this
@@ -167,10 +167,7 @@ test.describe('the crawl covers every registered surface', () => {
   // the only shape that cannot drift between the two crawls.
 
   test('no deferral names a route that does not exist', async () => {
-    const { ROUTE_CATALOG } = await import('../../src/shell/nav-catalog');
-    const registered = new Set(
-      Object.values(ROUTE_CATALOG).map((r) => (r as { path: string }).path),
-    );
+    const registered = await catalogPaths();
     const ghosts = [...DEFERRED.keys()].filter((p) => !registered.has(p)).sort();
     expect(
       ghosts,
@@ -180,18 +177,15 @@ test.describe('the crawl covers every registered surface', () => {
   });
 
   test('every catalog route is crawled or deferred with a reason', async () => {
-    const { ROUTE_CATALOG } = await import('../../src/shell/nav-catalog');
     const openedAs = await patternOf();
-    // A parameterised catalog path (/it/registry/rules/:ruleName) is a
+    // A parameterised catalog path (/engineering/registry/rules/:ruleName) is a
     // pattern no crawl can open, so it counts as crawled when a ROUTES
     // row OPENS as it — routePattern, the spelling surface-opens records
     // and the catalog uses. This filter used to drop every path with a
     // `:` on the comment "covered by the detail routes above", which
     // nothing checked: no row rendered the rule editor (backlog d7732e88).
     const crawled = new Set([...ROUTES, ...ROUTES.map(openedAs)]);
-    const missing = Object.values(ROUTE_CATALOG)
-      .map((r) => (r as { path: string }).path)
-      .filter((p) => typeof p === 'string')
+    const missing = [...(await catalogPaths())]
       .filter((p) => !crawled.has(p) && !DEFERRED.has(p))
       .sort();
     expect(
@@ -207,8 +201,8 @@ test.describe('the crawl covers every registered surface', () => {
     // path is that pattern (car 3071e235), so its row must open as it,
     // or the editor is registered and never rendered (backlog d7732e88).
     const openedAs = await patternOf();
-    const editors = ROUTES.filter((r) => openedAs(r) === '/it/registry/rules/:ruleName');
-    expect(editors).toEqual(['/it/registry/rules/auto-park-on-gate-green']);
+    const editors = ROUTES.filter((r) => openedAs(r) === '/engineering/registry/rules/:ruleName');
+    expect(editors).toEqual(['/engineering/registry/rules/auto-park-on-gate-green']);
   });
 });
 
@@ -219,5 +213,16 @@ test.describe('the crawl covers every registered surface', () => {
 async function patternOf(): Promise<(path: string) => string> {
   const { parseRoute } = await import('../../src/router');
   const { routePattern } = await import('../../src/shell/surface-opens');
-  return (path) => routePattern(parseRoute(path), path);
+  const { ADDRESSES } = await import('../fixtures/station-tree');
+  return (path) => routePattern(parseRoute(path, '', ADDRESSES), path);
+}
+
+/// Every catalogued page's path as the tree the floor serves places it: a
+/// hosted page's path is its host station's address plus its slug
+/// (backlog 0bc2eb68), and the crawl opens it at that address.
+async function catalogPaths(): Promise<ReadonlySet<string>> {
+  const { ROUTE_CATALOG } = await import('../../src/shell/nav-catalog');
+  const { pagePath } = await import('../../src/shell/page-address');
+  const { ADDRESSES } = await import('../fixtures/station-tree');
+  return new Set(Object.values(ROUTE_CATALOG).flatMap((r) => pagePath(r, ADDRESSES) ?? []));
 }

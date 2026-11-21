@@ -16,6 +16,7 @@
   import { onMount } from 'svelte';
   import type { Remote } from '../../data/remote';
   import { catalogPaths, loadSurfaceRollup, neverOpened, perActor, uncatalogued, type Rollup } from './surfaces';
+  import { stationAddresses } from '../../shell/stationAddresses.svelte';
 
   /** The reading's window. Seven days: the week David asked for. */
   const DAYS = 7;
@@ -29,7 +30,9 @@
 
   const ready = $derived(rollup.kind === 'ready' ? rollup.data : null);
   const actors = $derived(ready ? perActor(ready.rows) : []);
-  const roster = catalogPaths();
+  // Read against the tree: this section renders on the Codebase page,
+  // which the router reached only through the read tree (0bc2eb68).
+  const roster = $derived(catalogPaths(stationAddresses()));
   const unopened = $derived(ready ? neverOpened(ready.rows, roster) : []);
   /** Opened routes outside the roster (13ded76c part a): the candidate
    *  list cannot see them, so they are listed on their own. */

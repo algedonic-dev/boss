@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use boss_clock_client::ClockClient;
 use boss_core::publisher::DomainPublisher;
 use boss_core::roles::{ANONYMOUS_VISITOR_IDS, PLATFORM_ADMIN_ROLE, is_anonymous_visitor_role};
-use boss_policy_client::writes::{require_reaching, require_reaching_row};
+use boss_policy_client::writes::{require_reaching, require_reaching_row, row_refusal};
 use boss_policy_client::{CurrentUser, Pair, PolicyClient, User, controls};
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
@@ -306,12 +306,16 @@ async fn get_assign(
         Err(refused) => return refused,
     };
     match state.repo.get_assignment(id).await {
-        // The caller named an id, not an employee, so the refusal
-        // names nobody: echoing the row's tech_id would answer whose
-        // assignment it is, which is what is being refused.
-        Ok(Some(row)) if !who.admits(&row.tech_id) => super::access::not_in_scope(),
-        Ok(Some(row)) => Json(row).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, id.to_string()).into_response(),
+        Ok(Some(row)) if who.admits(&row.tech_id) => Json(row).into_response(),
+        // Only a grant at `all` may know every id there is, so only it
+        // is told an id does not exist.
+        Ok(None) if who.only().is_none() => (StatusCode::NOT_FOUND, id.to_string()).into_response(),
+        // The caller named an id, not an employee, so the refusal names
+        // nobody, and reads the same for another's row and for an id
+        // that does not exist: a 403-vs-404 split answered which guessed
+        // ids are real (backlog 12875389, the review of a621d091). It is
+        // the write doors' one refusal by id (`require_reaching_row`).
+        Ok(_) => row_refusal(controls::READ_SCHEDULE),
         Err(e) => err(e),
     }
 }

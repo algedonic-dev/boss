@@ -25,9 +25,11 @@
 //!    name twenty `step-signoff:<role>` resources no default gives it.
 //! 2. Break-glass repairs, it does not invent: a rule it writes must
 //!    equal a row core ships, and it writes no override at all — core
-//!    ships none, so none is a repair (H2). It may retire one, which
-//!    returns that user to the role rules, judged like anyone's
-//!    retirement.
+//!    ships none, so none is a repair (H2). It may retire one on
+//!    `policy-rule` — the lockout it exists for — which returns that
+//!    user to the role rules, judged like anyone's retirement; any other
+//!    retirement would lift a suspension it could not impose (backlog
+//!    912da9b7).
 //! 4. A write is judged by its effect: a row that exists, live or not,
 //!    makes an upsert an Update; ending a live override narrower than
 //!    `all` hands back whatever the user's role grants — up to `all`,
@@ -288,8 +290,23 @@ pub fn judge_override(
     held.about(row.action, &row.resource)?;
     if held.role == BREAK_GLASS_ROLE && write.is_some() {
         return Err(format!(
-            "break-glass repairs what core ships, and core ships no override; it may retire {}'s \
-             override on {} {}, which returns that user to the role rules, and write none",
+            "break-glass repairs what core ships, and core ships no override; it writes none, and \
+             retires one only on policy-rule ({}'s on {} {} as written)",
+            row.user_id,
+            row.action.as_str(),
+            row.resource.as_str(),
+        ));
+    }
+    // Backlog 912da9b7: retiring a deny on anything it held let
+    // break-glass lift a suspension it cannot impose — a plain grant's
+    // retirement is a Delete, which it never holds — so the emergency key
+    // widened and could not narrow. The lockout it exists for is a deny
+    // on the policy table; that is the one it lifts.
+    if held.role == BREAK_GLASS_ROLE && row.resource != Resource::policy_rule() {
+        return Err(format!(
+            "break-glass retires an override only on policy-rule, the lever a policy lockout is \
+             made of; {}'s override on {} {} is not one, so it stays until someone holding \
+             that grant retires it",
             row.user_id,
             row.action.as_str(),
             row.resource.as_str(),

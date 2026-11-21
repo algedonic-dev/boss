@@ -69,7 +69,7 @@ async fn an_unfenced_definition_snapshot_is_not_an_atomic_claim_authority() {
     let mut station = StationSpec::draft(
         "fixture",
         "Fixture",
-        StationKind::Batch,
+        StationKind::Group,
         StationPredicate {
             kind: Some("fixture".into()),
             step: Some(StepMatch {
@@ -91,6 +91,7 @@ async fn an_unfenced_definition_snapshot_is_not_an_atomic_claim_authority() {
         station,
         scope: JobScope::All,
         active_workflows: Default::default(),
+        tree_selection: None,
         validated_job: job,
         validated_step: step.clone(),
     };
@@ -231,7 +232,7 @@ async fn a_busy_station_writer_releases_earlier_definition_owners() {
     let mut station = StationSpec::draft(
         "fixture",
         "Fixture",
-        StationKind::Batch,
+        StationKind::Group,
         StationPredicate {
             kind: Some("fixture".into()),
             step: Some(StepMatch {
@@ -265,6 +266,7 @@ async fn a_busy_station_writer_releases_earlier_definition_owners() {
         station,
         scope: JobScope::All,
         active_workflows: Default::default(),
+        tree_selection: None,
         validated_job: job,
         validated_step: step.clone(),
     };
@@ -352,7 +354,7 @@ async fn a_competing_original_receipt_survives_owner_retirement_before_lock_acqu
     let mut station = StationSpec::draft(
         "fixture",
         "Fixture",
-        StationKind::Batch,
+        StationKind::Group,
         StationPredicate {
             kind: Some("fixture".into()),
             step: Some(StepMatch {
@@ -386,6 +388,7 @@ async fn a_competing_original_receipt_survives_owner_retirement_before_lock_acqu
         station,
         scope: JobScope::All,
         active_workflows: Default::default(),
+        tree_selection: None,
         validated_job: job,
         validated_step: step.clone(),
     };
@@ -514,7 +517,7 @@ async fn an_override_expiring_after_owner_acquisition_refuses_at_actual_commit()
     let mut station = StationSpec::draft(
         "fixture",
         "Fixture",
-        StationKind::Batch,
+        StationKind::Group,
         StationPredicate {
             kind: Some("fixture".into()),
             step: Some(StepMatch {
@@ -583,6 +586,7 @@ async fn an_override_expiring_after_owner_acquisition_refuses_at_actual_commit()
         station,
         scope: JobScope::All,
         active_workflows: Default::default(),
+        tree_selection: None,
         validated_job: job,
         validated_step: step.clone(),
     };
@@ -612,8 +616,15 @@ async fn an_override_expiring_after_owner_acquisition_refuses_at_actual_commit()
     );
 }
 
+/// A STATION CLAIM IS BOUNDED BY ITS POOL ALONE (backlog 3e927996). The
+/// in-memory writer used to count the actor's open `agent-run` packets
+/// under its own lock against the row's `max_concurrent_runs` and refuse
+/// at the cap — a second bound beside the `robots:<model>` pool, which
+/// David's design a3c5e58a Q3 retired. A row still declaring a cap of
+/// one, with one run open, is admitted, and the receipt carries no run
+/// population: nothing was counted.
 #[tokio::test]
-async fn a_run_population_change_after_observation_refuses_under_the_actual_jobs_owner() {
+async fn a_run_population_past_the_rows_declared_cap_admits_the_station_claim() {
     use boss_jobs::station_claim::{ActorSelectionObservation, RegistrySelectionFence};
     let request_id = uuid::Uuid::new_v4();
     let repo = std::sync::Arc::new(InMemoryJobs::for_selection_fixture());
@@ -635,7 +646,7 @@ async fn a_run_population_change_after_observation_refuses_under_the_actual_jobs
     let mut station = StationSpec::draft(
         "fixture",
         "Fixture",
-        StationKind::Batch,
+        StationKind::Group,
         StationPredicate {
             kind: Some("fixture".into()),
             step: Some(StepMatch {
@@ -663,13 +674,16 @@ async fn a_run_population_change_after_observation_refuses_under_the_actual_jobs
     boss_jobs::agents::AgentsRegistry::publish(
         &*agents,
         &[boss_jobs::agents::AgentInput {
+            factory_rotation: Some(true),
             id: "agent-worker".into(),
             display_name: "Worker".into(),
             default_model: "test-model".into(),
+            model_class: None,
             role: None,
             department: None,
             hourly_budget_usd_micros: None,
             max_concurrent_runs: Some(1),
+            stations: None,
             aliases: vec![],
         }],
         boss_core::publish::PublishMode::InsertIfAbsent,
@@ -695,20 +709,11 @@ async fn a_run_population_change_after_observation_refuses_under_the_actual_jobs
         station,
         scope: JobScope::All,
         active_workflows: Default::default(),
+        tree_selection: None,
         validated_job: job,
         validated_step: step.clone(),
     };
 
-    let filter = boss_jobs::port::JobFilter {
-        kind: Some(boss_jobs::agent_budget::RUN_KIND.into()),
-        status: Some(JobStatus::Open),
-        ..Default::default()
-    };
-    let (observed, _) = repo.list_jobs(&filter, 100, 0).await.unwrap();
-    assert_eq!(
-        boss_jobs::agent_budget::in_flight_runs(&observed, &["agent-worker".into()]),
-        0
-    );
     let mut run = Job::new(
         boss_jobs::agent_budget::RUN_KIND,
         Subject::new("custom", "new-run"),
@@ -720,54 +725,30 @@ async fn a_run_population_change_after_observation_refuses_under_the_actual_jobs
     run.status = JobStatus::Open;
     run.metadata[boss_jobs::agent_budget::RUN_AGENT_KEY] = serde_json::json!("agent-worker");
     repo.create_job(&run).await.unwrap();
-    let (current, _) = repo.list_jobs(&filter, 100, 0).await.unwrap();
-    assert_eq!(
-        boss_jobs::agent_budget::in_flight_runs(&current, &["agent-worker".into()]),
-        1
-    );
-    let before_events = serde_json::to_value(repo.recorded_events()).unwrap();
     let stamp = boss_core::publisher::EventStamp::new(
         "jobs",
         boss_core::actor::ActorId::human("agent-worker"),
     );
-    let result = repo
-        .claim_station_head_at(&context, "agent-worker", &[], &stamp, &[])
-        .await;
-    assert!(
-        matches!(result, Err(JobsError::SelectionConflict(_))),
-        "same-store run writer reached cap after observed zero"
-    );
-    assert_eq!(repo.get_step(&step.id).await.unwrap().unwrap(), step);
-    assert_eq!(
-        serde_json::to_value(repo.recorded_events()).unwrap(),
-        before_events
-    );
-    assert!(
-        repo.station_claim_receipt(context.request_id)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    run.status = JobStatus::Closed;
-    repo.update_job(&run).await.unwrap();
     let claimed = repo
         .claim_station_head_at(&context, "agent-worker", &[], &stamp, &[])
         .await
-        .unwrap();
+        .expect("one open run against a declared cap of one bounds nothing");
     let receipt = match claimed {
         boss_jobs::station_claim::SelectionResult::Claimed { receipt, .. } => receipt,
-        _ => panic!("drained population must admit fresh claim"),
+        _ => panic!("a run population past the row's cap must admit the claim"),
     };
-    run.id = boss_core::job::JobId::new();
-    run.status = JobStatus::Open;
-    repo.create_job(&run).await.unwrap();
+    let body: serde_json::Value = serde_json::from_str(receipt.json()).unwrap();
+    assert!(
+        body.pointer("/owner_consumption/run_population").is_none(),
+        "no run population is counted: {body}"
+    );
     let replayed = repo
         .claim_station_head_at(&context, "agent-worker", &[], &stamp, &[])
         .await
         .unwrap();
     assert!(
         matches!(replayed, boss_jobs::station_claim::SelectionResult::Replayed(original) if original.json() == receipt.json()),
-        "replayed original is not a fresh population acquisition"
+        "a replay returns the original receipt"
     );
 }
 

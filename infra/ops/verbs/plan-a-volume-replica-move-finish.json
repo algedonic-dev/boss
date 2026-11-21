@@ -1,0 +1,23 @@
+{
+  "about": "READ-ONLY: renders what `finish-volume-replica-move` WOULD do to finish (or undo) a move-volume-replica-to-disk that stopped after its rebuild and before its delete, and does nothing (infra/forge/move-volume-replica.sh --plan-finish <volume> <replica>; backlog 6d0b3c96). WHY: the signed move 02035ff0 (2026-11-17) raised boss/pgdata-postgres-0 to 4 replicas and its new replica on w-3's u-postgres outlasted the 1200 s rebuild wait; the run failed as designed, put the selector back and deleted nothing, which left 4 healthy replicas on 3 nodes with w-3 holding two — refused by the move's plan (one replica per node) and by plan-a-volume-replica-retirement (two share a node), so no verb could take it further. The plan holds the volume to exactly that shape: attached, robustness healthy, every replica healthy and active, M replicas on M-1 distinct nodes, the named replica's node holding exactly one other replica on another disk (so no node loses its copy), and the declared count M (the lower still to make) or M-1 (a finish stopped after its lower; step 1 then only tests it); the move's trim bounds (data locality disabled, replica auto-balance resolving to disabled, no eviction on any replica, its node or its disk), so Longhorn removes nothing of its own choosing on the lowered count; spec.replicaSoftAntiAffinity enabled only as the move's held state (spec.diskSelector the tags of one of the pair's disks), which the finish clears to [] and ignored, Longhorn's defaults, saying in the plan that what the volume carried before the move is not recorded on it — any other value of the two is tested and left; and the selector after the finish admitting every remaining replica's disk as Longhorn reads it (allow-empty-disk-selector-volume read). Name the OLD replica to finish the move, the NEW one to restore the volume. The plan prints the shape, the replica that goes and the one that stays with both disks, the count's path, the selector and anti-affinity before and after, the one compare-and-set patch verbatim, the delete, the read-back and every replica. No clock, live free space or actualSize in the signed bytes. Its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1). Every read goes through the forge's ops_kubectl door; a read that could not look is CANNOT ANSWER (exit 1), never a plan. Any refusal renders no plan (exit 78).",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/move-volume-replica.sh",
+    "--plan-finish",
+    "{1}",
+    "{2}"
+  ],
+  "params": [
+    {
+      "name": "volume",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    {
+      "name": "replica",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-r-[0-9a-f]{8}$"
+    }
+  ],
+  "timeout": 120
+}

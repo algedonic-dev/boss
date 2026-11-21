@@ -1,4 +1,4 @@
-// /ux/inbox — a way out for finished messages (page audit 5477d9eb,
+// /me/inbox — a way out for finished messages (page audit 5477d9eb,
 // GAP 8; backlog 5963a322), and the archived rows kept off the page
 // (GAP 2; backlog 8578b91e).
 //
@@ -13,9 +13,9 @@
 
 import { expect, test, type Page, type Route } from './_test';
 import { inboxPage, installApiFloor, servePeopleRows } from './_smokeMocks';
-import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
+import { pageAt } from '../fixtures/station-tree';
 
-const PATH = ROUTE_CATALOG.inbox.path;
+const PATH = pageAt('inbox');
 
 const json = (r: Route, b: unknown, status = 200) =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(b) });

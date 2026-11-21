@@ -1,7 +1,28 @@
 import { describe, expect, test } from 'bun:test';
 import type { JobLite, StepLite } from './yard';
-import { SIGNALS_SHOWN, yardSignals } from './yard-signals';
+import { SIGNALS_SHOWN, yardSignals, visibleSignals } from './yard-signals';
 import { testNet1 } from '../../../tests/fixtures/test-values';
+
+test('a stamped maintenance sweep names its actual WHO instead of an operator request', () => {
+  const packet: JobLite = {
+    id: 'sweep', kind: 'maintenance-disk-floor-sweep', title: 'Disk floor sweep',
+    status: 'closed', opened_on: '2026-11-02',
+    metadata: { opened_at: '2026-11-02T01:00:00Z', closed_at: '2026-11-02T01:00:02Z' },
+    steps: [{ title: 'Sweep', spec_slug: 'act', status: 'completed', metadata: { completed_at: '2026-11-02T01:00:01Z', exit_code: '0' } }],
+  };
+  const signals = yardSignals([], [], [packet]);
+  expect(signals).toHaveLength(1);
+  expect(signals[0]?.who).toBe('sweeper');
+  expect(signals[0]?.at).toBe('2026-11-02T01:00:01Z');
+  expect(signals[0]?.packetId).toBe('sweep');
+});
+
+test('routine is opt-in without hiding a refusal or hand intervention', () => {
+  const base = { id: 'a', at: '2026-11-02T01:00:00Z', who: 'sweeper' as const, what: 'sweep', packetId: 'packet', hand: false };
+  const rows = [{ ...base, sev: 'ok' as const }, { ...base, id: 'b', sev: 'err' as const }, { ...base, id: 'c', hand: true, sev: 'ok' as const }];
+  expect(visibleSignals(rows, false).map((row) => row.id)).toEqual(['b', 'c']);
+  expect(visibleSignals(rows, true)).toEqual(rows);
+});
 
 // The signals panel: what fired what, newest first, read off the
 // packets' own completed steps. Who is derived from the packet kind

@@ -5,7 +5,8 @@
 # three deploy scripts — so the paths and the atomic-flip mechanics cannot
 # drift between the three (CLAUDE.md §9a — a fact that lives twice).
 #
-# Layout (docs/design/deployment-as-network.md, Q1):
+# Layout (deployment-as-network Q1, folded into docs/architecture-decisions.md,
+# Deployment, the forge, and the cluster):
 #
 #   /usr/local/boss/
 #     releases/<sha>/        one generation, keyed by the deployed

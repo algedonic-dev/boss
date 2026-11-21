@@ -103,7 +103,8 @@ use serde_json::{Value, json};
 
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 
-use super::common::{api_client, get_json, owner_for_filing, post_json, rows_or_refuse};
+use super::alarm_item::{self, Occurrence};
+use super::common::{api_client, get_json, owner_for_filing, rows_or_refuse};
 use super::estate_compare::{DOOR_SCOPE, HOST_SCOPE, KNOWN_SCOPE, UNITS_SCOPE, VOLUMES_SCOPE};
 
 /// Consecutive same-series comparisons a hard finding must survive to
@@ -323,7 +324,8 @@ fn entries<'a>(comparison: &'a Value, field: &str) -> impl Iterator<Item = &'a V
 /// ([`hard_findings`]) and by recovery's evidence test ([`evaluated`]),
 /// so a class cannot be raisable without the recovery knowing where its
 /// evaluation is recorded (backlog c11bfb77).
-pub(super) const HARD_CLASSES: [(&str, &str); 7] = [
+pub(super) const HARD_CLASSES: [(&str, &str); 9] = [
+    ("dispatcher_lag", "dispatcher_lag"),
     ("not_ready", "not_ready"),
     ("declared_not_observed", "gone"),
     // The host scope's disk floor (49a8d842): a machine below the
@@ -352,6 +354,9 @@ pub(super) const HARD_CLASSES: [(&str, &str); 7] = [
     // said no. Keyed host + unit: the same unit sick on two hosts is
     // two conditions.
     ("units_unhealthy", "unit_unhealthy"),
+    // A declared producer's native failed Job is independent of its
+    // mounted filesystem figures and of any maintenance packet opener.
+    ("scheduled_job_failed", "scheduled_job_failed"),
 ];
 
 /// The classes a comparator can be BLIND to, as `(the findings field
@@ -365,9 +370,11 @@ pub(super) const HARD_CLASSES: [(&str, &str); 7] = [
 /// gap, as an empty list. Raised as `blind:<hard field>/<id>`; recovery
 /// reads the hard field's `evaluated` list, so the two names must agree
 /// (pinned by `every_blind_class_blinds_a_hard_class`).
-pub(super) const BLIND_CLASSES: [(&str, &str); 2] = [
+pub(super) const BLIND_CLASSES: [(&str, &str); 4] = [
+    ("dispatcher_lag_unmeasured", "dispatcher_lag"),
     ("ops_credentials_unmeasured", "ops_credentials_absent"),
     ("disk_unmeasured", "disk_tight"),
+    ("scheduled_job_unmeasured", "scheduled_job_failed"),
 ];
 
 /// The prefix of a blind class's keys (`blind:<hard field>/<id>`).
@@ -677,20 +684,6 @@ fn settled_recently(closed_jobs: &[Value], now: DateTime<Utc>) -> BTreeSet<Strin
         .collect()
 }
 
-/// `estate_finding` keys already carried by an open packet — the dedup
-/// set, pure over the jobs listing.
-fn already_raised(open_jobs: &[Value]) -> BTreeSet<String> {
-    open_jobs
-        .iter()
-        .filter_map(|j| {
-            j.get("metadata")?
-                .get("estate_finding")?
-                .as_str()
-                .map(str::to_string)
-        })
-        .collect()
-}
-
 /// Did the dedup read return every matching row? A page that came back
 /// shorter than the list's own `total` (`rows < total`) was TRUNCATED
 /// and cannot prove a finding unraised — treating it as complete
@@ -792,9 +785,10 @@ fn blind_body(
              `{class}` for `{id}` on {PERSIST_N} consecutive `{scope}` comparisons, \
              so that hard class is BLIND there — its alarm cannot fire, and silence \
              reads as health. The reading, verbatim: {state}. Latest entry: \
-             {latest}. Evidence: {evidence}. It closes itself once {PERSIST_N} \
+             {latest}. Evidence: {evidence}. It marks itself RECOVERED once {PERSIST_N} \
              comparisons list `{id}` in `evaluated.{class}` (estate.recover, \
-             c11bfb77). The series rides /api/estate/comparisons?scope={scope}.",
+             c11bfb77), and closes after a hold window with no relapse (f4b0ad41). \
+             The series rides /api/estate/comparisons?scope={scope}.",
             latest = excerpt(entry),
         ),
     });
@@ -843,8 +837,9 @@ fn door_body(key: &str, entry: &Value, evidence: &str, owner: &str) -> Value {
              declared in infra/estate/doors.toml. Why the probe failed: \
              {reason}. The prober is infra/estate/observe-door.sh on the forge, \
              outside the pod, so this alarm does not depend on the pod it is \
-             about. It closes itself once the half answers again \
-             (estate.recover). Latest reading: {latest}. Evidence: {evidence}. \
+             about. It marks itself RECOVERED once the half answers again \
+             (estate.recover), and closes after a hold window with no relapse \
+             (f4b0ad41). Latest reading: {latest}. Evidence: {evidence}. \
              The series rides /api/estate/comparisons?scope=door.",
             door = text("door"),
             since = text("dark_since"),
@@ -1192,18 +1187,31 @@ impl Handler for EstateAlarm {
                         let (open_rows, closed_rows): (Vec<Value>, Vec<Value>) = rows
                             .into_iter()
                             .partition(|j| j.get("status").and_then(Value::as_str) == Some("open"));
-                        let mut raised = already_raised(&open_rows);
-                        raised.extend(settled_recently(&closed_rows, now));
+                        let settled = settled_recently(&closed_rows, now);
 
                         for (key, body) in to_raise {
-                            if raised.contains(&key) {
+                            // The open alarm for the finding is found by the
+                            // one definition every alarm reads (backlog
+                            // f4b0ad41). A persisting finding is the same
+                            // occurrence; its return on an alarm told it had
+                            // RECOVERED is recorded by `estate.recover`, on
+                            // the first reading that carries it again, so
+                            // one writer counts each relapse once.
+                            if alarm_item::open_item(&open_rows, "estate_finding", &key).is_some()
+                                || settled.contains(&key)
+                            {
                                 tracing::info!(finding = %key, "estate.alarm: already raised or recently settled — not re-raising");
                                 continue;
                             }
-                            if let Err(e) = post_json(
+                            let evidence = body["title"].as_str().unwrap_or_default().to_string();
+                            let occ = Occurrence::new(now.to_rfc3339(), evidence);
+                            if let Err(e) = alarm_item::raise(
                                 &self.client,
-                                &format!("{}/api/jobs", self.base()),
-                                &body,
+                                self.base(),
+                                None,
+                                body,
+                                &occ,
+                                Default::default(),
                                 &ctx.rule_name,
                             )
                             .await
@@ -1246,6 +1254,19 @@ impl Handler for EstateAlarm {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn dispatcher_lag_and_missing_measurements_use_the_existing_alarm_and_recovery_contract() {
+        let observation = json!({"observed_at":"2026-10-30T14:00:00Z","nodes":[],"dispatcher":{
+            "dead_letters_unrecorded":0,"rules_consumer_lag":{"status":"observed","observed_at_unix":1793368800,
+                "pending":1001,"ack_pending":12}}});
+        let comparison = super::super::estate_compare::compare(&[], &observation);
+        assert!(alarm_keys(&comparison).contains("dispatcher_lag:boss-dispatcher"));
+        assert!(evaluated(&comparison, "dispatcher_lag:boss-dispatcher"));
+        let unread = super::super::estate_compare::compare(&[], &json!({"nodes":[]}));
+        assert!(alarm_keys(&unread).contains("blind:dispatcher_lag/boss-dispatcher"));
+        assert!(!evaluated(&unread, "dispatcher_lag:boss-dispatcher"));
+    }
 
     fn comparison(scope: &str, not_ready: &[&str], gone: &[&str]) -> Value {
         json!({
@@ -1536,7 +1557,7 @@ mod tests {
     #[test]
     fn an_open_packet_with_the_key_suppresses_a_second() {
         let open = [json!({"metadata": {"estate_finding": "not_ready:cp-2"}})];
-        assert!(already_raised(&open).contains("not_ready:cp-2"));
+        assert!(alarm_item::open_item(&open, "estate_finding", "not_ready:cp-2").is_some());
     }
 
     #[test]
@@ -1572,16 +1593,16 @@ mod tests {
         // A COMPLETE read (all 250) finds the existing alarm and dedups.
         assert!(dedup_page_complete(open.len(), 250));
         assert!(
-            already_raised(&open).contains(key),
+            alarm_item::open_item(&open, "estate_finding", key).is_some(),
             "a complete read sees the alarm on page three"
         );
 
         // A TRUNCATED read (first 200 rows) MISSES it — this is the
-        // defect: `already_raised` returns "not raised" and the alarm
+        // defect: the lookup answers "not raised" and the alarm
         // re-files every pass...
         let truncated: Vec<Value> = open.iter().take(200).cloned().collect();
         assert!(
-            !already_raised(&truncated).contains(key),
+            alarm_item::open_item(&truncated, "estate_finding", key).is_none(),
             "the truncated page cannot see the alarm beyond row 200"
         );
         // ...so the completeness guard refuses to trust the page and the
@@ -2318,6 +2339,57 @@ mod per_host_series_tests {
     }
 
     #[tokio::test]
+    async fn failed_scheduled_backup_files_an_urgent_packet_from_native_comparisons() {
+        for (field, key) in [
+            (
+                "scheduled_job_failed",
+                "scheduled_job_failed:boss/boss-pg-backup",
+            ),
+            (
+                "scheduled_job_unmeasured",
+                "blind:scheduled_job_failed/boss/boss-pg-backup",
+            ),
+        ] {
+            let now = Utc::now();
+            let rows: Vec<Value> = (0..3).map(|i| {
+            let mut row = volumes_row(now - chrono::Duration::minutes(15 * i), 20.0);
+            row["payload"]["findings"]["disk_unmeasured"] = json!([]);
+            row["payload"]["findings"][field] = json!([{"id":"boss/boss-pg-backup", "job_uid":"failed-uid", "cronjob_uid":"cron-uid", "reason":"BackoffLimitExceeded"}]);
+            row["payload"]["evaluated"]["scheduled_job_failed"] = if field == "scheduled_job_failed" { json!(["boss/boss-pg-backup"]) } else { json!([]) };
+            row
+        }).collect();
+            let stub = serve(vec![
+                (
+                    "/api/estate/comparisons?scope=instance-volumes",
+                    json!({"data":rows,"total":3}),
+                ),
+                ("/api/estate/comparisons", empty_listing()),
+                ("/api/estate/observations", empty_listing()),
+                ("/api/jobs", empty_listing()),
+            ])
+            .await;
+            handler(stub.base.clone())
+                .invoke(&[], &firing_at(rows[0]["payload"].clone(), now))
+                .await
+                .unwrap();
+            let posts: Vec<Value> = stub
+                .sent()
+                .into_iter()
+                .filter(|(path, _)| path == "POST /api/jobs")
+                .map(|(_, body)| body)
+                .collect();
+            assert_eq!(posts.len(), 1, "{posts:?}");
+            assert_eq!(posts[0]["priority"], "urgent");
+            assert!(posts[0].to_string().contains("failed-uid"));
+            assert!(
+                raised(&stub).contains(&key.to_string()),
+                "{:?}",
+                raised(&stub)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_volume_under_its_floor_on_three_comparisons_files_disk_tight_for_its_claim() {
         let now = Utc::now();
         let rows: Vec<Value> = (0..3)
@@ -2362,7 +2434,7 @@ mod per_host_series_tests {
         for named in [
             "pgdata-postgres-0",
             "pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56",
-            "requests.storage",
+            "plan-an-instance-volume-expansion",
         ] {
             assert!(
                 detail.contains(named),

@@ -1,0 +1,18 @@
+{
+  "about": "Renders the Forgejo upgrade plan and pulls the requested release into the local system Docker image store to bind the approval to its image ID and registry digest. The plan states the registry, Actions and clone outage, the backup rotation, and the rollback target. It checks the current image and Forgejo health, and refuses when Actions containers, trains, gates or convergence are active or a converge hold stands. The SHA-256 printed on stderr is the hash David signs.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/upgrade-forgejo.sh",
+    "--plan",
+    "{1}"
+  ],
+  "params": [
+    {
+      "name": "version",
+      "pattern": "^[0-9]{1,4}\\.[0-9]{1,4}\\.[0-9]{1,4}$"
+    }
+  ],
+  "timeout": 420
+}

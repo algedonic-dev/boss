@@ -79,16 +79,10 @@
 
   <!-- Orientation in the order a visitor needs it: what can I do,
        what happens when I do it, what am I looking at. -->
+  <!-- "Buy some beer" opened /ux/shop, which went with step 1 of design
+       01fa5bdf; the work now moves on the station tree, not the map. -->
   <section class="guest-tour">
-    <button type="button" class="guest-tour-card" onclick={() => go('/shop')}>
-      <span class="guest-tour-h">Buy some beer →</span>
-      <span class="guest-tour-p">
-        Order direct from the brewhouse. Availability is read off the
-        warehouse as you look at it — if it says two left, there are
-        two.
-      </span>
-    </button>
-    <button type="button" class="guest-tour-card" onclick={() => go('/it')}>
+    <button type="button" class="guest-tour-card" onclick={() => go('/it/tree')}>
       <span class="guest-tour-h">Watch the work move →</span>
       <span class="guest-tour-p">
         Every order becomes a job packet that walks the same brewhouse,

@@ -1,0 +1,25 @@
+# The item half of `a-car-ends-when-its-run-ends-before-any-gate`
+# (backlog 366c9fb1).
+#
+# WHY. A car admitted at build answers its `backlog_item`. An item that
+# closes `declined`, `stale` or `duplicate` while its car still stands at
+# build will never be built under that car, and nothing else would move
+# the car off `build`. The same pure decision ends it
+# (`boss_jobs::car::ending_claim`): only a car no gate ever ran for — a
+# gated car is a delivery in progress, and its arrival or abandonment is
+# the train's and the reviewer's to record, not this rule's.
+[[rule]]
+name = "a-car-ends-when-its-item-closes-unbuilt"
+why = """
+A CROSS-PROTOCOL REACTOR: a `backlog-item` packet's declined, stale or
+duplicate terminal ends the `ship-a-change` car still at build for it —
+two protocols, so no single Workflow definition can declare it. Measured
+by builder run d659981f on car 0d04ee3e (2026-11-09): a declined item's
+admitted car had no lifecycle that ever moved it off build.
+"""
+version = 1
+on_event = "jobs.job.closed"
+when = 'kind = "backlog-item" AND (outcome = "declined" OR outcome = "stale" OR outcome = "duplicate")'
+[[rule.do]]
+handler = "jobs.end_unlaunched_car"
+args = { by = "\"item\"" }

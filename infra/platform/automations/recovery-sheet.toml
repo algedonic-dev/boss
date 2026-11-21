@@ -5,3 +5,5 @@
 id = "automation:recovery-sheet"
 role = "platform-admin"
 description = 'The recovery sheet CronJob: records the sheet a human recovers the estate from (infra/cluster/manifests/boss-recovery-sheet.yaml).'
+# Host station: vault (backlog 6ecb5480, station-tree.md section 6).
+station = "fa8b479f-1573-4153-9359-0ee123c3295c"

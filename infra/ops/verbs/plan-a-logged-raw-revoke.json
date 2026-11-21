@@ -1,0 +1,10 @@
+{
+  "about": "READ-ONLY: renders what `revoke-logged-calendar-tokens` WOULD do on ONE declared instance, and writes nothing (infra/forge/revoke-logged-calendar-tokens.sh --plan <namespace>; backlog 77dc1579, design d33dfbe5 decided by David 2026-09-26). The namespace is the only parameter: one DNS label, boss-dev refused by name, and a namespace infra/cluster/instances.toml declares (read through render-instance.sh --instances). The count is read from INSIDE the instance — one kubectl exec into its own deploy/boss, container boss, through the forge's kubectl — as GET /api/scheduling/calendar-tokens/logged-raw on the jobs port (sor-ports.env) on loopback, signed automation:ops-runner at audit-readonly, with that container's own machine token handed to curl as a 0600 header file by the image's copy of the one reader (never read out, copied or printed). The plan names the instance, the namespace, the route, the count and the one revoke it authorises; no clock in the bytes (the read time rides stderr); its sha256 is printed on stderr as `plan-sha256:`, and that hash is what a passkey signs (design 17835005 q1). An unreachable pod, a non-200 answer or a body with no whole logged_raw is CANNOT ANSWER (exit 1), never a plan. A count of 0 is a plan with nothing in it (`nothing_to_do`): prod measured 0, so its request closes through ops-request's nothing-to-do terminal and asks nobody.",
+  "hosts": ["forge"],
+  "nothing_to_do": "\\Aplan: revoke-logged-calendar-tokens\\ninstance: [a-z0-9_-]+\\nnamespace: [a-z0-9-]+\\nread: [^\\n]+\\nlogged_raw: 0\\n\\n== the act this plan authorises ==\\nnone — nothing to revoke\\n\\z",
+  "argv": ["infra/forge/revoke-logged-calendar-tokens.sh", "--plan", "{1}"],
+  "params": [
+    { "name": "namespace", "pattern": "^[a-z][a-z0-9-]{0,62}$" }
+  ],
+  "timeout": 120
+}

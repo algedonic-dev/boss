@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::error::ContentError;
 use crate::port::ContentRepository;
 use crate::types::{
-    Bulletin, BulletinDraft, BulletinPatch, ManualPatch, ManualSection, ManualSectionDraft,
-    ManualSectionVersion, UserContext,
+    Bulletin, BulletinDraft, BulletinPatch, ManualIndexEntry, ManualPatch, ManualSection,
+    ManualSectionDraft, ManualSectionVersion, UserContext,
 };
 
 #[derive(Default)]
@@ -211,6 +211,34 @@ impl ContentRepository for InMemoryContent {
         Ok(())
     }
 
+    async fn manual_index(
+        &self,
+        user: &UserContext,
+    ) -> Result<Vec<ManualIndexEntry>, ContentError> {
+        let state = self.state.lock().map_err(poisoned)?;
+        let mut rows: Vec<_> = state
+            .manual
+            .values()
+            .filter(|s| {
+                crate::port::matches_observed(
+                    self.audience_observer.as_deref(),
+                    "content-manual-index-audience",
+                    &s.audience,
+                    user,
+                )
+            })
+            .map(ManualSection::index_entry)
+            .collect();
+        rows.sort_by(|a, b| {
+            a.parent_slug
+                .cmp(&b.parent_slug)
+                .then(a.sort_order.cmp(&b.sort_order))
+                .then(a.title.cmp(&b.title))
+                .then(a.slug.cmp(&b.slug))
+        });
+        Ok(rows)
+    }
+
     async fn manual_tree(&self, user: &UserContext) -> Result<Vec<ManualSection>, ContentError> {
         let state = self.state.lock().map_err(poisoned)?;
         let mut out: Vec<ManualSection> = state
@@ -297,6 +325,8 @@ impl ContentRepository for InMemoryContent {
             audience: draft.audience.clone(),
             current_version: 1,
             published: draft.published,
+            owner_station: draft.owner_station,
+            authoring_job_id: draft.authoring_job_id,
             created_at: now,
             updated_at: now,
         };
@@ -343,6 +373,12 @@ impl ContentRepository for InMemoryContent {
         }
         if let Some(published) = patch.published {
             existing.published = published;
+        }
+        if let Some(owner) = patch.owner_station {
+            existing.owner_station = Some(owner);
+        }
+        if let Some(packet) = patch.authoring_job_id {
+            existing.authoring_job_id = Some(packet);
         }
         existing.current_version += 1;
         existing.updated_at = stamp.timestamp;

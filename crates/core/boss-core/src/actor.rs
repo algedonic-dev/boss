@@ -182,6 +182,118 @@ impl ActorId {
     pub fn text_form_round_trips(&self) -> bool {
         self.to_string().parse::<Self>().as_ref() == Ok(self)
     }
+
+    /// The kind of executor this actor is (factory taxonomy M1). Total and
+    /// one-to-one over the arms, decided 2026-11-03 on backlog 3ff2ef60:
+    /// a human is the Human arm, an automaton the Automation arm, and a
+    /// robot either agent spelling. This is the answer the claim door
+    /// records for every holder, by its canonical id. `agents` carries an
+    /// `executor_kind` column (default `robot`, the backfill), but no
+    /// door writes any other value into it and no reader consults it, so
+    /// the column and this answer cannot disagree today (station tree
+    /// T1, 050284c2). A machine identity that claims a step is spelled
+    /// `automation:<name>` and is an automaton here.
+    ///
+    /// Two spellings are read past their arm (backlog 8e8d0b1a), so every
+    /// executor-kind question asks here rather than at an id prefix: a
+    /// legacy bare `rule:<name>` parses as an agent of mode `rule` but is
+    /// the dispatcher's, an automaton; and an address still in the record
+    /// parses Human but is an unresolved session login, which on this
+    /// deployment is a robot (the gateway resolves a person's login to an
+    /// `emp-*` id before any write is signed; apps/web's `isHumanActor`
+    /// reads it the same way).
+    pub fn executor_kind(&self) -> ExecutorKind {
+        match self {
+            Self::Human(id) if id.contains('@') => ExecutorKind::Robot,
+            Self::Human(_) => ExecutorKind::Human,
+            Self::Automation(_) => ExecutorKind::Automaton,
+            Self::Agent { mode, .. } if mode == "rule" => ExecutorKind::Automaton,
+            Self::Agent { .. } | Self::RegisteredAgent(_) => ExecutorKind::Robot,
+        }
+    }
+}
+
+/// What KIND of executor ran a step — the factory taxonomy's three
+/// (design 4348b857, decided by David 2026-11-02; v2 in
+/// `docs/design/factory-taxonomy-v2.md`, primitive 5). A **human** brings
+/// judgment and is stateful; a **robot** brings judgment, is stochastic
+/// and stateless between claims; an **automaton** is deterministic
+/// software executing a step.
+///
+/// A CLOSED enum, not Class-registry data, though CLAUDE.md §9 sends
+/// taxonomies to the registry: §9 is about TENANT-EXTENSIBLE categories,
+/// and these three are core vocabulary the design fixes — its rule 3 is
+/// that there is no fourth kind, and the one-kind check that holds every
+/// executor id to exactly one of them only means something over a
+/// closed set. Roles, model classes and equipment kinds — the part a
+/// tenant does extend — stay registry data.
+///
+/// Wire form is a lowercase word, and any word but those below is
+/// refused, never read as the nearest kind.
+///
+/// EXPAND NOW, CONTRACT LATER (station tree T1, backlog 050284c2). v2
+/// calls the staff kind `human`, and that is this variant's name. The
+/// record still WRITES `person`, the word every earlier build reads: the
+/// last-converged build a watchdog rollback lands on refuses `human` in
+/// its claims fold, so a claim written as `human` would leave the console
+/// unreadable on the build the rollback chose. This build READS both
+/// words. The retirement car flips the written word to `human` once a
+/// build that reads both has converged. Pinned by
+/// `every_kind_is_written_in_a_word_the_last_build_reads`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutorKind {
+    #[serde(rename = "person", alias = "human")]
+    Human,
+    Robot,
+    Automaton,
+}
+
+impl ExecutorKind {
+    /// Every kind there is.
+    pub const ALL: [Self; 3] = [Self::Human, Self::Robot, Self::Automaton];
+
+    /// The word the record carries for this kind: what this build
+    /// writes, and what every earlier build reads.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "person",
+            Self::Robot => "robot",
+            Self::Automaton => "automaton",
+        }
+    }
+
+    /// The v2 word for this kind (factory-taxonomy-v2.md), which this
+    /// build reads beside [`Self::as_str`] and does not yet write.
+    pub fn v2_word(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Robot => "robot",
+            Self::Automaton => "automaton",
+        }
+    }
+}
+
+impl fmt::Display for ExecutorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ExecutorKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == s || kind.v2_word() == s)
+            .ok_or_else(|| {
+                format!(
+                    "{s:?} is not an executor kind (human, robot or automaton, and person for \
+                     human; there is no fourth)"
+                )
+            })
+    }
 }
 
 impl fmt::Display for ActorId {
@@ -475,6 +587,110 @@ mod tests {
         ];
         for a in whole {
             assert!(a.text_form_round_trips(), "{a:?} reads back otherwise");
+        }
+    }
+
+    // -- ExecutorKind (factory taxonomy M1, design 4348b857) ----------
+
+    /// Every arm of the actor maps to exactly one kind, one-to-one with
+    /// the decision of 2026-11-03: Human → human, Automation →
+    /// automaton, both agent spellings → robot.
+    #[test]
+    fn every_actor_class_is_exactly_one_executor_kind() {
+        let cases = [
+            ("emp-032", ExecutorKind::Human),
+            ("automation:dispatcher", ExecutorKind::Automaton),
+            ("automation:rule:bill-approve", ExecutorKind::Automaton),
+            ("system", ExecutorKind::Automaton),
+            ("claude:opus-5", ExecutorKind::Robot),
+            ("agent-claude", ExecutorKind::Robot),
+        ];
+        for (wire, want) in cases {
+            let actor: ActorId = wire.parse().unwrap();
+            assert_eq!(actor.executor_kind(), want, "{wire}");
+        }
+    }
+
+    /// The two spellings the arms alone read wrongly (backlog 8e8d0b1a):
+    /// a legacy bare `rule:<name>` is the dispatcher's, an automaton, not
+    /// an agent of mode `rule`; and an address that reached the record
+    /// unresolved is a SESSION LOGIN, which the gateway never leaves for a
+    /// person (it resolves every human login to an `emp-*` id before a
+    /// write is signed), so on this deployment it is a robot. The web's
+    /// `isHumanActor` (apps/web/src/data/actor.ts) already reads it so.
+    #[test]
+    fn a_legacy_rule_is_an_automaton_and_an_unresolved_login_is_a_robot() {
+        for (wire, want) in [
+            ("rule:bill-approve", ExecutorKind::Automaton),
+            ("claude@algedonic.dev", ExecutorKind::Robot),
+            ("emp-bootstrap-admin", ExecutorKind::Human),
+        ] {
+            let actor: ActorId = wire.parse().unwrap();
+            assert_eq!(actor.executor_kind(), want, "{wire}");
+        }
+    }
+
+    /// The written spelling is the lowercase word, both ways, and there
+    /// is no fourth kind: `machine`, `agent`, a capitalised word and the
+    /// empty string are refused rather than read as one of the three.
+    /// (`human` is the v2 word for the first kind, not a fourth:
+    /// `the_v2_word_human_reads_as_the_human_kind`.)
+    #[test]
+    fn the_executor_kind_has_three_words_and_refuses_a_fourth() {
+        for (kind, word) in [
+            (ExecutorKind::Human, "person"),
+            (ExecutorKind::Robot, "robot"),
+            (ExecutorKind::Automaton, "automaton"),
+        ] {
+            assert_eq!(kind.as_str(), word);
+            assert_eq!(kind.to_string(), word);
+            assert_eq!(word.parse::<ExecutorKind>(), Ok(kind));
+            assert_eq!(serde_json::to_value(kind).unwrap(), word);
+            assert_eq!(
+                serde_json::from_value::<ExecutorKind>(serde_json::json!(word)).unwrap(),
+                kind
+            );
+        }
+        assert_eq!(ExecutorKind::ALL.len(), 3);
+        for fourth in ["machine", "agent", "Human", "Robot", ""] {
+            assert!(fourth.parse::<ExecutorKind>().is_err(), "{fourth:?}");
+            assert!(
+                serde_json::from_value::<ExecutorKind>(serde_json::json!(fourth)).is_err(),
+                "{fourth:?}"
+            );
+        }
+    }
+
+    /// Station tree T1 (backlog 050284c2, factory-taxonomy-v2.md): the
+    /// v2 word for the kind a staff member is is `human`. Every build
+    /// from this one on reads it, so the retirement car that WRITES it
+    /// rolls back onto a build that can read what it wrote.
+    #[test]
+    fn the_v2_word_human_reads_as_the_human_kind() {
+        let human = ActorId::Human("emp-032".into()).executor_kind();
+        assert_eq!("human".parse::<ExecutorKind>(), Ok(human));
+        assert_eq!(
+            serde_json::from_value::<ExecutorKind>(serde_json::json!("human")).unwrap(),
+            human
+        );
+    }
+
+    /// The rollback pin. The last-converged build a watchdog rollback
+    /// lands on predates the v2 word and refuses it: its claims fold
+    /// deserializes `_executor_kind` strictly and its `FromStr` knows
+    /// three words. So every word this build WRITES is one of those
+    /// three, and `human` is not written until a contract car flips it,
+    /// once a build that reads both has converged.
+    #[test]
+    fn every_kind_is_written_in_a_word_the_last_build_reads() {
+        const READ_BY_THE_LAST_BUILD: [&str; 3] = ["person", "robot", "automaton"];
+        for kind in ExecutorKind::ALL {
+            let written = serde_json::to_value(kind).unwrap();
+            assert!(
+                READ_BY_THE_LAST_BUILD.contains(&written.as_str().unwrap()),
+                "{kind:?} is written as {written}, which the last build refuses"
+            );
+            assert_eq!(kind.to_string(), written.as_str().unwrap());
         }
     }
 

@@ -1,6 +1,7 @@
 // Test-side reader for the actual two-lane frontend contract (c7720abe).
 // Directory is part of a command's identity: web-kit:test:unit cannot pay
-// apps/web:test:unit. Unknown/conditional shapes contribute no coverage.
+// apps/web:test:unit. Unknown/conditional shapes contribute no coverage,
+// except the one conditional the gate lane below qualifies (81ee98b3).
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -41,6 +42,32 @@ const qualifiedShell = (shell: unknown): boolean => shell === undefined
 // infra/forge/test_delivery_ci_workflow.py. Arbitrary job conditions still
 // supply nothing. Bind the named dependency through its actual output to
 // its non-conditional, failure-propagating producer (urgent271a2f6e).
+// The one other output producer delivery-plan may carry (399ee6c3): it
+// names the CI runner image by its recipe, so build-image (no checkout),
+// locomotive and web read one name. It is admitted as exact text that can
+// write ci_stamp and nothing else, with no shell of its own; any other
+// shape is a second writer and refuses. Train 7474e3e0 (2026-10-20) went
+// red when this step reached the reader unannounced. The line is held
+// equal to locomotive.sh's stamp by boss-testing's
+// the_ci_image_is_named_by_its_recipe, and to this text by the test here.
+export const STAMP_RUN = 'set -eu\npython3 -I -c \'import hashlib; print("ci_stamp=" + hashlib.sha256(b"".join('
+  + 'open("infra/forge/boss-ci/" + n, "rb").read() for n in ("Dockerfile", "required-tools.txt"))).hexdigest())\''
+  + ' >> "$GITHUB_OUTPUT"';
+const stampStep = (step: Record<string, unknown> | undefined): boolean => step?.id === 'stamp'
+  && !('shell' in step) && typeof step.run === 'string' && step.run.trim() === STAMP_RUN;
+// A refused stamp step NAMES itself (66aaea77). The text lives here and in
+// ci.yml on purpose — admitting it exactly is what makes a change to the
+// step a change to this reader, reviewed with it — so the two drifting is
+// expected, and it read as 'forge web job is absent' until this said why.
+const STAMP_DRIFT = "forge delivery-plan's `stamp` step is not the exact text this reader admits"
+  + ' (STAMP_RUN in apps/web/src/shell/web-ci-coverage.ts), or it declares its own shell;'
+  + ' change the step and STAMP_RUN together';
+const stampDrift = (root: Record<string, unknown>): string | undefined => {
+  const steps = object(object(root.jobs)?.['delivery-plan'])?.steps;
+  const stamps = Array.isArray(steps) ? steps.map(object).filter((step) => step?.id === 'stamp') : [];
+  return stamps.some((step) => !stampStep(step)) ? STAMP_DRIFT : undefined;
+};
+
 const softwareLane = (root: Record<string, unknown>, web: Record<string, unknown>): boolean => {
   if (!('if' in web)) return true;
   if (web.if !== "needs.delivery-plan.outputs.route != 'data'"
@@ -55,7 +82,7 @@ const softwareLane = (root: Record<string, unknown>, web: Record<string, unknown
   const planShell = shellDefault(plan);
   const workflowShell = shellDefault(root);
   if (planShell === null || workflowShell === null
-    || plan.steps.map(object).some((step) => step !== producer
+    || plan.steps.map(object).some((step) => step !== producer && !stampStep(step)
       && typeof step?.run === 'string' && step.run.includes('GITHUB_OUTPUT'))) return false;
   if ('if' in producer || (producer['continue-on-error'] !== undefined && producer['continue-on-error'] !== false)
     || typeof producer.run !== 'string'
@@ -189,13 +216,72 @@ const dispatcherRunsTypecheck = (gate: string): boolean => {
   }
 };
 
+// Qualify output_to, which carries the web-suite check's command: it must
+// run the command, keep its output, and hand back the command's status on
+// success AND failure — a tee'd pipeline returns tee's unless it says not
+// to. Extract the one helper; unknown layouts refuse, as above.
+const outputToPropagates = (gate: string): boolean => {
+  const matches = [...gate.matchAll(/^output_to\(\) \{[^\n]*\n[\s\S]*?^\}/gm)];
+  if (matches.length !== 1) return false;
+  const directory = mkdtempSync(join(tmpdir(), 'boss-web-output-to-'));
+  try {
+    const command = join(directory, 'suite');
+    writeFileSync(command, '#!/bin/sh\nprintf "%s\\n" suite >> "$CONTROL_LOG"\necho suite-output\nexit "$CONTROL_EXIT"\n', { mode: 0o700 });
+    const wrapper = join(directory, 'output-to.sh');
+    writeFileSync(wrapper, [
+      'set -u',
+      matches[0]![0],
+      'output_to "$CONTROL_OUT" "$CONTROL_COMMAND"',
+      'rc=$?',
+      '[ "$rc" = "$CONTROL_EXIT" ] || exit 91',
+      '[ "$(cat "$CONTROL_LOG")" = suite ] || exit 92',
+      'grep -qx suite-output "$CONTROL_OUT" || exit 93',
+    ].join('\n') + '\n');
+    for (const exit of [0, 17]) {
+      const log = join(directory, `control-${exit}.log`);
+      const out = join(directory, `control-${exit}.out`);
+      writeFileSync(log, '');
+      writeFileSync(out, '');
+      const result = spawnSync('/usr/bin/timeout', ['--kill-after=1s', '20s', '/bin/bash', wrapper], {
+        cwd: directory,
+        env: { PATH: '/usr/bin:/bin', HOME: directory, TMPDIR: directory, LC_ALL: 'C',
+          CONTROL_COMMAND: command, CONTROL_LOG: log, CONTROL_OUT: out, CONTROL_EXIT: String(exit) },
+        timeout: 22_000,
+        maxBuffer: 262_144,
+      });
+      if (result.pid > 0) {
+        try { process.kill(-result.pid, 'SIGKILL'); } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return false;
+        }
+      }
+      console.log('web-suite-carrier-control', JSON.stringify({
+        command_exit: exit, actual_exit: result.status, signal: result.signal,
+        error: result.error?.message ?? null,
+        stdout_b64: result.stdout?.toString('base64') ?? '',
+        stderr_b64: result.stderr?.toString('base64') ?? '',
+        invocation_b64: readFileSync(log).toString('base64'),
+      }));
+      if (result.error || result.status !== 0) return false;
+    }
+    return true;
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+};
+
+// The gate's web phase closes right before this anchor, and the final,
+// unconditional phase follows it.
+const FINAL_PHASE_ANCHOR = '\nfi\n\nrun_preflight\n';
+
 // This deliberately recognizes the gate's current final, unconditional
 // phase rather than pretending to parse arbitrary shell. A restructure
 // refuses until this reader and its adverse controls are reviewed with it.
-const unconditionalTypecheck = (gate: string, script: string): boolean => {
-  const anchor = '\nfi\n\nrun_preflight\n';
-  const offset = gate.lastIndexOf(anchor);
-  if (offset < 0) return false;
+// Consuming the WHOLE suffix, its verdict included, is what keeps both
+// this phase and the web phase before it out of an uncalled function or
+// an enclosing if: either would need a line after the verdict.
+const finalPhase = (gate: string): readonly string[] | undefined => {
+  const offset = gate.lastIndexOf(FINAL_PHASE_ANCHOR);
+  if (offset < 0) return undefined;
   const tail = gate.slice(offset + '\nfi\n\n'.length);
   const lines = tail.split('\n').map((line) => line.trim()).filter((line) => line && !line.startsWith('#'));
   // Consume the complete known suffix, including its final verdict. Extra
@@ -212,11 +298,85 @@ const unconditionalTypecheck = (gate: string, script: string): boolean => {
     'echo "gate: all checks green"',
     'echo "gate: receipt written to ${GATE_RECEIPT}"',
   ];
-  return lines[0] === 'run_preflight'
-    && /^check "svelte-check"\s+infra\/lint\/svelte-check\.sh$/.test(lines[1] ?? '')
-    && JSON.stringify(lines.slice(2)) === JSON.stringify(verdict)
+  return lines[0] === 'run_preflight' && JSON.stringify(lines.slice(2)) === JSON.stringify(verdict)
+    ? lines : undefined;
+};
+
+const unconditionalTypecheck = (gate: string, script: string): boolean =>
+  /^check "svelte-check"\s+infra\/lint\/svelte-check\.sh$/.test(finalPhase(gate)?.[1] ?? '')
     && dispatcherRunsTypecheck(gate)
     && carrierRunsTypecheck(script);
+
+// THE GATE LANE (backlog 81ee98b3, 2026-10-20). The forge's web steps run
+// only on a train that changes the runner image's recipe, so on every
+// other train apps/web's unit, build and mocked checks are paid by the
+// train's own cluster gate, or by nothing. Recognized, not parsed, like
+// the final phase: the web phase that closes at FINAL_PHASE_ANCHOR (whose
+// whole suffix must read), opened by exactly WEB_PHASE, its condition the
+// exact derived web_touched, and an if/else whose two check lines sit at
+// the top of their own branch — not nested, not the tail of a continued
+// command. Anything else credits nothing.
+//
+// IT CREDITS A CONDITIONAL LANE, which this reader otherwise refuses:
+// in --auto the build and the mocked suite run only when web_touched says
+// yes. That is design cdf626ac's "prove each tree once" — web_touched is
+// derived from what the build and specs read (web-suite-reads.ts, held by
+// its own test and by an_auto_gate_runs_the_web_suite_on_what_it_reads.rs)
+// and answers yes whenever it cannot answer, so a train that skips them
+// changed nothing they read since the tree that last ran them. test:unit
+// is credited only because BOTH branches run it. The condition is held
+// exactly, so a narrower one, or a fallback that answers no, credits
+// nothing.
+const WEB_PHASE = 'if [ "$AUTO" -eq 0 ] || [ "$(web_touched)" = "yes" ]; then';
+const WEB_TOUCHED = [
+  'web_touched() {',
+  'local answer',
+  'answer=$(changed_paths | (cd apps/web && bun scripts/web-suite-reads.ts --touched)) || answer=""',
+  'case "$answer" in',
+  'yes|no) echo "$answer" ;;',
+  '*) echo "gate: web-suite-reads gave no answer, so the web suite runs" >&2; echo yes ;;',
+  'esac',
+  '}',
+];
+const WEB_SUITE = `check "web-suite (unit+build+mocked)" output_to "$web_out" bash -c 'cd apps/web && bun run test:unit && bun run build && bun run test:mocked'`;
+const WEB_UNIT = `check "web unit" bash -c 'cd apps/web && bun run test:unit'`;
+
+const gateLane = (gate: string): readonly string[] => {
+  const lines = gate.split('\n');
+  const at = (text: string) => lines.flatMap((line, index) => line === text ? [index] : []);
+  const defined = at(WEB_TOUCHED[0]!);
+  const opened = at(WEB_PHASE);
+  const anchor = gate.lastIndexOf(FINAL_PHASE_ANCHOR);
+  if (defined.length !== 1 || opened.length !== 1 || anchor < 0 || !finalPhase(gate)) return [];
+  const definition = lines.slice(defined[0]!, defined[0]! + WEB_TOUCHED.length).map((line) => line.trim());
+  if (JSON.stringify(definition) !== JSON.stringify(WEB_TOUCHED)) return [];
+  const closed = gate.slice(0, anchor + 1).split('\n').length - 1; // the phase's `fi`
+  if (opened[0]! >= closed) return [];
+  const body = lines.slice(opened[0]! + 1, closed).map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('#'));
+  // Each branch's top-level commands; `if`/`fi` depth inside the phase.
+  const branches: string[][] = [[]];
+  let depth = 0;
+  let continued = false;
+  for (const line of body) {
+    if (depth === 0 && line === 'else') {
+      if (branches.length === 2) return [];
+      branches.push([]);
+      continued = false;
+      continue;
+    }
+    if (depth === 0 && /^(elif|else|fi|for|while|until|case|select)\b/.test(line)) return [];
+    const opens = /^if\b/.test(line) && !line.startsWith('if (');
+    const closes = line.split(/[\s;]+/).some((token) => token === 'fi' || token === 'fi)');
+    if (depth === 0 && !continued) branches.at(-1)!.push(line);
+    depth += Number(opens) - Number(closes);
+    if (depth < 0) return [];
+    continued = /(&&|\|\||\||\\)$/.test(line);
+  }
+  if (depth !== 0 || branches.length !== 2) return [];
+  const [then, otherwise] = branches as [string[], string[]];
+  if (!then.includes(WEB_SUITE) || !outputToPropagates(gate) || !dispatcherRunsTypecheck(gate)) return [];
+  return otherwise.includes(WEB_UNIT) ? ['test:unit', 'build', 'test:mocked'] : ['build', 'test:mocked'];
 };
 
 export const webCoverage = ({ workflow, gate, typecheck, scripts }: Inputs): readonly string[] => {
@@ -226,7 +386,9 @@ export const webCoverage = ({ workflow, gate, typecheck, scripts }: Inputs): rea
   const web = object(object(root?.jobs)?.web);
   const steps = web?.steps;
   if (!web || !softwareLane(root!, web) || (web['continue-on-error'] !== undefined && web['continue-on-error'] !== false)
-    || !Array.isArray(steps)) return ['forge web job is absent, conditional, failure-tolerant or unreadable'];
+    || !Array.isArray(steps)) {
+    return [(root && stampDrift(root)) ?? 'forge web job is absent, conditional, failure-tolerant or unreadable'];
+  }
   const workflowShell = shellDefault(root!);
   const jobShell = shellDefault(web);
   if (workflowShell === null || jobShell === null) return ['forge shell defaults are unreadable'];
@@ -243,12 +405,15 @@ export const webCoverage = ({ workflow, gate, typecheck, scripts }: Inputs): rea
     for (const command of commands(step.run)) forge.add(`${step['working-directory']}:${command}`);
   }
   const errors: string[] = [];
-  // AUTO may skip the whole web phase for non-app inputs read by the specs
-  // (a244c6e7). Until that changes, these residual forge checks must stay.
-  for (const identity of ['apps/web:test:unit', 'apps/web:build', 'apps/web:test:mocked', 'libs/web-kit:test:unit']) {
-    if (!forge.has(identity)) errors.push(`required residual forge check missing: ${identity}`);
-  }
-  const combined = new Set([...forge].filter((identity) => identity.startsWith('apps/web:')).map((identity) => identity.slice('apps/web:'.length)));
+  // The forge used to be REQUIRED to carry unit, build and mocked (and
+  // web-kit's unit) because --auto skipped the whole web phase on trees
+  // the specs still read. Since a244c6e7 the gate lane pays for them, and
+  // the forge runs them only on a new runner recipe (81ee98b3); web-kit's
+  // unit suite runs on every tree, held by the gate's own web-phase pin.
+  const combined = new Set([
+    ...[...forge].filter((identity) => identity.startsWith('apps/web:')).map((identity) => identity.slice('apps/web:'.length)),
+    ...gateLane(gate),
+  ]);
   if (unconditionalTypecheck(gate, typecheck)) combined.add('typecheck');
   const chain = (scripts.gate ?? '').split(/\s*&&\s*/);
   if (chain.some((command) => !/^bun run [a-z][a-z0-9:-]*$/.test(command))) {

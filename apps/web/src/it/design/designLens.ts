@@ -18,9 +18,8 @@
 // design-review/queue` makes the registry row the single definition.
 //
 // The page's own identity (header, which panels it carries) comes from
-// the same envelope, off `stations.lens` — the shape `upstream` proved
-// in 119: the row declares it, the queue echoes it, the lens renders
-// whatever the row says.
+// the same envelope, off `stations.lens`: the row declares it, the
+// queue echoes it, the lens renders whatever the row says.
 
 import { readEnvelope } from '../../data/shape';
 
@@ -391,10 +390,16 @@ export function foldLabel(status: string | null): string {
   }
 }
 
-/** Where Back returns to from the review surface. Without it the step
- *  surface fell back to the job page — the one place the reviewer was
- *  deliberately not sent (David, feedback 40fe7291). */
-export const BACK_HERE = `from=${encodeURIComponent('/it/design')}&from_label=${encodeURIComponent('Design Review')}`;
+/// Where Back returns to from the review surface. Without it the step
+/// surface fell back to the job page — the one place the reviewer was
+/// deliberately not sent (David, feedback 40fe7291).
+///
+/// `from` is the design page's address as the tree places it now (backlog
+/// 0bc2eb68: a page's path is its host station's address plus its slug).
+/// It was the literal /it/design until then; null, when no address is
+/// known, sends no Back rather than a guessed one.
+const backHere = (from: string): string =>
+  `from=${encodeURIComponent(from)}&from_label=${encodeURIComponent('Design Review')}`;
 
 /** The route into a review.
  *
@@ -404,6 +409,9 @@ export const BACK_HERE = `from=${encodeURIComponent('/it/design')}&from_label=${
  *  list — so the full-page step surface is the destination, and the
  *  job page is the fallback for a packet caught before its steps
  *  materialized. */
-export function reviewHref(jobId: string, stepId?: string | null): string {
-  return stepId ? `/jobs/${jobId}/steps/${stepId}?${BACK_HERE}` : `/service/${jobId}`;
+export function reviewHref(jobId: string, stepId: string | null | undefined, from: string | null): string {
+  // The job page's own spelling: `/service/<id>` answered it until
+  // design 01fa5bdf removed the Service queue's paths.
+  if (!stepId) return `/jobs/${jobId}`;
+  return from === null ? `/jobs/${jobId}/steps/${stepId}` : `/jobs/${jobId}/steps/${stepId}?${backHere(from)}`;
 }

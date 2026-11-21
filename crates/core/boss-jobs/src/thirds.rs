@@ -165,6 +165,13 @@ pub struct MachineSummary {
     /// Machines whose state the record cannot tell — "unjudged" on the
     /// HUD. Never folded into idle.
     pub unknown: usize,
+    /// Machines whose reading stopped refreshing at a named generation
+    /// (backlog 4db21aaf) — counted apart from `unknown`, since the
+    /// record says when it was last known, and named among the
+    /// failed-or-unknown because a dark reading asks for attention.
+    /// Absent from the wire when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub stale: usize,
     /// Machines whose record is WITHHELD from this caller by policy
     /// scope (backlog 1805bac0) — counted apart, never among the
     /// failed-or-unknown, because a refusal is not trouble. Absent from
@@ -172,7 +179,7 @@ pub struct MachineSummary {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub withheld: usize,
     pub total: usize,
-    /// Every failed and every unknown machine, failed first, then in
+    /// Every failed, unknown and stale machine, failed first, then in
     /// region order — each one a link to its own glyph on the map.
     pub failed_or_unknown: Vec<MachineAt>,
 }
@@ -360,10 +367,12 @@ pub fn machine_summary(regions: &[Region], plant: &[crate::regions::Machine]) ->
         idle: of(MachineState::Idle),
         failed: of(MachineState::Failed),
         unknown: of(MachineState::Unknown),
+        stale: of(MachineState::Stale),
         withheld: of(MachineState::Withheld),
         total: all.len(),
         failed_or_unknown: named(MachineState::Failed)
             .chain(named(MachineState::Unknown))
+            .chain(named(MachineState::Stale))
             .collect(),
     }
 }
@@ -731,5 +740,39 @@ mod tests {
                 .machines
                 .is_some()
         );
+        // No stale machine: the count is absent from the wire.
+        assert!(serde_json::to_value(&s).unwrap().get("stale").is_none());
+    }
+
+    /// Backlog 4db21aaf: a stale machine is counted apart from the
+    /// unknown ones and named after them, so the HUD and orient say how
+    /// many readings went dark rather than folding them into unjudged.
+    #[test]
+    fn a_stale_machine_is_counted_apart_and_named_after_the_unknown() {
+        let m = |id: &str, state| Machine {
+            id: id.into(),
+            name: id.into(),
+            state,
+            why: format!("{id} read"),
+        };
+        let status = empty_status();
+        let mut out = regions(&inputs(&status, &[], Some(&[]), Some(&[])));
+        for r in &mut out.regions {
+            r.machines = Vec::new();
+        }
+        out.regions[0].machines = vec![
+            m("s", MachineState::Stale),
+            m("u", MachineState::Unknown),
+            m("f", MachineState::Failed),
+        ];
+        let s = machine_summary(&out.regions, &[]);
+        assert_eq!(
+            (s.failed, s.unknown, s.stale, s.total),
+            (1, 1, 1, 3),
+            "{s:?}"
+        );
+        let named: Vec<&str> = s.failed_or_unknown.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(named, ["f", "u", "s"]);
+        assert_eq!(serde_json::to_value(&s).unwrap()["stale"], 1);
     }
 }

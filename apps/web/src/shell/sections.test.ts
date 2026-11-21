@@ -90,8 +90,8 @@ describe('sections resolve in the nav catalog', () => {
     // Every other route still answers through the catalog.
     expect(appForRoute({ kind: 'systemYard' })).toBe('it');
     expect(appForRoute({ kind: 'systemYard', at: 'dock' })).toBe('it');
-    expect(appForRoute({ kind: 'accounts' })).toBe('sales');
-    expect(appForRoute({ kind: 'jobs' })).toBe('home');
+    expect(appForRoute({ kind: 'watchlist' })).toBe('sales');
+    expect(appForRoute({ kind: 'jobDetail', jobId: 'j' })).toBe('home');
     expect(appForRoute({ kind: 'me' })).toBe('home');
   });
 
@@ -110,20 +110,23 @@ describe('sections resolve in the nav catalog', () => {
     // not-found page with one door Home — never a module-off notice, and
     // never its own department's chrome, for a department the company
     // does not have.
-    const roster = [{ code: 'it', label: 'IT' }, { code: 'support', label: 'Support' }];
-    const gone = withRoster({ kind: 'service' }, '/ux/service', roster);
-    expect(gone).toEqual({ kind: 'notFound', path: '/ux/service', department: 'service' });
+    // Pinned on the Service queue until it went with step 1 of design
+    // 01fa5bdf; Finance carries it now.
+    const roster = [{ code: 'it', label: 'IT' }, { code: 'sales', label: 'Sales' }];
+    const finance: Route = { kind: 'finance', view: { tab: 'overview', entry: '', fact: '' } };
+    const gone = withRoster(finance, '/finance', roster);
+    expect(gone).toEqual({ kind: 'notFound', path: '/finance', department: 'finance' });
     expect(sectionForRoute(gone)).toBe('me');
     expect(appForRoute(gone)).toBe('home');
     expect(moduleForRoute(gone)).toBeNull();
     // Even IT's own pages answer to the registry: a roster without `it`
     // has no IT department, and its chrome is not the way back.
-    const noIt = withRoster({ kind: 'systemYard' }, '/it', [{ code: 'support', label: 'Support' }]);
+    const noIt = withRoster({ kind: 'systemYard' }, '/it', [{ code: 'sales', label: 'Sales' }]);
     expect(noIt).toEqual({ kind: 'notFound', path: '/it', department: 'it' });
     expect(appForRoute(noIt)).toBe('home');
     // A department the roster has, and Home's pages, pass untouched.
-    expect(withRoster({ kind: 'support' }, '/ux/support', roster)).toEqual({ kind: 'support' });
-    expect(withRoster({ kind: 'jobs' }, '/ux/jobs', roster)).toEqual({ kind: 'jobs' });
+    expect(withRoster({ kind: 'watchlist' }, '/watchlist', roster)).toEqual({ kind: 'watchlist' });
+    expect(withRoster({ kind: 'jobDetail', jobId: 'j' }, '/ux/jobs/j', roster)).toEqual({ kind: 'jobDetail', jobId: 'j' });
     expect(withRoster({ kind: 'department', code: 'it' }, '/it/jobs', roster)).toEqual({
       kind: 'department',
       code: 'it',
@@ -135,7 +138,7 @@ describe('sections resolve in the nav catalog', () => {
     // an unanswered read taken for "no departments" would turn every
     // department page into not-found (a wrong target answers instead of
     // erroring). The page renders as it always did.
-    expect(withRoster({ kind: 'service' }, '/ux/service', null)).toEqual({ kind: 'service' });
+    expect(withRoster({ kind: 'watchlist' }, '/watchlist', null)).toEqual({ kind: 'watchlist' });
     expect(withRoster({ kind: 'department', code: 'x' }, '/x', null)).toEqual({ kind: 'department', code: 'x' });
     // And an already-unmatched path stays what it was.
     expect(withRoster({ kind: 'notFound', path: '/it/nope' }, '/it/nope', [])).toEqual({
@@ -144,13 +147,14 @@ describe('sections resolve in the nav catalog', () => {
     });
   });
 
-  test('every station on the map lights the one Department Map row, not Operate', () => {
+  test('every station selection lights the one alarms-board row, not Operate', () => {
     // Design e765b3fc, car N1 (2026-09-25): the Receiving Yard, the
     // Marshalling Yard and the Crew Board lost their sidebar rows to the
     // one "Department Map" row, so every selection on the map lights
     // that row. Car N3 retired the floor pages and the crew board, so a
     // selection is the only way in, and a retired path — not found —
-    // still renders in the IT chrome under the same row.
+    // still renders in the IT chrome under the same row. The row is the
+    // alarms board's since design 01fa5bdf step 1.
     for (const at of ['gates', 'receiving', 'marshalling', 'dock', 'shop-floor']) {
       expect(sectionForRoute({ kind: 'systemYard', at }), at).toBe('system-yard');
       expect(appForRoute({ kind: 'systemYard', at }), at).toBe('it');
@@ -181,20 +185,20 @@ describe('the module gate a route answers to', () => {
     const off = { kind: 'ready' as const, modules: { warehouse: false }, labels: {} };
     const on = { ...off, modules: { warehouse: true } };
     const vendors: Route = { kind: 'vendors' };
-    expect(withManifest(vendors, '/ux/vendors', off)).toEqual({ kind: 'notFound', path: '/ux/vendors' });
-    expect(withManifest({ kind: 'vendor', vendorLookup: 'v' }, '/ux/vendors/v', off)).toEqual({ kind: 'notFound', path: '/ux/vendors/v' });
-    expect(withManifest(vendors, '/ux/vendors', on)).toEqual(vendors);
+    expect(withManifest(vendors, '/finance/vendors', off)).toEqual({ kind: 'notFound', path: '/finance/vendors' });
+    expect(withManifest({ kind: 'vendor', vendorLookup: 'v' }, '/finance/vendors/v', off)).toEqual({ kind: 'notFound', path: '/finance/vendors/v' });
+    expect(withManifest(vendors, '/finance/vendors', on)).toEqual(vendors);
     for (const route of [{ kind: 'po', poId: 'p' }, { kind: 'vendorInvoice', vendorInvoiceId: 'b' }] as const) {
       expect(appForRoute(route)).toBe('finance');
       expect(moduleForRoute(route)).toBeNull();
       expect(withManifest(route, '/financial-detail', off)).toEqual(route);
     }
-    expect(withManifest({ kind: 'support' }, '/ux/support', off)).toEqual({ kind: 'support' });
+    expect(withManifest({ kind: 'watchlist' }, '/watchlist', off)).toEqual({ kind: 'watchlist' });
   });
 
   test('manifest loading and failure never normalize a known route to absent', () => {
     for (const manifest of [{ kind: 'loading' }, { kind: 'error' }] as const) {
-      expect(withManifest({ kind: 'vendors' }, '/ux/vendors', manifest)).toEqual({ kind: 'vendors' });
+      expect(withManifest({ kind: 'vendors' }, '/finance/vendors', manifest)).toEqual({ kind: 'vendors' });
     }
     const absent: Route = { kind: 'notFound', path: '/missing' };
     expect(withManifest(absent, '/missing', { kind: 'ready', modules: {}, labels: {} })).toEqual(absent);
@@ -207,37 +211,34 @@ describe('the module gate a route answers to', () => {
   // "Shipments is not enabled" for a page with nothing to do with
   // shipments, while the nav row was hidden on 'support'. Same
   // CLAUDE.md §9a class as MODEL_ROUTES / MODEL_KINDS, and the same
-  // fix: one answer derived from the catalog, not a second list.
+  // fix: one answer derived from the catalog, not a second list. (The
+  // support page itself went with step 1 of design 01fa5bdf; Finance
+  // carries the pin.)
 
-  test('the support page is gated on support, not on shipping', () => {
-    expect(moduleForRoute({ kind: 'support' })).toEqual({ id: 'support', label: 'Support' });
-    expect(moduleForRoute({ kind: 'service' })).toEqual({ id: 'support', label: 'Service queue' });
+  test('a gated page answers to its own row’s module', () => {
+    const finance: Route = { kind: 'finance', view: { tab: 'overview', entry: '', fact: '' } };
+    expect(moduleForRoute(finance)).toEqual({ id: 'finance', label: 'Finance' });
+    expect(moduleForRoute({ kind: 'newInvoice' })).toEqual({ id: 'finance', label: 'Finance' });
   });
 
   test('My schedule answers to its own row, not the Release calendar', () => {
     // Backlog eff0c5e5 (page audit 0e4fef17, gap 1; David approved
-    // 2026-09-24): /ux/calendar/me IS the `schedule` row's path, but
+    // 2026-09-24): /ux/calendar/me WAS the `schedule` row's path (it is
+    // /me/calendar since backlog 5cb56bb3), but
     // its kind lit the `calendar` row — so it highlighted Release
     // calendar under Production and was gated on the calendar module,
     // which the live instance has off, and every visit answered
     // ModuleDisabled for a page whose own row is always-on in Home.
-    expect(ROUTE_CATALOG.schedule.path).toBe('/ux/calendar/me');
+    expect(ROUTE_CATALOG.schedule.path).toBe('/me/calendar');
     expect(sectionForRoute({ kind: 'myCalendar' })).toBe('schedule');
     expect(appForRoute({ kind: 'myCalendar' })).toBe('home');
     expect(moduleForRoute({ kind: 'myCalendar' })).toBeNull();
   });
 
-  test('the service schedule answers to the Service queue, not My schedule', () => {
-    // Backlog 3b50fe11 (decided 2026-09-24): /ux/service/schedule is the
-    // service department's week grid of every tech, not a personal
-    // schedule, yet its kind lit the `schedule` row — so once eff0c5e5
-    // pointed myCalendar there too, two different pages highlighted
-    // Home > My schedule, and the tech grid was ungated. It lights the
-    // service department's own row and takes that row's module gate.
-    expect(sectionForRoute({ kind: 'schedule' })).toBe('service');
-    expect(appForRoute({ kind: 'schedule' })).toBe(ROUTE_CATALOG.service.owner!);
-    expect(moduleForRoute({ kind: 'schedule' })).toEqual({ id: 'support', label: 'Service queue' });
-    // One page per My schedule row: only /ux/calendar/me lights it.
+  test('only /me/calendar lights My schedule', () => {
+    // Backlog 3b50fe11 (2026-09-24): the service week grid lit this row
+    // too, until it was moved to the Service queue's; both went with
+    // step 1 of design 01fa5bdf. One page per My schedule row.
     const lightingMySchedule = ROUTE_KINDS.filter((kind) => sectionForRoute({ kind } as Route) === 'schedule');
     expect(lightingMySchedule).toEqual(['myCalendar']);
   });
@@ -256,8 +257,8 @@ describe('the module gate a route answers to', () => {
   test('a surface with no module in the catalog is never gated', () => {
     // Entries without a `module` field are always-on — the catalog
     // says so, and this is the only place that decides it.
-    expect(moduleForRoute({ kind: 'jobs' })).toBeNull();
-    expect(moduleForRoute({ kind: 'people' })).toBeNull();
+    expect(moduleForRoute({ kind: 'jobDetail', jobId: 'j' })).toBeNull();
+    expect(moduleForRoute({ kind: 'watchlist' })).toBeNull();
     expect(moduleForRoute({ kind: 'me' })).toBeNull();
     // A department jobs view is one surface for every declared
     // department: no catalog row, so nothing to gate it on.

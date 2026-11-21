@@ -1,0 +1,64 @@
+# A decided design files its own fold (backlog 77ac4f30; David,
+# 2026-11-18: keep canonical documentation fresh as tech debt is paid
+# off).
+#
+# WHAT WAS MISSING. A design-doc's `fold` step goes ready the moment its
+# last question is answered (`steps.review.done`, which `covers =
+# "questions"` refuses until every anchor carries a decision) or at once
+# when it asked none (`no_open_questions`). The step has carried an agent
+# block since 2026-09-23, so `boss dispatch` can hand it out — but
+# nothing put it in front of anyone who dispatches. Measured 2026-11-17:
+# 71 decided designs sat unfolded, some since September, each waiting for
+# a coordinator to notice it and file a fold car by hand. A fold that
+# waits to be noticed is the decision record going stale in silence.
+#
+# THE TRIGGER IS THE FOLD STEP GOING READY, not the review completing:
+# of the 100 newest design-docs on 2026-11-18, about half asked no
+# question and skipped `review` entirely, so `step.done.review-design`
+# would have missed them. `step.ready.task` carries `workflow_kind` and
+# `spec_slug` at its root (4d53fae2), so the `when` selects one
+# workflow's one step without a fetch, and AND short-circuits, so the
+# dedup read is asked only for a design's fold, never for the rest of
+# the board's task steps. The marker carries `job_title` for the title
+# (hoisted with this rule) and `concat` / `left` build it — the DSL had
+# no string operator.
+#
+# ONCE PER DESIGN. The item's subject IS the design's id, and
+# `NOT open_job_exists("backlog-item", job_id)` reads that subject back,
+# so a redelivered ready marker files nothing more. A fold step goes
+# ready once in a design's life.
+#
+# WHAT IT DOES NOT DO. Triage is not pre-routed: backlog-item's `triage`
+# is a task whose disposition and evidence an executor records, and a
+# spawn writes no step — the description tells triage what to measure
+# and that `build` is the expected route. Designs sharing a record
+# section are not batched by this rule: that needs a window and a
+# section the design does not declare (none of the 100 newest carried
+# an `area`), so the description tells the folder to carry the open fold
+# items for one section in one car instead.
+#
+# THE PUBLISHED STEP NEEDS NO RULE. Measured 2026-11-18 on the 100
+# newest design-docs: 97 `published` steps completed by
+# `automation:rule:complete-marker-on-step-ready`, two by hand, one
+# still pending behind its unfolded fold. `published` is an `outcome`
+# marker, and the marker rule completes it the instant `boss fold`
+# makes it ready.
+[[rule]]
+name = "file-a-fold-item-when-a-design-reaches-its-fold"
+why = """
+A CROSS-PROTOCOL REACTOR: a design-doc reaching its `fold` step files
+a backlog-item — two protocols, and the design's own Workflow cannot
+open a packet of another kind. Measured 2026-11-17 (backlog 77ac4f30):
+71 decided designs sat unfolded, some since September, because the
+fold reached a queue only when a coordinator noticed it and filed a
+car by hand. No authority widened: the only write is one standard
+backlog-item, about the design's own id, on the queue the kind's
+owner_role already answers for, deduplicated per design; triage
+still decides the route.
+"""
+version = 1
+on_event = "step.ready.task"
+when = 'workflow_kind = "design-doc" AND spec_slug = "fold" AND NOT open_job_exists("backlog-item", job_id)'
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"backlog-item\"", subject_kind = "\"custom\"", subject = "job_id", title = "concat(\"Fold design \", left(job_id, 8), \" (\", job_title, \") into the decision record\")", "metadata.input_channel" = "\"roadmap\"", "metadata.area" = "\"docs\"", "metadata.design" = "job_id", "metadata.fold_step" = "step_id", "metadata.description" = "concat(\"Design \", job_id, \" (\", job_title, \") reached its fold step: every question it asked is answered, or it asked none. Its decision is in force and absent from docs/architecture-decisions.md until a car writes it there. Triage: the claim is the design's own record (its markdown and its review resolutions), so measure whether origin/main's decision record already carries it and route build unless it does. Section: the design names no record section, so choose the one its subject belongs in, or open one; if other open fold items land in the same section, carry them in one car so no two cars edit one section. Precedent: cars e848e857 (fold batch F1, eight designs, one new section) and 027b8784 (two designs, each a paragraph in its existing section) — one section per car, every paragraph cites its design packet and states plainly whether it is built or decided and not built, measured on origin/main. After the car is green, run boss fold on the design with its change and folded_into (the file and section), which completes the fold step and publishes the design.\")" }

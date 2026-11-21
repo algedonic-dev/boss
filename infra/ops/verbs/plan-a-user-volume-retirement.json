@@ -1,0 +1,23 @@
+{
+  "about": "READ-ONLY: renders what `retire-a-user-volume` WOULD do to ONE worker's live Talos user volume, and does nothing (infra/forge/retire-user-volume.sh --plan <node> <volume>; backlog 412d504c, door 1 of the volume-move protocol David asked for on 88b35891 and ordered on 2026-11-07 ~02:00Z for w-1's gate volume). It runs every bound the write runs — the node is one the estate registry declares, not retired, as a talos-worker with one IPv4 address, and the cluster agrees on its address and carries no control-plane label (refused before any door opens); infra/cluster/talos/patches/<node>.yaml in the checkout this host converged to (the forge's HEAD) still names exactly one UserVolumeConfig called <volume> and passes check-declared.sh --only-read-classes, so node-converge can provision it again from that declaration; the live UserVolumeConfig, read through the talosconfig door and piped into check-declared.sh, DRIFTs from it IN ITS diskSelector — a MATCH (the tree still wants the volume where it is: the selector car has not landed), a drift in anything but the selector, a live config without the document, or one holding it twice is refused; Talos's volumestatus u-<volume> reads ready, mounted at /var/mnt/<volume>, on a partition discoveredvolumes names with partition label u-<volume>; and no pod on the node that is still Pending or Running mounts /var/mnt/<volume>, anything under it, or a path that holds it, judged by each container's effective host path — the volume's hostPath, or the local/hostPath path of the PersistentVolume its claim is bound to, plus the volumeMount's subPath, so a parent hostPath /var/mnt with subPath gate is the volume (review f1d1c254); a subPathExpr, or an absolute or climbing subPath, refuses whenever its source is related (a gate run in flight on claim boss-dev/gate, PV gate-w-1, or the trim pod's hostPath), with ONE exemption (backlog 76c8b647; the first live plan, ops-request cc8d602e, refused on it): a hostPath whose effective path is exactly / in a longhorn-system pod labelled longhorn.io/component=instance-manager and named instance-manager-*, which Longhorn runs on every node — admitted only because nodes.longhorn.io <node> registers no disk that is /var/mnt/<volume>, sits under it or holds it (Longhorn writes only its registered disks; such a disk is refused outright, and an unread Longhorn node cannot answer), and printed in the plan as an exempt line — and then prints the plan: the node, its address, role and Node uid, the declaration's path, sha256 and declared document, the declared and the live diskSelector as JSON strings, what Talos reads of the volume (phase, filesystem, mount, partition, parent disk, size, partition uuid) and its partition (label, filesystem), the PersistentVolumes at the path, Longhorn's disks on the node, each exempt mount, the one command (talosctl patch machineconfig --mode=no-reboot) and the exact document it applies (apiVersion v1alpha1, kind UserVolumeConfig, name <volume>, $patch: delete), and the read-back. No clock in the bytes; its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1). The live machine config is only ever piped into the check: of it the plan shows the two selectors alone. A read that could not look is CANNOT ANSWER (exit 1), never a plan; any refusal renders no plan (exit 78). Timeout 300: the registry read (15 s), a bounded first pull of the door's image (120 s), the Node, PV and pod reads (20-30 s each) and three talosctl reads (20 s each).",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/retire-user-volume.sh",
+    "--plan",
+    "{1}",
+    "{2}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    {
+      "name": "volume",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$"
+    }
+  ],
+  "timeout": 300
+}

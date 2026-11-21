@@ -29,7 +29,8 @@
 //! And one read, `GET /api/events/outbox/stats[?window_hours=N]`
 //! (backlog 72c50b8b): what the relay still owes — the undrained count,
 //! its oldest row and how far behind the newest write that row sits
-//! ([`undrained`]), pending rows, open dead letters — and its delivery
+//! ([`undrained`]), pending rows and how long the oldest has waited for
+//! the bus ([`undelivered`]), open dead letters — and its delivery
 //! lag p50/p95/max over the window up to the newest delivery
 //! ([`relay_lag`], default 24h, 1..=720). The outbox keeps delivered
 //! rows only for its retention window (a week by default, backlog
@@ -55,9 +56,9 @@ use serde::Deserialize;
 use sqlx::PgPool;
 
 use crate::outbox::{
-    DeadLetter, DeadLetterError, REDELIVERED_KIND, RESOLVED_KIND, RelayLag, Undrained,
+    DeadLetter, DeadLetterError, REDELIVERED_KIND, RESOLVED_KIND, RelayLag, Undelivered, Undrained,
     dead_lettered_count, pending_count, read_back, redeliver_dead_letter, relay_lag,
-    resolve_dead_letter, undrained,
+    resolve_dead_letter, undelivered, undrained,
 };
 
 #[derive(Clone)]
@@ -189,6 +190,10 @@ pub struct OutboxStats {
     /// Rows the relay still owes a move. `pending - undrained.count` is
     /// the rows already in audit_log but not yet published and stamped.
     pub pending: i64,
+    /// What the bus still owes, dated: through a dark bus `undrained` is
+    /// empty (audit_log is written first) while this grows and ages
+    /// (design ad9519bc part c).
+    pub undelivered: Undelivered,
     /// Rows set aside and not yet resolved — not lag; the relay is done.
     pub dead_lettered_open: i64,
     /// Delivery lag over the requested window; `lag.covered_hours` is
@@ -229,6 +234,7 @@ async fn stats(
         Ok::<_, String>(OutboxStats {
             undrained: undrained(pool.as_ref()).await?,
             pending: pending_count(pool).await?,
+            undelivered: undelivered(pool).await?,
             dead_lettered_open: dead_lettered_count(pool).await?,
             lag: relay_lag(pool, window_hours).await?,
         })

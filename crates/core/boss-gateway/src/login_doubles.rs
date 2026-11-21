@@ -24,6 +24,15 @@ pub(crate) const PEOPLE_VAR: &str = "BOSS_PEOPLE_UPSTREAM";
 /// The login's Class registry address (`local_auth::session_role`).
 pub(crate) const CLASSES_VAR: &str = "BOSS_CLASSES_URL";
 
+/// How long a login under test waits on a double, set on its state as
+/// `classes_timeout`. The doubles answer in-process over loopback, so a
+/// wait this long is a stalled test machine, never the double: the
+/// production 5 s (`boss_core::http_client::CLIENT_TIMEOUT`) was the
+/// gate drive's clock, and on gate 1f46ec58 (1679 s test check against
+/// 638 s) the role test read its expiry as a 503 from the login
+/// (backlog ac3a347c).
+pub(crate) const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Serialises every test that points a login at a double: the addresses
 /// are process environment, and tests run in parallel threads.
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -104,6 +113,16 @@ pub(crate) async fn mock_people_as(role: &'static str) -> String {
 pub(crate) async fn mock_classes(
     rows: Option<Vec<(&'static str, &'static str)>>,
 ) -> (String, Arc<AtomicUsize>) {
+    mock_classes_after(rows, std::time::Duration::ZERO).await
+}
+
+/// [`mock_classes`] answering each request only after `delay` — a
+/// registry slower than the login's `classes_timeout`, so a test can
+/// prove which clock the login waits on (backlog ac3a347c).
+pub(crate) async fn mock_classes_after(
+    rows: Option<Vec<(&'static str, &'static str)>>,
+    delay: std::time::Duration,
+) -> (String, Arc<AtomicUsize>) {
     use axum::routing::get;
     let asked = Arc::new(AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -116,6 +135,7 @@ pub(crate) async fn mock_classes(
             let counter = counter.clone();
             async move {
                 counter.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
                 let Some(rows) = rows else {
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 };

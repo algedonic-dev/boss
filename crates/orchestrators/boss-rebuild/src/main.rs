@@ -1,11 +1,12 @@
 //! `boss-rebuild-all` — replay every per-service projection from
 //! `audit_log` in one command.
 //!
-//! Order matters in exactly one place: `boss-catalog` upserts the
+//! Order matters in two places: `boss-catalog` upserts the
 //! shared `parts` table as a side-effect of model replay, and
 //! `boss-inventory` references `parts` via the
 //! `purchase_order_lines.part_sku` FK. So catalog runs before
-//! inventory. Everything else is independent.
+//! inventory. And search reads `event_facts` (backlog 832386eb), so
+//! event-facts runs before search. Everything else is independent.
 //!
 //! Every step holds its projection's advisory lock under a stable
 //! per-service key (`boss_core::rebuild::lock_key`), so two rebuilds of
@@ -265,6 +266,10 @@ async fn main() -> Result<()> {
     step!("accounts", boss_accounts::rebuild_accounts(&pool));
     step!("jobs", boss_jobs::rebuild_jobs_and_steps(&pool));
     step!(
+        "claims-console",
+        boss_jobs::claims_console::source::rebuild_native(&pool)
+    );
+    step!(
         "credentials",
         boss_jobs::credentials::rebuild::rebuild_credentials(&pool)
     );
@@ -333,16 +338,17 @@ async fn main() -> Result<()> {
         boss_ledger::rebuild_bank_settlements(&pool)
     );
 
-    // Search index LAST: it reads `subjects`, `jobs` and `audit_log`,
-    // so it must see every other rebuilder's replayed output rather
-    // than whatever those tables held before this run.
-    step!("search", boss_search::rebuild_search(&pool));
-
-    // event_facts alongside search, and for the same reason: it is a
-    // projection OF audit_log, so it only needs the log itself to be
-    // settled. Kept as its own step so a Views problem is diagnosable
-    // without re-running the search index, and vice versa.
+    // event_facts near the end: it is a projection OF audit_log (and
+    // resolves Subjects through `jobs`), so it needs the log and the
+    // replayed jobs settled. Kept as its own step so a Views problem is
+    // diagnosable without re-running the search index, and vice versa.
     step!("event-facts", boss_views::rebuild_event_facts(&pool));
+
+    // Search index LAST: it reads `subjects`, `jobs` and `event_facts`
+    // (its events half, since backlog 832386eb), so it must see every
+    // other rebuilder's replayed output — event_facts included —
+    // rather than whatever those tables held before this run.
+    step!("search", boss_search::rebuild_search(&pool));
 
     let total_elapsed_ms = started_at.elapsed().as_millis();
     info!(

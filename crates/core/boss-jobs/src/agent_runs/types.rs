@@ -462,32 +462,24 @@ pub const ADMISSION_WINDOW: Window = Window::LastHour;
 /// The instant is the run's own `started_at`, not the report's
 /// arrival: a run is admitted when it starts, and a report that
 /// arrives an hour late must be judged against the hour it ran in.
-/// Two measures, both over the SAME actor's other runs:
-///   - spend: the priced cost (`usd_micros`, so an unpriced run adds
-///     nothing — it cannot add a number it does not have) of runs that
-///     FINISHED inside the window and before this run started;
-///   - in flight: runs that had started and not yet finished at the
-///     instant this one started.
-/// A run the record does not hold yet (still running, or not reported)
-/// is invisible to both, which is the honest limit of a record that is
-/// written at finish.
+/// The measure, over the SAME actor's other runs: the priced cost
+/// (`usd_micros`, so an unpriced run adds nothing — it cannot add a
+/// number it does not have) of runs that FINISHED inside the window and
+/// before this run started. A run the record does not hold yet (still
+/// running, or not reported) is invisible to it, which is the honest
+/// limit of a record that is written at finish. It measured runs in
+/// flight too, for the per-actor concurrency cap, until backlog 3e927996
+/// retired that cap: a robot's runs are bounded by its pool alone.
 pub fn measure_load(prior: &[AgentRun], run: &NewAgentRun) -> AgentLoad {
     let from = ADMISSION_WINDOW.cutoff(run.started_at);
     let others = prior
         .iter()
         .filter(|r| r.run.run_id != run.run_id && r.run.actor_id == run.actor_id);
     let spent_usd_micros = others
-        .clone()
         .filter(|r| r.run.finished_at >= from && r.run.finished_at <= run.started_at)
         .filter_map(|r| r.usd_micros)
         .fold(0u64, u64::saturating_add);
-    let in_flight = others
-        .filter(|r| r.run.started_at <= run.started_at && r.run.finished_at > run.started_at)
-        .count();
-    AgentLoad {
-        spent_usd_micros,
-        in_flight: u32::try_from(in_flight).unwrap_or(u32::MAX),
-    }
+    AgentLoad { spent_usd_micros }
 }
 
 impl NewAgentRun {
@@ -854,7 +846,7 @@ pub fn summarize(runs: &[AgentRun]) -> RunSummary {
     }
 }
 
-fn blank(key: &str) -> GroupSpend {
+pub(super) fn blank(key: &str) -> GroupSpend {
     GroupSpend {
         key: key.to_string(),
         runs: 0,
@@ -880,7 +872,7 @@ fn blank(key: &str) -> GroupSpend {
 /// Add one run into a bucket. `usd_micros`, `total_tokens` and the two
 /// split halves go to `None` and STAY `None` the moment a run joins
 /// that cannot supply them — see [`RunSummary`].
-fn fold(into: &mut GroupSpend, run: &AgentRun) {
+pub(super) fn fold(into: &mut GroupSpend, run: &AgentRun) {
     into.runs += 1;
     // Counted, never dropped: the excluded eras are part of the record
     // and a bucket that quietly omitted them would be the same missing

@@ -89,7 +89,7 @@
 </script>
 
 <div class="detail-page theme-exec">
-  <Breadcrumb to={href('/ux/finance')}>
+  <Breadcrumb to={href('/finance')}>
     ← Finance
   </Breadcrumb>
 
@@ -174,11 +174,7 @@
         <Section title="Account">
             <dl class="kv">
               <dt>Name</dt>
-              <dd>
-                <Link to={entityHref('account', p.id)}>
-                  {p.name}
-                </Link>
-              </dd>
+              <dd><EntityLink kind="account" id={p.id} label={p.name} mono={false} /></dd>
               <dt>Location</dt><dd>{p.city}, {p.state}</dd>
               <dt>Tier</dt><dd><TierChip tier={p.tier} /></dd>
             </dl>
@@ -207,12 +203,10 @@
                     <td>
                       {#if !l.ref_id}
                         —
-                      {:else if l.ref_id.startsWith('opp-')}
-                        <Link to={href(`/ux/sales/${l.ref_id}`)} className="mono">
-                          {l.ref_id}
-                        </Link>
-                      {:else if l.ref_id.startsWith('tkt-')}
-                        <Link to={href(`/ux/service/${l.ref_id}`)} className="mono">
+                      {:else if l.ref_id.startsWith('opp-') || l.ref_id.startsWith('tkt-')}
+                        <!-- A job's own page: /ux/sales/<id> and /ux/service/<id>
+                             were its spellings until design 01fa5bdf. -->
+                        <Link to={entityHref('job', l.ref_id)} className="mono">
                           {l.ref_id}
                         </Link>
                       {:else}

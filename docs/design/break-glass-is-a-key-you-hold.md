@@ -1,8 +1,14 @@
 # Break-glass is a key you hold
 
-**Status**: in-review — Q1–Q6 ride the design packet "Break-glass is
-a key you hold" (`e9703d8f`, filed 2026-09-03) with proposals
-attached; the review step is assigned.
+**Status**: living reference (re-statused 2026-11-18, backlog 924de432).
+Q1–Q6 were resolved on packet `e9703d8f` on 2026-09-03 and built; the
+answers are summarized under "Answered questions" below and
+`crates/core/boss-gateway/src/break_glass.rs` records what each one
+shaped. The file stays because the gateway, the web session, the
+enrolment protocol and the break-glass manifest cite it. Later decisions
+about the door (presence-authorised enrolment, design `03451237`) are in
+`docs/architecture-decisions.md` §Policy & auth, and new ones go on
+design packets.
 
 Break-glass authority moves from a secret on a disk to a hardware
 security key in the operator's pocket. The emergency path into BOSS
@@ -217,7 +223,18 @@ whole list.
   cost of not hand-rolling signature verification, which is not a
   place to be original.
 
-## Open questions
+## Answered questions
+
+Resolved on packet `e9703d8f` (2026-09-03), as `break_glass.rs` records
+them: **Q1** any attested roaming authenticator, with no AAGUID
+allowlist; **Q2** both keys enrolled upfront, labelled `primary` and
+`backup`, either sufficient; **Q3** a browser ceremony only, with
+terminal cases left to the PIV and sk-SSH applets on the same key;
+**Q4** a narrow `break-glass` role, never platform-admin; **Q5** the
+credential records live in an in-tree ConfigMap; **Q6** one train of
+soak: the new door landed beside `credentials.toml` and the login route,
+and retiring the `boss-auth` PVC was left to a follow-up car after
+production proof. The questions as they were asked follow.
 
 ### Q1: Attestation policy — allowlist or any-hardware?
 Enforcing attestation keeps software passkeys out. Should enrollment

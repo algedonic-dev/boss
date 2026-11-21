@@ -1,0 +1,42 @@
+# A run handed to its gate that never hears a verdict dies, as a silent
+# build does (backlog 87d1ae40).
+#
+# WHY A SECOND CLOCK. Since agent-run carries a `verdict` step, `boss
+# gate` completes a run's `building` as `handed` at the accepted durable
+# submission — the builder station's work is done and its robots:<class>
+# slot exits there — and the run waits on `verdict` holding nothing.
+# `agent-run-dies-when-building-is-silent` watches `building`, so it no
+# longer sees such a run. A green completes `verdict` (gated) and a red
+# completes it (refused), and so does a withdrawal since backlog
+# 19a674cf (agent-run-is-refused-on-gate-withdrawn, category
+# gate-withdrawn); but a gate that ends `lost` or `refused` writes
+# neither, and without this rule the run would wait
+# forever — and so would its item's step, which
+# `an-abandoned-step-is-reclaimed-when-its-verdict-died` frees only once
+# the run is recorded dead.
+#
+# THE SAME CLOCK, GUARD AND ALL (f6fefad6). Every arg but `step` and
+# `hours` equals the building clock's, pinned equal by
+# platform_bundle_agent_run.rs: silence is measured from the newest
+# completion (the hand-off's), and a gate queued, launched or green
+# spares the run. That guard is the point: the resident supervisor
+# launches a queued gate only under its exact OPEN run, and on
+# 2026-11-08 a clock that closed a run under a gate #1 in the bay line
+# withdrew a correct gate after 2h20m. The bound is 2x `verdict`'s
+# `duration_hours`, held equal by the same test (CLAUDE.md 9a).
+[[rule]]
+name = "agent-run-dies-when-its-verdict-never-comes"
+why = """
+A TIMER, the standing exemption: the condition is a verdict that did
+NOT arrive, and no event says "four hours passed with no gate alive
+for this run". A Workflow definition can say what a step requires at
+done; it cannot complete its own step for want of anyone completing
+it. Backlog 87d1ae40 moved a handed run's wait off `building` (whose
+clock this mirrors) onto `verdict`, so without this a lost gate leaves
+the run open and its item's step held forever.
+"""
+version = 1
+schedule = { cadence = "hourly", anchor_date = "2026-11-09" }
+[[rule.do]]
+handler = "jobs.age_out_step"
+args = { kind = "\"agent-run\"", step = "\"verdict\"", hours = "\"4\"", done_metadata = '"{\"result\": \"died\"}"', unless_linked_job_proves_progress = '"{\"kind\":\"gate-run\",\"link\":\"agent_run\",\"started_step\":\"launched\",\"live_step\":\"record-verdict\",\"success_step\":\"green\",\"metadata_formats\":{\"branch\":\"nonblank\",\"sha\":\"git-sha\",\"launched_at\":\"timestamp\"},\"queued_formats\":{\"branch\":\"nonblank\",\"sha\":\"git-sha\",\"queued_at\":\"timestamp\"}}"' }

@@ -66,16 +66,6 @@ async fn main() -> Result<()> {
 
     let app = boss_views::http::router(boss_views::http::ViewsApiState {
         repo: Arc::new(boss_views::PgViewsRepo::new(pool.clone())),
-        // The OS map reads `event_facts` through the same adapter.
-        os_map: Some(Arc::new(boss_views::PgViewsRepo::new(pool.clone()))),
-        // Flow reads `audit_log` — the only view that does, because
-        // it is the only place the wall clock survives.
-        flow: Some(Arc::new(boss_views::PgViewsRepo::new(pool.clone()))),
-        // Fleet reads the live step set + audit_log for wall-clock
-        // ages (crate::fleet — same doctrine as flow).
-        fleet: Some(Arc::new(boss_views::PgViewsRepo::new(pool.clone()))),
-        // Stage durations read audit_log wall time (crate::stages).
-        stages: Some(Arc::new(boss_views::PgViewsRepo::new(pool.clone()))),
         resolver: Arc::new(boss_views::PgViewResolver::new(pool.clone(), policy)),
     })
     .merge(wiring.inventory);

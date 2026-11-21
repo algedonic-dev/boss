@@ -246,11 +246,22 @@ async fn a_rule_narrowing_the_readers_role_leaves_the_coverage_read_whole() {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    let reader = HttpCoverageSources::new("http://127.0.0.1:9", format!("http://{addr}"));
+    // The reader waits this test's own clock, not `new`'s 5 s: the router
+    // answers in process over loopback, and on gate 70ac6842 a loaded
+    // drive spent the 5 s, so the read failed and this panic named a rule
+    // as the cause (backlog ac3a347c). The value it got leads the
+    // message, ahead of the reader's identity, because a receipt keeps a
+    // panic's head and that run's kept only the identity's JSON.
+    let reader = HttpCoverageSources::with_timeout(
+        "http://127.0.0.1:9",
+        format!("http://{addr}"),
+        std::time::Duration::from_secs(120),
+    );
     let workflows = reader.workflows().await.unwrap_or_else(|e| {
         panic!(
-            "a rule on the reader's role blinded the coverage read ({COVERAGE_READER}): {e} — \
-             the guard would answer 503 to every non-exempt policy write"
+            "the coverage read got: {e} — if a rule on the reader's role refused it, the \
+             guard would answer 503 to every non-exempt policy write (reader \
+             {COVERAGE_READER})"
         )
     });
     assert_eq!(

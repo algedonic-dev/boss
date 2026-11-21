@@ -164,6 +164,7 @@ mod tests {
             published_at: now(),
             last_polled_at: None,
             cursor_at: None,
+            refused: None,
         };
         let window = |until| ReadingsWindow {
             sensor_id: "inbox".into(),

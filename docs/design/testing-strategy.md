@@ -111,8 +111,10 @@ so the test drifts if the production arg expressions drift.
 projection reconstructs cleanly from `audit_log` alone.
 
 **Mechanism:** `boss-rebuild-all` walks the audit log and
-re-derives every projection table; `infra/verify-replay.sh`
-diffs the rebuilt state against live state. The brewery 365-day
+re-derives every projection table. (The standalone script that
+diffed rebuilt state against live state over host ports left with the
+bare-metal deploy path on 2026-09-18; nothing replaced it, as
+`docs/invariants/correctness-idempotence.toml` records.) The brewery 365-day
 regen (`infra/postgres/validate-brewery-sim.sh`) drives a
 year of sim-events through the live API services then runs the
 rebuilders — the assertion is "0 failures across all 15

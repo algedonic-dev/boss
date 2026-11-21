@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { pageLink } from '../shell/stationAddresses.svelte';
   // /it/registry/authoring/:jobId — the graphical authoring surface
   // for a `workflow-design` Job (decision D6). The working spec lives in
   // the design Job's publish-step `metadata.workflow_spec`; edits persist
@@ -217,7 +218,7 @@
         );
       }
       await completeStep(jobId, publishStep.id);
-      navigate(href(`/it/registry/${encodeURIComponent(slug)}`));
+      navigate(pageLink('workflows', {}, `/${encodeURIComponent(slug)}`));
     } catch (e) {
       actionError = e instanceof Error ? e.message : String(e);
       acting = null;
@@ -244,7 +245,7 @@
 </script>
 
 <div class="catalog theme-exec">
-  <Breadcrumb to={href('/it/registry')}>← All job kinds</Breadcrumb>
+  <Breadcrumb to={pageLink('workflows')}>← All job kinds</Breadcrumb>
 
   {#if loadState.kind === 'loading'}
     <p class="empty">Loading…</p>

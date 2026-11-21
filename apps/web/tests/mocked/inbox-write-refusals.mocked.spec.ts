@@ -1,4 +1,4 @@
-// /ux/inbox — a refused write is said on the page, never swallowed
+// /me/inbox — a refused write is said on the page, never swallowed
 // (page audit 5477d9eb, 2026-09-23; backlog 129da587 and 2a6fab80).
 //
 // Before this car the inbox's two writes each dropped their answer:
@@ -20,9 +20,9 @@
 
 import { expect, test, type Page, type Route } from './_test';
 import { inboxPage, installApiFloor, servePeopleRows } from './_smokeMocks';
-import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
+import { pageAt } from '../fixtures/station-tree';
 
-const PATH = ROUTE_CATALOG.inbox.path;
+const PATH = pageAt('inbox');
 
 const json = (r: Route, b: unknown, status = 200) =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(b) });
@@ -33,7 +33,7 @@ const EMP = { id: 'emp-001', name: 'David', email: 'd@a', role: 'platform-admin'
 
 /// Where the message's entity link points. Any SPA route the floor
 /// can answer; the claim is only about whether the page goes there.
-const ENTITY_PATH = ROUTE_CATALOG.people.path;
+const ENTITY_PATH = pageAt('schedule');
 
 const MSG = {
   id: 'msg-1', sender_id: 'system', recipient_id: EMP.id, kind: 'direct',

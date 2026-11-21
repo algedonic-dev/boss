@@ -34,7 +34,7 @@ async function reads(page: Page, row: unknown = packet(), status = 200): Promise
 
 test('shows independently recorded chain, drift and check age with raw evidence and packet navigation', async ({ page }) => {
   await reads(page);
-  await mountPage(page, '/it/operate/audit');
+  await mountPage(page, '/operations/audit');
   const section = page.getByRole('region', { name: 'Audit integrity' });
   await expect(section).toContainText('Chain intact');
   await expect(section).toContainText('Every emitted kind declared');
@@ -51,32 +51,32 @@ test('shows independently recorded chain, drift and check age with raw evidence 
 
 test('a successful overall run can have undeclared event kinds', async ({ page }) => {
   await reads(page, packet({ ...receipt, drift: { state: 'undeclared', kinds: ['jobs.unregistered'] } }));
-  await mountPage(page, '/it/operate/audit');
+  await mountPage(page, '/operations/audit');
   await expect(page.getByRole('region', { name: 'Audit integrity' })).toContainText('Undeclared event kinds: jobs.unregistered');
   await expect(page.getByRole('region', { name: 'Audit integrity' })).not.toContainText('Every emitted kind declared');
 });
 
 test('a drift query failure is unknown even when the overall check exits zero', async ({ page }) => {
   await reads(page, packet({ ...receipt, drift: { state: 'unavailable', error: 'registry read refused' } }));
-  await mountPage(page, '/it/operate/audit');
+  await mountPage(page, '/operations/audit');
   await expect(page.getByRole('region', { name: 'Audit integrity' })).toContainText('Event-kind coverage unavailable: registry read refused');
 });
 
 test('historical missing report never turns an overall success into chain or drift proof', async ({ page }) => {
   await reads(page, packet(null));
-  await mountPage(page, '/it/operate/audit');
+  await mountPage(page, '/operations/audit');
   await expect(page.getByRole('region', { name: 'Audit integrity' })).toContainText('Check details unknown');
 });
 
 test('a refused maintenance read is unavailable rather than a clean verdict', async ({ page }) => {
   await reads(page, packet(), 403);
-  await mountPage(page, '/it/operate/audit');
+  await mountPage(page, '/operations/audit');
   await expect(page.getByRole('region', { name: 'Audit integrity' })).toContainText('Integrity check unavailable: HTTP 403');
 });
 
 test('a recorded broken chain remains a failed check', async ({ page }) => {
   await reads(page, packet({ ...receipt, chain: { ...receipt.chain, state: 'broken', chain_break_count: 1, gap_reading: 'possible-deletion' } }, 'failed'));
-  await mountPage(page, '/it/operate/audit');
+  await mountPage(page, '/operations/audit');
   await expect(page.getByRole('region', { name: 'Audit integrity' })).toContainText('Chain broken');
   await expect(page.getByRole('region', { name: 'Audit integrity' })).toContainText('Run failed');
 });
@@ -84,7 +84,7 @@ test('a recorded broken chain remains a failed check', async ({ page }) => {
 test('a counted empty population states absence without a clean verdict', async ({ page }) => {
   await reads(page);
   await page.route(/\/api\/jobs\?/, (r) => json(r, { total: 0, data: [] }));
-  await mountPage(page, '/it/operate/audit');
+  await mountPage(page, '/operations/audit');
   const section = page.getByRole('region', { name: 'Audit integrity' });
   await expect(section).toContainText('No recorded real integrity checks.');
   await expect(section).not.toContainText('Chain intact');
@@ -93,7 +93,7 @@ test('a counted empty population states absence without a clean verdict', async 
 test('malformed detail is unavailable and preserves the rest of the audit page', async ({ page }) => {
   await reads(page);
   await page.route(`/api/jobs/${ID}`, (r) => json(r, {}));
-  await mountPage(page, '/it/operate/audit');
+  await mountPage(page, '/operations/audit');
   await expect(page.getByRole('region', { name: 'Audit integrity' })).toContainText('Malformed integrity packet detail');
   await expect(page.getByRole('heading', { name: 'Audit Log', exact: true })).toBeVisible();
 });
@@ -101,7 +101,7 @@ test('malformed detail is unavailable and preserves the rest of the audit page',
 test('a newest unfinished run does not reuse an older clean observation', async ({ page }) => {
   const running = { ...packet(null), status: 'open', steps: [{ spec_slug: 'run', status: 'active', metadata: {} }] };
   await reads(page, running);
-  await mountPage(page, '/it/operate/audit');
+  await mountPage(page, '/operations/audit');
   const section = page.getByRole('region', { name: 'Audit integrity' });
   await expect(section).toContainText('Newest run is in progress');
   await expect(section).toContainText('Check details unknown');

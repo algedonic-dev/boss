@@ -21,7 +21,7 @@ label = "Join a node"
 category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
-metadata = { department = "it" }
+metadata = { owner = "9660c60f-eb47-4405-ae08-fcbb30c71e5f", department = "it" }
 description = "Admitting a machine to the cluster, as a protocol rather than a runbook. Every step demands the evidence that a node which reports Ready can still be broken: twice in one week a node joined, passed every Kubernetes health check, and could not pull an image or had never finished booting. The runbook said to check; nothing made anyone check. Each step here refuses to complete without the measurement."
 
 [[workflow.step]]
@@ -73,6 +73,10 @@ ready_when = "steps.verify-boot.done"
 title_template = "Registry verified on {metadata.node}"
 authority_role = "platform-admin"
 fields = [{ name = "image_pulled", field_type = "string", required = true }]
+# The three procedures below name the forge's doors for these steps
+# (backlog 01927489): w-2's join (829f75a8) closed them with kubectl run
+# by hand, and w-3's (aca68557) stood here for want of a door.
+metadata_defaults = { procedure = """Run the registry probe through its door: `boss ops forge registry-probe <node> --wait`. It applies the tree's one-shot Job (infra/forge/registry-probe.yaml) pinned to the node with imagePullPolicy Always and the mirrored image named by digest, prints the pod's whole log and the kubelet's Pulling/Pulled events, removes the Job by its uid, and prints `registry-probe: PULLED <image> on <node> — …` only when the pod exited 0 on that node with the image's digest. Put that line, the Pulled event and the ops-request's id in `image_pulled`. A FAILED or REFUSED answer is the finding: record it, do not complete the step, and never apply a probe Job by hand.""" }
 
 [[workflow.step]]
 title = "verify-role"
@@ -84,6 +88,7 @@ fields = [
   { name = "labels", field_type = "string", required = true },
   { name = "declared_in", field_type = "string", required = true },
 ]
+metadata_defaults = { procedure = """Read the node's labels through their door: `boss ops forge node-labels <node> --wait` (read-only). It prints every label and taint, and closes on `boss.dev/purpose declared <d>, carried <c>: AGREES|DISAGREES|UNDECLARED|AMBIGUOUS`, comparing the purpose the estate registry's row declares with the one the Node carries. Put the labels it printed and the ops-request's id in `labels`; put where the role is declared — the estate registry row it compared against, and the apply patch's machine.nodeLabels on this packet — in `declared_in`. Anything but AGREES is the finding: record it and do not complete the step.""" }
 
 [[workflow.step]]
 title = "prove"
@@ -95,6 +100,7 @@ fields = [
   { name = "workload", field_type = "string", required = true },
   { name = "evidence", field_type = "string", required = true },
 ]
+metadata_defaults = { procedure = """Read what the cluster runs on the node through its door: `boss ops forge node-pods <node> --wait` (read-only). It prints every pod placed there, in every phase, with namespace, name, phase, images and owner, and fails rather than answer none for a node it could not read. Put the pods it names — the DaemonSet pods the cluster placed, and the registry probe from verify-registry — in `workload`; put the ops-request ids of node-pods, node-status (Ready, cordon) and the verify-registry probe in `evidence`. A node with no Running pod has not proven real work: record that and do not complete the step.""" }
 
 [[workflow.step]]
 title = "joined"

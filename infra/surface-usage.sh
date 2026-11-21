@@ -49,7 +49,7 @@
 #
 # THE ROUTE IS A PATTERN. `/ux/jobs/:jobId`, never a uuid; so
 # `never_opened` compares catalog PATHS against opened PATTERNS, and a
-# catalog path with a detail page behind it (`/ux/jobs`) is opened when
+# catalog path with a detail page behind it (`/finance/vendors`) is opened when
 # its list is opened, not when a detail is. The nav catalog's `path`
 # values are the roster; tab strips (ItTabs.svelte) and detail pages
 # are surfaces too but are not catalogued, and are not in the
@@ -190,8 +190,40 @@ api() { # <method> <path> [body]
 # already the pattern the SPA records. A catalog that yields no path is
 # unreadable, not empty — the file has never had fewer than twenty.
 # ---------------------------------------------------------------------
+#
+# A HOSTED page spells no path (backlog 0bc2eb68): its entry names its
+# host station (`host: STATION.<name>`, the id in the catalog's STATION
+# table) and its `slug`, and its path is the host's address in the tree
+# — as the jobs API derives it from the parent chain, read here the way
+# the SPA reads it (the station rows for the root, then the tree under
+# it) — with the root's own segment dropped, plus the slug. A tree that
+# cannot be read is no roster at all, never a roster of the unhosted few:
+# that is the same confident wrong answer as an empty one. A missing
+# `path:` is read as `[capture(...)] | .[0]`, null when absent: jq 1.6's
+# capture yields NOTHING on no match rather than an error, so a `try`
+# around it dropped every hosted entry (measured on the gate's jq).
 catalog_paths() { # prints one path per line, catalog order, deduped
-    grep -oE "path: '[^']+'" "$CATALOG" | sed -E "s/^path: '([^']+)'$/\1/" | awk '!seen[$0]++'
+    local list root tree prefixes ids
+    list=$(api GET /api/stations) || return 1
+    root=$(printf '%s' "$list" | jq -r '[.data[]? | select((.status // "active") == "active" and (.id // null) != null and (.parent // null) == null) | .id] | if length == 1 then .[0] else empty end') || return 1
+    [ -n "$root" ] || return 1
+    tree=$(api GET "/api/stations?under=$root") || return 1
+    prefixes=$(printf '%s' "$tree" | jq -c '.data[0].address as $r | [.data[] | select(.station.id != null) | {key: .station.id, value: .address[($r | length):]}] | from_entries') || return 1
+    ids=$(sed -n '/^export const STATION = {/,/^} as const;/p' "$CATALOG" \
+        | sed -nE "s/^  ([A-Za-z_]+): '([^']+)',?\$/\1 \2/p" \
+        | jq -R 'split(" ") | {key: .[0], value: .[1]}' | jq -sc 'from_entries') || return 1
+    grep -E "^ *('[a-z-]+'|[a-zA-Z]+): +\{ id: '" "$CATALOG" \
+        | jq -R -r --argjson ids "$ids" --argjson pre "$prefixes" '
+            ([capture("path: \\x27(?<p>[^\\x27]*)\\x27").p] | .[0]) as $path
+            | if $path != null then $path
+              else (capture("slug: \\x27(?<s>[^\\x27]*)\\x27").s) as $slug
+                | (capture("host: STATION\\.(?<h>[A-Za-z_]+)").h) as $h
+                | ($pre[$ids[$h] // ""] // null) as $prefix
+                | if $prefix == null then empty
+                  elif $slug == "" then (if $prefix == "" then "/" else $prefix end)
+                  else "\($prefix)/\($slug)" end
+              end' \
+        | awk '!seen[$0]++'
 }
 
 # The checkout's commit, as context for the catalog read: null with the
@@ -233,8 +265,9 @@ row_json() {
     npaths=$(printf '%s' "$paths" | jq 'length')
     if [ "${npaths:-0}" = "0" ]; then
         {
-            printf '%s: %s — %s/%s yielded no nav paths, so there is no roster to\n' \
+            printf '%s: %s — %s/%s yielded no nav paths (or the station tree that\n' \
                 "$NAME" "$LINT_CANNOT_ANSWER_MARKER" "$REPO" "$CATALOG"
+            printf '  places its hosted pages could not be read), so there is no roster to\n'
             printf '  compare the opens against. A row with an empty never-opened list would\n'
             printf '  read as "every surface was opened" — an infrastructure refusal (exit %s).\n' \
                 "$LINT_CANNOT_ANSWER"
@@ -360,6 +393,20 @@ file_row() {
     # fields.
     local body
     body=$(printf '%s' "$row" | jq '{measured: .measured, coverage: .coverage}')
+    # The reading can land on an unfinished packet from an older run.
+    # Bind this PATCH to the collector's invocation, preserving the packet's
+    # creation identity rather than treating it as evidence of this reading.
+    if [ -n "${INVOCATION_ID:-}" ]; then
+        case "$INVOCATION_ID" in
+            *[!0-9a-f]*) echo "$NAME: invalid reading invocation identity; nothing filed" >&2; printf '%s\n' "$row" >&2; exit 1 ;;
+        esac
+        [ "${#INVOCATION_ID}" -eq 32 ] || {
+            echo "$NAME: malformed reading invocation identity; nothing filed" >&2
+            printf '%s\n' "$row" >&2
+            exit 1
+        }
+        body=$(printf '%s' "$body" | jq --arg invocation "$INVOCATION_ID" '. + {reading_invocation_id: $invocation}')
+    fi
     api PATCH "/api/jobs/$job_id/metadata" "$body" >/dev/null || {
         echo "$NAME: filing the reading onto ${job_id:0:8} failed. It is below rather than lost." >&2
         printf '%s\n' "$row" >&2

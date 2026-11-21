@@ -125,6 +125,12 @@ conventional stacks can't, and does the things they do better.
 
 ## Enforcement
 
+**Owner: `boss-events`, the BossMemory layer** (design `089dc107` Q2,
+David 2026-11-18). Each property's register entry,
+`docs/invariants/correctness-<property>.toml`, says how it is held
+today and carries `owner = "boss-events"`, so a property no mechanism
+holds is that layer's recorded debt.
+
 Five mechanisms turn the protocol into something the system
 checks for itself, not something authors have to remember.
 
@@ -138,7 +144,7 @@ checks for itself, not something authors have to remember.
    `steps.<slug>` reference resolves, the graph is acyclic,
    every step is reachable, and every fork point covers all
    values of its discriminating enum. Runs at author time
-   (`/system/workflows`), at publish, and at boot
+   (`/it/registry`), at publish, and at boot
    (boss-jobs-api refuses to start against a broken registry).
    The runtime metadata validator in `step_registry.rs` is the
    complement: it enforces a StepType's `required` fields when

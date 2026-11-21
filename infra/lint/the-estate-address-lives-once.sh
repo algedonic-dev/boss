@@ -85,6 +85,7 @@ infra/cluster/manifests/boss-break-glass-deposit.yaml	CronJob image
 infra/cluster/manifests/boss-break-glass-operator.yaml	the admission policy's repository per rollback target, a CEL literal the API server reads (no host file); held equal to boss.yaml's images and forge-defaults.sh's REGISTRY by the_break_glass_patch_is_image_only.rs
 infra/cluster/manifests/boss-conservation-invariants.yaml	CronJob image
 infra/cluster/manifests/boss-conductor.yaml	the conductor's image and BOSS_TRAIN_FORGE_URL — prod is the source instance; render-instance.sh substitutes only the instance keys
+infra/cluster/manifests/boss-dev-standby.yaml	the standby shell's image, its clone-by-IP and forge credential key, as the dev pod's (design 0491591b)
 infra/cluster/manifests/boss-dev.yaml	the dev pod's images and forge credential key; editing it rolls the pod
 infra/cluster/manifests/boss-estate-observe.yaml	CronJob images: the mirrored kubectl image by digest, and the boss image its token reader is copied from (backlog 066a7613)
 infra/cluster/manifests/boss-files-gc.yaml	CronJob image
@@ -95,6 +96,7 @@ infra/cluster/manifests/boss-machine-token-push.yaml	CronJob image
 infra/cluster/manifests/boss-messages-events-purge.yaml	CronJob image
 infra/cluster/manifests/boss-node-maintenance.yaml	CronJob image, pinned by digest: the one pod with a node capability pulls exactly the mirrored image that was read (17f6170c)
 infra/cluster/manifests/boss-playground-crawl.yaml	CronJob images and the clone-by-IP a Job needs before it has a checkout or a host file (gate-runner.yaml + run.sh's shape)
+infra/cluster/manifests/boss-post-start-schema.yaml	CronJob image, pinned to this instance's converged build; the kubelet reads no estate file
 infra/cluster/manifests/boss-recovery-sheet.yaml	CronJob images and the clone-by-IP, as the crawl above
 infra/cluster/manifests/boss-search-reindex.yaml	CronJob image
 infra/cluster/manifests/boss-views-catchup.yaml	CronJob image
@@ -104,9 +106,10 @@ infra/cluster/talos/patches/cp-1.yaml	machine.registries.mirrors — Talos node 
 infra/cluster/talos/patches/cp-2.yaml	machine.registries.mirrors, as above
 infra/cluster/talos/patches/cp-3.yaml	machine.registries.mirrors, as above
 infra/cluster/talos/patches/w-1.yaml	machine.registries.mirrors, as above
+infra/cluster/talos/patches/w-3.yaml	machine.registries.mirrors, as above
 infra/forge/boss-ci/Dockerfile	FROM lines pull mirrored bases by registry tag; a Dockerfile reads no env
-infra/gate-runner/bootstrap.sh	run.sh's fetch, one step earlier: it runs in the gate Job before any checkout and fetches run.sh itself (e3100bc8)
 infra/gate-runner/gate-runner.yaml	the gate Job's images (a manifest rendered by gate.rs)
+infra/gate-runner/gate-volume-proof.yaml	the gate-volume proof Job's image, the gate container's own (held equal to gate-runner.yaml's by prove_gate_volume_sh.rs; ae59464b)
 infra/gate-runner/run.sh	runs in a cluster Job before it has a checkout or a host file; gate.rs rendering both addresses from the source is the follow-up
 infra/lint/ci-checks-out-from-the-forge.sh	the expected checkout line it holds ci.yml to
 infra/lint/ci-images-are-pruned-by-age.sh	self-test fixtures for the sweep's image repo

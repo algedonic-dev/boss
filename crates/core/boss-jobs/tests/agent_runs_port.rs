@@ -657,8 +657,7 @@ async fn the_summary_groups_a_registered_run_and_a_legacy_run_under_one_model() 
 // as its own event when refused — so a refusal is as visible as spend.
 // --------------------------------------------------------------------
 
-/// `agent-claude` with a $0.02/hour cap and at most two runs in
-/// flight. Every `measured` fixture run is 1,000 tokens at opus-5 =
+/// `agent-claude` with a $0.02/hour cap. Every `measured` fixture run is 1,000 tokens at opus-5 =
 /// 7,000 micro-USD, so the cap admits two and refuses the third.
 fn budgeted_log() -> InMemoryAgentRuns {
     InMemoryAgentRuns::new(card()).with_budgeted_agent(
@@ -666,7 +665,6 @@ fn budgeted_log() -> InMemoryAgentRuns {
         "opus-5",
         AgentCaps {
             hourly_budget_usd_micros: Some(20_000),
-            max_concurrent_runs: Some(2),
         },
     )
 }
@@ -813,14 +811,18 @@ async fn a_legacy_colon_form_actor_has_no_row_and_is_unbudgeted() {
     );
 }
 
+/// THE RECORDER JUDGES NO RUN CAP (backlog 3e927996). It read a run
+/// that started while another was in flight as over the row's
+/// `max_concurrent_runs`; that cap is retired — a robot's runs are
+/// bounded by its `robots:<model>` pool alone — so the overlap reads as
+/// allowed.
 #[tokio::test]
-async fn a_run_that_started_while_the_cap_was_full_of_flights_is_read_as_over() {
+async fn a_run_that_started_while_another_was_in_flight_is_not_read_as_over() {
     let log = InMemoryAgentRuns::new(card()).with_budgeted_agent(
         "agent-claude",
         "opus-5",
         AgentCaps {
             hourly_budget_usd_micros: None,
-            max_concurrent_runs: Some(1),
         },
     );
     // run-long: 01:00 -> 01:10.
@@ -829,26 +831,16 @@ async fn a_run_that_started_while_the_cap_was_full_of_flights_is_read_as_over() 
         ..registered_at("run-long", 1, 0)
     };
     log.record_run(&long, &filer()).await.expect("first in");
-    // run-mid started at 01:05, while run-long was in flight: recorded,
-    // and read as over the concurrency cap (backlog e6b2066f).
+    // run-mid started at 01:05, while run-long was in flight.
     let mid = log
         .record_run(&registered_at("run-mid", 1, 5), &filer())
         .await
         .expect("a finished run is recorded whatever it read");
-    let Some(BudgetDecision::Deny { reason }) = &mid.run.budget else {
-        panic!("{:?}", mid.run.budget);
-    };
-    assert!(reason.contains("1 of 1"), "{reason}");
-    assert!(reason.contains("in flight"), "{reason}");
-    // And a run that started after run-long finished reads as under.
-    let after = log
-        .record_run(&registered_at("run-after", 1, 11), &filer())
-        .await
-        .expect("nothing in flight at 01:11");
-    assert!(matches!(
-        after.run.budget,
-        Some(BudgetDecision::Allow { .. })
-    ));
+    assert!(
+        matches!(mid.run.budget, Some(BudgetDecision::Allow { .. })),
+        "{:?}",
+        mid.run.budget
+    );
 }
 
 /// The gap design 91a9bfe7 closed, exercised through the port: the

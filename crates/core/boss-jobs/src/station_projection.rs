@@ -161,6 +161,16 @@ pub fn agent_station_name(c: &AgentConstraint) -> String {
     format!("a.{}.{}", c.role, model_slug(&c.model))
 }
 
+/// Whether `name` is in the namespace [`station_name`] and
+/// [`agent_station_name`] generate — `q.` or `a.` — whoever wrote the
+/// row: the projection, or an operator who authored one into the tree,
+/// as `q.platform-admin.task` was. A claim never stands at such a name
+/// (D1 of design 305cf4ce, backlog 5662d4b6): it is a view of a role or
+/// a model, not a place in the tree, and it retires with D8.
+pub fn in_derived_namespace(name: &str) -> bool {
+    name.starts_with("q.") || name.starts_with("a.")
+}
+
 /// Project the `(role, model)` pairs into the stations they require —
 /// the same merge rule as [`derived_stations`] (authored wins), the
 /// same actionable-only status filter, and a predicate on BOTH
@@ -184,6 +194,8 @@ pub fn agent_stations(
             version: 1,
             status: WorkflowStatus::Active,
             kind: StationKind::Constraint,
+            automaton: None,
+            bays: None,
             predicate: StationPredicate {
                 status: Some(JobStatus::Open),
                 step: Some(StepMatch {
@@ -198,14 +210,25 @@ pub fn agent_stations(
                 ..Default::default()
             },
             discipline: default_discipline(),
-            wip_limit: None,
             terminal_window_days: None,
             capability: Some(StationCapability {
                 roles: vec![c.role.clone()],
                 models: vec![c.model.clone()],
             }),
             rollup_parent: None,
-            upstream: None,
+            floor: None,
+            edges: Vec::new(),
+            // A projected row stands outside the station tree: its place
+            // is not declared anywhere a projection could read it from.
+            id: None,
+            parent: None,
+            mode: None,
+            capacity: None,
+            machines: Vec::new(),
+            allocation: BTreeMap::new(),
+            borrow_limit: BTreeMap::new(),
+            line: None,
+            placement: None,
             lens: None,
             created_at: now,
         })
@@ -220,8 +243,8 @@ pub fn agent_stations(
 /// already exists is DROPPED rather than merged: two sources for one
 /// row is the drift this whole change exists to remove, and silently
 /// preferring one would hide which. Q1's open edge — where a derived
-/// station's `wip_limit` and `discipline` come from — is answered by
-/// leaving them at their defaults here, so that an operator wanting
+/// station's `discipline` comes from — is answered by
+/// leaving it at its default here, so that an operator wanting
 /// something else authors a row and that row visibly wins.
 pub fn derived_stations(
     workflows: &[WorkflowSpec],
@@ -252,6 +275,8 @@ fn constraint_stations(
             version: 1,
             status: WorkflowStatus::Active,
             kind: StationKind::Constraint,
+            automaton: None,
+            bays: None,
             predicate: StationPredicate {
                 status: Some(JobStatus::Open),
                 step: Some(StepMatch {
@@ -288,7 +313,6 @@ fn constraint_stations(
                 ..Default::default()
             },
             discipline: default_discipline(),
-            wip_limit: None,
             terminal_window_days: None,
             // The role IS the constraint, so it gates the claim. This
             // is the half that makes the station mean something to M:
@@ -298,7 +322,19 @@ fn constraint_stations(
                 models: Vec::new(),
             }),
             rollup_parent: None,
-            upstream: None,
+            floor: None,
+            edges: Vec::new(),
+            // A projected row stands outside the station tree: its place
+            // is not declared anywhere a projection could read it from.
+            id: None,
+            parent: None,
+            mode: None,
+            capacity: None,
+            machines: Vec::new(),
+            allocation: BTreeMap::new(),
+            borrow_limit: BTreeMap::new(),
+            line: None,
+            placement: None,
             lens: None,
             created_at: now,
         })

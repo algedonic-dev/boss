@@ -12,7 +12,8 @@ use super::*;
 /// Rebases from the merge-base, so only the car's OWN work is replayed:
 /// anything it carries that already reached main (the squash-merge
 /// case) is dropped by git as an applied patch rather than re-applied
-/// as a conflict.
+/// as a conflict. A car carrying a merge the replay would lose is not
+/// replayed at all ([`carries_a_resolved_merge`]).
 ///
 /// Leaves the clone on `train_branch` whatever happens — a caller
 /// mid-consist must not be handed a detached HEAD or a half-finished
@@ -33,6 +34,9 @@ pub(super) fn rerail_onto_consist(
     if base.is_empty() {
         return Ok(None);
     }
+    if carries_a_resolved_merge(clone, &base, &car)? {
+        return Ok(None);
+    }
     sh_unchecked(&["git", "-C", clone, "checkout", "-q", "-B", scratch, &car])?;
     let rebase = sh_unchecked(&[
         "git",
@@ -51,6 +55,66 @@ pub(super) fn rerail_onto_consist(
     }
     sh_unchecked(&["git", "-C", clone, "checkout", "-q", train_branch])?;
     Ok(Some(scratch.to_string()))
+}
+
+/// Does `car` carry, past `base`, a merge commit whose tree is not the
+/// one git makes by itself from that merge's parents — a resolved
+/// conflict, or a change made in the merge?
+///
+/// `git rebase` linearises: it replays a car's own commits and DROPS its
+/// merge commits, so whatever lived only in a merge is gone from the
+/// re-railed tree, and when the replay happens to apply cleanly nothing
+/// says so (backlog 816ec1bd, reproduced against a real repo: a car that
+/// followed a rename on main inside its merge of main re-railed back to
+/// the old name). Builder rule 1 sends a car at a conflict down exactly
+/// that road — merge main in, resolve, commit — so such a car is not
+/// re-railed: it is skipped with its conflict, as any car the replay
+/// cannot carry is. A merge git would make again by itself holds nothing
+/// to lose, so a car with only those still re-rails past a squashed
+/// parent. `--rebase-merges` is no answer: git recreates the merges but
+/// documents that their resolutions are not kept.
+///
+/// A merge whose re-merge git cannot even run reads as resolved — a
+/// question this cannot answer must not be the one that re-rails.
+fn carries_a_resolved_merge(clone: &str, base: &str, car: &str) -> Result<bool> {
+    let range = format!("{base}..{car}");
+    let merges = sh_unchecked(&["git", "-C", clone, "rev-list", "--merges", &range])?;
+    if !merges.status.success() {
+        return Ok(true);
+    }
+    for merge in stdout_str(&merges).split_whitespace() {
+        let parents = sh_unchecked(&["git", "-C", clone, "rev-parse", &format!("{merge}^@")])?;
+        let parents: Vec<String> = stdout_str(&parents)
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let [ours, theirs] = parents.as_slice() else {
+            return Ok(true); // an octopus: not a merge of main
+        };
+        let remerge = sh_unchecked(&[
+            "git",
+            "-C",
+            clone,
+            "merge-tree",
+            "--write-tree",
+            ours,
+            theirs,
+        ])?;
+        let made = sh_unchecked(&[
+            "git",
+            "-C",
+            clone,
+            "rev-parse",
+            &format!("{merge}^{{tree}}"),
+        ])?;
+        let remade = stdout_str(&remerge);
+        let remade = remade.lines().next().unwrap_or("").trim();
+        if !remerge.status.success() || !made.status.success() || remade != stdout_str(&made).trim()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn skip_reason_conflict(conflicted: &[String], file_budget: usize) -> String {
@@ -420,19 +484,74 @@ pub(crate) fn parked_ready(job: &Value) -> bool {
     // train it then declines to join, producing the empty windows that
     // made arrival rate unreadable (feedback f4baea39).
     //
-    // THE MARKER READ IS NOT LOCAL. `stranded::hold_reason` is the one
+    // THE MARKER READ IS NOT LOCAL. `stranded::marked` is the one
     // definition of "is this marker set" — `null`/`false`/blank are no
     // marker, `true` is a marker with no reason — and the loading-dock
     // station row's `metadata_unmarked: ["hold"]` clause calls the same
-    // function. This used to be a local `truthy`, which agreed by
+    // function. A gate-run's envelope reader must not hide this raw
+    // review-step hold when unrelated metadata is malformed (5746).
+    // This used to be a local `truthy`, which agreed by
     // coincidence rather than by construction; the station row had no
     // hold term at all until 20260910201453, and the two predicates
     // answering "is this car boardable" differently is the defect
     // backlog 36c3d4ca records (CLAUDE.md §9a).
     review
         .and_then(|s| s.get("metadata"))
-        .and_then(boss_jobs::stranded::hold_reason)
+        .and_then(|md| boss_jobs::stranded::marked(md, "hold"))
         .is_none()
+}
+
+/// Priority follows the declared item, including a partial answer whose
+/// absence of a closing edge is deliberate (backlog 4a1e4e6a). Shared by
+/// the reader and sorter; nomination prose is not an item relation.
+pub(crate) fn priority_item(j: &Value) -> Option<&str> {
+    let metadata = j.get("metadata")?;
+    [car::BACKLOG_ITEM, car::PARTIAL_ITEM]
+        .into_iter()
+        .find_map(|key| {
+            metadata
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+        })
+}
+
+/// The order the dock walk visits its cars in: the carried item's
+/// priority first (`top_board::priority_rank`, the drain order — a car
+/// with no item, or one whose item could not be read, ranks standard),
+/// then parked longest first, by the car's own `gate` completion (the
+/// dock region's "parked"), else its admission instant; a car with
+/// neither stamp goes last of its rank. Ties keep the list's order.
+///
+/// THE WALK'S ORDER IS THE RE-GATE LAUNCH ORDER (backlog 8035bee3): each
+/// gate-stale car takes the next free bay first-come as the walk reaches
+/// it, so walking the list API's `opened_on DESC` re-gated the newest car
+/// first. Measured 2026-10-21: a gate change staled 19 cars, and car
+/// b16e373d — the car of the oldest urgent item — was 19th of 19 through
+/// six trains while cars parked that day were re-gated ahead of it.
+/// `item_rank` maps an item id to its rank; reading it is the caller's.
+pub(crate) fn launch_order(
+    cars: Vec<(String, Value)>,
+    item_rank: &HashMap<String, u8>,
+) -> Vec<(String, Value)> {
+    // What the drain order gives a packet that names no priority.
+    let unranked = crate::top_board::priority_rank(&Value::Null);
+    let mut cars = cars;
+    cars.sort_by_cached_key(|(_, j)| {
+        let rank = priority_item(j)
+            .and_then(|item| item_rank.get(item).copied())
+            .unwrap_or(unranked);
+        let instant = |v: Option<&Value>| {
+            v.and_then(Value::as_str)
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&Utc))
+        };
+        let parked =
+            instant(find_step(j, car::GATE_SLUG, car::GATE).and_then(|s| s.get("completed_at")))
+                .or_else(|| instant(j.get("opened_at")));
+        (rank, parked.is_none(), parked)
+    });
+    cars
 }
 
 /// Does this car carry a dock merge preview it is no longer at the dock
@@ -684,6 +803,101 @@ mod tests {
     use super::*;
     use crate::train::test_support::*;
 
+    #[test]
+    fn priority_uses_a_declared_item_and_never_a_nomination_sentence() {
+        assert_eq!(
+            priority_item(&json!({"metadata": {
+                car::BACKLOG_ITEM: "closing", car::PARTIAL_ITEM: "partial"
+            }})),
+            Some("closing")
+        );
+        for invalid in [Value::Null, json!(false), json!(" ")] {
+            assert_eq!(
+                priority_item(&json!({"metadata": {
+                    car::BACKLOG_ITEM: invalid, car::PARTIAL_ITEM: "partial"
+                }})),
+                Some("partial")
+            );
+        }
+        for car in [
+            json!({}),
+            json!({"metadata": {
+                "nomination_requested": {"why": "car for urgent item-urgent"}
+            }}),
+            json!({"metadata": {car::NO_ITEM_REASON: "operator request"}}),
+        ] {
+            assert_eq!(priority_item(&car), None, "no declared item: {car}");
+        }
+    }
+
+    /// The edges of `launch_order` the dock walk's end-to-end test does
+    /// not reach (backlog 8035bee3): emergency before urgent, an item no
+    /// rank was read for walks as standard, a car with no gate stamp is
+    /// dated by its admission and one with neither goes last of its rank,
+    /// instants compare as instants whatever their offset, and a tie keeps
+    /// the list's order.
+    #[test]
+    fn the_dock_walks_by_item_priority_then_parked_longest_first() {
+        let car = |item: &str, gate_done: Option<&str>, opened_at: Option<&str>| {
+            let mut steps = vec![];
+            if let Some(at) = gate_done {
+                steps.push(json!({"spec_slug": "gate", "completed_at": at}));
+            }
+            json!({"metadata": {car::BACKLOG_ITEM: item}, "steps": steps, "opened_at": opened_at})
+        };
+        let ranks: HashMap<String, u8> = [("emergency", 0), ("urgent", 1), ("standard", 2)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let dock = vec![
+            (
+                "unread-new",
+                car("unread", Some("2026-10-20T00:00:00Z"), None),
+            ),
+            ("standard-unstamped", car("standard", None, None)),
+            // 2026-10-19T23:00Z, older than the next by the instant even
+            // though its text sorts after it.
+            (
+                "standard-offset",
+                car("standard", Some("2026-10-20T01:00:00+02:00"), None),
+            ),
+            (
+                "standard-admitted",
+                car("standard", None, Some("2026-10-19T23:30:00Z")),
+            ),
+            (
+                "standard-tie",
+                car("standard", Some("2026-10-20T01:00:00+02:00"), None),
+            ),
+            ("urgent", car("urgent", Some("2026-10-20T12:00:00Z"), None)),
+            (
+                "emergency",
+                car("emergency", Some("2026-10-21T00:00:00Z"), None),
+            ),
+        ];
+        let order: Vec<String> = launch_order(
+            dock.into_iter()
+                .map(|(id, j)| (id.to_string(), j))
+                .collect(),
+            &ranks,
+        )
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+        assert_eq!(
+            order,
+            vec![
+                "emergency",
+                "urgent",
+                "standard-offset",
+                "standard-tie",
+                "standard-admitted",
+                "unread-new",
+                "standard-unstamped",
+            ]
+        );
+    }
+
     // ---------------------------------------------------------------
     // Re-railing — the conductor's answer to a squash-merged base.
     // ---------------------------------------------------------------
@@ -830,6 +1044,145 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A scratch repo with an identity, and a `git` that asserts success.
+    fn rerail_repo(name: &str) -> std::path::PathBuf {
+        let dir = boss_testing::scratch_dir(name);
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "t@t"],
+            &["config", "user.name", "t"],
+        ] {
+            git_in(&dir, args);
+        }
+        dir
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+        let d = dir.to_str().unwrap();
+        let mut a = vec!["git", "-C", d];
+        a.extend_from_slice(args);
+        let out = sh_unchecked(&a).unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", stdout_str(&out));
+        stdout_str(&out)
+    }
+
+    fn commit_file(dir: &std::path::Path, name: &str, body: &str, msg: &str) {
+        std::fs::write(dir.join(name), body).unwrap();
+        git_in(dir, &["add", "-A"]);
+        git_in(dir, &["commit", "-q", "-m", msg]);
+    }
+
+    /// A car that MERGED main and made a change in that merge — the
+    /// resolution builder rule 1 tells a builder to make at a conflict —
+    /// must not be re-railed into a tree without it (backlog 816ec1bd).
+    /// `git rebase` linearises: it replays the car's own commits and
+    /// drops every merge commit, so the change living only in the merge
+    /// is lost, and here the replay is clean, so nothing says so. The
+    /// shape is a rename on main the car's merge followed.
+    #[test]
+    fn a_car_whose_merge_of_main_carries_a_resolution_is_not_re_railed_without_it() {
+        let dir = rerail_repo("boss-rerail-merged-main");
+        let d = dir.to_str().unwrap();
+        commit_file(&dir, "lib.txt", "fn old_name\n", "base");
+        commit_file(&dir, "use.txt", "nothing yet\n", "base use");
+
+        git_in(&dir, &["checkout", "-q", "-b", "car"]);
+        commit_file(&dir, "use.txt", "call old_name\n", "car calls it");
+        git_in(&dir, &["checkout", "-q", "main"]);
+        commit_file(&dir, "lib.txt", "fn new_name\n", "main renames it");
+
+        // The car merges main and follows the rename IN the merge.
+        git_in(&dir, &["checkout", "-q", "car"]);
+        git_in(&dir, &["merge", "-q", "--no-ff", "--no-commit", "main"]);
+        commit_file(&dir, "use.txt", "call new_name\n", "merge main");
+        assert_eq!(
+            git_in(&dir, &["rev-list", "--merges", "main..car"])
+                .lines()
+                .count(),
+            1
+        );
+
+        git_in(&dir, &["update-ref", "refs/remotes/fork/car", "car"]);
+        git_in(&dir, &["checkout", "-q", "-B", "train", "main"]);
+
+        if let Some(rerailed) = rerail_onto_consist(d, "train", "car").unwrap() {
+            assert_eq!(
+                git_in(&dir, &["show", &format!("{rerailed}:use.txt")]),
+                "call new_name\n",
+                "the re-railed car dropped the resolution its merge of main made"
+            );
+        }
+        assert_eq!(
+            git_in(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "train",
+            "the clone is left on the train branch either way"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other side of that line: a merge of main that git would make
+    /// again by itself carries nothing a replay can lose, so a car with
+    /// one is still re-railed past its squash-merged parent — the case
+    /// the re-rail exists for.
+    #[test]
+    fn a_car_whose_merge_of_main_was_clean_is_still_re_railed() {
+        let dir = rerail_repo("boss-rerail-clean-merge");
+        let d = dir.to_str().unwrap();
+        commit_file(&dir, "base.txt", "base\n", "base");
+
+        git_in(&dir, &["checkout", "-q", "-b", "parent"]);
+        commit_file(&dir, "shared.txt", "from parent\n", "parent work");
+        git_in(&dir, &["checkout", "-q", "-b", "child"]);
+        commit_file(
+            &dir,
+            "shared.txt",
+            "from parent\nfrom child\n",
+            "child work",
+        );
+
+        // Main moves on elsewhere; the child merges it cleanly.
+        git_in(&dir, &["checkout", "-q", "main"]);
+        commit_file(&dir, "other.txt", "elsewhere\n", "someone else");
+        git_in(&dir, &["checkout", "-q", "child"]);
+        git_in(
+            &dir,
+            &["merge", "-q", "--no-ff", "-m", "merge main", "main"],
+        );
+
+        // Then the parent lands as a squash.
+        git_in(&dir, &["checkout", "-q", "main"]);
+        git_in(&dir, &["merge", "-q", "--squash", "parent"]);
+        git_in(&dir, &["commit", "-q", "-m", "train: parent (squashed)"]);
+
+        git_in(&dir, &["update-ref", "refs/remotes/fork/child", "child"]);
+        git_in(&dir, &["checkout", "-q", "-B", "train", "main"]);
+
+        let rerailed = rerail_onto_consist(d, "train", "child")
+            .unwrap()
+            .expect("a clean merge of main loses nothing in a replay");
+        git_in(
+            &dir,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "train: merge child (re-railed)",
+                &rerailed,
+            ],
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("shared.txt")).unwrap(),
+            "from parent\nfrom child\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("other.txt")).unwrap(),
+            "elsewhere\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A car parked at review, branch pushed, not on a train.
     fn ready_car() -> serde_json::Value {
         json!({
@@ -1070,6 +1423,19 @@ mod tests {
         let mut other = ready_car();
         other["steps"][0]["metadata"] = json!({"note": "looks fine"});
         assert!(parked_ready(&other));
+    }
+
+    #[test]
+    fn malformed_gate_envelope_does_not_make_a_reserved_hand_hold_boardable() {
+        for poison in [json!({}), json!(null)] {
+            let mut held = ready_car();
+            held["steps"][0]["metadata"] =
+                json!({"hold":"David only","releaser":"emp-david","gate_submission":poison});
+            assert!(
+                !parked_ready(&held),
+                "raw review hold must govern dock readiness"
+            );
+        }
     }
 
     #[test]

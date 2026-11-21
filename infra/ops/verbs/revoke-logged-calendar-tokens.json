@@ -1,0 +1,14 @@
+{
+  "about": "MUTATING — revokes, on ONE declared instance, every calendar feed whose token that instance's audit log still holds in the clear: the post-land act car 4aaff4dc (train #697) left owed once per instance, owed on the playground, where anonymous guests read the audit log, and which nothing the dev pod holds can reach. Decided by David 2026-09-26 (backlog 77dc1579, design d33dfbe5: an ops verb pair, NOT an --instance on boss-api, so the dev pod gains no standing write path to a public instance; Q1 the instance's own machine token used only inside its own pod; Q2 automation:ops-runner asserts platform-admin on this one call) in the shape of design 17835005, and authorised per run by David's passkey: it declares requires_approval with plan-a-logged-raw-revoke as its plan_verb, so the runner renders the plan onto the request's approve step, runs this only after a passkey on the approvers list signs those bytes, and hands the script sha256 of the SIGNED plan. Its bound is by construction of the ONE script it calls (infra/forge/revoke-logged-calendar-tokens.sh): the namespace is the only parameter (one DNS label, boss-dev refused by name, declared in infra/cluster/instances.toml); it re-renders the plan and revokes nothing unless today's plan hashes to the approved value, and the count is in the bytes, so a count that moved is refused and a second run of an applied plan (count now 0) is refused: at most once. The act is ONE POST /api/scheduling/calendar-tokens/logged-raw/revoke on the instance's jobs port on loopback, from inside its own deploy/boss container boss through kubectl exec, signed automation:ops-runner at platform-admin with that container's own machine token in a 0600 header file (never read out, copied, printed or delivered), the ops-request id printed beside it; an approved plan of 0 sends no POST. THE EFFECT IS READ BACK: the count is read again through the same route, and only logged_raw 0 prints the effect line; anything else exits 1, naming what it read.",
+  "hosts": ["forge"],
+  "requires_approval": true,
+  "plan_verb": "plan-a-logged-raw-revoke",
+  "approvers": ["emp-david"],
+  "argv": ["infra/forge/revoke-logged-calendar-tokens.sh", "{1}", "{2}"],
+  "params": [
+    { "name": "namespace", "pattern": "^[a-z][a-z0-9-]{0,62}$" },
+    { "name": "plan_sha256", "pattern": "^[0-9a-f]{64}$" }
+  ],
+  "timeout": 180,
+  "effect": "^revoke-logged-calendar-tokens: ([a-z0-9-]+ revoked [0-9]+ — read back: logged_raw 0 \\(was [0-9]+\\)|plan [0-9a-f]{64} still holds and names no token — nothing to revoke in [a-z0-9-]+)$"
+}

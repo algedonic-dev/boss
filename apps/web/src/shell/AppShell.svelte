@@ -1,55 +1,40 @@
 <script lang="ts">
   // App shell — persistent sidebar + content slot.
   //
-  // Sidebar layout: a Work section (operator-tier surfaces tied to
-  // the user's role + assignments) + a flat list of Browse/Know
-  // surfaces. The legacy Admin tier was removed 2026-05-03 — admin-
-  // shaped pages live in the regular sidebar gated by the policy
-  // role check.
+  // THE SIDEBAR IS WHAT THE STATION BEING VIEWED HOSTS (backlog 474e2c1c,
+  // David 2026-11-19: "I want the sidebar of a station to hold whatever
+  // navigation links or internal pages to the station that the station
+  // wants to host"). Its rows are the catalog entries whose `host` is that
+  // station (shell/station-trail.ts `sidebarOf`), and on the person's own
+  // pages, the person's own. Moving between stations is the top bar's job
+  // (StationTrail.svelte), so no row here names another station.
+  //
+  // It was a department's rows until then — the entries a
+  // departments-registry code owned, then a Jobs row — under one tab per
+  // row of that registry, so both bars drew departments the company no
+  // longer has (David 2026-11-20). The department rows and the hand-kept Home
+  // group retired with it. The visible() filter still drops whatever the
+  // role or the tenant manifest blocks.
 
   import ClassesReadFailed from '@boss/web-kit/ui/ClassesReadFailed.svelte';
   import { session } from '@boss/web-kit/session/session.svelte';
   import { moduleEnabled, getLabel } from '@boss/web-kit/session/manifest.svelte';
   import { canSeeRoute, type Role } from '@boss/web-kit/session/permissions';
-  import { departmentLabel } from '@boss/web-kit/nav';
-  import { departments } from '@boss/web-kit/session/departments.svelte';
   import { href, navigate } from '../router';
-  import {
-    ROUTE_CATALOG,
-    departmentRows,
-    inPerspective,
-    type AppId,
-    type NavItem,
-    type NavGroup,
-  } from './nav-catalog';
+  import type { NavItem } from './nav-catalog';
+  import { pagePath } from './page-address';
+  import { stationAddresses } from './stationAddresses.svelte';
+  import { sidebarOf, type Viewing } from './station-trail';
   import { classesFor } from '@boss/web-kit/session/classes.svelte';
   import { safeLinkHref } from '@boss/web-kit/links';
 
-  // NavItem / NavGroup / ROUTE_CATALOG live in ./nav-catalog so both
-  // this shell and App.svelte read the same registry — and so the
-  // consistency test can import it instead of mirroring it by hand.
-  // `owner` on each entry is the single answer to "which tab owns this
-  // surface"; it replaced this file's MODEL_ROUTES and App.svelte's
-  // MODEL_KINDS, which had to agree and could silently stop agreeing.
-
-  // Surfaces — one entry per department-rooted dashboard, in the
-  // order an operator would scan them. Rendered as-is; the visible()
-  // filter then drops anything the role/manifest blocks. A
-  // service-only persona simply sees Service + Inventory + Shipments.
-  let { activeSection, perspective = 'home', children } = $props<{
+  let { activeSection, viewing, children } = $props<{
     activeSection: string;
-    // Which app tab this shell renders under. Drives which surfaces
-    // appear in the sidebar. Typed as the full AppId — the shell
-    // speaks the same vocabulary as the catalog, so adding an app is
-    // a catalog change rather than a widening here.
-    perspective?: AppId;
+    /// What the page views (station-trail.ts `viewedBy`), the same value
+    /// the top bar draws the path to.
+    viewing: Viewing;
     children: () => any;
   }>();
-
-  // Svelte's generated props type widens `perspective` to `any` through
-  // the default, which silently un-types every Record lookup below.
-  // Pin it once.
-  let activeApp = $derived(perspective as AppId);
 
   let user = $derived(
     session.value.kind === 'ready' ? session.value.user : null,
@@ -106,81 +91,14 @@
     };
   });
 
-  // A department's sidebar is DERIVED (car 2 of design 8c3e9599, backlog
-  // 64656a46): `departmentRows` — its own catalog surfaces in catalog
-  // order, then its Jobs row — so a department the registry adds gets
-  // its sidebar with no edit here. Two hand lists answered this until
-  // then: APP_SURFACES, each department's surface order, and IT_GROUPS,
-  // IT's seven rows. Both repeated what the catalog already held, and
-  // APP_SURFACES disagreed with it: it listed Sales' Accounts first while
-  // the tab opened on the pipeline. `visible()` then drops whatever the
-  // role or the tenant manifest blocks.
+  let sidebar = $derived(sidebarOf(viewing as Viewing, stationAddresses()));
 
-  // The group header is the department's own label — the registry's
-  // display name, because a second spelling of "Finance" is a second
-  // thing to keep in step.
-  function appGroupLabel(app: AppId): string {
-    return app === 'home' || app === 'simulator' ? '' : departmentLabel(app, departments());
-  }
-
-  // Work group is All jobs, for every role (backlog 0f9be7c0,
-  // 2026-09-24). It was role-keyed — a closed map until 6a3b93eb, then
-  // each role row's `metadata.work` — but visible() drops every entry
-  // whose catalog owner is not home, so of any list only `jobs` could
-  // render and a list without it left Work empty. Each department app
-  // has its own sidebar; a role's surfaces are gated there, by the
-  // row's `surfaces`, and Work here is the same filter over one row.
-  const WORK: NavGroup = {
-    label: 'Work',
-    items: [ROUTE_CATALOG.jobs],
-  };
-
-  // Home — personal work, whichever domain it belongs to: "what am I
-  // meant to be doing" is one question, and its answer (All jobs, My
-  // Day) crosses every department freely.
-  //
-  // Mine lists Home surfaces only. It carried Exec until backlog
-  // e8fe5e5a (2026-09-24), a row visible() dropped for every role —
-  // Exec's catalog owner is executive — so it never rendered here; it is
-  // the Executive department's row, under a tab every role is offered.
-  const HOME_GROUPS: ReadonlyArray<NavGroup> = [
-    WORK,
-    {
-      label: 'Mine',
-      items: [
-        // Permkey-less: /` is App.svelte's `me` route, which has no
-        // catalog entry (it is everyone's, ungated).
-        { id: 'my-day', label: 'My Day', path: '/' },
-        ROUTE_CATALOG.inbox,
-        ROUTE_CATALOG.schedule,
-        ROUTE_CATALOG['company-map'],
-        ROUTE_CATALOG.manual,
-      ],
-    },
-  ];
-
-  // Every department group ends on its Jobs row — the department's in
-  // / working / out over the packets whose workflow declares it
-  // (cc76f755, 2026-09-18) — IT's included, since car 2 of design
-  // 8c3e9599: every unit carries it. `departmentRows` says why it is
-  // permKey-less.
-  let MAIN = $derived<ReadonlyArray<NavGroup>>(
-    activeApp === 'home'
-      ? HOME_GROUPS
-      : [{ label: appGroupLabel(activeApp), items: departmentRows(activeApp) }],
-  );
-
-  // A surface is in-perspective when its own catalog `owner` matches the
-  // app this shell is rendering — inPerspective in ./nav-catalog, where
-  // the test pinning every sidebar list imports it (72a88031). One
-  // comparison against one field, where this used to be a MODEL_ROUTES
-  // set here that had to agree with a MODEL_KINDS set in App.svelte.
   function visible(items: ReadonlyArray<NavItem>): ReadonlyArray<NavItem> {
     if (!role) return [];
     return items.filter((i) => {
       const policyOk = i.permKey === undefined || canSeeRoute(role, i.permKey, roleRow);
       const moduleOk = i.module === undefined || moduleEnabled(i.module);
-      return policyOk && moduleOk && inPerspective(i, activeApp);
+      return policyOk && moduleOk;
     });
   }
 
@@ -193,61 +111,60 @@
 
 <div class="app-shell">
   <aside class="shell-sidebar">
-    <nav class="shell-nav">
-      {#if perspective === 'user'}
-        <div class="shell-nav-personal">
-          <a
-            href="/ux/me"
-            class="shell-nav-item shell-nav-home {activeSection === 'me' ? 'shell-nav-item-active' : ''}"
-            onclick={(e) => onLinkClick(e, '/ux/me')}
-          >
-            My Day
-          </a>
-          <a
-            href="/ux/inbox"
-            class="shell-nav-item {activeSection === 'inbox' ? 'shell-nav-item-active' : ''}"
-            onclick={(e) => onLinkClick(e, '/ux/inbox')}
-          >
-            Inbox
-            {#if unreadDirect > 0}
-              <span
-                class="shell-nav-badge"
-                title="{unreadDirect} message{unreadDirect === 1 ? '' : 's'} addressed to you"
-                aria-label="{unreadDirect} unread message{unreadDirect === 1 ? '' : 's'} addressed to you"
-              >{unreadDirect}</span>
+    <nav class="shell-nav" data-sidebar-state={sidebar.kind}>
+      {#if sidebar.kind === 'loading'}
+        <p class="shell-nav-note" role="status">Reading the station tree…</p>
+      {:else if sidebar.kind === 'failed'}
+        <!-- Said, never an empty sidebar: no rows would read as a station
+             that hosts nothing (builder rule 21.2). Its own class, not
+             `load-failed`: that one marks a PAGE's primary read, and the
+             chrome wearing it too made two on the station floor's failed
+             read (gate-run 45fa3237, station-tree-floor.mocked.spec.ts). -->
+        <p class="shell-nav-note shell-nav-failed" role="alert" data-sidebar-failed>Couldn't read the station tree — {sidebar.why}</p>
+      {:else}
+        {@const items = visible(sidebar.items)}
+        {#if items.length > 0 || (sidebar.label !== '' && role !== null)}
+          <div class="shell-nav-group" data-sidebar-station={sidebar.label || undefined}>
+            {#if sidebar.label !== ''}
+              <div class="shell-nav-group-label">
+                <span class="shell-nav-group-chevron">▾</span>
+                {sidebar.label}
+              </div>
             {/if}
-          </a>
-          <a
-            href="/ux/shop"
-            class="shell-nav-item {activeSection === 'shop' ? 'shell-nav-item-active' : ''}"
-            onclick={(e) => onLinkClick(e, '/ux/shop')}
-          >
-            Shop
-          </a>
-        </div>
-      {/if}
-
-      {#each MAIN as group (group.label)}
-        {@const items = visible(group.items)}
-        {#if items.length > 0}
-          <div class="shell-nav-group">
-            <div class="shell-nav-group-label">
-              <span class="shell-nav-group-chevron">▾</span>
-              {group.label}
-            </div>
+            {#if items.length === 0}
+              <!-- A station that hosts no page you can open says so: an
+                   empty group would read as a sidebar that failed. -->
+              <p class="shell-nav-note" data-sidebar-empty>No pages hosted here.</p>
+            {/if}
             {#each items as item (item.id)}
-              <a
-                href={safeLinkHref(item.path)}
-                class="shell-nav-item {activeSection === item.id ? 'shell-nav-item-active' : ''}"
-                onclick={(e) => onLinkClick(e, item.path)}
-              >
-                {getLabel(`nav.${item.id}_label`, item.label)}
-              </a>
+              <!-- A hosted page's path is its host station's address in
+                   the tree plus its slug (backlog 0bc2eb68): until the
+                   tree answers, the row names the page and links nowhere. -->
+              {@const to = pagePath(item, stationAddresses())}
+              {#if to === null}
+                <span class="shell-nav-item" data-unplaced>{getLabel(`nav.${item.id}_label`, item.label)}</span>
+              {:else}
+                <a
+                  href={safeLinkHref(to)}
+                  class="shell-nav-item {activeSection === item.id ? 'shell-nav-item-active' : ''}"
+                  onclick={(e) => onLinkClick(e, to)}
+                >
+                  {getLabel(`nav.${item.id}_label`, item.label)}
+                  {#if item.id === 'inbox' && unreadDirect > 0}
+                    <span
+                      class="shell-nav-badge"
+                      title="{unreadDirect} message{unreadDirect === 1 ? '' : 's'} addressed to you"
+                      aria-label="{unreadDirect} unread message{unreadDirect === 1 ? '' : 's'} addressed to you"
+                    >{unreadDirect}</span>
+                  {/if}
+                </a>
+              {/if}
             {/each}
           </div>
         {/if}
-      {/each}
+      {/if}
     </nav>
+
 
 
     <div class="shell-sidebar-footer">
@@ -257,11 +174,11 @@
              user's name in the bottom right click into the profile"). -->
         <a
           class="shell-user"
-          href={href('/ux/me')}
+          href={href('/me')}
           title="Your profile and passkeys"
           onclick={(e) => {
             e.preventDefault();
-            navigate('/ux/me');
+            navigate('/me');
           }}
         >
           <div class="shell-user-name">{user.name}</div>

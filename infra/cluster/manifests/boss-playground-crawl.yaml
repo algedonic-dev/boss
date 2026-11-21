@@ -105,8 +105,12 @@ spec:
       backoffLimit: 0
       # The crawl of 55 routes took 1.4 min from the dev pod (2026-09-18);
       # the clone and install are seconds to a minute. An hour is a
-      # stuck browser, not a slow one.
-      activeDeadlineSeconds: 3600
+      # stuck browser, not a slow one. The hour is the crawl's; the Job
+      # adds the record's packet open ahead of it (about 278 s at three
+      # attempts, review 0aced427) and the record's close after it — the
+      # record container's BOSS_ACT_BOUND_S, held by
+      # every_maintenance_wrap_caller_retries_its_open.rs.
+      activeDeadlineSeconds: 3900
       template:
         spec:
           # The gate runner's uid, for the gate runner's reasons
@@ -240,9 +244,11 @@ spec:
                   export RESULT_DIR="${BOSS_CRAWL_RESULT_DIR:-/result}"
                   export GO_DIR="${BOSS_CRAWL_GO_DIR:-/go}"
                   export GUARD="${BOSS_CRAWL_GUARD:-/usr/local/bin/wait-out-a-converge.sh}"
-                  # Inside the Job's one-hour activeDeadlineSeconds, so
-                  # a crawl container that died without a word is a
-                  # packet closed `failed`, not a pod killed mid-wait.
+                  # Inside the Job's activeDeadlineSeconds with the open
+                  # before it and the close after it (BOSS_ACT_BOUND_S
+                  # below), so a crawl container that died without a
+                  # word is a packet closed `failed`, not a pod killed
+                  # mid-wait.
                   export RECORD_DEADLINE_S="${BOSS_CRAWL_RECORD_DEADLINE_S:-3450}"
                   export RESULT_POLL_S="${BOSS_CRAWL_RESULT_POLL_S:-5}"
                   exec /usr/local/bin/boss-chore.sh maintenance-playground-crawl "Playground crawl" -- bash -c '
@@ -287,6 +293,28 @@ spec:
                 # The record: prod's jobs door, IT's queue.
                 - name: BOSS_JOBS_URL
                   value: http://boss-jobs-internal.boss.svc.cluster.local:7900
+                # The packet open tries 3 times, not the wrap's default 1
+                # (backlog a2ae9f39: one failed read lost the backup's
+                # packet on 10-26 and 10-27). Pinned by
+                # every_maintenance_wrap_caller_retries_its_open.rs.
+                - name: BOSS_WRAP_OPEN_RETRY
+                  value: "3"
+                # THE ACT'S OWN BOUND, in seconds: how long this container
+                # still runs once the wrap's open returns. A declaration,
+                # read by every_maintenance_wrap_caller_retries_its_open.rs
+                # and by no process: that pin refuses an
+                # activeDeadlineSeconds below the wrap's worst-case open at
+                # three attempts plus this, and a bound below the
+                # RECORD_DEADLINE_S default above (review 0aced427, N4).
+                # $SECONDS starts in the inner bash, AFTER the open, so the
+                # record's wait is RECORD_DEADLINE_S (3450) plus one
+                # RESULT_POLL_S (5) it can sleep past it; then the two
+                # `take` reads at `timeout 30` (60), then the close the
+                # record exists for — boss-step.sh's three requests (open
+                # read, metadata merge, status PUT) at BOSS_STEP_MAX_TIME
+                # 30 (90): 3605.
+                - name: BOSS_ACT_BOUND_S
+                  value: "3605"
                 # The reader stamps loopback and the hosts named here.
                 - name: BOSS_MACHINE_TOKEN_HOSTS
                   value: ".boss.svc.cluster.local"

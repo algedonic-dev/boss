@@ -85,16 +85,19 @@ spec:
     metadata:
       labels: {app: postgres}
     spec:
-      # The system of record does not share a machine with builds.
-      # Neither StatefulSet had any scheduling constraint, so both went
-      # wherever capacity happened to be: postgres ran on w-1 (which
-      # resets under sustained build load - NVMe thermal, 2026-08-25),
-      # then w-2, and reached a control plane only by being moved by
-      # hand. The split lived in the design docs and nowhere the
-      # scheduler could read it. Control planes are untainted here, so
-      # a plain nodeSelector is enough.
-      nodeSelector:
-        node-role.kubernetes.io/control-plane: ""
+      # The system of record belongs on the declared data node, not an
+      # etcd or build node (design 3c475a19, item eb93f511). Other
+      # instances retain their declared placement in instances.toml.
+      # postgres-placement: begin
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: boss.dev/purpose
+                    operator: In
+                    values: [database]
+      # postgres-placement: end
       imagePullSecrets:
         - {name: forgejo-registry}
       containers:
@@ -114,7 +117,82 @@ spec:
           # blows past PG's default max_connections=100 and makes services
           # fail-closed mid-startup. 400 is the one setting; the compose
           # file's postgres carries the same.
-          args: ["postgres", "-c", "max_connections=400"]
+          # A rolled-away client must not leave its query running for hours
+          # (bbf242ed). Poll closed sockets during queries every ten seconds;
+          # explicit TCP probes also detect a peer lost without a FIN. These
+          # are disconnect defaults, not an application statement timeout.
+          # Changing these pod arguments rolls this single database instance.
+          # Time IO and WAL writes (923d75bd, urgent d9b39685): four hours of
+          # slow-request moments named LWLock:WALWrite and zero lock waits,
+          # and with both switches off the statistics could name that wait
+          # but not time it. Each timed IO costs two clock reads; measured
+          # 2026-10-29 in a dev-build worker (Ryzen 9 5950X, Talos 6.18,
+          # clocksource tsc) with the pg_test_timing loop: 23.8-24.3 ns a
+          # read, 97.6% under 1 us, over three 5 s runs.
+          # Buffer and WAL tuning (d9b39685, option A, David 2026-10-29):
+          # with the timing above on, a 27.0 s write at 19:32:41Z had 3 WAL
+          # writes take 23.8 s - the volume under this database (three
+          # synchronous Longhorn replicas on the control planes' etcd
+          # disks) stalls for seconds. These write less WAL, and wait on
+          # it less; they do not change what a commit waits for.
+          # - shared_buffers=2GB (from the 128MB default). The pod declares
+          #   no memory limit (request 3Gi, below), so "25% of the limit" has no
+          #   number; the bound is the node. It floats over cp-1 (15 GiB),
+          #   cp-2 and cp-3 (31 GiB each; estate.toml), and the smallest
+          #   one also runs etcd, the apiserver, kanidm, Longhorn and can
+          #   hold the boss Deployment (limit 12Gi). 25% of about half of
+          #   cp-1 is 2GB; the rest of the hot set stays in page cache.
+          # - wal_buffers=64MB (auto would be 16MB at this shared_buffers):
+          #   room for a burst to keep inserting while a write is stuck.
+          # - max_wal_size=4GB, min_wal_size=1GB (from 1GB / 80MB): the
+          #   log counted 3.1 TB of WAL over 58 days (about 185 MB per
+          #   5-minute checkpoint_timeout), so 4GB keeps a fold burst from
+          #   forcing an early checkpoint and the full-page images after
+          #   it; 1GB of recycled segments spares new 16MB zero-filled
+          #   files. 8GB was not taken: pg_wal lives on the same 68Gi
+          #   volume whose replicas fill 236 GB cp disks.
+          # - wal_compression=lz4: compresses those full-page images.
+          #   The image above is 16.15 built --with-lz4 (read 2026-10-29
+          #   from boss-dev.yaml's postgres sidecar, the same image).
+          # Durability is NOT changed: synchronous_commit, fsync,
+          # full_page_writes and wal_sync_method stay at their defaults,
+          # and the pin refuses each in any spelling (1702a075).
+          # shared_preload_libraries=pg_stat_statements (891e48c9, folded
+          # into this car 2026-10-29 so the database restarts once):
+          # temp-file spills may outweigh the WAL load on the same disks,
+          # and naming the statements that spill needs per-statement
+          # temp_blks_written, which only this library counts and which
+          # loads only at start. The schema creates its view
+          # (infra/postgres/schema/20261029215507-pg-stat-statements.sql);
+          # the pin holds every preloaded library to the file that does.
+          args:
+            - postgres
+            - -c
+            - max_connections=400
+            - -c
+            - client_connection_check_interval=10s
+            - -c
+            - tcp_keepalives_idle=60
+            - -c
+            - tcp_keepalives_interval=10
+            - -c
+            - tcp_keepalives_count=3
+            - -c
+            - track_io_timing=on
+            - -c
+            - track_wal_io_timing=on
+            - -c
+            - shared_buffers=2GB
+            - -c
+            - wal_buffers=64MB
+            - -c
+            - max_wal_size=4GB
+            - -c
+            - min_wal_size=1GB
+            - -c
+            - wal_compression=lz4
+            - -c
+            - shared_preload_libraries=pg_stat_statements
           env:
             - {name: POSTGRES_USER, value: boss}
             - {name: POSTGRES_DB, value: boss}
@@ -126,8 +204,21 @@ spec:
             exec: {command: ["pg_isready", "-U", "boss"]}
             initialDelaySeconds: 10
             periodSeconds: 5
+          # 3Gi, from 1Gi (d9b39685 review requirement, 2026-10-29): the
+          # 2GB of shared_buffers above is allocated at start and kept, and
+          # 400 connections, work_mem sorts and autovacuum need room past
+          # it. With no limit, a pod well over its request is among the
+          # first a node under memory pressure evicts - the one database.
+          # Checked against the nodes it may land on (estate registry
+          # 2026-10-29): cp-1 has 15 GiB, cp-2 and cp-3 31 GiB. The most
+          # this namespace pins to cp-1 is the boss Deployment (request
+          # 4Gi; it avoids cp-2), nats (256Mi) and cloudflared (32Mi), so
+          # with this pod 7.3 GiB is requested there, leaving room for
+          # etcd, the apiserver, kanidm and Longhorn. No limit is added:
+          # an OOM kill of the system of record is worse than a page
+          # cache squeezed by its neighbours.
           resources:
-            requests: {cpu: "500m", memory: 1Gi}
+            requests: {cpu: "500m", memory: 3Gi}
           volumeMounts:
             - {name: pgdata, mountPath: /var/lib/postgresql/data}
   volumeClaimTemplates:
@@ -240,15 +331,24 @@ spec:
 # method, route — and served at /api/machine-gate/misses to a caller
 # holding the token. That tally is how enforcement is earned: a window
 # of zero misses, read (operator decision (4) on 2710c8fc). NOTHING IS
-# REFUSED in this mode. `enforce` is row C of decision b08725c2, its
-# own car, after a 72-hour clean window, on a Pacific-hours train;
-# crates/core/boss-testing/tests/the_machine_gate_reports_and_refuses_nothing.rs
-# refuses `enforce` for THIS key anywhere under this directory until
-# then — the policy check's flip below did not carry it.
+# REFUSED in that mode.
 #
-# Rendered per instance, so the playground reports too. It holds no
-# token (the broker writes only boss and boss-dev), so every request it
-# serves is a miss — admitted, and bounded by the tally's key cap.
+# `enforce`, since row C's car (decision b08725c2; backlog 2710c8fc):
+# what `report` tallied is REFUSED 401, naming the header and the mode.
+# A request at a service port that presents no accepted token is no
+# longer believed about who sent it, so an x-boss-user claiming
+# platform-admin from the LAN or the mesh buys nothing. The gateway is
+# not gated (it strips x-boss-user at its edge and stamps the token on
+# what it forwards); OPTIONS and each binary's exact health paths stay
+# exempt. With NO readable token a gate in `enforce` degrades to
+# `report` and says so at error level — it never refuses everything.
+# crates/core/boss-testing/tests/the_machine_gate_reports_and_refuses_nothing.rs
+# holds `enforce` for THIS key to the one line below, and its way back
+# beside it.
+#
+# Rendered per instance. The playground holds no token (the broker
+# writes only boss and boss-dev), so its gates run degraded: admitted,
+# tallied, and said at error level, exactly as before this flip.
 #
 # THE POLICY CHECK'S MODE, the second key (F7 of backlog b8e75382, row
 # D of design b08725c2; boss_policy::check_mode). The same reader, the
@@ -307,7 +407,23 @@ metadata:
   name: boss-machine-gate
   namespace: boss
 data:
-  mode: report
+  # THE MACHINE GATE'S WORD (row C of decision b08725c2; backlog
+  # 2710c8fc). WHAT A MISFIRE COSTS: a caller the window never saw (a
+  # weekly cadence, a host script) is refused 401 at every port it calls
+  # until it stamps the token or this word goes back. THE WAY BACK
+  # passes neither the jobs API nor the forge nor the conductor — David's
+  # admin kubeconfig over the LAN kube road:
+  #   kubectl -n boss patch configmap boss-machine-gate --type merge -p '{"data":{"mode":"report"}}'
+  # Every gate re-reads it within kubelet's refresh plus five seconds,
+  # with no pod roll, and logs "LEFT enforce". The next converge
+  # re-applies this file, so land the revert car (this line back to
+  # `report`, with the pin named above) behind the patch.
+  #
+  # BEFORE THIS LINE DEPARTS, AND AFTER IT LANDS, the window is read by
+  # a machine (design 21946380, decision 4; 26 hours, David 2026-10-17):
+  #   boss-api GET '/api/events/gate-window?gate=machine-gate&hours=26' > window.json
+  #   bash infra/ops/gate-window-is-clean.sh machine-gate 26 < window.json
+  mode: enforce
   policy-check: enforce
   # abf9eeae precursor, classes only. No enforcement or 72h readiness.
   actor-role: report
@@ -406,16 +522,17 @@ spec:
       # `default` mounts nothing (backlog 28367b57).
       serviceAccountName: boss
       automountServiceAccountToken: true
-      # The SoR app rides its data: control-plane nodes only, never a
-      # flaky worker. Unpinned, this Deployment landed on w-1 and was
+      # stack-placement: begin (rendered from instances.toml)
+      # Registered instances require their declared node, without fallback.
+      # Before per-instance placement, this Deployment landed on w-1 and was
       # evicted when w-1 shed pods — :7900 went dark for minutes on a
       # Multi-Attach stall (90932d98). Its StatefulSets were already
       # pinned; the app was not.
       nodeSelector:
         node-role.kubernetes.io/control-plane: ""
       # …but NOT cp-2, until its disk is replaced. Every converge rolls
-      # this pod: a 309 MB image pull and layer extraction onto whichever
-      # control-plane node holds it. On cp-2 that disk is a DRAM-less
+      # this pod: a 309 MB image pull and layer extraction onto its
+      # declared node. On cp-2 that disk is a DRAM-less
       # PM991a (SAMSUNG MZALQ256HBJD) that also carries etcd's WAL, and
       # the extraction stalled the WHOLE node — etcd, containerd and the
       # kubelet together, /proc/pressure/io full ≈ 6.7 h — until the
@@ -433,6 +550,12 @@ spec:
             nodeSelectorTerms:
               - matchExpressions:
                   - {key: kubernetes.io/hostname, operator: NotIn, values: ["cp-2"]}
+                  # 6fd7ea29 car 1: cp-1 has only 15 GB and stalled under
+                  # stack pressure. Require each instance's declared node;
+                  # the fixed memory reader supplies the week of data
+                  # required before car 2 chooses a measured limit.
+                  - {key: kubernetes.io/hostname, operator: In, values: ["cp-3"]}
+      # stack-placement: end
       # The image runs as uid/gid 1500 (boss), but a freshly provisioned
       # Longhorn volume mounts root:root 0755 — so the credential store
       # was unwritable and boss-auth failed on the temp file. fsGroup
@@ -488,6 +611,14 @@ spec:
         # defaultMode 0400 + the pod fsGroup (1500) lands the file
         # root:1500; the kubelet OR's group-read onto a read-only secret
         # volume, so the boss uid can read it (matches boss-conductor).
+        # ROTATION is replace the Secret AND roll this Deployment, one
+        # act (design c22f36c6): the kubelet re-projects a replaced
+        # Secret in place, but the gateway and the jobs API read it at
+        # start, so a replace with no roll leaves them on the old key
+        # (the jobs API names the mismatch on a refused presence claim).
+        # Presence tickets and the OIDC state cookie are MAC'd under keys
+        # derived from this one (backlog 19f00800), so they rotate with
+        # it; session cookies are MAC'd with it directly.
         - name: boss-session-key
           secret:
             secretName: boss-session-key
@@ -810,15 +941,6 @@ spec:
             # 791 already-parked packets unblock separately (their
             # parked_batch=brewery-sim-2026-09-05).
             - {name: BOSS_SIM_ENABLED, value: "false"}
-            - {name: BOSS_DISPATCH_STRATEGY, value: spread}
-            # Decides-vs-executes (291a73a7, option c): decision-shaped
-            # steps go to the role's human holder; executable platform
-            # work defaults to the agent, who drains it. Which agent
-            # runs here is a deployment fact, same class as the
-            # strategy above. Scoped to platform-admin so brewery-role
-            # steps never land on the platform agent.
-            - {name: BOSS_DISPATCH_EXECUTOR_ID, value: "claude@algedonic.dev"}
-            - {name: BOSS_DISPATCH_EXECUTOR_ROLES, value: "platform-admin"}
             - {name: BOSS_DISPATCHER_RULES, value: /opt/boss/infra/dispatcher/rules}
             # The DNS zone declarations + comparator (infra/cluster/dns,
             # 5e58922c) the dns.observe handler runs over the zone it
@@ -995,6 +1117,8 @@ spec:
             failureThreshold: 150
           resources:
             requests: {cpu: "2", memory: 4Gi}
+            # UNMEASURED, retained by the 6fd7ea29 two-car decision.
+            # Size from a week of UID-bound reader samples after this roll.
             limits: {memory: 12Gi}
           volumeMounts:
             # credentials.toml, writable — not :ro as the compose file

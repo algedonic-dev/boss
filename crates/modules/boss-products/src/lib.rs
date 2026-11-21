@@ -12,6 +12,7 @@
 pub mod delta;
 pub mod events;
 pub mod port;
+pub mod sku;
 pub mod types;
 
 #[cfg(feature = "postgres")]

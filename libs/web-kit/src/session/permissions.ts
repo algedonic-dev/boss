@@ -27,25 +27,28 @@
 // A role code — an open string, the Class registry's `code`.
 export type Role = string;
 
+// 'shop', 'exec', 'catalog', 'assets', 'sales', 'service', 'parts',
+// 'products', 'people', 'qa', 'warehouse', 'support', 'shipping',
+// 'marketing-assets', 'policy' and 'system-experiments' left the
+// vocabulary with their pages in step 1 of design 01fa5bdf (David,
+// 2026-11-17). 'accounts' stays: it gates the Churn watchlist. 'jobs'
+// went with the jobs list in the same step (review df7aeb9c).
 export type RouteName =
-  | 'shop' | 'exec' | 'catalog' | 'accounts' | 'assets' | 'sales' | 'service'
-  | 'parts' | 'products' | 'finance' | 'people' | 'qa' | 'warehouse' | 'support'
-  | 'system-monitoring' | 'inbox' | 'shipping'
-  | 'vendors' | 'marketing-assets' | 'schedule' | 'jobs'
+  | 'accounts' | 'finance'
+  | 'system-monitoring' | 'inbox'
+  | 'vendors' | 'schedule'
   // Platform-administration surfaces. Same `permKey: 'it'` gate
   // as the legacy ADMIN footer; these route names exist so a role's
   // Class row can name the surfaces in `metadata.surfaces` per the
   // three-axis IA simplifier ("administering is someone's job").
-  | 'policy' | 'workflows' | 'system-step-plugins' | 'system-dispatcher' | 'system-design'
+  | 'workflows' | 'system-step-plugins' | 'system-dispatcher' | 'system-design'
   // The executor network — who moves work and where it goes.
   // Sits beside the dispatcher cascade: same IT audience, different
   // question (job traffic, not rule wiring).
   | 'system-yard'
   // system-map / system-flow / system-fleet / system-model retired by
-  // the 2026-08-31 IT consolidation (packet 1f6d55e0): map and flow's
-  // renderings folded into the Atlas tab, fleet lives on as the
-  // Bottlenecks tab under Operate (gated by system-monitoring), and
-  // the System Model wrapper page died with the /system prefix.
+  // the 2026-08-31 IT consolidation (packet 1f6d55e0); the Atlas and
+  // Bottlenecks tabs they folded into went in design 01fa5bdf.
   // The hardware registry page (59ef456a).
   | 'system-estate'
   // The model-vocabulary surface — SubjectKind taxonomy + Class registry
@@ -55,23 +58,16 @@ export type RouteName =
   // the cascade viz they hang off (reached via links from it, not their
   // own sidebar entries).
   | 'system-dispatcher-rules' | 'system-dispatcher-rule'
-  | 'system-kb' | 'auth-admin'
-  // The "Evolve" surface — controlled, sandboxed modifications to the
-  // running model (placeholder for now). Visible to every role.
-  | 'system-experiments'
-  | 'workflows';
+  | 'system-kb' | 'auth-admin';
 
 /// Every gated RouteName, once — the vocabulary a Class row's
 /// `metadata.surfaces` is written in (the always-on routes below are
 /// not in it; they need no declaring).
 export const ROUTES: ReadonlyArray<RouteName> = [
-  'shop', 'exec', 'catalog', 'accounts', 'assets', 'sales', 'service',
-  'parts', 'products', 'finance', 'people', 'qa', 'warehouse', 'support', 'system-monitoring',
-  'shipping', 'vendors', 'marketing-assets',
-  'schedule', 'jobs',
-  'policy', 'workflows', 'system-step-plugins', 'system-dispatcher',
+  'accounts', 'finance', 'system-monitoring',
+  'vendors', 'schedule',
+  'workflows', 'system-step-plugins', 'system-dispatcher',
   'system-dispatcher-rules', 'system-dispatcher-rule', 'system-design', 'system-yard', 'system-estate', 'system-subjects', 'system-kb', 'auth-admin',
-  'system-experiments',
 ];
 
 /// The shape of a role's Class row this reader needs; the full row is
@@ -97,10 +93,10 @@ export function declaredSurfaces(row: RoleRow | undefined): ReadonlyArray<string
 /// has loaded.
 export function canSeeRoute(role: Role, route: RouteName, row?: RoleRow): boolean {
   void role;
-  if (route === 'shop' || route === 'inbox' || route === 'workflows' || route === 'system-experiments') return true;
+  if (route === 'inbox' || route === 'workflows') return true;
   // 'system-feedback' was an always-on route here until car N3 of
-  // design e765b3fc (2026-09-25): the feedback board is the receiving
-  // station's panel on the Department Map now, which `system-yard` gates.
+  // design e765b3fc (2026-09-25); 'shop' and 'system-experiments' until
+  // their pages went in step 1 of design 01fa5bdf.
   const declared = declaredSurfaces(row);
   return declared ? declared.includes(route) : true;
 }

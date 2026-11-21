@@ -74,7 +74,13 @@ curl_through_a_roll() (
     exec {write_fd}>"$answer" || return $?
     exec {read_fd}<"$answer" || return $?
     rm -f -- "$answer" || return $?
-    rc=0; curl "$@" >&"$write_fd" || rc=$?
+    # -q FIRST, so no curlrc is read (backlog 2b1bf9b4, review 4ceac0c8):
+    # on the dev pod root's HOME is /work/home, which group 1500 may
+    # create files in, and curl honours a ~/.curlrc with no ownership
+    # check — a planted `proxy =` line sent infra/dev/boss-api's request,
+    # machine token aboard, where the planter chose. Anywhere but first,
+    # -q is a no-op; pinned by the_doors_read_no_curlrc.rs.
+    rc=0; curl -q "$@" >&"$write_fd" || rc=$?
     exec {write_fd}>&-
     case "$rc" in
       6|7) ;;

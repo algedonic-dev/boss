@@ -30,6 +30,12 @@
 #                                 # class. A migration implies every
 #                                 # crate that stands up the schema.
 #                                 # Never used by CI.
+#   infra/gate.sh --lints <paths> # the dock's LINT DELTA: main's copy
+#                                 # of each named infra/lint/<name>.sh
+#                                 # (comma-separated), run over this
+#                                 # head merged into origin/main, and
+#                                 # nothing else. Receipt mode `lints`.
+#                                 # Beside any other mode it refuses.
 #   infra/gate.sh --self-test     # run the roster loop's own pin and
 #                                 # nothing else. It runs inside every
 #                                 # mode below too; this is the way to
@@ -62,6 +68,68 @@ set -u
 # nested fixture gates must create their own journals. The runner parent
 # retains its own environment for the final merge after this gate returns.
 export -n BOSS_GATE_RUNTIME_EVIDENCE
+
+# THE HOST'S SERVICE MANAGER STOPS AT THE GATE'S DOOR (backlog 92da4bdb).
+# A process systemd starts inherits names that describe THAT unit. A
+# GitHub-hosted runner runs every job step under the runner's systemd
+# service, so the public mirror's Gate handed INVOCATION_ID and
+# JOURNAL_STREAM to every check, while every forge gate — a Kubernetes
+# pod with no systemd above it — has neither. surface-usage.sh and
+# boss-maintenance-wrap.sh read a well-formed INVOCATION_ID as their OWN
+# unit's invocation, so a test that did not scrub it went red on GitHub
+# alone (publish PR 259; reproduced exactly by run 29713605, item
+# 70e5bbc7, which fixed that one test). Each test fending for itself is
+# the defect, so the names go once, here, before the gate's first child.
+# Unconditional, not only under the public-mirror declaration: a
+# developer who runs the gate under a systemd user service hands it the
+# same names, and a forge pod has none to lose. The workflow's `env:`
+# could not do it — it sets a name, it cannot remove one the runner's
+# service manager exported.
+#
+# The list is systemd.exec(5)'s "Environment Variables in Spawned
+# Processes" (and systemd.service(5)'s stop/monitor variables) minus the
+# names a login shell carries too — PATH, HOME, USER, LOGNAME, SHELL,
+# LANG, TERM, XDG_RUNTIME_DIR, which the checks run WITH — and minus the
+# socket-accept peer's REMOTE_ADDR/REMOTE_PORT, whose names are CGI's as
+# much as systemd's, and minus TMPDIR and pam_systemd's XDG_SEAT/XDG_VTNR,
+# which a login carries too. The pidfd identities (MAINPIDFDID,
+# MANAGERPIDFDID, LISTEN_PIDFDID, systemd 258), SO_COOKIE (258) and the
+# CPU/IO pressure pairs (261) were missing from the first version: review
+# run ed9dea02 measured the three pidfd names reaching the first children
+# (systemd.exec(5) as published 2026-11-17). A fixture that wants an
+# identity sets it on its own child, which this cannot reach. Pinned by
+# the_gate_scrubs_the_host_service_manager_at_its_entry.rs, which holds
+# its OWN copy of the documented names, so dropping one here goes red.
+GATE_HOST_SERVICE_ENV=(
+    INVOCATION_ID JOURNAL_STREAM SYSTEMD_EXEC_PID DEBUG_INVOCATION
+    MANAGERPID MANAGERPIDFDID MAINPID MAINPIDFDID PIDFILE NOTIFY_SOCKET
+    WATCHDOG_PID WATCHDOG_USEC
+    LISTEN_FDS LISTEN_PID LISTEN_PIDFDID LISTEN_FDNAMES SO_COOKIE
+    FDSTORE LOG_NAMESPACE
+    RUNTIME_DIRECTORY STATE_DIRECTORY CACHE_DIRECTORY LOGS_DIRECTORY
+    CONFIGURATION_DIRECTORY CREDENTIALS_DIRECTORY
+    MEMORY_PRESSURE_WATCH MEMORY_PRESSURE_WRITE
+    CPU_PRESSURE_WATCH CPU_PRESSURE_WRITE
+    IO_PRESSURE_WATCH IO_PRESSURE_WRITE
+    SERVICE_RESULT EXIT_CODE EXIT_STATUS
+    MONITOR_SERVICE_RESULT MONITOR_EXIT_CODE MONITOR_EXIT_STATUS
+    MONITOR_INVOCATION_ID MONITOR_UNIT
+    TRIGGER_UNIT TRIGGER_PATH
+    TRIGGER_TIMER_REALTIME_USEC TRIGGER_TIMER_MONOTONIC_USEC
+)
+_gate_scrubbed=()
+for _gate_name in "${GATE_HOST_SERVICE_ENV[@]}"; do
+    if [ -n "${!_gate_name+set}" ]; then
+        _gate_scrubbed+=("$_gate_name")
+        unset "$_gate_name"
+    fi
+done
+# Names only, never a value — and said, because a run's log that does not
+# name what it took away sends the next reader to re-derive it.
+if [ "${#_gate_scrubbed[@]}" -gt 0 ]; then
+    echo "gate.sh: unset the host service manager's ${_gate_scrubbed[*]} before any check — no forge gate carries them (backlog 92da4bdb)" >&2
+fi
+unset _gate_name _gate_scrubbed
 
 # THE TREE CHECKED IS THE TREE THIS SCRIPT LIVES IN, so a caller standing
 # in a different git tree is refused rather than told its tree is clean
@@ -100,12 +168,21 @@ cd "$_gate_tree"
     echo "gate.sh: infra/lint/lib/no-estate.sh could not be read — without it the receipt cannot name a live check the run declared it would not make. Refusing." >&2
     exit 2
 }
+# And the words a trunk-relative lint prints when the run declared
+# BOSS_TRUNK=none and it judged no car — read the same way, named under
+# `trunk` on the receipt (backlog 2d28df78).
+# shellcheck source=infra/lint/lib/trunk-ref.sh
+. infra/lint/lib/trunk-ref.sh || {
+    echo "gate.sh: infra/lint/lib/trunk-ref.sh could not be read — without it the receipt cannot name a trunk comparison the run declared it would not make. Refusing." >&2
+    exit 2
+}
 
 # Incremental compilation helps REPEATED local builds; a gate build is
 # cold and one-shot, so incremental only writes an incremental/ dir that
 # is pure disk cost here — part of the ~80GB target/ that exhausted the
 # forge CI disk and blocked trains (2026-09-04;
-# docs/design/the-build-plane-manages-itself.md). Off for the gate and CI
+# docs/architecture-decisions.md, "The build plane manages itself"). Off
+# for the gate and CI
 # (this script IS the CI rust job); a human's own `cargo build` outside
 # this script is untouched and keeps incremental.
 export CARGO_INCREMENTAL=0
@@ -130,15 +207,10 @@ export CARGO_INCREMENTAL=0
 }
 wt_isolate_target_dir
 
-# AND IT MUST NOT RUN WIDER THAN THE WORKTREE'S BUILDS (backlog
-# 9ecd12ea, ask 3). In a linked worktree — a builder's on the dev pod —
-# `--lint`'s workspace clippy ran at cargo's default, one job per NODE
-# CPU (32 there) against a 32Gi container that every builder shares; the
-# memory watch saw it hold ten clippy-drivers at once, where wt-cargo
-# allows four. The helper bounds it to wt-cargo's width and says so; a
-# main checkout (the gate runner, CI) keeps its full width. A missing
-# bound is refused, as wt-cargo refuses one.
-wt_bound_build_jobs || exit $?
+# The helper above also bounds a linked worktree's cargo WIDTH
+# (`wt_bound_build_jobs`), but that call waits for the first mode that
+# compiles — below `--quick`, which compiles nothing — so the listings
+# and the pre-flight answer before it (backlog 9f7ee428).
 
 # THE GATE'S GIT READS MUST WORK FOR WHATEVER UID THE GATE RUNS AS.
 #
@@ -223,9 +295,11 @@ ROSTER=0
 EXCLUSIONS=0
 SERIAL_LANE=0
 SELFTEST=0
+LINTS_ONLY=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -p) shift; SCOPE+=(-p "${1:?-p needs a crate name}"); NAMED+=("$1"); shift ;;
+        --lints) shift; LINTS_ONLY="${1:?--lints needs a comma-separated list of infra/lint/<name>.sh paths}"; shift ;;
         --auto) AUTO=1; shift ;;
         --quick) QUICK=1; shift ;;
         --lint) LINT=1; shift ;;
@@ -233,9 +307,15 @@ while [ $# -gt 0 ]; do
         --exclusions) EXCLUSIONS=1; shift ;;
         --serial-lane) SERIAL_LANE=1; shift ;;
         --self-test) SELFTEST=1; shift ;;
-        *) echo "gate.sh: unknown arg: $1 (accepts -p <crate>, --auto, --quick, --lint, --roster, --exclusions, --serial-lane and --self-test)" >&2; exit 2 ;;
+        *) echo "gate.sh: unknown arg: $1 (accepts -p <crate>, --auto, --quick, --lint, --lints <paths>, --roster, --exclusions, --serial-lane and --self-test)" >&2; exit 2 ;;
     esac
 done
+# `--lints` is the dock's lint delta (below), and it runs NOTHING but the
+# lints it names: beside any other mode it would be one of two answers.
+if [ -n "$LINTS_ONLY" ] && { [ "$AUTO" -eq 1 ] || [ ${#NAMED[@]} -gt 0 ] || [ "$QUICK" -eq 1 ] || [ "$LINT" -eq 1 ]; }; then
+    echo "gate.sh: --lints and every other mode are alternatives; --lints runs only the lints it names" >&2
+    exit 2
+fi
 # Alternatives, not companions: --auto derives exactly what -p states,
 # so accepting both would mean silently preferring one belief over the
 # other — and the whole point of the refusal below is that a stated
@@ -522,35 +602,292 @@ case "${gate_min_free_gb:-empty}" in
         ;;
 esac
 
-# The free-space reader, overridable ONLY so the poll itself can be
-# tested — a fake that shrinks across calls is a faithful model of the
-# incident, and there is no other way to prove re-evaluation without
-# actually filling a disk.
-gate_avail_gb() {
-    local kb
-    kb="$(${BOSS_GATE_DF_CMD:-df -Pk .} 2>/dev/null | awk 'NR==2 {print $4}')"
-    if [ -z "${kb}" ]; then
-        echo "gate: could not read free space for $(pwd) — refusing rather than guessing." >&2
-        exit 2
+# WHERE THE RUN WRITES, not where it was started (backlog 878e5a0f).
+# Until 2026-10-19 the floor read `df -Pk .` — the CHECKOUT's volume —
+# in every mode. Measured 2026-10-17 ~23:00Z by builder run e4eee763: a
+# linked worktree's checkout sat on /work (84% full, 6 GB free) while
+# wt-cargo puts its cargo target on /scratch (248 GB free), where
+# `--lint`'s clippy writes; `--lint` refused with "6GB free, need 12GB"
+# before any check ran, and the builder shipped its car without the
+# pre-flight this door exists for. The same hour a worktree under /tmp
+# was not refused, so the verdict followed where the worktree lived
+# rather than where the build writes, and run e205c820 measured the same
+# line refusing `--quick`, which compiles nothing.
+#
+# So each MODE names the volumes it writes and the floor judges each:
+#   - the lint roster's scratch, TMPDIR: every mode runs the roster;
+#   - the cargo target, CARGO_TARGET_DIR or ./target: `--lint` and the
+#     gate, the modes that compile. Read AFTER wt_isolate_target_dir
+#     above, so a linked worktree is judged on the dir it will build in;
+#   - the checkout: the gate alone, whose web install and builds write
+#     into it. `--lint` and `--quick` write nothing there worth a floor.
+# `--quick` holding TMPDIR to the build floor is stricter than its lints
+# need, and is KEPT (backlog 011be442): no such refusal has been
+# measured — on the dev pod /tmp is the node's root, 529 GB free on
+# 2026-10-20 — and a lower number would be a second floor with no
+# measurement behind it. The poll is also the cheap stop several suites
+# drive `--quick` to (a fake df that trips before fmt, as
+# a_quick_preflight_refuses_an_untracked_file.rs does), so dropping it
+# moves those pins for a refusal nobody has seen.
+# On the gate pod the checkout and the target are both on /gate-target
+# (infra/gate-runner/run.sh), so its answer is the one it always gave,
+# plus /tmp, which its tests write too; in forge CI and any lone clone
+# ./target is inside the checkout, the same volume as before. On the
+# GitHub mirror (.github/workflows/ci.yml) TMPDIR is unset, so /tmp is
+# the runner's root filesystem — the one its "Free runner disk" step
+# clears for the build and prints with `df -h /` — so that row reads the
+# checkout's volume again and cannot move the verdict.
+# CARGO_HOME is deliberately NOT a row: on the dev pod it is
+# /work/home/.cargo, the checkout's /work, and judging /work against the
+# build floor in `--lint` is exactly the refusal 878e5a0f removed. Cargo
+# writes there only a download when the lockfile moves, and /work has
+# its own keeper: the reclaim sidecar prunes it below the floor plus
+# WORK_RECLAIM_MARGIN_GB (infra/build-floor.env).
+#
+# Each row is `<key>\t<path>\t<what writes there>`; the key picks the
+# writer's repair in gate_floor_repair below.
+gate_floor_volumes() {
+    printf '%s\t%s\t%s\n' tmp "${TMPDIR:-/tmp}" "the lint roster's scratch (TMPDIR)"
+    [ "$QUICK" -eq 1 ] && return 0
+    printf '%s\t%s\t%s\n' target "${CARGO_TARGET_DIR:-target}" "the cargo target"
+    [ "$LINT" -eq 1 ] && return 0
+    printf '%s\t%s\t%s\n' checkout "$(pwd)" "the checkout"
+}
+
+# THE REPAIR FOLLOWS THE VOLUME THAT REFUSED (backlog 011be442). Until
+# 2026-10-20 every refusal ended in one fixed paragraph — "drop target/
+# dirs from landed worktrees: du -sh */target ... Better: build in the
+# dev pod, which has 188GB of scratch" — written when the floor could
+# only mean the checkout's volume on a workstation. Once the refusal
+# named its volume (878e5a0f) the paragraph visibly mismatched: a
+# /scratch refusal was told to look for */target where worktree targets
+# are /scratch/target-<name>, a TMPDIR refusal got target advice, and
+# "build in the dev pod" was circular on the dev pod, where every
+# pre-flight runs. So each writer carries its own repair, at its own
+# path, and a refusal prints the repair of every writer under the floor —
+# several when writers share the full volume (review 2452d6ff, F1).
+# On the dev pod the target's repair names the reclaim door rather than a hand rm -rf
+# (review 2452d6ff, F2): the door spares the seed and records what it took.
+gate_floor_repair() {
+    local keys="$1" key path what
+    while IFS=$'\t' read -r key path what; do
+        case " ${keys} " in *" ${key} "*) ;; *) continue ;; esac
+        case "$key" in
+            tmp)
+                echo "  remediation for the lint roster's scratch (TMPDIR=${path}): it holds what runs left behind —" >&2
+                echo "    du -sh ${path}/* 2>/dev/null | sort -hr | head    # the largest leftovers" >&2
+                echo "    rm -rf <a dir no running process owns>, or run with TMPDIR on a roomier volume" >&2
+                ;;
+            target)
+                echo "  remediation for the cargo target (${path}): it is regenerable build output —" >&2
+                echo "    du -sh $(dirname "$path")/* 2>/dev/null | sort -hr | head    # this target and its siblings" >&2
+                # Print the bounded pass with the same seed naming and
+                # declared transport as wt-cargo, not the caller's target
+                # or token overrides (review 77b63de0, F3). Nothing runs here.
+                echo '    (' >&2
+                echo '      set -euo pipefail' >&2
+                echo '      . infra/dev/wt-target-dir.sh' >&2
+                echo '      scratch=${WT_TARGET_ROOT:-/scratch}' >&2
+                echo '      common=$(git rev-parse --path-format=absolute --git-common-dir)' >&2
+                echo '      seed=${WT_SEED:-$(wt_target_dir "$scratch" "$(dirname "$common")")}' >&2
+                echo '      token_dir=$(tr -d "[:space:]" < infra/dev/machine-token-dir)' >&2
+                echo '      token_host=$(tr -d "[:space:]" < infra/dev/sor-url)' >&2
+                echo '      token_host=${token_host#*://}; token_host=${token_host%%[/?#]*}; token_host=${token_host##*@}; token_host=${token_host%%:*}' >&2
+                echo '      [ -n "$token_dir" ] || { echo "reclaim: declared token directory is empty" >&2; exit 1; }' >&2
+                echo '      [ -n "$token_host" ] || { echo "reclaim: declared SoR host is empty" >&2; exit 1; }' >&2
+                echo '      env SCRATCH_MOUNT="$scratch" CARGO_TARGET_DIR="$seed" BOSS_MACHINE_TOKEN_DIR="$token_dir" BOSS_MACHINE_TOKEN_HOSTS="$token_host" bash infra/cluster/dev-scratch-reclaim.sh --scratch-floor' >&2
+                echo '    )' >&2
+                echo "      (/scratch/target-<worktree>) oldest first, sparing the seed, recorded on its packet" >&2
+                echo "    elsewhere: cargo clean for this one, or rm -rf <a sibling target no build is using>" >&2
+                ;;
+            checkout)
+                echo "  remediation for the checkout (${path}): it holds worktrees and their web installs —" >&2
+                echo "    du -sh $(dirname "$path")/* 2>/dev/null | sort -hr | head" >&2
+                echo "    git worktree remove <a worktree whose branch has landed>    # refuses one with uncommitted work" >&2
+                ;;
+            *)
+                echo "  no repair is recorded for the volume '${key}' (${what}) — gate_floor_repair owes one." >&2
+                ;;
+        esac
+    done < <(gate_floor_volumes)
+}
+
+# The nearest existing ancestor: a cold worktree's target dir does not
+# exist until its first build, and df answers only for a path that does.
+gate_existing_path() {
+    local p="$1"
+    while [ ! -e "$p" ] && [ "$p" != / ] && [ "$p" != . ]; do
+        p="$(dirname "$p")"
+    done
+    printf '%s\n' "$p"
+}
+
+# One `<GB free>\t<mount>\t<what writes there>` line per volume, from ONE
+# df over every path — one call per poll, as before, so a fake that
+# shrinks across calls still models the incident call for call.
+#
+# ALL OR NOTHING (backlog 8a08c00d). df answers one row per path it can
+# read, in order, and for a path it cannot it prints its complaint on
+# stderr and NO row — measured on the dev pod 2026-10-21: `df -Pk /tmp
+# /tmp /nonexistent-x /work` printed three rows for four paths and exited
+# 1. Until then a short answer passed the floor on the rows that came
+# back, each labelled with every writer, so the output claimed volumes
+# were measured that were not, and df's stderr — the only copy of which
+# path failed and why — went to /dev/null. Now a row short is an EMPTY
+# report, which every reader takes as unmeasured, and df's stderr
+# reaches the log.
+#
+# The df is overridable ONLY so the poll itself can be tested — a fake
+# that shrinks across calls is a faithful model of the incident, and
+# there is no other way to prove re-evaluation without actually filling
+# a disk. The seam is handed the paths too, so a fake answers per path,
+# one row each, as df does (the_disk_floor_measures_where_the_run_writes.rs,
+# a_volume_df_did_not_answer_refuses_the_floor.rs).
+# A fourth column carries the writer's key for gate_floor_repair;
+# display and receipt readers retain the first three columns.
+# Keep block sources distinct, and qualify pseudo filesystems by mount:
+# names such as tmpfs alone do not identify a volume (review 7059bd3c).
+# The dev pod's overlay and backing partition have different names but
+# the same full df capacity snapshot. Coalesce that observation only
+# when exactly one block source matches it; equal readings on two block
+# sources cannot identify which backs the overlay. This is a capacity
+# report, not proof of mount topology. Keep every label, writer and
+# repair key, and the lowest free GB when repeated readings differ.
+gate_free_report() {
+    local keys=() paths=() whats=() key path what rows i=0 line
+    while IFS=$'\t' read -r key path what; do
+        keys+=("$key")
+        paths+=("$(gate_existing_path "$path")")
+        whats+=("${what}: ${path}")
+    done < <(gate_floor_volumes)
+    rows="$(${BOSS_GATE_DF_CMD:-df -Pk} "${paths[@]}" \
+        | awk 'NR > 1 && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ {print int($4 / 1024 / 1024) "\t" $6 "\t" $1 "\t" $2 ":" $3 ":" $4}')"
+    [ -n "$rows" ] || return 0
+    [ "$(printf '%s\n' "$rows" | wc -l)" -eq "${#paths[@]}" ] || return 0
+    while IFS= read -r line; do
+        printf '%s\t%s\t%s\n' "$line" "${whats[$i]}" "${keys[$i]}"
+        i=$((i + 1))
+    done <<< "$rows" | awk -F'\t' '
+        {
+            row = ++rows
+            available[row] = $1
+            mount[row] = $2
+            source[row] = $3
+            capacity[row] = $4
+            writer[row] = $5
+            repair[row] = $6
+            if ($3 ~ /^\/dev\// && !seen_source[$4 SUBSEP $3]++) {
+                backing_count[$4]++
+                backing[$4] = $3
+            }
+        }
+        END {
+            for (row = 1; row <= rows; row++) {
+                device = source[row] ~ /^\/dev\// ? source[row] : source[row] SUBSEP mount[row]
+                if (source[row] == "overlay" && backing_count[capacity[row]] == 1)
+                    device = backing[capacity[row]]
+                if (!(device in free)) {
+                    order[++n] = device
+                    free[device] = available[row]
+                }
+                if (available[row] + 0 < free[device] + 0) free[device] = available[row]
+                if (!seen_mount[device SUBSEP mount[row]]++)
+                    mounts[device] = mounts[device] (mounts[device] == "" ? "" : ", ") mount[row]
+                writers[device] = writers[device] (writers[device] == "" ? "" : "; ") writer[row]
+                keys[device] = keys[device] (keys[device] == "" ? "" : " ") repair[row]
+            }
+            for (i = 1; i <= n; i++) {
+                device = order[i]
+                printf "%s\t%s\t%s\t%s\n", free[device], mounts[device], writers[device], keys[device]
+            }
+        }
+    '
+}
+
+# The volumes df gave no row for, as `<path>\t<what writes there>`, asked
+# one path at a time — which only a refusal pays for. A short combined
+# answer cannot say which row it dropped: a row names the MOUNT, not the
+# path asked, and two writers can share a mount. stderr is dropped HERE
+# only because the combined call above already printed df's complaint.
+gate_unanswered_volumes() {
+    local key path what
+    while IFS=$'\t' read -r key path what; do
+        if [ -z "$(${BOSS_GATE_DF_CMD:-df -Pk} "$(gate_existing_path "$path")" 2>/dev/null \
+            | awk 'NR > 1 && $4 ~ /^[0-9]+$/')" ]; then
+            printf '%s\t%s\n' "$path" "$what"
+        fi
+    done < <(gate_floor_volumes)
+}
+
+# The lowest free GB across a report — the volume that binds.
+gate_report_lowest() {
+    printf '%s\n' "$1" | awk -F'\t' 'NF && (!seen || $1 + 0 < min + 0) {seen = 1; min = $1; low = $0} END {print low}'
+}
+
+# Startup reaches these helpers before the receipt and check machinery.
+# Keep the same escaping and annotation path for early and mid-run refusals.
+gh_escape_data() {
+    local s="$1"
+    s="${s//%/%25}"
+    s="${s//$'\r'/%0D}"
+    s="${s//$'\n'/%0A}"
+    printf '%s' "$s"
+}
+gh_annotate_refusal() { # <why>
+    [ "${GITHUB_ACTIONS:-}" = "true" ] || return 0
+    printf '::error title=GATE REFUSED::%s\n' "$(gh_escape_data "$1")"
+}
+
+# A volume this run writes that df did not answer for is refused like
+# one under the floor, and on the receipt the same way: the run has not
+# measured it, and a floor judged on the volumes that did answer is a
+# guess (backlog 8a08c00d). Before, this refusal named every path and
+# none in particular, and mid-run it left no receipt at all.
+gate_refuse_unmeasured() {
+    local when="$1" missing
+    missing="$(gate_unanswered_volumes)"
+    # Every path answered when asked alone: the combined call came back
+    # short and cannot say which row it dropped, so none stands measured.
+    [ -n "$missing" ] || missing="$(gate_floor_volumes | cut -f2-)"
+    echo "gate: could not read free space for every volume this run writes — refusing ${when} rather than guessing." >&2
+    echo "  df gave no row for:" >&2
+    printf '%s\n' "$missing" | awk -F'\t' '{printf "    %s — %s\n", $1, $2}' >&2
+    GATE_REFUSAL="no free space read (${when}) for $(printf '%s\n' "$missing" | awk -F'\t' '{printf "%s%s, %s", sep, $1, $2; sep = "; "}')"
+    if declare -F write_receipt >/dev/null 2>&1; then
+        write_receipt "refused"
+    else
+        gh_annotate_refusal "$GATE_REFUSAL"
     fi
-    echo $((kb / 1024 / 1024))
+    exit 2
 }
 
 # `when` is "to start" or "to continue" — the distinction matters when
 # reading a log: the second means the run itself ate the headroom.
 require_headroom() {
-    local when="$1" avail
-    avail="$(gate_avail_gb)" || exit 2
+    local when="$1" report lowest avail
+    report="$(gate_free_report)"
+    if [ -z "${report}" ]; then
+        gate_refuse_unmeasured "$when"
+    fi
+    lowest="$(gate_report_lowest "$report")"
+    avail="$(printf '%s\n' "$lowest" | cut -f1)"
     if [ "${avail}" -ge "${gate_min_free_gb}" ]; then
         return 0
     fi
     echo "gate: ${avail}GB free, need ${gate_min_free_gb}GB. Refusing ${when}." >&2
+    # Every volume measured, so the reader sees which one refused and
+    # that the others were fine (backlog 878e5a0f: the refusal named no
+    # volume, and the target's 248 GB was found only by asking again).
+    echo "  measured where this run writes:" >&2
+    printf '%s\n' "$report" | awk -F'\t' '{printf "    %sGB free on %s — %s\n", $1, $2, $3}' >&2
     echo "  A build that fills this volume does not fail cleanly — it wedges the" >&2
     echo "  shell, and on 2026-08-16 it stopped even \`df\` from running." >&2
-    echo "  remediation: drop target/ dirs from landed worktrees —" >&2
-    echo "    du -sh */target | sort -hr        # the usual culprits" >&2
-    echo "    rm -rf <landed-worktree>/target" >&2
-    echo "  Better: build in the dev pod, which has 188GB of scratch." >&2
+    # The repair of EVERY row under the floor, not only the row that binds
+    # (review 2452d6ff, F1): writers that share a volume tie at one free
+    # GB, and the lowest row is the first of them, which is always TMPDIR.
+    # On the dev pod / (TMPDIR=/tmp) and /scratch are one partition, so a
+    # --lint refusal there printed only the /tmp repair, never the target's.
+    gate_floor_repair "$(printf '%s\n' "$report" | awk -F'\t' -v f="$gate_min_free_gb" '$1 + 0 < f + 0 {print $4}' | tr '\n' ' ')"
     # A REFUSAL IS NOT A FAILURE, and the receipt has to say which.
     #
     # The distinction already lived in the exit code — `exit 1` after
@@ -567,15 +904,18 @@ require_headroom() {
     # reader that only knows green/failed must not silently round this
     # to either. Written before exiting so the reason survives the
     # process.
-    GATE_REFUSAL="${avail}GB free, need ${gate_min_free_gb}GB (${when})"
+    # The binding volume rides AFTER the words readers already match on.
+    GATE_REFUSAL="${avail}GB free, need ${gate_min_free_gb}GB (${when}) on $(printf '%s\n' "$lowest" | cut -f2), $(printf '%s\n' "$lowest" | cut -f3)"
     # The startup call happens before `write_receipt` and GATE_RECEIPT
     # exist — nothing has run yet, so there is no receipt to write and
-    # the exit code is the whole signal. The mid-run calls (one before
+    # an annotation carries the reason. The mid-run calls (one before
     # every phase) are the ones a reader needs, and by then both are
     # defined. Guarding on the function keeps that honest instead of
     # emitting a half-built receipt.
     if declare -F write_receipt >/dev/null 2>&1; then
         write_receipt "refused"
+    else
+        gh_annotate_refusal "$GATE_REFUSAL"
     fi
     exit 2
 }
@@ -691,29 +1031,60 @@ changed_paths() {
     # scoped to nothing, skipped every cargo phase and reported
     # "all checks green". A gate that runs nothing must never say that.
     #
-    # Staged first: that is what a commit will actually carry.
-    local staged
-    staged=$(git diff --cached --name-only 2>/dev/null)
-    if [ -n "$staged" ]; then
-        printf '%s\n' "$staged"
-        return
-    fi
-    # Then the working tree, for the common case of gating before
-    # `git add`.
-    local dirty
-    dirty=$({ git diff --name-only 2>/dev/null
-              git ls-files --others --exclude-standard 2>/dev/null; })
-    if [ -n "$dirty" ]; then
-        printf '%s\n' "$dirty"
-        return
-    fi
-    # Finally the commits this branch adds over the trunk. A clean tree
-    # on a branch with commits is not "no change" — it is a car that is
-    # ready, which is exactly when it gets gated.
+    # THE UNION, NEVER THE FIRST NON-EMPTY (backlog d472aeaf). This
+    # used to answer with staged, else dirty, else the commits, so ONE
+    # uncommitted file stood in for the whole car. Measured 2026-11-05 on
+    # car 7aef2405 (worker exec 50b5e521): its commits changed boss-jobs,
+    # boss-cli and boss-dispatcher-handlers, an earlier `wt-cargo test`
+    # had re-resolved Cargo.lock in the worker, and `--lint` mapped that
+    # one dirty file, which names no crate, to "no crate implied —
+    # skipping clippy". The car lands its commits AND whatever is
+    # committed next, so all four sets are what it lands; a path in more
+    # than one is named once. Over-scoping is the safe direction.
+    #
+    # EVERY READ IS `-z` (review 93d22fbe R1). Line-oriented, git's
+    # default core.quotePath spells `crates/core/boss-a/src/café.rs` as
+    # `"crates/core/boss-a/src/caf\303\251.rs"`, the leading quote
+    # matches no `^crates/` shape, and a car whose change was that file
+    # skipped clippy. NUL-separated output is never quoted.
+    #
+    # AND EVERY NAME STAYS ONE LINE (review d0d0a78d R2). The readers
+    # downstream are line-oriented, and a newline is a legal byte in a
+    # git path: turned back into a line break, `infra/platform/w/a<LF>b.toml`
+    # became two fragments, neither matched the `.toml$` shape that
+    # scopes boss-jobs, and the car skipped clippy; a name that was only
+    # a newline was dropped outright. So each NUL-ended name is read
+    # whole and a newline inside it is spelled `\n`, which keeps the
+    # name's prefix and suffix — every reader matches shapes, none opens
+    # the file.
+    {
+        git diff --no-renames -z --cached --name-only 2>/dev/null
+        git diff --no-renames -z --name-only 2>/dev/null
+        git ls-files -z --others --exclude-standard 2>/dev/null
+        # The commits this branch adds over the trunk. A clean tree on a
+        # branch with commits is not "no change" — it is a car that is
+        # ready, which is exactly when it gets gated. No base answers
+        # none here; `--lint` asks `branch_base` itself and refuses to
+        # read that as "nothing to compile".
+        local base
+        if base=$(branch_base); then
+            git diff --no-renames -z --name-only "$base" HEAD 2>/dev/null
+        fi
+    } | while IFS= read -r -d '' name; do
+        printf '%s\n' "${name//$'\n'/\\n}"
+    done | sort -u
+}
+
+# The commit this branch forked from the trunk, or exit 1 when there is
+# no trunk ref or it shares no history with HEAD. Its own function so
+# `--lint` can tell "the car adds no commit" from "the car's commits are
+# unknowable" — the second is not evidence that nothing compiles.
+branch_base() {
     local base
-    base=$(git merge-base "$AUTO_TRUNK" HEAD 2>/dev/null) || return 0
-    [ -n "$base" ] || return 0
-    git diff --name-only "$base" HEAD 2>/dev/null
+    [ -n "$AUTO_TRUNK" ] || return 1
+    base=$(git merge-base "$AUTO_TRUNK" HEAD 2>/dev/null) || return 1
+    [ -n "$base" ] || return 1
+    printf '%s\n' "$base"
 }
 
 # Paths whose correctness ONLY a database can judge. A migration is
@@ -1064,6 +1435,261 @@ rules_crates() {
     if [ -n "$(rules_paths)" ]; then printf '%s\n' "${GATE_RULES_READERS}"; fi
 }
 
+# ---------------------------------------------------------------------
+# Crates that READ A REGISTRY DIRECTORY: derived, never listed
+# ---------------------------------------------------------------------
+# A protocol row is read by every crate that reads its DIRECTORY, and the
+# file-input index above cannot see one: it keys on a literal naming an
+# existing FILE, while the registries under infra/platform/ are read as
+# directories — through a helper that resolves one
+# (`boss_jobs::registry::platform_bundle_path()` is
+# `concat!(env!("CARGO_MANIFEST_DIR"), "/../../../infra/platform/workflows")`,
+# a literal the index drops as absolute), through a wrapper over that
+# helper (`seedable_platform_workflows()`), or through a `.join` of the
+# directory. So `infra/platform/<registry>/*.toml` mapped to boss-jobs
+# alone, on the shape line. On 2026-11-08 train 22:32 changed the
+# backlog-item row's build executor, gated green on 'boss-jobs
+# boss-testing', and main's full gate went red for ~1.6 h on
+# boss-dispatcher's `dispatcher::model_class_tests`, which reads that row
+# through `platform_bundle_path()` (gate-run acd9b76e; backlog 736f1bab,
+# David's decision 2026-11-09: widen the scope to every crate that reads
+# a changed registry row).
+#
+# THE PREDICATE IS THE READ, in three shapes, each one scan:
+#
+#   A LITERAL THAT RESOLVES TO A REGISTRY DIRECTORY (or a format template
+#   whose fixed prefix does: `"infra/platform/workflows/{kind}.toml"`),
+#   repo-relative, `../`-escaping, or `"/../"` inside a `concat!`, in any
+#   crate's src/, tests/ or build.rs. Comment lines do not count; a
+#   string literal in code that names the directory over-scopes by one
+#   crate at worst — a scratch `root.join("infra/platform/workflows")`
+#   fixture is the case — which is the safe direction.
+#
+#   A HELPER THAT RESOLVES ONE: a `pub fn` in src/ whose body carries the
+#   escaping literal. Every crate that calls it reads the directory.
+#
+#   ONE WRAPPER OVER A HELPER: a `pub fn` in src/ that calls a helper,
+#   admitted only when its name is defined ONCE in the workspace. The
+#   uniqueness is not tidiness: measured on 7381cde96, a hop without it
+#   admitted `serve` (boss-jobs' boot reads the pools) and, a hop later,
+#   every function in the workspace, because a common name's callers are
+#   everyone's. One hop is the whole chain today
+#   (`seedable_platform_workflows`, `feedback_branch_for_disposition`); a
+#   deeper one is a new reader for this comment to name.
+#
+# A changed path implies the readers of every registry directory above
+# it. Prose beside the rows (`*.md`) implies none: every reader of a
+# registry directory parses its rows, and the README case in
+# `scope_self_test` keeps it so.
+#
+# Cost, measured on the dev pod at 7381cde96: two awk passes over the
+# workspace's .rs files, under half a second, once per invocation.
+#
+# THREE REGISTRY TREES, NOT ONE (backlog a0d18d46). The scan keyed on
+# infra/platform alone, and the ops verbs are read the same way — by
+# DIRECTORY: boss-jobs' build.rs lists `../../../infra/ops/verbs` and
+# `include_str!`s every verb into `VERB_FILES`, and ops-runner tests
+# build `format!("infra/ops/verbs/{verb}.json")`. Neither names a FILE,
+# so the file-input index could not see them, and on 0291b4122 a car
+# editing a verb no test names (agent-image-status.json) derived no
+# crate at all and gated lints-only past the compiler that reads it.
+# The dispatcher rules are the third tree: their helper's callers are
+# counted by `rules_crates` below, and the scan adds the literal reads
+# (boss-brewery-engine's `"infra/dispatcher/rules/{}.toml"` template)
+# that no helper carries. Space-separated; a tree is a directory.
+REGISTRY_TREES='infra/platform infra/ops/verbs infra/dispatcher/rules'
+REGISTRY_SCAN='
+    function resolve(base, rel) {
+        if (rel !~ /^\.\.\//) return rel
+        while (sub(/^\.\.\//, "", rel)) {
+            if (base ~ /\//) sub(/\/[^\/]*$/, "", base); else base = ""
+        }
+        return (base == "" ? rel : base "/" rel)
+    }
+    function in_registry(r,    i) {
+        for (i = 1; i <= ntrees; i++)
+            if (r == tl[i] || index(r, tl[i] "/") == 1) return 1
+        return 0
+    }
+    BEGIN {
+        ntrees = split(trees, tl, " ")
+        nh = split(helpers, hl, " ")
+        for (i = 1; i + 1 <= nh; i += 2) hdir[hl[i]] = hdir[hl[i]] " " hl[i + 1]
+    }
+    FNR == 1 {
+        crate = ""; curfn = ""; curpub = 0; global_target = 0
+        n = split(FILENAME, p, "/")
+        if (n >= 4 && p[1] == "crates") {
+            crate = p[3]; root = p[1] "/" p[2] "/" p[3]
+            dir = FILENAME; sub(/\/[^\/]*$/, "", dir)
+            intests = (index(FILENAME, root "/tests/") == 1)
+        }
+    }
+    crate == "" { next }
+    # A declared tree-wide pin runs whole on every scoped gate already;
+    # its reads select nothing (the index above, 271a2f6e).
+    $0 ~ global_marker && intests && n == 5 { global_target = 1 }
+    global_target { next }
+    /^[[:space:]]*\/\// { next }
+    match($0, /fn [A-Za-z_0-9]+[<(]/) {
+        curfn = substr($0, RSTART + 3, RLENGTH - 4)
+        curpub = (!intests && $0 ~ /pub(\([a-z]+\))? (const )?(async )?(unsafe )?fn /)
+    }
+    pass == 1 {
+        rest = $0
+        while (match(rest, /"[^"]*"/)) {
+            spec = substr(rest, RSTART + 1, RLENGTH - 2)
+            rest = substr(rest, RSTART + RLENGTH)
+            if (spec ~ /[[:space:]]/) continue
+            if (spec ~ /^\/\.\.\//) spec = substr(spec, 2)
+            else if (spec ~ /^\//) continue
+            esc = (spec ~ /^\.\.\//)
+            sub(/\{.*$/, "", spec)
+            sub(/\/+$/, "", spec)
+            if (spec !~ /\//) continue
+            for (b = 0; b < 2; b++) {
+                r = resolve(b ? root : dir, spec)
+                if (!in_registry(r)) continue
+                print "R " r " " crate
+                if (esc && curpub) print "H " curfn " " r
+            }
+        }
+    }
+    pass == 2 {
+        for (h in hdir) {
+            if (index($0, h "(") == 0 || $0 ~ ("fn " h "[<(]")) continue
+            m = split(hdir[h], ds, " ")
+            for (j = 1; j <= m; j++) {
+                print "R " ds[j] " " crate
+                if (curpub && curfn != h) print "W " curfn " " ds[j]
+            }
+        }
+    }
+'
+
+# One scan: pass 1 finds literals and helpers, pass 2 the callers of the
+# helpers named in $2 ("name dir name dir …"). Sorted, so the answer
+# does not depend on the order find walks the tree.
+#
+# Only the files that carry one of the fixed strings in $3… are read: a
+# line the scan can count holds the tree's name or a helper's call, so
+# the grep is a filter, not a second predicate — and it is what keeps
+# the three passes at a fraction of a second rather than three.
+registry_scan() {
+    local pass="$1" helpers="$2" needle
+    local -a needles=()
+    shift 2
+    for needle in "$@"; do needles+=(-e "$needle"); done
+    grep -rlZF --include='*.rs' "${needles[@]}" crates 2>/dev/null \
+        | xargs -0 awk -v pass="$pass" -v helpers="$helpers" \
+            -v trees="${REGISTRY_TREES}" -v global_marker="$TREE_WIDE_FILE_PATTERN" \
+            "${REGISTRY_SCAN}" /dev/null | sort -u
+}
+
+# `H <name> <dir>` rows on stdin as the `name dir name dir …` pairs the
+# scan's `helpers` takes, and as the `name(` needles its filter takes.
+registry_pairs() { awk '{ printf "%s %s ", $2, $3 }'; }
+registry_needles() { awk '{ print $2 "(" }' | sort -u; }
+
+# The names on stdin that are defined exactly once in the workspace.
+registry_defined_once() {
+    local names
+    names="$(sort -u | sed '/^$/d' | paste -sd '|' -)"
+    [ -n "$names" ] || return 0
+    grep -rhoE --include='*.rs' "fn (${names})[<(]" crates 2>/dev/null \
+        | sed -E 's/^fn //; s/[<(]$//' | sort | uniq -c | awk '$1 == 1 { print $2 }'
+}
+
+# Rows `<tag> <a> <b>` on stdin whose `<b>` names an existing directory.
+registry_dirs_only() {
+    local tag a b
+    while read -r tag a b; do
+        if [ -n "$b" ] && [ -d "$b" ]; then printf '%s %s %s\n' "$tag" "$a" "$b"; fi
+    done
+}
+
+# `H <helper> <dir>` rows: the helpers, then the one admitted wrapper hop.
+# `R <dir> <crate>` rows: every reader. Printed together, sorted.
+registry_index() {
+    local first helpers second once wrappers
+    local -a needles=()
+    local -a trees=()
+    read -r -a trees <<< "${REGISTRY_TREES}"
+    first="$(registry_scan 1 '' "${trees[@]}")"
+    helpers="$(printf '%s\n' "$first" | awk '$1 == "H"' | registry_dirs_only | sort -u)"
+    if [ -n "$helpers" ]; then
+        mapfile -t needles < <(printf '%s\n' "$helpers" | registry_needles)
+        second="$(registry_scan 2 "$(printf '%s\n' "$helpers" | registry_pairs)" "${needles[@]}")"
+        once=" $(printf '%s\n' "$second" | awk '$1 == "W" { print $2 }' | registry_defined_once | tr '\n' ' ')"
+        wrappers="$(printf '%s\n' "$second" | awk -v once="$once" '
+            $1 == "W" && index(once, " " $2 " ") { print "H", $2, $3 }' | sort -u)"
+    fi
+    {
+        printf '%s\n' "$helpers" "${wrappers:-}"
+        printf '%s\n' "$first" "${second:-}" | awk '$1 == "R" { print "R", $3, $2 }' \
+            | registry_dirs_only | awk '{ print "R", $3, $2 }'
+        if [ -n "${wrappers:-}" ]; then
+            mapfile -t needles < <(printf '%s\n' "$wrappers" | registry_needles)
+            registry_scan 2 "$(printf '%s\n' "$wrappers" | registry_pairs)" "${needles[@]}" \
+                | awk '$1 == "R" { print "R", $2, $3 }'
+        fi
+    } | sed '/^$/d' | sort -u
+}
+GATE_REGISTRY_INDEX="$(registry_index)"
+# `<dir> <crate>`, the half `path_map` reads.
+GATE_REGISTRY_READERS="$(printf '%s\n' "${GATE_REGISTRY_INDEX}" | awk '$1 == "R" { print $2, $3 }')"
+
+# The readers of every registry directory above each path on stdin.
+registry_crates() {
+    awk -v idx="${GATE_REGISTRY_READERS}" -v trees="${REGISTRY_TREES}" '
+        BEGIN {
+            n = split(idx, rows, "\n")
+            for (i = 1; i <= n; i++) {
+                split(rows[i], f, " ")
+                if (f[1] != "") readers[f[1]] = readers[f[1]] " " f[2]
+            }
+            ntrees = split(trees, tl, " ")
+        }
+        $0 ~ /\.md$/ { next }
+        {
+            top = ""
+            for (i = 1; i <= ntrees; i++) if (index($0, tl[i] "/") == 1) top = tl[i]
+            if (top == "") next
+            d = $0
+            while (sub(/\/[^\/]*$/, "", d)) {
+                if (d in readers) print readers[d]
+                if (d == top) break
+            }
+        }
+    '
+}
+
+# The paths on stdin that are NOT registry data, one per line: anything
+# outside the registry trees, and anything inside them that is not a row
+# (`*.toml`) or a verb (`*.json`) — a README, a script. Empty means every
+# path is data, which is the one question the data lane asks (backlog
+# a0d18d46). A path it cannot place is NOT data, so ambiguity keeps the
+# compile checks rather than skipping them.
+not_registry_data() {
+    awk -v trees="${REGISTRY_TREES}" '
+        BEGIN { ntrees = split(trees, tl, " ") }
+        $0 == "" { next }
+        {
+            data = 0
+            if ($0 ~ /\.(toml|json)$/)
+                for (i = 1; i <= ntrees; i++) if (index($0, tl[i] "/") == 1) data = 1
+            if (!data) print
+        }
+    '
+}
+
+# The crates that read registry directory $1, space-separated, sorted —
+# the question `scope_self_test` asks of the derivation by name.
+registry_readers_of() {
+    printf '%s\n' "${GATE_REGISTRY_READERS}" | awk -v d="$1" '$1 == d { print $2 }' \
+        | sort -u | paste -sd ' ' -
+}
+
 # The paths on stdin that are migrations, one per line. Empty when the
 # change touches none.
 schema_paths() {
@@ -1103,15 +1729,17 @@ input_crates() {
 }
 
 path_map() {
-    # Stdin is read ONCE and handed to all four parts: the hand-written
+    # Stdin is read ONCE and handed to all five parts: the hand-written
     # shapes below, the file-input derivation above that reads the
-    # tree, the schema readers and the dispatcher-rule readers.
+    # tree, the schema readers, the dispatcher-rule readers and the
+    # registry-directory readers.
     local paths
     paths="$(cat)"
     { printf '%s\n' "$paths" | path_shapes
       printf '%s\n' "$paths" | input_crates
       printf '%s\n' "$paths" | schema_crates
       printf '%s\n' "$paths" | rules_crates
+      printf '%s\n' "$paths" | registry_crates
     } | tr ' ' '\n' | sed '/^$/d' | sort -u | live_crates | tr '\n' ' '
 }
 
@@ -1198,26 +1826,87 @@ path_shapes() {
 #
 # Prints `<crate> <selector> <name>` per line: `test:<file>` for a whole
 # tests/ file (the name is the file), `lib` or `bin:<name>` for one test.
+#
+# BOTH MARKERS ARE SPELLED ONCE, AS VARIABLES (backlog 1c03eeb0). The
+# guard that holds every declared pin free of a test database
+# (the_preflight_runs_the_tree_wide_pins.rs) reads TREE_WIDE_FILE_PATTERN
+# and this one out of this file, so it finds the pins by the pattern
+# that runs them and cannot drift to a second spelling (CLAUDE.md §9a).
+TREE_WIDE_TEST_PATTERN='^[[:space:]]*// tree-wide pin( —|$)'
 tree_wide_pins() {
-    local f crate dir rel sel
+    local records mapped
+    records=$(
     {
         grep -lE "$TREE_WIDE_FILE_PATTERN" crates/*/*/tests/*.rs 2>/dev/null \
             | sed -n 's|^crates/[^/]*/\([^/]*\)/tests/\([^/]*\)\.rs$|\1 test:\2 \2|p'
-        grep -rlE --include='*.rs' '^[[:space:]]*// tree-wide pin( —|$)' crates/*/*/src 2>/dev/null \
-            | while read -r f; do
-                crate=$(printf '%s\n' "$f" | cut -d/ -f3)
-                dir=$(printf '%s\n' "$f" | cut -d/ -f1-3)
-                rel=${f#"$dir"/src/}
-                sel=$(tree_wide_target "$dir" "$rel")
-                awk -v pre="${crate} ${sel} " '
-                    /^[[:space:]]*\/\/ tree-wide pin( —|$)/ { want = 1; next }
-                    want && $0 !~ /^[[:space:]]*\/\// && match($0, /fn [A-Za-z0-9_]+/) {
-                        print pre substr($0, RSTART + 3, RLENGTH - 3)
-                        want = 0
-                    }
-                ' "$f"
-            done
-    } | sort
+        src_pin_records "$TREE_WIDE_TEST_PATTERN" crates/*/*/src
+    }
+    )
+    mapped=$(printf '%s\n' "$records" |
+        python3 infra/gate-runner/test-targets.py
+    ) || return 1
+    printf '%s\n' "$mapped" | sort
+}
+
+# `<crate> <selector> <name>` for the test under each line matching
+# <marker> in the .rs files below the given `crates/<tier>/<crate>/src`
+# directories: the first `fn <name>` on a non-comment line below it, in
+# the test binary that owns it. ONE scan for both src/ markers, so a
+# crate pin is found exactly as a tree-wide pin is.
+src_pin_records() { # <marker ERE> <src dir>...
+    local marker="$1" f crate dir rel sel
+    shift
+    [ "$#" -gt 0 ] || return 0
+    grep -rlE --include='*.rs' "$marker" "$@" 2>/dev/null \
+        | while read -r f; do
+            crate=$(printf '%s\n' "$f" | cut -d/ -f3)
+            dir=$(printf '%s\n' "$f" | cut -d/ -f1-3)
+            rel=${f#"$dir"/src/}
+            sel=$(tree_wide_target "$dir" "$rel")
+            awk -v pre="${crate} ${sel} " -v marker="$marker" '
+                $0 ~ marker { want = 1; next }
+                want && $0 !~ /^[[:space:]]*\/\// && match($0, /fn [A-Za-z0-9_]+/) {
+                    print pre substr($0, RSTART + 3, RLENGTH - 3)
+                    want = 0
+                }
+            ' "$f"
+        done
+}
+
+# ---------------------------------------------------------------------
+# Crate pins: the in-crate pins `--lint` runs for the crates it implies
+# ---------------------------------------------------------------------
+# Measured on gate 1a44704a (item ada4d019, 2026-10-18; backlog
+# e2d091f7): a car added a 22nd machine filing site in
+# boss-dispatcher-handlers, `--lint` passed, and the gate went red on
+# `lane_pin::every_backlog_item_this_crate_files_stamps_an_input_lane`,
+# which counts its OWN crate's filing sites — so it is no tree-wide pin,
+# the gate's scoped `cargo test -p` runs it, and `--lint` ran none of a
+# crate's tests at all. The repair cost a second gate while the bays
+# were full.
+#
+# A DECLARED MARKER, NOT A NAME PATTERN. Measured on origin/main that
+# day, two unit-test modules were named `*_pin`: `lane_pin`, the source
+# count, and boss-cli's `dock_pin`, an equality of two predicates whose
+# tests open a TestDb — so a `*_pin` filter would have run a database test
+# where 127.0.0.1 may be production, and `every_*` names hundreds of
+# tests of every kind. A test that reads only its own crate's source
+# says so with a `// crate pin` line above it (or ` — <why>`), the
+# sibling of `// tree-wide pin`, found by the same scan, run by the same
+# runner, and held free of a test database by the same guard
+# (the_preflight_runs_the_tree_wide_pins.rs). The gate needs no second
+# copy: its `cargo test -p` already runs every test of the crate.
+CRATE_PIN_TEST_PATTERN='^[[:space:]]*// crate pin( —|$)'
+crate_pins() { # <crate>...
+    local name d
+    local -a dirs=()
+    for name in "$@"; do
+        for d in crates/*/"$name"/src; do
+            [ -d "$d" ] && dirs+=("$d")
+        done
+    done
+    [ "${#dirs[@]}" -gt 0 ] || return 0
+    src_pin_records "$CRATE_PIN_TEST_PATTERN" "${dirs[@]}" | sort
 }
 
 # Which test binary holds a test in `<crate dir>/src/<rel>`: the binary
@@ -1263,44 +1952,157 @@ tree_wide_unreported() { # <log> <name>...
     done
 }
 
-# Run the records in TREE_WIDE: per crate, its whole tests/ files in one
-# cargo run, then each unit-test binary once with its pins as filters.
-# The output is captured and printed whole — a filtered run has to be
-# READ to know it ran anything.
+# Run the records in TREE_WIDE: BUILD each crate's pins in one
+# `cargo test --no-run`, then RUN them several at a time — one `cargo
+# test` per tests/ file, and one per unit-test binary with its pins as
+# filters. Every run's output is captured and printed whole, in order,
+# once all have ended — a filtered run has to be READ to know it ran
+# anything.
+#
+# SEVERAL AT A TIME (backlog 19347752). Run one after another, the pins
+# were the slowest check a scoped gate or `--lint` paid for nothing:
+# measured on the dev pod 2026-10-18, 64 pins took 276 s warm (573 s
+# cold) and all but ~2 s of the warm run was the binaries' own time, a
+# handful of ~30 s scans and dozens of short ones. The floor is the
+# slowest single pin. Each run is still `cargo test` — cargo starts the
+# binary in its package root with its own environment and prints its
+# own `to rerun pass` line, and a fresh target costs it a fingerprint
+# check, not a build: concurrent `cargo test`s over a built target do
+# not wait on each other's lock (two ~30 s pins together: 34 s).
+#
+# THE WIDTH is CARGO_BUILD_JOBS — the gate's cgroup CPU quota
+# (infra/gate-runner/run.sh), wt-cargo's bound in a linked worktree
+# (wt_bound_build_jobs) — and 1, cargo's serial order, where it is
+# unset. Not infra/cargo-test-wide.sh's half-capped-at-four within the
+# sidecar's connection budget: that bound protects the shared Postgres,
+# and no pin opens a test database
+# (the_preflight_runs_the_tree_wide_pins.rs holds them to it), so CPU is
+# the only thing the width spends.
+#
+# A RUN THAT LEFT NO STATUS FAILED. The worker writes its status last
+# and by rename, as the lint roster's does; a run with no `.done` was
+# killed or could not record one, and no evidence is not a pass.
+# shellcheck disable=SC2016 # expanded by the worker's bash, not here
+TREE_WIDE_WORKER='
+dir=$1 at=$2 argv=()
+while IFS= read -r -d "" a; do argv+=("$a"); done < "$dir/$at.argv"
+cargo "${argv[@]}" < /dev/null > "$dir/$at.log" 2>&1
+status=$?
+printf "%s %s\n" "$status" "$SECONDS" > "$dir/$at.part" && mv "$dir/$at.part" "$dir/$at.done"
+'
 run_tree_wide_pins() {
-    local rc=0 crate rec c sel name target log missing
-    local -a files names
-    for crate in $(printf '%s\n' "${TREE_WIDE[@]}" | cut -d' ' -f1 | sort -u); do
-        files=()
-        for rec in "${TREE_WIDE[@]}"; do
+    run_declared_pins "tree-wide pin" ${TREE_WIDE[@]+"${TREE_WIDE[@]}"}
+}
+
+# The crate pins `--lint` found for the crates the tree implies (see
+# `crate_pins`), through the same runner and the same refusals.
+run_crate_pins() {
+    run_declared_pins "crate pin" ${CRATE_PINS[@]+"${CRATE_PINS[@]}"}
+}
+
+run_declared_pins() { # <label> <crate selector name>...
+    local label="$1"
+    shift
+    local -a recs=("$@")
+    local rc=0 crate rec c sel name target dir at=0 i width status took sum=0 t0=$SECONDS missing
+    local -a sels targets names labels filters test_targets test_runs
+    width=${CARGO_BUILD_JOBS:-1}
+    case ${width:-empty} in empty|*[!0-9]*|0) width=1 ;; esac
+    dir="$(mktemp -d)" || { echo "gate.sh: ${label}s cannot make a temp dir" >&2; return 1; }
+    for crate in $(printf '%s\n' "${recs[@]}" | cut -d' ' -f1 | sort -u); do
+        sels=()
+        targets=()
+        test_targets=()
+        test_runs=()
+        for rec in "${recs[@]}"; do
             read -r c sel name <<< "$rec"
             [ "$c" = "$crate" ] || continue
-            case "$sel" in test:*) files+=(--test "${sel#test:}") ;; esac
+            case "$sel" in test:*)
+                case " ${test_targets[*]:-} " in *" $sel "*) continue ;; esac
+                test_targets+=("$sel")
+                sels+=(--test "${sel#test:}")
+                continue ;;
+            esac
+            case " ${targets[*]:-} " in *" $sel "*) continue ;; esac
+            targets+=("$sel")
+            if [ "$sel" = lib ]; then sels+=(--lib); else sels+=(--bin "${sel#bin:}"); fi
         done
-        if [ "${#files[@]}" -gt 0 ]; then
-            cargo test -p "$crate" "${files[@]}" --all-features --no-fail-fast || rc=1
+        # `--no-fail-fast` here keeps compiling the crate's other pins
+        # past one that does not compile, so its error hides none of
+        # theirs (gate_sh's every_cargo_test_the_gate_runs_carries_no_fail_fast).
+        if ! cargo test -p "$crate" "${sels[@]}" --all-features --no-fail-fast --no-run; then
+            echo "gate: ${label}s in ${crate} did not build, so none of them ran: $(printf '%s\n' "${recs[@]}" | awk -v c="$crate" '$1 == c { printf "%s ", $3 }')" >&2
+            rc=1
+            continue
         fi
-        for target in $(printf '%s\n' "${TREE_WIDE[@]}" | awk -v c="$crate" '$1 == c && $2 !~ /^test:/ { print $2 }' | sort -u); do
+        # The unit-test binaries first: one is often the longest run
+        # (boss-dispatcher-handlers' lib, ~27 s), so it starts early.
+        for target in ${targets[@]+"${targets[@]}"}; do
             names=()
-            for rec in "${TREE_WIDE[@]}"; do
+            for rec in "${recs[@]}"; do
                 read -r c sel name <<< "$rec"
                 if [ "$c" = "$crate" ] && [ "$sel" = "$target" ]; then names+=("$name"); fi
             done
-            log="$(mktemp)" || { echo "gate.sh: tree-wide pins cannot make a temp file" >&2; return 1; }
-            if [ "$target" = "lib" ]; then
-                cargo test -p "$crate" --lib --all-features --no-fail-fast -- "${names[@]}" > "$log" 2>&1 || rc=1
+            at=$((at + 1))
+            if [ "$target" = lib ]; then
+                printf '%s\0' test -p "$crate" --lib --all-features -- "${names[@]}" > "$dir/$at.argv"
             else
-                cargo test -p "$crate" --bin "${target#bin:}" --all-features --no-fail-fast -- "${names[@]}" > "$log" 2>&1 || rc=1
+                printf '%s\0' test -p "$crate" --bin "${target#bin:}" --all-features -- "${names[@]}" > "$dir/$at.argv"
             fi
-            cat "$log"
-            missing=$(tree_wide_unreported "$log" "${names[@]}")
-            rm -f "$log"
-            if [ -n "$missing" ]; then
-                echo "gate: tree-wide pin(s) in ${crate} (${target}) not seen passing: $(echo "$missing" | tr '\n' ' ')— each failed above or matched no test, and a filter that matches nothing tested nothing" >&2
-                rc=1
-            fi
+            labels[at]="${names[*]} (${crate} ${target})"
+            filters[at]="${names[*]}"
+        done
+        for rec in "${recs[@]}"; do
+            read -r c sel name <<< "$rec"
+            [ "$c" = "$crate" ] || continue
+            case "$sel" in test:*) ;; *) continue ;; esac
+            # Several source pins can share one Cargo executable. Its
+            # membership reader refuses mixed pin/non-pin groups, so
+            # running it once preserves the original file-only scope.
+            case " ${test_runs[*]:-} " in *" $sel "*) continue ;; esac
+            test_runs+=("$sel")
+            names=()
+            local member owner selection member_name
+            for member in "${recs[@]}"; do
+                read -r owner selection member_name <<< "$member"
+                if [ "$owner" = "$crate" ] && [ "$selection" = "$sel" ]; then names+=("$member_name"); fi
+            done
+            at=$((at + 1))
+            printf '%s\0' test -p "$crate" --test "${sel#test:}" --all-features > "$dir/$at.argv"
+            labels[at]="${names[*]} (${crate} ${sel})"
+            filters[at]=""
         done
     done
+    if [ "$at" -gt 0 ]; then
+        # GNU and BSD xargs both take -0, -n and -P; it is never handed
+        # an empty list, on which GNU would run the worker once.
+        for ((i = 1; i <= at; i++)); do printf '%s\0' "$i"; done \
+            | xargs -0 -n 1 -P "$width" bash -c "$TREE_WIDE_WORKER" tree-wide-worker "$dir"
+    fi
+    for ((i = 1; i <= at; i++)); do
+        echo "gate: ${label} run ${i}/${at}: ${labels[i]}: cargo $(tr '\0' ' ' < "$dir/$i.argv")"
+        cat "$dir/$i.log" 2>/dev/null
+        if [ ! -f "$dir/$i.done" ]; then
+            echo "gate: ${label} ${labels[i]} failed: its run left no status — killed, or the record could not be written, and a run that did not finish is not a pass" >&2
+            rc=1
+            continue
+        fi
+        read -r status took < "$dir/$i.done"
+        sum=$((sum + took))
+        if [ "$status" != 0 ]; then
+            echo "gate: ${label} ${labels[i]} failed (exit ${status}) — its output is above" >&2
+            rc=1
+        elif [ -n "${filters[i]}" ]; then
+            # shellcheck disable=SC2086 # the names are words by construction
+            missing=$(tree_wide_unreported "$dir/$i.log" ${filters[i]})
+            if [ -n "$missing" ]; then
+                echo "gate: ${label}(s) ${labels[i]} not seen passing: $(echo "$missing" | tr '\n' ' ')— each failed above or matched no test, and a filter that matches nothing tested nothing" >&2
+                rc=1
+            fi
+        fi
+    done
+    rm -rf "$dir"
+    echo "gate: ${label}s: ${at} run(s), ${width} at a time, in $((SECONDS - t0))s with the build; their own times sum to ${sum}s (what one at a time would cost)"
     return "$rc"
 }
 
@@ -1347,6 +2149,9 @@ tree_wide_self_test() {
         > "$crates/crates/core/fixture/src/lib.rs"
     printf '//! tree-wide pin — it scans a tree\n#[test]\nfn t() {}\n' > "$crates/crates/core/fixture/tests/whole.rs"
     printf '//! tree-wide pinning is what the other file does\n#[test]\nfn t() {}\n' > "$crates/crates/core/fixture/tests/prose.rs"
+    mkdir -p "$crates/infra/gate-runner"
+    cp "$_gate_tree/infra/gate-runner/test-targets.py" "$crates/infra/gate-runner/test-targets.py"
+    cp "$_gate_tree/infra/gate.sh" "$crates/infra/gate.sh"
     got=$(cd "$crates" && tree_wide_pins | tr '\n' ',')
     rm -rf "$crates"
     if [ "$got" != "fixture lib bare_pin,fixture lib dashed_pin,fixture test:whole whole," ]; then
@@ -1371,13 +2176,13 @@ scope_self_test() {
     # its own until 2026-09-10; the defect it caught was never about
     # that, it was about the boss-jobs change riding along unnamed.
     _case "the commit that earned this rule" "boss-jobs" \
-        "docs/design/queue-visibility.md" \
+        "docs/design/station-tree.md" \
         "crates/core/boss-jobs/src/registry.rs" \
         "crates/core/boss-jobs/tests/platform_bundle.rs"
     # No crate parses the design corpus any more (boss-docs and its
     # docs_corpus_presents.rs went on 2026-09-10), so a docs-only car
     # has nothing to compile — the lints still run repo-wide.
-    _case "a genuinely docs-only car" "" "docs/design/stations.md"
+    _case "a genuinely docs-only car" "" "docs/design/factory-taxonomy-v2.md"
     # The platform bundle is DATA, but boss-jobs compiles a test that
     # parses and lints it (`the_platform_bundle_matches_the_specs_it
     # _replaced`). Without this line a protocol-only car scoped to
@@ -1385,7 +2190,13 @@ scope_self_test() {
     # — which is how correct-the-record's second defect nearly shipped:
     # the bundle lint caught a free-text fork with no fallback, and the
     # gate would not have run that lint at all.
-    _case "a protocol-only car still has a crate" "boss-jobs" \
+    # THE SIXTH RE-PIN (backlog 736f1bab): boss-jobs was only the crate
+    # that OWNS the bundle. Every crate that reads the row's directory is
+    # owed too — the want is the derivation's, and the named check at the
+    # end holds boss-dispatcher in it.
+    _case "a protocol-only car scopes the bundle's owner and every reader" \
+        "$({ echo boss-jobs; registry_readers_of infra/platform/workflows; registry_readers_of infra/platform; } \
+            | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ' | sed 's/ $//')" \
         "infra/platform/workflows/ship-a-change.toml"
     # THE THIRD RE-PIN (backlog f532c345). The line above was written
     # when infra/platform/ held one registry, and the shape it pinned
@@ -1402,10 +2213,16 @@ scope_self_test() {
     # fourth registry is pinned the day it appears. A fictional row, not
     # a real one, so the answer is the shape's alone and not the
     # file-input index's.
+    # Since backlog 736f1bab the row ALSO implies every crate that reads
+    # its directory — derived, so the want is read from the same
+    # derivation and this case pins the WIRING; the named checks near
+    # the end pin the derivation itself.
     for bundle_dir in infra/platform/*/; do
         [ -d "$bundle_dir" ] || continue
         bundle_dir="${bundle_dir%/}"
-        _case "a row in ${bundle_dir} implies boss-jobs" "boss-jobs" \
+        _case "a row in ${bundle_dir} implies boss-jobs and its readers" \
+            "$({ echo boss-jobs; printf '%s\n' "${bundle_dir}/zz-a-scratch-row.toml" | registry_crates; } \
+                | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ' | sed 's/ $//')" \
             "${bundle_dir}/zz-a-scratch-row.toml"
     done
     # …and the bundle's prose does not: a README beside the rows is read
@@ -1551,11 +2368,13 @@ scope_self_test() {
     # file by path and runs its post (backlog 2710c8fc).
     _case "a build script's input implies its crate" \
         "boss-dispatcher-handlers boss-testing" "infra/estate/observe-lib.sh"
-    # Two crates read this manifest — boss-cli defaults to it and asserts
+    # Three crates read this manifest — boss-cli defaults to it and asserts
     # against the real file, boss-testing's gate_runner_manifests.rs pins
-    # it — and the map owes both, not whichever was noticed first.
-    _case "a file two crates read implies both" \
-        "boss-cli boss-testing" "infra/gate-runner/gate-runner.yaml"
+    # it, and boss-jobs' station_tree.rs holds the gates' allocation to its
+    # CPU request (backlog 3f58c823) — and the map owes every one, not
+    # whichever was noticed first.
+    _case "a file several crates read implies each" \
+        "boss-cli boss-jobs boss-testing" "infra/gate-runner/gate-runner.yaml"
     # The wide set the old map simply omitted: boss-testing owns tests
     # that EXECUTE infra scripts, and the map gave it only infra/gate.sh
     # and infra/lint/*. Editing one of these scoped to NO crate, so the
@@ -1571,7 +2390,10 @@ scope_self_test() {
     # execute it. The argument-bearing remedy contract (53c8cb72) also
     # runs the runner's pure decide function from boss-dispatcher-handlers.
     # Derived, not listed — this case records every current reader.
-    _case "a script three crates read implies all three" "boss-dispatcher-handlers boss-jobs boss-testing" \
+    # boss-cli joined on 2026-10-20 (backlog 82946cd9): its prove.rs pin
+    # holds the owed payment's credential file equal to the runner's
+    # `RUNNER_CREDENTIAL_FILE=` line, so editing the runner can redden it.
+    _case "a script four crates read implies all four" "boss-cli boss-dispatcher-handlers boss-jobs boss-testing" \
         "infra/ops/ops-runner.sh"
     _case "docs outside design/ imply no crate" "" "docs/invariants/x.toml" "README.md"
     # …unless a crate READS it. gate_sh.rs asserts this runbook tells a
@@ -1714,6 +2536,56 @@ scope_self_test() {
             fails=1
         fi
     done
+    # The registry readers (backlog 736f1bab), named the same way: the
+    # crate train 22:32 gated without — boss-dispatcher reads the
+    # backlog-item row through `platform_bundle_path()` in
+    # dispatcher::model_class_tests — and the crate that owns the bundle.
+    # A scan that loses the helper, or keys on a literal the helper does
+    # not carry, reds here by name rather than scoping a protocol car
+    # without its readers.
+    local wf_readers
+    wf_readers=" $(registry_readers_of infra/platform/workflows) "
+    for rd_crate in boss-dispatcher boss-jobs; do
+        case "$wf_readers" in
+            *" ${rd_crate} "*) ;;
+            *) echo "gate.sh scope self-test FAIL: ${rd_crate} reads infra/platform/workflows and was not derived as its reader — a protocol-row car would gate without it (backlog 736f1bab)" >&2
+               fails=1 ;;
+        esac
+    done
+    # The verb directory's compiled reader (backlog a0d18d46): boss-jobs'
+    # build.rs include_str!s every verb, and the data lane skips clippy on
+    # the promise that this crate's test build still runs on a verb car.
+    case " $(registry_readers_of infra/ops/verbs) " in
+        *" boss-jobs "*) ;;
+        *) echo "gate.sh scope self-test FAIL: boss-jobs compiles infra/ops/verbs in (build.rs VERB_FILES) and was not derived as its reader — a verb car would gate past the compiler that reads it (backlog a0d18d46)" >&2
+           fails=1 ;;
+    esac
+    # The data lane's predicate: rows and verbs are data; prose beside
+    # them, a script, and anything outside the trees are not.
+    local not_data
+    not_data="$(printf '%s\n' infra/platform/workflows/x.toml infra/ops/verbs/x.json \
+        infra/dispatcher/rules/x.toml infra/ops/verbs/README.md infra/ops/ops-runner.sh \
+        crates/core/boss-jobs/src/lib.rs | not_registry_data | tr '\n' ' ')"
+    if [ "$not_data" != "infra/ops/verbs/README.md infra/ops/ops-runner.sh crates/core/boss-jobs/src/lib.rs " ]; then
+        echo "gate.sh scope self-test FAIL: not_registry_data answered '${not_data}' — the data lane would skip clippy for a change that is not only rows and verbs (backlog a0d18d46)" >&2
+        fails=1
+    fi
+    case "$(printf '%s\n' "${GATE_REGISTRY_INDEX}" | awk '$1 == "H" && $2 == "platform_bundle_path" { print $3 }')" in
+        infra/platform/workflows) ;;
+        *) echo "gate.sh scope self-test FAIL: platform_bundle_path() was not derived as the helper that resolves infra/platform/workflows — every crate that reads the bundle through it now implies nothing (backlog 736f1bab)" >&2
+           fails=1 ;;
+    esac
+    while read -r _ rd_crate; do
+        [ -n "$rd_crate" ] || continue
+        rd_found=0
+        for rd_manifest in crates/*/"$rd_crate"/Cargo.toml; do
+            [ -f "$rd_manifest" ] && rd_found=1
+        done
+        if [ "$rd_found" -eq 0 ]; then
+            echo "gate.sh scope self-test FAIL: ${rd_crate} was derived as a registry reader, which is not a crate — the map would demand a -p cargo cannot satisfy" >&2
+            fails=1
+        fi
+    done <<< "${GATE_REGISTRY_READERS}"
     if [ "$fails" -ne 0 ]; then
         echo "gate.sh: the scope check cannot be trusted — fix it before relying on -p" >&2
         exit 2
@@ -1793,6 +2665,7 @@ fi
 
 AUTO_LINTS_ONLY=0
 AUTO_SKIP_FIXTURE=0
+AUTO_DATA_ONLY=0
 if [ "$AUTO" -eq 1 ]; then
     scope_self_test
     DERIVED=$(crates_from_paths)
@@ -1804,6 +2677,25 @@ if [ "$AUTO" -eq 1 ]; then
         # here, not infer it.
         if [ "$(schema_touched)" = "yes" ]; then
             echo "gate: --auto schema change -> $(changed_paths | schema_paths | tr '\n' ' ')is read by ${GATE_SCHEMA_READERS}"
+        fi
+        # And when a registry row widened it (backlog 736f1bab).
+        registry_why="$(changed_paths | registry_crates | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
+        if [ -n "$registry_why" ]; then
+            echo "gate: --auto registry rows under ${REGISTRY_TREES// /, } are read by ${registry_why}"
+        fi
+        # THE DATA LANE (backlog a0d18d46). Every changed path is a
+        # registry row or verb, so no Rust source, manifest or build
+        # script moved: the workspace clippy and the default-feature
+        # build would compile the base's code and repeat its verdict.
+        # Skip those two, and ONLY those two — the derived scope above
+        # still runs whole, and its `test build` compiles each reader's
+        # build script and `include_str!` against the new data, so a row
+        # a compiler reads still meets that compiler (boss-jobs'
+        # VERB_FILES, boss-cli's workflow roster). Pinned both ways by
+        # gate_sh.rs a_registry_only_change_skips_the_compile_checks_and_keeps_every_reader.
+        if [ -z "$(changed_paths | not_registry_data)" ]; then
+            AUTO_DATA_ONLY=1
+            echo "gate: --auto data only — every changed path is a registry row or verb; no Rust moved, so clippy and the default-feature build are skipped and every reader above is tested"
         fi
     else
         AUTO_LINTS_ONLY=1
@@ -1832,14 +2724,40 @@ fi
 # scope already tests. Empty in full mode, which tests the workspace and
 # so runs every one.
 TREE_WIDE=()
-if [ "$AUTO" -eq 1 ] || [ "${#SCOPE[@]}" -gt 0 ]; then
+# Full gates compile only Cargo's declared targets too. Refuse an
+# omitted source even when the scoped pin runner is not needed.
+INTEGRATION_PACKAGING_UNREAD=0
+INTEGRATION_PACKAGING_STATUS=0
+INTEGRATION_PACKAGING_STDERR=""
+# Keep the whole reader refusal before bounding its receipt summary. The
+# runner deposits files named by evidence, including a refusal before checks.
+if INTEGRATION_PACKAGING_STDERR="$(mktemp)"; then
+    if python3 infra/gate-runner/test-targets.py --json > /dev/null 2>"$INTEGRATION_PACKAGING_STDERR"; then
+        :
+    else
+        INTEGRATION_PACKAGING_STATUS=$?
+        INTEGRATION_PACKAGING_UNREAD=1
+    fi
+    cat "$INTEGRATION_PACKAGING_STDERR" >&2
+else
+    INTEGRATION_PACKAGING_STATUS=$?
+    INTEGRATION_PACKAGING_UNREAD=1
+fi
+if [ "$INTEGRATION_PACKAGING_UNREAD" -eq 0 ] && { [ "$AUTO" -eq 1 ] || [ "${#SCOPE[@]}" -gt 0 ]; }; then
+    if tw_records=$(tree_wide_pins 2>>"$INTEGRATION_PACKAGING_STDERR"); then
+        :
+    else
+        INTEGRATION_PACKAGING_STATUS=$?
+        INTEGRATION_PACKAGING_UNREAD=1
+        cat "$INTEGRATION_PACKAGING_STDERR" >&2
+    fi
     tw_tests=""
     while read -r tw_crate tw_sel tw_test; do
         [ -n "$tw_crate" ] || continue
         case " ${NAMED[*]:-} " in *" ${tw_crate} "*) continue ;; esac
         TREE_WIDE+=("${tw_crate} ${tw_sel} ${tw_test}")
         tw_tests="${tw_tests} ${tw_test}"
-    done < <(tree_wide_pins)
+    done <<< "$tw_records"
     if [ -n "$tw_tests" ]; then
         echo "gate: tree-wide pins, run whatever the scope:${tw_tests}"
     fi
@@ -1891,13 +2809,6 @@ ANNOTATED_REST=0
 # GitHub's workflow-command escaping: data escapes % CR LF, and a
 # property value (the title) also `:` and `,` — a check name carries
 # commas, and the title carries the colon after GATE FAIL.
-gh_escape_data() {
-    local s="$1"
-    s="${s//%/%25}"
-    s="${s//$'\r'/%0D}"
-    s="${s//$'\n'/%0A}"
-    printf '%s' "$s"
-}
 gh_escape_prop() {
     local s
     s="$(gh_escape_data "$1")"
@@ -1957,11 +2868,6 @@ gh_annotate_fail() { # <name> <message>
     [ "${#ANNOTATED[@]}" -lt "$GATE_ANNOTATION_CAP" ] || return 0
     ANNOTATED+=("$1")
     printf '::error title=%s::%s\n' "$(gh_escape_prop "GATE FAIL: $1")" "$(gh_escape_data "$2")"
-}
-
-gh_annotate_refusal() { # <why>
-    [ "$GATE_ANNOTATE" -eq 1 ] || return 0
-    printf '::error title=GATE REFUSED::%s\n' "$(gh_escape_data "$1")"
 }
 
 # At the end of a run: every failed check not yet annotated — past the
@@ -2152,6 +3058,9 @@ evidence_json() {
 # today's reds were "passed on my machine, failed on the runner",
 # and neither prose field would have shown that.
 GATE_RECEIPT="${BOSS_GATE_RECEIPT:-.gate-receipt.json}"
+# Anchored to the tree the gate judges: a lint delta runs its lints from
+# another directory, and a refusal written from there must land here.
+case "$GATE_RECEIPT" in /*) ;; *) GATE_RECEIPT="$GATE_REPO_ROOT/$GATE_RECEIPT" ;; esac
 
 # --- web timings (begin) ---
 # WHAT THE WEB SUITES TOOK, ON THE RECEIPT (backlog ebb750cd).
@@ -2278,7 +3187,8 @@ write_receipt() {
     # 29c36336): why the gate declined, and every failure not yet named.
     if [ -n "${GATE_REFUSAL:-}" ]; then gh_annotate_refusal "$GATE_REFUSAL"; fi
     gh_annotate_rest
-    if [ "$AUTO" -eq 1 ]; then mode="auto"
+    if [ -n "$LINTS_ONLY" ]; then mode="lints"
+    elif [ "$AUTO" -eq 1 ]; then mode="auto"
     elif [ ${#NAMED[@]} -gt 0 ]; then mode="scoped"
     else mode="full"; fi
     for entry in ${RAN+"${RAN[@]}"}; do
@@ -2295,13 +3205,20 @@ write_receipt() {
     if [ -n "${CI:-}${GITHUB_ACTIONS:-}${FORGEJO_ACTIONS:-}" ]; then in_ci=true; fi
     # The honest-reading guard. Empty when nothing DB-backed changed,
     # or when the DB-backed checks actually ran and passed.
+    # A lint delta claims its named lints and nothing else, so it states
+    # no database-backed result either way: the car's own gate did. Its
+    # own `if`, not a clause of the one below, so the guard keeps the
+    # shape gate_sh's the_receipt_names_what_only_a_database_could_have_judged
+    # pins.
     local unver="" unver_count=0 p
-    if ! db_checks_passed; then
-        for p in $(db_backed_paths); do
-            [ "$unver_count" -eq 0 ] || unver="${unver},"
-            unver="${unver}\"${p}\""
-            unver_count=$((unver_count + 1))
-        done
+    if [ -z "$LINTS_ONLY" ]; then
+        if ! db_checks_passed; then
+            for p in $(db_backed_paths); do
+                [ "$unver_count" -eq 0 ] || unver="${unver},"
+                unver="${unver}\"${p}\""
+                unver_count=$((unver_count + 1))
+            done
+        fi
     fi
     # WHY the scope is what it is, for the half of it a reader cannot
     # infer from the changed files: a migration names no crate, so a
@@ -2322,7 +3239,9 @@ write_receipt() {
     # branch was bad".
     local refusal_json=""
     if [ -n "${GATE_REFUSAL:-}" ]; then
-        refusal_json="\"refused_because\": \"${GATE_REFUSAL}\","
+        # A reader's diagnostic may contain quotes and newlines. Encode the
+        # value rather than interpolating those bytes into receipt syntax.
+        refusal_json="\"refused_because\": $(printf '%s' "$GATE_REFUSAL" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),"
     fi
     # Only a run that DECLARED it has no estate sets this (BOSS_ESTATE,
     # lib/no-estate.sh; backlog 3e63662c): the declared word, and every
@@ -2338,18 +3257,51 @@ write_receipt() {
         done
         estate_json="\"estate\": {\"declared\": \"${declared}\", \"live_not_run\": [${live}]},"
     fi
+    # The same for a run that DECLARED it has no per-car trunk (BOSS_TRUNK,
+    # lib/trunk-ref.sh; backlog 2d28df78): every lint that made no trunk
+    # comparison, read off what each printed. The forge's per-car receipts
+    # hold those judgements; this is where a reader sees they were not
+    # remade here.
+    local trunk_json="" trunk_declared not_judged=""
+    if [ -n "${BOSS_TRUNK:-}" ]; then
+        trunk_declared="$(printf '%s' "$BOSS_TRUNK" | tr -d '"\\' | tr '[:cntrl:]' ' ' | cut -c1-40)"
+        for lint in ${NO_TRUNK_LINTS[@]+"${NO_TRUNK_LINTS[@]}"}; do
+            not_judged="${not_judged:+${not_judged},}\"${lint}\""
+        done
+        trunk_json="\"trunk\": {\"declared\": \"${trunk_declared}\", \"not_judged\": [${not_judged}]},"
+    fi
+    # The floor's reading, volume by volume (backlog 8a08c00d). `free_gb`
+    # is the binding volume's — the lowest, as before — and `free_gb_on`
+    # names it, because since the floor judged several volumes (878e5a0f)
+    # the bare number was a minimum over volumes a reader could not tell
+    # apart: on the gate pod the smaller of /gate-target and the node's
+    # /tmp. Null, never a guess, when a volume went unmeasured.
+    local floor_report floor_low free_gb_json=null free_on_json=null free_volumes_json
+    floor_report="$(gate_free_report)"
+    if [ -n "${floor_report}" ]; then
+        floor_low="$(gate_report_lowest "$floor_report")"
+        free_gb_json="$(printf '%s\n' "$floor_low" | cut -f1)"
+        free_on_json="\"$(printf '%s\n' "$floor_low" | cut -f2 | tr -d '"\\')\""
+    fi
+    free_volumes_json="$(printf '%s\n' "$floor_report" | tr -d '"\\' \
+        | awk -F'\t' 'NF >= 3 {printf "%s{\"free_gb\": %s, \"mount\": \"%s\", \"writes\": \"%s\"}", sep, $1, $2, $3; sep = ", "}')"
     cat > "${GATE_RECEIPT}" <<RECEIPT
 {
   ${refusal_json}
   ${estate_json}
+  ${trunk_json}
+  ${LINTS_JSON:-}
   "verdict": "${verdict}",
   "mode": "${mode}",
   "scope": "${NAMED[*]:-}",
-  "head": "$(git rev-parse HEAD 2>/dev/null || echo unknown)",
-  "dirty": $( [ -n "$(git status --porcelain 2>/dev/null)" ] && echo true || echo false ),
+  "data_only": $( [ "${AUTO_DATA_ONLY:-0}" -eq 1 ] && echo true || echo false ),
+  "head": "$(git -C "$GATE_REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)",
+  "dirty": $( [ -n "$(git -C "$GATE_REPO_ROOT" status --porcelain 2>/dev/null)" ] && echo true || echo false ),
   "host": "$(hostname 2>/dev/null || echo unknown)",
   "ci": ${in_ci},
-  "free_gb": $(gate_avail_gb),
+  "free_gb": ${free_gb_json},
+  "free_gb_on": ${free_on_json},
+  "free_volumes": [${free_volumes_json}],
   "web_timings": $(web_timings_json),
   "test_binaries": $(test_binaries_json),
   "runtime_evidence": $(runtime_evidence_report),
@@ -2368,6 +3320,11 @@ RECEIPT
         printf 'gate: NO ESTATE — BOSS_ESTATE=%s — the live half of %s lint(s) did not run: %s\n' \
             "${declared}" "${#NO_ESTATE_LINTS[@]}" "${NO_ESTATE_LINTS[*]:-(none)}" >&2
         printf '      This receipt is a verdict on the tree; the live comparisons were not made (receipt: estate).\n' >&2
+    fi
+    if [ -n "${trunk_json}" ]; then
+        printf 'gate: NO TRUNK — BOSS_TRUNK=%s — %s lint(s) judged no car against a trunk: %s\n' \
+            "${trunk_declared}" "${#NO_TRUNK_LINTS[@]}" "${NO_TRUNK_LINTS[*]:-(none)}" >&2
+        printf '      Each car was judged against its own base on the forge; those comparisons were not remade here (receipt: trunk).\n' >&2
     fi
 }
 
@@ -2487,6 +3444,23 @@ CANNOT_READ=()
 # The lints whose live half did not run because the run declared
 # BOSS_ESTATE=none (lib/no-estate.sh), named on the receipt's `estate`.
 NO_ESTATE_LINTS=()
+# The lints that made no trunk comparison because the run declared
+# BOSS_TRUNK=none (lib/trunk-ref.sh), named on the receipt's `trunk`.
+NO_TRUNK_LINTS=()
+# Resolve membership before choosing pins, but refuse only once the ordinary
+# receipt machinery exists. No phase may run with an unread target roster.
+if [ "$INTEGRATION_PACKAGING_UNREAD" -ne 0 ]; then
+    echo "gate: unread integration packaging" >&2
+    packaging_detail="no temp file to retain reader stderr"
+    if [ -n "$INTEGRATION_PACKAGING_STDERR" ]; then
+        packaging_detail="$(head -c 2048 "$INTEGRATION_PACKAGING_STDERR")"
+        EVIDENCE+=("integration packaging"$'\t'"${INTEGRATION_PACKAGING_STDERR}")
+    fi
+    GATE_REFUSAL="unread integration packaging: reader exit ${INTEGRATION_PACKAGING_STATUS}: ${packaging_detail:-reader produced no stderr}"
+    write_receipt "refused"
+    exit 2
+fi
+rm -f "$INTEGRATION_PACKAGING_STDERR"
 check_lint() {
     local name="$1" keep why target
     shift
@@ -2511,6 +3485,10 @@ check_lint() {
     # list kept here (backlog 3e63662c).
     if grep -qF "$LINT_NO_ESTATE_MARKER" "$keep"; then
         NO_ESTATE_LINTS+=("$name")
+    fi
+    # And one that honoured BOSS_TRUNK=none (backlog 2d28df78).
+    if grep -qF "$LINT_NO_TRUNK_MARKER" "$keep"; then
+        NO_TRUNK_LINTS+=("$name")
     fi
     if [ "$CHECK_STATUS" -ne "$LINT_CANNOT_ANSWER" ]; then
         rm -f "$keep"
@@ -2915,8 +3893,9 @@ check_stdin_self_test() {
     # ate one of those readings would move the refusal that test expects
     # — which is exactly what it did on the first attempt, turning a
     # green receipt-timing test red. The self-test is about stdin; it must
-    # leave the poll's own fixture untouched.
-    printf '#!/usr/bin/env bash\necho "Filesystem 1024-blocks Used Available Capacity Mounted on"\necho "/dev/check-self-test 1 1 943718400 1%% /"\n' \
+    # leave the poll's own fixture untouched. One row per path it is
+    # handed, as df answers: a row short is a refusal (backlog 8a08c00d).
+    printf '#!/usr/bin/env bash\necho "Filesystem 1024-blocks Used Available Capacity Mounted on"\nfor _ in "$@"; do echo "/dev/check-self-test 1 1 943718400 1%% /"; done\n' \
         > "$tmp/df"
     chmod +x "$tmp/df"
     saved_ran=(${RAN+"${RAN[@]}"})
@@ -3172,24 +4151,50 @@ run_preflight() {
 # Pinned by boss-testing's
 # a_quick_preflight_refuses_an_untracked_file.rs, which runs THIS
 # script against synthetic trees.
+# One path, for a person to read: as spelled, unless it holds a control
+# character that would break the line it is printed on — then in bash's
+# `$'…'` quoting, so a file whose name is a newline is still a visible
+# line rather than a blank one (review d0d0a78d R2).
+gate_show_path() {
+    case "$1" in
+        *[[:cntrl:]]*) printf '%q' "$1" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
 refuse_untracked_files() {
-    local untracked status
-    untracked=$(git ls-files --others --exclude-standard 2>&1)
+    local listing errors status name
+    local -a untracked=()
+    # `-z`, so a path git would quote is listed as spelled (review
+    # 93d22fbe R1). The NUL list goes to a FILE and is read name by name,
+    # never through a substitution (review d0d0a78d R2): a substitution
+    # strips trailing newlines, so an untracked file whose whole name is
+    # a newline became an empty list and this refusal waved it through.
+    listing=$(mktemp) || {
+        echo "gate: cannot make a temp file to list untracked files in — refusing rather than certifying a tree the lints may not have read." >&2
+        GATE_REFUSAL="no temp file for the untracked listing"
+        write_receipt "refused"
+        exit 2
+    }
+    errors=$(git ls-files -z --others --exclude-standard 2>&1 >"$listing")
     status=$?
     if [ "$status" -ne 0 ]; then
-        echo "gate: cannot tell which files are untracked (git ls-files exited ${status}: ${untracked}) — refusing rather than certifying a tree the lints may not have read." >&2
+        rm -f "$listing"
+        echo "gate: cannot tell which files are untracked (git ls-files exited ${status}: ${errors}) — refusing rather than certifying a tree the lints may not have read." >&2
         GATE_REFUSAL="git ls-files --others exited ${status}"
         write_receipt "refused"
         exit 2
     fi
-    [ -n "$untracked" ] || return 0
+    while IFS= read -r -d '' name; do untracked+=("$name"); done <"$listing"
+    rm -f "$listing"
+    [ "${#untracked[@]}" -gt 0 ] || return 0
     echo "gate: the tree holds untracked files the lints cannot see. Refusing to certify it." >&2
-    printf '%s\n' "$untracked" | sed 's/^/  /' >&2
+    for name in "${untracked[@]}"; do printf '  %s\n' "$(gate_show_path "$name")"; done >&2
     echo "  Every git-based lint reads the index, so an untracked file is clean here and" >&2
     echo "  red at the gate, which checks out the pushed commit (backlog a5efc919)." >&2
     echo "  remediation: git add <file>   # the gate will read it once it is tracked" >&2
     echo "            or add it to .gitignore, if it is scratch that must never ship" >&2
-    GATE_REFUSAL="$(printf '%s\n' "$untracked" | grep -c '[^[:space:]]') untracked file(s) the lints cannot read"
+    GATE_REFUSAL="${#untracked[@]} untracked file(s) the lints cannot read"
     write_receipt "refused"
     exit 2
 }
@@ -3223,24 +4228,39 @@ refuse_untracked_files() {
 # a_preflight_says_which_files_the_gate_will_not_read.rs, which runs
 # THIS script against synthetic trees.
 note_uncommitted_modifications() {
-    local modified status count
+    local listing errors status code name
+    local -a modified=()
     # `git diff HEAD` rather than a bare `git diff`: a staged edit is
     # still not in the commit the push carries, and `git add` without a
     # commit is the other half of the same slip.
-    modified=$(git diff --name-status HEAD 2>&1)
-    status=$?
-    if [ "$status" -ne 0 ]; then
-        # Not fatal — this is a warning, and a pre-flight that cannot
-        # compare to HEAD still ran its lints. Said out loud rather than
-        # swallowed, because silence here is the defect above.
-        echo "pre-flight: cannot tell how this tree differs from HEAD (git diff exited ${status}: ${modified})" >&2
+    # `-z` emits `<status>NUL<path>NUL` and never quotes the path
+    # (review 93d22fbe R1). Each pair is read off the NULs, never off
+    # lines (review d0d0a78d R2): a name holding a newline was two
+    # lines, so `paste - -` paired the status with half the name and
+    # the next file with the other half, and one edit counted as two.
+    if ! listing=$(mktemp); then
+        echo "pre-flight: cannot make a temp file to compare this tree with HEAD" >&2
         echo "pre-flight: the gate reads the PUSHED commit, so commit before you push." >&2
         return 0
     fi
-    [ -n "$modified" ] || return 0
-    count=$(printf '%s\n' "$modified" | grep -c '[^[:space:]]')
-    echo "pre-flight: ${count} tracked file(s) here differ from HEAD, and the gate reads the PUSHED commit:"
-    printf '%s\n' "$modified" | sed 's/^/  /'
+    errors=$(git diff --no-renames -z --name-status HEAD 2>&1 >"$listing")
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        rm -f "$listing"
+        # Not fatal — this is a warning, and a pre-flight that cannot
+        # compare to HEAD still ran its lints. Said out loud rather than
+        # swallowed, because silence here is the defect above.
+        echo "pre-flight: cannot tell how this tree differs from HEAD (git diff exited ${status}: ${errors})" >&2
+        echo "pre-flight: the gate reads the PUSHED commit, so commit before you push." >&2
+        return 0
+    fi
+    while IFS= read -r -d '' code && IFS= read -r -d '' name; do
+        modified+=("${code}"$'\t'"$(gate_show_path "$name")")
+    done <"$listing"
+    rm -f "$listing"
+    [ "${#modified[@]}" -gt 0 ] || return 0
+    echo "pre-flight: ${#modified[@]} tracked file(s) here differ from HEAD, and the gate reads the PUSHED commit:"
+    printf '  %s\n' "${modified[@]}"
     echo "  The lints above read the working copy, so this verdict is about THIS tree."
     echo "  remediation: commit before you push — an edit made after the pre-flight is"
     echo "            judged by the gate and vouched for by nobody (backlog 87454e54)."
@@ -3272,6 +4292,132 @@ if [ "$QUICK" -eq 1 ]; then
     echo "pre-flight: clean — no build ran, so this is NOT a gate."
     echo "pre-flight: clippy, build and the test suites are still unproven — infra/gate.sh --lint proves clippy in seconds."
     exit 0
+fi
+
+# ---------------------------------------------------------------------
+# --lints <paths>: the dock's LINT DELTA (backlog ce60b5c6; design
+# 7c4024d8 Q2)
+# ---------------------------------------------------------------------
+# A parked car's green ran the checks its BASE had. When main changes
+# only lints a bare tree can run, the dock classes the car lint-only
+# (crates/orchestrators/boss-cli/src/train/dock_regate.rs) and, rather
+# than a full re-gate — a median 41 minutes, twelve of them on
+# 2026-11-19, every one green — files this: MAIN's copy of each named
+# lint, run over the car's head MERGED WITH MAIN, and nothing else.
+#
+# MAIN FIRST, THEN THE CAR. The merge is checked out at origin/main and
+# takes the car as its second parent, so a lint resolving its baseline as
+# `merge-base(origin/main, HEAD)` reads the car's own diff — the way the
+# consist check reads a train's. In a worktree of its own, so HEAD — the
+# head the receipt vouches for, and the one the dock's `lint_delta` keys
+# on — is the car's, untouched.
+#
+# A REFUSAL for what the launcher asked wrongly (a path of the wrong
+# shape, a lint main does not hold, no origin/main to merge): nothing
+# about the car was judged. A RED for a merge that conflicts — no lint
+# can read the tree that would board — and for any lint that fails.
+LINTS_JSON=""
+lint_delta_refuse() { # <why>
+    GATE_REFUSAL="--lints: $1"
+    echo "gate.sh: $GATE_REFUSAL" >&2
+    write_receipt "refused"
+    exit 2
+}
+
+run_lint_delta() { # <comma-separated infra/lint/<name>.sh paths>
+    local list="$1" path main head merged merge roster="" ran="" sha nl=$'\n'
+    local -a paths=()
+    IFS=',' read -r -a paths <<< "$list"
+    [ "${#paths[@]}" -gt 0 ] || lint_delta_refuse "names no lint"
+    for path in "${paths[@]}"; do
+        case "$path" in
+            infra/lint/*/*|*[!A-Za-z0-9._/-]*|infra/lint/.*) lint_delta_refuse "$path is not a top-level infra/lint/<name>.sh" ;;
+            infra/lint/?*.sh) ;;
+            *) lint_delta_refuse "$path is not a top-level infra/lint/<name>.sh" ;;
+        esac
+    done
+    main="$(git rev-parse --verify -q 'refs/remotes/origin/main^{commit}')" \
+        || lint_delta_refuse "no origin/main in this clone to merge the car with"
+    head="$(git rev-parse --verify HEAD)" || lint_delta_refuse "HEAD is not a commit"
+    for path in "${paths[@]}"; do
+        git cat-file -e "${main}:${path}" 2>/dev/null \
+            || lint_delta_refuse "${path} is not a lint main (${main:0:12}) holds"
+    done
+    merged="$(mktemp -d)" || lint_delta_refuse "no temp dir for the merged tree"
+    rmdir "$merged"
+    if ! git worktree add -q --detach "$merged" "$main"; then
+        rm -rf "$merged"
+        lint_delta_refuse "could not check out main (${main:0:12}) beside the car"
+    fi
+    # shellcheck disable=SC2064 # the path is fixed now
+    trap "git -C '$GATE_REPO_ROOT' worktree remove --force '$merged' >/dev/null 2>&1 || rm -rf '$merged'" EXIT
+    echo "lint delta: ${#paths[@]} lint(s) from main ${main:0:12}, over ${head:0:12} merged into it"
+    if ! git -C "$merged" -c user.name='boss gate' -c user.email='gate@boss.invalid' \
+            -c commit.gpgsign=false merge -q --no-ff --no-edit "$head"; then
+        echo "GATE FAIL: lints-merge — ${head:0:12} does not merge into main ${main:0:12}; no lint can read the tree that would board" >&2
+        FAILED+=("lints-merge")
+        RAN+=("lints-merge:fail:0")
+        LINTS_JSON="\"lints\": {\"main\": \"${main}\", \"merge\": null, \"ran\": []},"
+        return 0
+    fi
+    merge="$(git -C "$merged" rev-parse HEAD)"
+    for path in "${paths[@]}"; do
+        roster="${roster}$(basename "$path" .sh) ${path}${nl}"
+        sha="$(sha256sum "$merged/$path" | cut -d' ' -f1)"
+        ran="${ran:+${ran}, }{\"path\": \"${path}\", \"sha256\": \"${sha}\"}"
+    done
+    LINTS_JSON="\"lints\": {\"main\": \"${main}\", \"merge\": \"${merge}\", \"ran\": [${ran}]},"
+    # The merged tree's git reads must survive the runner's uid the way the
+    # gated tree's do (`gate_git_reads_self_test`): a refused read inside a
+    # lint ends `|| true` and reports clean on a tree it never read.
+    export "GIT_CONFIG_KEY_${GIT_CONFIG_COUNT}=safe.directory"
+    export "GIT_CONFIG_VALUE_${GIT_CONFIG_COUNT}=${merged}"
+    export GIT_CONFIG_COUNT=$((GIT_CONFIG_COUNT + 1))
+    cd "$merged" || lint_delta_refuse "could not enter the merged tree"
+    if ! run_roster "$roster" check_lint; then
+        FAILED+=("lints-complete")
+        RAN+=("lints-complete:fail:0")
+    fi
+    cd "$GATE_REPO_ROOT" || exit 2
+    git worktree remove --force "$merged" >/dev/null 2>&1 || rm -rf "$merged"
+    trap - EXIT
+}
+
+if [ -n "$LINTS_ONLY" ]; then
+    run_lint_delta "$LINTS_ONLY"
+    if [ "${#FAILED[@]}" -gt 0 ]; then
+        write_receipt "failed"
+        echo "gate: lint delta — ${#FAILED[@]} check(s) failed: ${FAILED[*]}" >&2
+        exit 1
+    fi
+    write_receipt "green"
+    echo "gate: lint delta green — the named lint(s) pass over this head merged with main; nothing else ran"
+    exit 0
+fi
+
+# AND IT MUST NOT RUN WIDER THAN THE WORKTREE'S BUILDS (backlog
+# 9ecd12ea, ask 3). In a linked worktree — a builder's on the dev pod —
+# `--lint`'s workspace clippy ran at cargo's default, one job per NODE
+# CPU (32 there) against a 32Gi container that every builder shares; the
+# memory watch saw it hold ten clippy-drivers at once, where wt-cargo
+# allows four. The helper bounds it to wt-cargo's width and says so; a
+# main checkout (the gate runner, CI) keeps its full width. A missing
+# bound is refused, as wt-cargo refuses one.
+#
+# HERE, below the listings and `--quick`, above every cargo that
+# compiles (backlog 9f7ee428, from review 9612e118 of car d7b90451). It
+# sat at the top of the script until then, above the listings dispatch
+# whose rule (13700f6f) is that a listing answers before every refusal:
+# `--roster` in a linked worktree printed a width no cargo would use,
+# and with pod-build.env missing it refused the question. `--lint`'s
+# clippy and tree-wide pins and every gate phase below this line are the
+# cargo it bounds; `cargo metadata` above reads a manifest and compiles
+# nothing. A refusal here is the disk floor's shape — an infrastructure
+# refusal on the receipt, never a verdict on the branch.
+if ! wt_bound_build_jobs; then
+    GATE_REFUSAL="no cargo bound for this linked worktree (infra/dev/pod-build.env; backlog 9ecd12ea)"
+    write_receipt "refused"
+    exit 2
 fi
 
 # `--lint` is `--quick` plus the one compiled check that pays for
@@ -3322,9 +4468,20 @@ if [ "$LINT" -eq 1 ]; then
     refuse_untracked_files
     run_preflight
     LINT_CRATES=$(crates_from_paths)
-    if [ -n "$LINT_CRATES" ]; then
+    # NO BASE IS NOT "NO CHANGE" (backlog d472aeaf). Without a merge-base
+    # against the trunk the car's commits are unknowable, so an empty map
+    # says nothing about whether anything compiles: run the workspace
+    # clippy and name the ref, rather than skip it on a guess.
+    LINT_NO_BASE=0
+    branch_base >/dev/null || LINT_NO_BASE=1
+    if [ "$LINT_NO_BASE" -eq 1 ]; then
         echo ""
-        echo "pre-flight: workspace clippy, including dependents of ${LINT_CRATES//$'\n'/ }"
+        echo "pre-flight: cannot find this branch's base against the trunk (${AUTO_TRUNK:-<no trunk ref found>}) — its commits are unknown, so clippy runs on the whole workspace (set BOSS_GATE_TRUNK to the trunk ref to scope it)"
+    fi
+    if [ -n "$LINT_CRATES" ] || [ "$LINT_NO_BASE" -eq 1 ]; then
+        lint_scope="${LINT_CRATES//$'\n'/ }"
+        echo ""
+        echo "pre-flight: workspace clippy, including dependents of ${lint_scope:-every crate (no base to scope from)}"
         # The SAME invocation the gate runs in car mode — a second
         # spelling here would be a check that disagrees with the check
         # it is meant to predict.
@@ -3356,13 +4513,43 @@ if [ "$LINT" -eq 1 ]; then
     # the_preflight_runs_the_tree_wide_pins.rs — so this stays safe on a
     # pod whose 127.0.0.1 may be a forward to production.
     TREE_WIDE=()
+    tw_records=$(tree_wide_pins) || { echo "gate: cannot resolve integration pin membership" >&2; exit 1; }
     while read -r tw_crate tw_sel tw_test; do
         [ -n "$tw_crate" ] && TREE_WIDE+=("${tw_crate} ${tw_sel} ${tw_test}")
-    done < <(tree_wide_pins)
+    done <<< "$tw_records"
     if [ "${#TREE_WIDE[@]}" -gt 0 ]; then
         echo ""
         echo "pre-flight: ${#TREE_WIDE[@]} tree-wide pin(s), the set every scoped gate runs"
         check "tree-wide pins" run_tree_wide_pins
+    fi
+    # AND THE IMPLIED CRATES' CRATE PINS (backlog e2d091f7). The gate's
+    # scoped `cargo test -p` runs every test of the crates this tree
+    # implies; the `// crate pin` ones (see `crate_pins`) read only their
+    # own crate's source and answer here in seconds, warm, with no
+    # database. Bounded to the crates the map named — every crate when
+    # there is no base to scope from, as clippy is — and named, so a
+    # builder reads which in-crate pins ran and that the rest of each
+    # crate's suite is still the gate's.
+    CRATE_PINS=()
+    if [ "$LINT_NO_BASE" -eq 1 ]; then
+        cp_crates=$(printf '%s\n' crates/*/*/src | cut -d/ -f3)
+    else
+        cp_crates=$LINT_CRATES
+    fi
+    # shellcheck disable=SC2086 # crate names are words by construction
+    cp_records=$(crate_pins $cp_crates)
+    while read -r cp_crate cp_sel cp_test; do
+        [ -n "$cp_crate" ] && CRATE_PINS+=("${cp_crate} ${cp_sel} ${cp_test}")
+    done <<< "$cp_records"
+    if [ "${#CRATE_PINS[@]}" -gt 0 ]; then
+        cp_in=$(printf '%s\n' "${CRATE_PINS[@]}" | cut -d' ' -f1 | sort -u | tr '\n' ' ')
+        cp_names=$(printf '%s\n' "${CRATE_PINS[@]}" | cut -d' ' -f3 | tr '\n' ' ')
+        echo ""
+        echo "pre-flight: ${#CRATE_PINS[@]} crate pin(s) in ${cp_in% }: ${cp_names% } — the rest of each crate's tests is still the gate's"
+        check "crate pins" run_crate_pins
+    elif [ -n "$LINT_CRATES" ]; then
+        echo ""
+        echo "pre-flight: no crate pin declared in ${lint_scope} — every test of those crates is still the gate's"
     fi
     echo ""
     note_uncommitted_modifications
@@ -3435,8 +4622,12 @@ elif [ "${#SCOPE[@]}" -eq 0 ]; then
     # #161 had deleted, read by nobody (spa-lists-are-generated.toml).
     check "no-snapshot-arrays" infra/lint/no-snapshot-arrays.sh
 else
-    check "clippy"  cargo clippy --workspace --all-features --all-targets -- -D warnings
-    check "build (default features)" cargo build "${SCOPE[@]}"
+    if [ "$AUTO_DATA_ONLY" -eq 1 ]; then
+        echo "gate: skipping clippy / build (default features) — data only, no Rust moved (see --auto above)"
+    else
+        check "clippy"  cargo clippy --workspace --all-features --all-targets -- -D warnings
+        check "build (default features)" cargo build "${SCOPE[@]}"
+    fi
     check "test build" infra/cargo-test-wide.sh build "$TEST_WIDE_STATE" cargo test "${SCOPE[@]}" --all-features --no-fail-fast
     check "test"       infra/cargo-test-wide.sh run   "$TEST_WIDE_STATE" cargo test "${SCOPE[@]}" --all-features --no-fail-fast
     # A scoped car pays for the binary only when it could have moved
@@ -3461,13 +4652,14 @@ if [ "${#TREE_WIDE[@]}" -gt 0 ]; then
     check "tree-wide pins" run_tree_wide_pins
 fi
 
-# THE WEB SUITE. CI's web job runs unit + build + the mocked
-# Playwright suite; before this gate ran svelte-check alone, so a car
-# could pass here and red the train on a check it never saw (§9a: this
-# block and ci.yml's web job are two copies of one definition, kept in
-# sync). CI no longer runs the typecheck: svelte-check below runs on
-# every tree, the train's --auto gate included (backlog 81ee98b3; pinned
-# by gate_sh.rs the_forge_web_job_runs_only_what_the_train_gate_may_skip).
+# THE WEB SUITE. Unit + build + the mocked Playwright suite; before
+# this gate ran svelte-check alone, so a car could pass here and red the
+# train on a check only CI's web job ran. That job is no longer a second
+# copy of this block: svelte-check below runs on every tree, the train's
+# --auto gate included, so CI runs no typecheck; and CI runs the rest
+# only on a train that changes its runner image's recipe, the one thing
+# this gate's image cannot prove (backlog 81ee98b3). Which lane pays for
+# each of apps/web's checks is read by apps/web's web-ci-coverage.ts.
 #
 # FULL MODE RUNS IT UNCONDITIONALLY, matching CI — the full gate is the
 # authoritative one and must not be narrower than the train it feeds.
@@ -3475,53 +4667,68 @@ fi
 # which is exactly why `boss gate` runs full mode, skipped the suite,
 # and let mocked-spec reds through: trains #160 (route crawl missed the
 # estate page) and #161 (~35 specs after the IT consolidation moved
-# surfaces) both died that way — ade5d82b. --auto keeps the old
-# scoping, because a docs or Rust car iterating locally should not pay
-# the suite unless it touched the web; CI and the full gate are the
-# unconditional backstops. The browser is baked into boss-ci at
-# /opt/ms-playwright (the keystone), so this needs no run-time download
-# — the gate-runner points PLAYWRIGHT_BROWSERS_PATH there.
+# surfaces) both died that way — ade5d82b. The browser is baked into
+# boss-ci at /opt/ms-playwright (the keystone), so this needs no
+# run-time download — the gate-runner points PLAYWRIGHT_BROWSERS_PATH
+# there.
+#
+# WHAT --auto RUNS (backlog a244c6e7, 2026-10-19). The unit suites run
+# on EVERY tree: web install, web-kit unit, the simulator and apps/web's
+# test:unit take ~21 s together (dev pod, the gate's own 4-wide runner),
+# and they read far outside the web trees — ci.yml, Rust handlers,
+# workflows, seeds — so no list of paths could say when to skip them.
+# The build and the mocked suite take minutes (257-425 s for the
+# web-suite check in the 2026-10-18 receipts), so --auto runs them only
+# when the car changes something they read, and what they read is
+# DERIVED from their own files by apps/web/scripts/web-suite-reads.ts:
+# apps/web and the workspace packages it depends on, the install's
+# inputs, and every relative path their code names outside those trees.
+# Until then web_touched grepped for three directories while the specs
+# read infra/step-plugins, infra/estate and docs/, so a step-plugin car
+# was green without the specs that render it, and the forge's web job on
+# the train was their first run. A derivation that cannot answer (no
+# bun, a file whose reads it cannot see) answers yes: the suite runs.
+# Pinned by an_auto_gate_runs_the_web_suite_on_what_it_reads.rs.
 web_touched() {
-    if changed_paths | grep -qE '^(apps/web|apps/simulator|libs/web-kit)/'; then echo yes; else echo no; fi
+    local answer
+    answer=$(changed_paths | (cd apps/web && bun scripts/web-suite-reads.ts --touched)) || answer=""
+    case "$answer" in
+        yes|no) echo "$answer" ;;
+        *) echo "gate: web-suite-reads gave no answer, so the web suite runs" >&2; echo yes ;;
+    esac
 }
-simulator_touched() {
-    if changed_paths | grep -qE '^(apps/simulator|libs/web-kit)/'; then echo yes; else echo no; fi
-}
-if [ "$AUTO" -eq 0 ] || [ "$(web_touched)" = "yes" ]; then
-    # Every web check below appends what it took (see "web timings").
-    web_timings_begin
+# Every web check below appends what it took (see "web timings").
+web_timings_begin
 
-    # A clean install FIRST, with puppeteer's postinstall skipped. bun
-    # aborts the WHOLE install on a failed postinstall, and puppeteer's
-    # browser download is the flaky one — the exact reason ci.yml's web
-    # job and svelte-check.sh both set PUPPETEER_SKIP_DOWNLOAD. This is
-    # the install the web checks run on, and the web-suite check below
-    # is the one build: the gate-runner's silenced warm-up of both is
-    # gone (backlog efd7f75c), so what they take and whether they fail
-    # are on the receipt (the_gate_builds_the_web_app_once.rs).
-    check "web install" bash -c 'cd apps/web && PUPPETEER_SKIP_DOWNLOAD=1 bun install --frozen-lockfile'
+# A clean install FIRST, with puppeteer's postinstall skipped. bun
+# aborts the WHOLE install on a failed postinstall, and puppeteer's
+# browser download is the flaky one — the exact reason ci.yml's web
+# job and svelte-check.sh both set PUPPETEER_SKIP_DOWNLOAD. This is
+# the install the web checks run on, and the web-suite check below
+# is the one build: the gate-runner's silenced warm-up of both is
+# gone (backlog efd7f75c), so what they take and whether they fail
+# are on the receipt (the_gate_builds_the_web_app_once.rs).
+check "web install" bash -c 'cd apps/web && PUPPETEER_SKIP_DOWNLOAD=1 bun install --frozen-lockfile'
+# web-kit FIRST: its 7 test files existed for weeks and ran in no
+# job at all - not here, not in ci.yml. One of them could not even
+# load, because it imported a module whose top-level `$state` made
+# it unloadable outside the Svelte compiler; the rest silently
+# protected nothing. A test nothing runs is not a test.
+check "web-kit unit" bash -c 'cd libs/web-kit && bun run test:unit'
+# THE SIMULATOR (backlog 5796d7ea, 2026-09-26). web_touched opened
+# the web phase on an apps/simulator change and then ran nothing of
+# it: no typecheck, no unit test, no build here, in ci.yml or anywhere
+# else, so a broken simulator was green. Measured clean the day it
+# was added (0 errors, 6 tests, a 4-file bundle, ~7 s warm), so no
+# baseline. It was scoped in --auto to its own tree and web-kit until
+# a244c6e7 measured it at 6 s and ran it on every tree.
+check "simulator (typecheck+unit+build)" bash -c 'cd apps/simulator && bun run typecheck && bun run test:unit && bun run build'
+if [ "$AUTO" -eq 0 ] || [ "$(web_touched)" = "yes" ]; then
     # Resolve controls in the same toolchain/environment; runtime output remains
     # a separate observation rather than a configured worker count posing as one.
     (cd apps/web && bun -e 'import config from "./playwright.mocked.config.ts"; console.log(JSON.stringify({workers:config.workers,retries:config.retries}));') \
         > "${BOSS_GATE_RUNTIME_EVIDENCE}.browser-config" 2> "${BOSS_GATE_RUNTIME_EVIDENCE}.browser-config-error" \
         || printf '%s\n' browser-config >> "${BOSS_GATE_RUNTIME_EVIDENCE}.failed"
-    # web-kit FIRST: its 7 test files existed for weeks and ran in no
-    # job at all - not here, not in ci.yml. One of them could not even
-    # load, because it imported a module whose top-level `$state` made
-    # it unloadable outside the Svelte compiler; the rest silently
-    # protected nothing. A test nothing runs is not a test.
-    check "web-kit unit" bash -c 'cd libs/web-kit && bun run test:unit'
-    # THE SIMULATOR (backlog 5796d7ea, 2026-09-26). web_touched opened
-    # this phase on an apps/simulator change and then ran nothing of it:
-    # no typecheck, no unit test, no build here, in ci.yml or anywhere
-    # else, so a broken simulator was green. Measured clean the day it
-    # was added (0 errors, 6 tests, a 4-file bundle, ~7 s warm), so no
-    # baseline. Scoped in --auto to what it reads — its own tree and
-    # web-kit, its one workspace dependency — so an apps/web car does
-    # not pay for it; full mode runs it like the rest of the phase.
-    if [ "$AUTO" -eq 0 ] || [ "$(simulator_touched)" = "yes" ]; then
-        check "simulator (typecheck+unit+build)" bash -c 'cd apps/simulator && bun run typecheck && bun run test:unit && bun run build'
-    fi
     # The check's own output, teed, so the keeper can read Playwright's
     # roll-up of failed specs (see "web evidence"; backlog a766e20d).
     web_out="$(mktemp)" || web_out=""
@@ -3535,6 +4742,11 @@ if [ "$AUTO" -eq 0 ] || [ "$(web_touched)" = "yes" ]; then
     if [ "$CHECK_STATUS" -ne 0 ] && [ -n "$web_since" ]; then keep_error_context "web-suite (unit+build+mocked)" "$web_since" "$web_out"; fi
     [ -z "$web_since" ] || rm -f "$web_since"
     [ -z "$web_out" ] || rm -f "$web_out"
+else
+    # apps/web's unit files, which the web-suite check above opens with:
+    # a car that skips the browser still has them judged (a244c6e7),
+    # gate-matches-ci.test.ts and estate.test.ts among them.
+    check "web unit" bash -c 'cd apps/web && bun run test:unit'
 fi
 
 run_preflight

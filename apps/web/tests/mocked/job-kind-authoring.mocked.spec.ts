@@ -18,7 +18,7 @@ import { test, expect } from './_test';
 import { mountPage } from './_helpers';
 import { installAuthoringMocks, JOB_ID, KIND_SLUG } from './_mockApi';
 
-const WORKSPACE = `/it/registry/authoring/${JOB_ID}`;
+const WORKSPACE = `/engineering/registry/authoring/${JOB_ID}`;
 
 test.beforeEach(async ({ page }) => {
   await installAuthoringMocks(page);
@@ -89,7 +89,7 @@ test.describe('Workflow authoring workspace — workflow rail', () => {
 
     // Publishing completes the terminal step and routes to the kind.
     await Promise.all([
-      page.waitForURL(new RegExp(`/it/registry/${KIND_SLUG}$`)),
+      page.waitForURL(new RegExp(`/engineering/registry/${KIND_SLUG}$`)),
       publish.click(),
     ]);
   });

@@ -1,0 +1,67 @@
+# No car gate launched for an hour while ready builds and reviews wait
+# is an alarm on the WHOLE factory, and it tells the platform owner
+# directly (backlog 5627a4e1).
+#
+# THE CASE. 2026-11-17: the last car gate launched 06:31:25Z, the last
+# train departed 07:20Z (#1809), the last agent-run opened 05:57:55Z, and
+# no gate launched again until David noticed at 14:45Z — about seven
+# hourly trains lost, with 775 ready backlog builds (three of them
+# urgent) and three held-car reviews waiting. Measured at 14:55Z off the
+# gate-run list (newest 50, order=newest) and the agent-run list.
+#
+# WHY THE NEIGHBOURS DID NOT SAVE IT. Two of them FIRED inside the stall:
+# `an-unheld-ready-review-past-its-bound-is-alarmed` at 07:01Z (fd20fb6c)
+# and `a-silent-factory-holding-claimed-work-is-alarmed` at 08:01Z
+# (a79f9097, agent-claude silent 53m holding 25). Each filed an urgent
+# backlog item owned by the platform owner and assigned to nobody, so
+# `messages.notify` told no one (a role-only ready step pages nobody),
+# and the only reader of an urgent backlog item is the coordinator
+# session that had stopped. Detection was not the gap; the reader was.
+# And each is keyed by an actor or a station: none states the system's
+# own fact, "nothing is being built".
+#
+# THE ARGS ARE THE DECLARATION, as registry data:
+#   - idle_minutes, 60: since the newest CAR gate-run's `opened_at`. A
+#     train gate and main's full gate are filed on their own clocks and
+#     ran that morning with every builder down, so they do not count
+#     (boss-jobs `stranded::is_train_gate`, `full_gate_on_main::
+#     is_main_gate`).
+#   - ready: the `<workflow>.<step>` pairs an agent takes — backlog and
+#     feedback builds, and a landed car's owed review. A parked car's
+#     `review` is ready on every car at the dock and waits on its train,
+#     so it is not declared (the unheld-review watch reads the held ones).
+#
+# WHO READS IT. The alarm is an urgent backlog item for whichever
+# coordinator comes back, AND a `direct` inbox message to the platform
+# owner — the needs-you kind — sent by the dispatcher, which owes
+# nothing to any agent session. That message is the reader path the
+# overnight alarms lacked.
+#
+# DEDUP PER IDLE EPISODE: the episode is the newest car gate's
+# `opened_at`, stamped as `factory_idle_since`; one alarm per episode
+# whatever its status, and the next car gate starts a new one.
+#
+# EVERY FIFTEEN MINUTES: the bound is an hour, so the alarm lands 60 to
+# 75 minutes into a stall. A tick reads one page of 50 gate-runs; the
+# queue-age lens and the run and session lists are read only past the
+# bound.
+[[rule]]
+name = "a-factory-idle-past-an-hour-alarms-the-owner"
+why = """
+A TIMER over an ABSENCE, the standing exemption: the condition is gates
+that did NOT launch, and no event says "an hour passed and the factory
+built nothing". A Workflow can say who a step is for; it cannot notice
+that every executor has stopped. Measured 2026-11-17 (backlog 5627a4e1):
+no car gate from 06:31Z to past 14:45Z with hundreds of ready builds,
+while the two alarms that fired were read by nobody. It routes nothing
+and refuses nothing: one firing files ONE urgent alarm per idle episode
+naming the minutes idle, the ready count, the open agent-runs and every
+open work-session with its last activity, owned by the platform owner,
+and sends that owner one direct inbox message — a reader that does not
+depend on the sessions that stopped.
+"""
+version = 1
+schedule = { cadence = "every-15-minutes", anchor_date = "2026-11-17" }
+[[rule.do]]
+handler = "jobs.factory_idle_watch"
+args = { idle_minutes = "60", ready = "\"backlog-item.build,user-feedback.build,ship-a-change.landed-review\"" }

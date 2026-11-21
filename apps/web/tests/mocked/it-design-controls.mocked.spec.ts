@@ -1,4 +1,4 @@
-// /it/design — every control the page renders, pinned (page audit
+// /engineering/design — every control the page renders, pinned (page audit
 // 79db48ae, step `test`; backlog 6bef2baa asked for exactly this spec).
 //
 // design-in-working-out.mocked.spec.ts pins what the IN, WORKING and OUT
@@ -69,7 +69,7 @@
 //       own region's read.
 // and not owned by any open item (UNFILED):
 //   U3  the eyebrow names "System Model", on an IT page, in both lens
-//       rows (the fallback's was changed to IT by the /it/kb car,
+//       rows (the fallback's was changed to IT by the /engineering/kb car,
 //       839a7f0f, 2026-09-27); the fallback subtitle "Open questions
 //       and ADRs" describes the corpus deleted on 2026-09-10, and it is
 //       what a failed read shows
@@ -78,11 +78,17 @@ import { expect, test, type Page, type Request, type Route } from './_test';
 import { mountPage } from './_helpers';
 import { FAILURE_MARKER } from './_routes';
 import { installSmokeMocks } from './_smokeMocks';
-import { parseRoute } from '../../src/router';
+import { parseRoute as parseRouteAt } from '../../src/router';
+import { pagePath } from '../../src/shell/page-address';
+import type { NavItem } from '../../src/shell/nav-catalog';
 import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
+import { ADDRESSES, pageAt } from '../fixtures/station-tree';
 import { FALLBACK_HEADER } from '../../src/it/design/designLens';
+// The router reads a hosted page's address off the station tree
+// (backlog 0bc2eb68); this spec reads it off the tree the floor serves.
+const parseRoute = (path: string, search = '') => parseRouteAt(path, search, ADDRESSES);
 
-const PATH = '/it/design';
+const PATH = '/engineering/design';
 const TITLE = { titleMatch: /Design review/ };
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
@@ -136,8 +142,8 @@ const HIGH = 'rev-high';
 const BARE = 'rev-bare';
 const FRESH = 'rev-fresh';
 const queue = () => ({
-  station: 'design-review', kind: 'batch', discipline: ['priority', 'age'],
-  wip_limit: null, over_limit: false, terminal_window_days: null,
+  station: 'design-review', kind: 'group', discipline: ['priority', 'age'],
+  terminal_window_days: null,
   lens: LENS,
   total: 3,
   data: [
@@ -159,8 +165,8 @@ const W_READY = 'w-ready';
 const W_ACTIVE = 'w-active';
 const O_DONE = 'o-done';
 const decided = () => ({
-  station: 'design-decided', kind: 'batch', discipline: ['recency'],
-  wip_limit: null, over_limit: false, terminal_window_days: 7,
+  station: 'design-decided', kind: 'group', discipline: ['recency'],
+  terminal_window_days: 7,
   lens: { eyebrow: 'System Model · Design review', title: 'Decided designs', panels: [], with_steps: true },
   total: 3,
   data: [
@@ -242,15 +248,15 @@ const EMPTY_QUEUE_TEXT =
   'Nothing is waiting on a decision. A design doc reaches this queue as a design-doc packet carrying its own prose and questions — boss design files one. Settled material folds into docs/architecture-decisions.md, the one current-truth record.';
 
 const REVIEW_HREF = (id: string, stepId: string): RegExp =>
-  new RegExp(`/jobs/${id}/steps/${stepId}${esc('?from=%2Fit%2Fdesign&from_label=Design%20Review')}$`);
+  new RegExp(`/jobs/${id}/steps/${stepId}${esc('?from=%2Fengineering%2Fdesign&from_label=Design%20Review')}$`);
 
 // ---------------------------------------------------------------------
 // The route, the chrome and the words
 // ---------------------------------------------------------------------
 
-test.describe('/it/design — the route and the words it says', () => {
+test.describe('/engineering/design — the route and the words it says', () => {
   test('the path is the catalogued Design route, headed by what the station row declares', async ({ page }) => {
-    expect(ROUTE_CATALOG['system-design'].path).toBe(PATH);
+    expect(pageAt('system-design')).toBe(PATH);
     expect(parseRoute(PATH)).toEqual({ kind: 'systemDesign' });
     await install(page);
     await mountPage(page, PATH, TITLE);
@@ -392,25 +398,23 @@ test.describe('/it/design — the route and the words it says', () => {
 // The controls — each does what its label says, and back returns
 // ---------------------------------------------------------------------
 
-test.describe('/it/design — every control', () => {
-  test('the two tabs are catalogued routes, Reviews is this page, and each lands where it says and comes back', async ({ page }) => {
+test.describe('/engineering/design — every control', () => {
+  test('the one tab is a catalogued route, Reviews, this page', async ({ page }) => {
     await install(page);
     await mountPage(page, PATH, TITLE);
     const tabs = page.locator('nav.it-tabs a');
     // Feedback and Backlog left with car N3 of design e765b3fc: the
     // feedback board is the Receiving station's panel on the Department
-    // Map, the backlog board Receiving's and Marshalling's.
-    await expect(tabs).toHaveText(['Reviews', 'Experiments']);
+    // Map, the backlog board Receiving's and Marshalling's. Experiments
+    // left with step 1 of design 01fa5bdf.
+    await expect(tabs).toHaveText(['Reviews']);
     await expect(tabs.nth(0)).toHaveAttribute('aria-current', 'page');
     await expect(page.locator('nav.it-tabs a[aria-current]')).toHaveCount(1);
 
     // Each tab's target is read from the one catalogue, never a second list.
-    const catalogued = new Set(Object.values(ROUTE_CATALOG).map((n) => n.path));
+    const catalogued = new Set(Object.values(ROUTE_CATALOG).map((n) => pagePath(n as NavItem, ADDRESSES) ?? `unplaced:${n.id}`));
     const hrefs = await tabs.evaluateAll((as) => as.map((a) => a.getAttribute('href') ?? ''));
-    expect(hrefs).toEqual([
-      ROUTE_CATALOG['system-design'].path,
-      ROUTE_CATALOG['system-experiments'].path,
-    ]);
+    expect(hrefs).toEqual([pageAt('system-design')]);
     for (const h of hrefs) {
       expect(catalogued.has(h)).toBe(true);
       expect(parseRoute(h).kind).not.toBe('notFound');
@@ -430,7 +434,7 @@ test.describe('/it/design — every control', () => {
 
   test('Review opens the review step the envelope carried, reads nothing to find it, and its Back returns here', async ({ page }) => {
     // The fallback read is REFUSED for this packet. Had the page made
-    // it, the button would have landed on /service/…, so landing on the
+    // it, the button would have landed on /jobs/…, so landing on the
     // step surface proves the envelope's step was used. (The step
     // surface reads the job itself after the navigation, so a count of
     // that read could not tell the two apart.)
@@ -439,7 +443,7 @@ test.describe('/it/design — every control', () => {
 
     await queueRow(page, 'Admit every packet').getByRole('button', { name: 'Review' }).click();
     await expect(page).toHaveURL(REVIEW_HREF(HIGH, 'rs-high'));
-    expect(parseRoute(`/jobs/${HIGH}/steps/rs-high`, '?from=%2Fit%2Fdesign&from_label=Design%20Review')).toMatchObject({
+    expect(parseRoute(`/jobs/${HIGH}/steps/rs-high`, '?from=%2Fengineering%2Fdesign&from_label=Design%20Review')).toMatchObject({
       kind: 'stepFocus', jobId: HIGH, stepId: 'rs-high', from: PATH, fromLabel: 'Design Review',
     });
 
@@ -486,8 +490,8 @@ test.describe('/it/design — every control', () => {
     page.on('dialog', (d) => { alerts.push(d.message()); void d.dismiss(); });
 
     await queueRow(page, 'A design whose steps').getByRole('button', { name: 'Review' }).click();
-    await expect(page).toHaveURL(new RegExp(`/service/${BARE}$`));
-    expect(parseRoute(`/service/${BARE}`)).toEqual({ kind: 'jobDetail', jobId: BARE });
+    await expect(page).toHaveURL(new RegExp(`/jobs/${BARE}$`));
+    expect(parseRoute(`/jobs/${BARE}`)).toEqual({ kind: 'jobDetail', jobId: BARE });
     expect(alerts).toEqual([]);
   });
 
@@ -497,7 +501,7 @@ test.describe('/it/design — every control', () => {
     });
     await mountPage(page, PATH, TITLE);
     await queueRow(page, 'A design whose steps').getByRole('button', { name: 'Review' }).click();
-    await expect(page).toHaveURL(new RegExp(`/service/${BARE}$`));
+    await expect(page).toHaveURL(new RegExp(`/jobs/${BARE}$`));
   });
 
   test('each decided row is a link to its packet\'s job detail, and back returns here', async ({ page }) => {
@@ -536,7 +540,7 @@ test.describe('/it/design — every control', () => {
 // the two are never the same paint
 // ---------------------------------------------------------------------
 
-test.describe('/it/design — empty, failed and malformed reads', () => {
+test.describe('/engineering/design — empty, failed and malformed reads', () => {
   test('an empty review queue paints the empty state and no failure', async ({ page }) => {
     await install(page, { queue: (r) => json(r, emptyQueue()) });
     await mountPage(page, PATH, TITLE);

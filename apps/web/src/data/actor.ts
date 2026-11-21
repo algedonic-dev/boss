@@ -96,6 +96,21 @@ export function isHumanActor(actorId: string | null | undefined): boolean {
   );
 }
 
+/** The executor kinds, in the words the server writes (`ExecutorKind`). */
+export type ExecutorKind = 'person' | 'robot' | 'automaton';
+
+/** The TS mirror of `ActorId::executor_kind` (boss-core actor.rs), the one
+ *  place on the client that answers "what kind of executor is this id"
+ *  (backlog 8e8d0b1a). An automaton is any `automation:` id, the legacy
+ *  bare `rule:` id the dispatcher signed with, and the platform `system`
+ *  (a legacy null or empty reads as the platform too); a person is exactly
+ *  what [`isHumanActor`] says; every other id, an unresolved login
+ *  included, is a robot. Rust reads the same table, pinned on both sides. */
+export function executorKind(actorId: string | null | undefined): ExecutorKind {
+  if (!actorId || actorId === 'system' || actorId.startsWith('automation:') || actorId.startsWith('rule:')) return 'automaton';
+  return isHumanActor(actorId) ? 'person' : 'robot';
+}
+
 /** `agent-<slug>` — the id of an `agents` registry row. The Rust parse
  *  (`ActorId::from_str`, branch 4) reads the same prefix and, like it,
  *  wants a non-empty slug after the hyphen. */

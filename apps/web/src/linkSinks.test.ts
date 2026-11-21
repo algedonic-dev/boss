@@ -136,7 +136,9 @@ describe('every dynamic href and src goes through safeLinkHref', () => {
   test('the templates are there to read', () => {
     // A wrong root reads zero files and passes everything below.
     expect(FILES.length).toBeGreaterThan(100);
-    expect(ALL.some((s) => s.file === 'apps/web/src/catalog/DevicePage.svelte')).toBe(true);
+    // A stored file's link, as the device page's document link was until
+    // that page went with step 1 of design 01fa5bdf.
+    expect(ALL.some((s) => s.file === 'apps/web/src/content/FileAttachments.svelte')).toBe(true);
   });
 
   test('no template binds a value the helper has not judged', () => {

@@ -194,7 +194,7 @@ if [ "$fail" -ne 0 ] && [ -n "$refusal" ]; then
     # shellcheck source=infra/lib/secret-header.sh
     if . "$(dirname "${BASH_SOURCE[0]}")/../lib/secret-header.sh" \
        && secret_header FORGE_HDR "Authorization: token $FORGE_TOKEN" \
-       && curl -fsS -o /dev/null -X POST -H "$FORGE_HDR" -H 'Content-Type: application/json' \
+       && curl -q -fsS -o /dev/null -X POST -H "$FORGE_HDR" -H 'Content-Type: application/json' \
          "$api/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -d "$body"; then
       say "locomotive: refusal posted as a commit status (context 'CI / locomotive refusal') — the conductor will spare the cars"
     else

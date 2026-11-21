@@ -5,3 +5,5 @@
 id = "automation:gateway"
 role = "platform-admin"
 description = 'The gateway own server-side calls: passkey promotion, break-glass, site inquiries (crates/core/boss-gateway/src/passkey.rs sign_as_gateway).'
+# Host station: edge (backlog 6ecb5480, station-tree.md section 6).
+station = "20f2b366-553c-4e60-8a21-c532e784f3a2"

@@ -117,6 +117,19 @@ impl Resource {
     pub fn workflow() -> Self {
         Self::new("workflow")
     }
+    /// Reading an unpublished draft — a workflow or station version
+    /// never published — WITHOUT any authoring verb (backlog f21804d8,
+    /// design 600c07d7, decided 2026-10-17). Until then a draft was read
+    /// only by who may author one, so a read-only observer that captures
+    /// the complete graph could qualify only by being granted Create,
+    /// Update or Publish on `workflow`. Deliberately not a shipped
+    /// resource: the read-only roles (the auditor's, which an audit-opted
+    /// guest also carries) would inherit it, and a draft is an author's
+    /// workspace. The deploy superuser holds it in `default_rules`; an
+    /// install grants a named observer role as a policy row.
+    pub fn workflow_draft() -> Self {
+        Self::new("workflow-draft")
+    }
     /// Raw audit-log rows, wherever they are surfaced as results —
     /// global search, a View over `events`, any future reader.
     ///
@@ -203,6 +216,16 @@ impl Resource {
         Self::new("dispatcher-rule")
     }
 
+    /// The resource-pool registry's live door (backlog f399458f): read a
+    /// lineage, publish a version, retire the active one. A pool amount
+    /// is how much work the factory admits at once, so by default it is
+    /// the deploy superuser's, held in `default_rules`. Not shipped: the
+    /// host pools name the estate's machines, which the read-only roles
+    /// are granted by name (`estate`), never by inheritance.
+    pub fn pool() -> Self {
+        Self::new("pool")
+    }
+
     /// Writing the SubjectKind registry — today its one write, a kind's
     /// metadata merge, which is Update (backlog abc2e9d5, 2026-09-28:
     /// until then the registry had no write door, so a migration UPDATE
@@ -281,6 +304,17 @@ impl Resource {
     // else without a core change.
     pub fn account() -> Self {
         Self::new("account")
+    }
+    /// A DTC buyer — a `customer` Subject in boss-customers: a name, an
+    /// email and a phone (backlog cda177ef, 2026-11-19: the list
+    /// `/api/customers` and the row `/api/customers/{id}` asked nobody,
+    /// so a Basic guest read every buyer's contact details). Not `account`,
+    /// the B2B relationship a tenant's sales roles hold by account team:
+    /// a buyer has no account team, team or department, so its read is
+    /// all-or-nothing. Shipped, so the deploy superuser and the
+    /// read-only auditor read it, and the `visitor` does not.
+    pub fn customer() -> Self {
+        Self::new("customer")
     }
     pub fn employee() -> Self {
         Self::new("employee")

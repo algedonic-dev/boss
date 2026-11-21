@@ -27,7 +27,14 @@
 //!
 //! Every test names the offending entry when it fails.
 
-use boss_testing::repo_root;
+use boss_testing::{TREE_WIDE_FILE_PATTERN, repo_root, tree_wide_pattern};
+
+/// A `tests/` file's tree-wide marker, as infra/gate.sh runs the pins by
+/// it — read, never spelled here (backlog 07ad55b3).
+fn tree_wide_file_marker() -> regex::Regex {
+    regex::Regex::new(&tree_wide_pattern(TREE_WIDE_FILE_PATTERN))
+        .expect("TREE_WIDE_FILE_PATTERN in infra/gate.sh is a regex")
+}
 
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);
@@ -208,45 +215,427 @@ fn the_forge_workflow_carries_no_second_definition_of_the_gate() {
 /// (train/conductor.rs `render_job(.., "--auto")`) and merges no train
 /// without that verdict (`BOSS_TRAIN_GATE_REQUIRED=1`). In `--auto`,
 /// gate.sh runs `svelte-check` on every tree — a top-level `check`, no
-/// condition around it — so a `bun run typecheck` in the workflow is the
-/// same check run twice, serially, after the image build. The rest of
-/// the web phase (web-kit unit, unit, build, mocked) sits behind
-/// `web_touched`, which reads only apps/web, apps/simulator and
-/// libs/web-kit while the specs also read files from infra/step-plugins,
-/// infra/estate, infra/postgres, examples/ and docs/: a train that changes
-/// only those is judged by the forge's run of them and by nothing else. So
-/// those STAY, and this pin holds both halves — drop one from the
-/// workflow while the gate still scopes it, and this goes red.
+/// condition around it — so a typecheck in the workflow is the same
+/// check run twice, serially, after the image build. The rest of the web
+/// phase sat behind `web_touched`, which read only apps/web,
+/// apps/simulator and libs/web-kit while the specs also read files from
+/// infra/step-plugins, infra/estate and docs/: a train that changed only
+/// those was judged by the forge's run of them and by nothing else. Since
+/// a244c6e7 the unit suites run on every tree and `web_touched` is derived
+/// from what the build and mocked specs read (web-suite-reads.ts), so on
+/// the same tree the kept steps below are the train gate's checks run a
+/// second time, in series.
+///
+/// SO THEY RUN ONLY ON A NEW RUNNER RECIPE (the rest of 81ee98b3,
+/// 2026-10-20). They are not deleted, because one thing differs between
+/// the lanes: the forge job runs in the image built from the train's own
+/// infra/forge/boss-ci/, while the cluster gate runs the boss-ci:rust1.96
+/// it pulled at launch. On a train that changes that recipe, the forge's
+/// run is the only proof that the new image still runs bun, the browser
+/// and the suite; on every other train it proves nothing the gate did not.
+/// So each kept step must be present, unguarded by anything else, and
+/// guarded by exactly [`ON_A_NEW_RECIPE`] — deleted, it loses the one
+/// proof; unguarded, it is the serial duplicate again. The recipe step's
+/// answer is pinned by EXECUTING it, in
+/// the_forge_web_job_runs_on_a_new_recipe.rs, and that the gate lane pays
+/// for what these steps no longer run is web-ci-coverage.ts's question.
+///
+/// It did not, at first (backlog 25a20d02, measured by mutation in
+/// review run 57a5c8d6): `run: bun run test:unit` is spelled twice in the
+/// workflow, so deleting apps/web's Unit tests step left the web-kit one
+/// to satisfy it; wrapping the svelte-check line in an `if … fi` left a
+/// line that still STARTED with the check; and a step spelled
+/// `bunx svelte-check` passed the no-duplicate half. So each kept step
+/// is now matched by its directory as well as its command, and by its
+/// guard (none but the recipe's since 81ee98b3 closed);
+/// the check must sit outside every `if … fi`; and a duplicate is any
+/// invocation of svelte-check, by name or through a package.json script
+/// that reaches it. `the_forge_web_job_pin_refuses_what_its_review_measured`
+/// replays those mutations so the pin cannot weaken back silently.
 #[test]
 fn the_forge_web_job_runs_only_what_the_train_gate_may_skip() {
     let ci = forge_workflow();
     let gate = read("infra/gate.sh");
+    let web_package = read("apps/web/package.json");
+    if let Err(why) = svelte_check_runs_at_top_level(&gate) {
+        panic!(
+            "infra/gate.sh no longer runs svelte-check unconditionally ({why}) — the forge's \
+             web job dropped its typecheck because the train's --auto gate always ran it \
+             (81ee98b3); put the typecheck back in .forgejo/workflows/ci.yml or the check \
+             back at top level"
+        );
+    }
+    let duplicates = typecheck_invocations(&ci, &web_package);
     assert!(
-        gate.lines()
-            .any(|l| l.starts_with("check \"svelte-check\"")),
-        "infra/gate.sh no longer runs svelte-check unconditionally — the forge's web job \
-         dropped its typecheck because the train's --auto gate always ran it (81ee98b3); \
-         put the typecheck back in .forgejo/workflows/ci.yml or the check back at top level"
+        duplicates.is_empty(),
+        ".forgejo/workflows/ci.yml runs svelte-check again — the train's gate runs it on the \
+         identical tree on every train, so this is a serial duplicate: {duplicates:?}"
     );
+    let off = kept_web_steps_off_the_recipe(&ci);
     assert!(
-        !ci.contains("run: bun run typecheck"),
-        ".forgejo/workflows/ci.yml runs `bun run typecheck` again — the train's gate runs \
-         svelte-check on the identical tree on every train, so this is a serial duplicate"
+        off.is_empty(),
+        ".forgejo/workflows/ci.yml's web job: {off:?} — each kept step runs only when the \
+         train changes infra/forge/boss-ci/ (`if: {ON_A_NEW_RECIPE}`, after the unguarded \
+         `recipe` step): deleted, nothing proves a new runner image still runs the web suite; \
+         unguarded, it re-runs the train gate's checks in series on every train (81ee98b3)"
     );
-    assert!(
-        gate.contains("if [ \"$AUTO\" -eq 0 ] || [ \"$(web_touched)\" = \"yes\" ]; then"),
-        "gate.sh's web phase is no longer scoped by web_touched in --auto — if the train's \
-         gate now runs it on every tree, the forge's web job is a duplicate and can go"
-    );
-    for kept in [
-        "run: bun run test:unit",
-        "run: bun run build",
-        "run: bun run test:mocked",
-    ] {
+}
+
+/// The guard on every kept step: the `recipe` step's answer, so that
+/// anything but an explicit `no` (a failed read included) runs them.
+const ON_A_NEW_RECIPE: &str = "steps.recipe.outputs.changed != 'no'";
+
+/// The steps the forge's web job keeps, as (working-directory, run).
+/// The directory is half the identity: `bun run test:unit` is two
+/// different suites in libs/web-kit and apps/web. The install is here
+/// because, guarded or not, it is minutes of a fresh container's track
+/// time spent on steps that will not run.
+const KEPT_WEB_STEPS: [(&str, &str); 5] = [
+    (
+        "apps/web",
+        "PUPPETEER_SKIP_DOWNLOAD=1 bun install --frozen-lockfile",
+    ),
+    ("libs/web-kit", "bun run test:unit"),
+    ("apps/web", "bun run test:unit"),
+    ("apps/web", "bun run build"),
+    ("apps/web", "bun run test:mocked"),
+];
+
+/// One step of a workflow job, as much of it as the pin reads: its id,
+/// where it runs, its one-line `run:`, its `if:`, and whether a failure
+/// would not count (`continue-on-error: true`).
+#[derive(Debug, Default)]
+struct WorkflowStep {
+    id: Option<String>,
+    working_directory: Option<String>,
+    run: Option<String>,
+    condition: Option<String>,
+    tolerated: bool,
+}
+
+/// The steps of job `job` in a workflow, read line by line: the job runs
+/// from its `  <job>:` key to the next two-space key, and a step starts
+/// at each `- ` item. Enough YAML for this file's shape, and no more.
+fn job_steps(ci: &str, job: &str) -> Vec<WorkflowStep> {
+    let header = format!("  {job}:");
+    let next_key = |l: &&str| {
+        let bare = l.trim_start_matches(' ');
+        let indent = l.len() - bare.len();
+        indent <= 2 && !bare.is_empty() && !bare.starts_with('#')
+    };
+    ci.lines()
+        .skip_while(|l| *l != header)
+        .skip(1)
+        .take_while(|l| !next_key(l))
+        .map(str::trim)
+        .fold(Vec::new(), |mut steps: Vec<WorkflowStep>, line| {
+            let field = match line.strip_prefix("- ") {
+                Some(rest) => {
+                    steps.push(WorkflowStep::default());
+                    rest
+                }
+                None => line,
+            };
+            if let Some(step) = steps.last_mut() {
+                let value = |key: &str| field.strip_prefix(key).map(|v| v.trim().to_string());
+                if let Some(dir) = value("working-directory:") {
+                    step.working_directory = Some(dir);
+                } else if let Some(run) = value("run:") {
+                    step.run = Some(run);
+                } else if let Some(id) = value("id:") {
+                    step.id = Some(id);
+                } else if let Some(condition) = value("if:") {
+                    step.condition = Some(condition);
+                } else if value("continue-on-error:").as_deref() == Some("true") {
+                    step.tolerated = true;
+                }
+            }
+            steps
+        })
+}
+
+/// What is wrong with the web job's kept steps, one entry per fault:
+/// the `recipe` step missing, guarded, tolerated or after a kept step,
+/// and each kept step that is absent from its own directory or not
+/// guarded by exactly [`ON_A_NEW_RECIPE`] (with a failure that counts).
+fn kept_web_steps_off_the_recipe(ci: &str) -> Vec<String> {
+    let steps = job_steps(ci, "web");
+    let recipe = steps.iter().position(|s| s.id.as_deref() == Some("recipe"));
+    let recipe_faults = match recipe.map(|at| (at, &steps[at])) {
+        None => vec!["no step with `id: recipe`".to_string()],
+        Some((_, s)) if s.condition.is_some() || s.tolerated => {
+            vec!["the recipe step is itself conditional or failure-tolerant".to_string()]
+        }
+        Some(_) => Vec::new(),
+    };
+    let kept_faults = KEPT_WEB_STEPS.iter().filter_map(|(dir, run)| {
+        let found = steps.iter().enumerate().find(|(_, s)| {
+            s.working_directory.as_deref() == Some(*dir) && s.run.as_deref() == Some(*run)
+        });
+        match found {
+            None => Some(format!("{dir}: {run} is gone")),
+            Some((_, s)) if s.condition.as_deref() != Some(ON_A_NEW_RECIPE) || s.tolerated => {
+                Some(format!(
+                    "{dir}: {run} runs on `{}`{}",
+                    s.condition.as_deref().unwrap_or("every train"),
+                    if s.tolerated {
+                        ", failure tolerated"
+                    } else {
+                        ""
+                    }
+                ))
+            }
+            Some((at, _)) if recipe.is_some_and(|r| r > at) => {
+                Some(format!("{dir}: {run} runs before the recipe step answers"))
+            }
+            Some(_) => None,
+        }
+    });
+    recipe_faults.into_iter().chain(kept_faults).collect()
+}
+
+/// Whether gate.sh's `check "svelte-check"` runs on every tree: written
+/// at column 0, outside every `if … fi`, and not the tail of a command
+/// continued from the line above (`&&`, `||`, `|`, `\`).
+///
+/// The `if`/`fi` depth is counted over the whole script, skipping
+/// comments and heredoc bodies, and must come back to zero at the end:
+/// a count that does not balance is a script this reader cannot follow,
+/// and it says so rather than answering (a pin that guesses is how this
+/// one first passed a wrapped check).
+fn svelte_check_runs_at_top_level(gate: &str) -> Result<(), String> {
+    fn starts_with_word(text: &str, word: &str) -> bool {
+        text.strip_prefix(word)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', ';', ')', '|', '>', '&']))
+    }
+    fn heredoc_tag(line: &str) -> Option<String> {
+        let at = line.find("<<")?;
+        let rest = &line[at + 2..];
+        if rest.starts_with('<') {
+            return None; // a here-string, `<<<`, has no body
+        }
+        let tag: String = rest
+            .trim_start_matches('-')
+            .trim_start()
+            .trim_start_matches(['\'', '"'])
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        (!tag.is_empty()).then_some(tag)
+    }
+    struct Walk {
+        depth: i64,
+        heredoc: Option<String>,
+        continued: bool,
+        found: Option<(usize, i64, bool)>,
+    }
+    let walk = gate.lines().enumerate().try_fold(
+        Walk {
+            depth: 0,
+            heredoc: None,
+            continued: false,
+            found: None,
+        },
+        |mut w, (n, line)| {
+            if let Some(tag) = &w.heredoc {
+                if line.trim() == tag {
+                    w.heredoc = None;
+                }
+                return Ok(w);
+            }
+            let code = line.trim();
+            if code.is_empty() || code.starts_with('#') {
+                return Ok(w);
+            }
+            if line.starts_with("check \"svelte-check\"") {
+                w.found = Some((n + 1, w.depth, w.continued));
+            }
+            // A shell `if` opens; awk's `if (` inside a quoted program does
+            // not (gate.sh carries ten). A `fi` token closes wherever it
+            // sits: alone, after `else …;`, or ending a one-line `if`.
+            let opens = starts_with_word(code, "if") && !code.starts_with("if (");
+            let closes = code
+                .split([' ', '\t', ';'])
+                .any(|token| token == "fi" || token == "fi)");
+            w.depth += i64::from(opens) - i64::from(closes);
+            if w.depth < 0 {
+                return Err(format!("a `fi` at line {} closes no `if`", n + 1));
+            }
+            w.heredoc = heredoc_tag(code);
+            w.continued = ["&&", "||", "|", "\\"].iter().any(|c| code.ends_with(c));
+            Ok(w)
+        },
+    )?;
+    if walk.depth != 0 {
+        return Err(format!(
+            "its if/fi do not balance (depth {} at the end), so where the check sits cannot be read",
+            walk.depth
+        ));
+    }
+    match walk.found {
+        None => Err("no line starts with `check \"svelte-check\"`".into()),
+        Some((n, depth, _)) if depth > 0 => Err(format!("line {n} sits inside {depth} if/fi")),
+        Some((n, _, true)) => Err(format!("line {n} continues a command from the line above")),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Every line of the workflow that runs svelte-check, in any spelling:
+/// the tool by name (`bunx svelte-check`, `bun x svelte-check`), or a
+/// `run <script>` of any apps/web package.json script that reaches it —
+/// `typecheck` directly, `gate` through `bun run typecheck`. Comment
+/// lines are prose, not invocations.
+fn typecheck_invocations(ci: &str, web_package: &str) -> Vec<String> {
+    let package: serde_json::Value =
+        serde_json::from_str(web_package).expect("apps/web/package.json is JSON");
+    let scripts: Vec<(String, String)> = package["scripts"]
+        .as_object()
+        .expect("apps/web/package.json has scripts")
+        .iter()
+        .map(|(name, cmd)| (name.clone(), cmd.as_str().unwrap_or_default().to_string()))
+        .collect();
+    let runs = |cmd: &str, name: &str| {
+        cmd.match_indices(&format!("run {name}")).any(|(at, m)| {
+            let before = cmd[..at].chars().next_back();
+            let after = cmd[at + m.len()..].chars().next();
+            before.is_none_or(char::is_whitespace)
+                && after.is_none_or(|c| !(c.is_ascii_alphanumeric() || ":-_".contains(c)))
+        })
+    };
+    // The scripts that reach svelte-check, to a fixed point: a script
+    // that runs one of them reaches it too.
+    let mut reach: Vec<String> = Vec::new();
+    loop {
+        let more: Vec<String> = scripts
+            .iter()
+            .filter(|(name, cmd)| {
+                !reach.contains(name)
+                    && (cmd.contains("svelte-check") || reach.iter().any(|r| runs(cmd, r)))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        reach.extend(more);
+    }
+    ci.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter(|l| l.contains("svelte-check") || reach.iter().any(|r| runs(l, r)))
+        .map(|l| l.trim().to_string())
+        .collect()
+}
+
+/// The three mutations review run 57a5c8d6 made to the real files, each
+/// of which the first version of the pin above let through (backlog
+/// 25a20d02), plus the guard a kept step could hide behind. Each one
+/// must be refused, and the real files must not be — a mutation that no
+/// longer applies to the file fails here by name rather than passing.
+#[test]
+fn the_forge_web_job_pin_refuses_what_its_review_measured() {
+    let ci = forge_workflow();
+    let gate = read("infra/gate.sh");
+    let web_package = read("apps/web/package.json");
+    let mutate = |text: &str, from: &str, to: &str| {
         assert!(
-            ci.contains(kept),
-            ".forgejo/workflows/ci.yml lost `{kept}` — the train's --auto gate skips the web \
-             phase on a train that touches no web path, so the forge's run is the only one"
+            text.contains(from),
+            "the mutation's anchor is gone from the file — update the mutation: {from:?}"
+        );
+        text.replacen(from, to, 1)
+    };
+
+    assert_eq!(svelte_check_runs_at_top_level(&gate), Ok(()));
+    assert_eq!(
+        typecheck_invocations(&ci, &web_package),
+        Vec::<String>::new()
+    );
+    assert_eq!(kept_web_steps_off_the_recipe(&ci), Vec::<String>::new());
+
+    let guard = format!("        if: {ON_A_NEW_RECIPE}\n");
+    let unit = format!(
+        "      - name: Unit tests\n{guard}        working-directory: apps/web\n        run: bun run test:unit\n"
+    );
+    assert_eq!(
+        kept_web_steps_off_the_recipe(&mutate(&ci, &unit, "")),
+        vec!["apps/web: bun run test:unit is gone".to_string()],
+        "deleting apps/web's Unit tests step must be seen although web-kit's step runs the same command"
+    );
+
+    // The recipe guard is the ONLY condition a kept step may carry: an
+    // `if: false` never runs it, and no guard runs it on every train.
+    let build = "      - name: Build\n";
+    let guarded_build = format!("{build}{guard}");
+    for (to, says) in [
+        (format!("{build}        if: false\n"), "runs on `false`"),
+        (build.to_string(), "runs on `every train`"),
+        (
+            format!("{guarded_build}        continue-on-error: true\n"),
+            "failure tolerated",
+        ),
+    ] {
+        let off = kept_web_steps_off_the_recipe(&mutate(&ci, &guarded_build, &to));
+        assert!(
+            off.len() == 1
+                && off[0].starts_with("apps/web: bun run build")
+                && off[0].contains(says),
+            "a kept step whose guard is {to:?} must be refused for it: {off:?}"
+        );
+    }
+
+    // The recipe step answers first, and answers unconditionally.
+    let recipe = "        id: recipe\n";
+    assert_eq!(
+        kept_web_steps_off_the_recipe(&mutate(&ci, recipe, "        id: other\n")),
+        vec!["no step with `id: recipe`".to_string()]
+    );
+    assert_eq!(
+        kept_web_steps_off_the_recipe(&mutate(
+            &ci,
+            recipe,
+            &format!("{recipe}        if: false\n")
+        )),
+        vec!["the recipe step is itself conditional or failure-tolerant".to_string()]
+    );
+
+    let line = gate
+        .lines()
+        .find(|l| l.starts_with("check \"svelte-check\""))
+        .expect("gate.sh carries the svelte-check line");
+    let wrapped = mutate(
+        &gate,
+        line,
+        &format!("if [ \"$AUTO\" -eq 0 ]; then\n{line}\nfi"),
+    );
+    // Refused for its own reason, not because the walk lost count.
+    let refusal = |script: &str| {
+        svelte_check_runs_at_top_level(script)
+            .err()
+            .unwrap_or_default()
+    };
+    assert!(
+        refusal(&wrapped).contains("sits inside 1 if/fi"),
+        "svelte-check wrapped in an if/fi must not read as unconditional: {:?}",
+        refusal(&wrapped)
+    );
+    let chained = mutate(&gate, line, &format!("[ \"$AUTO\" -eq 0 ] &&\n{line}"));
+    assert!(
+        refusal(&chained).contains("continues a command"),
+        "svelte-check behind a continued && must not read as unconditional: {:?}",
+        refusal(&chained)
+    );
+
+    for spelling in [
+        "bunx svelte-check --tsconfig ./tsconfig.json",
+        "bun run typecheck",
+        "bun run gate",
+    ] {
+        let step = format!(
+            "      - name: Typecheck\n        working-directory: apps/web\n        run: {spelling}\n{build}"
+        );
+        assert_eq!(
+            typecheck_invocations(&mutate(&ci, build, &step), &web_package).len(),
+            1,
+            "a CI step running `{spelling}` re-runs the gate's svelte-check"
         );
     }
 }
@@ -626,8 +1015,8 @@ fn the_gate_rechecks_headroom_as_the_run_proceeds() {
              n=$(cat {c} 2>/dev/null || echo 0)\n\
              echo $((n+1)) > {c}\n\
              echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
-             if [ \"$n\" -eq 0 ]; then echo '/dev/fake 1 1 943718400 1% /'; \
-             else echo '/dev/fake 1 1 1048576 99% /'; fi\n",
+             for _ in \"$@\"; do if [ \"$n\" -eq 0 ]; then echo '/dev/fake 1 1 943718400 1% /'; \
+             else echo '/dev/fake 1 1 1048576 99% /'; fi; done\n",
             c = counter.display()
         ),
     );
@@ -1038,8 +1427,8 @@ fn the_receipt_times_every_check() {
              n=$(cat {c} 2>/dev/null || echo 0)\n\
              echo $((n+1)) > {c}\n\
              echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
-             if [ \"$n\" -lt 2 ]; then echo '/dev/fake 1 1 943718400 1% /'; \
-             else echo '/dev/fake 1 1 1048576 99% /'; fi\n",
+             for _ in \"$@\"; do if [ \"$n\" -lt 2 ]; then echo '/dev/fake 1 1 943718400 1% /'; \
+             else echo '/dev/fake 1 1 1048576 99% /'; fi; done\n",
             c = counter.display()
         ),
     );
@@ -1133,9 +1522,26 @@ fn auto_scope_of(label: &str, touch: &[&str]) -> (String, serde_json::Value) {
         ],
         &dir,
     );
-    // mode-bits-ok: run below as bash <path>, which opens it read-only
-    std::fs::copy(root.join("infra/gate.sh"), tree.join("infra/gate.sh"))
-        .expect("carry this tree's gate.sh into the scratch clone");
+    // Carry the script and all inputs to its target reader: a shared clone
+    // otherwise pairs the working reader with pre-repair membership.
+    for rel in [
+        "infra/gate.sh",
+        "infra/gate-runner/test-targets.py",
+        "crates/core/boss-testing/Cargo.toml",
+    ] {
+        // mode-bits-ok: interpreters below open these files read-only
+        std::fs::copy(root.join(rel), tree.join(rel))
+            .expect("carry this tree's gate and target reader into the scratch clone");
+    }
+    let groups = "crates/core/boss-testing/tests/groups";
+    for entry in std::fs::read_dir(root.join(groups)).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().extension().is_some_and(|ext| ext == "rs") {
+            // mode-bits-ok: Rust and the reader open these declarations read-only
+            std::fs::copy(entry.path(), tree.join(groups).join(entry.file_name()))
+                .expect("carry actual group membership into the scratch clone");
+        }
+    }
     git(
         &[
             "-c",
@@ -1170,8 +1576,8 @@ fn auto_scope_of(label: &str, touch: &[&str]) -> (String, serde_json::Value) {
              n=$(cat {c} 2>/dev/null || echo 0)\n\
              echo $((n+1)) > {c}\n\
              echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
-             if [ \"$n\" -lt 1 ]; then echo '/dev/fake 1 1 943718400 1% /'; \
-             else echo '/dev/fake 1 1 1048576 99% /'; fi\n",
+             for _ in \"$@\"; do if [ \"$n\" -lt 1 ]; then echo '/dev/fake 1 1 943718400 1% /'; \
+             else echo '/dev/fake 1 1 1048576 99% /'; fi; done\n",
             c = counter.display()
         ),
     );
@@ -1193,9 +1599,20 @@ fn auto_scope_of(label: &str, touch: &[&str]) -> (String, serde_json::Value) {
             "the refusal at the first phase must still write a receipt ({e}).\nstdout: {stdout}\nstderr: {stderr}"
         )
     });
-    let _ = std::fs::remove_dir_all(&dir);
     let parsed: serde_json::Value = serde_json::from_str(&body)
         .unwrap_or_else(|e| panic!("receipt is not JSON ({e}): {body}\nstderr: {stderr}"));
+    if let Some(path) = parsed["evidence"]["integration packaging"].as_str() {
+        let kept = std::fs::read_to_string(path).expect("reader evidence retained before cleanup");
+        assert!(
+            !kept.is_empty() && stderr.contains(&kept),
+            "the complete reader stderr must remain in both evidence and the runner log"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !stderr.contains("Traceback (most recent call last)"),
+        "membership refusal must be named without an interpreter traceback: {stderr}"
+    );
     (stdout, parsed)
 }
 
@@ -1431,6 +1848,145 @@ fn a_platform_bundle_edit_scopes_the_crate_whose_pins_hold_it_to_the_migrations(
     }
 }
 
+/// THE PACKET (backlog 736f1bab). On 2026-11-08 train 22:32 changed the
+/// backlog-item row's build executor and gated green on a scope of
+/// 'boss-jobs boss-testing'; boss-dispatcher's
+/// `dispatcher::model_class_tests` reads that row through
+/// `boss_jobs::registry::platform_bundle_path()` and asserted the old
+/// executor, so main's full gate (acd9b76e) went red and every full car
+/// gate failed for ~1.6 h. The row's file is named by no literal the
+/// file-input index counts: the helper is a `concat!` of a DIRECTORY.
+/// So a row-only car must scope every crate that reads the row's
+/// directory — boss-dispatcher by name, and the bundle's other readers
+/// (the wrapper `seedable_platform_workflows()` reaches boss-dispatcher-
+/// handlers and boss-cli) — and the derivation must answer the same on
+/// a second run, because a scope that depends on the order `find` walks
+/// the tree is not a scope a receipt can vouch for.
+#[test]
+fn a_protocol_row_edit_scopes_every_crate_that_reads_the_registry_row() {
+    let row = "infra/platform/workflows/backlog-item.toml";
+    let (stdout, receipt) = auto_scope_of("gate-scope-registry-row", &[row]);
+    let scope = scope_of(&receipt);
+    for must in [
+        "boss-dispatcher",
+        "boss-dispatcher-handlers",
+        "boss-cli",
+        "boss-jobs",
+    ] {
+        assert!(
+            scope.iter().any(|c| c == must),
+            "a car that only edits {row} must scope {must} — it reads the platform bundle \
+             (through platform_bundle_path() or a wrapper over it), and a row-only train \
+             gated without boss-dispatcher landed main red for 1.6 h (backlog 736f1bab).\n\
+             scope: {scope:?}\nstdout: {stdout}"
+        );
+    }
+    let (_, again) = auto_scope_of("gate-scope-registry-row-again", &[row]);
+    assert_eq!(
+        scope,
+        scope_of(&again),
+        "the registry readers are derived from the tree, so the same change must derive \
+         the same scope twice"
+    );
+}
+
+/// The other half of 736f1bab's pin: the widening is keyed on the
+/// registry tree, so a docs-only car still derives no crate at all and
+/// gates lints + fmt — the widening costs nothing a change does not read.
+#[test]
+fn a_docs_only_change_derives_no_registry_reader() {
+    let doc = "docs/design/zz-a-scratch-design-reads-no-registry.md";
+    let (stdout, receipt) = auto_scope_of("gate-scope-docs-only", &[doc]);
+    assert!(
+        scope_of(&receipt).is_empty(),
+        "a docs-only car must scope no crate.\nstdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("nothing changed implies a crate"),
+        "a docs-only car must say it fell to lints + fmt.\nstdout: {stdout}"
+    );
+    assert_eq!(
+        receipt["data_only"],
+        serde_json::Value::Bool(false),
+        "a docs page is not registry data, so it never takes the data lane.\nstdout: {stdout}"
+    );
+}
+
+/// A READER THE COMPILER IS (backlog a0d18d46). boss-jobs' build.rs
+/// lists `infra/ops/verbs/` and `include_str!`s every verb into
+/// `VERB_FILES`, and `ops_verbs.rs` judges each one — yet the verb
+/// directory sat outside the registry scan (it read `infra/platform`
+/// only) and the file-input index counts a literal naming a FILE, so a
+/// car editing a verb no test names by file derived NO crate and gated
+/// lints-only: a malformed verb was green on its car and red on main.
+/// `agent-image-status.json` is such a verb, measured on 0291b4122. A
+/// data lane that skips the compile checks is only as safe as the reader
+/// set it keeps, so this is the reader it must never lose.
+#[test]
+fn a_verb_edit_scopes_the_crate_that_compiles_every_verb_in() {
+    let verb = "infra/ops/verbs/agent-image-status.json";
+    let (stdout, receipt) = auto_scope_of("gate-scope-verb-compiled-in", &[verb]);
+    let scope = scope_of(&receipt);
+    assert!(
+        scope.iter().any(|c| c == "boss-jobs"),
+        "a car that only edits {verb} must scope boss-jobs: its build.rs compiles every \
+         verb in and ops_verbs.rs judges each one, so skipping it gates a malformed verb \
+         green.\nscope: {scope:?}\nstdout: {stdout}"
+    );
+}
+
+/// THE DATA LANE (backlog a0d18d46, David 2026-10-31: "fewer changes
+/// requiring compiling"). A change whose every path is registry data —
+/// a protocol row, a station, a dispatcher rule, an ops verb — moves no
+/// Rust source, so the workspace clippy and the default-feature build
+/// can only repeat the base's verdict; the lane skips those two and says
+/// so on the receipt (`data_only`). What it must NOT skip is any reader:
+/// the derived scope still runs whole, and its `test build` compiles the
+/// build scripts and `include_str!`s that read the data. So the lane is
+/// held to two things here — it engages on a row-only change WITH every
+/// reader the row has (the crates 736f1bab named), and a change that
+/// also moves a .rs file never takes it.
+#[test]
+fn a_registry_only_change_skips_the_compile_checks_and_keeps_every_reader() {
+    let row = "infra/platform/workflows/backlog-item.toml";
+    let (stdout, receipt) = auto_scope_of("gate-scope-data-lane", &[row]);
+    assert_eq!(
+        receipt["data_only"],
+        serde_json::Value::Bool(true),
+        "a row-only car must take the data lane and record it.\nstdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("gate: --auto data only"),
+        "the gate must say why clippy and the build did not run.\nstdout: {stdout}"
+    );
+    let scope = scope_of(&receipt);
+    for must in [
+        "boss-dispatcher",
+        "boss-dispatcher-handlers",
+        "boss-cli",
+        "boss-jobs",
+    ] {
+        assert!(
+            scope.iter().any(|c| c == must),
+            "the data lane must keep {must}, a reader of {row}: it skips the compile \
+             checks, never a reader.\nscope: {scope:?}\nstdout: {stdout}"
+        );
+    }
+
+    let code = "crates/core/boss-jobs/src/lib.rs";
+    let (mixed_out, mixed) = auto_scope_of("gate-scope-data-lane-mixed", &[row, code]);
+    assert_eq!(
+        mixed["data_only"],
+        serde_json::Value::Bool(false),
+        "a change that also edits {code} moves Rust, so it must run clippy and the \
+         build.\nstdout: {mixed_out}"
+    );
+    assert!(
+        !mixed_out.contains("gate: --auto data only"),
+        "a mixed change must not announce the data lane.\nstdout: {mixed_out}"
+    );
+}
+
 /// THE PACKET (backlog 1b52c278). Train #470's car 4f1ba1f9 edited
 /// `docs/tenant-contract.md` (one sentence on the tenant.toml row)
 /// without touching `CONTRACT` in boss-cli's tenant.rs. The equality pin
@@ -1504,15 +2060,14 @@ fn a_document_read_only_by_tree_wide_pins_does_not_select_the_whole_crate() {
         !scope_of(&receipt).iter().any(|c| c == "boss-testing"),
         "tree-wide document readers must remain checked without selecting all boss-testing: {stdout}"
     );
+    let marker = tree_wide_file_marker();
     for pin in [
         "the_vsm_mapping_outlives_its_code",
         "a_retired_crate_is_superseded_not_dead",
     ] {
         let source = read(&format!("crates/core/boss-testing/tests/{pin}.rs"));
         assert!(
-            source
-                .lines()
-                .any(|line| line.starts_with("//! tree-wide pin —")),
+            source.lines().any(|line| marker.is_match(line)),
             "{pin} must remain an actual declared tree-wide target"
         );
     }
@@ -1653,7 +2208,8 @@ fn a_web_only_car_still_runs_the_tree_wide_pins() {
 fn a_car_scoped_to_the_pins_crate_does_not_run_them_twice() {
     let (stdout, receipt) = auto_scope_of(
         "gate-auto-tree-wide-pins-in-scope",
-        &["crates/core/boss-testing/tests/zz_a_scratch_pin.rs"],
+        // This is a declared target even when automatic discovery is disabled.
+        &["crates/core/boss-testing/tests/gate_sh.rs"],
     );
     assert!(
         scope_of(&receipt).iter().any(|c| c == "boss-testing"),
@@ -1665,6 +2221,35 @@ fn a_car_scoped_to_the_pins_crate_does_not_run_them_twice() {
             "boss-testing is in scope, so its pins ride its own test run: {line}"
         );
     }
+}
+
+#[test]
+fn an_unowned_integration_source_refuses_with_a_receipt() {
+    let (_, receipt) = auto_scope_of(
+        "gate-auto-unowned-integration-source",
+        &[
+            "crates/core/boss-testing/tests/zz_a_scratch_pin.rs",
+            "crates/core/boss-testing/tests/zz_a_\"quoted\"_scratch.rs",
+        ],
+    );
+    assert_eq!(receipt["verdict"], "refused");
+    let reason = receipt["refused_because"].as_str().unwrap();
+    assert!(reason.starts_with("unread integration packaging"));
+    assert!(
+        reason.contains("reader exit 1"),
+        "reader status lost: {reason}"
+    );
+    assert!(
+        reason.contains("integration source coverage differs")
+            && reason.contains("zz_a_scratch_pin"),
+        "the receipt must retain the actual reader diagnostic: {reason}"
+    );
+    assert!(
+        reason.contains("\"quoted\""),
+        "diagnostic quoting lost: {reason}"
+    );
+    assert!(receipt["evidence"]["integration packaging"].is_string());
+    assert_eq!(receipt["checks"].as_array().unwrap().len(), 0);
 }
 
 /// The gateway's two route-coverage pins, by name. Read off the source's
@@ -1886,6 +2471,32 @@ fn a_web_only_car_runs_the_dispatcher_cascade_pin() {
     );
 }
 
+/// …and so does the brief's reading of CLAUDE.md (review e207853d,
+/// 2026-10-20). boss-cli renders every builder brief's pre-flight
+/// invariant from CLAUDE.md's `Before pushing` entry and refuses to
+/// render ANY lane's brief when that entry records no measurement. A
+/// CLAUDE.md-only car selects no crate — the name has no slash for the
+/// file-input index and no shape line maps it — so the docs edit that
+/// re-words the measurement gated green and would have stopped dispatch.
+#[test]
+fn a_claude_md_only_car_runs_the_briefs_reading_of_it() {
+    let (stdout, receipt) = auto_scope_of("gate-auto-tree-wide-claude-md", &["CLAUDE.md"]);
+    assert!(
+        !scope_of(&receipt).iter().any(|c| c == "boss-cli"),
+        "the fixture is a CLAUDE.md-only car, whose derived scope must NOT already hold \
+         boss-cli — else this proves nothing.\nstdout: {stdout}"
+    );
+    let line = tree_wide_line(&stdout).unwrap_or_else(|| {
+        panic!(
+            "a CLAUDE.md-only --auto gate must name the tree-wide pins it runs.\nstdout: {stdout}"
+        )
+    });
+    assert!(
+        line.contains("the_preflight_cost_is_the_measurement_the_doors_entry_records"),
+        "the brief's reading of CLAUDE.md must run on every scoped gate: {line}"
+    );
+}
+
 /// A single test named as a cargo FILTER can match nothing — a test
 /// renamed, a module moved from the binary to the library — and a
 /// filtered run that matched nothing is a green run that tested nothing.
@@ -2013,7 +2624,7 @@ impl LevelTree {
             &t.dir.join("df"),
             "#!/usr/bin/env bash\n\
              echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
-             echo '/dev/fake 1 1 943718400 1% /'\n",
+             for _ in \"$@\"; do echo '/dev/fake 1 1 943718400 1% /'; done\n",
         );
         t
     }
@@ -2090,6 +2701,9 @@ impl LevelTree {
             // 3e63662c), under which the lint reads no level; every case
             // here is about the level it reads.
             .env_remove("BOSS_ESTATE")
+            // And BOSS_TRUNK=none (backlog 2d28df78), refused beside the
+            // BOSS_TRUNK_REF above.
+            .env_remove("BOSS_TRUNK")
             .output()
             .expect("run gate.sh --quick")
     }
@@ -2567,7 +3181,7 @@ impl RosterTree {
             &dir.join("df"),
             "#!/usr/bin/env bash\n\
              echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
-             echo '/dev/fake 1 1 943718400 1% /'\n",
+             for _ in \"$@\"; do echo '/dev/fake 1 1 943718400 1% /'; done\n",
         );
         boss_testing::create_dir(&dir.join("shared"));
         for args in [
@@ -2813,7 +3427,7 @@ fn a_nested_gate_leaves_the_outer_test_summary_and_claims_only_its_own_run() {
              avail=943718400\n\
              [ \"$n\" -eq 0 ] || avail=1024\n\
              echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
-             echo \"/dev/fake 1 1 $avail 1% /\"\n",
+             for _ in \"$@\"; do echo \"/dev/fake 1 1 $avail 1% /\"; done\n",
             calls = calls.display()
         ),
     );
@@ -3152,7 +3766,7 @@ fn the_live_registry_comparisons_are_out_of_the_gate_and_say_why() {
     let tree_half = "crates/core/boss-testing/tests/a_lint_that_reads_the_api_waits_out_a_roll.rs";
     let text = read(tree_half);
     assert!(
-        text.lines().any(|l| l.starts_with("//! tree-wide pin")),
+        text.lines().any(|l| tree_wide_file_marker().is_match(l)),
         "{tree_half} is no longer a tree-wide pin, so a scoped gate may skip it — and with \
          both live comparisons out of the roster, nothing else runs their tree halves on \
          every gate"
@@ -3162,5 +3776,445 @@ fn the_live_registry_comparisons_are_out_of_the_gate_and_say_why() {
             text.contains(lint),
             "{tree_half} no longer runs {lint}, so its tree half and self-test run on no gate"
         );
+    }
+}
+
+// ---- `--lint` scopes clippy from the whole car (backlog d472aeaf) ----
+//
+// MEASURED 2026-11-05 on car 7aef2405 (run 6543fe4e, worker exec
+// 50b5e521): `--lint` printed "no crate implied by the tree — skipping
+// clippy" on a branch whose commits changed boss-jobs, boss-cli and
+// boss-dispatcher-handlers. The same run's closing note named the one
+// file that hid them: `M Cargo.lock`, which an earlier `wt-cargo test`
+// had re-resolved in the worker and nobody committed. `changed_paths`
+// answered with the FIRST non-empty of staged, dirty and the branch's
+// commits, so one dirty file that maps to no crate stood in for the
+// whole car. The later run on the commit that locked the dependency
+// had a clean tree, fell through to the commits, and ran clippy.
+
+/// The lint the roster refuses to run without; the synthetic tree's
+/// only lint.
+const CAR_SCOPE_LINT: &str = "infra/lint/workspace-declares-what-it-runs.sh";
+
+/// A synthetic repository: `main` holds this tree's gate, one lint, a
+/// tracked `Cargo.lock` and one crate, `boss-a`; the `car` branch
+/// commits one change to that crate. `cargo` records its argv, so the
+/// test reads whether clippy ran rather than what was printed about it.
+struct CarScopeTree {
+    dir: std::path::PathBuf,
+    tree: std::path::PathBuf,
+}
+
+impl CarScopeTree {
+    fn new(tag: &str) -> CarScopeTree {
+        let dir = boss_testing::scratch_dir(&format!("preflight-car-scope-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tree = dir.join("tree");
+        boss_testing::copy_lint_libs(&tree);
+        boss_testing::copy_gate_sh(&tree);
+        for (rel, body) in [
+            (CAR_SCOPE_LINT, "#!/usr/bin/env bash\nexit 0\n"),
+            (".gitignore", "scratch/\n"),
+            ("Cargo.lock", "# the lock main carries\n"),
+            (
+                "crates/core/boss-a/Cargo.toml",
+                "[package]\nname = \"boss-a\"\nversion = \"0.0.0\"\n",
+            ),
+            ("crates/core/boss-a/src/lib.rs", "// a\n"),
+        ] {
+            let to = tree.join(rel);
+            boss_testing::create_dir(to.parent().expect("a relative path has a parent"));
+            boss_testing::write_file(&to, body);
+        }
+        let t = CarScopeTree { dir, tree };
+        t.vcs(&["init", "-q", "-b", "main"]);
+        t.vcs(&["add", "."]);
+        t.commit("the tree");
+        t.vcs(&["checkout", "-q", "-b", "car"]);
+        boss_testing::write_file(
+            &t.tree.join("crates/core/boss-a/src/lib.rs"),
+            "// a\npub fn added() {}\n",
+        );
+        t.vcs(&["add", "."]);
+        t.commit("the car changes boss-a");
+        let bin = t.dir.join("bin");
+        boss_testing::create_dir(&bin);
+        boss_testing::write_exec(
+            &bin.join("cargo"),
+            &format!(
+                "#!/usr/bin/env bash\necho \"$*\" >> '{}'\nexit 0\n",
+                t.dir.join("cargo.log").display()
+            ),
+        );
+        boss_testing::write_exec(
+            &t.dir.join("df"),
+            "#!/usr/bin/env bash\n\
+             echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
+             for _ in \"$@\"; do echo '/dev/fake 1 1 943718400 1% /'; done\n",
+        );
+        t
+    }
+
+    fn vcs(&self, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&self.tree)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn commit(&self, msg: &str) {
+        self.vcs(&[
+            "-c",
+            "user.email=car-scope@test",
+            "-c",
+            "user.name=car-scope",
+            "commit",
+            "-q",
+            "-m",
+            msg,
+        ]);
+    }
+
+    /// The 7aef2405 shape: a tracked file that maps to no crate,
+    /// modified after the car's commits and never committed.
+    fn relock(&self) {
+        boss_testing::write_file(
+            &self.tree.join("Cargo.lock"),
+            "# the lock main carries\n# the dependency a wt-cargo run resolved\n",
+        );
+    }
+
+    /// `infra/gate.sh --lint` with `trunk` as the base the car is
+    /// measured from; the lints' own trunk stays `main`.
+    fn lint(&self, trunk: &str) -> (std::process::Output, String) {
+        self.lint_with(trunk, |_| {})
+    }
+
+    /// `lint`, with `env` adjusting the command before it runs.
+    fn lint_with(
+        &self,
+        trunk: &str,
+        env: impl Fn(&mut std::process::Command),
+    ) -> (std::process::Output, String) {
+        let path = std::env::var("PATH").unwrap_or_default();
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(self.tree.join("infra/gate.sh"))
+            .arg("--lint")
+            .current_dir(&self.tree)
+            .env("PATH", format!("{}:{path}", self.dir.join("bin").display()))
+            .env("BOSS_GATE_DF_CMD", self.dir.join("df"))
+            .env("BOSS_GATE_MIN_FREE_GB", "12")
+            .env("BOSS_GATE_RECEIPT", nested_receipt())
+            .env("BOSS_GATE_TRUNK", trunk)
+            .env("BOSS_TRUNK_REF", "main")
+            .env("GIT_CEILING_DIRECTORIES", "");
+        // Last, so a caller can override a default (the receipt path).
+        env(&mut cmd);
+        let out = cmd.output().expect("run gate.sh --lint");
+        let log = std::fs::read_to_string(self.dir.join("cargo.log")).unwrap_or_default();
+        (out, log)
+    }
+}
+
+impl Drop for CarScopeTree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn ran_workspace_clippy(cargo_log: &str) -> bool {
+    cargo_log
+        .lines()
+        .any(|l| l.starts_with("clippy --workspace"))
+}
+
+/// THE DEFECT, in the shape it had: the car's commits change a crate
+/// and the tree also holds an uncommitted edit to a file that maps to
+/// no crate — modified, then the same edit staged. Clippy must run, and
+/// the scope it names must be the car's crate.
+#[test]
+fn a_lint_preflight_runs_clippy_for_a_car_beside_an_uncommitted_edit() {
+    for staged in [false, true] {
+        let tag = if staged { "staged" } else { "modified" };
+        let tree = CarScopeTree::new(&format!("beside-{tag}"));
+        tree.relock();
+        if staged {
+            tree.vcs(&["add", "Cargo.lock"]);
+        }
+        let (out, log) = tree.lint("main");
+        let t = both(&out);
+        assert!(
+            ran_workspace_clippy(&log),
+            "[{tag}] the car's commits change boss-a, so --lint must run workspace clippy \
+             whatever else the tree holds; an uncommitted Cargo.lock hid the whole car on \
+             7aef2405 (backlog d472aeaf). cargo was asked:\n{log}\n{t}"
+        );
+        assert!(
+            t.contains("workspace clippy, including dependents of boss-a"),
+            "[{tag}] the scope names the car's crate:\n{t}"
+        );
+        assert!(!t.contains("no crate implied"), "[{tag}] {t}");
+        assert_eq!(out.status.code(), Some(0), "[{tag}] {t}");
+    }
+}
+
+/// THE CONTROLS. The same car on a clean tree runs clippy — the shape
+/// that already worked, so the fixture is one that CAN run it — and
+/// `main` itself, which adds nothing over the trunk, still skips it:
+/// the fix scopes from the whole car, it does not run clippy always.
+#[test]
+fn a_lint_preflight_scopes_a_clean_car_and_skips_a_tree_that_adds_nothing() {
+    let tree = CarScopeTree::new("controls");
+    let (out, log) = tree.lint("main");
+    let t = both(&out);
+    assert!(ran_workspace_clippy(&log), "a clean car:\n{log}\n{t}");
+    assert_eq!(out.status.code(), Some(0), "{t}");
+
+    tree.vcs(&["checkout", "-q", "main"]);
+    let _ = std::fs::remove_file(tree.dir.join("cargo.log"));
+    let (out, log) = tree.lint("main");
+    let t = both(&out);
+    assert!(
+        !ran_workspace_clippy(&log),
+        "a tree that adds nothing over the trunk has nothing to compile:\n{log}\n{t}"
+    );
+    assert!(t.contains("no crate implied by the tree"), "{t}");
+    assert_eq!(out.status.code(), Some(0), "{t}");
+}
+
+/// NO BASE IS NOT "NO CHANGE". When the trunk cannot be resolved to a
+/// merge-base with HEAD, the car's commits are unknowable, and an empty
+/// map is not evidence that nothing compiles: --lint runs workspace
+/// clippy and names the ref it could not use.
+#[test]
+fn a_lint_preflight_that_cannot_find_its_base_runs_clippy_and_says_so() {
+    let tree = CarScopeTree::new("no-base");
+    let (out, log) = tree.lint("refs/heads/no-such-trunk");
+    let t = both(&out);
+    assert!(
+        ran_workspace_clippy(&log),
+        "an unresolvable base must run clippy, not skip it:\n{log}\n{t}"
+    );
+    assert!(
+        t.contains("refs/heads/no-such-trunk") && t.contains("cannot find"),
+        "the pre-flight names the base it could not resolve:\n{t}"
+    );
+    assert!(!t.contains("no crate implied"), "{t}");
+    assert_eq!(out.status.code(), Some(0), "{t}");
+}
+
+/// A PATH GIT QUOTES IS STILL A PATH (backlog d472aeaf, review 93d22fbe
+/// R1). Under git's default `core.quotePath=true` a name-only read
+/// spells `crates/core/boss-a/src/café.rs` as
+/// `"crates/core/boss-a/src/caf\303\251.rs"`, and the leading quote
+/// kept it from every `^crates/` shape: a car whose only change was
+/// that file printed "no crate implied" and skipped clippy. The gate
+/// reads every path list NUL-separated, which git never quotes, so the
+/// scope, the dirty-file note and the untracked refusal all name the
+/// file as it is spelled. quotePath is set to its default here so a
+/// HOME config that turns it off cannot hide the shape.
+#[test]
+fn a_lint_preflight_reads_a_path_git_would_quote() {
+    let tree = CarScopeTree::new("non-ascii");
+    tree.vcs(&["reset", "-q", "--hard", "main"]);
+    let cafe = tree.tree.join("crates/core/boss-a/src/café.rs");
+    boss_testing::write_file(&cafe, "// é\n");
+    tree.vcs(&["add", "."]);
+    tree.commit("the car adds a non-ASCII source file to boss-a");
+    let quoted = |cmd: &mut std::process::Command| {
+        cmd.env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.quotePath")
+            .env("GIT_CONFIG_VALUE_0", "true");
+    };
+
+    let (out, log) = tree.lint_with("main", quoted);
+    let t = both(&out);
+    assert!(
+        ran_workspace_clippy(&log),
+        "the car's only change is crates/core/boss-a/src/café.rs, so --lint must run \
+         workspace clippy; a git-quoted spelling mapped to no crate. cargo was asked:\n{log}\n{t}"
+    );
+    assert!(
+        t.contains("workspace clippy, including dependents of boss-a"),
+        "the scope names the crate the file is in:\n{t}"
+    );
+    assert!(!t.contains("no crate implied"), "{t}");
+    assert_eq!(out.status.code(), Some(0), "{t}");
+
+    // The dirty-file note names the file as spelled, not octal-escaped.
+    boss_testing::write_file(&cafe, "// é, edited\n");
+    let (out, _) = tree.lint_with("main", quoted);
+    let t = both(&out);
+    assert!(
+        t.contains("M\tcrates/core/boss-a/src/café.rs"),
+        "the uncommitted-edit note names café.rs as spelled:\n{t}"
+    );
+    assert_eq!(out.status.code(), Some(0), "{t}");
+
+    // The untracked refusal names it as spelled too.
+    boss_testing::write_file(&tree.tree.join("crates/core/boss-a/src/naïve.rs"), "// ï\n");
+    let (out, _) = tree.lint_with("main", quoted);
+    let t = both(&out);
+    assert!(
+        t.contains("  crates/core/boss-a/src/naïve.rs\n"),
+        "the untracked refusal names naïve.rs as spelled:\n{t}"
+    );
+    assert_eq!(out.status.code(), Some(2), "{t}");
+}
+
+// ---- A name a line cannot hold (review d0d0a78d R2) ----
+//
+// The previous round read every path list `-z` and then turned the NULs
+// back into newlines, three times inside a command substitution. A
+// newline is a legal byte in a git path, and a substitution strips every
+// trailing newline: an untracked file whose whole name is one newline
+// became an empty list, the refusal's `-n` test passed, and `--lint`
+// exited 0 where an ordinary untracked file exits 2. A newline INSIDE a
+// name split it into two lines, so the note counted two files, and the
+// scope matched two fragments, neither of which a `.toml$` shape reads.
+// The three cases below are those three readers, each with the name in
+// the shape that broke it.
+
+/// THE REFUSAL counts the names git returned, never the lines left
+/// after a substitution: each of these is ONE untracked file, refused
+/// exit 2 like an ordinary one, listed once and counted once. A name
+/// holding a control character is shown in bash's `$'…'` quoting so the
+/// newline-only file is a visible line.
+#[test]
+fn a_lint_preflight_refuses_an_untracked_file_whose_name_holds_a_newline() {
+    for (tag, name, shown) in [
+        ("ordinary", "stray.txt", "  stray.txt\n"),
+        ("newline-only", "\n", "  $'\\n'\n"),
+        ("trailing-newline", "stray\n", "  $'stray\\n'\n"),
+        ("embedded-newline", "str\nay", "  $'str\\nay'\n"),
+    ] {
+        let tree = CarScopeTree::new(&format!("untracked-{tag}"));
+        boss_testing::write_file(&tree.tree.join(name), "untracked\n");
+        let receipt = tree.dir.join("receipt.json");
+        let at = receipt.clone();
+        let (out, log) = tree.lint_with("main", move |cmd| {
+            cmd.env("BOSS_GATE_RECEIPT", &at);
+        });
+        let t = both(&out);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "[{tag}] an untracked file is refused whatever its name; a newline-only \
+             name became an empty substitution and --lint exited 0:\n{t}"
+        );
+        assert!(
+            !ran_workspace_clippy(&log),
+            "[{tag}] a refusal compiles nothing:\n{log}"
+        );
+        assert!(
+            t.contains(shown),
+            "[{tag}] the refusal lists the file as {shown:?}:\n{t}"
+        );
+        let receipt = std::fs::read_to_string(&receipt).unwrap_or_default();
+        assert!(
+            receipt.contains("\"refused_because\": \"1 untracked file(s)"),
+            "[{tag}] the receipt counts one file:\n{receipt}"
+        );
+    }
+}
+
+/// THE NOTE pairs each status with its whole name: one tracked file
+/// whose name is, ends in or holds a newline is ONE file, listed on one
+/// line beside its status.
+#[test]
+fn a_preflight_note_names_a_tracked_file_whose_name_holds_a_newline_once() {
+    for (tag, name, shown) in [
+        ("newline-only", "\n", "  M\t$'\\n'\n"),
+        ("trailing-newline", "x\n", "  M\t$'x\\n'\n"),
+        (
+            "embedded-newline",
+            "crates/core/boss-a/src/x\ny.rs",
+            "  M\t$'crates/core/boss-a/src/x\\ny.rs'\n",
+        ),
+    ] {
+        let tree = CarScopeTree::new(&format!("note-{tag}"));
+        let odd = tree.tree.join(name);
+        boss_testing::write_file(&odd, "// x\n");
+        tree.vcs(&["add", "."]);
+        tree.commit("the car adds a file whose name holds a newline");
+        boss_testing::write_file(&odd, "// x, edited\n");
+        let (out, _) = tree.lint("main");
+        let t = both(&out);
+        assert!(
+            t.contains("pre-flight: 1 tracked file(s) here differ from HEAD"),
+            "[{tag}] one modified file is counted once, not once per line of its name:\n{t}"
+        );
+        assert!(
+            t.contains(shown),
+            "[{tag}] the note shows the status beside the whole name, {shown:?}:\n{t}"
+        );
+        assert_eq!(out.status.code(), Some(0), "[{tag}] {t}");
+    }
+}
+
+/// THE SCOPE keeps a name on one line, so a shape anchored at its end
+/// still reads it. The car's only change is a workflow bundle whose name
+/// holds a newline; `^infra/platform/<dir>/<file>.toml$` scopes it to
+/// boss-jobs, and split at the newline neither fragment matched, so
+/// --lint said "no crate implied" and skipped clippy. Each of the reads
+/// `changed_paths` unions carries the change alone once: the car's
+/// commit, the index, the working copy. (An untracked bundle never
+/// reaches the scope: the refusal above stops it first.)
+#[test]
+fn a_lint_preflight_scopes_a_car_whose_only_change_has_a_newline_in_its_name() {
+    for read in ["committed", "staged", "modified"] {
+        let tree = CarScopeTree::new(&format!("newline-scope-{read}"));
+        tree.vcs(&["checkout", "-q", "main"]);
+        let bundle = tree.tree.join("infra/platform/workflows/odd\nname.toml");
+        boss_testing::create_dir(bundle.parent().expect("a relative path has a parent"));
+        for (rel, body) in [
+            (
+                "crates/core/boss-jobs/Cargo.toml",
+                "[package]\nname = \"boss-jobs\"\nversion = \"0.0.0\"\n",
+            ),
+            ("crates/core/boss-jobs/src/lib.rs", "// jobs\n"),
+        ] {
+            let to = tree.tree.join(rel);
+            boss_testing::create_dir(to.parent().expect("a relative path has a parent"));
+            boss_testing::write_file(&to, body);
+        }
+        if read == "modified" {
+            boss_testing::write_file(&bundle, "kind = \"odd\"\n");
+        }
+        tree.vcs(&["add", "."]);
+        tree.commit("main carries boss-jobs");
+        // The car is main plus the one change, in the read under test.
+        tree.vcs(&["checkout", "-q", "car"]);
+        tree.vcs(&["reset", "-q", "--hard", "main"]);
+        match read {
+            "committed" | "staged" => {
+                boss_testing::write_file(&bundle, "kind = \"odd\"\n");
+                tree.vcs(&["add", "."]);
+                if read == "committed" {
+                    tree.commit("the car's only change is a bundle whose name holds a newline");
+                }
+            }
+            _ => boss_testing::write_file(&bundle, "kind = \"odd, edited\"\n"),
+        }
+
+        let (out, log) = tree.lint("main");
+        let t = both(&out);
+        assert!(
+            ran_workspace_clippy(&log),
+            "[{read}] a workflow bundle scopes boss-jobs whatever bytes its name holds; split \
+             at the newline it mapped to no crate. cargo was asked:\n{log}\n{t}"
+        );
+        assert!(
+            t.contains("workspace clippy, including dependents of boss-jobs"),
+            "[{read}] the scope names boss-jobs:\n{t}"
+        );
+        assert!(!t.contains("no crate implied"), "[{read}] {t}");
+        assert_eq!(out.status.code(), Some(0), "[{read}] {t}");
     }
 }

@@ -4,64 +4,71 @@
   // one surface instead of sidebar rows. One component, data-driven —
   // adding a tab is a row here, not a new sidebar entry (the sidebar
   // holds exactly six IT rows and this file is why it can).
+  //
+  // Each tab names its page by CATALOG ID, never a path (backlog
+  // 0bc2eb68): a page's path is its host station's address in the tree
+  // plus its slug, so the strip asks the catalog where each page is now.
   import { href, navigate } from '../router';
   import { safeLinkHref } from '@boss/web-kit/links';
+  import { pageHref } from '../shell/stationAddresses.svelte';
+  import type { ROUTE_CATALOG } from '../shell/nav-catalog';
 
   export type ItTabGroup = 'operate' | 'registry' | 'design';
+  type PageId = keyof typeof ROUTE_CATALOG;
 
-  const GROUPS: Readonly<Record<ItTabGroup, ReadonlyArray<{ label: string; path: string }>>> = {
+  const GROUPS: Readonly<Record<ItTabGroup, ReadonlyArray<{ label: string; page: PageId }>>> = {
     // Car N3 of design e765b3fc (2026-09-25) took five tabs off this
     // strip, each now a selection's panel on the Department Map: Yard
     // status (the track, dock and garage stations), Conductor (the
     // track), Receiving Yard and Marshalling Yard (those two stations),
     // and on Design, Feedback and Backlog (receiving; the backlog on
     // marshalling too). What stays is desk work, not a station.
+    // Incidents, Atlas, Bottlenecks, Policy and Experiments went with
+    // step 1 of design 01fa5bdf (David, 2026-11-17).
     operate: [
-      { label: 'Incidents', path: '/it/operate' },
-      { label: 'Audit Log', path: '/it/operate/audit' },
-      { label: 'Performance', path: '/it/operate/perf' },
-      { label: 'Atlas', path: '/it/operate/atlas' },
-      { label: 'Bottlenecks', path: '/it/operate/bottlenecks' },
+      { label: 'Audit Log', page: 'system-monitoring' },
+      { label: 'Performance', page: 'system-performance' },
     ],
     registry: [
-      { label: 'Workflows', path: '/it/registry' },
-      { label: 'Dispatcher', path: '/it/registry/dispatcher' },
+      { label: 'Workflows', page: 'workflows' },
+      { label: 'Dispatcher', page: 'system-dispatcher' },
       // The authoring list of the rules the cascade draws. Rendered bare
       // until 2026-09-24, reachable only through the cascade's "Edit
       // rules →" link, and 0 of 784 surface-opens reached it (0a98d93f).
-      { label: 'Rules', path: '/it/registry/rules' },
-      { label: 'Step plugins', path: '/it/registry/step-plugins' },
-      { label: 'Policy', path: '/it/registry/policy' },
-      { label: 'Subjects', path: '/it/registry/subjects' },
-      { label: 'Drift', path: '/it/registry/drift' },
+      { label: 'Rules', page: 'system-dispatcher-rules' },
+      { label: 'Step plugins', page: 'system-step-plugins' },
+      { label: 'Subjects', page: 'system-subjects' },
+      { label: 'Drift', page: 'system-registry-drift' },
       // The agents registry as a directory (62988516) — who runs work
       // besides people, beside the other registries.
-      { label: 'Agents', path: '/it/registry/agents' },
+      { label: 'Agents', page: 'system-agents' },
       // The credentials registry, its lifecycle as packets (851259b9;
       // design 76155676 step 3) — what the estate holds access with.
-      { label: 'Credentials', path: '/it/registry/credentials' },
+      { label: 'Credentials', page: 'system-credentials' },
     ],
     design: [
-      { label: 'Reviews', path: '/it/design' },
-      { label: 'Experiments', path: '/it/design/experiments' },
+      { label: 'Reviews', page: 'system-design' },
     ],
   };
 
-  let { group, active }: { group: ItTabGroup; active: string } = $props();
+  let { group, active }: { group: ItTabGroup; active: PageId } = $props();
   const tabs = GROUPS[group];
 </script>
 
 <nav class="it-tabs" aria-label="IT {group}">
-  {#each tabs as t (t.path)}
-    <a
-      href={safeLinkHref(href(t.path))}
-      class:active={t.path === active}
-      aria-current={t.path === active ? 'page' : undefined}
-      onclick={(e) => {
-        e.preventDefault();
-        navigate(t.path);
-      }}>{t.label}</a
-    >
+  {#each tabs as t (t.page)}
+    {@const to = pageHref(t.page)}
+    {#if to !== null}
+      <a
+        href={safeLinkHref(href(to))}
+        class:active={t.page === active}
+        aria-current={t.page === active ? 'page' : undefined}
+        onclick={(e) => {
+          e.preventDefault();
+          navigate(to);
+        }}>{t.label}</a
+      >
+    {/if}
   {/each}
 </nav>
 

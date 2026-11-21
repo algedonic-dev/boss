@@ -90,6 +90,66 @@ export function formatDateTime(
   return `${month} ${day}, ${year}, ${hour}:${minute}`;
 }
 
+/// The two halves of one instant: the viewer's local reading and the
+/// stack's own (UTC). Kept apart so a surface can ink the UTC half as
+/// secondary rather than parse a joined string back up.
+export type LocalAndUtc = Readonly<{ local: string; utc: string }>;
+
+export type LocalAndUtcOptions = DateTimeFormatOptions &
+  Readonly<{
+    /// `hh:mm:ss` rather than `hh:mm`.
+    seconds?: boolean;
+    /// Lead each half with its own calendar day (`Nov 5`), which can
+    /// differ between the halves near midnight.
+    date?: boolean;
+  }>;
+
+/// ISO timestamp → `{ local: '17:42 PT', utc: '01:42Z' }`; null for
+/// input that is not an instant (a surface renders nothing rather than
+/// an invented time).
+///
+/// David, user-feedback 0b1fd59f (2026-11-08): "We need to show UTC in
+/// addition to local time since the factory runs on UTC." Design
+/// b03ef2d4 decided the shape — `17:42 PT · 01:42Z` — and that this
+/// module, the SPA's one date formatter, carries it rather than a
+/// second. The zone name is Intl's `shortGeneric` (`PT`, not the
+/// `PST`/`PDT` that flips twice a year); the UTC half is `Z`, the
+/// spelling the record and the alarms already use.
+export function formatLocalAndUtc(
+  iso: string,
+  opts: LocalAndUtcOptions = {},
+): LocalAndUtc | null {
+  if (iso === '') return null;
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return null;
+  const read = (timeZone: string | undefined, zoneName: boolean): string | null => {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+      ...(opts.seconds ? { second: '2-digit' } : {}),
+      ...(opts.date ? { month: 'short', day: 'numeric' } : {}),
+      ...(zoneName ? { timeZoneName: 'shortGeneric' } : {}),
+      ...(timeZone ? { timeZone } : {}),
+    } as const).formatToParts(at);
+    const p = new Map(parts.map((x) => [x.type, x.value]));
+    const hour = p.get('hour');
+    const minute = p.get('minute');
+    if (!hour || !minute) return null;
+    const clock = `${hour}:${minute}${opts.seconds ? `:${p.get('second') ?? '00'}` : ''}`;
+    const day = opts.date ? `${p.get('month') ?? ''} ${p.get('day') ?? ''} ` : '';
+    const zone = p.get('timeZoneName');
+    return zoneName ? `${day}${clock}${zone ? ` ${zone}` : ''}` : `${day}${clock}Z`;
+  };
+  const local = read(opts.timeZone, true);
+  const utc = read('UTC', false);
+  return local === null || utc === null ? null : { local, utc };
+}
+
+/// The pair as one line of text — `17:42 PT · 01:42Z` — for a surface
+/// that cannot ink the halves apart (a title attribute, a sentence).
+export const localAndUtcText = (t: LocalAndUtc): string => `${t.local} · ${t.utc}`;
+
 /// Compact "how long ago" — `'today'`, `'3d'`, `'2mo'`, `'1y'`.
 ///
 /// Semantics absorbed from the two byte-identical `daysAgo` helpers

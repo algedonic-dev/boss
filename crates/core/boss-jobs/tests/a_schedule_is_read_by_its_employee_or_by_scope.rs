@@ -47,6 +47,8 @@ use uuid::Uuid;
 const MINE: &str = "emp-tech-001";
 const THEIRS: &str = "emp-tech-002";
 const MANAGER: &str = "emp-mgr-001";
+/// The seeded auditor login: a real employee id on a read-only role.
+const AUDIT_LOGIN: &str = "emp-audit";
 
 fn at(h: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 9, 28, h, 0, 0).unwrap()
@@ -308,6 +310,47 @@ fn app_with_reporter(
     })
 }
 
+/// A policy client whose service cannot be asked — what the reqwest
+/// adapter answers for a refused connection, a timeout or a 5xx since
+/// backlog 45553536. The detail is reqwest's own text, which names the
+/// policy service's internal address.
+struct DarkPolicy;
+
+const DARK_DETAIL: &str = "error sending request for url (http://boss-policy:7920/check)";
+
+#[async_trait]
+impl boss_policy_client::PolicyClient for DarkPolicy {
+    async fn check(
+        &self,
+        _: &boss_policy_client::User,
+        _: Action,
+        _: Resource,
+    ) -> Result<boss_policy_client::Decision, boss_policy_client::PolicyClientError> {
+        Err(boss_policy_client::PolicyClientError::Unreachable(
+            DARK_DETAIL.into(),
+        ))
+    }
+    async fn scope_predicate(
+        &self,
+        _: &boss_policy_client::User,
+        _: Resource,
+    ) -> Result<boss_policy_client::Predicate, boss_policy_client::PolicyClientError> {
+        Err(boss_policy_client::PolicyClientError::Unreachable(
+            DARK_DETAIL.into(),
+        ))
+    }
+}
+
+fn dark_app() -> Router {
+    router(SchedulingApiState {
+        role_guards: None,
+        repo: Arc::new(TwoSchedules),
+        publisher: None,
+        clock: Arc::new(boss_clock_client::WallClockClient),
+        policy: Arc::new(DarkPolicy),
+    })
+}
+
 #[tokio::test]
 async fn schedule_self_visibility_reports_the_recorded_floor_without_changing_the_answer() {
     exercise_schedule_report(true, boss_policy_client::role_reporting::ReportMode::Report).await;
@@ -397,6 +440,12 @@ enum Caller {
     /// 2830b6b7 added to the read-only floor — the role a session
     /// that names none now falls back to.
     VisitorSession,
+    /// A REAL employee id at a role on the read-only floor — the seeded
+    /// `emp-audit` login. Until backlog 12875389 the role half of
+    /// `is_an_employee` was pinned only at unit level: every caller
+    /// above is refused by its id alone, so dropping the role check
+    /// left this file green.
+    ReadOnlyLogin(&'static str),
     Employee(&'static str),
     /// A manager whose one direct report is `MINE`.
     Manager,
@@ -409,6 +458,7 @@ fn user_header(c: Caller) -> Option<Value> {
         Caller::Headerless => return None,
         Caller::GuestSession => ("guest@algedonic.dev", "audit-readonly", "user", vec![]),
         Caller::VisitorSession => ("guest@algedonic.dev", "visitor", "user", vec![]),
+        Caller::ReadOnlyLogin(role) => (AUDIT_LOGIN, role, "user", vec![]),
         Caller::Employee(id) => (id, "service-tech", "user", vec![]),
         Caller::Manager => (MANAGER, "service-mgr", "user", vec![MINE]),
         Caller::Operator => ("emp-david", "platform-admin", "operator", vec![]),
@@ -526,6 +576,93 @@ async fn a_refused_read_by_id_names_no_employee() {
         !text.contains(MINE),
         "the refusal named the assignment's employee: {text}"
     );
+}
+
+/// A real employee id at a read-only-floor role is nobody's self: it
+/// reads no schedule, not even under its own id (backlog 12875389, the
+/// review of a621d091's third note).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_login_reads_no_schedule_not_even_its_own() {
+    let app = app();
+    for role in ["audit-readonly", "visitor"] {
+        for uri in reads_naming(AUDIT_LOGIN)
+            .iter()
+            .chain(reads_naming(MINE).iter())
+            .map(String::as_str)
+            .chain(reads_naming_nobody())
+        {
+            let (status, body) = get(&app, Caller::ReadOnlyLogin(role), uri).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{role}: {uri} answered {body}"
+            );
+        }
+    }
+}
+
+/// A read by id answers the same for another employee's row as for an
+/// id that does not exist, so a guessed id cannot learn which ids are
+/// real (backlog 12875389, the review of a621d091's first note: it
+/// answered 403 for the one and 404 for the other). It is the write
+/// doors' rule (`require_reaching_row`, car 11721a25), one answer for
+/// one question.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_by_id_answers_a_missing_id_as_it_answers_anothers() {
+    let app = app();
+    let theirs = format!("/api/scheduling/assignments/{}", assignment_id(MINE));
+    let missing = format!("/api/scheduling/assignments/{}", Uuid::new_v4());
+    let read = |uri: String| {
+        let app = app.clone();
+        async move {
+            let mut req = TestRequest::get(&uri);
+            if let Some(u) = user_header(Caller::Employee(THEIRS)) {
+                req = req.header("x-boss-user", u.to_string());
+            }
+            let resp = req.send(&app).await;
+            (
+                resp.status,
+                String::from_utf8_lossy(&resp.body_bytes).into_owned(),
+            )
+        }
+    };
+    let (another, missing_id) = (read(theirs).await, read(missing.clone()).await);
+    assert_eq!(another.0, StatusCode::FORBIDDEN, "{another:?}");
+    assert_eq!(another, missing_id, "another's row and a missing id differ");
+    // The control: a grant at `all` may know every id there is, so a
+    // missing id is its 404 — the refusal above is the scope, not a
+    // broken lookup.
+    let (status, body) = get(&app, Caller::Operator, &missing).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing} answered {body}");
+}
+
+/// A policy service that cannot be asked answers the client's own 503
+/// on every read — the outage rendering every jobs-API door shares
+/// (backlog 45553536) — and never a 500 carrying the client's detail,
+/// which names the policy service's internal address (fe9d212c). The
+/// review of a621d091's second note: the doc said 500, and no test
+/// held it to anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_policy_outage_answers_503_on_every_schedule_read() {
+    let app = dark_app();
+    for uri in reads_naming(MINE)
+        .iter()
+        .map(String::as_str)
+        .chain(reads_naming_nobody())
+    {
+        let mut req = TestRequest::get(uri);
+        if let Some(u) = user_header(Caller::Employee(MINE)) {
+            req = req.header("x-boss-user", u.to_string());
+        }
+        let resp = req.send(&app).await;
+        let text = String::from_utf8_lossy(&resp.body_bytes);
+        assert_eq!(
+            resp.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{uri} answered {text}"
+        );
+        assert_eq!(text, "policy-unreachable", "{uri} answered {text}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1,0 +1,355 @@
+# ---------------------------------------------------------------------------
+# roll-the-dev-pod — a dev pod roll, and BOSS bringing the agent sessions
+# back up by itself afterwards, as one packet per roll (backlog e505b3dc,
+# David 2026-10-29; the design is that packet's `decision` key).
+#
+# WHEN TO RUN IT. Every time the dev pod (namespace boss-dev, workload
+# boss-dev) is replaced: a car that edits infra/cluster/manifests/
+# boss-dev.yaml rolls it when its train converges, a converge rolls it,
+# and a node or pod failure rolls it with no warning at all. File the
+# packet BEFORE a roll you can see coming, and the moment you notice one
+# you could not. David asked for it to be tried first in calm
+# circumstances — the planned roll car 4e2ec7d2 carries — so that the
+# emergency is the second time it runs, not the first.
+#
+# TWO PATHS, chosen by the trigger's `planned` field:
+#
+#   planned = "true" — the roll is still ahead of us.
+#     raised -> quiesce -> quiet-conductor + quiet-factory -> roll ->
+#     rolled -> ...
+#     The conductor asks every agent session in the pod to stop taking
+#     new work; each session confirms that every builder it launched is
+#     at a gate or has reported, and writes its handoff; only then does
+#     the conductor release the carrying car (or run the converge).
+#
+#   planned = "false" — the pod is already gone (an emergency).
+#     raised -> rolled -> ...
+#     There is nothing left to quiesce, so `quiesce`, both `quiet` halves
+#     and `roll` are SKIPPED at admission — the readiness engine proves
+#     their predicates can never hold and marks them so — and the packet
+#     starts at `rolled`. The handoffs the sessions resume from are the
+#     last ones they wrote before the pod died, which is why a session
+#     writes one on every turn and not only before a roll.
+#
+#   Both paths then run the same bring-up and the same review:
+#     rolled -> conductor-up + factory-up -> resumed-conductor +
+#     resumed-factory -> review -> closed
+#
+# WHAT EACH AGENT DOES. Nothing here is David's, by design: the trial
+# asks whether he is necessary to a roll, so a step a person had to do
+# is not a step of this protocol — it is a finding, recorded in the
+# review's `person_steps` and filed as its own packet.
+#
+#   The CONDUCTOR (agent-claude, tmux session `dev`) files the packet,
+#   asks the sessions to stop (`quiesce`), quiets its own builders
+#   (`quiet-conductor`), rolls (`roll`), observes the new pod (`rolled`),
+#   records its own first write and resumption (`conductor-up`,
+#   `resumed-conductor`), and measures the whole roll (`review`).
+#
+#   The FACTORY (agent-codex, tmux session `codex-factory`,
+#   infra/dev/factory-loop.sh) confirms its own builders are at a gate
+#   or reported and its handoff is written (`quiet-factory`), then, after
+#   the roll, records its own first write and resumption (`factory-up`,
+#   `resumed-factory`). Each session writes ITS OWN steps: a confirmation
+#   is evidence only from the actor it is about.
+#
+# THE FACTS THIS IS BUILT ON, measured on 2026-10-29 at origin/main
+# 5c88039e5:
+#
+#   - The pod start already brings up the conductor. boss-dev.yaml's
+#     postStart writes /work/dev-claude.sh and starts it in tmux session
+#     `dev` (`claude --remote-control boss-dev`) whenever the claude
+#     binary and its credentials are on the /work volume. With
+#     /work/home/.config/boss/drain-on-boot set, dev-claude.sh fetches
+#     origin and its first prompt is infra/dev/drain.md read from
+#     origin/main (the checkout's copy if that read fails), and it
+#     appends which copy it used to /work/ssh/postStart.log.
+#   - The factory does NOT come up at boot yet. infra/dev/dev-session.sh
+#     on main has no detached mode; car 0dd77a5c adds
+#     `dev-session.sh --detached 6` (option 6, `codex-factory`) and car
+#     4e2ec7d2 calls it from postStart. Until 4e2ec7d2 lands,
+#     `factory-up` will record `brought_up_by` as `person` or `agent`,
+#     and that is the finding the review files.
+#   - Gates run in-cluster and SURVIVE a dev pod roll: the gate-runner
+#     Job clones from the forge and mounts no /work, and a green's
+#     auto-park files the car whoever is up to read it.
+#   - Builders in the pod do NOT survive: a dispatched run is a process
+#     in the pod, so the roll kills it. Its worktree on the /work volume
+#     outlives it; its unpushed work and its unreported run do not, and
+#     the run ages into `died`. That is why `quiet` asks for every open
+#     run AT A GATE OR REPORTED before anything rolls.
+#
+# EVIDENCE IS FIELDS, NOT PROSE. Every step owes required fields at done
+# — who was asked and by which order key, each session's handoff key and
+# its open-runs read, the release or converge id, the new pod's name and
+# start time and the door they were read through, each session's first
+# write with its time and its event, what it resumed from — and the
+# review owes the three measured intervals in minutes. Times come from
+# `date -u` or from the record, never from memory.
+#
+# WHERE THE REGISTRY FORCED A DEVIATION FROM THE DECISION (2026-10-29):
+#
+#   - The decision names ONE `quiet` and ONE `resumed` step, done by
+#     "each agent session". A confirmation is evidence only from the
+#     session it is about, so each is split into a conductor half and a
+#     factory half, and the step after waits on both.
+#   - "Conductor steps on agent-claude; factory confirmations on
+#     agent-codex" cannot be declared as an audience. An `individual`
+#     audience is claim-for authority, and the bundle holds every one to
+#     an `automation:` principal (a_step_becomes_active_through_a_claim.rs,
+#     every_individual_executor_in_the_platform_bundle_is_an_automation),
+#     because a protocol row must not hand an agent login that authority.
+#     So every step's audience is the role both agents hold,
+#     `platform-admin`, and which session writes a step is said in its
+#     title and procedure. Who actually wrote it is the step's own
+#     completed_by, which the review reads.
+#   - The factory's steps carry NO agent block. Every block in the
+#     bundle names the opus family the effort definitions run
+#     (boss_jobs::agent_spec::DEFINITION_MODEL, pinned by agent_spec.rs
+#     and platform_bundle_agent_blocks.rs), and the factory runs
+#     gpt-6.1-sol: a block naming opus on a Codex step would assert a
+#     model that run never has. Without a block and without an
+#     individual audience, these three steps may read in a queue as a
+#     person's work. They are not, and a queue that shows them as
+#     David's is the first finding this protocol owes its review.
+#   - The conductor's steps carry the `analyst` profile: the claim door
+#     knows builder, analyst, reviewer and tenant-reviewer, and these are
+#     reads and records, no car.
+#
+# Publication is `boss workflow publish roll-the-dev-pod` after this car
+# lands; the seed is insert-if-missing, so a fresh database gets this
+# body as its v1. Pinned by
+# crates/core/boss-jobs/tests/platform_bundle_roll_the_dev_pod.rs.
+# ---------------------------------------------------------------------------
+
+[[workflow]]
+kind = "roll-the-dev-pod"
+label = "Roll the dev pod"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "A dev pod roll worked as a packet, and the agent sessions brought back up by BOSS itself afterwards. A planned roll quiesces first: the conductor asks every agent session in the pod to stop taking new work, each session confirms its builders are at a gate or reported and writes its handoff, and only then does the conductor release the carrying car or run the converge. An emergency roll (the pod already gone) skips all of that and starts at rolled. Both paths then record the new pod, each session's first write and its resumption from its handoff, and a review that measures roll-to-conductor-up, roll-to-factory-up and roll-to-resumed in minutes, names what broke, and files each fix as its own packet. No step is a person's: a step a person had to do is a finding."
+metadata = { owner = "9660c60f-eb47-4405-ae08-fcbb30c71e5f", department = "it", owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "raised"
+kind = "trigger"
+ready_when = "true"
+title_template = "Dev pod roll raised"
+metadata_defaults = { trigger_kind = "operator", trigger_name = "dev-pod-roll", why = "{metadata.why}", planned = "{metadata.planned}", carrying = "{metadata.carrying}" }
+fields = [
+  { name = "why", field_type = "non-empty-string", required = true, filled_by = "filer" },
+  # The path: "true" quiesces first, "false" starts at `rolled`. A
+  # string, as the enum validator and the predicates both read it.
+  { name = "planned", field_type = "true|false", required = true, filled_by = "filer" },
+  # The car whose landing rolls the pod, the converge, or — unplanned —
+  # what took the pod down, as far as it is known when the packet opens.
+  { name = "carrying", field_type = "non-empty-string", required = true, filled_by = "filer" },
+]
+
+[[workflow.step]]
+title = "quiesce"
+kind = "task"
+ready_when = "steps.raised.done AND steps.raised.metadata.planned = \"true\""
+title_template = "Ask every agent session in the pod to stop new work"
+audience = { role = "platform-admin" }
+agent = { profile = "analyst", model = "opus-5-5", budget_usd = 2, effort = "medium" }
+fields = [
+  { name = "sessions_asked", field_type = "array", required = true },
+  { name = "asked_via", field_type = "non-empty-string", required = true },
+  { name = "asked_at", field_type = "date-time", required = true },
+]
+[workflow.step.metadata_defaults]
+human_only = false
+procedure = '''
+Ask every agent session running in the pod to stop taking new work: no new dispatch, no new claim, nothing new pushed to a gate. Running gates are left alone — they run in-cluster and survive the roll.
+
+Find the sessions from the record, not from memory: the open `work-session` packets (`boss-api GET '/api/jobs?kind=work-session&status=open&limit=50'`, rows compared to `.total`), each with its `actor` and `host`. Ask each one on its own newest open work-session by writing that session's one `order` key, `{by, at, text}`, which replaces the order before it (`boss-api PATCH /api/jobs/<session>/metadata <body.json>`), saying: stop new work, bring every open run to a gate or a report, write a handoff, then complete your `quiet-*` step on this packet. A session keeps one current order and its history is the log, because a key per order grew session packets until the packet budget refused their writes (backlog e18b0b44, design e17c81c9).
+
+`sessions_asked` lists each session asked, as `{actor, session_packet, order_key}`, with `order_key` written `order@<at>` so it names the version meant; `asked_via` names the channel; `asked_at` is the `date -u` reading when the last ask was written.
+'''
+
+[[workflow.step]]
+title = "quiet-conductor"
+kind = "task"
+ready_when = "steps.quiesce.done"
+title_template = "The conductor's builders are at a gate or reported; its handoff is written"
+audience = { role = "platform-admin" }
+agent = { profile = "analyst", model = "opus-5-5", budget_usd = 1, effort = "low" }
+fields = [
+  { name = "handoff_key", field_type = "non-empty-string", required = true },
+  { name = "open_runs", field_type = "non-empty-string", required = true },
+  { name = "read_at", field_type = "date-time", required = true },
+]
+[workflow.step.metadata_defaults]
+human_only = false
+procedure = '''
+Every builder this session launched dies with the pod unless it is at a gate or has reported. Read your open runs (`boss-api GET '/api/jobs?kind=agent-run&status=open&limit=500'`, rows compared to `.total`, kept to the runs you dispatched) and bring each to one of two places: its gate launched (the gate-run id) or its report recorded. `open_runs` lists each run with where it stands, or `none` with the read that showed none.
+
+Then write your handoff as the one `handoff` key on your own open work-session, replacing the last one — `at` from `date -u`, what is in flight and on whom, what is next — and record it as `handoff_key` in the form `<work-session packet>:handoff@<at>`, so it names the version meant: the versions before it are in the session's `jobs.job.updated` events. `read_at` is the `date -u` reading of the open-runs read.
+'''
+
+[[workflow.step]]
+title = "quiet-factory"
+kind = "task"
+ready_when = "steps.quiesce.done"
+title_template = "agent-codex: the factory's builders are at a gate or reported; its handoff is written"
+audience = { role = "platform-admin" }
+fields = [
+  { name = "handoff_key", field_type = "non-empty-string", required = true },
+  { name = "open_runs", field_type = "non-empty-string", required = true },
+  { name = "read_at", field_type = "date-time", required = true },
+]
+[workflow.step.metadata_defaults]
+procedure = '''
+The factory's own confirmation, written by the factory and by no one else. Finish or park the turn you are in: every open run you hold brought to its gate (the gate-run id) or its report, and nothing new claimed. Read your open runs (`boss-api GET '/api/jobs?kind=agent-run&status=open&limit=500'`, rows compared to `.total`, kept to your actor) and list each with where it stands in `open_runs`, or `none` with the read that showed none.
+
+Write your handoff as the one `handoff` key on your open work-session, replacing the last one, with `at` from `date -u`, and record it as `handoff_key` in the form `<work-session packet>:handoff@<at>`, so it names the version meant: the versions before it are in the session's `jobs.job.updated` events. `read_at` is the `date -u` reading of the open-runs read.
+'''
+
+[[workflow.step]]
+title = "roll"
+kind = "task"
+ready_when = "steps.quiet-conductor.done AND steps.quiet-factory.done"
+title_template = "Roll the pod: release the carrying car or run the converge"
+audience = { role = "platform-admin" }
+agent = { profile = "analyst", model = "opus-5-5", budget_usd = 2, effort = "medium" }
+fields = [
+  { name = "act", field_type = "release|converge", required = true },
+  { name = "act_ref", field_type = "non-empty-string", required = true },
+  { name = "acted_at", field_type = "date-time", required = true },
+]
+[workflow.step.metadata_defaults]
+human_only = false
+procedure = '''
+Both sessions are quiet. Roll the pod by the door that already exists: `release` when a car carries the roll (`boss release <car>` for a held car; for a car that boards on its own, the train it boards), `converge` when the roll is a converge (the ops-request id). `act_ref` is that car, train or request id, copied from the verb's own output; `acted_at` is the `date -u` reading taken as the verb returns.
+
+Complete this step as soon as the verb returns. A train or a converge takes minutes to replace the pod, and once it does this session is gone: a step left open here is filled by the next session from memory. `acted_at` is the zero the review measures from on the planned path.
+'''
+
+[[workflow.step]]
+title = "rolled"
+kind = "task"
+ready_when = "steps.roll.done OR (steps.raised.done AND steps.raised.metadata.planned = \"false\")"
+title_template = "Observe the new pod"
+audience = { role = "platform-admin" }
+agent = { profile = "analyst", model = "opus-5-5", budget_usd = 1, effort = "low" }
+fields = [
+  { name = "new_pod", field_type = "non-empty-string", required = true },
+  { name = "started_at", field_type = "date-time", required = true },
+  { name = "read_via", field_type = "non-empty-string", required = true },
+  { name = "old_pod", field_type = "string" },
+]
+[workflow.step.metadata_defaults]
+human_only = false
+procedure = '''
+Observe the new pod; do not infer it. From inside the new pod, `hostname` is its name and `ps -o lstart= -p 1` is when its container started (record it in UTC, `date -u -d "<that>" +%FT%TZ`). `/work/ssh/postStart.log` is truncated on every pod start and holds the boot's `dev session:` lines: quote the one that says what the conductor's first prompt was.
+
+`read_via` names the commands, exactly as run. No door reads the dev pod's start from OUTSIDE it today — `boss ops forge pod-logs` refuses boss-dev by design — so if that is what you needed, say so here and file it in the review. `old_pod` is the pod that went away, from the last handoff or the previous roll packet, when it is known.
+'''
+
+[[workflow.step]]
+title = "conductor-up"
+kind = "task"
+ready_when = "steps.rolled.done"
+title_template = "The conductor's first write after the roll"
+audience = { role = "platform-admin" }
+agent = { profile = "analyst", model = "opus-5-5", budget_usd = 1, effort = "low" }
+fields = [
+  { name = "first_write_at", field_type = "date-time", required = true },
+  { name = "first_write_ref", field_type = "non-empty-string", required = true },
+  { name = "brought_up_by", field_type = "boot|agent|person", required = true },
+  { name = "session", field_type = "non-empty-string", required = true },
+]
+[workflow.step.metadata_defaults]
+human_only = false
+procedure = '''
+Read the conductor's first write after `rolled.started_at` from the audit log, not from this session's memory: `boss-api GET '/api/events/tail?actor=agent-claude&since=<rolled.started_at>&simulated=real&limit=500'` is newest first, so the first write is the LAST row; if the page is full, narrow with `until=` and read again. `first_write_at` is its timestamp and `first_write_ref` its event id and kind.
+
+`brought_up_by` is `boot` when the pod's postStart started the session (the `dev session: started claude` line in /work/ssh/postStart.log), `agent` when another agent started it, `person` when someone had to. `session` names the tmux session and the first prompt (drain.md from which copy, or none).
+'''
+
+[[workflow.step]]
+title = "factory-up"
+kind = "task"
+ready_when = "steps.rolled.done"
+title_template = "agent-codex: the factory's first write after the roll"
+audience = { role = "platform-admin" }
+fields = [
+  { name = "first_write_at", field_type = "date-time", required = true },
+  { name = "first_write_ref", field_type = "non-empty-string", required = true },
+  { name = "brought_up_by", field_type = "boot|agent|person", required = true },
+  { name = "session", field_type = "non-empty-string", required = true },
+]
+[workflow.step.metadata_defaults]
+procedure = '''
+The factory's own record of coming back. Read your first write after `rolled.started_at` from the audit log: `boss-api GET '/api/events/tail?actor=agent-codex&since=<rolled.started_at>&simulated=real&limit=500'` is newest first, so the first write is the LAST row; if the page is full, narrow with `until=` and read again. `first_write_at` is its timestamp and `first_write_ref` its event id and kind.
+
+`brought_up_by` is `boot` when the pod's postStart started `codex-factory` (`dev-session.sh --detached 6`, from car 4e2ec7d2), `agent` when another session started it, `person` when someone had to. `session` names the tmux session and the loop (infra/dev/factory-loop.sh) that runs it.
+'''
+
+[[workflow.step]]
+title = "resumed-conductor"
+kind = "task"
+ready_when = "steps.conductor-up.done"
+title_template = "The conductor took up work from its handoff"
+audience = { role = "platform-admin" }
+agent = { profile = "analyst", model = "opus-5-5", budget_usd = 1, effort = "low" }
+fields = [
+  { name = "resumed_from", field_type = "non-empty-string", required = true },
+  { name = "first_work", field_type = "non-empty-string", required = true },
+  { name = "first_work_at", field_type = "date-time", required = true },
+]
+[workflow.step.metadata_defaults]
+human_only = false
+procedure = '''
+Coming up is not resuming. `resumed_from` is the handoff the session read, `<work-session packet>:handoff@<at>` — on the planned path the one `quiet-conductor` recorded, on the emergency path the last one written before the pod died. `first_work` is the first act it took from that handoff after `rolled.started_at`: a dispatch (the agent-run id) or a note on a packet the handoff names (the packet and key). `first_work_at` is that act's time from the record.
+'''
+
+[[workflow.step]]
+title = "resumed-factory"
+kind = "task"
+ready_when = "steps.factory-up.done"
+title_template = "agent-codex: the factory took up work from its handoff"
+audience = { role = "platform-admin" }
+fields = [
+  { name = "resumed_from", field_type = "non-empty-string", required = true },
+  { name = "first_work", field_type = "non-empty-string", required = true },
+  { name = "first_work_at", field_type = "date-time", required = true },
+]
+[workflow.step.metadata_defaults]
+procedure = '''
+Coming up is not resuming. `resumed_from` is the handoff you read, `<work-session packet>:handoff@<at>` — on the planned path the one `quiet-factory` recorded, on the emergency path your last one before the pod died. `first_work` is the first act you took from it after `rolled.started_at`: a dispatch or a gate (its id), or a note on a packet the handoff names (the packet and key). `first_work_at` is that act's time from the record.
+'''
+
+[[workflow.step]]
+title = "review"
+kind = "task"
+ready_when = "steps.resumed-conductor.done AND steps.resumed-factory.done"
+title_template = "Measure the roll; file each fix as its own packet"
+audience = { role = "platform-admin" }
+agent = { profile = "analyst", model = "opus-5-5", budget_usd = 2, effort = "medium" }
+fields = [
+  { name = "measured_from", field_type = "non-empty-string", required = true },
+  { name = "roll_to_conductor_up_minutes", field_type = "number", required = true },
+  { name = "roll_to_factory_up_minutes", field_type = "number", required = true },
+  { name = "roll_to_resumed_minutes", field_type = "number", required = true },
+  { name = "what_broke", field_type = "non-empty-string", required = true },
+  { name = "person_steps", field_type = "non-empty-string", required = true },
+  { name = "fix_packets", field_type = "array", required = true },
+]
+[workflow.step.metadata_defaults]
+human_only = false
+procedure = '''
+Measure, from the fields this packet already holds — never from recollection. `measured_from` names the zero and its value: `roll.acted_at` on the planned path, `rolled.started_at` on the emergency path (the pod died before anyone could say when, so the new pod's start is the first time the record holds). Then, in minutes from that zero: `roll_to_conductor_up_minutes` to `conductor-up.first_write_at`, `roll_to_factory_up_minutes` to `factory-up.first_write_at`, and `roll_to_resumed_minutes` to the LATER of the two `resumed-*.first_work_at`.
+
+Read each step's completed_by on this packet: every factory step must read agent-codex and every other step agent-claude, because the audience (the platform-admin role) cannot say so. A step written by anyone else goes in `what_broke`. `what_broke` is every place the roll did not go as this protocol says — a run that died, a session that did not come up by itself, a read no door could take — or `nothing`. `person_steps` is every act a person had to do, or `none`: each one is a finding, because the trial asks whether David is needed. File each fix as its OWN packet (a backlog item) and list the ids in `fix_packets`, empty only when nothing broke and no person acted. A fix to this protocol itself is a new version of this row, published with `boss workflow publish roll-the-dev-pod`.
+'''
+
+[[workflow.step]]
+title = "closed"
+kind = "outcome"
+ready_when = "steps.review.done"
+title_template = "Roll closed"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "closed" }

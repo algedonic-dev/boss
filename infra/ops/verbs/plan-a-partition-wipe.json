@@ -1,0 +1,23 @@
+{
+  "about": "READ-ONLY: renders what `wipe-a-partition` WOULD do to one partition of one worker node, and does nothing (infra/forge/wipe-a-partition.sh --plan <node> <partition>; backlog c98e3425, door 4 of the gate-volume move David ordered on 88b35891). It runs every bound the write runs — the node is a talos-worker in the estate registry and the cluster agrees; the partition is one NVMe partition's kernel name (^nvme[0-9]+n[0-9]+p[0-9]+$); its disk is neither the disk Talos's systemdisk names nor the one EPHEMERAL lives on; Talos discovers it as a partition of that disk labelled u-<name>; that disk carries no other partition; no volume Talos holds (volumestatus) is named its label, located on it or living on its disk; nothing is mounted from the disk (talosctl mounts); and /var/mnt/<name> is not a Longhorn disk on the node (nodes.longhorn.io spec.disks) — and then prints the plan: the node, its address and role, the partition by kernel name AND by what Talos says it is (its label, index, partition uuid, size, filesystem and filesystem uuid; its parent disk's model, serial, wwid, size and transport), the system disk, the Longhorn disks on the node, and the exact act: talosctl -n <the registry's address> wipe disk <partition> --drop-partition (the argv as the pinned v1.13.8 client's own wipe disk --help gives it; infra/estate/install-cluster-operator.sh pins that client by sha256). Every read fails closed (exit 1): an unread fact is never 'none'. No clock and no resource version in the bytes; its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1). Any refusal (exit 78) renders no plan. Timeout 120: six bounded reads through the forge's ops doors.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/wipe-a-partition.sh",
+    "--plan",
+    "{1}",
+    "{2}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    {
+      "name": "partition",
+      "pattern": "^nvme[0-9]+n[0-9]+p[0-9]+$"
+    }
+  ],
+  "timeout": 120
+}

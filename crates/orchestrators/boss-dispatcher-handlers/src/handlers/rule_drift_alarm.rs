@@ -8,10 +8,14 @@
 //! sat for up to eleven days under a boot line that said "already
 //! matches"; the defect was found by a refused ops-request, not by
 //! anything reading the journal. A warning in a boot log is a check
-//! nobody reads (CLAUDE.md §Diagnosis), so each drift also becomes ONE
-//! urgent backlog-item, deduped on [`DRIFT_KEY`] = `<name>@v<version>`
-//! against the OPEN alarms, the way the coverage backstop dedups on its
-//! control.
+//! nobody reads (CLAUDE.md §Diagnosis), so each drifted RULE also
+//! becomes ONE urgent backlog-item, keyed on [`DRIFT_KEY`] = the rule's
+//! name against the OPEN alarms, the way the coverage backstop keys on
+//! its control. The version is the EPISODE (`<name>@v<version>`): the
+//! same rule drifting again at a later version while its alarm is open
+//! is appended to that alarm as an occurrence (backlog f4b0ad41) — it
+//! was keyed on the version until then, so one rule could hold two
+//! open alarms.
 //!
 //! WHY IT NEVER STOPS THE BOOT. The seed runs before the rules runner
 //! starts, and a boot that refused over one drifted file would stop
@@ -25,27 +29,27 @@
 //! does not withdraw its own alarm — the triage that routes the fix
 //! closes it — and a still-open alarm is never filed twice.
 
-use std::collections::BTreeSet;
-
 use boss_dispatcher::rules::handler::HandlerError;
 use boss_dispatcher::rules::seed::Drift;
 use boss_jobs::channels::InputChannel;
 use serde_json::{Value as Json, json};
 
-use super::common::{jobs_where, owner_for_filing, post_json, with_lane};
+use super::alarm_item::{self, Occurrence, Raised};
+use super::common::{jobs_where, owner_for_filing, with_lane};
 
 /// The name the filing signs as (`rule:<this>`): the boot seed is not a
 /// rule row, but the jobs API credits every dispatcher write to one.
 pub const ACTOR: &str = "dispatcher-rule-seed";
 
-/// The packet-metadata key holding `<name>@v<version>` — the dedup key.
+/// The packet-metadata key holding the drifted rule's name — the dedup
+/// key, one open alarm per rule.
 pub const DRIFT_KEY: &str = "drifted_rule";
 
 /// The `scope` every alarm this files carries.
 pub const SCOPE: &str = "rule-drift";
 
-/// `<name>@v<version>`: one alarm per drifted version, so a second edit
-/// that is bumped and drifts again is a new finding.
+/// `<name>@v<version>`: the drift's EPISODE, so a rule that is bumped
+/// and drifts again while its alarm is open is a new occurrence on it.
 pub fn drift_key(d: &Drift) -> String {
     format!("{}@v{}", d.name, d.version)
 }
@@ -87,7 +91,7 @@ pub fn alarm_body(d: &Drift, owner: &str) -> Json {
         "metadata": with_lane(json!({
             "area": "dispatcher",
             "scope": SCOPE,
-            DRIFT_KEY: drift_key(d),
+            DRIFT_KEY: d.name,
             "rule": d.name,
             "version": d.version,
             "row_status": d.status,
@@ -97,9 +101,11 @@ pub fn alarm_body(d: &Drift, owner: &str) -> Json {
     })
 }
 
-/// File one alarm per drift no open alarm already names. Returns how
-/// many were filed. Reads the open alarms first and files nothing if
-/// that read fails: a dark dedup read must not become a flood.
+/// File one alarm per drifted rule no open alarm already names; a rule
+/// whose alarm is open takes the drift as an occurrence when it is at a
+/// version the alarm has not seen (backlog f4b0ad41). Returns how many
+/// were filed. Reads the open alarms first and files nothing if that
+/// read fails: a dark dedup read must not become a flood.
 pub async fn file_drift_alarms(
     client: &boss_core::machine_token::Client,
     jobs_base: &str,
@@ -110,32 +116,48 @@ pub async fn file_drift_alarms(
         return Ok(0);
     }
     let jobs_base = jobs_base.trim_end_matches('/');
-    let open: BTreeSet<String> = jobs_where(
+    let open = jobs_where(
         client,
         jobs_base,
         &format!("kind=backlog-item&status=open&metadata_has={DRIFT_KEY}"),
         ACTOR,
     )
-    .await?
-    .iter()
-    .filter_map(|row| row.pointer(&format!("/metadata/{DRIFT_KEY}")))
-    .filter_map(Json::as_str)
-    .map(str::to_string)
-    .collect();
+    .await?;
     let owner = owner_for_filing(owner, ACTOR).await;
     let mut filed = 0usize;
     for d in drifted {
-        if open.contains(&drift_key(d)) {
-            continue;
-        }
-        post_json(
+        // The boot has no tick, so the occurrence is unstamped: the
+        // write's own event stamp says when, and no clock is read here
+        // (backlog 2b03a2df).
+        let occ = Occurrence::unstamped(format!(
+            "the boot seed read {} at v{} ({}) differing in: {}",
+            d.name,
+            d.version,
+            d.status,
+            d.fields.join(", ")
+        ))
+        .in_episode(drift_key(d));
+        // The newest drift is what the open alarm should name.
+        let refresh = [
+            ("version".to_string(), json!(d.version)),
+            ("row_status".to_string(), json!(d.status)),
+            ("fields".to_string(), json!(d.fields)),
+        ]
+        .into_iter()
+        .collect();
+        let raised = alarm_item::raise(
             client,
-            &format!("{jobs_base}/api/jobs"),
-            &alarm_body(d, &owner),
+            jobs_base,
+            alarm_item::open_item(&open, DRIFT_KEY, &d.name),
+            alarm_body(d, &owner),
+            &occ,
+            refresh,
             ACTOR,
         )
         .await?;
-        filed += 1;
+        if matches!(raised, Raised::Filed(_)) {
+            filed += 1;
+        }
     }
     Ok(filed)
 }
@@ -195,9 +217,13 @@ mod tests {
         }
     }
 
-    fn open_alarm(key: &str) -> Json {
+    /// An alarm a v1 drift of `rule` filed, as the jobs API lists it.
+    fn open_alarm(rule: &str) -> Json {
         json!({"id": "al-1", "kind": "backlog-item", "status": "open",
-               "metadata": {"scope": SCOPE, DRIFT_KEY: key}, "steps": []})
+               "metadata": {"scope": SCOPE, DRIFT_KEY: rule, "version": 1,
+                            "row_status": "active", "fields": ["when", "do"],
+                            "occurrences": 1, "last_episode": format!("{rule}@v1")},
+               "steps": []})
     }
 
     fn owner() -> boss_core::platform_owner::Fixed {
@@ -211,7 +237,7 @@ mod tests {
         assert_eq!(body["priority"], "urgent");
         assert_eq!(body["owner_id"], "emp-owner");
         let m = &body["metadata"];
-        assert_eq!(m[DRIFT_KEY], "broker-mints@v1");
+        assert_eq!(m[DRIFT_KEY], "broker-mints");
         assert_eq!(m["area"], "dispatcher");
         assert_eq!(m["fields"], json!(["when", "do"]));
         let detail = m["description"].as_str().unwrap();
@@ -244,7 +270,9 @@ mod tests {
         let sent = stub.sent();
         assert_eq!(sent.len(), 2, "{sent:?}");
         assert!(sent.iter().all(|(route, _)| route == "POST /api/jobs"));
-        assert_eq!(sent[0].1["metadata"][DRIFT_KEY], "a@v1");
+        assert_eq!(sent[0].1["metadata"][DRIFT_KEY], "a");
+        assert_eq!(sent[0].1["metadata"]["last_episode"], "a@v1");
+        assert_eq!(sent[0].1["metadata"]["occurrences"], 1);
     }
 
     /// Every boot re-reads the drift, so an alarm still open is not
@@ -255,7 +283,7 @@ mod tests {
     async fn an_open_alarm_for_the_drift_is_not_filed_again() {
         let stub = listing_stub::serve(vec![(
             ALARMS,
-            listing_stub::backlog_listing(&[open_alarm("a@v1")], Some(DRIFT_KEY), Some(500)),
+            listing_stub::backlog_listing(&[open_alarm("a")], Some(DRIFT_KEY), Some(500)),
         )])
         .await;
         let filed = file_drift_alarms(&api_client(), &stub.base, &owner(), &[drift("a")])
@@ -263,6 +291,51 @@ mod tests {
             .unwrap();
         assert_eq!(filed, 0);
         assert!(stub.writes().is_empty(), "{:?}", stub.writes());
+    }
+
+    /// AN OPEN ALARM UPDATES ITS ITEM (backlog f4b0ad41, rule 3). The
+    /// rule drifted at v1, its alarm is still open, and it drifts again
+    /// at v2: that is a second occurrence about the SAME rule, appended
+    /// to the open item — not a second item about one rule, which is
+    /// what keying the alarm on `<name>@v<version>` filed.
+    #[tokio::test]
+    async fn a_new_version_drifting_while_its_alarm_is_open_appends_and_files_nothing() {
+        let open = open_alarm("a");
+        let stub = listing_stub::serve(vec![(
+            ALARMS,
+            listing_stub::backlog_listing(&[open], Some(DRIFT_KEY), Some(500)),
+        )])
+        .await;
+        let mut again = drift("a");
+        again.version = 2;
+        let filed = file_drift_alarms(&api_client(), &stub.base, &owner(), &[again])
+            .await
+            .unwrap();
+        assert_eq!(filed, 0);
+        let sent = stub.sent();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, "PATCH /api/jobs/al-1/metadata");
+        assert_eq!(sent[0].1["occurrences"], 2);
+        assert_eq!(sent[0].1["last_episode"], "a@v2");
+        assert_eq!(sent[0].1["version"], 2);
+    }
+
+    /// The alarm the rule held is CLOSED: the next drift is a new fact
+    /// and files a new item.
+    #[tokio::test]
+    async fn a_drift_after_its_alarm_closed_files_a_new_one() {
+        let mut closed = open_alarm("a");
+        closed["status"] = json!("closed");
+        let stub = listing_stub::serve(vec![(
+            ALARMS,
+            listing_stub::backlog_listing(&[closed], Some(DRIFT_KEY), Some(500)),
+        )])
+        .await;
+        let filed = file_drift_alarms(&api_client(), &stub.base, &owner(), &[drift("a")])
+            .await
+            .unwrap();
+        assert_eq!(filed, 1);
+        assert_eq!(stub.sent()[0].0, "POST /api/jobs");
     }
 
     /// A dedup read that is not an answer files nothing: a flood of

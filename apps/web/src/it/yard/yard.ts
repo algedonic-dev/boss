@@ -4,7 +4,7 @@ import { nonBlankProofString } from './proof-strings';
 // pr-train and ship-a-change Jobs the conductor already writes;
 // audit-readonly reads only, so the guest landing renders whole.
 //
-// The loading dock is the first registry-backed lens (stations.md):
+// The loading dock is the first registry-backed lens (station-tree.md):
 // its rows come from `GET /api/stations/loading-dock/queue` — the
 // station's predicate and discipline evaluated server-side — with the
 // old hand-rolled derivation kept as fallback for clusters that
@@ -94,7 +94,7 @@ export type DeliveryChannel = (typeof DELIVERY_CHANNELS)[number];
 /** The "not yet" exit (EX_TEMPFAIL): a verb or probe that ran, found
  *  the world not ready to judge, and said so. It is not a failure —
  *  the one TypeScript spelling of Rust's `NOT_YET_EXIT`
- *  (boss-dispatcher-handlers jobs_complete_linked_step.rs), held equal
+ *  (boss-jobs ops_execution.rs, the ops-execution classifier), held equal
  *  to it by yard-machines.test.ts. The converge verb exits 75 when a
  *  converge already running took its start into itself (backlog
  *  1058e686, car D); read as a failure, the shed drew a healthy
@@ -354,7 +354,7 @@ export type TrainRow = Readonly<{
   cancelRefused: boolean;
 }>;
 
-// The `GET /api/stations/{name}/queue` envelope (stations.md; the
+// The `GET /api/stations/{name}/queue` envelope (station-tree.md; the
 // StationQueue struct in boss-jobs/src/station_queue.rs). Discipline
 // keys and station kinds stay plain strings on this side: the lens
 // renders whatever vocabulary the registry declares — a key published
@@ -363,21 +363,9 @@ export type StationQueueEnvelope = Readonly<{
   station: string;
   kind: string;
   discipline: readonly string[];
-  wip_limit?: number | null;
-  over_limit: boolean;
-  /** The station's declared upstream, when the row names one.
-   *  Optional on the wire: a cluster whose registry predates
-   *  119-station-upstream.sql omits the key entirely. */
-  upstream?: StationUpstream | null;
   total: number;
   data: readonly JobLite[];
 }>;
-
-// Where the queue that FEEDS a station is read, exactly as the
-// registry row declares it (`stations.upstream`; StationUpstream in
-// boss-jobs). One object, not two loose strings: a label with no href
-// is a dead button and an href with no label is an unlabelled one.
-export type StationUpstream = Readonly<{ label: string; href: string }>;
 
 // Where the dock's rows came from: the station registry served, with
 // the row's own facts, or it did not — and then the lane has NO
@@ -397,10 +385,7 @@ export type DockStation =
   | Readonly<{
       source: 'station';
       discipline: readonly string[];
-      wipLimit: number | null;
-      overLimit: boolean;
       total: number;
-      upstream: StationUpstream | null;
     }>
   | Readonly<{ source: 'unavailable' }>;
 
@@ -409,55 +394,6 @@ export type DockStation =
 // why the queue is in this order.
 export function disciplineLabel(discipline: readonly string[]): string {
   return discipline.map(k => k.toUpperCase()).join(' → ');
-}
-
-// Q3's resolution rendered: `wip_limit` is advisory — a lens warning,
-// never enforcement. Chip text only when the station declared a limit
-// AND the server's verdict says the queue exceeds it.
-export function wipAdvisory(station: DockStation): string | null {
-  if (station.source !== 'station') return null;
-  if (!station.overLimit || station.wipLimit === null) return null;
-  return `WIP ${station.total}/${station.wipLimit}`;
-}
-
-// The walk upstream (David, feedback 3ccb79f5): "navigating to the
-// upstream queues when jobs aren't materializing as expected. That is
-// how our actual operators will diagnose the running system too."
-//
-// A lens that cannot walk upstream forces the operator out of the
-// system to guess. So the button is NAVIGATION, not content: it adds
-// no packet, no count, no state — it points at where this queue's
-// traffic comes from.
-//
-// Everything about it is the station row's business. The lens supplies
-// the "walk upstream" framing (the arrow, the word) and the row
-// supplies the destination, so any station that declares an upstream
-// gets the affordance with zero code here — and one that declares none
-// renders nothing rather than a guess.
-export type UpstreamButton = Readonly<{ label: string; href: string; title: string }>;
-
-/** The button for a declared upstream, or null when there is nothing
- *  honest to point at. A half-declared pointer (label without href, or
- *  the reverse) is treated as absent: a dead navigational aid is worse
- *  than none, because it fails at exactly the moment it is trusted. */
-export function upstreamButton(up: StationUpstream | null | undefined): UpstreamButton | null {
-  if (!up) return null;
-  const label = up.label.trim();
-  const href = up.href.trim();
-  if (label === '' || href === '') return null;
-  const name = label.toUpperCase();
-  return {
-    label: `↑ UPSTREAM: ${name}`,
-    href,
-    title: `Walk upstream to ${name} — the queue that feeds this station`,
-  };
-}
-
-/** The dock's walk upstream. Same shape as `wipAdvisory`: a station
- *  fact off the envelope, or null when the queue did not serve — no
- *  row read, so nothing honest to say about upstream. */
-export function dockUpstream(station: DockStation): UpstreamButton | null {
-  return station.source === 'station' ? upstreamButton(station.upstream) : null;
 }
 
 export type YardState = Readonly<{
@@ -784,13 +720,17 @@ export function itemAnswer(c: ArrivalCar): ItemAnswer | null {
   return null;
 }
 export type ArrivalSkip = Readonly<{ car_id_short: string | null; reason: string | null }>;
+/** The deploy leg ends at `converged`, the observed deploy. Reports
+ *  filed before backlog 4472781d carried `deployed_at` and
+ *  `merge_to_deploy_s` instead — the merge instant and a 0 — and are
+ *  deliberately not read: a fabricated zero is not a timing. */
 export type ArrivalTimings = Readonly<{
   boarded_at: string | null;
   merged_at: string | null;
-  deployed_at: string | null;
+  converged_at: string | null;
   arrived_at: string | null;
   board_to_merge_s: number | null;
-  merge_to_deploy_s: number | null;
+  merge_to_converge_s: number | null;
   total_s: number | null;
 }>;
 export type ArrivalReport = Readonly<{
@@ -818,10 +758,10 @@ function timings(v: unknown): ArrivalTimings | null {
   return {
     boarded_at: asText(t.boarded_at),
     merged_at: asText(t.merged_at),
-    deployed_at: asText(t.deployed_at),
+    converged_at: asText(t.converged_at),
     arrived_at: asText(t.arrived_at),
     board_to_merge_s: asNumber(t.board_to_merge_s),
-    merge_to_deploy_s: asNumber(t.merge_to_deploy_s),
+    merge_to_converge_s: asNumber(t.merge_to_converge_s),
     total_s: asNumber(t.total_s),
   };
 }
@@ -861,20 +801,20 @@ export function arrivalReport(j: WithSteps): ArrivalReport | null {
 // ETAs. The batching the train does is exactly the coordination cost an
 // ETA answers — but an estimate that looks like a promise is worse than
 // none. So: the numbers come from what recent trains ACTUALLY did
-// (median board→merge, median merge→deploy), a train with no started-at
+// (median board→merge, median merge→converge), a train with no started-at
 // evidence gets its phase and no time, and the chip always wears `~`.
 // ---------------------------------------------------------------------------
 
 export type ArrivalMedians = Readonly<{
   boardToMergeS: number | null;
-  mergeToDeployS: number | null;
+  mergeToConvergeS: number | null;
   /** How many arrivals contributed a usable leg — the estimate's basis. */
   samples: number;
 }>;
 
 export const NO_MEDIANS: ArrivalMedians = {
   boardToMergeS: null,
-  mergeToDeployS: null,
+  mergeToConvergeS: null,
   samples: 0,
 };
 
@@ -905,7 +845,7 @@ export function arrivalMedians(
   window: number = ARRIVAL_SAMPLE_WINDOW,
 ): ArrivalMedians {
   const boardToMerge: number[] = [];
-  const mergeToDeploy: number[] = [];
+  const mergeToConverge: number[] = [];
   let samples = 0;
   for (const j of arrived.slice(0, window)) {
     const t = arrivalReport(j)?.timings ?? null;
@@ -915,19 +855,23 @@ export function arrivalMedians(
         stampAt(step(j, 'pr', 'Open the batched PR')),
         stampAt(step(j, 'merged', 'Merged into main')),
       );
-    const md =
-      t?.merge_to_deploy_s ??
+    // To `converged`, never to `deployed`: the conductor stamps
+    // `deployed` in the same pass as `merged`, so that leg read 0 on
+    // every arrival and an ETA built on it left the converge wait out
+    // (backlog 4472781d).
+    const mc =
+      t?.merge_to_converge_s ??
       legSeconds(
         stampAt(step(j, 'merged', 'Merged into main')),
-        stampAt(step(j, 'deployed', 'Deployed to the playground')),
+        stampAt(step(j, 'converged', 'Cluster converged')),
       );
     if (bm !== null) boardToMerge.push(bm);
-    if (md !== null) mergeToDeploy.push(md);
-    if (bm !== null || md !== null) samples += 1;
+    if (mc !== null) mergeToConverge.push(mc);
+    if (bm !== null || mc !== null) samples += 1;
   }
   return {
     boardToMergeS: median(boardToMerge),
-    mergeToDeployS: median(mergeToDeploy),
+    mergeToConvergeS: median(mergeToConverge),
     samples,
   };
 }
@@ -974,7 +918,7 @@ export function trainEta(j: JobLite, medians: ArrivalMedians, nowMs: number): Et
   const phase = etaPhase(trainStatus(j), ciLamp(j));
   const phaseOnly: Eta = { kind: 'phase', phase };
   const basis = `median of last ${medians.samples} arrivals`;
-  const { boardToMergeS, mergeToDeployS } = medians;
+  const { boardToMergeS, mergeToConvergeS } = medians;
 
   // Remaining seconds on the leg under way, plus whatever legs follow.
   // `startedAt` is the evidence requirement: no stamp, no estimate —
@@ -990,25 +934,26 @@ export function trainEta(j: JobLite, medians: ArrivalMedians, nowMs: number): Et
     return { kind: 'eta', phase, atMs: nowMs + Math.round(left * 1000), basis, progress };
   };
 
-  // Converging renders an elapsed "converging for …", not an ETA: there
-  // is no merge→converge median in `medians`, and inventing a converge
-  // duration would read as a promise. The board reads `convergingSince`
-  // (carried on the row by `toTrainRow`) for the elapsed instead — the
+  // Converging renders an elapsed "converging for …", not an ETA: the
+  // merge→converge median prices the leg a train has not yet entered,
+  // and once it is converging the elapsed is the honest reading. The
+  // board reads `convergingSince` (carried on the row by `toTrainRow`)
+  // for the elapsed instead — the
   // same choice the server model makes (boss-jobs/src/yard.rs, which
   // surfaces convergence as elapsed time, never a projection).
   if (phase === 'converging') return phaseOnly;
 
   if (phase === 'ci' || phase === 'merging') {
-    if (boardToMergeS === null || mergeToDeployS === null) return phaseOnly;
+    if (boardToMergeS === null || mergeToConvergeS === null) return phaseOnly;
     return project(
       stampAt(step(j, 'pr', 'Open the batched PR')),
       boardToMergeS,
-      mergeToDeployS,
+      mergeToConvergeS,
     );
   }
   if (phase === 'deploying') {
-    if (mergeToDeployS === null) return phaseOnly;
-    return project(stampAt(step(j, 'merged', 'Merged into main')), mergeToDeployS, 0);
+    if (mergeToConvergeS === null) return phaseOnly;
+    return project(stampAt(step(j, 'merged', 'Merged into main')), mergeToConvergeS, 0);
   }
   return phaseOnly;
 }
@@ -1194,17 +1139,28 @@ function readCancelRefused(j: JobLite): boolean {
  *  when the gate could not be filed and CI alone judged the train, and
  *  WHY the gate is not filed yet while the conductor keeps trying (the
  *  bound line naming the running gates; nulled the pass it is filed).
- *  Every field is a packet field; nothing is derived. */
+ *  Every field but `wait_since` is a packet field, read verbatim. */
 export type TrainGateReading = Readonly<{
   run: string | null;
   line: string | null;
   forge: string | null;
   fallback: string | null;
+  /** Written on EVERY failed launch — the bound, a manifest that does not
+   *  render, kubectl, RBAC. */
   wait_reason: string | null;
-  /** When the wait for a bay began, as the record holds it: the later of
-   *  the PR's opening and the last gate launch (track.rs
-   *  `train_gate_wait_since`, the same two facts). Null when neither is
-   *  recorded — then a wait is trouble at once, never guessed short. */
+  /** The train's place in the gate line (`train_gate_bound_wait`): set
+   *  by a bound refusal, a gate-run owed a relaunch, or an unfiled retry
+   *  (812a6ed8). Priority is distinct from the fault's trouble reading. */
+  bound_wait: string | null;
+  /** An unresolved unfiled fault, distinct from the retained queue place.
+   *  Historical callers may omit this derived reading. */
+  launch_failure?: string | null;
+  /** When the wait for a bay began, as the record holds it: the latest
+   *  of the PR's opening, the last gate launch and the last refusal
+   *  (track.rs `train_gate_wait_since`, the same three facts, read by its
+   *  two rules: a completed step only, an RFC3339 stamp only). Null when
+   *  none is recorded — then a wait is trouble at once, never guessed
+   *  short. */
   wait_since: string | null;
   relaunches: number;
 }>;
@@ -1222,7 +1178,10 @@ export function readTrainGate(j: JobLite): TrainGateReading | null {
     train_gate_run?: unknown;
     train_gate_fallback?: unknown;
     train_gate_wait_reason?: unknown;
+    train_gate_bound_wait?: unknown;
+    train_gate_last_launch_failure?: unknown;
     train_gate_launched_at?: unknown;
+    train_gate_refusals?: unknown;
     train_gate_relaunches?: unknown;
   };
   const ci = (step(j, 'ci', 'CI verdict')?.metadata ?? {}) as {
@@ -1236,20 +1195,49 @@ export function readTrainGate(j: JobLite): TrainGateReading | null {
   const forge = text(ci.forge_result);
   const fallback = text(md.train_gate_fallback);
   const wait_reason = text(md.train_gate_wait_reason);
+  const bound_wait = text(md.train_gate_bound_wait);
+  const lastFailure = md.train_gate_last_launch_failure;
+  const failure = lastFailure !== null && typeof lastFailure === 'object'
+    ? lastFailure as { reason?: unknown; at?: unknown }
+    : null;
+  const failureAt = rfc3339Ms(text(failure?.at));
+  const filedAt = rfc3339Ms(text(md.train_gate_launched_at));
+  // Filing preserves the diagnosis, but resolves that fault. A later
+  // relaunch must not inherit trouble from before its successful filing.
+  const launch_failure = run === null && !Number.isNaN(failureAt)
+    && (Number.isNaN(filedAt) || failureAt > filedAt) ? text(failure?.reason) : null;
   const relaunches = typeof md.train_gate_relaunches === 'number' ? md.train_gate_relaunches : 0;
-  if (run === null && line === null && forge === null && fallback === null && wait_reason === null) return null;
-  const wait_since = laterStamp(stampAt(step(j, 'pr', 'Open the batched PR')), text(md.train_gate_launched_at));
-  return { run, line, forge, fallback, wait_reason, wait_since, relaunches };
+  if (run === null && line === null && forge === null && fallback === null && wait_reason === null && bound_wait === null && launch_failure === null) {
+    return null;
+  }
+  const pr = step(j, 'pr', 'Open the batched PR');
+  const refusals = Array.isArray(md.train_gate_refusals) ? (md.train_gate_refusals as unknown[]) : [];
+  const wait_since = latestStamp([
+    completed(pr) ? stampAt(pr) : null,
+    text(md.train_gate_launched_at),
+    ...refusals.map(r => text((r as { at?: unknown } | null)?.at)),
+  ]);
+  return { run, line, forge, fallback, wait_reason, bound_wait, launch_failure, wait_since, relaunches };
 }
 
-/** The later of two instants, either of which may be absent or
- *  unparseable; null when neither reads. */
-function laterStamp(a: string | null, b: string | null): string | null {
-  const ms = (x: string | null): number => (x === null ? Number.NaN : Date.parse(x));
-  const [am, bm] = [ms(a), ms(b)];
-  if (Number.isNaN(am)) return Number.isNaN(bm) ? null : b;
-  if (Number.isNaN(bm)) return a;
-  return bm > am ? b : a;
+/** The shape track.rs `parse_instant` (chrono's `parse_from_rfc3339`)
+ *  accepts, and no other: Date.parse alone also reads a bare date as
+ *  midnight, so the two sides dated one wait differently (review
+ *  a2ace778, finding 3). */
+const RFC3339 = /^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$/;
+
+function rfc3339Ms(x: string | null): number {
+  return x !== null && RFC3339.test(x) ? Date.parse(x.toUpperCase()) : Number.NaN;
+}
+
+/** The latest of these instants that reads as RFC3339, verbatim; null
+ *  when none does. */
+function latestStamp(xs: readonly (string | null)[]): string | null {
+  return xs.reduce<string | null>((best, x) => {
+    const ms = rfc3339Ms(x);
+    if (Number.isNaN(ms)) return best;
+    return best === null || ms > rfc3339Ms(best) ? x : best;
+  }, null);
 }
 
 /** The verdict row's one line: both halves, in words the conductor
@@ -1260,23 +1248,30 @@ function laterStamp(a: string | null, b: string | null): string | null {
 export function trainGateLabel(g: TrainGateReading): string {
   const forge = g.forge ? `forge ${g.forge}` : 'forge pending';
   if (g.fallback) return `${forge} · gate UNAVAILABLE — CI alone judged this train`;
+  if (g.launch_failure) return `${forge} · gate launch failing: ${g.launch_failure}`;
   if (g.line) return `${forge} · ${g.line.replace(/^train gate: /, 'gate ')}`;
-  if (g.wait_reason) return `${forge} · gate waiting: ${g.wait_reason}`;
+  const waiting = g.wait_reason ?? g.bound_wait;
+  // An uncertain CREATE retains a reason beside its already-filed run.
+  // Keep a real bound wait, but do not describe that running gate as waiting.
+  if (waiting && (g.run === null || g.bound_wait !== null)) return `${forge} · gate waiting: ${waiting}`;
   if (g.run) return `${forge} · gate running (${g.run.slice(0, 8)})${g.relaunches > 0 ? ` · relaunched ${g.relaunches}×` : ''}`;
   return forge;
 }
 
 /** Whether the verdict row wears the yard's trouble style: a gate that
- *  could not be filed (fallback) at once; one still waiting for a bay
- *  (wait_reason) once the wait has held TRAIN_GATE_WAIT_MINUTES — a
- *  short wait is the train holding the first place in line, the normal
- *  path since 1e787fc2 (19227ca8). A troubled packet must look
- *  troubled; a wait with no onset on record is trouble at once. Ported
- *  to track.rs `train_gate_troubled`, which judges by the same number. */
+ *  could not be filed (fallback) at once; one holding its place in line
+ *  for a bay (bound_wait) once the wait has held TRAIN_GATE_WAIT_MINUTES
+ *  — a short wait is the normal path since 1e787fc2 (19227ca8); any
+ *  other failed launch (wait_reason with no place or bound run) at once, because no
+ *  bay that frees will file it (review a2ace778). A troubled packet must
+ *  look troubled; a wait with no onset on record is trouble at once.
+ *  track.rs `train_gate_unfiled` reads the same keys in the same order,
+ *  and its region settles the wait by the same number. */
 export function trainGateTroubled(g: TrainGateReading, nowMs: number = Date.now()): boolean {
   if (g.fallback !== null) return true;
-  if (g.wait_reason === null) return false;
-  const since = g.wait_since === null ? Number.NaN : Date.parse(g.wait_since);
+  if (g.launch_failure) return true;
+  if (g.bound_wait === null) return g.wait_reason !== null && g.run === null;
+  const since = g.wait_since === null ? Number.NaN : rfc3339Ms(g.wait_since);
   if (Number.isNaN(since)) return true;
   return nowMs - since >= TRAIN_GATE_WAIT_MINUTES * 60_000;
 }
@@ -1468,10 +1463,7 @@ export function assembleYard(
       ? {
           source: 'station',
           discipline: dockQueue.discipline,
-          wipLimit: dockQueue.wip_limit ?? null,
-          overLimit: dockQueue.over_limit,
           total: dockQueue.total,
-          upstream: dockQueue.upstream ?? null,
         }
       : { source: 'unavailable' },
     arrivals: arrived

@@ -279,7 +279,57 @@ under() { # <path> <dir> — path is dir or inside it
     [ "$1" = "$2" ] || [[ "$1" == "$2"/* ]]
 }
 
-OPT_REAL=$(realpath -e -- "$OPT" 2>/dev/null) \
+# kernel_path e|m <path> — where the KERNEL reaches <path>, one component
+# at a time: each name is asked of the kernel (`[ -L ]` is lstat(2)) on a
+# prefix already resolved physically, a symlink's target from readlink is
+# put back in front of what remains, and `..` climbs from the resolved
+# prefix, never from the spelling — never `realpath`, whose -e/-m is
+# GNU's and which a host may ship as one that collapses `..` as text
+# first (backlog 9b74c84b, after restore-shared's 920f4fd5). `e` refuses
+# a missing component, or a non-directory with more path after it; `m`
+# spells a missing name as written and keeps walking, so a link AFTER a
+# cancelled missing prefix (`gone/../link`) is still followed, as GNU -m
+# follows it — the first text folded the missing prefix and appended the
+# rest unresolved (review 5e3eb6f3). More than 40 links is a refusal in
+# both modes: no answer exists, and a spelling would pass a guard. One
+# text in every root verb that carries it, held to GNU's answers by
+# gcp_root_paths_resolve_through_the_kernel.rs.
+kernel_path() {
+    local mode=$1 rest=$2 r c t more links=0
+    [ -n "$rest" ] || return 1
+    case $rest in
+        /*) r= ;;
+        *) r=$(pwd -P) || return 1; r=${r%/} ;;
+    esac
+    while [ -n "$rest" ]; do
+        case $rest in
+            */*) c=${rest%%/*}; rest=${rest#*/}; more=1 ;;
+            *) c=$rest; rest=; more= ;;
+        esac
+        case $c in
+            '' | .) continue ;;
+            ..) r=${r%/*}; continue ;;
+        esac
+        if [ -L "$r/$c" ]; then
+            links=$((links + 1))
+            [ "$links" -le 40 ] || return 1
+            t=$(readlink -- "$r/$c" && printf .) || return 1
+            t=${t%.}; t=${t%$'\n'}
+            [ -n "$t" ] || return 1
+            case $t in /*) r= ;; esac
+            rest=$t${more:+/$rest}
+        elif [ "$mode" = m ]; then
+            r=$r/$c
+        elif [ -e "$r/$c" ] && { [ -z "$more" ] || [ -d "$r/$c" ]; }; then
+            r=$r/$c
+        else
+            return 1
+        fi
+    done
+    printf '%s\n' "${r:-/}"
+}
+
+OPT_REAL=$(kernel_path e "$OPT") \
     || refuse "$OPT does not resolve on this host"
 LINK_DIRS="${BOSS_RECLAIM_LINK_DIRS:-$OPT_REAL /usr/local/bin /usr/bin /usr/sbin /etc/systemd/system}"
 free_mib() { df -Pm -- "$OPT_REAL" 2>/dev/null | awk 'NR == 2 { print $4 }'; }
@@ -651,7 +701,7 @@ for d in "$OPT"/boss-binbak-* "$OPT"/boss-dev-bak; do
         refuse "\`$d\` is a symlink (to $(readlink -- "$d")) — this verb removes only real directories under $OPT, never what a link points at"
     fi
     [ -d "$d" ] || refuse "\`$d\` is not a directory — this verb removes backup directories only"
-    real=$(realpath -e -- "$d") || refuse "\`$d\` does not resolve"
+    real=$(kernel_path e "$d") || refuse "\`$d\` does not resolve"
     [ "$real" = "$OPT_REAL/$name" ] \
         || refuse "\`$d\` resolves to $real, not $OPT_REAL/$name — it is not the directory its name says"
     checkouts_evidence "$real" > "$TMP/evidence"
@@ -697,7 +747,7 @@ done
 # (a) the live trees themselves.
 for live in "$OPT/boss" "$OPT/boss-cli"; do
     [ -e "$live" ] || continue
-    lr=$(realpath -e -- "$live") || refuse "$live does not resolve, so whether it points into a backup cannot be judged"
+    lr=$(kernel_path e "$live") || refuse "$live does not resolve, so whether it points into a backup cannot be judged"
     for c in "${CANDS[@]+"${CANDS[@]}"}"; do
         if under "$lr" "$c" || under "$c" "$lr"; then
             refuse "$live resolves to $lr, which is \`$c\` or overlaps it — that backup is LIVE"
@@ -723,7 +773,11 @@ if [ "${#CANDS[@]}" -gt 0 ]; then
             skip=0
             for c in "${CANDS[@]}"; do under "$link" "$c" && skip=1; done
             [ "$skip" = 1 ] && continue
-            t=$(realpath -m -- "$link" 2>/dev/null) || continue
+            # A link whose answer cannot be established (a loop) is
+            # refused, not skipped: skipping it passed the guard on no
+            # evidence (review 5e3eb6f3).
+            t=$(kernel_path m "$link" 2>/dev/null) \
+                || refuse "the symlink $link does not resolve (a loop, or more than 40 links), so whether it reaches a backup cannot be judged — a bound that cannot be evaluated is not passed"
             for c in "${CANDS[@]}"; do
                 under "$t" "$c" && refuse "the symlink $link resolves to $t, inside \`$c\` — that backup is still linked to"
             done
@@ -754,7 +808,8 @@ if [ "${#CANDS[@]}" -gt 0 ]; then
             || refuse "systemctl show $unit failed ($(head -c 300 "$TMP/show.err")), so whether it runs from a backup cannot be judged"
         set -f
         for p in $(printf '%s\n' "$props" | grep -oE '/[^ ;]+'); do
-            t=$(realpath -m -- "$p" 2>/dev/null) || continue
+            t=$(kernel_path m "$p" 2>/dev/null) \
+                || refuse "the unit $unit names $p, which does not resolve (a loop, or more than 40 links), so whether it runs from a backup cannot be judged — a bound that cannot be evaluated is not passed"
             for c in "${CANDS[@]}"; do
                 under "$t" "$c" && refuse "the unit $unit names $p (resolving to $t), inside \`$c\` — that backup is LIVE"
             done
@@ -861,7 +916,7 @@ if [ -e "$CAPTURE_DIR" ] || [ -L "$CAPTURE_DIR" ]; then
     [ -L "$CAPTURE_DIR" ] \
         && refuse "\`$CAPTURE_DIR\` is a symlink (to $(readlink -- "$CAPTURE_DIR")) — the capture is removed only from the directory retire-second-stack wrote it to, never through a link"
     [ -d "$CAPTURE_DIR" ] || refuse "\`$CAPTURE_DIR\` is not a directory"
-    cap_real=$(realpath -e -- "$CAPTURE_DIR" 2>/dev/null) \
+    cap_real=$(kernel_path e "$CAPTURE_DIR" 2>/dev/null) \
         || refuse "\`$CAPTURE_DIR\` does not resolve"
     [ "$cap_real" = "$CAPTURE_DIR" ] \
         || refuse "\`$CAPTURE_DIR\` resolves to $cap_real — a link on the way means it is not the directory retire-second-stack wrote its capture to"
@@ -885,7 +940,7 @@ if [ -e "$CAPTURE_DIR" ] || [ -L "$CAPTURE_DIR" ]; then
             || refuse "could not count the links to \`$f\` ($(head -c 300 "$TMP/links.err")) — a bound that cannot be evaluated is not passed"
         [ "$links" = 1 ] \
             || refuse "\`$f\` has $links links — another name holds the same bytes, so removing this one frees nothing, and it may be a dump that is not the capture"
-        real=$(realpath -e -- "$f" 2>/dev/null) || refuse "\`$f\` does not resolve"
+        real=$(kernel_path e "$f" 2>/dev/null) || refuse "\`$f\` does not resolve"
         [ "$real" = "$CAPTURE_DIR/$name" ] \
             || refuse "\`$f\` resolves to $real, not $CAPTURE_DIR/$name — it is not the file its name says"
         [ -r "$MOUNTINFO" ] || refuse "$MOUNTINFO cannot be read, so whether a capture is a mount point cannot be judged"
@@ -946,7 +1001,7 @@ if [ -e "$DUMP_DIR" ] || [ -L "$DUMP_DIR" ]; then
     [ -L "$DUMP_DIR" ] \
         && refuse "\`$DUMP_DIR\` is a symlink (to $(readlink -- "$DUMP_DIR")) — the dumps are removed only from the directory the retired leg deposited them in, never through a link"
     [ -d "$DUMP_DIR" ] || refuse "\`$DUMP_DIR\` is not a directory"
-    dump_real=$(realpath -e -- "$DUMP_DIR" 2>/dev/null) \
+    dump_real=$(kernel_path e "$DUMP_DIR" 2>/dev/null) \
         || refuse "\`$DUMP_DIR\` does not resolve"
     [ "$dump_real" = "$DUMP_DIR" ] \
         || refuse "\`$DUMP_DIR\` resolves to $dump_real — a link on the way means it is not the directory the retired leg deposited its dumps in"
@@ -968,7 +1023,7 @@ if [ -e "$DUMP_DIR" ] || [ -L "$DUMP_DIR" ]; then
             || refuse "could not count the links to \`$f\` ($(head -c 300 "$TMP/links.err")) — a bound that cannot be evaluated is not passed"
         [ "$links" = 1 ] \
             || refuse "\`$f\` has $links links — another name holds the same bytes, so removing this one frees nothing"
-        real=$(realpath -e -- "$f" 2>/dev/null) || refuse "\`$f\` does not resolve"
+        real=$(kernel_path e "$f" 2>/dev/null) || refuse "\`$f\` does not resolve"
         [ "$real" = "$DUMP_DIR/$name" ] \
             || refuse "\`$f\` resolves to $real, not $DUMP_DIR/$name — it is not the file its name says"
         [ -r "$MOUNTINFO" ] || refuse "$MOUNTINFO cannot be read, so whether a dump is a mount point cannot be judged"
@@ -1130,7 +1185,7 @@ while read -r bytes sha f; do
         || stop 2 "REFUSED — could not count the links to \`$f\` just before removing it ($(head -c 300 "$TMP/links.err")); a bound that cannot be evaluated is not passed."
     [ "$links" = 1 ] \
         || stop 2 "REFUSED — \`$f\` has $links links now: another name holds the same bytes, so removing this one would free nothing the record could claim."
-    real=$(realpath -e -- "$f" 2>/dev/null) \
+    real=$(kernel_path e "$f" 2>/dev/null) \
         || stop 2 "REFUSED — \`$f\` does not resolve now; a bound that cannot be evaluated is not passed."
     [ "$real" = "$f" ] \
         || stop 2 "REFUSED — \`$f\` resolves to $real now, not itself; it is not the file the plan named."
@@ -1169,7 +1224,7 @@ while IFS=$'\t' read -r f ident; do
         || stop 2 "REFUSED — could not count the links to \`$f\` just before removing it ($(head -c 300 "$TMP/links.err")); a bound that cannot be evaluated is not passed."
     [ "$links" = 1 ] \
         || stop 2 "REFUSED — \`$f\` has $links links now: another name holds the same bytes, so removing this one would free nothing the record could claim."
-    real=$(realpath -e -- "$f" 2>/dev/null) \
+    real=$(kernel_path e "$f" 2>/dev/null) \
         || stop 2 "REFUSED — \`$f\` does not resolve now; a bound that cannot be evaluated is not passed."
     [ "$real" = "$f" ] \
         || stop 2 "REFUSED — \`$f\` resolves to $real now, not itself; it is not the file the plan named."

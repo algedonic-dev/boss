@@ -106,7 +106,7 @@ impl Tree {
             &dir.join("df"),
             "#!/usr/bin/env bash\n\
              echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
-             echo '/dev/fake 1 1 943718400 1% /'\n",
+             for _ in \"$@\"; do echo '/dev/fake 1 1 943718400 1% /'; done\n",
         );
         Tree { dir, tree }
     }
@@ -174,6 +174,8 @@ impl Tree {
             .env("GIT_CEILING_DIRECTORIES", "")
             .env_remove("BOSS_JOBS_URL")
             .env_remove("BOSS_ESTATE")
+            // And the mirror's other declaration (backlog 6665aa97).
+            .env_remove("BOSS_TRUNK")
             .env_remove("BOSS_EDIT_LEVEL_ANSWER")
             .env_remove("BOSS_SOR_WAIT_SECONDS");
         for (k, v) in env {

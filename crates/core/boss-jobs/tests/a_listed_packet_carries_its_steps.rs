@@ -116,6 +116,10 @@ fn execute_step(job: &str, exit_code: &str) -> Step {
 }
 
 async fn seed() -> Router {
+    seed_for(false).await
+}
+
+async fn seed_for(human_view: bool) -> Router {
     let jobs = Arc::new(InMemoryJobs::new());
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
@@ -138,7 +142,11 @@ async fn seed() -> Router {
         warp_factor: None,
     }));
     for (id, verb, exit) in [(FIRST, "converge", "0"), (SECOND, "publish-drift", "75")] {
-        jobs.create_job(&request(id, verb)).await.expect("job");
+        let mut job = request(id, verb);
+        if human_view {
+            job.metadata["large_receipt"] = serde_json::json!("receipt".repeat(32768));
+        }
+        jobs.create_job(&job).await.expect("job");
         let mut step = execute_step(id, exit);
         if id == SECOND {
             // The note jobs.complete_linked_step writes on a step whose
@@ -152,10 +160,64 @@ async fn seed() -> Router {
                 "alert": ALERT,
             });
         }
+        if human_view && id == SECOND {
+            step.metadata["human_only"] = serde_json::json!(" TrUe ");
+            step.assignee_id = Some("someone-else".into());
+        }
         jobs.add_step(&step).await.expect("step");
     }
     let state = JobsApiState::minimal(jobs, bus, publisher, policy, clock);
     router(state)
+}
+
+#[tokio::test]
+async fn the_human_required_view_is_canonical_thin_and_independent_of_holder() {
+    let app = seed_for(true).await;
+    let original = list(&app, "status=open&full=true").await;
+    assert!(serde_json::to_vec(&original).unwrap().len() > 65536);
+    let body = list(
+        &app,
+        "status=open&human_required_view=true&limit=1&offset=0",
+    )
+    .await;
+    assert!(
+        serde_json::to_vec(&body).unwrap().len() < 4096,
+        "the native view does not fan out receipts"
+    );
+    assert_eq!(
+        body["human_required_view"], 1,
+        "schema marker also qualifies empty pages"
+    );
+    assert_eq!(
+        body["total"], 2,
+        "total remains the scoped job population before projection"
+    );
+    let second = list(
+        &app,
+        "status=open&human_required_view=true&limit=1&offset=1",
+    )
+    .await;
+    let mut steps = Vec::new();
+    for page in [&body, &second] {
+        for job in page["data"].as_array().unwrap() {
+            assert!(
+                job.get("metadata").is_none(),
+                "no packet receipt fanout: {job}"
+            );
+            for step in job["steps"].as_array().unwrap() {
+                assert_eq!(step["human_required"], true);
+                assert!(step.get("metadata").is_none());
+                assert!(step.get("fields").is_none());
+                steps.push(step.clone());
+            }
+        }
+    }
+    assert_eq!(
+        steps.len(),
+        1,
+        "the unflagged agent-shaped task does not enter the view"
+    );
+    assert_eq!(steps[0]["title"], "execute");
 }
 
 async fn list(app: &Router, query: &str) -> serde_json::Value {

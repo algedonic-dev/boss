@@ -1,7 +1,7 @@
 import { afterEach, describe, it, expect } from 'bun:test';
 import { loadEntryIdForFact } from './ledger';
 
-// entity-href's `fact` kind links /ux/finance?fact=<id>, and the page
+// entity-href's `fact` kind links /finance?fact=<id>, and the page
 // now opens the journal entry that fact posted (backlog 2ab44d55). A
 // fact is resolved to its entry through the ledger's own filter,
 // GET /api/ledger/entries?fact_id=; a fact with no entry and a read

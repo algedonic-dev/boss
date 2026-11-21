@@ -87,7 +87,9 @@ describe('a whole read of the jobs list pages to its total', () => {
     // Control: the search reached .svelte and .ts files that read the
     // jobs list (each reads it through fetchEvery since 2026-09-27) …
     const names = CANDIDATES.map((c) => c.name);
-    expect(names).toContain('apps/web/src/jobs/TriageFlow.svelte');
+    // (TriageFlow.svelte was the .svelte control until it went with
+    // the Department Map's boards, design 01fa5bdf step 1.)
+    expect(names).toContain('apps/web/src/me/GuestHome.svelte');
     expect(names).toContain('apps/web/src/it/yard/yard.ts');
     // … and left the test files out: this one names the shape in its
     // planted lines below, so a search that read it would red the pin.

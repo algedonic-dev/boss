@@ -1,4 +1,5 @@
 [package]
+autotests = false
 name = "boss-testing"
 description = "Shared test utilities for Boss service testing"
 version.workspace = true
@@ -130,3 +131,93 @@ required-features = ["postgres"]
 
 [lints]
 workspace = true
+
+[[test]]
+name = "postgres_client_disconnect_pg"
+required-features = ["postgres"]
+
+# Car 5 (6bcf8315): original test files remain modules; each area links once.
+# Feature-gated and process-owning targets remain separate.
+# The four domain fixtures also keep their own targets: each loads the
+# same private scan module, which Clippy correctly refuses twice in one binary.
+
+[[test]]
+name = "lexical_value_domain"
+
+[[test]]
+name = "listener_binding_domain"
+
+[[test]]
+name = "mount_namespace_domain"
+
+[[test]]
+name = "transport_namespace_domain"
+
+[[test]]
+name = "gate_sh"
+
+[[test]]
+name = "integration_packaging"
+
+[[test]]
+name = "the_build_floor_lives_once"
+
+[[test]]
+name = "group_analysis"
+path = "tests/groups/analysis.rs"
+
+[[test]]
+name = "group_credentials"
+path = "tests/groups/credentials.rs"
+
+[[test]]
+name = "group_delivery"
+path = "tests/groups/delivery.rs"
+
+[[test]]
+name = "group_delivery_2"
+path = "tests/groups/delivery_2.rs"
+
+[[test]]
+name = "group_developer"
+path = "tests/groups/developer.rs"
+
+[[test]]
+name = "group_operations"
+path = "tests/groups/operations.rs"
+
+[[test]]
+name = "group_pins_contracts"
+path = "tests/groups/pins_contracts.rs"
+
+[[test]]
+name = "group_pins_delivery"
+path = "tests/groups/pins_delivery.rs"
+
+[[test]]
+name = "group_pins_identity"
+path = "tests/groups/pins_identity.rs"
+
+[[test]]
+name = "group_protocols"
+path = "tests/groups/protocols.rs"
+
+[[test]]
+name = "group_protocols_2"
+path = "tests/groups/protocols_2.rs"
+
+[[test]]
+name = "group_storage"
+path = "tests/groups/storage.rs"
+
+[[test]]
+name = "group_storage_2"
+path = "tests/groups/storage_2.rs"
+
+[[test]]
+name = "group_storage_3"
+path = "tests/groups/storage_3.rs"
+
+[[test]]
+name = "group_tenant"
+path = "tests/groups/tenant.rs"

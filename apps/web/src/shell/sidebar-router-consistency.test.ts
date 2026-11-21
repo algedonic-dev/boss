@@ -27,30 +27,39 @@
 
 import { describe, it, expect } from 'bun:test';
 import { parseRoute } from '../router';
-import { ROUTE_CATALOG } from './nav-catalog';
+import { ROUTE_CATALOG, type NavItem } from './nav-catalog';
+import { pagePath } from './page-address';
+import { ADDRESSES } from '../../tests/fixtures/station-tree';
 
-// Every catalog path, straight from the registry the sidebar renders.
-// Plus the plain sub-page links declared inline in nav groups (they
-// have no catalog entry of their own) and the two always-available
-// surfaces reachable outside the sidebar.
+// Every catalog path, straight from the registry the sidebar renders —
+// a hosted page at its host station's address in the tree plus its slug
+// (backlog 0bc2eb68), the fixture's tree standing in for the server's.
+// Plus the always-available surface reachable outside the sidebar: the
+// site root, which renders My Day in place. My Day itself is the
+// catalog's `me` entry at /me since backlog 5cb56bb3, and '/ux/manual'
+// answers nothing since the manual is hosted at Engineering.
 const INLINE_SUBPAGE_PATHS: ReadonlyArray<string> = [
-  '/it/operate/audit', // "Audit Log" — plain sub-page link in the Run group
-  '/it/operate/atlas', // "Atlas" — plain sub-page link in the Run group
-  '/ux/manual',
-  '/ux/me',
+  '/',
 ];
 
 const SIDEBAR_PATHS: ReadonlyArray<string> = [
   ...new Set([
-    ...Object.values(ROUTE_CATALOG).map((i) => i.path),
+    ...Object.values(ROUTE_CATALOG).map((i) => pagePath(i as NavItem, ADDRESSES) ?? `unplaced:${i.id}`),
     ...INLINE_SUBPAGE_PATHS,
   ]),
 ];
 
+// Catalog paths describe parameters, not literal department codes or ids.
+// Exercise every parameterised entry with the same valid segment; accepting
+// the placeholder itself would loosen the production router's input contract.
+function routeExample(path: string): string {
+  return path.replace(/:[A-Za-z][A-Za-z0-9_]*/g, 'example');
+}
+
 describe('sidebar-router consistency', () => {
   for (const path of SIDEBAR_PATHS) {
     it(`sidebar path "${path}" resolves to a non-catch-all route`, () => {
-      const route = parseRoute(path);
+      const route = parseRoute(routeExample(path), '', ADDRESSES);
       // The catch-all returns { kind: 'notFound' }; any *labeled*
       // sidebar item should resolve to its own route.
       expect(
@@ -62,10 +71,18 @@ describe('sidebar-router consistency', () => {
     });
   }
 
+  it('materialises every parameter without hiding an unmatched route', () => {
+    expect(routeExample('/unregistered/:code/child/:id')).toBe('/unregistered/example/child/example');
+    expect(parseRoute(routeExample('/unregistered/:code/child/:id'), '', ADDRESSES)).toEqual({
+      kind: 'notFound', path: '/unregistered/example/child/example',
+    });
+    expect(parseRoute('/it/floor/:code')).toEqual({ kind: 'notFound', path: '/it/floor/:code' });
+  });
+
   it('the catch-all itself still works: an unknown path is notFound, naming it', () => {
     // Two segments: one bare segment is a department's address since car
     // 2 of design 8c3e9599, which the registry judges, not the router.
-    expect(parseRoute('/definitely-not/a-real-route-xyzzy')).toEqual({
+    expect(parseRoute('/definitely-not/a-real-route-xyzzy', '', ADDRESSES)).toEqual({
       kind: 'notFound',
       path: '/definitely-not/a-real-route-xyzzy',
     });

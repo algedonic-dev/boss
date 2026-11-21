@@ -28,177 +28,9 @@ const MAX_LIMIT: usize = 500;
 pub struct ViewsApiState {
     pub repo: Arc<dyn ViewsRepo>,
     pub resolver: Arc<dyn ViewResolver>,
-    /// The Operating System map. Optional so a deployment without a
-    /// Postgres-backed views service still serves the rest of the
-    /// surface rather than failing to construct.
-    pub os_map: Option<Arc<dyn crate::os_map::OsMapRepo>>,
-    /// The team's flow. Optional for the same reason as `os_map`.
-    pub flow: Option<Arc<dyn crate::flow::FlowRepo>>,
-    /// The per-kind fleet. Optional for the same reason as `os_map`.
-    pub fleet: Option<Arc<dyn crate::fleet::FleetRepo>>,
-    /// Per-stage wall-clock durations. Optional like the others.
-    pub stages: Option<Arc<dyn crate::stages::StageDurationsRepo>>,
-}
-
-#[derive(Deserialize)]
-pub struct OsMapQuery {
-    /// How many recent step completions to build the map from.
-    /// Bounded by recency rather than time because `occurred_at` runs
-    /// on the sim clock, which moves at warp — "the last N handoffs"
-    /// means the same thing at any speed.
-    #[serde(default)]
-    pub limit: Option<i64>,
-}
-
-/// `GET /api/views/os-map` — the executor network.
-///
-/// A read of who is moving work and where it goes, per
-/// `docs/architecture-decisions.md`. Cheap enough to poll,
-/// which is what makes it a live instrument rather than a snapshot.
-async fn os_map(State(state): State<Arc<ViewsApiState>>, Query(q): Query<OsMapQuery>) -> Response {
-    let Some(repo) = state.os_map.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "os-map needs a postgres-backed views service",
-        )
-            .into_response();
-    };
-    // Clamp rather than reject: a caller asking for everything gets a
-    // large map, not an error, and the ceiling keeps one request from
-    // scanning the whole log.
-    let limit = q
-        .limit
-        .unwrap_or(crate::os_map::DEFAULT_LIMIT)
-        .clamp(1, 100_000);
-    match repo.os_map(limit).await {
-        Ok(map) => Json(map).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
-}
-
-/// Roles whose Workflows count as this team's work. Defaults to the
-/// platform operator — the role the IT Workflows declare as owner.
-/// Overridable so the same surface serves another team without a
-/// second endpoint.
-fn default_owner_roles() -> Vec<String> {
-    vec![boss_core::roles::PLATFORM_ADMIN_ROLE.to_string()]
-}
-
-#[derive(Deserialize)]
-pub struct FlowQuery {
-    #[serde(default)]
-    pub limit: Option<i64>,
-    /// Comma-separated owner roles.
-    #[serde(default)]
-    pub owner_roles: Option<String>,
-}
-
-/// `GET /api/views/flow` — what the team is getting through.
-///
-/// Wall-clock, unlike every other view: see `crate::flow` for why the
-/// projection's timestamps cannot answer this question.
-async fn flow(State(state): State<Arc<ViewsApiState>>, Query(q): Query<FlowQuery>) -> Response {
-    let Some(repo) = state.flow.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "flow needs a postgres-backed views service",
-        )
-            .into_response();
-    };
-    let roles: Vec<String> = q
-        .owner_roles
-        .as_deref()
-        .map(|s| {
-            s.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect()
-        })
-        .filter(|v: &Vec<String>| !v.is_empty())
-        .unwrap_or_else(default_owner_roles);
-    let limit = q
-        .limit
-        .unwrap_or(crate::flow::DEFAULT_LIMIT)
-        .clamp(1, 20_000);
-    match repo.flow(&roles, limit).await {
-        Ok(f) => Json(f).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
-}
-
-/// `GET /api/views/fleet/{kind}` — every in-flight Job of one
-/// Workflow kind, as per-step depth over the Workflow's shape.
-///
-/// Wall-clock for the same reason as `flow`; O(work-in-flight) by
-/// construction — see `crate::fleet`.
-async fn fleet(State(state): State<Arc<ViewsApiState>>, Path(kind): Path<String>) -> Response {
-    let Some(repo) = state.fleet.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "fleet needs a postgres-backed views service",
-        )
-            .into_response();
-    };
-    match repo.fleet(&kind).await {
-        Ok(f) => Json(f).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct StagesQuery {
-    #[serde(default)]
-    pub days: Option<i64>,
-}
-
-/// `GET /api/views/stage-durations/{kind}` — per-hop wall-clock
-/// latency for one Workflow kind (see `crate::stages`).
-async fn stage_durations(
-    State(state): State<Arc<ViewsApiState>>,
-    Path(kind): Path<String>,
-    Query(q): Query<StagesQuery>,
-) -> Response {
-    let Some(repo) = state.stages.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "stage durations need a postgres-backed views service",
-        )
-            .into_response();
-    };
-    let days = q.days.unwrap_or(7).clamp(1, 90);
-    match repo.stage_durations(&kind, days).await {
-        Ok(s) => Json(s).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct RunsQuery {
-    #[serde(default)]
-    pub limit: Option<i64>,
-}
-
-/// `GET /api/views/stage-runs/{kind}` — the last N Jobs of the kind
-/// with per-step durations, newest first (the per-run rows behind the
-/// stage-durations aggregate; backlog `a5096c8f`).
-async fn stage_runs(
-    State(state): State<Arc<ViewsApiState>>,
-    Path(kind): Path<String>,
-    Query(q): Query<RunsQuery>,
-) -> Response {
-    let Some(repo) = state.stages.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "stage runs need a postgres-backed views service",
-        )
-            .into_response();
-    };
-    let limit = q.limit.unwrap_or(10).clamp(1, 50);
-    match repo.stage_runs(&kind, limit).await {
-        Ok(s) => Json(s).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+    // The os-map, flow, fleet and stages repos rode here until their
+    // endpoints went with the pages that read them (design 01fa5bdf
+    // step 1, 2026-11-17).
 }
 
 #[derive(Deserialize)]
@@ -217,16 +49,17 @@ pub fn router(state: ViewsApiState) -> Router {
             get(get_view).put(replace_view).delete(delete_view),
         )
         .route("/api/views/{id}/results", get(view_results))
-        .route("/api/views/os-map", get(os_map))
-        .route("/api/views/flow", get(flow))
-        .route("/api/views/fleet/{kind}", get(fleet))
-        .route("/api/views/stage-durations/{kind}", get(stage_durations))
-        .route("/api/views/stage-runs/{kind}", get(stage_runs))
         .with_state(Arc::new(state))
 }
 
-async fn health() -> Response {
-    Json(serde_json::json!({ "status": "ok", "service": "views" })).into_response()
+/// The shared health body, so the read names the build that answered
+/// (backlog 56f88ada); views reads postgres through its pool.
+async fn health() -> Json<boss_core::startup::HealthResponse> {
+    Json(boss_core::startup::health_response(
+        "boss-views-api",
+        env!("CARGO_PKG_VERSION"),
+        "postgres",
+    ))
 }
 
 /// `GET /api/views/sources` — each source's fields, the ones a filter
@@ -390,12 +223,6 @@ mod tests {
 
     fn app() -> Router {
         router(ViewsApiState {
-            // These tests exercise the View surface; the map has its
-            // own coverage and needs Postgres.
-            os_map: None,
-            flow: None,
-            fleet: None,
-            stages: None,
             repo: Arc::new(InMemoryViewsRepo::new(
                 DateTime::from_timestamp(1_700_000_000, 0).expect("valid ts"),
             )),

@@ -1,4 +1,4 @@
-// /it/registry/credentials — the credentials registry drawn, its
+// /operations/vault/credentials — the credentials registry drawn, its
 // lifecycle offered as packets (backlog 851259b9; design 76155676 step 3,
 // David 2026-09-27).
 //
@@ -15,7 +15,7 @@ import { expect, test, type Page, type Route } from './_test';
 import { mountPage } from './_helpers';
 import { installSmokeMocks } from './_smokeMocks';
 
-const PAGE = '/it/registry/credentials';
+const PAGE = '/operations/vault/credentials';
 const FILED = '5b1e0c4a-2f6d-4c1e-9a7b-3d8e2f1c0a9b';
 const PLANTED = 'PLANTED-VALUE-9f8e7d6c';
 
@@ -103,7 +103,7 @@ async function install(page: Page, opts: Install = {}): Promise<void> {
 const card = (page: Page, id: string) => page.locator(`section.cr-card[aria-label="${id}"]`);
 const fact = (page: Page, id: string, label: string) => card(page, id).locator(`dt:has-text("${label}") + dd`);
 
-test.describe('/it/registry/credentials', () => {
+test.describe('/operations/vault/credentials', () => {
   test('tells root, broker and hand apart, and draws every missing fact as a gap', async ({ page }) => {
     await install(page);
     await mountPage(page, PAGE, { titleMatch: /Credentials/ });
@@ -158,7 +158,7 @@ test.describe('/it/registry/credentials', () => {
       title: 'Rotate forge-host-checkout-token',
       subject: { id: 'forge-host-checkout-token', subject_kind: 'custom' },
       owner_id: 'emp-001',
-      metadata: { credential: 'forge-host-checkout-token', requested_from: PAGE },
+      metadata: { credential: 'forge-host-checkout-token', requested_from: 'credentials-tab' },
     });
   });
 

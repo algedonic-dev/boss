@@ -5,8 +5,12 @@
 
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { QUERY_FIELDS, makeSurfaceOpenRecorder, routePattern, type SurfaceOpen } from './surface-opens';
+import { QUERY_FIELDS, makeSurfaceOpenRecorder, openedPattern, routePattern, type SurfaceOpen } from './surface-opens';
+import { ADDRESSES_LOADING, pagePath } from './page-address';
+import { ROUTE_CATALOG, type NavItem } from './nav-catalog';
+import { catalogPaths } from '../it/metrics/surfaces';
 import { parseRoute } from '../router';
+import { ADDRESSES } from '../../tests/fixtures/station-tree';
 
 describe('routePattern', () => {
   test('a catalogued surface is its own path', () => {
@@ -22,8 +26,8 @@ describe('routePattern', () => {
   test('a detail page carries the field name, never the id', () => {
     const uuid = '0123abcd-4567-89ef-0123-456789abcdef';
     expect(routePattern({ kind: 'jobDetail', jobId: uuid }, `/ux/jobs/${uuid}`)).toBe('/ux/jobs/:jobId');
-    expect(routePattern({ kind: 'account', accountId: 'account-00001' }, '/ux/accounts/account-00001')).toBe(
-      '/ux/accounts/:accountId',
+    expect(routePattern({ kind: 'invoice', invoiceId: 'inv-00001' }, '/finance/invoices/inv-00001')).toBe(
+      '/finance/invoices/:invoiceId',
     );
     expect(
       routePattern({ kind: 'workflowDetail', kindSlug: 'seasonal-release' }, '/it/registry/seasonal-release'),
@@ -37,7 +41,9 @@ describe('routePattern', () => {
   });
 
   test('an encoded id in the pathname still matches its decoded field', () => {
-    expect(routePattern({ kind: 'part', partSku: 'HOP 01' }, '/ux/parts/HOP%2001')).toBe('/ux/parts/:partSku');
+    expect(routePattern({ kind: 'vendor', vendorLookup: 'HOP 01' }, '/finance/vendors/HOP%2001')).toBe(
+      '/finance/vendors/:vendorLookup',
+    );
   });
 
   test('a query-string field never rewrites a static segment', () => {
@@ -48,12 +54,12 @@ describe('routePattern', () => {
         '/ux/jobs/j/steps/s',
       ),
     ).toBe('/ux/jobs/:jobId/steps/:stepId');
-    expect(routePattern({ kind: 'search', q: 'search' }, '/ux/search')).toBe('/ux/search');
-    expect(routePattern({ kind: 'jobs', workflow: 'jobs' }, '/ux/jobs')).toBe('/ux/jobs');
-  });
+    expect(routePattern({ kind: 'search', q: 'search' }, '/ux/search')).toBe('/ux/search');  });
 
   test('an id that is a substring of a static segment is left alone', () => {
-    expect(routePattern({ kind: 'asset', assetId: 'asset' }, '/ux/assets/asset')).toBe('/ux/assets/:assetId');
+    expect(routePattern({ kind: 'invoice', invoiceId: 'invoice' }, '/finance/invoices/invoice')).toBe(
+      '/finance/invoices/:invoiceId',
+    );
   });
 
   test('the router and the pattern agree on every parsed route (CLAUDE.md 9a)', () => {
@@ -61,16 +67,67 @@ describe('routePattern', () => {
     // route never carries the id the parser extracted.
     for (const [path, expected] of [
       ['/ux/jobs/abc', '/ux/jobs/:jobId'],
-      ['/ux/vendors/acme%20co', '/ux/vendors/:vendorLookup'],
-      ['/ux/people/emp-032', '/ux/people/:empId'],
-      ['/ux/finance/inv-1', '/ux/finance/:invoiceId'],
-      ['/ux/purchase-orders/po-7', '/ux/purchase-orders/:poId'],
-      ['/it/registry/rules/some-rule', '/it/registry/rules/:ruleName'],
-      ['/it/registry/step-plugins/review-design', '/it/registry/step-plugins/:pluginSlug'],
-      ['/ux/manual/intro', '/ux/manual/:slug'],
-      ['/it/operate/audit', '/it/operate/audit'],
+      ['/finance/vendors/acme%20co', '/finance/vendors/:vendorLookup'],
+      ['/finance/invoices/inv-1', '/finance/invoices/:invoiceId'],
+      ['/finance/purchase-orders/po-7', '/finance/purchase-orders/:poId'],
+      // Hosted pages at their stations' addresses (backlog 0bc2eb68).
+      ['/engineering/registry/rules/some-rule', '/engineering/registry/rules/:ruleName'],
+      ['/engineering/registry/step-plugins/review-design', '/engineering/registry/step-plugins/:pluginSlug'],
+      ['/engineering/manual/intro', '/engineering/manual/:slug'],
+      ['/operations/audit', '/operations/audit'],
     ] as const) {
-      expect(routePattern(parseRoute(path), path)).toBe(expected);
+      expect(routePattern(parseRoute(path, '', ADDRESSES), path)).toBe(expected);
+    }
+  });
+});
+
+// Review 7379181c F1 (backlog 0bc2eb68): the IT tab links to /it, which
+// renders the alarms board in place, and the board's catalog address is
+// /alarms. An open through the tab must count as an open of the board,
+// or the never-opened list (catalog paths minus opened patterns) names
+// the board a deletion candidate on every day it was reached by the tab.
+describe('openedPattern — what an open is recorded under', () => {
+  const board = pagePath(ROUTE_CATALOG['system-yard'] as NavItem, ADDRESSES);
+
+  test('an open of /it is an open of the alarms board at its own address', () => {
+    expect(board).toBe('/alarms');
+    for (const [path, search] of [['/it', ''], ['/it', '?at=dock'], ['/dashboard/it/', '']] as const) {
+      const recorded = openedPattern(parseRoute(path, search, ADDRESSES), path, ADDRESSES);
+      expect({ path, recorded }).toEqual({ path, recorded: board });
+    }
+    // So the roster the never-opened list subtracts from holds it.
+    expect(catalogPaths(ADDRESSES)).toContain(board!);
+  });
+
+  // The site's root and /ux render My Day in place, as /it renders the
+  // board; My Day is the person's station's own page at /me (backlog
+  // 5cb56bb3), so an open of either is an open of /me — and needs no
+  // tree, because /me is the person's and not a position in it.
+  test('an open of / or /ux is an open of the person’s station at /me', () => {
+    const me = pagePath(ROUTE_CATALOG.me as NavItem, ADDRESSES_LOADING);
+    expect(me).toBe('/me');
+    for (const path of ['/', '/ux', '/dashboard/', '/me']) {
+      for (const at of [ADDRESSES_LOADING, ADDRESSES]) {
+        expect({ path, recorded: openedPattern(parseRoute(path, '', at), path, at) }).toEqual({ path, recorded: me });
+      }
+    }
+    expect(catalogPaths(ADDRESSES_LOADING)).toContain(me!);
+  });
+
+  test('until the tree places the board, the open waits rather than record a guess', () => {
+    expect(openedPattern(parseRoute('/it', ''), '/it', ADDRESSES_LOADING)).toBeNull();
+  });
+
+  test('every other address records its own pattern', () => {
+    for (const [path, expected] of [
+      ['/alarms', '/alarms'],
+      ['/finance', '/finance'],
+      // A department with no landing page: its jobs view, as before.
+      ['/sales', '/:code'],
+      ['/ux/jobs/abc', '/ux/jobs/:jobId'],
+      ['/engineering/registry/rules/r-1', '/engineering/registry/rules/:ruleName'],
+    ] as const) {
+      expect({ path, recorded: openedPattern(parseRoute(path, '', ADDRESSES), path, ADDRESSES) }).toEqual({ path, recorded: expected });
     }
   });
 });

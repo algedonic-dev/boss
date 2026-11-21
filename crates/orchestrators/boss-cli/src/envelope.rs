@@ -10,7 +10,7 @@
 //!   an array) and `title`.
 //! - `/api/stations/{name}/queue` rows are packet envelopes keyed `id`
 //!   with NO `steps` at all — the station's own fields (`station`,
-//!   `total`, `wip_limit`, `lens`) wrap them.
+//!   `total`, `lens`) wrap them.
 //! - `/api/jobs/assignments` rows key the packet `job_id`, its name
 //!   `job_title`, and carry ONE `step` (singular, an object). There is
 //!   no `id` on the row, and the job's `status` is not on it either.
@@ -321,10 +321,7 @@ mod tests {
       "station": "q.platform-admin.task",
       "kind": "constraint",
       "discipline": ["priority", "age"],
-      "wip_limit": null,
-      "over_limit": false,
       "terminal_window_days": null,
-      "upstream": null,
       "lens": null,
       "total": 61,
       "data": [

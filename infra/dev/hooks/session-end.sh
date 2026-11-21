@@ -15,6 +15,20 @@
 read_payload
 session_dir
 session_packet
+# A SEAT'S TURN IS NOT ITS SESSION'S END (review ce8970ce B1, car
+# aab5f34e, backlog b513514c). Claude Code -p fires SessionStart AND
+# SessionEnd (reason "other") on EVERY turn — measured on 2.1.326,
+# 2026-11-17 — so under infra/dev/factory-loop.sh this hook ended the
+# seat's work-session at each turn's end and dropped its state, the
+# next turn filed another, and no heartbeat of the loop's ever found
+# one open. The loop marks its turns with BOSS_SEAT and owns the
+# packet: it files it, beats on it, and ends it through this same hook,
+# unmarked, when its conversation ends. So a marked end keeps both the
+# packet and this state directory, and says so.
+if [ -n "${BOSS_SEAT:-}" ]; then
+  log "a turn of seat $BOSS_SEAT ended ($(field .reason)) — work-session ${packet:-(none yet)} stays open; the seat's loop ends it"
+  exit 0
+fi
 [ -n "$packet" ] || bail "no work-session for session $(field .session_id) — nothing to end"
 door=$(command -v boss-api 2>/dev/null) || bail "boss-api is not on PATH — work-session $packet is left to the clock"
 # PAST A STALE DOOR (backlog 584dc9da). Since 0b36dd65 boss-api

@@ -6,7 +6,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "A platform administrator authorizes one declared credential's public installation read. The broker records the complete public permission map and exact observed identity, without minting, revoking, installing, granting or publishing anything. A diagnostic observation does not complete the failed publication it investigates."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { owner = "9660c60f-eb47-4405-ae08-fcbb30c71e5f", department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "scope"
@@ -15,7 +15,7 @@ ready_when = "true"
 title_template = "Authorize the bounded installation read"
 authority_role = "platform-admin"
 audience = { role = "platform-admin" }
-metadata_defaults = { human_only = true, installation_diagnostic = "scope", procedure = "Authorize a public GET of this declared GitHub App installation. Supply the expected account login explicitly; an optional numeric account id adds a separate equality assertion. App id comes from the issuer-owned root; installation id comes from the declaration or issuer default. This does not authorize token minting, permission changes or retrying publication." }
+metadata_defaults = { human_presentation = { ask = "Authorize a read of this GitHub installation's permissions", why_person = "A person must authorize the exact account and the reason for this diagnostic read.", action = "Name the account and authorize the read", after = "The broker records public permissions only; nothing is minted, granted, installed, or published.", evidence = "current-step" }, human_only = true, installation_diagnostic = "scope", procedure = "Authorize a public GET of this declared GitHub App installation. Supply the expected account login explicitly; an optional numeric account id adds a separate equality assertion. App id comes from the issuer-owned root; installation id comes from the declaration or issuer default. This does not authorize token minting, permission changes or retrying publication." }
 fields = [
     { name = "credential", field_type = "non-empty-string", required = true },
     { name = "expected_account_login", field_type = "non-empty-string", required = true },

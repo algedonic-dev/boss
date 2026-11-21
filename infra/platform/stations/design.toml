@@ -1,0 +1,37 @@
+# ---------------------------------------------------------------------------
+# design — Engineering's design stage (design c0ae096f section 2, car 1,
+# backlog 599fec3e; David, 2026-11-10): drafting design docs, workflow
+# design and protocol experiments. Its address is /algedonic/engineering/
+# design, derived from `parent` and stored nowhere.
+#
+# A STAGE STATION INSIDE ENGINEERING, not a sibling department: Engineering
+# is where most of the work volume runs, so its stages stand inside it.
+# The design-review queue stands here (design-review.toml v7), moved from
+# executive by the same car.
+#
+# A CONTAINER, NOT A QUEUE: the tagged predicate holds no packet (see
+# algedonic.toml); its children are the queues. It allocates nothing: a
+# stage reserves capacity only when its allocation is measured to differ
+# from Engineering's float. It names no line, so it draws Engineering's.
+# To change this station, bump `version`; `id` never changes.
+#
+# Version 2 (backlog e3a927c3; bumped from the LIVE newest, v1):
+# `placement`, where Design stands on Engineering's floor, {x, y, w, h} in
+# floor units. The Plan artboard (David, 2026-11-19) does not draw it, so
+# it takes the free bay under build, beside review. Nothing else changed.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "design"
+version = 2
+status = "active"
+title = "Design — drafting and deciding designs and protocols"
+kind = "group"
+discipline = ["priority", "age"]
+id = "cc856b32-3667-4e70-b6cd-667f6fe89007"
+parent = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5"
+mode = "standing"
+placement = { x = 300, y = 600, w = 230, h = 190 }
+
+[station.predicate]
+tags_any = ["station:design"]

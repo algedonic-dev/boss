@@ -1,4 +1,4 @@
-// /it/registry — each kind's packet history (backlogs 112c0535 and
+// /engineering/registry — each kind's packet history (backlogs 112c0535 and
 // 5eacf6db, page audit 9da74410).
 //
 // The catalog drew a kind's active `v{n}` and its in-flight count, and
@@ -19,7 +19,7 @@ import { mountPage } from './_helpers';
 import { JOBS_KINDS, JOBS_LIVE, installSmokeMocks } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
 
-const PAGE = '/it/registry';
+const PAGE = '/engineering/registry';
 const TITLE = /^Workflows$/;
 const WORKFLOWS = /\/api\/workflows$/;
 

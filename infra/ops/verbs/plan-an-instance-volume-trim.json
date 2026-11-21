@@ -1,0 +1,11 @@
+{
+  "about": "READ-ONLY plan for a filesystem trim of ONE instance claim's attached healthy Longhorn V1 volume (infra/forge/instance-volume-trim.sh --plan <namespace> <pvc>; backlog b1520f80 part b, approved by David 2026-10-29). Resolves exact PVC UID to PV CSI identity to Longhorn UID/engine/complete healthy RW replica set by the snapshot purge's own admission, and refuses an active or unknown backup, rebuild, restore, clone or purge, an unfinished claim Job or live Job-owned claim Pod, and an engine that is not v1.11.3. A trim additionally needs: a Filesystem-mode claim; a rwo blockdev volume with its frontend enabled and no encryption; a Running pod holding the claim on the node the volume is attached to, because Longhorn trims the MOUNTED filesystem (fstrim) and a detached volume such as boss/boss-backups between its CronJob runs cannot be trimmed; and unmapMarkSnapChainRemoved resolving to disabled (the volume field, or the setting remove-snapshots-during-filesystem-trim when it is ignored) — enabled, a trim marks the snapshot chain removed, a snapshot decision this verb refuses. The plan freezes identities, the mounting pods, the size and that resolution; status.actualSize moves every second and rides stderr as `actual-size:`, never the signed bytes. Its exact stdout bytes are what David's separate passkey approval signs (plan-sha256 on stderr). Fixed reads only, through the forge's ops_kubectl door; no trim, purge, attach, resize or setting change. Original bounded native receipts are attached to the ops request.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/instance-volume-trim.sh", "--plan", "{1}", "{2}"],
+  "params": [
+    {"name": "namespace", "pattern": "^[a-z][a-z0-9-]{0,62}$"},
+    {"name": "pvc", "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"}
+  ],
+  "timeout": 480,
+  "capture": "separate-streams"
+}

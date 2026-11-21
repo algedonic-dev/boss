@@ -13,7 +13,12 @@ import {
   windowFor,
   type RouteCount,
 } from './surfaces';
-import { ROUTE_CATALOG } from '../../shell/nav-catalog';
+import { ROUTE_CATALOG, type NavItem } from '../../shell/nav-catalog';
+import { ADDRESSES_LOADING, addressesOf, pagePath } from '../../shell/page-address';
+import { parseTree } from '../tree/station-tree';
+import { treeRead } from '../../../tests/fixtures/station-tree';
+
+const AT = addressesOf(parseTree(treeRead()));
 
 const row = (actor_id: string, route: string, opens: number, last_at = '2026-09-16T12:00:00Z'): RouteCount => ({
   actor_id,
@@ -109,7 +114,7 @@ describe('neverOpened', () => {
   });
 
   test('with no rows every catalogued surface is a candidate — and the page says why', () => {
-    expect(neverOpened([], catalogPaths())).toEqual(catalogPaths());
+    expect(neverOpened([], catalogPaths(AT))).toEqual(catalogPaths(AT));
   });
 
   // 13ded76c part (a): the roster is the nav catalog, so a route the
@@ -129,8 +134,11 @@ describe('neverOpened', () => {
   });
 
   test('the roster is every catalog path once (CLAUDE.md 9a: one catalog)', () => {
-    const paths = catalogPaths();
+    const paths = catalogPaths(AT);
     expect(new Set(paths).size).toBe(paths.length);
-    for (const e of Object.values(ROUTE_CATALOG)) expect(paths).toContain(e.path);
+    for (const e of Object.values(ROUTE_CATALOG)) expect(paths).toContain(pagePath(e as NavItem, AT) ?? `unplaced: ${e.id}`);
+    // A page the tree has not placed is not listed under a guess.
+    expect(catalogPaths(ADDRESSES_LOADING)).not.toContain('/engineering/registry');
+    expect(catalogPaths(ADDRESSES_LOADING)).toContain('/me/inbox');
   });
 });

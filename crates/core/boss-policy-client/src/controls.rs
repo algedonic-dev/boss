@@ -136,6 +136,10 @@ controls! {
 
     READ_COMPENSATION: Read "compensation";
 
+    /// A DTC buyer has no owner, account team, team or department, so the
+    /// customers reads admit only scope `all` (backlog cda177ef).
+    READ_CUSTOMER: Read "customer", all;
+
     CREATE_DISPATCHER_RULE: Create "dispatcher-rule", all;
     PUBLISH_DISPATCHER_RULE: Publish "dispatcher-rule", all;
     RETIRE_DISPATCHER_RULE: Retire "dispatcher-rule", all;
@@ -190,6 +194,13 @@ controls! {
 
     CREATE_POSTING_RULE: Create "posting-rule", all;
 
+    /// The live pools door (`boss-jobs` http/pools.rs, backlog f399458f):
+    /// a pool row is the station tree's allocation, so tuning one is its
+    /// own privilege rather than a protocol publish (`workflow`).
+    READ_POOL: Read "pool";
+    PUBLISH_POOL: Publish "pool";
+    RETIRE_POOL: Retire "pool";
+
     READ_SCHEDULE: Read "schedule";
     CREATE_SCHEDULE: Create "schedule", all;
     UPDATE_SCHEDULE: Update "schedule";
@@ -198,7 +209,11 @@ controls! {
     /// The in-flight count spans every packet's steps, so that door
     /// reads steps only at scope `all`; a file on a step reads it too.
     READ_STEP: Read "step", all;
-    UPDATE_STEP: Update "step";
+    /// Every other step door admits a narrower scope, but the resource
+    /// lease sweep (boss-jobs `lease_sweep.rs`) writes on every packet
+    /// whose lease lapsed and has no row predicate to narrow, so — the
+    /// strictest deciding — this is `all` (backlog 3aeaf08c).
+    UPDATE_STEP: Update "step", all;
 
     /// The claim door's third route to a step (`claimant_holds_authority`).
     UPDATE_STEP_ASSIGN: Update "step-assign";
@@ -221,6 +236,11 @@ controls! {
     UPDATE_WORKFLOW: Update "workflow";
     PUBLISH_WORKFLOW: Publish "workflow";
     RETIRE_WORKFLOW: Retire "workflow";
+    /// Reading a workflow or station version never published, and
+    /// nothing else (backlog f21804d8, design 600c07d7): the read-only
+    /// fourth leg of `boss-jobs` http/kinds.rs `may_read_drafts`, beside
+    /// the three authoring verbs that already read a draft.
+    READ_WORKFLOW_DRAFT: Read "workflow-draft";
 }
 
 #[cfg(test)]
@@ -251,7 +271,7 @@ mod tests {
     /// a control read as held.
     #[test]
     fn the_scope_all_doors_are_declared_scope_all() {
-        let doors: [(Pair, &str); 36] = [
+        let doors: [(Pair, &str); 38] = [
             (
                 READ_MANUAL_INVENTORY,
                 "boss-content manual_baseline_http inventory",
@@ -272,6 +292,7 @@ mod tests {
             (CREATE_AGREEMENT, "boss-commerce require_on"),
             (UPDATE_AGREEMENT, "boss-commerce require_on"),
             (READ_STEP, "boss-jobs the in-flight plugin count"),
+            (UPDATE_STEP, "boss-jobs the resource lease sweep"),
             (CREATE_CLASS, "the registry ladder: boss-classes"),
             (UPDATE_CLASS, "the registry ladder: boss-classes"),
             (RETIRE_CLASS, "the registry ladder: boss-classes"),
@@ -321,6 +342,7 @@ mod tests {
             (DELETE_SCHEDULE, "boss-calendar cancel-by-reason"),
             (READ_EVENT, "boss-search unrestricted_read"),
             (READ_SUBJECT, "boss-search unrestricted_read"),
+            (READ_CUSTOMER, "boss-customers http read_customers"),
         ];
         for (pair, door) in doors {
             assert!(
@@ -344,5 +366,7 @@ mod tests {
         assert_eq!(CREATE_CLASS.resource(), Resource::class());
         assert_eq!(UPDATE_STEP_ASSIGN.resource(), Resource::step_assign());
         assert_eq!(READ_POLICY_RULE.resource(), Resource::policy_rule());
+        assert_eq!(READ_WORKFLOW_DRAFT.action(), Action::Read);
+        assert_eq!(READ_WORKFLOW_DRAFT.resource(), Resource::workflow_draft());
     }
 }

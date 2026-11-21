@@ -326,7 +326,7 @@ impl RetainedMount {
 pub(crate) struct FileStore<V: PrivateVerifier> {
     root: File,
     owner: u32,
-    _lock: File,
+    _lock: crate::file_lock::FileLock,
     retained: Option<RetainedCache>,
     verifier: V,
     #[cfg(test)]
@@ -359,7 +359,7 @@ impl<V: PrivateVerifier + 'static> FileStore<V> {
         Ok(Self {
             root,
             owner,
-            _lock: lock,
+            _lock: crate::file_lock::FileLock::held(lock),
             retained: None,
             verifier,
             #[cfg(test)]
@@ -605,6 +605,20 @@ impl<V: PrivateVerifier + 'static> Store for FileStore<V> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn dropping_the_store_unlocks_with_an_inherited_descriptor_open() {
+        let (root, store) = seeded();
+        let inherited = store._lock.try_clone().unwrap();
+        assert!(FileStore::open(&root, store.owner, FixtureVerifier).is_err());
+        drop(store);
+        assert!(
+            FileStore::open(&root, rustix::process::geteuid().as_raw(), FixtureVerifier).is_ok(),
+            "a descriptor inherited before exec must not retain the store's lock"
+        );
+        drop(inherited);
+    }
+
     struct FixtureVerifier;
     impl PrivateVerifier for FixtureVerifier {
         fn verify(&mut self, bytes: &[u8], principal: &str) -> Result<Vec<u8>, CacheError> {

@@ -85,6 +85,15 @@ describe('a PagedResult or a Remote becomes a read state', () => {
     const remote = { kind: 'loading' } as const;
     expect(readStateOf(remote)).toEqual(okRead);
   });
+
+  // fetchRemote marks a 401/403 `refused` (backlog 7abb184f). Dropping
+  // the mark here turned the refusal back into an ordinary failure on
+  // every list page that renders its read through ListEmpty.
+  test('a refused Remote stays refused', () => {
+    const remote = { kind: 'failed', error: '/api/inbox: HTTP 403: no grant', refused: true } as const;
+    expect(readStateOf(remote)).toEqual({ kind: 'failed', error: '/api/inbox: HTTP 403: no grant', refused: true });
+    expect(readStateOf({ kind: 'failed', error: 'x' })).not.toHaveProperty('refused');
+  });
 });
 
 describe('a list view refuses to let a failed read wear the empty state', () => {
@@ -236,6 +245,23 @@ describe('an empty list says which of three things is true', () => {
     // A list built from several reads names the one that failed.
     const several = [{ source: 'the parts reads', state: failedRead('/api/catalog/parts: HTTP 502') }];
     expect(emptyState(several, 0, 0)).toEqual({ kind: 'failed', error: '/api/catalog/parts: HTTP 502' });
+  });
+
+  // A 401/403 is the server saying no to this session, which is a grant
+  // to chase, not a store to restart (backlog 7abb184f). The line keeps
+  // "Couldn't load" — the list did not load — and says it was refused.
+  test('a refused read is worded as a refusal, keeping the reason', () => {
+    const refused: ReadState = { kind: 'failed', error: '/api/things: HTTP 403: emp-x may read no packets', refused: true };
+    const v = emptyState(read(refused), 0, 0);
+    expect(v).toEqual({ kind: 'failed', error: '/api/things: HTTP 403: emp-x may read no packets', refused: true });
+    expect(emptyLine(v, words)).toEqual({
+      text: "Couldn't load things — the server refused this session: /api/things: HTTP 403: emp-x may read no packets",
+      alert: true,
+    });
+    // An ordinary failure is not worded as a refusal.
+    expect(emptyLine(emptyState(read(failedRead('/api/things: HTTP 500')), 0, 0), words)?.text).toBe(
+      "Couldn't load things — /api/things: HTTP 500",
+    );
   });
 
   test('a failure outranks rows: numbers from a failed read are not the list', () => {

@@ -35,7 +35,11 @@
 #   4  REFUSED     the tree's row does not lint — listed
 #   8  no live row — the seed admits it; listed as pending, skipped
 #   9  HELD        the kind is held out of every unattended publish and
-#                  the tree is ahead — listed as held, never published
+#                  the tree is ahead — listed as held, never published;
+#                  OR the server judges its live row passkey-protected
+#                  (the sub-verb's PASSKEY-PROTECTED line, backlog
+#                  5af64799) — held the same way, with the server's
+#                  reason, and --file-held files its packet
 #  75/78           the sub-verb could not answer / is misconfigured —
 #                  THIS RUN STOPS with the same code: half a drift set
 #                  judged from half a registry is the confident wrong
@@ -111,8 +115,41 @@
 # exit 75, and nothing is asked — the operator's `until --check ok` loop
 # becomes a verdict a rule can re-file on the next converge.
 #
+# --file-held: A HELD KIND'S PUBLISH IS FILED ON ITS OWNER (design
+# b1f319bc, David 2026-11-05; backlog 7955a488)
+# ---------------------------------------------------------------------
+# A held kind whose tree moved ahead of live is an obligation on a
+# person, and until this mode it ended as a `held` line on a check
+# nobody was asked to act on: on 2026-11-05 the held ops-request row's
+# publish lived only in a handoff note. `--file-held` checks every kind,
+# including kinds whose hold was lifted: their outstanding publish
+# obligations can now be satisfied by the unattended road. For
+# each that answers 9 with the tree ahead, files one publish-a-protocol
+# packet carrying what the owner's passkey will sign: the kind, its
+# file, the file's sha256 at this checkout, the live version, the
+# checkout sha, the sub-verb's dry-run lint line and its rendered diff
+# (its indented DIFF lines, copied, never re-derived). It publishes
+# nothing; the publish runs on boss-gcp after the owner signs (rule
+# publish-a-protocol-files-its-machine-publish).
+#
+#   - ONE PACKET PER SPEC, EVER. Every publish-a-protocol packet is read
+#     (every page, every status) and a packet for the same kind and
+#     sha256 — open, published, declined — files nothing: a declined
+#     spec is an answer, and asking it again on every converge (~28 a
+#     day) would be a passkey prompt nobody wants. A new edit is a new
+#     sha256 and a new question.
+#   - A NEWER EDIT SUPERSEDES. An OPEN packet for the kind with another
+#     sha256 is marked `superseded_by` the new one through the metadata
+#     merge door, which readies its `superseded` terminal: its signature
+#     could no longer publish anything (the script refuses other bytes).
+#   - A DARK READ IS NOT AN EMPTY LIST. A known answer is asked first —
+#     the ops-request this run answers exists, so that listing is never
+#     empty — and a list whose rows do not reach its total files nothing
+#     (75): a duplicate per converge is worse than one converge's
+#     silence, and the next converge re-derives the finding.
+#
 # USAGE
-#   publish-drift.sh [--check | --for-real]      (default: --check)
+#   publish-drift.sh [--check | --for-real | --file-held]   (default: --check)
 #
 # ENV
 #   BOSS_JOBS_URL                (required) the system of record
@@ -133,8 +170,9 @@
 #      the operator's decision, not this verb's failure
 #   1  at least one publish was NOT confirmed, a sub-verb run ended
 #      outside its documented codes, or the checkout moved (or its
-#      holds stopped being readable) while the publishes ran
-#   2  usage: a mode outside --check / --for-real
+#      holds stopped being readable) while the publishes ran; under
+#      --file-held, a packet that should have been filed was not
+#   2  usage: a mode outside --check / --for-real / --file-held
 #  75  cannot answer: the checkout is behind the newest converged train
 #      (not yet), the system of record could not be read, or a kind's
 #      registry row could not
@@ -158,13 +196,13 @@ usage() {
 # --- arguments ------------------------------------------------------------
 MODE="${1:---check}"
 if [ $# -gt 1 ]; then
-    echo "$NAME: usage: $(basename "$0") [--check | --for-real]" >&2
+    echo "$NAME: usage: $(basename "$0") [--check | --for-real | --file-held]" >&2
     usage; exit 2
 fi
 case "$MODE" in
-    --check|--for-real) ;;
+    --check|--for-real|--file-held) ;;
     *)
-        echo "$NAME: usage: mode '$MODE' is not one of --check, --for-real (there is no --force-tree here: a live row the tree never said is the operator's decision at the Drift tab, one kind at a time)" >&2
+        echo "$NAME: usage: mode '$MODE' is not one of --check, --for-real, --file-held (there is no --force-tree here: a live row the tree never said is the operator's decision at the Drift tab, one kind at a time)" >&2
         exit 2 ;;
 esac
 
@@ -212,20 +250,13 @@ trap 'rm -rf "$TMP"' EXIT
 machine_token_header MT_HDR "$BOSS_JOBS_URL" || exit 78
 
 # --- git, as the checkout's owner -------------------------------------------
-OWNER="$(stat -c %U "$REPO" 2>/dev/null)"
-OWNER_UID="$(stat -c %u "$REPO" 2>/dev/null)"
-if [ -z "$OWNER" ] || [ "$OWNER" = "UNKNOWN" ]; then
+# The one definition of that bound, infra/lib/git-owner.sh (backlog 5ff118da).
+# shellcheck source=infra/lib/git-owner.sh
+. "$SELF_DIR/../lib/git-owner.sh" || { echo "$NAME: $SELF_DIR/../lib/git-owner.sh is missing — nothing compared, nothing published" >&2; exit 78; }
+if ! git_owner_of "$REPO"; then
     echo "$NAME: cannot resolve the owner of $REPO (stat says '${OWNER:-}', uid ${OWNER_UID:-?}) — no passwd entry, so there is no account to read git as" >&2
     exit 78
 fi
-OWNER_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"
-as_owner() { # <command string>
-    if [ "$(id -un)" = "$OWNER" ]; then
-        bash -c "$1"
-    else
-        runuser -u "$OWNER" -- env HOME="${OWNER_HOME:-/}" PATH="$PATH" bash -c "$1"
-    fi
-}
 
 # --- the first line: which checkout, at what sha ------------------------------
 HEAD="$(as_owner "git -C '$REPO' rev-parse HEAD" 2>"$TMP/git.err")"
@@ -240,7 +271,7 @@ say "checkout $REPO at ${HEAD:0:12} — $MODE (packet ${OPS_REQUEST_ID:-none}, a
 # rather than an error, so an empty listing below is a failed read and
 # never "no train has landed".
 TRAINS_URL="$BOSS_JOBS_URL/api/jobs?kind=pr-train&limit=40&full=true"
-if ! curl -fsS --max-time 20 -H "x-boss-user: $BOSS_USER" \
+if ! curl -q -fsS --max-time 20 -H "x-boss-user: $BOSS_USER" \
         ${MT_HDR:+-H "$MT_HDR"} \
         "$TRAINS_URL" > "$TMP/trains.json" 2>"$TMP/curl.err"; then
     say "cannot answer: the system of record did not answer the pr-train read ($TRAINS_URL): $(tr '\n' ' ' <"$TMP/curl.err")"
@@ -309,11 +340,11 @@ HOLDS="$TMP/holds.tsv"
 if ! read_holds "$HOLDS"; then
     say "REFUSED — the tree's holds cannot be read, and a hold that cannot be read is not a hold that is absent:"
     sed 's/^/  /' "$TMP/holds.problems"
-    say "nothing asked, nothing published, in either mode: which kinds are held out of this verb is declared under $HOLDS_REL and derived from each row's writers and executors ($HOLDS_PY), and until that reads whole this verb cannot tell a refusal row from any other. Fix the file named above in a car (packet ${OPS_REQUEST_ID:-none})."
+    say "nothing asked, nothing published, in either mode: which kinds are held out of this verb is declared under $HOLDS_REL and derived from each row's writers, executors and bills ($HOLDS_PY), and until that reads whole this verb cannot tell a refusal row from any other. Fix the file named above in a car (packet ${OPS_REQUEST_ID:-none})."
     exit 78
 fi
 n_declared_held="$(awk -F'\t' '$1 == "held" { n++ } END { print n + 0 }' "$HOLDS")"
-say "holds: ${n_declared_held:-0} kind(s) held out of this verb, read from $HOLDS_REL and each row's writers and executors"
+say "holds: ${n_declared_held:-0} kind(s) held out of this verb, read from $HOLDS_REL and each row's writers, executors and bills"
 say "bundle: ${#KINDS[@]} kind(s) under $BUNDLE_REL; asking $SUB --check for each"
 
 # --- the table -----------------------------------------------------------------
@@ -340,20 +371,40 @@ held_line() { # <holds file> <kind>: the line that names a held kind, outside th
         "$(hold_field "$1" held "$2" 3)" "$(hold_field "$1" held "$2" 4)" "$(hold_field "$1" held "$2" 5)"
 }
 HAND="published only by the deliberate door: boss workflow publish <kind> $BUNDLE_REL/<kind>.toml, run by a person from a checkout — which does not lift the hold (the publish-workflow verb refuses a held kind too)"
-n_equal=0; n_refused=0; n_pending=0; n_other=0; n_held=0
+n_equal=0; n_refused=0; n_pending=0; n_other=0; n_held=0; n_open=0
+HELD_AHEAD=()     # --file-held: held kinds the tree moved ahead of
+EQUAL_KINDS=()    # exact live-version / frozen-spec witnesses, never publishes
 for kind in "${KINDS[@]}"; do
     if ! grep -Eqx -- '^[a-z][a-z0-9-]{1,60}$' <<<"$kind"; then
         row "$kind" "-" "-" "skipped: file name outside the kind pattern ^[a-z][a-z0-9-]{1,60}$"
         n_other=$((n_other + 1))
         continue
     fi
+    # A lifted hold must not hide an obsolete publish obligation.
+    if [ "$MODE" = "--file-held" ] && [ -z "$(hold_field "$HOLDS" held "$kind" 3)" ]; then
+        n_open=$((n_open + 1))
+    fi
     out="$("$SUB" "$kind" --check 2>&1)"; rc=$?
+    if [ "$MODE" = "--file-held" ] && [ "$rc" = 5 ]; then
+        # Only the sub-verb's explicit equality witness authorizes a
+        # withdrawal. Exit 5 or a human sentence alone is insufficient.
+        witness="$(sed -n "s/^publish-workflow: EQUAL: $kind v\([1-9][0-9]*\); spec sha256 \([0-9a-f]\{64\}\)$/\1 \2/p" <<<"$out")"
+        if [ -z "$witness" ] || [ "$(wc -l <<<"$witness")" -ne 1 ]; then
+            say "cannot answer: $kind exit 5 carried no single live-version and frozen-spec equality witness — nothing superseded"
+            exit 75
+        fi
+        printf '%s\n' "$witness" > "$TMP/equal.$kind"
+        EQUAL_KINDS+=("$kind")
+    fi
     # A HELD kind is asked like any other — its row states what the
     # registry holds, and a registry that cannot be read still stops the
     # run below — and is then held WHATEVER the sub-verb answered: in
     # neither `would publish` nor `refused`, so it never reaches AHEAD
     # and never stops the kinds that are not held.
     held_source="$(hold_field "$HOLDS" held "$kind" 3)"
+    held_why="$(hold_field "$HOLDS" held "$kind" 4)"
+    held_lifts="$(hold_field "$HOLDS" held "$kind" 5)"
+    hand="${HAND//<kind>/$kind}"
     # Only a VERDICT is folded into `held`: 75/78 stop the run and an
     # undocumented exit is still an error, held or not.
     #
@@ -363,7 +414,27 @@ for kind in "${KINDS[@]}"; do
     # reader, so they agree unless the tree changed between the two
     # reads — and then the LATER read wins: a 9 for a kind this run did
     # not know as held re-reads the holds and holds it.
+    #
+    # A PASSKEY-PROTECTED KIND IS HELD THE SAME WAY (backlog 5af64799).
+    # The sub-verb also answers 9 for a kind the SERVER judges
+    # passkey-protected (GET /api/workflows/<kind>/passkey) and no hold
+    # names, and says so on its `PASSKEY-PROTECTED (...)` line with the
+    # server's reason, copied here, never re-derived. Until that line, a
+    # protected kind came back `--check ok`, went down --for-real, and the
+    # server refused it unsigned with a draft created and left (ops-request
+    # 489680c9, publish-to-github v18). Its road is the owner's passkey:
+    # held below, so --for-real names it and skips it, and --file-held
+    # files its publish-a-protocol packet as for any held kind.
+    passkey_why=""
     if [ "$rc" = 9 ] && [ -z "$held_source" ]; then
+        passkey_why="$(sed -n '/^publish-workflow: PASSKEY-PROTECTED (/{s/^publish-workflow: PASSKEY-PROTECTED ([^)]*): //p;q;}' <<<"$out")"
+    fi
+    if [ -n "$passkey_why" ]; then
+        held_source="passkey-protected, judged by the server"
+        held_why="$passkey_why"
+        held_lifts="a publish-a-protocol packet its owner signs with a passkey (--file-held files it)"
+        hand="published only with its owner's passkey: the server refuses an unsigned publish of a passkey-protected row, so neither this verb nor boss workflow publish without a signed packet can land it"
+    elif [ "$rc" = 9 ] && [ -z "$held_source" ]; then
         if ! read_holds "$HOLDS"; then
             say "REFUSED — the sub-verb says '$kind' is held and the tree's holds can no longer be read:"
             sed 's/^/  /' "$TMP/holds.problems"
@@ -371,6 +442,8 @@ for kind in "${KINDS[@]}"; do
             exit 78
         fi
         held_source="$(hold_field "$HOLDS" held "$kind" 3)"
+        held_why="$(hold_field "$HOLDS" held "$kind" 4)"
+        held_lifts="$(hold_field "$HOLDS" held "$kind" 5)"
         if [ -z "$held_source" ]; then
             # The sub-verb held it and the reader, asked again, does not:
             # the tree is moving under this run. Not an answer.
@@ -393,9 +466,15 @@ for kind in "${KINDS[@]}"; do
             4) state="the tree's row does not lint clean (or the registry holds a stale draft)" ;;
             8) state="no live row yet (the seed admits a new kind)" ;;
         esac
-        row "$kind" "$live" "-" "HELD out of this verb ($held_source): $(hold_field "$HOLDS" held "$kind" 4) — lifts: $(hold_field "$HOLDS" held "$kind" 5). State: $state. ${HAND//<kind>/$kind}"
-        held_line "$HOLDS" "$kind" >> "$HELD_LINES"
+        row "$kind" "$live" "-" "HELD out of this verb ($held_source): $held_why — lifts: $held_lifts. State: $state. $hand"
+        printf '%s: held %s (%s) — %s — lifts: %s\n' "$NAME" "$kind" "$held_source" "$held_why" "$held_lifts" >> "$HELD_LINES"
         n_held=$((n_held + 1))
+        # The sub-verb's own answer, kept whole for the packet: its
+        # dry-run line and its indented DIFF lines are what gets signed.
+        if [ "$MODE" = "--file-held" ] && [ "$rc" = 9 ]; then
+            printf '%s\n' "$out" > "$TMP/held-ahead.$kind"
+            HELD_AHEAD+=("$kind")
+        fi
         continue
     fi
     case "$rc" in
@@ -516,6 +595,157 @@ if [ "$MODE" = "--for-real" ] && [ "${#AHEAD[@]}" -gt 0 ]; then
     done < "$PUB"
 fi
 
+# --- --file-held: one publish-a-protocol packet per held spec ---------------------
+n_filed=0; n_asked=0; n_superseded=0; n_unfiled=0
+if [ "$MODE" = "--file-held" ] && { [ "${#HELD_AHEAD[@]}" -gt 0 ] || [ "${#EQUAL_KINDS[@]}" -gt 0 ]; }; then
+    api_get() { # <path> <out>: 0 with a 200 body written
+        local code
+        code=$(curl -q -sS --max-time 20 -o "$2" -w '%{http_code}' -H "x-boss-user: $BOSS_USER" \
+            ${MT_HDR:+-H "$MT_HDR"} "$BOSS_JOBS_URL$1" 2>>"$TMP/api.err")
+        [ "$code" = "200" ]
+    }
+    # The known answer: the request this run answers is an ops-request,
+    # so a listing that says there are none is a dark read.
+    # Read as a number, not asked as a `jq -e` guard: an empty body
+    # yields no total at all, and the case below refuses it.
+    control=""
+    api_get "/api/jobs?kind=ops-request&limit=1" "$TMP/control.json" \
+        && control="$(jq -r '.total // empty' "$TMP/control.json" 2>/dev/null)"
+    case "${control:-empty}" in empty|*[!0-9]*|0) control="" ;; esac
+    if [ -z "$control" ]; then
+        say "cannot answer: the known-answer read (GET /api/jobs?kind=ops-request) did not show the request this run answers, so a listing of publish-a-protocol packets could not be trusted to be whole — nothing filed (packet ${OPS_REQUEST_ID:-none}). $(head -c 300 "$TMP/api.err" | tr '\n' ' ')"
+        exit 75
+    fi
+    # Every publish-a-protocol packet, every status, every page.
+    : > "$TMP/asked.tsv"
+    offset=0
+    while :; do
+        if ! api_get "/api/jobs?kind=publish-a-protocol&limit=500&offset=$offset" "$TMP/page.json"; then
+            say "cannot answer: the publish-a-protocol listing failed at offset $offset — nothing filed (packet ${OPS_REQUEST_ID:-none}). $(head -c 300 "$TMP/api.err" | tr '\n' ' ')"
+            exit 75
+        fi
+        # A page is rows only when `data` IS an array of jobs, each an
+        # object with an id (review R2 of car 214ae147, Codex run
+        # 753b6bd7): `.data // []` read a 200 carrying `data: null` as
+        # an empty world, the extraction's error went unchecked, and a
+        # second packet was filed for a declined spec, exit 0. A page
+        # that is not rows proves nothing about what is already asked.
+        rows=""; total=""
+        read -r rows total < <(jq -r '
+            select((.data | type) == "array"
+                   and all(.data[]; type == "object" and (.id | type) == "string" and .id != ""))
+            | [(.data | length), (.total // "x")] | @tsv' "$TMP/page.json" 2>/dev/null)
+        case "${rows:-x}:${total:-x}" in
+            *[!0-9:]*|:*|*:) say "cannot answer: the publish-a-protocol listing answered a page at offset $offset that is not rows (no data array of jobs with ids, or no total) — nothing filed (packet ${OPS_REQUEST_ID:-none})"; exit 75 ;;
+        esac
+        if ! jq -r '.data[] | select((.metadata.registry // "workflow") == "workflow") | [.id, (.status // ""), (.metadata.protocol_kind // ""), (.metadata.spec_sha256 // "")] | @tsv' \
+            "$TMP/page.json" >> "$TMP/asked.tsv" 2>"$TMP/page.err"; then
+            say "cannot answer: the publish-a-protocol page at offset $offset could not be read as rows ($(head -c 200 "$TMP/page.err" | tr '\n' ' ')) — nothing filed (packet ${OPS_REQUEST_ID:-none})"
+            exit 75
+        fi
+        offset=$((offset + rows))
+        [ "$offset" -lt "$total" ] || break
+        [ "$rows" -gt 0 ] || { say "cannot answer: the publish-a-protocol listing stopped at $offset of $total — nothing filed"; exit 75; }
+    done
+    # Equality satisfies the old obligation; it is not a publish by
+    # this packet. Retain the observed version and the compared bytes
+    # as the witness for the existing superseded terminal. A later edit
+    # is a new obligation, not a retroactive change to this observation.
+    for kind in "${EQUAL_KINDS[@]}"; do
+        read -r live sha < "$TMP/equal.$kind"
+        file_rel="$BUNDLE_REL/$kind.toml"
+        while IFS=$'\t' read -r old_id old_status old_kind old_sha; do
+            [ "$old_kind" = "$kind" ] && [ "$old_status" = "open" ] || continue
+            # Bind the witness to this checkout before each metadata write.
+            current_head="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
+            current_sha="$(sha256sum "$REPO/$file_rel" 2>/dev/null | cut -c1-64)"
+            if [ "$current_head" != "$HEAD" ] || [ "$current_sha" != "$sha" ]; then
+                say "cannot answer: $kind checkout changed after its equality read — no withdrawal of $old_id"
+                exit 75
+            fi
+            jq -n --arg kind "$kind" --arg live "$live" --arg sha "$sha" \
+                --arg head "$HEAD" --arg path "$file_rel" --arg req "${OPS_REQUEST_ID:-none}" '{
+                  superseded_by: "workflow:\($kind):v\($live)",
+                  supersession_translation: "Live \($kind) v\($live) compared equal to \($path) sha256 \($sha) at checkout \($head); no publish was needed by this packet.",
+                  superseded_live: {kind: $kind, version: $live, spec_sha256: $sha, tree_sha: $head, for_check: $req}
+                }' > "$TMP/supersede.json"
+            code=$(curl -q -sS --max-time 20 -X PATCH -o /dev/null -w '%{http_code}' \
+                -H 'content-type: application/json' -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} \
+                --data-binary @"$TMP/supersede.json" "$BOSS_JOBS_URL/api/jobs/$old_id/metadata" 2>>"$TMP/api.err")
+            case "$code" in
+                200|204) say "file-held: $kind — open publish-a-protocol $old_id superseded by equal live v$live"
+                         n_superseded=$((n_superseded + 1)) ;;
+                *) say "file-held: $kind — $old_id NOT superseded (PATCH answered HTTP ${code:-000})"
+                   n_unfiled=$((n_unfiled + 1)) ;;
+            esac
+        done < "$TMP/asked.tsv"
+    done
+    for kind in "${HELD_AHEAD[@]}"; do
+        out="$(cat "$TMP/held-ahead.$kind")"
+        file_rel="$BUNDLE_REL/$kind.toml"
+        held_line_text="$(first_line_with '--check HELD: would NOT publish' "$out")"
+        live="$(version_after 'over live v' "$held_line_text")"
+        # The sha the sub-verb printed for the ONE copy its diff and lint
+        # read (publish-workflow.sh 1'), never a fresh hash of a checkout
+        # that may have moved since: the owner signs one file's hash
+        # beside that same file's diff (the source of review R1, car
+        # 214ae147). A check that prints none files nothing.
+        sha="$(sed -n 's/.*; spec sha256 \([0-9a-f]\{64\}\)$/\1/p' <<<"$held_line_text")"
+        if [ -z "$sha" ]; then
+            say "file-held: $kind NOT filed — its --check HELD line names no spec sha256, so which bytes its diff describes cannot be signed"
+            n_unfiled=$((n_unfiled + 1))
+            continue
+        fi
+        asked="$(awk -F'\t' -v k="$kind" -v s="$sha" '$3 == k && $4 == s { print $1 " (" $2 ")"; exit }' "$TMP/asked.tsv")"
+        if [ -n "$asked" ]; then
+            say "file-held: $kind at sha256 ${sha:0:12} was already asked as publish-a-protocol $asked — not filed again"
+            n_asked=$((n_asked + 1))
+            continue
+        fi
+        dry_run="$(first_line_with 'lints clean' "$out" | sed 's/^publish-workflow: //')"
+        diff_text="$(grep -E '^  ' <<<"$out" | sed 's/^  //')"
+        jq -n --arg kind "$kind" --arg path "$file_rel" --arg sha "$sha" --arg live "$live" \
+            --arg head "$HEAD" --arg dry "${dry_run:-the sub-verb printed no lint line}" \
+            --arg diff "${diff_text:-the sub-verb printed no diff}" --arg actor "$BOSS_ACTOR" \
+            --arg req "${OPS_REQUEST_ID:-none}" '{
+              kind: "publish-a-protocol", status: "open", owner_id: $actor, priority: "standard", tags: [],
+              subject: {subject_kind: "custom", id: $kind},
+              title: "Publish \($kind) over live v\($live)",
+              metadata: {registry: "workflow", row_name: $kind,
+                         protocol_kind: $kind, spec_path: $path, spec_sha256: $sha, live_version: $live,
+                         tree_sha: $head, dry_run: $dry, diff: $diff, filed_by: $actor, for_check: $req,
+                         design: "b1f319bc"}}' > "$TMP/packet.json"
+        code=$(curl -q -sS --max-time 20 -X POST -o "$TMP/created.json" -w '%{http_code}' \
+            -H 'content-type: application/json' -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} \
+            --data-binary @"$TMP/packet.json" "$BOSS_JOBS_URL/api/jobs" 2>>"$TMP/api.err")
+        new_id="$(jq -r '.id // empty' "$TMP/created.json" 2>/dev/null)"
+        if [ "$code" != "201" ] || [ -z "$new_id" ]; then
+            say "file-held: $kind NOT filed — POST /api/jobs answered HTTP ${code:-000}: $(head -c 300 "$TMP/created.json" 2>/dev/null | tr '\n' ' ')"
+            n_unfiled=$((n_unfiled + 1))
+            continue
+        fi
+        say "file-held: $kind filed as publish-a-protocol $new_id — $file_rel sha256 ${sha:0:12} over live v$live, for its owner's passkey"
+        n_filed=$((n_filed + 1))
+        printf '%s\topen\t%s\t%s\n' "$new_id" "$kind" "$sha" >> "$TMP/asked.tsv"
+        # Each OPEN packet for the kind that signs other bytes is
+        # superseded: its signature could publish nothing now.
+        while IFS=$'\t' read -r old_id old_status old_kind old_sha; do
+            [ "$old_kind" = "$kind" ] && [ "$old_status" = "open" ] && [ "$old_id" != "$new_id" ] && [ "$old_sha" != "$sha" ] || continue
+            jq -n --arg new "$new_id" --arg sha "$sha" '{superseded_by: $new,
+                supersession_translation: "a newer edit of the same kind (sha256 \($sha[0:12])) was filed as \($new[0:8]); this packet signs bytes the tree no longer holds, so its publish would be refused"}' \
+                > "$TMP/supersede.json"
+            code=$(curl -q -sS --max-time 20 -X PATCH -o /dev/null -w '%{http_code}' \
+                -H 'content-type: application/json' -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} \
+                --data-binary @"$TMP/supersede.json" "$BOSS_JOBS_URL/api/jobs/$old_id/metadata" 2>>"$TMP/api.err")
+            case "$code" in
+                200|204) say "file-held: $kind — open publish-a-protocol $old_id superseded by $new_id"
+                         n_superseded=$((n_superseded + 1)) ;;
+                *) say "file-held: $kind — open publish-a-protocol $old_id NOT marked superseded (PATCH answered HTTP ${code:-000}); its signature would be refused for other bytes anyway" ;;
+            esac
+        done < <(cat "$TMP/asked.tsv")
+    done
+fi
+
 # --- the answer ------------------------------------------------------------------
 echo
 printf 'kind\tfrom\tto\tresult\n'
@@ -533,6 +763,10 @@ awk -F'\t' -v n="$NAME" '$1 == "released" { printf "%s: released %s (%s) — %s\
 verdict=""
 if [ "$MODE" = "--check" ]; then
     verdict="$NAME: would publish $n_ahead, skipped $n_equal equal, refused $n_refused, held $n_held"
+elif [ "$MODE" = "--file-held" ]; then
+    # Never `would publish` / `published`: the for-real rule's pattern
+    # must not read a filing as a check.
+    verdict="$NAME: filed $n_filed publish-a-protocol packet(s), already asked $n_asked, superseded $n_superseded, not filed $n_unfiled, held $n_held ahead ${#HELD_AHEAD[@]}, not held $n_open"
 else
     verdict="$NAME: published $n_published, skipped $n_equal equal, refused $n_refused, held $n_held"
     [ "$n_unconfirmed" -eq 0 ] || verdict="$verdict, not confirmed $n_unconfirmed"
@@ -541,7 +775,7 @@ fi
 [ "$n_other" -eq 0 ] || verdict="$verdict, errored $n_other"
 verdict="$verdict (checkout ${HEAD:0:8}, ${#KINDS[@]} kind(s), packet ${OPS_REQUEST_ID:-none})"
 echo "$verdict"
-if [ "$n_unconfirmed" -gt 0 ] || [ "$n_other" -gt 0 ]; then
+if [ "$n_unconfirmed" -gt 0 ] || [ "$n_other" -gt 0 ] || [ "$n_unfiled" -gt 0 ]; then
     exit 1
 fi
 exit 0

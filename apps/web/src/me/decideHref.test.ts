@@ -8,7 +8,7 @@ describe('stepFocusHref', () => {
     const q = new URLSearchParams(href.split('?')[1]);
     // Leading slash matters: the router drops a `from` that is not an
     // in-app path, and Back silently falls to the job page.
-    expect(q.get('from')).toBe('/ux/me');
+    expect(q.get('from')).toBe('/me');
     expect(q.get('from_label')).toBe('My Day');
   });
 

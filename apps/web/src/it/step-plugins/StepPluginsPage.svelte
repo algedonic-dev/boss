@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { pageLink } from '../../shell/stationAddresses.svelte';
   import { safeLinkHref } from '@boss/web-kit/links';
   // /admin/step-plugins — port of apps/web/src/admin/StepPluginsPage.tsx.
 
@@ -127,7 +128,7 @@
                 {@const count = counts[p.kind]}
                 <tr>
                   <td>
-                    <Link to={href(`/it/registry/step-plugins/${encodeURIComponent(p.kind)}`)}>
+                    <Link to={pageLink('system-step-plugins', {}, `/${encodeURIComponent(p.kind)}`)}>
                       <span class="mono">{p.kind}</span>
                     </Link>
                   </td>
@@ -147,7 +148,7 @@
                     {:else}
                       {@const matches = bindings.value.filter((b) => b.kind === p.kind)}
                       {#each matches as b (`${b.workflow}/${b.step}`)}
-                        <div><Link to={href(`/it/registry/${encodeURIComponent(b.workflow)}`)}>{b.workflow} v{b.version} · {b.step}</Link></div>
+                        <div><Link to={pageLink('workflows', {}, `/${encodeURIComponent(b.workflow)}`)}>{b.workflow} v{b.version} · {b.step}</Link></div>
                       {:else}None in active workflows{/each}
                     {/if}
                   </td>

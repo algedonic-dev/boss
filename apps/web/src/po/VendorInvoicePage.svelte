@@ -57,8 +57,8 @@
 </script>
 
 <div class="detail-page theme-exec">
-  <Breadcrumb to={href('/ux/warehouse')}>
-    ← Warehouse
+  <Breadcrumb to={href('/finance')}>
+    ← Finance
   </Breadcrumb>
 
   {#if fetchState.kind === 'loading'}

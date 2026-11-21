@@ -1,0 +1,15 @@
+{
+  "about": "MUTATING — lower ONE Longhorn volume's declared count by ONE and retire ONE signed named replica, never below 2 for database or non-database data (723c0828). Requires David's passkey over plan-a-volume-replica-lowering; no previous approved operation is reused. Exact volume UID, every replica UID/placement and the complete fixed execution-source manifest are bound. Fresh running RW replicas on distinct Ready nodes/disks are required at destructive boundaries. The shared retirement engine retains disabled locality/effective auto-balance/no evictions, full growth guards, UID/count CAS, settle and exact effect readback; the named deletion carries DeleteOptions UID precondition on container stdin. Detached volumes use a bounded unique longhorn-api maintenance ticket with disableFrontend=true, never a direct volume nodeID patch or force attach. Complete claim consumer inventories and explicit live Etc/UTC daily CronJob schedules fence the whole 1800-second exclusion window; a new consumer/foreign ticket prevents destructive work. A separate per-operation cleanup owner survives the runner group or work-child kill, stops and reaps owned host descendants, and reserves 300 seconds of its 1500-second absolute budget for cleanup. Reaping host descendants cannot stop requests in remote containers: cleanup first makes a genuinely changed owned attachment annotation with exact UID/resourceVersion CAS, reconciles a losing CAS or lost ACK by rereading, then removes only its exact ticket even when foreign tickets are present. Foreign tickets are preserved; changed owned tickets or identities remain cleanup debt. Actual detached/stopped engine/replica state must read back. Every stopped operation retains a final count and all replica identities, including attached volumes; unread observations are UNKNOWN, and a snapshot cannot settle a count/delete write with unknown ACK. Host/cleanup-owner loss, unread state, uninterruptible kernel I/O, partial failure, cleanup debt or final mismatch cannot establish an effect; no guessed rollback or deletion of another replica. The source builder performs none of these live operations.",
+  "hosts": ["forge"],
+  "requires_approval": true,
+  "plan_verb": "plan-a-volume-replica-lowering",
+  "approvers": ["emp-david"],
+  "argv": ["infra/forge/retire-volume-replica.sh", "--lower", "{1}", "{2}", "{3}"],
+  "params": [
+    {"name": "volume", "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    {"name": "replica", "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-r-[0-9a-f]{8}$"},
+    {"name": "plan_sha256", "pattern": "^[0-9a-f]{64}$"}
+  ],
+  "timeout": 1800,
+  "effect": "^lower-volume-replicas: pvc-[0-9a-f-]{36} declared ([2-9]|[1-9][0-9]+); exactly pvc-[0-9a-f-]{36}-r-[0-9a-f]{8} retired; (maintenance ticket removed and detached/stopped read back|fresh attached RW set read back)$"
+}

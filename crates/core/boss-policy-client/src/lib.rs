@@ -14,6 +14,8 @@
 //! `(user_id, role, access_tier, action, resource)` — every input the
 //! decision reads (backlog 8878f85f; see `CacheKey`). Invalidation is TTL-only; NATS-
 //! driven invalidation on top of the TTL is a planned addition (D4).
+//! The cache is bounded: each insert sweeps expired entries, and past
+//! `DECISION_CACHE_CAP` the oldest goes (backlog 5f83e4ed).
 //!
 //! Fail-closed: if the HTTP call fails (no connection, a timeout, a
 //! 5xx) and no live cache entry is available, `check` and
@@ -447,6 +449,25 @@ struct CacheEntry {
     expires_at: std::time::Instant,
 }
 
+/// How many decisions one client holds, live or expired (backlog
+/// 5f83e4ed).
+///
+/// Until 2026-11-19 `cache_put` only inserted and nothing removed: an
+/// expired entry was skipped on read and kept for the life of the
+/// process. Since 8878f85f the key holds the caller's id and role as
+/// written, and both are asserted in `x-boss-user` on the LAN machine
+/// door, so every distinct value presented there added an entry for
+/// good — memory any LAN caller could grow without bound.
+///
+/// The bound is a multiple of what the code can ask. One caller's keys
+/// are at most the 8 [`Action`]s times the 31 named [`Resource`]s
+/// (about 250, more with per-kind `job:` resources), so 10 000 holds
+/// every pair for 40 callers at once, or a few pairs each for
+/// thousands, inside one 60 s TTL — a few MB at a few hundred bytes an
+/// entry. Past it the oldest entry goes. Eviction never changes a
+/// decision; it only costs the evicted key one more ask.
+const DECISION_CACHE_CAP: usize = 10_000;
+
 pub struct ReqwestPolicyClient {
     base_url: String,
     /// Stamped with the machine token, redirects off. Every service asks
@@ -464,6 +485,9 @@ pub struct ReqwestPolicyClient {
     http: boss_core::machine_token::Client,
     cache: RwLock<HashMap<CacheKey, CacheEntry>>,
     ttl: std::time::Duration,
+    /// [`DECISION_CACHE_CAP`] in production; a field so a test can
+    /// flood a small one rather than ten thousand asks.
+    cap: usize,
 }
 
 impl ReqwestPolicyClient {
@@ -530,6 +554,7 @@ impl ReqwestPolicyClient {
             .expect("reqwest client"),
             cache: RwLock::new(HashMap::new()),
             ttl: std::time::Duration::from_secs(60),
+            cap: DECISION_CACHE_CAP,
         }
     }
 
@@ -551,13 +576,30 @@ impl ReqwestPolicyClient {
             .map(|e| e.decision.clone())
     }
 
+    /// Insert after sweeping what has expired, and past the cap drop the
+    /// oldest entry first (backlog 5f83e4ed). Every entry is given the
+    /// same TTL, so the soonest to expire is the oldest inserted. Both
+    /// scans run under the write lock and visit at most the cap, which
+    /// is small beside the round trip to the policy service that every
+    /// insert follows.
     async fn cache_put(&self, key: CacheKey, decision: Decision) {
         let mut cache = self.cache.write().await;
+        let now = std::time::Instant::now();
+        cache.retain(|_, e| e.expires_at > now);
+        if cache.len() >= self.cap && !cache.contains_key(&key) {
+            let oldest = cache
+                .iter()
+                .min_by_key(|(_, e)| e.expires_at)
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                cache.remove(&oldest);
+            }
+        }
         cache.insert(
             key,
             CacheEntry {
                 decision,
-                expires_at: std::time::Instant::now() + self.ttl,
+                expires_at: now + self.ttl,
             },
         );
     }
@@ -1336,6 +1378,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(seen.load(Ordering::SeqCst), 3, "another tier is asked");
+    }
+
+    // -- The cache is bounded (backlog 5f83e4ed) ------------------------
+    //
+    // Until 2026-11-19 cache_put only inserted: an expired entry was
+    // skipped on read and kept, and every distinct id and role a LAN
+    // caller asserted in x-boss-user added an entry for the life of the
+    // process. Both legs ask through the production adapter on the wire.
+
+    /// The flood's shape: a new asserted id on every ask.
+    fn flood_caller(n: usize) -> User {
+        caller(&format!("emp-flood-{n}"), "clerk")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flood_of_distinct_callers_stays_within_the_cap() {
+        use std::sync::atomic::Ordering;
+        let (url, seen) = policy_stub(0, axum::http::StatusCode::OK).await;
+        let mut c = loopback_client(url);
+        assert_eq!(c.cap, DECISION_CACHE_CAP, "production is bounded");
+        c.cap = 8;
+
+        for n in 0..100 {
+            c.check(&flood_caller(n), Action::Read, Resource::job())
+                .await
+                .unwrap();
+        }
+        assert_eq!(seen.load(Ordering::SeqCst), 100, "each new key is asked");
+        let held = c.cache.read().await.len();
+        assert!(held <= 8, "the cache holds {held} entries past a cap of 8");
+
+        // A live entry inside the cap is still served, not asked again.
+        assert!(
+            c.check(&flood_caller(99), Action::Read, Resource::job())
+                .await
+                .unwrap()
+                .is_allowed()
+        );
+        assert_eq!(seen.load(Ordering::SeqCst), 100, "the newest stays cached");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expired_decision_is_swept_on_the_next_insert() {
+        let (url, seen) = policy_stub(0, axum::http::StatusCode::OK).await;
+        let mut c = loopback_client(url);
+        // Every entry has expired by the time anything reads it, so no
+        // wall-clock wait is needed to make one stale.
+        c.ttl = std::time::Duration::ZERO;
+
+        for n in 0..20 {
+            c.check(&flood_caller(n), Action::Read, Resource::job())
+                .await
+                .unwrap();
+        }
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 20);
+        let held = c.cache.read().await.len();
+        assert!(
+            held <= 1,
+            "{held} expired entries kept; only the newest may remain"
+        );
     }
 
     #[tokio::test]

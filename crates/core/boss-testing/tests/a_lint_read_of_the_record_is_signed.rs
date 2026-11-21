@@ -134,6 +134,9 @@ fn run_lint(s: &Stub, lint: &str, url_var: &str, code: &str) -> Run {
         .env("BOSS_SOR_WAIT_SECONDS", "0")
         .env("STUB_CODE", code)
         .env_remove("BOSS_ESTATE")
+        // And BOSS_TRUNK=none (backlog 2d28df78): the edit-level lint
+        // would judge no path and never reach the read.
+        .env_remove("BOSS_TRUNK")
         .output()
         .unwrap_or_else(|e| panic!("run {lint}: {e}"));
     Run {

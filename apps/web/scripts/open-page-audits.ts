@@ -17,7 +17,7 @@
 // that tests/mocked/_routes.ts does NOT derive from the catalog: it is
 // a hand list of crawled paths, pinned a SUPERSET of the catalog by
 // that drift test, and it carries routes the catalog does not (bare
-// `/`, `/ux/me`, a seeded detail page, `/sales/jobs`). The
+// `/`, a seeded detail page, `/sales/jobs`). The
 // catalog is the roster; `_routes.ts` is a crawl list held to it.
 //
 // THE DOOR, NOT A SECOND HEADER SHAPE. Every read and write goes
@@ -49,7 +49,9 @@
 // still names them so that surface lands in its place.
 
 import { readFileSync } from 'node:fs';
-import { ROUTE_CATALOG, departmentJobsPath } from '../src/shell/nav-catalog';
+import { ROUTE_CATALOG, departmentJobsPath, type NavItem } from '../src/shell/nav-catalog';
+import { addressesOf, pagePath, type StationAddresses } from '../src/shell/page-address';
+import { parseTree, rootIdOf } from '../src/it/tree/station-tree';
 
 export type PlannedAudit = Readonly<{
   route: string;
@@ -89,6 +91,24 @@ export const FIRST_DEPARTMENTS: ReadonlyArray<string> = [
 export const HOME_DEPARTMENT = 'it';
 
 type CatalogEntry = Readonly<{ label: string; path: string; owner?: string }>;
+type Catalog = Readonly<Record<string, CatalogEntry>>;
+
+/// The catalog with every page at the route it answers NOW. A hosted
+/// page's route is its host station's address in the tree plus its slug
+/// (backlog 0bc2eb68), so the roster is read against the live tree; a
+/// page whose host the tree does not hold has no route to audit and is
+/// left out rather than planned under a guessed address.
+export function resolvedCatalog(
+  at: StationAddresses,
+  catalog: Readonly<Record<string, NavItem>> = ROUTE_CATALOG,
+): Catalog {
+  return Object.fromEntries(
+    Object.entries(catalog).flatMap(([id, e]) => {
+      const path = pagePath(e, at);
+      return path === null ? [] : [[id, { label: e.label, path, ...(e.owner === undefined ? {} : { owner: e.owner }) }]];
+    }),
+  );
+}
 
 /// Every catalogued route, once, in catalog order — with the department
 /// the catalog assigns it. If two catalog keys ever share a path the
@@ -96,9 +116,7 @@ type CatalogEntry = Readonly<{ label: string; path: string; owner?: string }>;
 /// :ruleName`) IS a page: it used to be filtered out here, which is why
 /// the rule editor — its four writes behind 66+ links — was never
 /// audited even once it had a path of its own (backlog 3071e235).
-export function catalogRoutes(
-  catalog: Readonly<Record<string, CatalogEntry>> = ROUTE_CATALOG,
-): ReadonlyArray<PlannedAudit> {
+export function catalogRoutes(catalog: Catalog): ReadonlyArray<PlannedAudit> {
   const seen = new Set<string>();
   return Object.values(catalog)
     .filter((e) => {
@@ -130,9 +148,7 @@ function rank(audit: PlannedAudit, owner: string | undefined): number {
 }
 
 /// The catalog's routes in march order.
-export function marchOrder(
-  catalog: Readonly<Record<string, CatalogEntry>> = ROUTE_CATALOG,
-): ReadonlyArray<PlannedAudit> {
+export function marchOrder(catalog: Catalog): ReadonlyArray<PlannedAudit> {
   const ownerOf = new Map(Object.values(catalog).map((e) => [e.path, e.owner] as const));
   return catalogRoutes(catalog)
     .map((a, i) => ({ a, i, r: rank(a, ownerOf.get(a.route)) }))
@@ -170,10 +186,7 @@ export function plan(
 /// One route by name: a catalogued path, or a department's jobs view
 /// (`/<code>/jobs`, one surface for every declared
 /// department, which has no catalog entry of its own).
-export function routeByName(
-  route: string,
-  catalog: Readonly<Record<string, CatalogEntry>> = ROUTE_CATALOG,
-): PlannedAudit | undefined {
+export function routeByName(route: string, catalog: Catalog): PlannedAudit | undefined {
   const listed = catalogRoutes(catalog).find((a) => a.route === route);
   if (listed) return listed;
   const m = route.match(/^\/([^/]+)\/jobs$/);
@@ -238,6 +251,19 @@ export function bossApi(command: string = process.env['BOSS_API'] ?? 'boss-api')
     get: (path) => call('GET', path),
     post: (path, body) => call('POST', path, body),
   };
+}
+
+/// The tree's addresses, read through the door the way the SPA reads
+/// them (apps/web/src/shell/stationAddresses.svelte.ts): the rows for the
+/// root, then the tree under it. A failed read is the failed arm.
+export async function treeAddresses(api: Api): Promise<StationAddresses> {
+  try {
+    const root = rootIdOf(await api.get('/api/stations'));
+    if (root === null) return { kind: 'failed', why: 'the station rows name no single root' };
+    return addressesOf(parseTree(await api.get(`/api/stations?under=${encodeURIComponent(root)}`)));
+  } catch (e) {
+    return { kind: 'failed', why: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 /// Every existing page-audit, across pages: the list answers `total`,
@@ -318,17 +344,25 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
     console.error('usage: open-page-audits.ts --dry-run | --all | --route <path>');
     return 2;
   }
+  const api = bossApi();
+  const at = await treeAddresses(api);
+  if (at.kind !== 'ready') {
+    console.error(
+      `open-page-audits: the station tree could not be read (${at.kind === 'failed' ? at.why : 'no answer'}), and a hosted page's route is its host's address in it — nothing was planned.`,
+    );
+    return 1;
+  }
+  const catalog = resolvedCatalog(at);
   const wanted: ReadonlyArray<PlannedAudit> = route === undefined
-    ? marchOrder()
+    ? marchOrder(catalog)
     : (() => {
-        const one = routeByName(route);
+        const one = routeByName(route, catalog);
         if (one === undefined) {
           throw new Error(`${route} is not a catalogued route (apps/web/src/shell/nav-catalog.ts) nor a department jobs view`);
         }
         return [one];
       })();
 
-  const api = bossApi();
   const p = plan(wanted, await existingAudits(api));
   console.log(renderPlan(p));
   if (dryRun) return 0;

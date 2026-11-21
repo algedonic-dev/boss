@@ -28,8 +28,10 @@ alerts and #239 stalled on 109 — because the check runs after the
 packet's sign-off on a surface only David sees. This files the READ
 the moment the PR is on the record; it adds no routing inside the
 protocol, which still owns open-pr -> read-checks -> judge-checks ->
-pr-opened. No authority widened: the verb holds no credential and
-writes only the publish packet's own reading and step.
+pr-opened. No authority widened: the verb's one credential is a
+read-only actions:read token on the mirror, for a failing check's job
+log (backlog b7a74610), and it writes only the publish packet's own
+reading and step.
 """
 on_event = "step.ready.task"
 when = 'metadata.ops_verb = "read-publish-checks"'

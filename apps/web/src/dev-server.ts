@@ -269,7 +269,9 @@ serve({
     // suite can tell "a server is up" from "MY server is up" without
     // waiting on the SPA bundle. See src/dev-tree.ts for why a suite
     // that could not ask this went green against another worktree.
-    [TREE_PATH]: () => treeResponse(),
+    // MOCKED rides along: a mocked server is a run's, stopped when
+    // that run ends, so no other run may borrow it (backlog 14ab6f08).
+    [TREE_PATH]: () => treeResponse(MOCKED),
     '/instance-config/dev-door.json': () => serveDevDoorDefault(),
     '/api/tenant/manifest': () => serveTenantManifest(),
     // /api/session — gateway-only route in production; mocked here
@@ -308,7 +310,7 @@ console.log(
     : `  api proxy → ${SCRATCH ? 'SCRATCH ports (boss_scratch DB) for paired services' : 'prod service ports (boss DB)'}`,
 );
 console.log('  /plugins/* → /var/lib/boss/step-plugins/');
-console.log(`  ${MERMAID_ROUTE}* → node_modules/mermaid/dist (ESM build, for /it/kb)`);
+console.log(`  ${MERMAID_ROUTE}* → node_modules/mermaid/dist (ESM build, for the knowledge base page)`);
 console.log(`  serving tree: ${TREE_ID} (named at ${TREE_PATH})`);
 
 // The runner stops this server with SIGTERM once Playwright is done;

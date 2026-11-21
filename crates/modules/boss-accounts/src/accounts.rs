@@ -122,6 +122,9 @@ fn default_account_type() -> String {
     "unspecified".to_string()
 }
 
+/// The `member_attribute` an account tier Class is filed under.
+const TIER_AXIS: &str = "tier";
+
 /// Validate `account_type` against the Class registry under
 /// `(subject_kind='account', member_attribute='type')`.
 ///
@@ -131,6 +134,15 @@ fn default_account_type() -> String {
 /// `account_type` is `NOT NULL DEFAULT 'unspecified'` so it is always
 /// present — every value (including the default) must be a registered
 /// Class. Returns `Ok(())` on success, or the response to short-circuit.
+///
+/// Still AXIS-BLIND, deliberately, unlike `check_tier` (backlog
+/// 3ff7205c): the registries spell the type axis two ways. Schema
+/// 01-registries and the example tenant's seed file `unspecified` and
+/// every example type under `type`, while the live registry (read
+/// 2026-11-19) holds `unspecified` on `type` and `sponsor` and
+/// `prospect` on `account_type` — and the gateway's site inquiry
+/// writes `prospect`. Either spelling alone would refuse a live write,
+/// so this reads one axis only after the registry agrees on one.
 async fn check_account_type(
     classes: Option<&Arc<dyn ClassesClient>>,
     account_type: &str,
@@ -164,6 +176,13 @@ async fn check_account_type(
 /// is always allowed (skip the check). Only a `Some` value is gated.
 /// Otherwise identical to `check_account_type` (permissive without a
 /// registry, 503 unreachable, 400 unregistered).
+///
+/// On its OWN axis (backlog 3ff7205c, as ab1e6ff8 did for team roles):
+/// the `account` drawer also holds type and note-kind codes, and
+/// `class_exists` took any of them — `prospect`, `call` — as a tier.
+/// Every registry spells this axis `tier` (schema 01-registries and
+/// the live registry, read 2026-11-19), so the check refuses no live
+/// write.
 async fn check_tier(
     classes: Option<&Arc<dyn ClassesClient>>,
     tier: Option<&str>,
@@ -172,7 +191,7 @@ async fn check_tier(
         return Ok(());
     };
     let class_ref = ClassRef::new("account", tier);
-    match client.class_exists(&class_ref).await {
+    match client.class_exists_on(&class_ref, TIER_AXIS).await {
         Ok(true) => Ok(()),
         Ok(false) => Err((
             StatusCode::BAD_REQUEST,
@@ -874,6 +893,44 @@ mod tests {
             sort_order: 0,
             retired_at: None,
         }
+    }
+
+    fn account_class(code: &str, member_attribute: &str) -> Class {
+        Class {
+            subject_kind: "account".into(),
+            code: code.into(),
+            display_name: code.into(),
+            parent_code: None,
+            member_attribute: Some(member_attribute.into()),
+            metadata: serde_json::Value::Null,
+            sort_order: 0,
+            retired_at: None,
+        }
+    }
+
+    /// Backlog 3ff7205c: the `account` drawer holds three taxonomies —
+    /// type, tier and note-kind — and an axis-blind check took any of
+    /// them as a tier, so an account could be tiered `prospect` or
+    /// `call`. Only a code on the `tier` axis is a tier.
+    #[tokio::test]
+    async fn a_tier_must_be_a_code_on_the_tier_axis() {
+        let registry: Arc<dyn ClassesClient> = Arc::new(FakeClassesClient::with_classes(vec![
+            account_class("gold", "tier"),
+            account_class("unspecified", "type"),
+            account_class("prospect", "account_type"),
+            account_class("call", "note-kind"),
+        ]));
+
+        for wrong_axis in ["unspecified", "prospect", "call"] {
+            let refused = check_tier(Some(&registry), Some(wrong_axis)).await;
+            assert_eq!(
+                refused.map_err(|r| r.status()).err(),
+                Some(StatusCode::BAD_REQUEST),
+                "`{wrong_axis}` is an account Class but not a tier, and must be refused as one"
+            );
+        }
+        assert!(check_tier(Some(&registry), Some("gold")).await.is_ok());
+        assert!(check_tier(Some(&registry), None).await.is_ok());
     }
 
     fn account(rep: Option<&str>, since: Option<NaiveDate>) -> Account {

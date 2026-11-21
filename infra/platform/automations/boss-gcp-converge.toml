@@ -9,3 +9,5 @@
 id = "automation:boss-gcp-converge"
 role = "audit-readonly"
 description = 'The boss-gcp host converge reading its estate roles and the completed transport/token lifecycles before protected root adoption (infra/gcp/boss-gcp-converge.sh, through node-roles.sh and adopt-root-tree.sh). Reads only.'
+# Host station: deploy (backlog 6ecb5480, station-tree.md section 6).
+station = "57b72e1f-490e-443a-9a9f-870a9977c9fb"

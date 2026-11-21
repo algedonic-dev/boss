@@ -1,4 +1,4 @@
-// /it/registry — the Workflow catalog, pinned (page audit 9da74410).
+// /engineering/registry — the Workflow catalog, pinned (page audit 9da74410).
 //
 // Nothing rendered this page before this spec (c19efb57): only the
 // static enamel-token scan named its file. So both of its reads could
@@ -21,7 +21,7 @@ import { mountPage } from './_helpers';
 import { JOBS_LIVE, WORKFLOW_DETAIL, installSmokeMocks } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
 
-const PAGE = '/it/registry';
+const PAGE = '/engineering/registry';
 const TITLE = /^Workflows$/;
 const WORKFLOWS = /\/api\/workflows$/;
 
@@ -61,7 +61,7 @@ const CATALOG = [
   workflow('hire', 'Hire someone', 'people'),
 ] as const;
 
-const REGISTRY_TABS = ['Workflows', 'Dispatcher', 'Rules', 'Step plugins', 'Policy', 'Subjects', 'Drift', 'Agents', 'Credentials'];
+const REGISTRY_TABS = ['Workflows', 'Dispatcher', 'Rules', 'Step plugins', 'Subjects', 'Drift', 'Agents', 'Credentials'];
 
 async function openRegistry(
   page: Page,
@@ -82,7 +82,7 @@ const row = (page: Page, kind: string) => page.locator('.kb-workflow-row').filte
 const noMatch = (page: Page) => page.getByText(/^No Workflows match/);
 const emptyRegistry = (page: Page) => page.getByText('The registry holds 0 active workflows.');
 
-test.describe('/it/registry — the catalog as it reads', () => {
+test.describe('/engineering/registry — the catalog as it reads', () => {
   test('every kind links to its detail page, with the header, tabs and New workflow around it', async ({ page }) => {
     await openRegistry(page);
 
@@ -91,13 +91,13 @@ test.describe('/it/registry — the catalog as it reads', () => {
       '4 active Workflows across 3 categories — every kind of work this instance runs',
     );
     await expect(page.locator('nav[aria-label="IT registry"] a')).toHaveText(REGISTRY_TABS);
-    await expect(page.getByRole('link', { name: '+ New workflow' })).toHaveAttribute('href', '/it/registry/new');
+    await expect(page.getByRole('link', { name: '+ New workflow' })).toHaveAttribute('href', '/engineering/registry/new');
 
     await expect(kindLinks(page)).toHaveCount(CATALOG.length);
     for (const k of CATALOG) {
       await expect(page.locator('.kb-workflow-header').filter({ hasText: k.kind }).locator('a')).toHaveAttribute(
         'href',
-        `/it/registry/${k.kind}`,
+        `/engineering/registry/${k.kind}`,
       );
     }
     await expect(row(page, 'backlog-item').locator('.kb-workflow-live')).toHaveText('7 in flight');
@@ -112,7 +112,7 @@ test.describe('/it/registry — the catalog as it reads', () => {
     await page.route(WORKFLOW_DETAIL, (r) => json(r, hire));
 
     await page.locator('.kb-workflow-header a', { hasText: hire.kind }).click();
-    await expect(page).toHaveURL(new RegExp(`/it/registry/${hire.kind}$`));
+    await expect(page).toHaveURL(new RegExp(`/engineering/registry/${hire.kind}$`));
     await expect(page.locator('h1').first()).toHaveText(hire.label);
   });
 
@@ -148,7 +148,7 @@ test.describe('/it/registry — the catalog as it reads', () => {
   });
 });
 
-test.describe('/it/registry — a failed in-flight read is said, and the catalog stays', () => {
+test.describe('/engineering/registry — a failed in-flight read is said, and the catalog stays', () => {
   test('a refused GET /api/jobs/live names the read and its status', async ({ page }) => {
     await openRegistry(page, {
       live: (r) => r.fulfill({ status: 503, contentType: 'text/plain', body: 'jobs down' }),
@@ -175,7 +175,7 @@ test.describe('/it/registry — a failed in-flight read is said, and the catalog
   });
 });
 
-test.describe('/it/registry — a failed catalog read is not an empty one, and neither is a search miss', () => {
+test.describe('/engineering/registry — a failed catalog read is not an empty one, and neither is a search miss', () => {
   test('a refused registry read says the count is unknown and claims no search miss', async ({ page }) => {
     await openRegistry(page, {
       workflows: (r) => r.fulfill({ status: 503, contentType: 'text/plain', body: 'registry down' }),

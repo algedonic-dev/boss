@@ -1,4 +1,4 @@
-// /it/registry/drift — the measurement header and the three honest
+// /engineering/registry/drift — the measurement header and the three honest
 // behaviours, rendered (page audit 93b508fd).
 //
 // Until this spec the route was reached only by the crawls, which see
@@ -29,7 +29,7 @@ import { mountPage } from './_helpers';
 import { installSmokeMocks } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
 
-const PAGE = '/it/registry/drift';
+const PAGE = '/engineering/registry/drift';
 const TITLE = 'Protocol drift';
 const PACKET = 'b35a096b-a314-486f-98db-5f9c1b85d910';
 const MEASURED_AT = '2026-09-27T05:21:58Z';
@@ -118,7 +118,7 @@ async function install(page: Page, opts: Install = {}): Promise<void> {
 
 const header = (page: Page) => page.locator('.pd-section').first();
 
-test.describe('/it/registry/drift — the measurement header', () => {
+test.describe('/engineering/registry/drift — the measurement header', () => {
   test('links the measured packet, names its age, the compared fields, and the tenant seeds', async ({ page }) => {
     await page.clock.setFixedTime(at(14));
     await install(page);
@@ -166,7 +166,7 @@ test.describe('/it/registry/drift — the measurement header', () => {
   });
 });
 
-test.describe('/it/registry/drift — the approve section fails honestly (cece5515)', () => {
+test.describe('/engineering/registry/drift — the approve section fails honestly (cece5515)', () => {
   test('a failed authority-role read withholds every control, with the failure marker', async ({ page }) => {
     await install(page, {
       drift: { data: [packet([ADRIFT])], total: 1 },
@@ -206,7 +206,7 @@ test.describe('/it/registry/drift — the approve section fails honestly (cece55
   });
 });
 
-test.describe('/it/registry/drift — the re-read runs only while a request is open (cece5515)', () => {
+test.describe('/engineering/registry/drift — the re-read runs only while a request is open (cece5515)', () => {
   const request = (status: 'open' | 'closed') => ({
     id: 'c0ffee00-0000-4000-8000-000000000001',
     title: 'publish-workflow ship-a-change on boss-gcp',

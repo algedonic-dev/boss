@@ -13,6 +13,33 @@ pub struct Expected {
     pub value: Value,
 }
 
+/// One presence/value contract for conditional writes and translation
+/// source guards (f375ae85). Absence is distinct from explicit null.
+pub(crate) fn validate_expectations(
+    expected: &std::collections::BTreeMap<String, Expected>,
+) -> Result<(), &'static str> {
+    if expected
+        .iter()
+        .any(|(key, expected)| key.is_empty() || (!expected.present && !expected.value.is_null()))
+    {
+        return Err("an absent expected key has no value");
+    }
+    Ok(())
+}
+
+pub(crate) fn expectations_match(
+    expected: &std::collections::BTreeMap<String, Expected>,
+    metadata: &Value,
+) -> bool {
+    expected.iter().all(
+        |(key, expected)| match (metadata.get(key), expected.present) {
+            (None, false) => true,
+            (Some(value), true) => value == &expected.value,
+            _ => false,
+        },
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Command {
@@ -68,23 +95,11 @@ impl Command {
                 "immutable fields must be patched and guarded; the binding record is server-owned",
             );
         }
-        if self.expected.iter().any(|(key, expected)| {
-            key.is_empty() || (!expected.present && !expected.value.is_null())
-        }) {
-            return Err("an absent expected key has no value");
-        }
-        Ok(())
+        validate_expectations(&self.expected)
     }
 
     pub fn matches(&self, job: &Job) -> bool {
-        job.status == JobStatus::Open
-            && self.expected.iter().all(|(key, expected)| {
-                match (job.metadata.get(key), expected.present) {
-                    (None, false) => true,
-                    (Some(value), true) => value == &expected.value,
-                    _ => false,
-                }
-            })
+        job.status == JobStatus::Open && expectations_match(&self.expected, &job.metadata)
     }
 
     pub fn apply(&self, job: &Job) -> Result<Job, crate::port::JobsError> {
