@@ -1,7 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import { parseStationLoad } from '../marshalling/marshalling';
-import { CLAIMS, POOLS, claimsRead, idOf, stationList, stationLoad, treeRead } from '../../../tests/fixtures/station-tree';
+import { ADDRESSES, CLAIMS, POOLS, claimsRead, idOf, stationList, stationLoad, treeRead } from '../../../tests/fixtures/station-tree';
 import { parseRoute } from '../../router';
+import { ROUTE_CATALOG, STATION } from '../../shell/nav-catalog';
+import { pagePath } from '../../shell/page-address';
 import {
   DEFAULT_DEPTH, claimsPath, depthOf, parseClaims, parseTree, partWords, poolFigure, rootIdOf, stationCard, treeHref,
   type CardPool, type CardReads, type StationCardModel,
@@ -349,11 +351,21 @@ describe('the station card: rail, plate and parts', () => {
 });
 
 describe("the floor's address", () => {
+  // The floor is the company root's page since backlog 92bfcb04 (car 3 of
+  // design df0ecd8b: "tree — the company root — the whole tree is the
+  // company's view of itself"), so its address is the catalog's, and
+  // /it/tree answers nothing.
   test('the plain link is plain; a station and a depth ride the query', () => {
-    expect(treeHref(null)).toBe('/it/tree');
-    expect(treeHref(null, DEFAULT_DEPTH)).toBe('/it/tree');
-    expect(treeHref('id-engineering', 1)).toBe('/it/tree?under=id-engineering&depth=1');
-    expect(treeHref('a b', 2)).toBe('/it/tree?under=a+b&depth=2');
+    expect(treeHref(null)).toBe('/tree');
+    expect(treeHref(null, DEFAULT_DEPTH)).toBe('/tree');
+    expect(treeHref('id-engineering', 1)).toBe('/tree?under=id-engineering&depth=1');
+    expect(treeHref('a b', 2)).toBe('/tree?under=a+b&depth=2');
+  });
+
+  test('the floor is the page the root hosts, at the address the tree gives it', () => {
+    expect<string | undefined>(ROUTE_CATALOG['system-tree'].host).toBe(STATION.algedonic);
+    expect(pagePath(ROUTE_CATALOG['system-tree'], ADDRESSES)).toBe(treeHref(null));
+    expect(parseRoute('/it/tree', '', ADDRESSES)).toEqual({ kind: 'notFound', path: '/it/tree' });
   });
 
   test('a depth is a whole number from 1 to 9, anything else the default', () => {
@@ -363,9 +375,9 @@ describe("the floor's address", () => {
   });
 
   test('the router reaches the floor with its station and depth', () => {
-    expect(parseRoute('/it/tree', '')).toEqual({ kind: 'systemTree' });
-    expect(parseRoute('/it/tree', '?under=id-engineering&depth=2')).toEqual({ kind: 'systemTree', under: 'id-engineering', depth: 2 });
-    expect(parseRoute('/it/tree', '?depth=nope')).toEqual({ kind: 'systemTree' });
+    expect(parseRoute('/tree', '', ADDRESSES)).toEqual({ kind: 'systemTree' });
+    expect(parseRoute('/tree', '?under=id-engineering&depth=2', ADDRESSES)).toEqual({ kind: 'systemTree', under: 'id-engineering', depth: 2 });
+    expect(parseRoute('/tree', '?depth=nope', ADDRESSES)).toEqual({ kind: 'systemTree' });
   });
 });
 
@@ -373,8 +385,8 @@ describe("the floor's address", () => {
 // (R3, backlog 23a4b4d7): a query that names a view is no view.
 describe('no region view rides the floor', () => {
   test('a `view` in the query is ignored by the router', () => {
-    expect(parseRoute('/it/tree', '?view=marshalling')).toEqual({ kind: 'systemTree' });
-    expect(parseRoute('/it/tree', '?view=gates&depth=2')).toEqual({ kind: 'systemTree', depth: 2 });
+    expect(parseRoute('/tree', '?view=marshalling', ADDRESSES)).toEqual({ kind: 'systemTree' });
+    expect(parseRoute('/tree', '?view=gates&depth=2', ADDRESSES)).toEqual({ kind: 'systemTree', depth: 2 });
   });
 });
 

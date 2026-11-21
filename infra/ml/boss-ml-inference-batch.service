@@ -5,6 +5,11 @@ After=network-online.target
 [Service]
 EnvironmentFile=/etc/boss/sor.env
 Type=oneshot
+# NOT WHAT boss-gcp RUNS (backlog c440ab8d, 2026-11-21): with root's
+# tree accepted, install-units.sh installs infra/gcp/root-tree-units/
+# boss-ml-inference-batch.service.in in this file's place, User=root
+# over root's own tree. This copy is the timer's pair and the fixture
+# roots' unit.
 User=boss
 # The packet goes to the SYSTEM OF RECORD — /etc/boss/sor.env
 # (EnvironmentFile= above), rendered on this host from

@@ -172,7 +172,18 @@
 #     one the pull was judged against. That belief is kept beside the
 #     log ($log.unseen) so a restart keeps it too; it can only refuse a
 #     pull, never permit one, and a file there the loop cannot read or
-#     remove holds the seat until a run of its agent is seen building.
+#     remove, or one that holds anything but a run id, holds the seat
+#     until a run of its agent is seen building (review 2d18db68 N11).
+# THE HOLD ASSUMES EVERY RUN IS EQUALLY VISIBLE (review 2d18db68 N12).
+# Either way the unseen hold releases — a run of the agent seen
+# building, a newer run its signer signed — can be met by a run other
+# than the one it waits for if the two reads see different runs: another
+# process signing under the same login, a listing blind where the
+# control sees, a partial read scope. Not reachable on 2026-11-21: one
+# primary answers both reads and every agent-run is owned by the same
+# person, so whoever can read one run reads them all. A seat whose actor
+# reads through a narrower role than that must not be turned to `next`
+# until the hold names the run it waits for, not a run like it.
 # THE SLOT IS THE RECORD, NOT A FILE (review 0d65ef4c B1, 2026-11-20).
 # The first build kept the pulled run's id in a file beside the log and
 # parsed it out of the brief's prose; a failed write, a brief that
@@ -582,12 +593,14 @@ seen_runs() {
 # The kept belief that a pull's run was not read back (B3; see the
 # header). Loaded from beside the log when the process holds none, so a
 # restart keeps it; a file there that names no run is '?', which only a
-# run of the agent seen building clears.
+# run of the agent seen building clears. Anything but a run id is '?' too
+# (review 2d18db68 N11, backlog a569e6b2): a corrupt file was compared as
+# a run id, never matched the control, and so released the hold.
 load_unseen() {
   [ -z "$unseen" ] || return 0
   [ -e "$unseen_file" ] || [ -L "$unseen_file" ] || return 0
   unseen=$(tr -d '[:space:]' 2>/dev/null <"$unseen_file")
-  unseen=${unseen:-?}
+  [[ $unseen =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || unseen='?'
 }
 
 clear_unseen() {
@@ -649,9 +662,12 @@ pull_pass() {
   fi
   # The brief and the door's words are kept beside the log; a place the
   # loop cannot write is its own trouble, not the door's refusal (review
-  # f8cbaa0e N7), and nothing is claimed before it is known.
-  if ! { : >"$pulled" && : >"$pull_err"; } 2>/dev/null; then
-    slot_why="the pulled brief cannot be kept beside the log ($pulled, $pull_err)"
+  # f8cbaa0e N7), and nothing is claimed before it is known. The turn's
+  # prompt is the third place, checked with the other two (review
+  # 2d18db68 N10): unchecked, a pull claimed a step whose turn was then
+  # handed nothing.
+  if ! { : >"$pulled" && : >"$pull_err" && : >"$turn_prompt"; } 2>/dev/null; then
+    slot_why="the pulled brief cannot be kept beside the log ($pulled, $pull_err, $turn_prompt)"
     unjudged
     return 0
   fi
@@ -693,11 +709,29 @@ pull_pass() {
       say "pass $turn: the unseen pull could not be kept at $unseen_file: a restart of this loop forgets it"
     say "pass $turn: the run this pull opened was not read back (${slot_why:-the record lists no open run of $actor}); the turn is handed the brief because its step is claimed, and the seat HOLDS - nothing more is pulled until the record lists a run of its agent building, or a run signed by $signer newer than $control_run"
   fi
+  # The write is checked too (N10): a place that stopped being writable
+  # after the check, or a full volume, would hand the turn a prompt with
+  # no brief in it. The step is claimed by then, so the pass runs no
+  # turn and says what landed — the claim, its run when it was read back,
+  # and the brief kept in $pulled — and the run holds the slot, so the
+  # next pass is that run's turn under the seat's own prompt. The status
+  # is read after, never through `if !`: bash 5.2 answers a negated group
+  # whose own redirection fails as if it had succeeded (measured
+  # 2026-11-21 on the pod's 5.2.15, `! { :; } >dir` takes no branch).
   {
-    cat "$prompt_file"
-    printf '\n## This turn'\''s step\n\nThe seat pulled this step from its station with `boss dispatch --next` (infra/dev/factory-loop.sh, backlog 35f828cf): it is claimed as you and it is this turn'\''s work. Build it under the brief below; the turn rules above still hold.\n\n'
-    cat "$pulled"
-  } >"$turn_prompt"
+    cat "$prompt_file" &&
+      printf '\n## This turn'\''s step\n\nThe seat pulled this step from its station with `boss dispatch --next` (infra/dev/factory-loop.sh, backlog 35f828cf): it is claimed as you and it is this turn'\''s work. Build it under the brief below; the turn rules above still hold.\n\n' &&
+      cat "$pulled"
+  } 2>/dev/null >"$turn_prompt"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    turn_from=''
+    climb
+    why="the pulled step is claimed (run ${pull_run:-not read back}) but its turn prompt $turn_prompt could not be written; its brief is kept at $pulled, and the claimed run's turn runs under the seat's prompt"
+    say "pass $turn: $why (next pass in ${wait_s}s, failure $failures in a row)"
+    note_restart "seat turn prompt not written: $why" null "$wait_s"
+    return 0
+  fi
   turn_from=$turn_prompt
 }
 

@@ -1,0 +1,27 @@
+{
+  "about": "READ-ONLY: reads the public mirror's GitHub Actions job log and answers which tests failed, onto this ops-request alone (backlog 8f266452, David 2026-11-20). Runs infra/forge/read-github-job-log.sh with a mode and an id: `job <id>` reads that job's log; `run <id>` lists the run's jobs over the PUBLIC API with no credential and reads the logs of at most two that did not pass, naming any further one as not read; `--check` asks only for the tools and the addresses, with no network and no token. WHY: PR #261 (publish fbe2e977) failed its mirror Gate — job 135639960947, run 44546952203 — and nothing in BOSS could name the test: its annotations quote a prose line (54278a24), its job log answers 403 to an anonymous reader, and the one reader holding a token, read-publish-checks, reads only the OPEN publish packet's failing checks, so a closed packet's failure or any other run had no door. NO NEW CREDENTIAL: a log is read with the broker's read-only checks token — actions:read and metadata:read on the mirror alone, the same Secret key, minted by the same rule (broker-mints-the-algedonic-dev-checks-token-when-a-checks-read-is-filed) when this verb's request is filed with a mode other than --check — rendered onto this host by infra/forge/credential-render.sh only when there is a log to read, handed to curl in a 0600 header file, and removed from its slot on every way the run ends; the slot checks, the read and the parse are the one definition read-publish-checks sources, infra/forge/lib/github-job-log.sh. ONE REPOSITORY: there is no repository parameter — the repository is the mirror this host declares in /etc/boss/sor.env, and the script refuses (exit 2) before any read when that is not the repository the checks token is minted for (the rule's verify_repo); the token's narrowing to that one repository is the second wall. The id is digits, checked here and again by the script. ANSWERS, bounded: per job its id, name and conclusion; every test the log says FAILED, at most fifty with the rest counted, each with its binary and the cargo selector that reruns it; the checks the gate's receipt names failed; and the forty lines before the first FAILED / error: line through twenty after, held to 8 KiB with terminal escapes stripped — never the token. What could not be read is stated with why: no live token (a filing that reaches the serial runner before its mint lands; file it again), GitHub's refusal in its own words, or a read that did not complete. Exit 0 when every log it set out to read was read, 1 when one was not, 2 a refusal. Nothing on this host is changed but the checks token's own slot, and nothing on GitHub or in the system of record is written.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/read-github-job-log.sh",
+    "{1}",
+    "{2}"
+  ],
+  "params": [
+    {
+      "name": "mode",
+      "one_of": [
+        "job",
+        "run",
+        "--check"
+      ]
+    },
+    {
+      "name": "id",
+      "pattern": "^[0-9]{1,20}$",
+      "optional": true
+    }
+  ],
+  "timeout": 120
+}

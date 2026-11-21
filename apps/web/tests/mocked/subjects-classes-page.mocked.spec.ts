@@ -246,7 +246,7 @@ test.describe('/engineering/registry/subjects points the department kind at its 
     // 01fa5bdf pulled it out; the station tree draws them now.
     await expect(meta(page).getByRole('link', { name: 'Station tree' })).toHaveAttribute(
       'href',
-      '/it/tree',
+      '/tree',
     );
   });
 

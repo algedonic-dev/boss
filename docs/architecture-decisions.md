@@ -1911,8 +1911,18 @@ and `q.platform-admin.task` still name it as their parent, the
 answers an `executive` row, and the web's station tree draws an
 executive card. `design-review` and `landed-review` have already left it
 for engineering's `design` and `review` stations (design `c0ae096f`).
-Until the cars land, `docs/design/station-tree.md` describes the tree as
-it runs, not as decided. The cars are backlog items, one each: the
+The registry car (`878fd1e7`, re-checked against design `01fa5bdf`)
+deletes `executive.toml`; `my-watchlist` and `q.platform-admin.task`
+stand at the root, as queues the company hosts and no department (a
+department is a root child with a `line` of its own), until `/me` takes
+them (`5cb56bb3`); `design-decided` stands beside `design-review` in
+engineering's `design`; `surface-usage` is hosted at the root. Each row
+kept its `id`, and only `parent` moved. The live `executive` row is
+retired by `POST /api/stations/executive/retire` once the seed has moved
+its children, and the `executive` department row is the tenant
+roster's, retired by a tenant car. Until the cars land,
+`docs/design/station-tree.md` describes the tree as it runs, not as
+decided. The cars are backlog items, one each: the
 registry (`878fd1e7`: re-parent or retire the three rows, delete the
 executive row, take it out of the departments registry, and pin that no
 station names a parent with no row), the web (`cd3fa679`: the tree
@@ -5970,9 +5980,12 @@ uses it, and kept David's own interactive sudo as it is; a password on
 it was offered and not taken. No per-unit sudoers wrapper is owed. Live,
 read 2026-11-13: the forge converge of 08:14Z records `probe_account`
 verified with no sudo, and root's tree and the probe view both at forge
-main `2dbd868b`. Not built: the tree's own text still says otherwise in
-four places, among them rows of `no_unattended_unit_runs_from_a_home.rs`
-that call boss-gcp's stage owed (backlog `c440ab8d`).
+main `2dbd868b`. The tree's own text said otherwise in four places
+until backlog `c440ab8d` (2026-11-21): the roster rows of
+`no_unattended_unit_runs_from_a_home.rs` now name the root-tree unit
+boss-gcp installs in each one's place and hold it to root, the four
+units installed nowhere are deleted with their timers, and the forge scripts say root runs
+its own tree.
 
 **Row C, second round: who holds the machine token, and what runs branch
 code instead** (design-doc "Row C, second round: who holds the machine

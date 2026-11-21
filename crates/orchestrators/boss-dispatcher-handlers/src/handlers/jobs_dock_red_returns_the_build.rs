@@ -51,7 +51,9 @@ pub const HANDLER: &str = "jobs.dock_red_returns_the_build";
 /// Where the return's evidence lands on the item's build step: the key
 /// the red-gate return writes (`a-red-gate-returns-the-build-to-its-station`),
 /// because it is the same fact — a red sent this build back.
-pub const NOTE_KEY: &str = "returned_for_red";
+/// One definition, in boss-jobs, because the station queue reads it to
+/// rank a returned repair ahead of fresh work (backlog 205ce78a).
+pub const NOTE_KEY: &str = boss_jobs::station_queue::RETURNED_FOR_RED;
 
 /// PURE: the returned red a car stands on, or `None` for any other
 /// packet, or a red the dock still retries.

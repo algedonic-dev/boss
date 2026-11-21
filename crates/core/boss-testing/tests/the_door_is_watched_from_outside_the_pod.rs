@@ -15,11 +15,13 @@
 //!
 //! What each case pins: the two values doors.toml shares with other
 //! files are equal to them (the MetalLB address of Service boss-dev-ssh,
-//! and the name the tunnel routes to it); the watchdog's unit runs the
+//! and the name the tunnel routes to it; the standby door's address and
+//! the Cilium pin on Service boss-dev-standby-ssh); the watchdog's unit runs the
 //! observer after the watchdog and best-effort; the parser reads the
 //! real doors.toml; an open door is open, a refused port and a port
 //! that offers no host key are dark, a name that does not resolve is a
-//! dark public half; the first dark reading is remembered and a later
+//! dark public half, a door with no public name is observed on its lan
+//! half alone; the first dark reading is remembered and a later
 //! one carries it forward, and an open reading forgets it; an empty
 //! declaration is refused; and the observation is POSTed to the estate
 //! door, or spooled when the door will not take it.
@@ -46,17 +48,32 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(repo_root().join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
-/// The one `[[door]]` table doors.toml declares today.
-fn declared_door() -> String {
+/// The one `[[door]]` table doors.toml declares under `id`. Two tables
+/// with one id would be two declarations of one door that can disagree,
+/// so that is refused here too.
+fn declared_door(id: &str) -> String {
     let toml = read("infra/estate/doors.toml");
-    let blocks: Vec<&str> = toml.split("[[door]]").skip(1).collect();
+    let blocks: Vec<&str> = toml
+        .split("[[door]]")
+        .skip(1)
+        .filter(|b| toml_value(b, "id") == Some(id))
+        .collect();
     assert_eq!(
         blocks.len(),
         1,
-        "doors.toml declares {} doors",
+        "doors.toml declares door {id} {} time(s)",
         blocks.len()
     );
     blocks[0].to_string()
+}
+
+/// The YAML documents of a manifest, nulls dropped.
+fn documents_of(text: &str) -> Vec<Value> {
+    use serde::Deserialize;
+    yaml_serde::Deserializer::from_str(text)
+        .map(|document| Value::deserialize(document).unwrap())
+        .filter(|d| !d.is_null())
+        .collect()
 }
 
 #[test]
@@ -78,13 +95,67 @@ fn the_lan_half_is_the_metallb_address_of_the_ssh_service() {
         .lines()
         .find_map(|l| l.trim().strip_prefix("port:").map(str::trim))
         .expect("Service boss-dev-ssh names a port");
-    let door = declared_door();
+    let door = declared_door("dev-ssh");
     assert_eq!(
         toml_value(&door, "lan"),
         Some(format!("{ip}:{port}").as_str()),
         "doors.toml's lan half must be Service boss-dev-ssh's MetalLB address \
          (infra/cluster/manifests/boss-dev.yaml) — a door watched at the wrong \
          address is watched as dark forever, or as open while the real one is dark"
+    );
+}
+
+/// The standby's door (design 0491591b, backlog 47601829). Its address
+/// was ALLOCATED, not chosen: Cilium LB-IPAM gave Service
+/// boss-dev-standby-ssh 10.20.0.37 with nothing pinned (read through
+/// ops-request 29dd7af1, 2026-11-21), and the manifest now pins what was
+/// read, in the form Cilium reads (`io.cilium/lb-ipam-ips`, as boss.yaml
+/// pins the gateway). The address lives in two files — the Service the
+/// cluster serves it on and the door the forge probes — so this holds
+/// the two equal (CLAUDE.md §9a). The dev login menu's standby option
+/// reads it from doors.toml, so it is not spelled a third time.
+#[test]
+fn the_standby_lan_half_is_the_address_pinned_on_the_standby_service() {
+    let docs = documents_of(&read("infra/cluster/manifests/boss-dev-standby.yaml"));
+    let service = docs
+        .iter()
+        .find(|d| d["kind"] == "Service" && d["metadata"]["name"] == "boss-dev-standby-ssh")
+        .expect("boss-dev-standby.yaml declares Service boss-dev-standby-ssh");
+    let ip = service["metadata"]["annotations"]["io.cilium/lb-ipam-ips"]
+        .as_str()
+        .expect(
+            "Service boss-dev-standby-ssh pins its address with io.cilium/lb-ipam-ips — \
+             unpinned, a re-created Service can be handed a different address and the \
+             door below watches the old one",
+        );
+    assert!(
+        !ip.is_empty() && !ip.contains(','),
+        "the standby's ssh Service pins exactly one address, got {ip:?}"
+    );
+    // A second spelling on the Service itself must agree, or it is the
+    // drift this pin exists to stop, one file closer.
+    for other in [
+        &service["metadata"]["annotations"]["metallb.universe.tf/loadBalancerIPs"],
+        &service["spec"]["loadBalancerIP"],
+    ] {
+        if let Some(v) = other.as_str() {
+            assert_eq!(v, ip, "Service boss-dev-standby-ssh spells two addresses");
+        }
+    }
+    let port = service["spec"]["ports"][0]["port"]
+        .as_u64()
+        .expect("Service boss-dev-standby-ssh names a port");
+    let door = declared_door("dev-standby-ssh");
+    assert_eq!(
+        toml_value(&door, "lan"),
+        Some(format!("{ip}:{port}").as_str()),
+        "doors.toml's dev-standby-ssh lan half must be the address pinned on Service \
+         boss-dev-standby-ssh (infra/cluster/manifests/boss-dev-standby.yaml)"
+    );
+    assert_eq!(
+        toml_value(&door, "dark_band_minutes"),
+        toml_value(&declared_door("dev-ssh"), "dark_band_minutes"),
+        "the standby is watched on the dev door's band (design 0491591b)"
     );
 }
 
@@ -97,7 +168,7 @@ fn the_public_half_is_the_name_the_tunnel_routes_to_that_service() {
         .expect("tunnel-origins.toml routes a hostname to Service boss-dev-ssh");
     let hostname = toml_value(origin, "hostname").expect("the origin names its hostname");
     assert_eq!(
-        toml_value(&declared_door(), "public"),
+        toml_value(&declared_door("dev-ssh"), "public"),
         Some(hostname),
         "doors.toml's public half must be the name infra/cluster/tunnel-origins.toml \
          routes to the ssh Service"
@@ -250,8 +321,42 @@ fn the_parser_reads_the_real_declaration() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "dev-ssh 10.20.0.35:22 dev.algedonic.dev band_s=900"
+        "dev-ssh 10.20.0.35:22 dev.algedonic.dev band_s=900\n\
+         dev-standby-ssh 10.20.0.37:22 - band_s=900"
     );
+}
+
+/// A door may have a LAN half and no public name: the standby's
+/// (dev-standby-ssh) has none until its hostname car (0e33a4de). It is
+/// observed on the one half it has — no public half is invented, so no
+/// alarm can fire on a name nobody declared.
+#[test]
+fn a_door_with_no_public_name_is_observed_on_its_lan_half_alone() {
+    let w = World::new("door-lan-only");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let lan = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    write_file(
+        &w.doors,
+        &format!("[[door]]\nid = \"dev-ssh\"\nlan = \"{lan}\"\ndark_band_minutes = \"15\"\n"),
+    );
+    let out = w.run(&["--print"], &[("STUB_KEYSCAN_KEY", "ssh-ed25519")]);
+    assert!(
+        out.status.success(),
+        "a door with no public name is observed, not refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let obs: Value = serde_json::from_str(stdout.lines().find(|l| l.starts_with('{')).unwrap())
+        .expect("an observation");
+    let halves = obs["nodes"][0]["halves"].as_array().expect("halves");
+    assert_eq!(halves.len(), 1, "only the declared half: {obs}");
+    assert_eq!(half(&obs, "lan")["open"], true, "{obs}");
+    assert!(
+        !stdout.contains("public"),
+        "the journal line names no public half: {stdout}"
+    );
+    assert!(!exists(&w.state_file("public")));
+    drop(listener);
 }
 
 #[test]

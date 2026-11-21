@@ -33,6 +33,8 @@ mod ops_runner_unit_keeps_the_host_mount_namespace;
 mod ops_runner_wake_sh;
 #[path = "../prove_gate_volume_sh.rs"]
 mod prove_gate_volume_sh;
+#[path = "../read_service_address_sh.rs"]
+mod read_service_address_sh;
 #[path = "../recovery_kit_sh.rs"]
 mod recovery_kit_sh;
 #[path = "../retire_access_object_sh.rs"]

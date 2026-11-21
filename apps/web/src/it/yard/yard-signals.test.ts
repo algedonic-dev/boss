@@ -272,12 +272,24 @@ describe("yardSignals — what fired what, in the packets' own stamps", () => {
       });
     expect(yardSignals([], [], [withExit('o4', '75')]).find(x => x.who === 'ops-runner')).toMatchObject({
       sev: 'warn',
-      what: 'converge answered on forge · exit 75 (not yet)',
+      what: 'converge not yet on forge · exit 75',
     });
+    // A nonzero exit says FAILED, never "answered · exit 1" — the words
+    // ops-request 02035ff0 closed under (design b7bb1625, backlog 50a1578f).
     expect(yardSignals([], [], [withExit('o5', '1')]).find(x => x.who === 'ops-runner')).toMatchObject({
       sev: 'err',
-      what: 'converge answered on forge · exit 1',
+      what: 'converge failed on forge · exit 1',
     });
+    // An answer with no exit is unknown trouble, never ok; a refusal with
+    // no recorded reason invents none.
+    const answer = (id: string, md: Record<string, unknown>): JobLite =>
+      opsRequest(id, { steps: [step('execute', 'completed', { runner_host: 'forge', ...md })] });
+    expect(yardSignals([], [], [answer('o6', { disposition: 'answered' })]).find(x => x.who === 'ops-runner')).toMatchObject({
+      sev: 'err',
+      what: 'converge indeterminate on forge — the verb was invoked and no exit was recorded',
+    });
+    const bare = yardSignals([], [], [answer('o7', { disposition: 'refused' })]).find(x => x.who === 'ops-runner');
+    expect(bare).toMatchObject({ sev: 'err', what: 'converge refused on forge — the runner recorded no reason' });
   });
 
   test('all sources interleave by instant, newest first, capped at the panel size', () => {

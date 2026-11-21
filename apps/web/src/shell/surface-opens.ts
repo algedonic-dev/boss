@@ -49,7 +49,7 @@ export const QUERY_FIELDS: ReadonlySet<string> = new Set([
   'from',
   'fromLabel',
   // The Department Map's selection (design e765b3fc, car N1): a station
-  // name, so `/it?at=gates` is the page /it, never `/it/:at`.
+  // name, so `/alarms?at=gates` is the page /alarms, never `/alarms/:at`.
   'at',
 ]);
 

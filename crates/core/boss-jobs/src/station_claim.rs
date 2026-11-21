@@ -1568,7 +1568,14 @@ fn competitors_in_tree(
 /// the queue reader uses, so the head is always the first of them.
 fn in_queue_order(station: &StationSpec, candidates: Vec<(Job, Step)>) -> Vec<(Job, Step)> {
     let mut ordered: Vec<_> = candidates.iter().map(|(job, _)| job.clone()).collect();
-    crate::station_queue::order_by_discipline(&station.discipline, &mut ordered);
+    // The step each would claim is the one the queue reader judges a
+    // returned repair by (backlog 205ce78a).
+    let returned: std::collections::BTreeSet<String> = candidates
+        .iter()
+        .filter(|(_, step)| crate::station_queue::returned_repair(step))
+        .map(|(job, _)| job.id.to_string())
+        .collect();
+    crate::station_queue::order_returns_first(&station.discipline, &mut ordered, &returned);
     let mut by_id: BTreeMap<String, (Job, Step)> = candidates
         .into_iter()
         .map(|candidate| (candidate.0.id.to_string(), candidate))
@@ -1961,6 +1968,41 @@ mod tree_pull_tests {
             Some(step.id),
             "a declared tree root has tag predicates and step addresses, not a projected predicate.step: {selected:?}",
         );
+    }
+
+    /// The pull agrees with the queue (backlog 205ce78a): a build a
+    /// CHANGES verdict returned to its station is the head ahead of an
+    /// OLDER fresh build of the same priority, and an urgent fresh build
+    /// is still the head ahead of it.
+    #[test]
+    fn a_pull_takes_a_returned_repair_before_older_fresh_work_of_its_priority() {
+        let (station, fresh, fresh_step) = fixture();
+        let packet = |priority, opened: chrono::NaiveDate, note: bool| {
+            let mut job = fresh.clone();
+            job.id = boss_core::job::JobId::new();
+            job.priority = priority;
+            job.opened_on = opened;
+            let mut step = fresh_step.clone();
+            step.id = boss_core::job::StepId::new();
+            step.job_id = job.id;
+            if note {
+                step.metadata[crate::station_queue::RETURNED_FOR_CHANGES] =
+                    serde_json::json!({"review": "5eed5eed"});
+            }
+            (job, vec![step])
+        };
+        let later = fresh.opened_on + chrono::Days::new(3);
+        let returned = packet(boss_core::job::Priority::Standard, later, true);
+        let pulled = |packets: &[(Job, Vec<Step>)]| {
+            head(&station, &JobScope::All, &BTreeMap::new(), packets)
+                .unwrap()
+                .map(|(job, _)| job.id)
+        };
+        let both = [(fresh.clone(), vec![fresh_step.clone()]), returned.clone()];
+        assert_eq!(pulled(&both), Some(returned.0.id), "the repair first");
+        let urgent = packet(boss_core::job::Priority::Urgent, later, false);
+        let all = [both[0].clone(), returned, urgent.clone()];
+        assert_eq!(pulled(&all), Some(urgent.0.id), "priority still first");
     }
 
     #[test]

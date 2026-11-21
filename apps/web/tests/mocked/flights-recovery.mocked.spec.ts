@@ -29,7 +29,7 @@ for (const inline of ['absent', 'null'] as const) {
         return answer(route, ['it-map-transit', 'it-map-live']);
       });
       try {
-        await page.goto('/it');
+        await page.goto('/alarms');
         // This is the defect's witness: old App/loader makes only ONE
         // request. Hold the retry response so its unread mark is observable.
         await expect.poll(() => requests, { timeout: scaled(15_000) }).toBe(2);
@@ -49,7 +49,7 @@ test('a valid inline empty list is known OFF and never starts recovery', async (
   await page.addInitScript('window.__BOSS_FLIGHTS__ = { flights: [] }');
   let requests = 0;
   await page.route(FLIGHTS, route => { requests += 1; return answer(route, ['it-map-transit']); });
-  await page.goto('/it');
+  await page.goto('/alarms');
   await expect(page.locator(unread)).toHaveCount(0);
   await page.clock.runFor(60_000);
   expect(requests).toBe(0);
@@ -60,7 +60,7 @@ test('a fetched empty list is known OFF and stops recovery', async ({ page }) =>
   await installSmokeMocks(page);
   let requests = 0;
   await page.route(FLIGHTS, route => { requests += 1; return answer(route, []); });
-  await page.goto('/it');
+  await page.goto('/alarms');
   await expect.poll(() => requests).toBe(1);
   await expect(page.locator(unread)).toHaveCount(0);
   await page.clock.runFor(60_000);
@@ -75,7 +75,7 @@ test('unread reads back off from one second to a thirty-second cap, with one req
     requests += 1;
     return route.fulfill({ status: 503, body: 'rolling' });
   });
-  await page.goto('/it');
+  await page.goto('/alarms');
   const retrying = page.locator(`${unread}[data-retrying="true"]`);
   await expect(retrying).toBeVisible();
   for (const delay of [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000]) {

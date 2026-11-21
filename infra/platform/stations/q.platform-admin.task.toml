@@ -25,13 +25,27 @@
 # LIVE newest, v2): the station stands in the tree — its stable `id`, its
 # `parent` /algedonic/executive (proposal section 6: the operator's task
 # station is the human's), its mode. Nothing else changed.
+#
+# Version 5 (car 1 of design 2910ec3d, backlog 878fd1e7; bumped from the
+# LIVE newest, v4): the executive desk dissolved into the company, so
+# the person-held task queue stands at the root, `algedonic`, until the
+# person's own station `/me` takes it (design 01fa5bdf, backlog
+# 5cb56bb3). It is no department: it declares no `line`. Only `parent`
+# changed — the capability still admits `platform-admin` alone, so the
+# move gains no one a claim.
+#
+# Version 6 (design 01fa5bdf step 3, backlog 5cb56bb3; bumped from the
+# LIVE newest, v5): the person's own station `me` exists (me.toml), so
+# the person-held task queue stands in it, at
+# /algedonic/me/q.platform-admin.task. Only `parent` changed; the
+# capability still admits `platform-admin` alone.
 # ---------------------------------------------------------------------------
 
 [[station]]
 name = "q.platform-admin.task"
-version = 4
+version = 6
 id = "21bf19d3-94dc-4fcc-ac7c-4a19923c726f"
-parent = "5f922a2a-31f5-4f07-acf1-41dc140687a4"
+parent = "bbfea3e2-d865-42c1-858b-85d45d29f350"
 mode = "standing"
 status = "active"
 title = "platform-admin — task"

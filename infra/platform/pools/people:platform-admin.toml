@@ -8,7 +8,9 @@
 # roster-pools-are-observed-every-five-minutes (backlog a6cb448a), so the
 # observed versions stand above this declared one; until the first
 # observation the capacity is unknown — unknown, not zero, and not one
-# either. The executive station allocates none of it yet.
+# either. No station allocates any of it yet; the executive desk that
+# was to (design 2910ec3d car 1, backlog 878fd1e7) dissolved into the
+# root, which holds the pool itself.
 # v2 (backlog 84f570a1): `capacity_from` says where the capacity number
 # comes from, for the console to show beside it (station-tree.md section 3).
 [[pool]]

@@ -20,15 +20,19 @@ The control stops the daemon before opening its vault and restarts it afterwards
 Do not start another CLI against the running service.
 
 An authorized operator then uses the registered `capture-bridge-credential`
-operation. Its root-only local control stops and verifies the daemon, supplies
-fixed `info` and `exit` input, validates one complete configuration, restarts the
+operation. Its root-only local control stops and verifies the daemon, asks
+`list` until the account has finished loading (a vault account reads `locked`
+until then, and `info` prints nothing for it), asks `info` for the one connected
+row by its index and then `exit`, validates one complete configuration, restarts the
 service, and atomically writes `/etc/boss-bridge/adapter-credential.json` as root
 0600 inside a root 0700 directory. On success it prints only the location and
 byte count. A refusal names an allowlisted constant reason beside UNAVAILABLE;
 CLI text, configuration values and other exception messages remain private.
 A missing owner login (no account configuration), a second stale account (more
 than one) and a configuration naming another account are three different
-reasons, because each needs a different hand; the wrapper prints the child's
+reasons, because each needs a different hand. The account list adds its own:
+no account, every account signed out, and an account still loading or locked
+when the 35 s wait ends (backlog 34d95817). The wrapper prints the child's
 reason once and its own generic line only when the child died without one.
 An unrecognized refusal stays generic. An unavailable outcome does not establish
 whether a credential replacement reached durable storage.

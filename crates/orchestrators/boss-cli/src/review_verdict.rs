@@ -33,14 +33,24 @@
 //!   another sha is no release, and the car is held again
 //!   (`mutating_verb::dock`).
 //!
-//! THE BUILDER IS A RUN, NOT AN ACTOR (D5): the agent-run the car
-//! carries as `agent_run`, which the auto-park handler copies from the
-//! gate-run whose green filed or last refreshed it. A review by that run
-//! is no review, and that run does not release the car in either form
-//! (`car_release::may_release_identity`, car 3 of design 7cedfa29). The
-//! refusal binds runs, never a person: a shell with no run is not
-//! refused, so the three-verb human road in `boss release --help`
-//! stands.
+//! THE BUILDER IS AN ACTOR, AND ITS RUN IS THE NARROWER CASE (backlog
+//! 8e97a4ec, superseding D5's "a run, not an actor"). The builder is
+//! the car's `built_by`, else its builder run's `metadata.agent`
+//! (`car_release::builder_actor`). A review recorded by a run of that
+//! actor, in any spelling the agents registry ties to it, is no review:
+//! `boss review` refuses it before it records anything, and the release
+//! door and the conductor refuse it in `vouches_with_executor`. Measured
+//! 2026-11-13 (review 5775e4cd): every check compared runs, so a
+//! builder's second run, filed by hand and never passing the review
+//! claim door (which refuses the builder actor, 2b927025), reviewed and
+//! released its own car. The run check stays inside it: the builder RUN
+//! (`agent_run`, copied by the auto-park handler from the gate-run
+//! whose green filed or last refreshed the car) neither reviews nor
+//! releases it (`car_release::may_release_identity`, car 3 of design
+//! 7cedfa29). Who PRESSES release stays per run, so a shell with no run
+//! is not refused and the three-verb human road in `boss release
+//! --help` stands: once the review must come from another actor, the
+//! release adds no judgement of its own.
 //!
 //! WHAT A RELEASE RECORDS OF ITS SHELL, AND WHAT IT CANNOT (reviews
 //! 5aa91689 B1, c91ba45b B1'). Every release carries `agent_shell`
@@ -64,7 +74,8 @@ use crate::steps::Wire;
 pub(crate) use boss_jobs::car_release::{
     ExecutorRecordReader, ORIGINAL_VERDICT_KEY, RELEASE, REVIEW_KEY, VERDICTS, branch_of,
     builder_run, immutable_record_resource, judgment_time, may_release, original_verdict_matches,
-    pinned_executor_requirement, read_executor_eligibility, vouches_with_executor,
+    pinned_executor_requirement, read_builder_actor, read_executor_eligibility,
+    vouches_with_executor,
 };
 #[cfg(test)]
 pub(crate) use boss_jobs::car_release::{release_record, reviewer_model, vouches};
@@ -83,23 +94,13 @@ fn short(id: &str) -> &str {
 #[async_trait::async_trait]
 impl ExecutorRecordReader for Wire {
     async fn release_actor_rows(&self) -> Result<Vec<Value>> {
-        let body = self
-            .call(reqwest::Method::GET, "/api/agents", None)
-            .await?
-            .context("the agents registry returned no body")?;
-        let rows = body
-            .get("data")
-            .and_then(Value::as_array)
-            .context("the agents registry returned no rows")?;
-        let total = body
-            .get("total")
-            .and_then(Value::as_u64)
-            .context("the agents registry returned no total")?;
-        anyhow::ensure!(
-            total == rows.len() as u64,
-            "the agents registry returned an incomplete snapshot"
-        );
-        Ok(rows.clone())
+        boss_jobs::car_release::agents_snapshot(
+            self.call(reqwest::Method::GET, "/api/agents", None).await?,
+        )
+    }
+    async fn job_packet(&self, id: &str) -> Result<Option<Value>> {
+        self.call(reqwest::Method::GET, &format!("/api/jobs/{id}"), None)
+            .await
     }
     async fn protocol_version(&self, kind: &str, version: i64) -> Result<Option<Value>> {
         self.call(
@@ -522,6 +523,14 @@ pub(crate) async fn record_in(
             str_at(&run_packet, "/kind")
         );
     }
+    // The builder ACTOR, from any run of its own (backlog 8e97a4ec):
+    // told here, before anything is recorded, by the predicate the
+    // release door and the conductor ask of the same run.
+    read_builder_actor(wire, &packet)
+        .await
+        .context("boss review: REFUSED — the car's builder actor could not be read")?
+        .independent(&run_packet)
+        .map_err(|why| anyhow!("boss review: REFUSED — {why}"))?;
     let branch = branch_of(&packet)?;
     let head = forge(&format!("refs/heads/{branch}"))?;
     let executor = read_executor_eligibility(wire, &run_packet, &packet, &head).await.context("boss review: FORMAL executor eligibility refused; advisory findings remain reportable on the run")?;
@@ -1107,8 +1116,9 @@ mod tests {
         let mut packet = car();
         packet["status"] = json!("open");
         packet["workflow_version"] = json!(7);
+        packet["metadata"]["built_by"] = json!("claude@algedonic.dev");
         packet["steps"] = json!([{"id":"00000000-0000-0000-0000-000000000003", "spec_slug":"review","metadata":{"agent_executor_provenance":"verified"}}]);
-        let native = json!({"id":REVIEWER,"kind":"agent-run","metadata":{"executor.binding":{"assurance":"verified"}},"steps":[{"id":"00000000-0000-0000-0000-000000000004","spec_slug":"building","status":"active"}]});
+        let native = json!({"id":REVIEWER,"kind":"agent-run","metadata":{"agent":"agent-codex","executor.binding":{"assurance":"verified"}},"steps":[{"id":"00000000-0000-0000-0000-000000000004","spec_slug":"building","status":"active"}]});
         let app = Router::new().fallback(move |request: Request| {
             let calls = observed.clone(); let packet = packet.clone(); let native = native.clone();
             async move {
@@ -1118,6 +1128,7 @@ mod tests {
                     else if path == "/api/jobs" { Some(json!({"data":[packet],"total":1})) }
                     else if path == format!("/api/jobs/{CAR}") { Some(packet) }
                     else if path == format!("/api/jobs/{REVIEWER}") { Some(native) }
+                    else if path == "/api/agents" { Some(json!({"data":[],"total":0})) }
                     else if path == "/api/workflows/ship-a-change/versions/7" { Some(json!({"kind":"ship-a-change","version":7,"status":"active","steps":[{"title":"review","agent":{"profile":"reviewer","model":"gpt-6.1-sol","budget_usd":1,"effort":"low","executor_provenance":"verified"}}]})) }
                     else { None };
                 match answer {

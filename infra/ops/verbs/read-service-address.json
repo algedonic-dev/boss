@@ -1,0 +1,22 @@
+{
+  "about": "READ-ONLY: the address the cluster assigned one LoadBalancer Service, beside its ports, its pins and the allocator the object names (infra/forge/read-service-address.sh <namespace> <service>; backlog 7f05ef2f, filed from 47601829, whose standby dev pod's ssh door must pin the address the pool gave boss-dev/boss-dev-standby-ssh — the dev session's credential cannot get services, no verb read a Service, and the estate API holds no load-balancer address). The Service must be one a manifest under infra/cluster/manifests declares in that namespace, DERIVED through infra/cluster/undeclared-objects.sh --declared and never a typed list; anything else is refused (exit 78) before any cluster read. Then one kubectl get svc through the forge's ops_kubectl door, bounded by --request-timeout=20s and a 60 s timeout around the door, prints `service <ns>/<name> type <type> class <loadBalancerClass|none>`, each `ingress <ip|hostname>`, each `port <name> <port>/<protocol>`, `pin <key>=<value|none>` for io.cilium/lb-ipam-ips, metallb.universe.tf/loadBalancerIPs and spec.loadBalancerIP, and `allocator …` from MetalLB's ip-allocated-from-pool annotation or a cilium.io/ status condition (or `allocator none named`) — so its first run says which allocator serves, an answer the tree cannot give because it declares no pool. Only those named fields are read off the object, never its annotations wholesale. A Service the cluster does not hold, a read that failed or ran past its bound, an answer about another object, a declared set that could not be derived, or a Service with no assigned address prints CANNOT ANSWER and exits 1, never an empty success. Nothing is written. Timeout 300: the declared set's derivation (one client-side kubectl parse per manifest), the door image's pull bounded at 120 s the first time, and the bounded read.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/read-service-address.sh",
+    "{1}",
+    "{2}"
+  ],
+  "params": [
+    {
+      "name": "namespace",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    {
+      "name": "service",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    }
+  ],
+  "timeout": 300
+}

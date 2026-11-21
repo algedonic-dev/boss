@@ -54,7 +54,7 @@ describe('the waits ladder: not admitted, worst first', () => {
     ]);
     expect(l.rungs[0]?.words).toBe('Its seat is idle while 30 wait.');
     expect(l.rungs[1]?.words).toBe('1 of 2 seats held.');
-    expect(l.rungs[0]?.href).toBe('/it/tree/loading-dock');
+    expect(l.rungs[0]?.href).toBe('/tree/loading-dock');
     // design-review stands under executive, not here.
     expect(l.rungs.some((r) => r.station === 'design-review')).toBe(false);
     // The budget is said once, never invented per rung.
@@ -95,7 +95,7 @@ describe('the stuck list', () => {
     expect(s.items.map((i) => [i.words, i.age])).toEqual([['1 claim at no station', '9 d']]);
     const t = stuckList(tree(), 'engineering', load(), claims(PLACED), NOW);
     if (t.kind !== 'items') throw new Error('stuck unread');
-    expect(t.items.map((i) => [i.words, i.age, i.href])).toEqual([['loading-dock: 30 not admitted, its seat idle', '2 d', '/it/tree/loading-dock']]);
+    expect(t.items.map((i) => [i.words, i.age, i.href])).toEqual([['loading-dock: 30 not admitted, its seat idle', '2 d', '/tree/loading-dock']]);
   });
 
   test('an unread claims read is the list unread', () => {
@@ -158,7 +158,7 @@ describe('needs you: the human-required view, over the protocols this station ho
     const l = needsYouList(needs([car, job('a', 'ready')]), NOW);
     if (l.kind !== 'lines') throw new Error('no lines');
     expect(l.count).toEqual({ kind: 'count', n: 2, floor: false });
-    expect(l.lines.map((line) => [line.id, line.href])).toEqual([['rv', '/it?at=dock#held-cars'], ['st-a', '/ux/jobs/a/steps/st-a']]);
+    expect(l.lines.map((line) => [line.id, line.href])).toEqual([['rv', '/alarms?at=dock#held-cars'], ['st-a', '/ux/jobs/a/steps/st-a']]);
     expect(l.lines.map((line) => line.href)).toEqual([needHref(car, rv), needHref({ id: 'a' }, { id: 'st-a' })]);
   });
   test('the band says the count in words, a floor as at least, and unread with why', () => {

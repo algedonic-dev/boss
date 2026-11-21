@@ -18,6 +18,7 @@ import {
 } from './regions';
 import { scaled } from '../../dev-load';
 import { parseRoute } from '../../router';
+import { ADDRESSES } from '../../../tests/fixtures/station-tree';
 import { readSources } from '../../source-scan';
 
 // The IT system map (design 0524fc95, car 2): the region cards read
@@ -186,21 +187,24 @@ describe('the names are the server\'s, in map order', () => {
 // The region's floor page that the detail linked to (`floorHref`) retired
 // with car N3: the panel carries the floor itself.
 describe('regionHref — every region the server serves is a selection on the Department Map', () => {
-  it('each name opens /it?at=<name>, and the router reads it as that selection', () => {
+  // At the alarms board's own address, which the root hosts, since backlog
+  // 92bfcb04: /it was IT's, and IT retires as a department (design
+  // df0ecd8b). The /it spelling is no selection of anything.
+  it('each name opens /alarms?at=<name>, and the router reads it as that selection', () => {
     const { names } = serverRegions();
     expect(names).toContain('publish');
     for (const name of names) {
       const href = regionHref(name);
-      expect(href, name).toBe(`/it?at=${name}`);
+      expect(href, name).toBe(`/alarms?at=${name}`);
       const url = new URL(href, 'http://boss.test');
-      expect(parseRoute(url.pathname, url.search), name).toEqual({ kind: 'systemYard', at: name });
+      expect(parseRoute(url.pathname, url.search, ADDRESSES), name).toEqual({ kind: 'systemYard', at: name });
     }
   });
 
   it('a name that is not a region — the plant, a newer server\'s eleventh — opens the map with nothing selected', () => {
-    expect(regionHref('siding')).toBe('/it');
-    expect(regionHref('plant')).toBe('/it');
-    expect(regionHref('')).toBe('/it');
+    expect(regionHref('siding')).toBe('/alarms');
+    expect(regionHref('plant')).toBe('/alarms');
+    expect(regionHref('')).toBe('/alarms');
   });
 
   // Every file under src/ is read, so the reads go out side by side and

@@ -67,7 +67,11 @@ pub(super) async fn waiting<R: JobsRepository + 'static, B: EventBus + 'static>(
 
 #[derive(Deserialize, Default)]
 pub(super) struct Query {
-    as_of: Option<i64>,
+    /// The retired time-travel selector, read only so it can be refused:
+    /// axum ignores a key no field names, and `?as_of=N` would then answer
+    /// the head as if it were the past (backlog 4bec011d). A string, so
+    /// any value — a number, a word, nothing — meets the same refusal.
+    as_of: Option<String>,
     window: Option<String>,
     /// The station, by `id` or name, whose subtree's claims to answer
     /// (backlog d05e29a7). Absent: every claim, as before.
@@ -167,7 +171,7 @@ fn narrow(
     }
 }
 
-/// The one gate both claims reads stand behind: the existing full job-read
+/// The gate the claims read stands behind: the existing full job-read
 /// scope, and a wired materialized reader. A narrower scope is 403, an
 /// unwired reader is named 503, never a missing route.
 async fn scoped_history<R: JobsRepository + 'static, B: EventBus + 'static>(
@@ -195,11 +199,11 @@ async fn scoped_history<R: JobsRepository + 'static, B: EventBus + 'static>(
     })
 }
 
-/// One answer shape for both reads: the 2 s deadline, Invalid 400,
+/// The claims read's answer shape: the 2 s deadline, Invalid 400,
 /// OutsideRetention 410, everything else a named 503.
 async fn answer<T: serde::Serialize>(
     read: impl std::future::Future<Output = Result<T, crate::claims_console::ClaimsError>>,
-    trace: Option<crate::claims_console::CutsTrace>,
+    trace: crate::claims_console::ReadTrace,
 ) -> Response {
     match tokio::time::timeout(std::time::Duration::from_secs(2), read).await {
         Ok(Ok(reading)) => Json(reading).into_response(),
@@ -212,14 +216,10 @@ async fn answer<T: serde::Serialize>(
         Ok(Err(error)) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            trace
-                .map(|trace| {
-                    format!(
-                        "claims history unavailable: outer deadline exhausted; {}",
-                        trace.describe()
-                    )
-                })
-                .unwrap_or_else(|| "claims history unavailable: read deadline exhausted".into()),
+            format!(
+                "claims history unavailable: outer deadline exhausted; {}",
+                trace.describe()
+            ),
         )
             .into_response(),
     }
@@ -234,6 +234,16 @@ pub(super) async fn read<R: JobsRepository + 'static, B: EventBus + 'static>(
         Ok(history) => history,
         Err(refused) => return refused,
     };
+    // After policy, like every jobs read: an unscoped caller learns
+    // nothing about the parameters (the every-jobs-read pin).
+    if query.as_of.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "as_of is retired: the claims console's time travel went with its \
+             scrubber (backlog 4bec011d); GET /api/claims answers the head only",
+        )
+            .into_response();
+    }
     let hours = match crate::regions::parse_window(query.window.as_deref()) {
         Ok(hours) => hours,
         Err(why) => return (StatusCode::BAD_REQUEST, why).into_response(),
@@ -247,9 +257,9 @@ pub(super) async fn read<R: JobsRepository + 'static, B: EventBus + 'static>(
         },
         None => None,
     };
-    // The same request-owned trace the cuts read carries, so a deadline
-    // names the statement it interrupted (backlog 81f8e468).
-    let trace = crate::claims_console::CutsTrace::default();
+    // A request-owned trace, so a deadline names the statement it
+    // interrupted (backlog 81f8e468).
+    let trace = crate::claims_console::ReadTrace::default();
     let observer = trace.clone();
     answer(
         async {
@@ -257,65 +267,11 @@ pub(super) async fn read<R: JobsRepository + 'static, B: EventBus + 'static>(
             let now = state.claims_history_clock.now().await.now;
             observer.finish();
             history
-                .read_traced(query.as_of, hours, now, observer)
+                .read_traced(None, hours, now, observer)
                 .await
                 .map(|reading| narrow(reading, within, query.limit))
         },
-        Some(trace),
-    )
-    .await
-}
-
-/// `GET /api/claims/cuts?from=<rfc3339>&to=<rfc3339>&buckets=<1..1024>`:
-/// the retained cuts a review screen may scrub to (car 3c, item c46a4e99).
-#[derive(Deserialize, Default)]
-pub(super) struct CutsQuery {
-    from: Option<String>,
-    to: Option<String>,
-    buckets: Option<usize>,
-}
-
-fn instant(
-    name: &str,
-    text: Option<&str>,
-) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
-    text.map(|t| {
-        chrono::DateTime::parse_from_rfc3339(t)
-            .map(|d| d.with_timezone(&chrono::Utc))
-            .map_err(|e| format!("{name} is not RFC 3339: {e}"))
-    })
-    .transpose()
-}
-
-pub(super) async fn cuts<R: JobsRepository + 'static, B: EventBus + 'static>(
-    State(state): State<Arc<JobsApiState<R, B>>>,
-    CurrentUser(user): CurrentUser,
-    axum::extract::Query(query): axum::extract::Query<CutsQuery>,
-) -> Response {
-    let history = match scoped_history(&state, &user).await {
-        Ok(history) => history,
-        Err(refused) => return refused,
-    };
-    let (from, to) = match (
-        instant("from", query.from.as_deref()),
-        instant("to", query.to.as_deref()),
-    ) {
-        (Ok(from), Ok(to)) => (from, to),
-        (Err(why), _) | (_, Err(why)) => return (StatusCode::BAD_REQUEST, why).into_response(),
-    };
-    let buckets = query
-        .buckets
-        .unwrap_or(crate::claims_console::DEFAULT_CUT_BUCKETS);
-    let trace = crate::claims_console::CutsTrace::default();
-    let observer = trace.clone();
-    answer(
-        async {
-            observer.start("clock");
-            let now = state.claims_history_clock.now().await.now;
-            observer.finish();
-            history.cuts_traced(from, to, buckets, now, observer).await
-        },
-        Some(trace),
+        trace,
     )
     .await
 }

@@ -560,11 +560,6 @@ fn build_router(
             "/api/claims",
             axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
         )
-        // The retained cuts the review screen scrubs to (console car 3c).
-        .route(
-            "/api/claims/cuts",
-            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
-        )
         // A pool's claim line, in order (claims_console.rs `waiting`):
         // the station Resources view draws it (backlog 87575d69).
         .route(
@@ -1453,8 +1448,7 @@ mod routing_tests {
     #[tokio::test]
     async fn no_service_route_is_shadowed_by_the_catch_all() {
         const REAL: &[&str] = &[
-            "/api/claims?as_of=42&window=24h",
-            "/api/claims/cuts?buckets=8",
+            "/api/claims?window=24h",
             "/api/claims/waiting?pool=robots:opus",
             "/api/session",
             "/api/tenant/manifest",
@@ -1903,7 +1897,7 @@ fetch(`/api/${service}/items`);
     async fn claims_console_history_is_routed_and_session_gated_with_its_query() {
         let (status, body) = get(
             app_declaring(None, &demo()),
-            "/api/claims?as_of=42&window=24h",
+            "/api/claims?window=24h&station=engineering",
         )
         .await;
         assert_eq!(
@@ -1912,6 +1906,16 @@ fetch(`/api/${service}/items`);
             "the query must reach the existing session gate: {body}"
         );
         assert!(!body.contains(MISS));
+    }
+
+    /// Backlog 4bec011d: the retained-cuts index lost its one reader with
+    /// the scrubber (7381cde96), so the door no longer proxies it — a GET
+    /// is the gateway's own named miss, not a session challenge.
+    #[tokio::test]
+    async fn the_retired_claims_cuts_route_is_a_miss() {
+        let (status, body) = get(app_declaring(None, &demo()), "/api/claims/cuts").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+        assert!(body.contains(MISS), "body: {body}");
     }
 
     #[tokio::test]

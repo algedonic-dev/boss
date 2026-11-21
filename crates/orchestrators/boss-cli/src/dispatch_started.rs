@@ -462,9 +462,14 @@ pub(crate) async fn started_with_worker_at(
             .pointer("/metadata/profile")
             .and_then(Value::as_str)
             .context("own run names no execution profile")?;
-        let repo = crate::brief::repo_root()?;
-        if crate::dispatch::Isolation::for_profile(&repo, profile)?
-            == crate::dispatch::Isolation::Worktree
+        if start_profile_isolation(
+            &std::env::current_dir().context("reading the current directory")?,
+            std::env::var_os(crate::trust_boundary::TREE_ENV)
+                .as_deref()
+                .map(std::path::Path::new),
+            std::path::Path::new(crate::trust_boundary::BUILT_FROM),
+            profile,
+        )? == crate::dispatch::Isolation::Worktree
         {
             bail!(
                 "source builder START requires --local-root <your own worktree>; no worker acknowledgment written"
@@ -1162,10 +1167,147 @@ pub(crate) async fn started(
     Ok(())
 }
 
+/// START reads profile data even when a shared run stands in its
+/// prescribed scratch directory (b2d2adde). Keep a caller's worktree
+/// first; outside one, use the named or built tree as the trust verbs
+/// already do. This chooses a declaration, not an execution waiver:
+/// the caller still refuses Worktree without --local-root, and the
+/// claim, receipt and pinned workerless bill checks are unchanged.
+fn start_profile_isolation(
+    cwd: &std::path::Path,
+    named: Option<&std::path::Path>,
+    built: &std::path::Path,
+    profile: &str,
+) -> Result<crate::dispatch::Isolation> {
+    match crate::brief::repo_root_at(cwd) {
+        Ok(repo) => crate::dispatch::Isolation::for_profile(&repo, profile),
+        Err(cwd_error) => {
+            let mut misses = vec![format!("current directory: {cwd_error:#}")];
+            for (label, tree) in [
+                (crate::trust_boundary::TREE_ENV, named),
+                ("the checkout this binary was built from", Some(built)),
+            ] {
+                let Some(tree) = tree.filter(|p| !p.as_os_str().is_empty()) else {
+                    misses.push(format!("{label} is unset"));
+                    continue;
+                };
+                if tree.join(crate::documents::DIR).is_dir() {
+                    // A bad or absent profile in the selected tree must
+                    // not fall through to a different declaration.
+                    return crate::dispatch::Isolation::for_profile(tree, profile);
+                }
+                misses.push(format!(
+                    "{label}: {} holds no {}",
+                    tree.display(),
+                    crate::documents::DIR
+                ));
+            }
+            bail!(
+                "no profile declaration tree for START; no acknowledgment written:\n{}",
+                misses.join("\n")
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_shared_start_resolves_its_profile_without_a_cwd_worktree() {
+        let root = boss_testing::scratch::scratch_dir("shared-start-profile-tree");
+        let scratch = root.join("run-scratch");
+        let tree = root.join("named-tree");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir_all(tree.join(crate::documents::DIR)).unwrap();
+        std::fs::write(
+            tree.join(crate::documents::path_for("analyst")),
+            "---\nprofile: analyst\nlane: step\n---\nNo source work.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            start_profile_isolation(&scratch, Some(&tree), &root.join("missing"), "analyst")
+                .unwrap(),
+            crate::dispatch::Isolation::Shared,
+            "the shared START prescribed scratch directory is not a checkout"
+        );
+    }
+
+    #[test]
+    fn start_profile_fallback_reads_data_and_keeps_source_profiles_isolated() {
+        let root = boss_testing::scratch::scratch_dir("start-profile-fallback");
+        let scratch = root.join("scratch");
+        let tree = root.join("built");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir_all(tree.join(crate::documents::DIR)).unwrap();
+        std::fs::write(
+            tree.join(crate::documents::path_for("observer")),
+            "---\nprofile: observer\nlane: step\n---\nShared data-defined profile.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            start_profile_isolation(&scratch, Some(&root.join("gone")), &tree, "observer").unwrap(),
+            crate::dispatch::Isolation::Shared,
+        );
+        for profile in ["builder", "unknown"] {
+            assert_eq!(
+                start_profile_isolation(&scratch, None, &tree, profile).unwrap(),
+                crate::dispatch::Isolation::Worktree,
+                "an absent declaration keeps the source-builder default: {profile}",
+            );
+        }
+        let err =
+            start_profile_isolation(&scratch, None, &root.join("gone"), "observer").unwrap_err();
+        assert!(
+            err.to_string().contains("no acknowledgment written"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_start_profile_uses_its_worktree_and_never_falls_through_a_bad_declaration() {
+        let root = boss_testing::scratch::scratch_dir("start-profile-precedence");
+        let current = root.join("current");
+        let named = root.join("named");
+        let scratch = root.join("scratch");
+        for tree in [&current, &named] {
+            std::fs::create_dir_all(tree.join(crate::documents::DIR)).unwrap();
+        }
+        std::fs::create_dir_all(&scratch).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg(&current)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        std::fs::write(
+            current.join(crate::documents::path_for("observer")),
+            "---\nprofile: observer\nlane: car\n---\nSource profile.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            named.join(crate::documents::path_for("observer")),
+            "---\nprofile: observer\nlane: step\n---\nShared profile.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            start_profile_isolation(&current, Some(&named), &named, "observer").unwrap(),
+            crate::dispatch::Isolation::Worktree,
+            "a named shared declaration cannot override the caller's source tree",
+        );
+        std::fs::write(
+            current.join(crate::documents::path_for("observer")),
+            "---\nprofile: wrong-profile\nlane: step\n---\n",
+        )
+        .unwrap();
+        assert!(start_profile_isolation(&current, Some(&named), &named, "observer").is_err());
+        assert!(start_profile_isolation(&scratch, Some(&current), &named, "observer").is_err());
+    }
 
     fn active() -> serde_json::Value {
         json!({"id":"own-run","kind":"agent-run","status":"open",

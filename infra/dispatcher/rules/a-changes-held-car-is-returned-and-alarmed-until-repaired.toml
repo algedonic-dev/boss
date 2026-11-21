@@ -1,0 +1,44 @@
+# Every hour, each HELD car whose review stands at a CHANGES verdict is
+# judged again: its item's build goes back to its station by the same
+# judgement the verdict's own rule makes, and a car that has gone
+# `alarm_hours` with no repair gate-run since the verdict files one alarm
+# naming it (backlog 205ce78a).
+#
+# THE CASE. Measured 2026-11-21 16:14-16:30Z (triage run 85bad576, 15
+# held CHANGES cars read whole): 11 were stranded. Seven had been
+# returned by `a-changes-verdict-returns-the-build-to-its-station` and
+# never pulled, 2.1 to 3.5 days. Four stood ACTIVE on a closed run, which
+# that rule cannot see again: it fires only on a write to the REVIEW run,
+# and it leaves a build whose run edge names an open run (the builder's
+# own, still unreported at verdict time). When that run closed later, or
+# a repair run ended refused, nothing judged the build again. The oldest
+# was eight days old, and nothing alarmed.
+#
+# THE RETURN reuses the verdict rule's functions (`changes_of`,
+# `owed_item`, `return_build`), so the two cannot judge one car two ways;
+# the sweep adds one case, a build this verdict returned that was taken
+# again by a run that has since CLOSED. THE ALARM reads the repair's own
+# record: a gate-run on the car's branch opened after the verdict ends the
+# wait. One alarm per car, held while it stays open; closing it re-arms.
+#
+# The pull half — a returned repair drains before fresh work of its
+# priority — is the station queue's discipline (boss-jobs
+# `station_queue::order_returns_first`), not a rule.
+[[rule]]
+name = "a-changes-held-car-is-returned-and-alarmed-until-repaired"
+why = """
+A TIMER over an ABSENCE, the standing exemption: the conditions are a
+pull and a repair that did NOT happen, and no event says "twelve hours
+passed and no gate-run was opened on this car" or "the run this build
+waited on closed". Its event twin acts only on the verdict's own write.
+Measured 2026-11-21 (backlog 205ce78a): 11 of 15 held CHANGES cars
+stranded, the oldest eight days, four of them on a build active on a
+closed run. It returns a build to its station exactly as the verdict
+rule would and files one urgent alarm per unrepaired car, owned by the
+platform owner, assigned to nobody; it nominates and claims nothing.
+"""
+version = 1
+schedule = { cadence = "hourly", anchor_date = "2026-11-21" }
+[[rule.do]]
+handler = "jobs.changes_repair_watch"
+args = { kind = "\"ship-a-change\"", alarm_hours = "12" }

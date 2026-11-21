@@ -1548,6 +1548,17 @@ enum CarAction {
     /// and the successor recorded. Never a reopen: both facts stay.
     /// WHY (backlog f9256445): train 2026-09-25 20:04 merged as c85941b4
     /// and main was back at 777a5888 within 32 seconds.
+    ///
+    /// SECOND READING, `--reverted-by <revert car|sha> --superseded-by
+    /// <car>`: main still CARRIES the merge but reverted it (backlog
+    /// 7f4694eb: car 526974b0, reverted by car 6c272983, its intent landed
+    /// as car bfa6f7be). Reads, itself, that the merge IS on main, that the
+    /// revert is on main and descends from the merge, and that it undoes
+    /// every path of the car's own boarded diff (an empty diff against
+    /// before the merge, or matching patch-ids) — a partial revert is
+    /// refused naming the paths. Opens NO successor: the named car, which
+    /// must answer the same item, gains `supersedes`; the car closes
+    /// through `unlanded` naming the revert and the successor.
     Unland {
         /// The car: its branch, or 8+ characters of its id.
         car: String,
@@ -1555,6 +1566,15 @@ enum CarAction {
         /// (a full sha is fetched by sha when this clone never saw it).
         #[arg(long)]
         merge_ref: String,
+        /// The revert main carries: the revert's car (closed merged; its
+        /// `merge_ref` is read) or the revert's sha. Requires
+        /// --superseded-by.
+        #[arg(long, requires = "superseded_by")]
+        reverted_by: Option<String>,
+        /// The car that carries the reverted car's intent — open or
+        /// landed, answering the same item. Requires --reverted-by.
+        #[arg(long, requires = "reverted_by")]
+        superseded_by: Option<String>,
         /// Read and print, write nothing.
         #[arg(long)]
         dry_run: bool,
@@ -1624,7 +1644,7 @@ enum TrainAction {
     /// the jobs API's `/api/cadence/*` door) against boss-clock time
     /// and fire the verbs the rules name, recording every firing
     /// through the same door. The supervised entry
-    /// (infra/train/boss-train.service) — the schedule itself is
+    /// (infra/cluster/manifests/boss-conductor.yaml) — the schedule itself is
     /// protocol data (the protocol-cadence decision in docs/architecture-decisions.md).
     Cadence {
         /// Evaluate one tick and exit (operator / test entry)
@@ -2321,8 +2341,20 @@ async fn main() -> Result<()> {
             CarAction::Unland {
                 car: given,
                 merge_ref,
+                reverted_by,
+                superseded_by,
                 dry_run,
-            } => car_unland::unland(&given, &merge_ref, dry_run, chrono::Utc::now()).await,
+            } => {
+                car_unland::unland(
+                    &given,
+                    &merge_ref,
+                    reverted_by.as_deref(),
+                    superseded_by.as_deref(),
+                    dry_run,
+                    chrono::Utc::now(),
+                )
+                .await
+            }
         },
         Commands::Workflow { action } => match action {
             WorkflowAction::Publish {

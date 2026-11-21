@@ -65,7 +65,7 @@ done
 
 echo "==> [3/3] boss CLI (-p boss-cli --bin boss)"
 # The CLI is a deploy-roster member, not a dev convenience:
-# boss-train.service and infra/train/conductor.sh exec
+# the cadence loop and infra/train/conductor.sh exec
 # /usr/local/bin/boss on the box, and a roster that never NAMED it
 # left a stale Aug-7 CLI serving the cadence cutover (missing
 # `train`, then `cadence` — the conductor broke twice in one night).

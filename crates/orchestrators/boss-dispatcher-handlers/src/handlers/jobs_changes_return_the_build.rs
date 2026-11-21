@@ -65,7 +65,9 @@ pub const HANDLER: &str = "jobs.changes_return_the_build";
 /// reclaim's `reclaimed`, the hand verb's `released`, the urgent watch's
 /// `released_unrun` or the stranded-review return's
 /// `returned_to_station`, so a reader can tell which door moved it.
-pub const NOTE_KEY: &str = "returned_for_changes";
+/// One definition, in boss-jobs, because the station queue reads it to
+/// rank a returned repair ahead of fresh work (backlog 205ce78a).
+pub const NOTE_KEY: &str = boss_jobs::station_queue::RETURNED_FOR_CHANGES;
 
 /// The item's step a car is built on (`backlog-item.toml`'s `build`).
 const ITEM_BUILD_SLUG: &str = "build";
@@ -179,10 +181,19 @@ pub(crate) enum Plan<'a> {
 }
 
 /// PURE: does `step` already carry this verdict's note?
-fn noted(step: &Json, changes: &Changes) -> bool {
+pub(crate) fn noted(step: &Json, changes: &Changes) -> bool {
     let note = format!("/metadata/{NOTE_KEY}");
     step.pointer(&note)
         .is_some_and(|n| text(n, "/review") == changes.run && text(n, "/head") == changes.head)
+}
+
+/// PURE: the item's `build` step, the one a car is built on.
+pub(crate) fn build_step(item: &Json) -> Option<&Json> {
+    item.get("steps")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .find(|s| text(s, "/spec_slug") == ITEM_BUILD_SLUG)
 }
 
 /// PURE: the plan for `item`'s build on `changes` (module doc).
@@ -200,13 +211,7 @@ pub(crate) fn plan_by<'a>(item: &'a Json, done: impl Fn(&Json) -> bool) -> Plan<
     if status != "open" {
         return Plan::Leave(format!("item {id} is {status:?}, not open"));
     }
-    let Some(step) = item
-        .get("steps")
-        .and_then(Json::as_array)
-        .into_iter()
-        .flatten()
-        .find(|s| text(s, "/spec_slug") == ITEM_BUILD_SLUG)
-    else {
+    let Some(step) = build_step(item) else {
         return Plan::Leave(format!("item {id} has no `{ITEM_BUILD_SLUG}` step"));
     };
     let done = done(step);

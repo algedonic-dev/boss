@@ -1,12 +1,12 @@
 <script lang="ts">
-  // THE ALARMS BOARD — what stays at /it of the Department Map (design
+  // THE ALARMS BOARD — what stays of the Department Map (design
   // e765b3fc) after step 1 of design 01fa5bdf (David, 2026-11-17: "IT
   // disappears, the old map is pulled out"; when unsure, remove). It
   // keeps the two things no other page offers yet:
   //
   //   - THE ALARMS BOARD: every station neither clear nor full, with the
   //     server's why, from GET /api/yard/regions (alarms.ts);
-  //   - THE RELEASE AND CANCEL CONTROLS, under `/it?at=<name>`: the
+  //   - THE RELEASE AND CANCEL CONTROLS, under `/alarms?at=<name>`: the
   //     track's deck, where a troubled train is cancelled, and the yard
   //     status board's dock and garage lanes, where a held car is
   //     released (panel.ts names which station carries which).
@@ -15,7 +15,7 @@
   // goes then; the regions read goes in its step 5, once the alarms read
   // station rows. Gone in step 1: the needs-you board (the person's
   // queue moves to /me), the embedded company station page (it stands at
-  // /it/tree), and every other station's boards — the gates', arrivals'
+  // /tree, the root's, since backlog 92bfcb04), and every other station's boards — the gates', arrivals'
   // and shed's decks, the receiving and marshalling queue boards, the
   // sensors panel, the conductor's feed and the feedback and backlog
   // boards.
@@ -24,7 +24,8 @@
   import { navigate } from '@boss/web-kit/nav';
   import { safeLinkHref } from '@boss/web-kit/links';
   import type { Remote } from '../../data/remote';
-  import { fetchRegions, regionHref, REGION_NAMES, type Regions } from './regions';
+  import { BOARD_HREF, fetchRegions, regionHref, REGION_NAMES, type Regions } from './regions';
+  import { treeHref } from '../tree/station-tree';
   import { alarmLabel, alarmsOf } from './alarms';
   import { boardsOf } from './panel';
   import StationBoundary from './StationBoundary.svelte';
@@ -33,7 +34,7 @@
   import { mapRead, startMapPolling } from './map-polling';
 
   type Props = Readonly<{
-    /** The station whose boards open below — `/it?at=<name>`. Absent,
+    /** The station whose boards open below — `/alarms?at=<name>`. Absent,
      *  none opens. */
     at?: string;
   }>;
@@ -84,7 +85,7 @@
 </script>
 
 <div class="theme-exec yard-root">
-  <a class="company-back" href="/it/tree" onclick={(e) => go(e, '/it/tree')}>Company station tree</a>
+  <a class="company-back" href={safeLinkHref(treeHref(null))} onclick={(e) => go(e, treeHref(null))}>Company station tree</a>
   <PageHeader
     eyebrow="IT"
     title="Alarms"
@@ -117,7 +118,7 @@
       <header class="panel-head">
         <span class="panel-kind">Station</span>
         <h2 class="panel-title">{titleOf(at)}</h2>
-        <a class="panel-close" data-close href="/it" aria-label="close the {at} selection" onclick={(e) => go(e, '/it')}>close</a>
+        <a class="panel-close" data-close href={safeLinkHref(BOARD_HREF)} aria-label="close the {at} selection" onclick={(e) => go(e, BOARD_HREF)}>close</a>
       </header>
       {#if station === null}
         <p class="panel-none">No station here is named “{at}”.</p>

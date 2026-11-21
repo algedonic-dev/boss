@@ -17,8 +17,10 @@
 //! backlog b7b02024 explain it. A RELEASE IS A REVIEW VERDICT BOUND TO
 //! THE HEAD IT JUDGED:
 //!
-//! - the named run is an agent-run, not the car's builder, and (when it
-//!   was dispatched) was opened on THIS car's `review` step;
+//! - the named run is an agent-run, not the car's builder run, and not a
+//!   run of the builder ACTOR in any spelling the agents registry ties to
+//!   it ([`BuilderActor`], backlog 8e97a4ec), and (when it was
+//!   dispatched) was opened on THIS car's `review` step;
 //! - it records a review of this car, the verdict is RELEASE, and the
 //!   head it read is the head the release is given at ([`vouches`]);
 //! - the shell releasing is not the car's builder run
@@ -135,6 +137,186 @@ pub fn builder_run(car: &Value) -> Option<&str> {
     Some(str_at(car, "/metadata/agent_run")).filter(|s| !s.is_empty())
 }
 
+/// The ACTOR that built this car (backlog 8e97a4ec): its `built_by`,
+/// the login its builder signed the car with, or, on a car that records
+/// none (the auto-park case, 30bf3109), the `metadata.agent` of its
+/// builder run. `builder` is that run's packet as read, and counts only
+/// when it IS the run the car names. `None` for a car gated by hand
+/// with neither.
+///
+/// Beside [`builder_run`] because the run is the narrower of the two:
+/// measured 2026-11-13 (review 5775e4cd), a builder opened a second run
+/// of its own, recorded RELEASE in it and released its own car, because
+/// every check here compared runs. The claim door already refused the
+/// builder ACTOR its review step (2b927025); a run that never passed
+/// that door did not meet it.
+pub fn builder_actor<'a>(car: &'a Value, builder: Option<&'a Value>) -> Option<&'a str> {
+    Some(str_at(car, &format!("/metadata/{}", crate::car::BUILT_BY)))
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let run = builder_run(car)?;
+            builder
+                .filter(|b| str_at(b, "/id").eq_ignore_ascii_case(run))
+                .map(|b| str_at(b, "/metadata/agent"))
+                .filter(|s| !s.is_empty())
+        })
+}
+
+/// The car's builder as the agents registry spells it, read during this
+/// operation ([`read_builder_actor`]): the actor [`builder_actor`]
+/// names, and every spelling a registry row that names it (as its id or
+/// one of its aliases) ties to it. Empty for a car with no builder.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BuilderActor {
+    actor: Option<String>,
+    spellings: Vec<String>,
+}
+
+impl BuilderActor {
+    /// PURE: `actor`, and every spelling of each row in `rows` (one
+    /// agents-registry snapshot) whose id or alias is `actor`. A login
+    /// two rows list ties BOTH rows to the builder: an ambiguous alias
+    /// refuses more, never less.
+    pub fn of(actor: &str, rows: &[Value]) -> Self {
+        let actor = actor.trim();
+        let same = |v: &Value| {
+            v.as_str()
+                .is_some_and(|s| s.trim().eq_ignore_ascii_case(actor))
+        };
+        let mut spellings = vec![actor.to_string()];
+        for row in rows {
+            let aliases = row["aliases"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if same(&row["id"]) || aliases.iter().any(same) {
+                spellings.extend(
+                    std::iter::once(&row["id"])
+                        .chain(aliases)
+                        .filter_map(Value::as_str)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                );
+            }
+        }
+        Self {
+            actor: Some(actor.to_string()),
+            spellings,
+        }
+    }
+
+    /// PURE: the builder as the car alone records it, `built_by` in its
+    /// own spelling, with no registry. Only [`vouches`] judges this way;
+    /// every door reads the registry ([`read_builder_actor`]).
+    pub fn recorded(car: &Value) -> Self {
+        builder_actor(car, None)
+            .map(|actor| Self::of(actor, &[]))
+            .unwrap_or_default()
+    }
+
+    /// PURE: may `run`'s review count as independent of this builder?
+    /// Refused when the actor the run reviews as is the builder in any
+    /// spelling. That actor is the run's `metadata.agent`; a run no
+    /// dispatch opened (it names no `packet`) also answers for its filer,
+    /// `opened_by`, which admission stamps from the signer and no body
+    /// can supply, because the hole this closes is the builder filing a
+    /// run of its own by hand. A run that names neither cannot be told
+    /// from the builder, and is refused.
+    pub fn independent(&self, run: &Value) -> Result<(), String> {
+        let Some(builder) = &self.actor else {
+            return Ok(());
+        };
+        let run_id = short(str_at(run, "/id"));
+        let agent = str_at(run, "/metadata/agent");
+        let filer = str_at(
+            run,
+            &format!("/metadata/{}", crate::opened_by::OPENED_BY_KEY),
+        );
+        let hand_filed = str_at(run, "/metadata/packet").is_empty();
+        let mut names: Vec<&str> = Vec::new();
+        if !agent.is_empty() {
+            names.push(agent);
+        }
+        if (hand_filed || agent.is_empty()) && !filer.is_empty() {
+            names.push(filer);
+        }
+        if names.is_empty() {
+            return Err(format!(
+                "run {run_id} names no agent and no filer, so its review cannot be told from \
+                 the car's builder {builder}"
+            ));
+        }
+        match names
+            .into_iter()
+            .find(|n| self.spellings.iter().any(|s| s.eq_ignore_ascii_case(n)))
+        {
+            Some(same) => Err(format!(
+                "run {run_id} reviews as {same}, and the agents registry ties {same} to \
+                 {builder}, the actor that built this car (its built_by, else its builder \
+                 run's agent) — a builder's review is no review, from any run of its own \
+                 (backlog 8e97a4ec); another actor reviews it"
+            )),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The car's builder, read ([`BuilderActor`]): [`builder_actor`] of the
+/// car, reading its builder run only when it records no `built_by`, then
+/// one agents-registry snapshot. FAILS CLOSED: a car whose builder run
+/// cannot be read, or names no agent, or a registry that cannot be read,
+/// is an error, never an absent builder, because the answer it would
+/// otherwise give is "independent" (rule 21.2 of the builder rules).
+pub async fn read_builder_actor(
+    reader: &impl ExecutorRecordReader,
+    car: &Value,
+) -> Result<BuilderActor> {
+    let recorded = builder_actor(car, None);
+    let run = match (recorded, builder_run(car)) {
+        (None, Some(id)) => Some(reader.job_packet(id).await?.with_context(|| {
+            format!(
+                "the car records no built_by and its builder run {} is not in the system of \
+                 record",
+                short(id)
+            )
+        })?),
+        _ => None,
+    };
+    let Some(actor) = builder_actor(car, run.as_ref()) else {
+        if let Some(id) = builder_run(car) {
+            bail!(
+                "the car records no built_by and its builder run {} names no agent, so its \
+                 builder cannot be told from a reviewer",
+                short(id)
+            );
+        }
+        return Ok(BuilderActor::default());
+    };
+    let rows = reader
+        .release_actor_rows()
+        .await
+        .context("reading the agents registry to tell the car's builder from its reviewer")?;
+    Ok(BuilderActor::of(actor, &rows))
+}
+
+/// One complete agents-registry snapshot, as `GET /api/agents` answers
+/// it: `{data, total}`, refused when the rows do not add up to the
+/// total. The one reading every HTTP reader of [`ExecutorRecordReader`]
+/// uses, so the CLI and the conductor cannot judge two snapshots.
+pub fn agents_snapshot(body: Option<Value>) -> Result<Vec<Value>> {
+    let body = body.context("the agents registry returned no body")?;
+    let rows = body
+        .get("data")
+        .and_then(Value::as_array)
+        .context("the agents registry returned no rows")?;
+    let total = body
+        .get("total")
+        .and_then(Value::as_u64)
+        .context("the agents registry returned no total")?;
+    anyhow::ensure!(
+        total == rows.len() as u64,
+        "the agents registry returned an incomplete snapshot"
+    );
+    Ok(rows.clone())
+}
+
 /// The car's review step: the step the hold and the release live on.
 pub fn review_step(car: &Value) -> Option<&Value> {
     crate::car::find_step(car, crate::car::REVIEW_SLUG, crate::car::REVIEW)
@@ -209,12 +391,21 @@ pub fn holdable(car: &Value) -> Result<&Value, String> {
 /// only when every fact holds: the run is an agent-run that is not the
 /// car's builder, it records a review OF THIS CAR, the verdict is
 /// RELEASE, and it read exactly `head`. Each refusal names the fact.
+///
+/// The builder actor is judged here as the car alone records it
+/// ([`BuilderActor::recorded`]); the doors ask [`vouches_with_executor`],
+/// which judges the builder the registry spells.
 pub fn vouches(run: &Value, car: &Value, head: &str) -> Result<(), String> {
     executor_review_eligibility(car)?;
-    vouches_inner(run, car, head)
+    vouches_inner(run, car, head, &BuilderActor::recorded(car))
 }
 
-fn vouches_inner(run: &Value, car: &Value, head: &str) -> Result<(), String> {
+fn vouches_inner(
+    run: &Value,
+    car: &Value,
+    head: &str,
+    builder: &BuilderActor,
+) -> Result<(), String> {
     let run_id = str_at(run, "/id");
     let car_id = str_at(car, "/id");
     if run_id.is_empty() {
@@ -296,7 +487,12 @@ fn vouches_inner(run: &Value, car: &Value, head: &str) -> Result<(), String> {
             short(head)
         ));
     }
-    Ok(())
+    // The builder-run check above is the narrow case of this one: the
+    // builder is an ACTOR, and a second run of its own is still its
+    // review, dispatched or hand-filed (backlog 8e97a4ec). Asked last, so
+    // every refusal above still reads as it did, and a review that would
+    // otherwise vouch is refused for whose it is.
+    builder.independent(run)
 }
 
 /// What the release rule reads besides the two packets: the pinned
@@ -309,6 +505,12 @@ pub trait ExecutorRecordReader: Sync {
     /// alias-based authority; exact named identity needs no lookup.
     async fn release_actor_rows(&self) -> Result<Vec<Value>> {
         bail!("the agents registry is not configured for release aliases")
+    }
+    /// A packet as `GET /api/jobs/{id}` serves it, `None` when there is
+    /// none: read for a car's builder run when the car records no
+    /// `built_by` ([`read_builder_actor`]). A missing adapter refuses.
+    async fn job_packet(&self, id: &str) -> Result<Option<Value>> {
+        bail!("this reader cannot read packet {}", short(id))
     }
     /// The protocol row `kind` v`version`, as `GET
     /// /api/workflows/{kind}/versions/{version}` serves it.
@@ -389,6 +591,9 @@ pub struct ExecutorReviewEligibility {
     verified: Option<crate::executor_attestation::VerifiedExecutor>,
     original_verdict: Option<crate::first_record::FirstRecord>,
     original_receipt: Option<crate::first_record::FirstRecord>,
+    /// The car's builder, read with the rest (backlog 8e97a4ec), so every
+    /// caller of [`vouches_with_executor`] refuses its review.
+    builder: BuilderActor,
 }
 
 pub fn judgment_time(
@@ -496,7 +701,7 @@ pub fn vouches_with_executor(
             .ok_or("verified review has no valid Building identity")?;
         original_verdict_matches(original, run, building, receipt)?;
     }
-    vouches_inner(run, car, head)
+    vouches_inner(run, car, head, &eligibility.builder)
 }
 
 /// A car's branch, or a refusal naming the car.
@@ -519,12 +724,16 @@ pub async fn read_executor_eligibility(
         UnavailableLaunchReceiptVerifier, executor_eligibility,
     };
     let requirement = pinned_executor_requirement(reader, car).await?;
+    let builder = read_builder_actor(reader, car)
+        .await
+        .context("the car's builder actor could not be read")?;
     let advisory = || ExecutorReviewEligibility {
         car: str_at(car, "/id").into(),
         head: head.into(),
         verified: None,
         original_verdict: None,
         original_receipt: None,
+        builder: builder.clone(),
     };
     let native = str_at(run, "/id");
     let building = steps(run)
@@ -619,6 +828,7 @@ pub async fn read_executor_eligibility(
         verified,
         original_verdict,
         original_receipt: Some(record),
+        builder,
     })
 }
 
@@ -1451,18 +1661,38 @@ mod tests {
                "findings": findings, "at": "2026-10-09T13:00:00Z"})
     }
 
+    /// The actor [`BUILDER`] ran as, and the actor every other review run
+    /// here runs as: two actors the registry does not tie together.
+    const BUILDER_AGENT: &str = "agent-builder";
+    const REVIEWER_AGENT: &str = "agent-reviewer";
+
     fn reviewer(review: Value) -> Value {
         json!({"id": REVIEWER, "kind": "agent-run",
                "metadata": {REVIEW_KEY: review, "model": "opus-5[1m]",
+                            "agent": REVIEWER_AGENT,
                             "model_observed": {"observed": "opus-5-5"}}})
     }
 
+    /// The car's builder run, as the system of record serves it.
+    fn builder_run_packet() -> Value {
+        json!({"id": BUILDER, "kind": "agent-run",
+               "metadata": {"agent": BUILDER_AGENT, "packet": "the-item", "step": "build"}})
+    }
+
     /// The pinned protocol answers advisory, and there are no first
-    /// records: the shape every live car had on 2026-10-09.
+    /// records: the shape every live car had on 2026-10-09. The agents
+    /// registry is empty, and the one other packet it serves is the
+    /// car's builder run.
     struct Advisory;
 
     #[async_trait::async_trait]
     impl ExecutorRecordReader for Advisory {
+        async fn release_actor_rows(&self) -> Result<Vec<Value>> {
+            Ok(vec![])
+        }
+        async fn job_packet(&self, id: &str) -> Result<Option<Value>> {
+            Ok((id == BUILDER).then(builder_run_packet))
+        }
         async fn protocol_version(&self, kind: &str, version: i64) -> Result<Option<Value>> {
             Ok(Some(
                 json!({"kind": kind, "version": version, "status": "active",
@@ -1487,6 +1717,9 @@ mod tests {
     impl<R: ExecutorRecordReader> ExecutorRecordReader for SourceFixture<'_, R> {
         async fn release_actor_rows(&self) -> Result<Vec<Value>> {
             self.reader.release_actor_rows().await
+        }
+        async fn job_packet(&self, id: &str) -> Result<Option<Value>> {
+            self.reader.job_packet(id).await
         }
         async fn protocol_version(&self, kind: &str, version: i64) -> Result<Option<Value>> {
             self.reader.protocol_version(kind, version).await
@@ -1715,6 +1948,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ExecutorRecordReader for Launched {
+        async fn release_actor_rows(&self) -> Result<Vec<Value>> {
+            Advisory.release_actor_rows().await
+        }
+        async fn job_packet(&self, id: &str) -> Result<Option<Value>> {
+            Advisory.job_packet(id).await
+        }
         async fn protocol_version(&self, kind: &str, version: i64) -> Result<Option<Value>> {
             Advisory.protocol_version(kind, version).await
         }
@@ -2277,6 +2516,7 @@ mod tests {
             verified: None,
             original_verdict: None,
             original_receipt: None,
+            builder: BuilderActor::default(),
         };
         let mut reviewer = reviewer(review_at(H1, RELEASE, ""));
         assert!(vouches_with_executor(&reviewer, &car, H1, &eligibility).is_ok());
@@ -2399,6 +2639,9 @@ mod tests {
                 .clone()
                 .ok_or_else(|| anyhow!("registry unavailable"))
         }
+        async fn job_packet(&self, id: &str) -> Result<Option<Value>> {
+            Advisory.job_packet(id).await
+        }
         async fn protocol_version(&self, kind: &str, version: i64) -> Result<Option<Value>> {
             Advisory.protocol_version(kind, version).await
         }
@@ -2447,9 +2690,16 @@ mod tests {
             judge(&reader, &car, &run, &ask(None), "owner@login.example", "t")
                 .await
                 .expect_err("unavailable, missing or ambiguous alias refuses");
-            judge(&reader, &car, &run, &ask(None), "agent-owner", "t")
-                .await
-                .expect("exact identity is independent of aliases");
+            let exact = judge(&reader, &car, &run, &ask(None), "agent-owner", "t").await;
+            if reader.0.is_some() {
+                exact.expect("exact identity is independent of aliases");
+            } else {
+                // The RELEASER needs no registry, but telling the car's
+                // builder from its reviewer does (backlog 8e97a4ec), and
+                // an unread registry tells nothing: refused, not guessed.
+                let why = exact.expect_err("no registry, no builder check");
+                assert!(why.contains("builder actor could not be read"), "{why}");
+            }
         }
         car["steps"][0]["metadata"][crate::car::RELEASER] = json!("owner@login.example");
         judge(&reader, &car, &run, &ask(None), "agent-owner", "t")
@@ -2512,5 +2762,169 @@ mod tests {
             granted.patch[crate::car::RELEASE]["review"],
             json!(REVIEWER)
         );
+    }
+
+    /// The login the builder signed the car with (`built_by`), which the
+    /// registry ties to [`BUILDER_AGENT`], the id its runs carry.
+    const BUILDER_LOGIN: &str = "builder@login.example";
+
+    fn registry() -> Vec<Value> {
+        vec![
+            json!({"id": BUILDER_AGENT, "aliases": [BUILDER_LOGIN]}),
+            json!({"id": REVIEWER_AGENT, "aliases": ["reviewer@login.example"]}),
+        ]
+    }
+
+    fn built_by(by: &str) -> Value {
+        let mut car = held_car();
+        car["metadata"][crate::car::BUILT_BY] = json!(by);
+        car
+    }
+
+    /// A RELEASE review run whose identity keys are exactly `md`.
+    fn run_as(md: Value) -> Value {
+        let mut run = reviewer(review_at(H1, RELEASE, ""));
+        let keys = run["metadata"].as_object_mut().expect("metadata");
+        keys.remove("agent");
+        for (k, v) in md.as_object().expect("an object") {
+            keys.insert(k.clone(), v.clone());
+        }
+        run
+    }
+
+    /// A BUILDER'S REVIEW IS NO REVIEW, FROM ANY RUN OF ITS OWN (backlog
+    /// 8e97a4ec, review 5775e4cd). Every check here compared RUNS, so a
+    /// builder that filed a second run by hand, recorded RELEASE in it
+    /// and asked the door, released its own car: that run never met the
+    /// review claim door, the one place the builder ACTOR was refused
+    /// (2b927025). The door now refuses a review run whose agent is the
+    /// builder in any spelling the registry ties to it, and a hand-filed
+    /// run its builder filed, whatever agent it names; another actor's
+    /// review, and a dispatched one whose dispatcher was the builder,
+    /// still release.
+    #[tokio::test]
+    async fn a_hand_filed_review_run_of_the_builders_own_agent_does_not_release_its_car() {
+        let reader = ReleaseActors(Some(registry()));
+        let car = built_by(BUILDER_LOGIN);
+        for agent in [BUILDER_AGENT, BUILDER_LOGIN, "Builder@Login.Example"] {
+            let why = judge(
+                &reader,
+                &car,
+                &run_as(json!({"agent": agent})),
+                &ask(None),
+                "emp-david",
+                "t",
+            )
+            .await
+            .expect_err(agent);
+            assert!(
+                why.contains("8e97a4ec") && why.contains(BUILDER_LOGIN),
+                "{agent}: {why}"
+            );
+        }
+        // Filed by the builder by hand, naming another agent: still its own.
+        let why = judge(
+            &reader,
+            &car,
+            &run_as(json!({"agent": REVIEWER_AGENT, "opened_by": BUILDER_AGENT})),
+            &ask(None),
+            "emp-david",
+            "t",
+        )
+        .await
+        .expect_err("the builder's own filing");
+        assert!(why.contains(BUILDER_AGENT), "{why}");
+        // A run that names no one cannot be told from the builder.
+        let why = judge(
+            &reader,
+            &car,
+            &run_as(json!({})),
+            &ask(None),
+            "emp-david",
+            "t",
+        )
+        .await
+        .expect_err("no agent, no filer");
+        assert!(why.contains("names no agent and no filer"), "{why}");
+        // The pure form refuses the builder's recorded spelling too.
+        assert!(vouches(&run_as(json!({"agent": BUILDER_LOGIN})), &car, H1).is_err());
+
+        // Another actor's review releases it.
+        judge(
+            &reader,
+            &car,
+            &run_as(json!({"agent": REVIEWER_AGENT, "opened_by": "emp-david"})),
+            &ask(None),
+            "emp-david",
+            "t",
+        )
+        .await
+        .expect("another actor's review releases the car");
+        // Dispatched to another agent by the builder's session: the
+        // dispatcher files the run, the agent reviews (and the claim door
+        // already refused the builder that step).
+        judge(
+            &reader,
+            &car,
+            &run_as(json!({"agent": REVIEWER_AGENT, "opened_by": BUILDER_AGENT,
+                           "packet": CAR, "step": crate::car::REVIEW_SLUG})),
+            &ask(None),
+            "emp-david",
+            "t",
+        )
+        .await
+        .expect("a dispatched review is its agent's");
+    }
+
+    /// NO `built_by`, THE BUILDER RUN'S AGENT (backlog 8e97a4ec; the
+    /// auto-park cars of 30bf3109 record none). The conductor's re-judge
+    /// and the door both read it, through `vouches_with_executor`; a
+    /// builder run the system of record does not serve refuses, since
+    /// the answer an absent builder gives is "independent".
+    #[tokio::test]
+    async fn a_car_with_no_built_by_is_judged_by_its_builder_runs_agent() {
+        let reader = ReleaseActors(Some(registry()));
+        let car = held_car();
+        assert_eq!(
+            builder_actor(&car, Some(&builder_run_packet())),
+            Some(BUILDER_AGENT)
+        );
+        assert_eq!(builder_actor(&car, None), None);
+        let mut another = builder_run_packet();
+        another["id"] = json!(REVIEWER);
+        assert_eq!(
+            builder_actor(&car, Some(&another)),
+            None,
+            "only the run the car names is its builder"
+        );
+        for (agent, independent) in [
+            (BUILDER_AGENT, false),
+            (BUILDER_LOGIN, false),
+            (REVIEWER_AGENT, true),
+        ] {
+            let (run, record) = attested_source(&car, &run_as(json!({"agent": agent})), H1);
+            let source = SourceFixture {
+                reader: &reader,
+                record,
+            };
+            let executor = read_executor_eligibility(&source, &run, &car, H1)
+                .await
+                .expect("eligibility read");
+            let vouched = vouches_with_executor(&run, &car, H1, &executor);
+            assert_eq!(vouched.is_ok(), independent, "{agent}: {vouched:?}");
+        }
+        let mut lost = held_car();
+        lost["metadata"]["agent_run"] = json!(RUN_ID);
+        let why = judge(
+            &reader,
+            &lost,
+            &reviewer(review_at(H1, RELEASE, "")),
+            &ask(None),
+            "emp-david",
+            "t",
+        )
+        .await
+        .expect_err("an unread builder run");
+        assert!(why.contains("not in the system of record"), "{why}");
     }
 }

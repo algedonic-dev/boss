@@ -556,10 +556,16 @@ spec:
             runAsGroup: 1500
             capabilities: {drop: ["ALL"]}
           resources:
-            # CPU/memory: four concurrent gates (policy v3, backlog
-            # 366c2ed5, 2026-09-28; four again at v5, e6dc7331) request
-            # 16 CPU / 32Gi against w-1's 32 / 63Gi — five with the train
-            # gate, 20 / 40Gi; the 20-CPU limit lets a lone gate use the box.
+            # CPU/memory: the scheduler places the gate POD, so one gate
+            # requests this container's 4 CPU / 8Gi PLUS the postgres
+            # sidecar's 250m / 3Gi beside it: 4.25 / 11Gi. Three bays are
+            # 12.75 / 33Gi of w-1's 32 / 62.2Gi, and the gates station
+            # charges 13 of host:w-1 for them (gates.toml v8, backlog
+            # 2b7c78f8; this comment said four gates request 16 / 32Gi,
+            # left from policy v3's four bays, 366c2ed5). Beside them: the
+            # dev pod's 4.3 / 8.6Gi and four dev-build workers at 2.5 /
+            # 5Gi (engineering.toml v9). The 20-CPU limit lets a lone gate
+            # use the box.
             # Five is the measured I/O cliff (2026-08-26: I/O pressure
             # 65%, a ~35-min gate took ~93), so four is measured for a
             # day before any further step.

@@ -43,6 +43,16 @@
 # those volumes are left nowhere to rebuild. The scratch disk's
 # sequence (infra/cluster/talos/README.md) reads it first.
 #
+# THE THIRD WORD, guaranteed-instance-manager-cpu (backlog 2b7c78f8), is
+# CPU: the percentage of each node's allocatable CPU that Longhorn's
+# instance manager pod requests there. On w-1, the build node, that
+# request stood beside three gates and the dev-build workers and no
+# station row charged it, so the capacity record admitted builders the
+# scheduler refused `Insufficient cpu`. Longhorn's default (12, so 3.84
+# of w-1's 32) is not a reading; this is. A per-node override on the
+# Longhorn node object is not read here — `node-pods <node>` prints the
+# instance manager pod's own request, which is what the scheduler counts.
+#
 # THE ANSWER names the value, whether Longhorn's API agrees and reports
 # it applied, Longhorn's default and type (read, never typed here), and
 # Longhorn's own words for the setting. Its last line is the verdict
@@ -65,7 +75,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/../lib/jq.sh"
 
 # The settings this verb may read, space-separated, one line.
-ALLOWED="allow-empty-node-selector-volume allow-empty-disk-selector-volume"
+ALLOWED="allow-empty-node-selector-volume allow-empty-disk-selector-volume guaranteed-instance-manager-cpu"
 
 LH=longhorn-system
 

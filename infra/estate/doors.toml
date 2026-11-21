@@ -27,13 +27,16 @@
 #   public — the public name. Open when it resolves. (The name is a
 #            proxied CNAME to the tunnel, whose origin is the same
 #            Service, so a dark LAN half is a dark public door too;
-#            this half is what says the NAME still exists.)
+#            this half is what says the NAME still exists.) OPTIONAL:
+#            a door with no public name has only its lan half, and
+#            none is invented for it.
 #
 # EACH VALUE LIVES ONCE ELSEWHERE TOO, so each is pinned rather than
-# trusted (CLAUDE.md §9a): `lan` equals the MetalLB address of Service
-# boss-dev-ssh in infra/cluster/manifests/boss-dev.yaml, and `public` is
+# trusted (CLAUDE.md §9a): `lan` equals the address pinned on the door's
+# Service (boss-dev-ssh in infra/cluster/manifests/boss-dev.yaml,
+# boss-dev-standby-ssh in boss-dev-standby.yaml), and `public` is
 # the hostname infra/cluster/tunnel-origins.toml routes to that Service
-# — both held by crates/core/boss-testing/tests/the_door_is_watched_from_outside_the_pod.rs.
+# — all held by crates/core/boss-testing/tests/the_door_is_watched_from_outside_the_pod.rs.
 # The band lives only here.
 #
 # THE BAND — 15 minutes: three of the observer's five-minute readings,
@@ -50,4 +53,19 @@
 id = "dev-ssh"
 lan = "10.20.0.35:22"
 public = "dev.algedonic.dev"
+dark_band_minutes = "15"
+
+# THE STANDBY SHELL'S DOOR (design 0491591b, backlog 47601829): the small
+# pod infra/cluster/manifests/boss-dev-standby.yaml keeps off the dev
+# pod's node, so an operator has a shell inside the LAN when the dev pod
+# cannot schedule. Watched here so a dark standby is an alarm on the day
+# it goes dark, not a discovery on the day it is needed. `lan` is the
+# address Cilium LB-IPAM gave Service boss-dev-standby-ssh (read through
+# ops-request 29dd7af1, 2026-11-21) and now pinned on it; the same test
+# holds the two equal. No `public` yet: standby.algedonic.dev is its own
+# car (0e33a4de), and a door with no public name is observed on its lan
+# half alone. The dev login menu's standby option reads `lan` from here.
+[[door]]
+id = "dev-standby-ssh"
+lan = "10.20.0.37:22"
 dark_band_minutes = "15"

@@ -38,10 +38,12 @@ test.describe('/engineering/kb — the words the audit decided', () => {
     await expect(page.getByText('System Model', { exact: false })).toHaveCount(0);
   });
 
-  test('846f0b51: the breadcrumb goes to the IT world, not My Day', async ({ page }) => {
+  // It went to the IT world, /it, until IT retired as a department
+  // (design df0ecd8b); the tree the root hosts since backlog 92bfcb04.
+  test('846f0b51: the breadcrumb goes to the station tree, not My Day', async ({ page }) => {
     await open(page);
-    const crumb = page.getByRole('link', { name: '← The IT world' });
-    await expect(crumb).toHaveAttribute('href', '/it');
+    const crumb = page.getByRole('link', { name: '← The station tree' });
+    await expect(crumb).toHaveAttribute('href', '/tree');
     await expect(page.getByRole('link', { name: '← Home' })).toHaveCount(0);
   });
 

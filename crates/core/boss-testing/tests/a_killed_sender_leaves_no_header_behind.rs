@@ -1205,9 +1205,13 @@ fn every_unit_that_starts_a_sender_of_the_token_declares_a_private_runtime_direc
             "the walk no longer finds {unit} as a sender: {senders:?}"
         );
     }
+    // At least 24 on 2026-10-08; 22 counted on 2026-11-21, after backlog
+    // c440ab8d deleted the senders no role installed —
+    // boss-forge-token-audit and the second stack's boss-search-reindex
+    // and boss-views-catchup copies.
     assert!(
-        senders.len() >= 24,
-        "the walk found {} sender unit(s), fewer than the tree held on 2026-10-08: {senders:?}",
+        senders.len() >= 22,
+        "the walk found {} sender unit(s), fewer than the tree held on 2026-11-21: {senders:?}",
         senders.len()
     );
 }

@@ -1,0 +1,74 @@
+# The superseded areas — ONE list of the areas a NEW backlog item may
+# not be filed about, because a reconstruction step onto the station
+# tree retires them (backlog f4b0ad41 rule 1; design 25511015 Q4,
+# decided by David 2026-11-17).
+#
+# WHY A LIST. The backlog grew every week since W40 (W43: 818 opened
+# against 577 closed; W45: 528 against 344), and reconstruction closes
+# only about 5% of what is open. Intake is one of the two levers. A new
+# item about an area a step is about to delete is work filed against
+# code that will not exist: it either rides the backlog until that step
+# lands and closes it as superseded, or it is built and the build is
+# deleted with the area. So the decision pauses intake there, narrowly,
+# and points the filer at the step instead.
+#
+# HOW IT IS READ. Admission of a `backlog-item` in the jobs API
+# (`crates/core/boss-jobs/src/superseded_area.rs`, compiled in from
+# this file) refuses a create whose `metadata.area` is one of an
+# entry's `areas`, exactly, with a 422 naming the entry and its step.
+# `boss job file --area <slug>` posts through that admission, so the
+# verb and every other filer meet the same refusal from the one place
+# (pinned by boss-cli's job.rs test
+# a_backlog_item_about_a_superseded_area_is_refused_naming_its_step).
+# Only the recorded area is judged — a title's words are not parsed
+# into one, which would be a guess drawn as a fact.
+#
+# WORK THAT BUILDS A STEP is not refused work about a dead area: it is
+# the reconstruction itself, and it is filed under the area the step
+# builds in (`station-tree`), never under the area it deletes.
+#
+# Adding an area is adding a row here — no code names one. `name` is
+# the entry's own slug; `what` is the sentence a filer matches against;
+# `areas` are the `metadata.area` slugs refused (lowercase, as
+# `boss job file --area` requires); `step` is the reconstruction step's
+# number in design 25511015 §4 and `step_title` its heading there.
+# When a step lands, its entry's already-open items close as
+# superseded and point at the step's car; the entry stays, so the area
+# stays closed to intake once its code is gone.
+
+[[area]]
+name = "v1-map"
+what = "the v1 IT map: the yard, its region boards, receiving and marshalling, recorded moves keyed on regions, the HUD and /api/yard"
+# Not `yard`: measured 2026-11-21, its 5 open items are station-flow,
+# flights and clock defects in parts v2 keeps, not the v1 map.
+areas = ["v1-map", "it-map"]
+step = 2
+step_title = "converge the visuals onto the station views"
+
+[[area]]
+name = "regions"
+what = "regions as a partition of the factory: the REGIONS list, region states, borders and region-keyed reads"
+areas = ["regions", "region"]
+step = 2
+step_title = "converge the visuals onto the station views"
+
+[[area]]
+name = "departments"
+what = "departments as an entity: the departments registry and its readers, department pins and keys, DepartmentThirds and the department pages"
+areas = ["departments", "department"]
+step = 3
+step_title = "departments become the tier"
+
+[[area]]
+name = "peer-nominations"
+what = "work that arrives by nomination to a peer or a pane nudge: peer send and paste, matchmaking nominations, per-executor addresses"
+areas = ["peer-nominations", "nominations", "pane-nudges"]
+step = 1
+step_title = "executors sit at stations and pull"
+
+[[area]]
+name = "systemd-timers"
+what = "systemd timers driving maintenance: the *.timer units, the maintenance wrap and the cadence-silence sweep"
+areas = ["systemd-timers", "timers"]
+step = 6
+step_title = "keep-the-estate: systemd timers become packets on cadence"

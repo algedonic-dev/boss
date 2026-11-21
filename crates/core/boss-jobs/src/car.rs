@@ -1041,6 +1041,104 @@ pub fn green_gate_writes(
     ]
 }
 
+/// The holder an OPEN gate step names: its [`GATE_RUN`], when the step
+/// is neither completed nor skipped and carries a non-blank one.
+fn open_gate_holder(car: &Value) -> Option<&str> {
+    let gate = find_step(car, GATE_SLUG, GATE)?;
+    if already_done(gate) {
+        return None;
+    }
+    gate.pointer(&format!("/metadata/{GATE_RUN}"))
+        .and_then(Value::as_str)
+        .filter(|h| !h.trim().is_empty())
+}
+
+/// The open car of `branch` whose `gate` step `gate_run` still holds —
+/// ACTIVE or handed back READY — which is the car a machine relaunch of
+/// that gate-run takes over ([`relaunch_takeover`]). Unlike
+/// [`car_in_gate_run`] the step need not be active: a lost run's
+/// hand-back leaves it READY naming the lost run (car 88645b17).
+pub fn car_held_by<'a>(cars: &'a [Value], branch: &str, gate_run: &str) -> Option<&'a Value> {
+    cars.iter().find(|c| {
+        is_open(c)
+            && c.pointer("/metadata/branch").and_then(Value::as_str) == Some(branch)
+            && open_gate_holder(c) == Some(gate_run)
+    })
+}
+
+/// PURE: what a machine RELAUNCH of the lost gate-run `lost` writes on
+/// the car whose `gate` step `lost` holds, so the relaunch holds it in
+/// its place — or `None` when `lost` holds no open gate step there (a
+/// newer launch restamped it, the car parked or ended), and `Err` when
+/// the step was launched at another head than the relaunch's.
+///
+/// WHY A TAKEOVER, NOT A COPIED EDGE (backlog 37111b65 car (a), design
+/// 689d1f7f; decided by the measure of 2026-11-20). The conductor's
+/// relaunch copied only the lost run's `park_*` keys, so it carried no
+/// `fulfils` edge and its verdict was finished by the branch scan — the
+/// scan car 3 retires. Copying the lost run's edge would point a gate-run
+/// at a step it does not hold, and an edge is judged on the holder
+/// stamped on the step ([`edge_green`]). So the relaunch takes the hold
+/// over the way a relaunch's green already does ([`green_gate_writes`],
+/// 98a28d24): [`GATE_RUN`] renamed to the relaunch, the lost run kept
+/// under [`LOST_GATE_RUN`], judged on the lost run still holding the
+/// step at its head and on no ending having claimed the car — and the
+/// edge is then read back off the step with [`gate_edge`], exactly as a
+/// launch's.
+///
+/// NEVER A CLAIM. A loss's hand-back leaves the step READY and still
+/// held by the builder who launched it, and the claim door refuses the
+/// conductor that ("ready and held by someone else", measured on the
+/// real router 2026-11-20). The relaunch re-runs that builder's gate; it
+/// does not take the builder's step. So the step keeps the status the
+/// loss left it in, and only its stamp changes hands — which is all a
+/// green by edge is judged on ([`green_binding`]).
+pub fn relaunch_takeover(
+    car: &Value,
+    lost: &str,
+    relaunch: &str,
+    head: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<GateLaunch>, String> {
+    if !is_open(car) || ending_of(car).is_some() || open_gate_holder(car) != Some(lost) {
+        return Ok(None);
+    }
+    let Some(gate) = find_step(car, GATE_SLUG, GATE) else {
+        return Ok(None);
+    };
+    let Some(gate_step) = gate.get("id").and_then(Value::as_str) else {
+        return Err(format!("the `{GATE_SLUG}` step on this car has no id"));
+    };
+    let launched = gate.pointer("/metadata/gated_head").and_then(Value::as_str);
+    if let Some(at) = launched
+        && !same_head(at, head)
+    {
+        let short = |s: &str| s[..8.min(s.len())].to_string();
+        return Err(format!(
+            "car {}'s gate step was launched at {} by gate-run {}, and relaunch {} is at {}, \
+             another head — a relaunch takes over only the head its lost run held",
+            short(car.get("id").and_then(Value::as_str).unwrap_or("?")),
+            short(at),
+            short(lost),
+            short(relaunch),
+            short(head)
+        ));
+    }
+    let mut fence = launch_fence();
+    fence.insert(GATE_RUN.to_string(), json!(lost));
+    fence.insert(
+        "gated_head".to_string(),
+        launched.map_or(Value::Null, |h| json!(h)),
+    );
+    Ok(Some(GateLaunch {
+        build: None,
+        gate_step: gate_step.to_string(),
+        gate_merge: json!({GATE_RUN: relaunch, LOST_GATE_RUN: lost, "launched_at": stamp(now)}),
+        fence,
+        claim: false,
+    }))
+}
+
 /// PURE: the R8 edge a gate LAUNCH writes onto its gate-run — the car
 /// and its `gate` step — read off the car AS IT READS AFTER THE LAUNCH,
 /// or `None` unless that gate step names `gate_run` as its holder
@@ -4820,6 +4918,145 @@ mod building_tests {
         c["steps"][3]["status"] = json!("active");
         c["steps"][3]["metadata"] = json!({GATE_RUN: "gr-new", "gated_head": "1234567aa"});
         assert!(green_binding(&c, "gr-relaunch", Some("gr-lost"), "544327d0aa").is_err());
+    }
+
+    /// The car a lost gate-run's hand-back left: build handed in, the
+    /// gate step READY and still naming `lost` at HEAD, the loss beside
+    /// it — car 88645b17's shape on 2026-11-10.
+    fn handed_back(lost: &str) -> Value {
+        let mut c = held(lost);
+        c["steps"][3]["status"] = json!("ready");
+        c["steps"][3]["metadata"][LAST_VERDICT] = json!({GATE_RUN: lost, "verdict": "lost"});
+        c
+    }
+
+    /// `car` with `plan`'s gate merge landed on its gate step — what the
+    /// car reads as after a takeover, its status untouched.
+    fn taken_over(car: &Value, plan: &GateLaunch) -> Value {
+        let mut after = car.clone();
+        for (k, v) in plan.gate_merge.as_object().unwrap() {
+            after["steps"][3]["metadata"][k] = v.clone();
+        }
+        after
+    }
+
+    /// A MACHINE RELAUNCH INHERITS THE EDGE BY TAKING OVER THE HOLD
+    /// (backlog 37111b65 car (a), design 689d1f7f). The conductor's
+    /// relaunch of a lost gate-run used to copy only the `park_*` keys,
+    /// so it carried no `fulfils` edge and was finished by the branch
+    /// scan. Its takeover names the relaunch the gate step's holder —
+    /// judged on the lost run still holding it at its head, keeping the
+    /// lost run beside it, as a relaunch's green already does
+    /// ([`green_gate_writes`], 98a28d24) — and the edge is then read back
+    /// off the step ([`gate_edge`]), never copied from the lost run. Its
+    /// green finishes the car by that edge. It claims nothing: the step
+    /// keeps the status the loss left it in.
+    #[test]
+    fn a_relaunch_takes_over_the_gate_its_lost_run_held_and_carries_the_edge() {
+        let now = at("2026-11-20T16:00:00Z");
+        let c = handed_back("gr-lost");
+        let plan = relaunch_takeover(&c, "gr-lost", "gr-relaunch", HEAD, now)
+            .unwrap()
+            .expect("the lost run still holds the step");
+        assert_eq!(plan.gate_step, "s-gate");
+        assert!(plan.build.is_none(), "build was handed in at first launch");
+        assert!(!plan.claim, "the builder still holds the READY step");
+        assert_eq!(
+            plan.gate_merge,
+            json!({GATE_RUN: "gr-relaunch", LOST_GATE_RUN: "gr-lost", "launched_at": stamp(now)})
+        );
+        assert_eq!(
+            Value::Object(plan.fence.clone()),
+            json!({GATE_RUN: "gr-lost", "gated_head": HEAD, ENDED_BEFORE_GATE: null}),
+            "judged on the lost holder at its head, and on no ending"
+        );
+
+        let after = taken_over(&c, &plan);
+        assert_eq!(gate_edge(&after, "gr-relaunch"), Some(edge()));
+        assert_eq!(gate_edge(&after, "gr-lost"), None, "the lost run's is gone");
+        match edge_green(
+            &after,
+            &edge(),
+            BRANCH,
+            "gr-relaunch",
+            Some("gr-lost"),
+            HEAD,
+        ) {
+            Ok(EdgeGreen::Finish(expect)) => assert_eq!(expect[GATE_RUN], "gr-relaunch"),
+            other => panic!("the relaunch's green finishes by its edge: {other:?}"),
+        }
+        assert!(
+            edge_return(&after, &edge(), "gr-relaunch", "failed")
+                .unwrap()
+                .is_empty(),
+            "a READY step is already handed back: a red writes nothing, never a completion"
+        );
+        // An ACTIVE step (the loss was never handed back) is restamped in
+        // place, and the relaunch's red then hands it back by edge.
+        let still = held("gr-lost");
+        let plan = relaunch_takeover(&still, "gr-lost", "gr-relaunch", HEAD, now)
+            .unwrap()
+            .unwrap();
+        assert!(!plan.claim);
+        let after = taken_over(&still, &plan);
+        assert_eq!(
+            edge_return(&after, &edge(), "gr-relaunch", "failed")
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// A RELAUNCH INHERITS ONLY WHAT ITS LOST RUN HELD. A step a newer
+    /// launch restamped is that launch's; a parked car's completed gate
+    /// is past any relaunch; an ended car is its ending's; and a step
+    /// launched at another head is REFUSED, by name — a relaunch vouches
+    /// only for the sha it was filed at.
+    #[test]
+    fn a_relaunch_takes_over_nothing_its_lost_run_does_not_hold() {
+        let now = at("2026-11-20T16:00:00Z");
+        let take = |c: &Value| relaunch_takeover(c, "gr-lost", "gr-relaunch", HEAD, now);
+        assert_eq!(take(&handed_back("gr-newer")), Ok(None), "restamped");
+        let mut parked = held("gr-lost");
+        parked["steps"][3]["status"] = json!("completed");
+        assert_eq!(take(&parked), Ok(None), "past its gate");
+        let mut ended = handed_back("gr-lost");
+        ended["steps"][3]["metadata"][ENDED_BEFORE_GATE] = json!({"by": "run", "id": "r"});
+        assert_eq!(take(&ended), Ok(None), "an ending holds it");
+        let mut closed = handed_back("gr-lost");
+        closed["status"] = json!("closed");
+        assert_eq!(take(&closed), Ok(None));
+        let mut unbound = building("b1", BRANCH, BRANCH);
+        unbound["steps"][3]["status"] = json!("ready");
+        assert_eq!(take(&unbound), Ok(None), "no holder to take over");
+
+        let mut moved = handed_back("gr-lost");
+        moved["steps"][3]["metadata"]["gated_head"] = json!("0000000aaaa");
+        let why = take(&moved).unwrap_err();
+        assert!(why.contains("another head"), "{why}");
+    }
+
+    /// The car a relaunch acts on is the open car of the lost run's
+    /// branch whose gate step names the lost run — not another branch's,
+    /// not a closed one, not one a newer launch restamped.
+    #[test]
+    fn the_car_a_relaunch_takes_over_is_the_one_its_lost_run_holds() {
+        let mine = handed_back("gr-lost");
+        let mut other_branch = handed_back("gr-lost");
+        other_branch["id"] = json!("b2");
+        other_branch["metadata"]["branch"] = json!("feat/other");
+        let mut restamped = handed_back("gr-newer");
+        restamped["id"] = json!("b3");
+        let mut closed = handed_back("gr-lost");
+        closed["id"] = json!("b4");
+        closed["status"] = json!("closed");
+        let cars = [other_branch, restamped, closed, mine];
+        assert_eq!(
+            car_held_by(&cars, BRANCH, "gr-lost").map(|c| &c["id"]),
+            Some(&json!("b1"))
+        );
+        assert!(car_held_by(&cars, BRANCH, "gr-none").is_none());
+        assert!(car_held_by(&cars[..3], BRANCH, "gr-lost").is_none());
     }
 
     /// THE STEP NAMES THE RUN WHOSE RECEIPT IT CARRIES (backlog

@@ -20,6 +20,7 @@
 // soften.
 
 import { prNumber } from './yard-floor';
+import { executionDetail, executionTone, executionWord, readExecution } from '../ops-execution';
 import { exitFailed, failedChecks, NOT_YET_EXIT, stampAt, type JobLite, type StepLite } from './yard';
 
 /** How many signals the panel shows. */
@@ -187,20 +188,15 @@ function opsSignals(j: JobLite): Signal[] {
   const answeredAt = execute?.status === 'completed' ? (stampAt(execute) ?? closedAt(j)) : null;
   if (execute && answeredAt !== null) {
     const em = stepMd(execute);
-    const disposition = str(em.disposition) ?? 'completed';
     const runnerHost = str(em.runner_host) ?? host;
-    const code = str(em.exit_code);
-    const output = (str(em.output) ?? '').split('\n')[0]?.trim() ?? '';
-    const refused = disposition === 'refused';
-    const failed = refused || exitFailed(code);
-    // Exit 75 is "not yet", not a failure (backlog 1058e686): the warn
-    // tone, and the words say so.
-    const notYet = !refused && code === String(NOT_YET_EXIT);
-    const what = refused
-      ? `${verb} refused on ${runnerHost}${output !== '' ? ` — ${output}` : ' — outside the allowlist'}`
-      : `${verb} ${disposition} on ${runnerHost}${code !== null ? ` · exit ${code}` : ''}${notYet ? ' (not yet)' : ''}`;
-    const sev: Signal['sev'] = failed ? 'err' : notYet ? 'warn' : 'ok';
-    out.push({ id: `${j.id}:execute`, at: answeredAt, who: 'ops-runner', what, sev, hand: false, packetId: j.id });
+    // The one classifier's reading (design b7bb1625, backlog 50a1578f):
+    // a nonzero exit says FAILED, never "answered · exit 1"; exit 75 is
+    // NOT YET in the warn tone (backlog 1058e686); an answer with no
+    // trustworthy exit is indeterminate trouble, never ok; a refusal
+    // names the reason it recorded and none it did not.
+    const e = readExecution(em);
+    const what = `${verb} ${executionWord(e)} on ${runnerHost}${executionDetail(e)}`;
+    out.push({ id: `${j.id}:execute`, at: answeredAt, who: 'ops-runner', what, sev: executionTone(e), hand: false, packetId: j.id });
   }
   return out;
 }

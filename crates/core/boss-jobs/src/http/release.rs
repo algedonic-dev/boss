@@ -60,6 +60,23 @@ impl<R: JobsRepository + 'static, B: EventBus + 'static> ExecutorRecordReader
             .map_err(Into::into)
     }
 
+    /// The car's builder run, read from this process's own store for the
+    /// builder-actor check (backlog 8e97a4ec). Unscoped like the
+    /// registry read: it decides a refusal, and is never served.
+    async fn job_packet(&self, id: &str) -> anyhow::Result<Option<serde_json::Value>> {
+        let Some(job_id) = parse_job_id(id.trim()) else {
+            anyhow::bail!("{id:?} is not a packet id");
+        };
+        match self.state.jobs.get_job(&job_id).await {
+            Ok(Some(job)) => packet_value(self.state, job)
+                .await
+                .map(Some)
+                .map_err(|e| anyhow::anyhow!(e)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("reading packet {id}: {e}")),
+        }
+    }
+
     async fn protocol_version(
         &self,
         kind: &str,

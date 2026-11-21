@@ -23,6 +23,7 @@
   import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { href } from '../router';
+  import { treeHref } from './tree/station-tree';
   import KbDiagram from './KbDiagram.svelte';
   import { kbDiagram } from './kbDiagrams';
 </script>
@@ -72,11 +73,13 @@
 </style>
 
 <div class="catalog theme-it">
-  <!-- A breadcrumb names the page's parent, and this page's parent is
-       the IT department — the words MapPage's own crumb uses (846f0b51).
-       The eyebrow says IT for the same reason: /system became /it on
-       2026-08-31 (839a7f0f). -->
-  <Breadcrumb to={href('/it')}>← The IT world</Breadcrumb>
+  <!-- A breadcrumb names the page's parent. It was the IT department,
+       at /it (846f0b51), until IT retired as a department (design
+       df0ecd8b); the page is Engineering's now, and the tree the root
+       hosts is where every station is reached from (backlog 92bfcb04).
+       The eyebrow still says IT: /system became /it on 2026-08-31
+       (839a7f0f), and the words move with the shell (474e2c1c). -->
+  <Breadcrumb to={href(treeHref(null))}>← The station tree</Breadcrumb>
 
   <PageHeader
     eyebrow="IT · Knowledge Base"

@@ -10,23 +10,27 @@ use boss_jobs::{
 use boss_policy_client::{Action, FakePolicyClient, PolicyClient, Resource, Scope};
 use boss_testing::{RecordingEventBus, TestRequest};
 
-struct UnresponsiveCuts;
+/// A history whose head read never answers, so the route's outer deadline
+/// is what is judged.
+struct UnresponsiveHistory;
 #[async_trait::async_trait]
-impl boss_jobs::claims_console::ClaimsHistory for UnresponsiveCuts {
-    async fn cuts(
+impl boss_jobs::claims_console::ClaimsHistory for UnresponsiveHistory {
+    async fn read(
         &self,
-        _: Option<chrono::DateTime<chrono::Utc>>,
-        _: Option<chrono::DateTime<chrono::Utc>>,
-        _: usize,
+        _: Option<i64>,
+        _: i64,
         _: chrono::DateTime<chrono::Utc>,
-    ) -> Result<boss_jobs::claims_console::CutsReading, boss_jobs::claims_console::ClaimsError>
+    ) -> Result<boss_jobs::claims_console::ClaimsReading, boss_jobs::claims_console::ClaimsError>
     {
         std::future::pending().await
     }
 }
 
+/// The request-owned deadline trace outlived the cuts route it was built
+/// for (backlog 81f8e468, 4bec011d): the head read still names the span it
+/// interrupted.
 #[tokio::test]
-async fn a_cuts_outer_deadline_names_the_active_adapter_and_elapsed_time() {
+async fn a_claims_outer_deadline_names_the_active_adapter_and_elapsed_time() {
     let bus = RecordingEventBus::new();
     let events: Arc<dyn EventBus> = bus.clone();
     let policy: Arc<dyn PolicyClient> = Arc::new(
@@ -35,7 +39,7 @@ async fn a_cuts_outer_deadline_names_the_active_adapter_and_elapsed_time() {
             .build(),
     );
     let app = router(JobsApiState {
-        claims_history: Some(Arc::new(UnresponsiveCuts)),
+        claims_history: Some(Arc::new(UnresponsiveHistory)),
         ..JobsApiState::minimal(
             Arc::new(InMemoryJobs::new()),
             bus,
@@ -44,7 +48,7 @@ async fn a_cuts_outer_deadline_names_the_active_adapter_and_elapsed_time() {
             Arc::new(boss_clock_client::WallClockClient),
         )
     });
-    let response = TestRequest::get("/api/claims/cuts")
+    let response = TestRequest::get("/api/claims")
         .as_user("emp-console", "operator")
         .send(&app)
         .await;
@@ -194,20 +198,17 @@ async fn the_claims_route_names_its_actual_basis_and_refuses_narrow_or_future_re
         )
     };
     let app = router(state);
-    let observed = TestRequest::get("/api/claims?as_of=7&window=24h")
+    let observed = TestRequest::get("/api/claims?window=24h")
         .as_user("emp-console", "operator")
         .send(&app)
         .await;
     observed.assert_status(StatusCode::OK);
     let body: serde_json::Value = observed.assert_json();
+    // `as_of` stays in the ANSWER: it is the head the reading stands at,
+    // not the retired selector (backlog 4bec011d).
     assert_eq!(body["as_of"], 7);
     assert_eq!(body["claims"], serde_json::json!([]));
     assert_eq!(body["window_hours"], 24);
-    TestRequest::get("/api/claims?as_of=8")
-        .as_user("emp-console", "operator")
-        .send(&app)
-        .await
-        .assert_status(StatusCode::BAD_REQUEST);
     TestRequest::get("/api/claims?window=999h")
         .as_user("emp-console", "operator")
         .send(&app)
@@ -264,18 +265,20 @@ async fn retention_uses_the_injected_record_clock_not_a_second_wall_read() {
             Arc::new(boss_clock_client::WallClockClient),
         )
     };
-    TestRequest::get("/api/claims?as_of=7")
+    let response = TestRequest::get("/api/claims")
         .as_user("emp-console", "operator")
         .send(&router(state))
-        .await
-        .assert_status(StatusCode::OK);
+        .await;
+    response.assert_status(StatusCode::OK);
+    let body: serde_json::Value = response.assert_json();
+    // The retention floor is the injected record clock's, 168 hours before
+    // 2020-01-01 — a wall read would put it in the present.
+    assert_eq!(body["retained_from"], "2019-12-25T00:00:00Z");
 }
 
-/// Car 3c: the retained-cuts index rides its own route behind the same scope
-/// gate, answers the bounds and a bounded sample, and refuses a bad range or
-/// bucket count by name.
-#[tokio::test]
-async fn the_cuts_route_publishes_the_retained_index_and_refuses_bad_ranges_or_narrow_scope() {
+/// A materialized history at head 7, behind an operator with the full
+/// job-read scope and a `limited` caller without it.
+async fn head_seven_app() -> axum::Router {
     use boss_jobs::claims_console::{ClaimsHistory, HistoryBatch, InMemoryClaimsHistory};
     let bus = RecordingEventBus::new();
     let events: Arc<dyn EventBus> = bus.clone();
@@ -294,7 +297,7 @@ async fn the_cuts_route_publishes_the_retained_index_and_refuses_bad_ranges_or_n
         })
         .await
         .unwrap();
-    let state = JobsApiState {
+    router(JobsApiState {
         claims_history: Some(history),
         ..JobsApiState::minimal(
             Arc::new(InMemoryJobs::new()),
@@ -303,68 +306,53 @@ async fn the_cuts_route_publishes_the_retained_index_and_refuses_bad_ranges_or_n
             policy,
             Arc::new(boss_clock_client::WallClockClient),
         )
-    };
-    let app = router(state);
-    let observed = TestRequest::get("/api/claims/cuts?buckets=8")
-        .as_user("emp-console", "operator")
-        .send(&app)
-        .await;
-    observed.assert_status(StatusCode::OK);
-    let body: serde_json::Value = observed.assert_json();
-    assert_eq!(body["head"]["seq"], 7);
-    assert_eq!(body["first_retained"]["seq"], 7);
-    assert_eq!(body["pruned_through"], 0);
-    assert_eq!(body["buckets"], 8);
-    assert_eq!(body["complete"], true);
-    assert_eq!(body["cuts"].as_array().unwrap().len(), 1);
-    assert_eq!(body["cuts"][0]["seq"], 7);
-    assert_eq!(body["retention_hours"], 168);
-    assert!(body["projection"]["through"] == 7);
-    for bad in [
-        "/api/claims/cuts?buckets=0",
-        "/api/claims/cuts?buckets=5000",
-        "/api/claims/cuts?from=yesterday",
-        "/api/claims/cuts?from=2027-01-02T00:00:00Z&to=2027-01-01T00:00:00Z",
+    })
+}
+
+/// Backlog 4bec011d: the console's time travel went with the scrubber
+/// (7381cde96), and no caller passes `as_of`. Axum ignores a query key no
+/// field names, so deleting the field alone would answer `?as_of=N` with
+/// the HEAD and call it the past — the retired selector is refused by name
+/// instead, whatever its value, and after policy like every jobs read.
+#[tokio::test]
+async fn the_as_of_selector_is_refused_as_retired() {
+    let app = head_seven_app().await;
+    for uri in [
+        "/api/claims?as_of=7",
+        "/api/claims?as_of=8&window=24h",
+        "/api/claims?as_of=yesterday",
+        "/api/claims?as_of=",
     ] {
-        let refused = TestRequest::get(bad)
+        let refused = TestRequest::get(uri)
             .as_user("emp-console", "operator")
             .send(&app)
             .await;
-        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{bad}");
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{uri}");
+        let body = String::from_utf8(refused.body_bytes).unwrap();
+        assert!(
+            body.contains("as_of") && body.contains("retired"),
+            "{uri}: {body}"
+        );
     }
-    TestRequest::get("/api/claims/cuts")
+    TestRequest::get("/api/claims?as_of=7")
         .as_user("emp-console", "limited")
         .send(&app)
         .await
         .assert_status(StatusCode::FORBIDDEN);
 }
 
+/// Backlog 4bec011d: the retained-cuts index had one reader, the review
+/// screen's scrubber, removed in 7381cde96. The route is gone, not answered.
 #[tokio::test]
-async fn an_unwired_claim_history_refuses_the_cuts_route_by_name() {
-    let bus = RecordingEventBus::new();
-    let events: Arc<dyn EventBus> = bus.clone();
-    let policy: Arc<dyn PolicyClient> = Arc::new(
-        FakePolicyClient::builder()
-            .allow("operator", Action::Read, Resource::job(), Scope::All)
-            .build(),
-    );
-    let app = router(JobsApiState::minimal(
-        Arc::new(InMemoryJobs::new()),
-        bus,
-        DomainPublisher::new(events, "jobs"),
-        policy,
-        Arc::new(boss_clock_client::WallClockClient),
-    ));
-    let response = TestRequest::get("/api/claims/cuts")
-        .as_user("emp-console", "operator")
-        .send(&app)
-        .await;
-    assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(
-        String::from_utf8(response.body_bytes)
-            .unwrap()
-            .contains("materialized reader not configured")
-    );
+async fn the_cuts_route_is_retired() {
+    let app = head_seven_app().await;
+    for uri in ["/api/claims/cuts", "/api/claims/cuts?buckets=8"] {
+        let response = TestRequest::get(uri)
+            .as_user("emp-console", "operator")
+            .send(&app)
+            .await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND, "{uri}");
+    }
 }
 
 // -- the station page and the floor read their own subtree (backlog d05e29a7) --

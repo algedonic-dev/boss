@@ -32,8 +32,12 @@ STORE = Path('/opt/boss-bridge')
 SYSTEMD = Path('/etc/systemd/system')
 LOCK_DIR = Path('/run/boss-bridge')
 LIMIT = 128 * 1024
-INPUT = b'info agent-b@algedonic.dev\nexit\n'
 CLI_SECONDS = 45
+# 34d95817: how often capture re-asks `list` while the account reads locked,
+# and how long it waits before refusing; the rest of CLI_SECONDS is for
+# `info` and `exit`.
+LIST_POLL_SECONDS = 1
+ACCOUNT_WAIT_SECONDS = 35
 CLI_CLEANUP_SECONDS = 5
 SERVICE_STATE_SECONDS = 5
 SERVICE_CHANGE_SECONDS = 20
@@ -43,9 +47,11 @@ SERVICE_CHANGE_SECONDS = 20
 # str(error): even a Refused supplied by a future caller may contain CLI input.
 SAFE_REFUSALS = frozenset({
     'Bridge login, capture or converge already owns the session',
+    'Bridge printed no readable account list before the wait bound; credential unchanged',
     'Bridge state is linked or unavailable',
     'CLI cleanup is unproven',
     'CLI deadline exceeded; credential unchanged',
+    'CLI exited before an account was selected; credential unchanged',
     'CLI failed; credential unchanged',
     'CLI output bound exceeded; credential unchanged',
     'CLI termination is unproven',
@@ -70,6 +76,8 @@ SAFE_REFUSALS = frozenset({
     'installed control bytes differ from their identity',
     'installed release bytes differ from the pin',
     'more than one connected account configuration; a second account must be signed out',
+    'no Bridge account is configured; the owner login is missing',
+    'no connected Bridge account; the owner login is signed out',
     'no connected account configuration; the owner login is missing or signed out',
     'one printable Bridge password must cover both protocols',
     'owner login did not finish',
@@ -83,6 +91,7 @@ SAFE_REFUSALS = frozenset({
     'root-only Bridge operation',
     'singleton lock is not root-owned and private',
     'singleton parent is not owned and private',
+    'the Bridge account was still loading or locked at the wait bound; credential unchanged',
     'the one connected account configuration names another account',
 })
 
@@ -151,6 +160,82 @@ def parse_configuration(raw, account):
             'imap_security': values[5], 'smtp_security': values[11]}
 
 
+# 34d95817: capture dbe1bf9a refused 'no connected account configuration'
+# while Bridge listed its one account as connected. At the pin (3.27.1,
+# 43b92377) `info` ignores its argument when the vault holds one account,
+# so the address was never the fault. GetUserInfo answers Locked for a vault
+# user not yet loaded, loadUsers is an asynchronous task started beside the
+# shell, and piped stdin is answered at once: the fixed 'info ADDRESS / exit'
+# input asked before the account loaded and got no configuration block.
+# Capture now reads `list` (accounts.go listAccounts: the bold header, one
+# '%-2d: %-20s (%-15s, %-15s)' row per account, one empty line), waits while
+# an account reads locked, and asks `info` by the one connected row's index.
+# The configuration parser still checks the account address on its own.
+LIST_HEADER = re.compile(r'^# : account +\(status +, address mode +\)$')
+LIST_ROW = re.compile(r'^(\d+) *: .+ +\((signed out|locked|connected) *, (?:combined|split|unknown) *\)$')
+
+
+def account_rows(raw):
+    """The account states of the LAST complete `list` answer, by index; None
+    while there is none, or while it is still arriving or was split by an
+    asynchronous line (the next poll asks again). Usernames are not kept."""
+    text = re.sub(r'\x1b\[[0-9;]*m', '', raw.decode('utf-8', 'replace'))
+    # The text after the last newline is still arriving: not a line yet.
+    lines = [line.rstrip() for line in text.split('\n')[:-1]]
+    headers = [i for i, line in enumerate(lines) if LIST_HEADER.match(line)]
+    if not headers:
+        return None
+    states = []
+    for line in lines[headers[-1]+1:]:
+        if not line:
+            return states
+        row = LIST_ROW.match(line)
+        if row is None or int(row.group(1)) != len(states):
+            return None
+        states.append(row.group(2))
+    return None
+
+
+def choose_account(states):
+    """The index to ask `info` for, None to wait, or a refusal for a settled state."""
+    if not states:
+        raise Refused('no Bridge account is configured; the owner login is missing')
+    # A locked row may be an account still loading: it may yet connect, so
+    # judging the other rows now could select one of two connected accounts.
+    if 'locked' in states:
+        return None
+    connected = [index for index, state in enumerate(states) if state == 'connected']
+    if len(connected) > 1:
+        raise Refused('more than one connected account configuration; a second account must be signed out')
+    if not connected:
+        raise Refused('no connected Bridge account; the owner login is signed out')
+    return connected[0]
+
+
+def capture_conversation():
+    """Capture's side of the CLI session: respond(stdout so far, monotonic now)
+    answers (bytes to send or None, finished). It is only ever handed output
+    from before `info` was asked, so it never sees the configuration."""
+    asked = {'started': None, 'listed': None}
+    def respond(raw, now):
+        if asked['started'] is None:
+            asked['started'] = now
+        states = account_rows(raw)
+        if states is not None:
+            index = choose_account(states)
+            if index is not None:
+                return b'info '+str(index).encode()+b'\nexit\n', True
+        if now-asked['started'] >= ACCOUNT_WAIT_SECONDS:
+            if states is None:
+                raise Refused('Bridge printed no readable account list before the wait bound; credential unchanged')
+            raise Refused('the Bridge account was still loading or locked at the wait bound; credential unchanged')
+        if asked['listed'] is None or now-asked['listed'] >= LIST_POLL_SECONDS:
+            asked['listed'] = now
+            return b'list\n', False
+        return None, False
+    return respond
+
+
 def write_credential(path, value):
     parent = path.parent
     info = parent.lstat()
@@ -180,15 +265,19 @@ def write_credential(path, value):
             os.unlink(temporary)
 
 
-def private_cli(argv, env, seconds=CLI_SECONDS, data=INPUT):
+def private_cli(argv, env, seconds=CLI_SECONDS, data=b'', respond=None):
+    """Run the CLI privately. Fixed `data` is sent whole and stdin closed; a
+    `respond` conversation (capture_conversation) is asked what to send next
+    until it says it has finished, all inside the one deadline."""
+    if respond is None:
+        respond = lambda raw, now: (data, True)
     process = subprocess.Popen(argv, env=env, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                start_new_session=True)
     output = {process.stdout: bytearray(), process.stderr: bytearray()}
     deadline = time.monotonic()+seconds
+    finished = False
     try:
-        process.stdin.write(data)
-        process.stdin.close()
         with selectors.DefaultSelector() as selector:
             for pipe in output:
                 selector.register(pipe, selectors.EVENT_READ)
@@ -196,6 +285,16 @@ def private_cli(argv, env, seconds=CLI_SECONDS, data=INPUT):
                 remaining = deadline-time.monotonic()
                 if remaining <= 0:
                     raise Refused('CLI deadline exceeded; credential unchanged')
+                if not finished:
+                    said, finished = respond(bytes(output[process.stdout]), time.monotonic())
+                    try:
+                        if said:
+                            process.stdin.write(said)
+                            process.stdin.flush()
+                        if finished:
+                            process.stdin.close()
+                    except BrokenPipeError as error:
+                        raise Refused('CLI failed; credential unchanged') from error
                 for key, _ in selector.select(min(remaining, 0.1)):
                     chunk = os.read(key.fileobj.fileno(), 8192)
                     if not chunk:
@@ -204,6 +303,8 @@ def private_cli(argv, env, seconds=CLI_SECONDS, data=INPUT):
                     output[key.fileobj].extend(chunk)
                     if sum(map(len, output.values())) > LIMIT:
                         raise Refused('CLI output bound exceeded; credential unchanged')
+        if not finished:
+            raise Refused('CLI exited before an account was selected; credential unchanged')
         try:
             status = process.wait(timeout=max(0.01, deadline-time.monotonic()))
         except subprocess.TimeoutExpired as error:
@@ -221,6 +322,9 @@ def private_cli(argv, env, seconds=CLI_SECONDS, data=INPUT):
         except subprocess.TimeoutExpired as error:
             raise Refused('CLI cleanup is unproven') from error
         finally:
+            # A conversation refused before it finished leaves stdin open.
+            with contextlib.suppress(OSError):
+                process.stdin.close()
             process.stdout.close()
             process.stderr.close()
 
@@ -414,7 +518,8 @@ def main():
         if action == 'install':
             install()
         elif action == 'capture':
-            row = coordinated_capture(service, lambda: private_cli(user_argv([executable(), '--cli']), {'PATH': '/usr/bin:/bin'}), ACCOUNT)
+            row = coordinated_capture(service, lambda: private_cli(user_argv([executable(), '--cli']), {'PATH': '/usr/bin:/bin'},
+                                                                   respond=capture_conversation()), ACCOUNT)
             row['captured_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             row['bridge_version'] = pin()['version']
             target = PRIVATE/'adapter-credential.json'

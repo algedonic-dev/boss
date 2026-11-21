@@ -6,11 +6,11 @@
 # and the probe shed where landed cars prove.
 #
 # ALLOCATION, read off the manifests that decide it, never estimated:
-# 28 vCPU of host:w-1, the build node — the gates' 12 (gates.toml) and
-# the 16 CPU the dev pod, where every builder's workspace runs, is limited
-# to (infra/cluster/manifests/boss-dev.yaml, `limits: {cpu: "16"}`; it
-# prefers w-1 by node affinity). w-1 has 32 (host:w-1); the 4 left are
-# the root's slack.
+# 23 vCPU of host:w-1, the build node, since version 9 — the gates' 13
+# (gates.toml) and a builder float of four dev-build worker claims at
+# agent-run's 2.5. What the rest of w-1's 32 holds, which no row
+# reserves, is named in version 9 below. (Until v9: 28, the gates' 12
+# and the dev pod's 16-CPU limit.)
 #
 # A CONTAINER, NOT A QUEUE: the tagged predicate holds no packet (see
 # algedonic.toml). To change this station, bump `version`.
@@ -68,11 +68,45 @@
 #     gates' 12) and stops there — the same 16 the owner's share bounds
 #     today, which the version-2 writer still judges by.
 # Nothing else changed.
+#
+# Version 9 (backlog 2b7c78f8, folding 1f8a8a32; bumped from the LIVE
+# newest, v8, read 2026-11-21 on GET /api/stations/engineering/versions):
+# host:w-1 28 -> 23 — the gates' 13 (gates.toml v8: three gate pods at
+# 4.25, the postgres sidecar included) plus a builder float of 10, FOUR
+# worker claims at agent-run's 2.5. The 28 was the gates' 12 plus the dev
+# pod's 16-CPU LIMIT, from when builders built inside the dev pod; since
+# isolation they build in dev-build workers, pods of their own, and the
+# 16 floating admitted SIX of them (16 / 2.5; 1f8a8a32 found v6's comment
+# above claiming ten — that arithmetic was wrong, the gates held 12 of
+# the 28). Measured 2026-11-21 16:50Z (the triage of 2b7c78f8): w-1
+# placed 3 gates + 3 workers while this record admitted 3 + 6, so the
+# fourth to sixth builder waited 300 s in the scheduler and died exit 75
+# instead of waiting in the host:w-1 line. What the rest of w-1's 32
+# holds, which no station row reserves:
+#   - the dev pod's REQUEST, 4.3 (its shell 4, postgres 250m and reclaim
+#     50m, infra/cluster/manifests/boss-dev.yaml). Pinned: this row plus
+#     it fits the box (the_engineering_allocations_are_the_manifests_numbers);
+#   - Longhorn's instance manager: guaranteed-instance-manager-cpu percent
+#     of the node, 3.84 at Longhorn's default 12 and UNREAD until this car
+#     — `read-longhorn-setting guaranteed-instance-manager-cpu` reads the
+#     setting, `node-pods w-1` the pod's own request;
+#   - the DaemonSets (cilium, cilium-envoy, longhorn-manager, csi,
+#     engine-image), about 0.1 — `node-pods w-1` prints each;
+#   - the playground stack's 2 while infra/cluster/instances.toml stands
+#     it on w-1. With it there, 23 + 4.3 + 3.84 + 0.1 + 2 = 33.2 of 32, so
+#     a fourth builder beside three running gates still waits in the
+#     scheduler. Moving it off the build node is the next car of
+#     2b7c78f8, once `node-pods` names a node with its 2 vCPU / 4Gi of
+#     room; then 31.2 of 32.
+# Memory is charged by no row (a pool has one unit): three gate pods at
+# 11Gi, four workers at 5Gi and the dev pod's 8.6 are 61.6 of w-1's
+# 62.2Gi allocatable, so a fifth worker needs a measured worker memory
+# peak first (58a9910e measures the gates'). Nothing else changed.
 # ---------------------------------------------------------------------------
 
 [[station]]
 name = "engineering"
-version = 8
+version = 9
 status = "active"
 title = "Engineering — makes the change"
 kind = "group"
@@ -81,7 +115,7 @@ id = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5"
 parent = "00b04483-90c6-46b9-b911-8e19d2a0b410"
 mode = "standing"
 placement = { x = 120, y = 120, w = 600, h = 420 }
-allocation = { "host:w-1" = 28, "robots:opus" = 0, "robots:sol" = 0 }
+allocation = { "host:w-1" = 23, "robots:opus" = 0, "robots:sol" = 0 }
 borrow_limit = { "host:w-1" = 0 }
 line = "engineering"
 

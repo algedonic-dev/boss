@@ -41,16 +41,34 @@
 # it dies within the hour. A leak is answered the way an hour-long token
 # is: it dies on its own, and the next mint replaces it.
 #
-# WHICH REQUESTS. A `read-publish-checks` request with no `--check`: the
-# verb's one admitted argument is its no-network input check, which
-# holds no token and must not mint one. A run carries no args, and an
-# absent `metadata.args.0` compares unequal to the literal (boss-expr:
-# Absent is unequal to every literal), so it fires.
+# WHICH REQUESTS. A `read-publish-checks` or `read-github-job-log`
+# request with no `--check`: each verb's `--check` is its no-network
+# input check, which holds no token and must not mint one. A
+# read-publish-checks run carries no args, and an absent
+# `metadata.args.0` compares unequal to the literal (boss-expr: Absent
+# is unequal to every literal), so it fires; a read-github-job-log run
+# carries `job <id>` or `run <id>`, so it fires.
 #
-# THE CONSUMER is off the cluster: read-publish-checks.sh on the forge
-# host renders this rule's key through infra/forge/credential-render.sh
-# into /etc/boss-publish/github-app/algedonic-dev-checks.token — its own
-# slot — only when the reading holds a failing Actions check, removing
+# THE SECOND READER (backlog 8f266452, David 2026-11-20; version 2).
+# read-publish-checks reads only the OPEN publish packet's failing
+# checks, so PR #261's failed Gate (job 135639960947) — a closed
+# packet's — had no door, and its log answers 403 anonymously.
+# read-github-job-log reads one job, or one run's failed jobs, of the
+# mirror alone, with THIS key: same Secret, same two permissions, same
+# window; no new credential, no new permission, no App change. Its
+# filing carries a caller-chosen job or run id, so any actor that may
+# file an ops-request can now cause a mint; what it mints reads the
+# Actions logs of one public repository and nothing else, and a mint
+# inside the window is no mint at all (refresh_within_minutes). A cold
+# ad-hoc filing can reach the forge's runner before its mint lands; the
+# verb then says it held no live token, and a refile reads the log.
+#
+# THE CONSUMERS are off the cluster: read-publish-checks.sh and
+# read-github-job-log.sh on the forge host render this rule's key, both
+# through the one definition infra/forge/lib/github-job-log.sh, through
+# infra/forge/credential-render.sh into
+# /etc/boss-publish/github-app/algedonic-dev-checks.token — one slot, the
+# forge's runner being serial — only when a run has a log to read, removing
 # it once the logs are read and on every other way the run ends (its
 # EXIT trap, through which HUP / INT / TERM exit); a slot a SIGKILL left
 # is removed at the start of the next run (review f5a9b7f8, B1). It is
@@ -71,9 +89,9 @@ b7a74610 (2026-11-19): a GitHub-only red could not name its failing
 test, because the mirror's job log answers 403 to the anonymous reader;
 this mints the read-only token the reader reads it with.
 """
-version = 1
+version = 2
 on_event = "jobs.job.created"
-when = 'kind = "ops-request" AND metadata.verb = "read-publish-checks" AND metadata.args.0 != "--check"'
+when = 'kind = "ops-request" AND (metadata.verb = "read-publish-checks" OR metadata.verb = "read-github-job-log") AND metadata.args.0 != "--check"'
 [[rule.do]]
 handler = "credential.rotate.github-app-installation"
 args = { phase = "\"refresh\"", refresh_within_minutes = "\"40\"", secret_namespace = "\"boss\"", secret_name = "\"github-app-algedonic-dev\"", secret_key = "\"checks-token\"", credential_id = "\"github-app-algedonic-dev\"", verify_repo = "\"algedonic-dev/boss\"", repositories = "\"boss\"", permissions = "\"actions:read,metadata:read\"" }

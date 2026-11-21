@@ -9,8 +9,8 @@ use serde_json::json;
 // what these tests judge is what the projection folds, and main gate
 // 643e3baf at f150f78f went red here on a loaded gate drive when one of them
 // spent production's 2 s pre-commit budget on the drive (backlog ebbf38c6).
-// The two blocked-read tests below judge the refusal itself, so they take
-// `blocked_read_history`, a budget they state, rather than production's.
+// The blocked-read test below judges the refusal itself, so it takes
+// `blocked_read_history`, a budget it states, rather than production's.
 
 /// The budget a blocked read waits out. A lock that never releases makes
 /// any budget expire AT the locked statement; this one is long enough that
@@ -27,41 +27,10 @@ fn blocked_read_history(db: &boss_testing::TestDb) -> PgClaimsHistory {
     )
 }
 
-#[tokio::test]
-async fn a_blocked_cuts_query_names_the_pg_budget_and_query() {
-    let db = boss_testing::TestDb::new().await;
-    let at = fact(1, "jobs.unrelated", json!({})).recorded_at;
-    PgClaimsHistory::for_fold_fixture(db.pool.clone())
-        .materialize(&HistoryBatch {
-            through: 1,
-            through_at: at,
-            facts: vec![],
-        })
-        .await
-        .unwrap();
-    let mut blocker = db.pool.begin().await.unwrap();
-    sqlx::query("LOCK TABLE jobs_claim_history_cuts IN ACCESS EXCLUSIVE MODE")
-        .execute(&mut *blocker)
-        .await
-        .unwrap();
-    let error = blocked_read_history(&db)
-        .cuts(None, None, 4, at)
-        .await
-        .unwrap_err()
-        .to_string();
-    blocker.rollback().await.unwrap();
-    assert!(
-        error.contains("first_retained")
-            && error.contains("elapsed_ms")
-            && error.contains("query budget"),
-        "{error}"
-    );
-}
-
-/// The head read names the statement its budget ran out in, as the cuts
-/// read does (backlog 81f8e468): on 2026-11-07 GET /api/claims answered
-/// 503 'read deadline exhausted' for an hour with no statement named,
-/// while the cuts read beside it named `first_retained` and its elapsed
+/// The head read names the statement its budget ran out in (backlog
+/// 81f8e468): on 2026-11-07 GET /api/claims answered 503 'read deadline
+/// exhausted' for an hour with no statement named, while the cuts read
+/// beside it (retired in 4bec011d) named `first_retained` and its elapsed
 /// time.
 #[tokio::test]
 async fn a_blocked_head_read_names_the_pg_budget_and_query() {
@@ -474,12 +443,8 @@ boss_testing::adapters_agree! {
         open_claim_missing_run_and_station_are_named_not_inferred,
         open_claim_context_at_an_old_cut_survives_later_changes,
         every_claim_holder_resolves_to_exactly_one_executor_kind,
-        a_refused_raw_bucket_max_seeks_the_next_whole_cut_in_that_same_bucket,
-        cut_samples_conserve_nonmonotonic_microseconds_and_count_thresholds,
-        an_expired_head_is_not_offered_as_a_retained_cut,
-        zero_width_cut_ranges_sample_the_same_answerable_endpoints,
         unknown_resource_kinds_are_counted_and_make_every_pool_attention,
-        retained_cuts_are_published_with_their_times_and_every_listed_cut_is_answerable,
+        a_historical_read_answers_whole_cuts_and_refuses_a_bisecting_or_pruned_one,
         both_refusal_doors_share_one_attempt_count_and_binding_ties_use_registry_keys,
         exact_reservations_and_releases_are_generation_bound_historical_vectors,
         a_changed_original_transaction_is_refused_without_mutating_visible_rows,
@@ -561,178 +526,6 @@ async fn an_old_consumer_reads_the_allocations_of_a_live_version_two_claim<H: Cl
         let old: before_version_three::Allocation = serde_json::from_value(allocation.clone())
             .unwrap_or_else(|e| panic!("the reader before version 3 refuses {allocation}: {e}"));
         assert_eq!(serde_json::to_value(&old).unwrap(), *allocation);
-    }
-}
-
-async fn a_refused_raw_bucket_max_seeks_the_next_whole_cut_in_that_same_bucket<H: ClaimsHistory>(
-    history: &H,
-    _: &str,
-) {
-    use boss_events::original_group::{GroupReference, OriginalGroup};
-    let at = fact(1, "jobs.unrelated", json!({})).recorded_at;
-    let mut facts: Vec<_> = [9, 1, 7, 3, 5, 4, 8, 2, 6]
-        .into_iter()
-        .enumerate()
-        .map(|(i, us)| {
-            let mut f = fact(i as i64 + 1, "jobs.unrelated", json!({}));
-            f.recorded_at = at + chrono::Duration::microseconds(us);
-            f.event_at = f.recorded_at;
-            f
-        })
-        .collect();
-    let ids = vec![facts[6].event_id, facts[7].event_id];
-    let group = OriginalGroup {
-        reference: GroupReference {
-            id: uuid::Uuid::from_u128(47771),
-            schema_version: 1,
-            event_count: 2,
-            member_hash: OriginalGroup::roster_hash(&ids),
-        },
-        event_ids: ids,
-        audit_sequences: vec![Some(7), Some(8)],
-        complete: true,
-    };
-    facts[6].original_group = Some(group.clone());
-    facts[7].original_group = Some(group);
-    history
-        .materialize(&HistoryBatch {
-            through: 10,
-            through_at: at + chrono::Duration::microseconds(10),
-            facts,
-        })
-        .await
-        .unwrap();
-    let reading = history
-        .cuts(
-            Some(at + chrono::Duration::microseconds(1)),
-            Some(at + chrono::Duration::microseconds(9)),
-            4,
-            at + chrono::Duration::microseconds(10),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        reading.cuts.iter().map(|c| c.seq).collect::<Vec<_>>(),
-        vec![1, 3, 6, 8, 9],
-        "rawmax7 bisects7/8; nextvalid LAST-bucketcut is3, notseq6 fromanotherbucket"
-    );
-    assert!(!reading.complete);
-    assert!(
-        history
-            .read(Some(7), 24, at + chrono::Duration::microseconds(10))
-            .await
-            .is_err()
-    );
-    history
-        .read(Some(8), 24, at + chrono::Duration::microseconds(10))
-        .await
-        .unwrap();
-}
-
-async fn cut_samples_conserve_nonmonotonic_microseconds_and_count_thresholds<H: ClaimsHistory>(
-    history: &H,
-    _: &str,
-) {
-    let at = fact(1, "jobs.unrelated", json!({})).recorded_at;
-    let facts = [9, 1, 7, 3, 5, 4, 8, 2, 6]
-        .into_iter()
-        .enumerate()
-        .map(|(i, us)| {
-            let mut f = fact(i as i64 + 1, "jobs.unrelated", json!({}));
-            f.recorded_at = at + chrono::Duration::microseconds(us);
-            f.event_at = f.recorded_at;
-            f
-        })
-        .collect();
-    history
-        .materialize(&HistoryBatch {
-            through: 10,
-            through_at: at + chrono::Duration::microseconds(10),
-            facts,
-        })
-        .await
-        .unwrap();
-    for (end, expected, complete) in [
-        (3, vec![2, 4, 8], true),
-        (4, vec![2, 4, 6, 8], true),
-        (5, vec![2, 4, 6, 8], false),
-        (8, vec![2, 6, 7, 8, 9], false),
-        (9, vec![1, 6, 7, 8, 9], false),
-    ] {
-        let reading = history
-            .cuts(
-                Some(at + chrono::Duration::microseconds(1)),
-                Some(at + chrono::Duration::microseconds(end)),
-                4,
-                at + chrono::Duration::microseconds(10),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            reading.cuts.iter().map(|c| c.seq).collect::<Vec<_>>(),
-            expected,
-            "end={end}"
-        );
-        assert_eq!(reading.complete, complete, "end={end}");
-        let basis = reading.read_basis.as_ref().unwrap();
-        assert_eq!(basis.range_count_exact, complete);
-        assert_eq!(basis.range_count, if end < 5 { end as usize } else { 5 });
-        assert_eq!(
-            reading.first_retained.seq, 1,
-            "global earliest sequence, not earliest timestamp or requested endpoint"
-        );
-    }
-}
-
-async fn an_expired_head_is_not_offered_as_a_retained_cut<H: ClaimsHistory>(history: &H, _: &str) {
-    let f = fact(1, "jobs.unrelated", json!({}));
-    let at = f.recorded_at;
-    history
-        .materialize(&HistoryBatch {
-            through: 1,
-            through_at: at,
-            facts: vec![f],
-        })
-        .await
-        .unwrap();
-    let now = at + chrono::Duration::hours(169);
-    let reading = history.cuts(None, None, 4, now).await;
-    assert!(
-        reading.is_err(),
-        "no retained cut: an expired head must not be offered as answerable: {reading:?}"
-    );
-}
-
-async fn zero_width_cut_ranges_sample_the_same_answerable_endpoints<H: ClaimsHistory>(
-    history: &H,
-    _: &str,
-) {
-    let at = fact(1, "jobs.unrelated", json!({})).recorded_at;
-    let facts = (1..=9)
-        .map(|seq| {
-            let mut f = fact(seq, "jobs.unrelated", json!({}));
-            f.recorded_at = at;
-            f.event_at = at;
-            f
-        })
-        .collect();
-    history
-        .materialize(&HistoryBatch {
-            through: 9,
-            through_at: at,
-            facts,
-        })
-        .await
-        .unwrap();
-    let reading = history.cuts(Some(at), Some(at), 4, at).await.unwrap();
-    assert!(!reading.complete);
-    assert_eq!(reading.first_retained.seq, 1);
-    assert_eq!(
-        reading.cuts.iter().map(|c| c.seq).collect::<Vec<_>>(),
-        vec![1, 9]
-    );
-    for cut in reading.cuts {
-        history.read(Some(cut.seq), 24, at).await.unwrap();
     }
 }
 
@@ -2629,20 +2422,20 @@ async fn unobserved_history_is_unavailable_not_a_successful_zero_or_future_seque
     );
 }
 
-/// Car 3c (item c46a4e99): the review screen scrubs only cuts the server can
-/// answer. The index names the head and the first retained cut, lists every
-/// answerable cut in a range when they fit and one per equal time slice
-/// when they do not, and every cut it lists is one `read(Some(seq))`
-/// answers — recorded, after the pruned horizon, inside retention, and not
-/// bisecting an original transaction.
-async fn retained_cuts_are_published_with_their_times_and_every_listed_cut_is_answerable<
+/// The historical read the replay tests still lean on: every recorded whole
+/// cut answers at its own time, a sequence inside an original transaction
+/// is refused, and a pruned one is outside retention. The retained-cuts
+/// index carried these assertions until backlog 4bec011d retired it; the
+/// read they witness stays until that item's second car retires it with the
+/// replay comparisons that use it.
+async fn a_historical_read_answers_whole_cuts_and_refuses_a_bisecting_or_pruned_one<
     H: ClaimsHistory,
 >(
     history: &H,
     _: &str,
 ) {
     use boss_events::original_group::{GroupReference, OriginalGroup};
-    use boss_jobs::claims_console::{ClaimsError, Cut};
+    use boss_jobs::claims_console::ClaimsError;
     let at = |seq: i64| fact(seq, "ignored", json!({})).recorded_at;
     // Three batches: facts 1..=3, 4..=5, 6..=9. Facts 7 and 8 are one original
     // transaction, so cut 7 bisects it and is not answerable; cut 8 is whole.
@@ -2679,110 +2472,30 @@ async fn retained_cuts_are_published_with_their_times_and_every_listed_cut_is_an
             .unwrap();
     }
     let now = at(9) + chrono::Duration::hours(1);
-    let index = history.cuts(None, None, 1024, now).await.unwrap();
-    assert_eq!(index.head, Cut { seq: 9, at: at(9) });
-    assert_eq!(index.first_retained, Cut { seq: 1, at: at(1) });
-    assert_eq!(index.pruned_through, 0);
-    assert_eq!(index.retention_hours, 168);
-    assert_eq!(index.retained_from, now - chrono::Duration::hours(168));
-    assert_eq!((index.from, index.to), (index.retained_from, now));
-    assert!(index.complete);
-    assert_eq!(
-        index.cuts.iter().map(|c| c.seq).collect::<Vec<_>>(),
-        vec![1, 2, 3, 4, 5, 6, 8, 9],
-        "cut 7 bisects an original transaction and is not published"
-    );
-    for cut in &index.cuts {
+    for seq in [1, 2, 3, 4, 5, 6, 8, 9] {
         let reading = history
-            .read(Some(cut.seq), 24, now)
+            .read(Some(seq), 24, now)
             .await
-            .unwrap_or_else(|e| panic!("published cut {} must be answerable: {e}", cut.seq));
-        assert_eq!((reading.as_of, reading.as_of_at), (cut.seq, cut.at));
+            .unwrap_or_else(|e| panic!("recorded whole cut {seq} must be answerable: {e}"));
+        assert_eq!((reading.as_of, reading.as_of_at), (seq, at(seq)));
     }
     assert!(
         matches!(
             history.read(Some(7), 24, now).await,
             Err(ClaimsError::Invalid(_))
         ),
-        "the bisecting sequence the index left out is refused by the read"
+        "a sequence inside an original transaction is refused"
     );
 
-    // Retention passes cuts 1..=5: the index starts at the first retained cut
-    // and the read refuses what was pruned.
+    // Retention passes cuts 1..=5: the read refuses what was pruned and still
+    // answers the first retained cut.
     let later = at(5) + chrono::Duration::hours(168) + chrono::Duration::seconds(1);
     let cursor = history.cursor().await.unwrap();
     while history.prune(cursor, later, 1024).await.unwrap() == 1024 {}
-    let index = history.cuts(None, None, 1024, later).await.unwrap();
-    assert_eq!(index.pruned_through, 5);
-    assert_eq!(index.first_retained, Cut { seq: 6, at: at(6) });
-    assert_eq!(
-        index.cuts.iter().map(|c| c.seq).collect::<Vec<_>>(),
-        vec![6, 8, 9]
-    );
     assert!(matches!(
         history.read(Some(5), 24, later).await,
         Err(ClaimsError::OutsideRetention(_))
     ));
-
-    // Forty more facts in one batch. Over [at(6), at(49)] four slices publish
-    // the last cut of each plus the first in range: a bounded sample whose
-    // every member is answerable, the same list from both adapters.
-    let many: Vec<_> = (10..=49)
-        .map(|seq| fact(seq, "jobs.unrelated", json!({"seq": seq})))
-        .collect();
-    history
-        .materialize(&HistoryBatch {
-            through: 49,
-            through_at: at(49),
-            facts: many,
-        })
-        .await
-        .unwrap();
-    let now = at(49) + chrono::Duration::hours(1);
-    let sampled = history
-        .cuts(Some(at(6)), Some(at(49)), 4, now)
-        .await
-        .unwrap();
-    assert!(!sampled.complete);
-    assert_eq!(
-        sampled.cuts.iter().map(|c| c.seq).collect::<Vec<_>>(),
-        vec![6, 16, 27, 38, 49],
-        "{:?}",
-        sampled.cuts
-    );
-    assert_eq!((sampled.from, sampled.to), (at(6), at(49)));
-    for cut in &sampled.cuts {
-        history
-            .read(Some(cut.seq), 24, now)
-            .await
-            .unwrap_or_else(|e| panic!("sampled cut {} must be answerable: {e}", cut.seq));
-    }
-    let narrow = history
-        .cuts(Some(at(20)), Some(at(30)), 1024, now)
-        .await
-        .unwrap();
-    assert!(narrow.complete);
-    assert_eq!(
-        narrow.cuts.iter().map(|c| c.seq).collect::<Vec<_>>(),
-        (20..=30).collect::<Vec<_>>()
-    );
-    // A `from` before retention is clamped to the floor and the answer says
-    // so; an inverted range and a bucket count outside the bound are refused.
-    let clamped = history
-        .cuts(Some(at(1) - chrono::Duration::days(400)), None, 1024, now)
-        .await
-        .unwrap();
-    assert_eq!(clamped.from, clamped.retained_from);
-    assert!(matches!(
-        history.cuts(Some(at(30)), Some(at(20)), 8, now).await,
-        Err(ClaimsError::Invalid(_))
-    ));
-    assert!(matches!(
-        history.cuts(None, None, 0, now).await,
-        Err(ClaimsError::Invalid(_))
-    ));
-    assert!(matches!(
-        history.cuts(None, None, 1025, now).await,
-        Err(ClaimsError::Invalid(_))
-    ));
+    let first = history.read(Some(6), 24, later).await.unwrap();
+    assert_eq!((first.as_of, first.as_of_at), (6, at(6)));
 }

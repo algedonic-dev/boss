@@ -266,10 +266,10 @@ describe('yardAlerts — what is wrong right now, each a button to its subject',
   test('a failed converge warns, selecting the runner; a request the runner has not answered in time warns too', () => {
     const failed = alertsOf(yardOf(), statusOf(), {
       ...quiet,
-      runner: { kind: 'failed', id: 'r1', at: '2026-09-08T02:30:40Z', reason: 'refused — outside the allowlist' },
+      runner: { kind: 'failed', id: 'r1', at: '2026-09-08T02:30:40Z', reason: 'refused — the runner recorded no reason' },
     });
     expect(failed[0]).toMatchObject({ subject: 'runner', sev: 'warn', since: '2026-09-08T02:30:40Z' });
-    expect(failed[0]?.text).toBe('deploy runner · converge FAILED — refused — outside the allowlist');
+    expect(failed[0]?.text).toBe('deploy runner · converge FAILED — refused — the runner recorded no reason');
     const stuckAt = new Date(NOW - (OPS_RUNNER_STUCK_MINUTES + 1) * 60_000).toISOString();
     const stuck = alertsOf(yardOf(), statusOf(), { ...quiet, runner: { kind: 'requested', id: 'o1', at: stuckAt } });
     expect(stuck[0]).toMatchObject({ subject: 'runner', sev: 'warn', since: stuckAt });

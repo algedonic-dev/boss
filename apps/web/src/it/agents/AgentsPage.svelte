@@ -15,6 +15,7 @@
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import Link from '@boss/web-kit/ui/Link.svelte';
   import { href } from '../../router';
+  import { regionHref } from '../yard/regions';
   import {
     budgetText,
     changeText,
@@ -241,8 +242,8 @@
     <p class="ag-footnote">
       The registry records no manager for an agent, so no reports-to line is drawn. Open steps held counts the
       ready and active steps assigned to the id or any alias. Runs are finished runs from the agent-run record,
-      each linked to its own packet; a run still open is on the Department Map's
-      <Link to={href('/it?at=shop-floor')}>shop floor</Link>.
+      each linked to its own packet; a run still open is on the alarms board's
+      <Link to={href(regionHref('shop-floor'))}>shop floor</Link>.
     </p>
   {/if}
 </div>

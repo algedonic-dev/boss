@@ -1,29 +1,37 @@
-//! boss-codebase-metrics.service runs as the owner of the checkout it
-//! reads. With no `User=` the unit ran as root, and root reading a
-//! checkout owned by another user is what git calls "dubious ownership":
-//! on 2026-09-12 05:14Z the timer's first-ever firing exited 3 with
+//! The boss-codebase-metrics unit boss-gcp installs runs as root over a
+//! tree root owns. On 2026-09-12 05:14Z the timer's first-ever firing,
+//! as root with no `User=` over david's /opt/boss, exited 3 with
 //! `fatal: detected dubious ownership in repository at '/opt/boss'`,
 //! the cadence stayed silent (436a2e91), the unit read unhealthy
 //! (fdd10ec8), and two landed cars waited on a packet that could not
-//! exist. Read off the packet the ops-runner answered (988bb127), not
-//! an ssh session. The siblings that run git against /opt/boss
-//! (boss-search-reindex, boss-forge-token-audit) already say User=david;
-//! this pins that this one does too, and says why in the unit.
+//! exist (read off the packet the ops-runner answered, 988bb127). The
+//! answer then was `User=david`, the checkout's owner. The answer since
+//! boss-gcp's stage of design c98c79aa (db018094; backlog c440ab8d
+//! brought this pin level, 2026-11-21) is that root reads ROOT's tree:
+//! install-units.sh installs infra/gcp/root-tree-units/
+//! boss-codebase-metrics.service.in, `User=root` working in
+//! /var/lib/boss/gcp-tree/current, so no ownership git reads is foreign
+//! and no person's account runs the chore. infra/boss-codebase-metrics.service,
+//! `User=david` still, is only the fixture copy and the timer's pair
+//! (no_unattended_unit_runs_from_a_home.rs, INSTALLED_FROM_ROOTS_TREE).
 
 use boss_testing::repo_root;
 
+/// The unit boss-gcp installs for this stem.
+const INSTALLED: &str = "infra/gcp/root-tree-units/boss-codebase-metrics.service.in";
+
 #[test]
-fn the_codebase_metrics_unit_runs_as_the_checkout_owner() {
-    let unit = std::fs::read_to_string(repo_root().join("infra/boss-codebase-metrics.service"))
-        .expect("infra/boss-codebase-metrics.service");
+fn the_codebase_metrics_unit_runs_as_root_over_roots_own_tree() {
+    let unit = std::fs::read_to_string(repo_root().join(INSTALLED)).expect(INSTALLED);
     assert!(
-        unit.lines().any(|l| l.trim() == "User=david"),
-        "boss-codebase-metrics.service must run as the checkout owner (User=david): \
-         root reading /opt/boss is 'dubious ownership' and the measurement exits 3"
+        unit.lines().any(|l| l.trim() == "User=root"),
+        "{INSTALLED} runs as root: root's tree is root's, so git reads no foreign ownership"
     );
     assert!(
-        unit.contains("dubious ownership"),
-        "the unit names the refusal the User= line prevents, so the next reader does not remove it"
+        unit.lines()
+            .any(|l| l.trim() == "WorkingDirectory=/var/lib/boss/gcp-tree/current"),
+        "{INSTALLED} measures root's tree, never a checkout another account owns — \
+         root over /opt/boss is 'dubious ownership' and the measurement exits 3"
     );
 }
 
@@ -90,7 +98,7 @@ fn the_codebase_metrics_unit_names_the_counter_the_converge_installs() {
     let root = repo_root();
     let read =
         |p: &str| std::fs::read_to_string(root.join(p)).unwrap_or_else(|e| panic!("{p}: {e}"));
-    let unit = read("infra/boss-codebase-metrics.service");
+    let unit = read(INSTALLED);
     let installer = read("infra/estate/install-cli-from-image.sh");
     let converge = read("infra/gcp/boss-gcp-converge.sh");
     let dockerfile = read("infra/oss-quickstart/Dockerfile");

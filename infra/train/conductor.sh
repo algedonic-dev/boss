@@ -5,8 +5,10 @@
 # system. The systemd timers that used to enter here are gone
 # (protocol-cadence): the schedule is rows in the cadence_rules
 # registry, executed by the supervised `boss train cadence` loop
-# (boss-train.service). This shim survives for humans — a terminal
-# and a dry run keep the flags they always passed.
+# (the cluster's boss-conductor Deployment; the host unit
+# boss-train.service was deleted in backlog c440ab8d). This shim
+# survives for humans — a terminal and a dry run keep the flags they
+# always passed.
 #
 #   ./infra/train/conductor.sh                  # reconcile + board
 #   ./infra/train/conductor.sh --reconcile-only # advance open trains only

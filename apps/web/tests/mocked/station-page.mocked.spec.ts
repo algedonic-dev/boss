@@ -123,7 +123,7 @@ async function mocks(page: Page, o: Opts = {}): Promise<Readonly<{ queues: strin
 
 test('opening a station: the answer band, then the live floor in place of the cards, the rail and the line', async ({ page }, testInfo) => {
   const { queues } = await mocks(page);
-  await page.goto('/it/tree/engineering');
+  await page.goto('/tree/engineering');
   const root = page.locator('[data-station-page="engineering"]');
   await expect(root.locator('h1')).toHaveText('engineering');
   await expect(root.locator('[data-subtitle]')).toHaveText('a station');
@@ -139,7 +139,7 @@ test('opening a station: the answer band, then the live floor in place of the ca
   await expect(page.locator('[data-answer="needs you"] [data-answer-count]')).toHaveText('1');
   await expect(page.locator('[data-binding="pool"] [data-binding-pool]')).toHaveText('host:w-1 · 7.5 of 32 vCPU reserved');
   await expect(root.locator('[data-crumbs] [data-view-toggle] .on')).toHaveText('Work');
-  await expect(root.locator('[data-crumbs] [data-view-toggle] a[data-view="resources"]')).toHaveAttribute('href', '/it/tree/engineering/resources');
+  await expect(root.locator('[data-crumbs] [data-view-toggle] a[data-view="resources"]')).toHaveAttribute('href', '/tree/engineering/resources');
 
   // THE FLOOR: one admission edge, each part at its place.
   const floor = page.locator('[data-floor="engineering"]');
@@ -191,7 +191,7 @@ test('a move on the stream: the token and its station move, and a packet claimed
       { event_id: 'e-3', timestamp: at, source: 'boss-people-api', kind: 'people.employee.updated', payload: { id: 'emp-1' } },
     ],
   });
-  await page.goto('/it/tree/engineering');
+  await page.goto('/tree/engineering');
   const floor = page.locator('[data-floor="engineering"]');
   await expect(floor.locator('[data-token="j-dock-1"]')).toBeVisible();
   release();
@@ -207,7 +207,7 @@ test('a move on the stream: the token and its station move, and a packet claimed
 test('a part whose row serves a placement stands where it says; the rest keep the fallback grid', async ({ page }) => {
   // Car A (backlog e3a927c3) serves the box as `placement` on the row.
   await mocks(page, { rows: TREE_ROWS.map((r) => (r.name === 'gates' ? { ...r, placement: { x: 590, y: 120, w: 230, h: 170 } } : r)) });
-  await page.goto('/it/tree/engineering');
+  await page.goto('/tree/engineering');
   const floor = page.locator('[data-floor="engineering"]');
   await expect(floor.locator('[data-floor-station="gates"]')).toHaveAttribute('data-placed', 'declared');
   await expect(floor.locator('[data-floor-station="loading-dock"]')).toHaveAttribute('data-placed', 'grid');
@@ -215,9 +215,9 @@ test('a part whose row serves a placement stands where it says; the rest keep th
 
 test('opening a part opens the same view one level down', async ({ page }) => {
   await mocks(page);
-  await page.goto('/it/tree/engineering');
+  await page.goto('/tree/engineering');
   await page.locator('[data-floor-station="forge"] a.sname').click();
-  await expect(page).toHaveURL(/\/it\/tree\/forge$/);
+  await expect(page).toHaveURL(/\/tree\/forge$/);
   await expect(page.locator('[data-crumb]')).toHaveText(['company', 'engineering', 'forge']);
   await expect(page.locator('[data-floor="forge"] [data-floor-station="forge-ci"]')).toBeVisible();
   // A station whose stations queue no protocol cannot scope Needs you: said, never zero.
@@ -227,7 +227,7 @@ test('opening a part opens the same view one level down', async ({ page }) => {
 
 test('a leaf’s floor is its own admission, its working slots and its Outbound record', async ({ page }) => {
   await mocks(page);
-  await page.goto('/it/tree/gates');
+  await page.goto('/tree/gates');
   const floor = page.locator('[data-floor="gates"]');
   await expect(floor.locator('[data-floor-station]')).toHaveCount(1);
   await expect(floor.locator('[data-floor-station="gates"] a.sname')).toHaveCount(0);
@@ -235,7 +235,7 @@ test('a leaf’s floor is its own admission, its working slots and its Outbound 
   await expect(floor.locator('[data-outbound="gates"]')).toBeVisible();
 });
 
-test('/engineering is the same station page as /it/tree/engineering', async ({ page }) => {
+test('/engineering is the same station page as /tree/engineering', async ({ page }) => {
   await mocks(page);
   await page.goto('/engineering');
   await expect(page.locator('[data-station-page="engineering"] h1')).toHaveText('engineering');
@@ -245,15 +245,15 @@ test('/engineering is the same station page as /it/tree/engineering', async ({ p
 
 test('every claim placed: an idle seat with a queue is stuck, on the band and in the list', async ({ page }) => {
   await mocks(page, { held: HELD.slice(0, 3), binding: null });
-  await page.goto('/it/tree/engineering');
+  await page.goto('/tree/engineering');
   await expect(page.locator('[data-answer="stuck"]')).toContainText('loading-dock: 30 not admitted, its seat idle');
-  await expect(page.locator('#stuck [data-stuck="idle:loading-dock"] a')).toHaveAttribute('href', '/it/tree/loading-dock');
+  await expect(page.locator('#stuck [data-stuck="idle:loading-dock"] a')).toHaveAttribute('href', '/tree/loading-dock');
   await expect(page.locator('[data-binding="none"]')).toContainText('no reservation refused in 24 h');
 });
 
 test('a failed claims read draws the red rail, fills no slot, and says why', async ({ page }) => {
   await mocks(page, { claims: 'down' });
-  await page.goto('/it/tree/engineering');
+  await page.goto('/tree/engineering');
   await expect(page.locator('[data-station-page] header.head')).toHaveAttribute('data-rail', 'failed');
   await expect(page.locator('[data-plate-why]')).toContainText('503');
   await expect(page.locator('[data-answer="working"]')).toHaveAttribute('data-answer-state', 'unread');
@@ -266,17 +266,22 @@ test('a failed claims read draws the red rail, fills no slot, and says why', asy
 
 test('a failed queue read is said in its station, and the others still draw', async ({ page }) => {
   await mocks(page, { queueDown: 'loading-dock' });
-  await page.goto('/it/tree/engineering');
+  await page.goto('/tree/engineering');
   const dock = page.locator('[data-floor-station="loading-dock"]');
   await expect(dock.locator('[data-queue-unread]')).toContainText('the queue read failed');
   await expect(dock.locator('[data-queue-unread]')).toContainText('HTTP 500');
   await expect(page.locator('[data-token="j-g-2"]')).toBeVisible();
 });
 
-test('a failed tree read draws the red rail and no figure at all', async ({ page }) => {
+// The page is the root's since backlog 92bfcb04, and a hosted page is
+// placed by the tree (backlog 0bc2eb68): with the tree unread, nothing can
+// place the address, and the page says why rather than guessing one. At
+// /it/tree/<name> it was placed by hand and drew its own red rail.
+test('a failed tree read is said, naming the read, and no figure is drawn', async ({ page }) => {
   await mocks(page, { tree: 'down' });
-  await page.goto('/it/tree/engineering');
-  await expect(page.locator('[data-page-failed]')).toContainText('503');
+  await page.goto('/tree/engineering');
+  await expect(page.locator('[data-not-found-why]')).toContainText('the station tree could not be read');
+  await expect(page.locator('[data-not-found-why]')).toContainText('503');
   await expect(page.locator('[data-floor]')).toHaveCount(0);
   await expect(page.locator('[data-answer]')).toHaveCount(0);
 });

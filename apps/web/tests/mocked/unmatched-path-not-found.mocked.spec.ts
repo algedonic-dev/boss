@@ -33,15 +33,18 @@ test.describe('an unmatched path renders a not-found that names it', () => {
     });
   }
 
-  test('an unknown /it path says so inside IT, with its one door back to the alarms board', async ({ page }) => {
+  // It said so inside IT, with its door back to the alarms board, until
+  // backlog 92bfcb04 retired the /it prefix with IT as a department
+  // (design df0ecd8b): a path under it is a path like any other.
+  test('an unknown /it path says so at the company root, with its one door back to My Day', async ({ page }) => {
     await installSmokeMocks(page);
     await mountPage(page, '/it/no-such', { titleMatch: new RegExp(TITLE) });
 
     await expect(page.locator('.app-shell')).toContainText('Nothing in this app answers /it/no-such');
     expect(new URL(page.url()).pathname).toBe('/it/no-such');
-    await expect(page.getByRole('link', { name: /Back to the alarms board/ })).toHaveAttribute('href', '/it');
-    // At the company root, which hosts the alarms board its door opens
-    // (backlog 474e2c1c: the bar walks the station tree).
+    await expect(page.getByRole('link', { name: /Back to My Day/ })).toHaveAttribute('href', '/me');
+    // At the company root, where its door leads (backlog 474e2c1c: the bar
+    // walks the station tree).
     await expect(page.locator('.perspective-tabs [aria-current="page"]')).toHaveAttribute('data-trail-stop', 'company');
   });
 });

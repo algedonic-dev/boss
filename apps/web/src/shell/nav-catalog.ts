@@ -95,8 +95,10 @@ type Placement =
       /// 5cb56bb3). One address for every person, because WHOSE station
       /// it is comes from the session, never from the URL — so a link to
       /// /me/inbox is the reader's own inbox, and no address names
-      /// another person's. It is no row of the company tree, so the path
-      /// is spelled, and needs no tree read: a tree that has not answered
+      /// another person's. Its row in the company tree, `me`
+      /// (infra/platform/stations/me.toml), is one row for every person,
+      /// so the path is spelled rather than read off the tree's address,
+      /// and needs no tree read: a tree that has not answered
       /// or could not be read never takes a person's own pages away.
       /// The type holds it under /me.
       person: true;
@@ -191,6 +193,9 @@ export type UngatedSurfaceId =
   // 851259b9). It borrows the `workflows` gate of the family it sits in,
   // as Agents does; the registry read itself is operator-tier upstream.
   | 'system-credentials'
+  // 'system-tree' (the station tree floor, backlog 92bfcb04): the
+  // company's view of itself, gated like the alarms board it sat behind.
+  | 'system-tree'
   | 'purchase-order'
   | 'vendor-invoice'
   | 'manual';
@@ -244,6 +249,11 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavIte
   'vendor-invoice': { id: 'vendor-invoice', label: 'Vendor invoice', slug: 'vendor-invoices/:vendorInvoiceId', permKey: 'vendors', owner: 'finance', unlisted: true, host: STATION.finance },
   inbox:     { id: 'inbox',     label: 'Inbox',            path: '/me/inbox',     permKey: 'inbox',     owner: 'home', person: true },
   manual:    { id: 'manual',    label: 'Manual',           slug: 'manual',        owner: 'home', host: STATION.engineering },
+  // The station tree floor, and below it each station's page and its
+  // Resources view (router.ts HOSTED). It answered at /it/tree until
+  // backlog 92bfcb04 (car 3 of design df0ecd8b: "the whole tree is the
+  // company's view of itself"), so the root hosts it and Home owns it.
+  'system-tree':             { id: 'system-tree',             label: 'Station tree',        slug: 'tree',             permKey: 'system-yard',             owner: 'home', unlisted: true, host: STATION.algedonic },
 
   // The IT department (the 2026-08-31 consolidation, packet 1f6d55e0).
   // The catalog keeps non-sidebar entries only where a RouteName still
@@ -316,8 +326,8 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavIte
 /// `unhosted-pages:<n>`, a number that falls. When it reaches zero the
 /// `host` field becomes required and the report becomes a pin (car 3).
 /// A person's page is hosted — at the signed-in person's own station,
-/// /me, which is no row of the company tree (backlog 5cb56bb3) — so it
-/// is not on the report.
+/// /me, whose page the session decides rather than the tree (backlog
+/// 5cb56bb3) — so it is not on the report.
 export function unhostedPages(): ReadonlyArray<NavItem> {
   return Object.values(ROUTE_CATALOG).filter((e) => e.host === undefined && e.person !== true);
 }

@@ -172,6 +172,7 @@ pub mod step_plugins;
 pub mod step_registry;
 pub mod step_wait;
 pub mod subject_existence;
+pub mod superseded_area;
 pub mod surface_opens;
 pub mod tenant_publishes;
 

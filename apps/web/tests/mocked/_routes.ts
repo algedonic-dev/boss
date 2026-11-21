@@ -52,8 +52,11 @@ export const ROUTES: ReadonlyArray<string> = [
   // Since backlog 0bc2eb68 each page answers at its host station's
   // address in the tree plus its slug (the fixture tree's, which the
   // floor serves), and the alarms board, hosted at the root, at /alarms;
-  // /it renders it too, as IT's landing, because the IT tab links there.
-  '/it', '/alarms', '/engineering/registry/subjects', '/engineering/registry/dispatcher', '/engineering/registry/rules',
+  // /it renders it too, as IT's landing, because the IT tab links there,
+  // until the departments registry retires the row (car 2 of design
+  // df0ecd8b). The station tree floor is the root's page at /tree since
+  // backlog 92bfcb04 (car 3 of that design).
+  '/it', '/alarms', '/tree', '/engineering/registry/subjects', '/engineering/registry/dispatcher', '/engineering/registry/rules',
   // The rule editor — a detail route, because its catalog path is the
   // pattern /engineering/registry/rules/:ruleName (car 3071e235) and a pattern
   // is not a URL. route-smoke's drift test holds every parameterised
@@ -79,15 +82,16 @@ export const ROUTES: ReadonlyArray<string> = [
   // controls are pinned in audit-log-page.mocked.spec.ts (65a273d5).
   '/operations/audit',
   // THE ALARMS BOARD AND THE STATIONS THAT KEEP A BOARD (design
-  // 01fa5bdf step 1): what stays at /it of the Department Map. Only the
+  // 01fa5bdf step 1): what stays of the Department Map. Only the
   // track, the dock and the garage still carry boards — the release and
   // cancel controls (panel.ts `STATION_BOARDS`) — so the crawl opens
   // those three selections: each board renders its empty states under
   // the mocks and its `load-failed` line under the outage. The other
-  // stations' boards went with the map. '/it' itself is crawled above.
-  '/it?at=dock',
-  '/it?at=track',
-  '/it?at=garage',
+  // stations' boards went with the map. The board itself is crawled
+  // above; its selections ride its own address since backlog 92bfcb04.
+  '/alarms?at=dock',
+  '/alarms?at=track',
+  '/alarms?at=garage',
   // The codebase — its own sidebar row since feedback 9827c699
   // (2026-09-14; a Design tab before, backlog 06048ade). Its one read is
   // `/api/jobs?kind=maintenance-codebase-metrics`; under the mock's `[]`
@@ -176,8 +180,14 @@ export const RETIRED_ROUTES: ReadonlyArray<string> = [
   '/it/operate/receiving', '/it/operate/marshalling', '/it/operate/yard-status',
   '/it/operate/conductor', '/it/design/feedback', '/it/design/backlog', '/it/design/codebase',
   // The department floor (backlog 858e62aa, 2026-11-08): the recursive
-  // station view at /it/tree is the surface it was a flat copy of.
+  // station view (/tree since backlog 92bfcb04) is the surface it was a
+  // flat copy of.
   '/it/floor/hosting',
+  // THE /it/tree SPELLINGS (backlog 92bfcb04, car 3 of design df0ecd8b):
+  // the floor, a station's page and its Resources view are the root's
+  // pages at /tree, /tree/<name> and /tree/<name>/resources, with no
+  // alias (no shims before 1.0.0).
+  '/it/tree', '/it/tree/engineering', '/it/tree/engineering/resources',
   // STEP 1 OF DESIGN 01fa5bdf (David, 2026-11-17: "IT disappears, the
   // old map is pulled out, and the /ux business pages are removed").
   // Each answered until then and is not found now; a page comes back as

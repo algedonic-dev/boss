@@ -67,10 +67,36 @@ impl crate::car_retire::Door for Conductor {
     async fn send(&self, method: Method, path: &str, body: Option<Value>) -> Result<Option<Value>> {
         self.api(method, path, body).await
     }
+
+    async fn send_expecting(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        expect: &serde_json::Map<String, Value>,
+    ) -> Result<Option<Value>> {
+        self.api_expecting(method, path, body, expect).await
+    }
 }
 
 #[async_trait]
 impl crate::review_verdict::ExecutorRecordReader for Conductor {
+    /// The re-judge at boarding refuses a release whose review the car's
+    /// builder actor recorded (backlog 8e97a4ec), which needs the agents
+    /// registry the release door reads, and the builder run of a car that
+    /// records no `built_by`.
+    async fn release_actor_rows(&self) -> Result<Vec<Value>> {
+        boss_jobs::car_release::agents_snapshot(self.api(Method::GET, "/api/agents", None).await?)
+    }
+    async fn job_packet(&self, id: &str) -> Result<Option<Value>> {
+        match self
+            .api(Method::GET, &format!("/api/jobs/{id}"), None)
+            .await
+        {
+            Err(e) if is_no_such_job(&e) => Ok(None),
+            read => read,
+        }
+    }
     async fn protocol_version(&self, kind: &str, version: i64) -> Result<Option<Value>> {
         self.api(
             Method::GET,
@@ -645,11 +671,59 @@ impl Conductor {
         payload: Option<Value>,
         bound: Option<usize>,
     ) -> std::result::Result<Option<Value>, ApiFailure> {
+        self.api_once_judged(method, path, payload, bound, None)
+            .await
+    }
+
+    /// [`Self::api`] carrying the keys a write JUDGED, as it read them, in
+    /// [`boss_jobs::step_metadata_write::EXPECT_HEADER`] (backlog
+    /// cd1f68c6): the merge door lands it only on a step that still reads
+    /// so, and answers 409 `step_changed` otherwise — never retried, a
+    /// 4xx. The conductor's first judged write is a relaunch's takeover of
+    /// its lost run's gate (backlog 37111b65 car (a)).
+    pub(super) async fn api_expecting(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<Value>,
+        expect: &serde_json::Map<String, Value>,
+    ) -> Result<Option<Value>> {
+        let judged = crate::sor_client::expectation_value(expect)?;
+        retrying(
+            &JOBS_API_RETRY,
+            &method,
+            path,
+            self.policy.blip_cause_budget,
+            &|m| log(m),
+            || {
+                let method = method.clone();
+                let payload = payload.clone();
+                let judged = judged.clone();
+                async move {
+                    self.api_once_judged(method, path, payload, None, Some(judged))
+                        .await
+                }
+            },
+        )
+        .await
+    }
+
+    async fn api_once_judged(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<Value>,
+        bound: Option<usize>,
+        judged: Option<reqwest::header::HeaderValue>,
+    ) -> std::result::Result<Option<Value>, ApiFailure> {
         let mut req = self
             .http
             .request(method.clone(), format!("{}{path}", self.cfg.jobs))
             .header("content-type", "application/json")
             .header("x-boss-user", boss_user());
+        if let Some(judged) = judged {
+            req = req.header(boss_jobs::step_metadata_write::EXPECT_HEADER, judged);
+        }
         if let Some(p) = &payload {
             req = req.json(p);
         }
@@ -3160,14 +3234,19 @@ impl Conductor {
                     .launch_gate(&branch, &sha, crate::gate::Requester::Car, marks)
                     .await;
                 match launched {
-                    Ok(new) => (
-                        lg::stamp(lg::RELAUNCHED, now, Some(&new), None, None),
-                        format!(
-                            "relaunched as {} on {}",
-                            id8(&new),
-                            &sha[..sha.len().min(8)]
-                        ),
-                    ),
+                    Ok(new) => {
+                        let held = self
+                            .relaunch_holds_the_gate(&cars, &branch, rid, &new, &sha, now)
+                            .await;
+                        (
+                            lg::stamp(lg::RELAUNCHED, now, Some(&new), None, None),
+                            format!(
+                                "relaunched as {} on {}{held}",
+                                id8(&new),
+                                &sha[..sha.len().min(8)]
+                            ),
+                        )
+                    }
                     Err(f) if f.filed.is_none() => {
                         let cause = format!("{:#}", f.cause);
                         (
@@ -3191,6 +3270,55 @@ impl Conductor {
             id8(rid)
         ));
         Ok(())
+    }
+
+    /// A RELAUNCH INHERITS ITS LOST RUN'S EDGE (backlog 37111b65 car (a),
+    /// design 689d1f7f). Once relaunch `new` is filed, it takes over the
+    /// gate step lost run `lost` held on the branch's car
+    /// (`car::relaunch_into_gate`) and records the R8 edge read back off
+    /// that car (`car::fulfils_from_read_back`), so its verdict completes
+    /// or hands back the step by edge. Until 2026-11-20 a relaunch carried
+    /// only the `park_*` keys and was finished by the branch scan, which
+    /// car 3 of the design retires.
+    ///
+    /// NEVER FATAL: the relaunch is filed and running, and a gate-run
+    /// without the edge is still finished by the scan, so a refusal here
+    /// is said on the reconcile line, not raised. The edge is attempted
+    /// after a refused takeover too — its read-back writes it only onto a
+    /// step that names `new` — because a retried stamp whose first try
+    /// landed reads as refused. Returns the clause for that line.
+    async fn relaunch_holds_the_gate(
+        &self,
+        cars: &[Value],
+        branch: &str,
+        lost: &str,
+        new: &str,
+        sha: &str,
+        now: DateTime<Utc>,
+    ) -> String {
+        let taken = crate::car::relaunch_into_gate(self, cars, branch, lost, new, sha, now).await;
+        let (car, said) = match taken {
+            Ok(None) => return String::new(),
+            Ok(Some(car)) => {
+                let said = format!("; took over car {}'s gate step", id8(&car));
+                (car, said)
+            }
+            Err(e) => match boss_jobs::car::car_held_by(cars, branch, lost)
+                .and_then(|c| c.get("id").and_then(Value::as_str))
+            {
+                Some(car) => (
+                    car.to_string(),
+                    format!("; the takeover was refused ({e:#})"),
+                ),
+                None => return format!("; the takeover was refused ({e:#})"),
+            },
+        };
+        let edge = match crate::car::fulfils_from_read_back(self, &car, new).await {
+            Ok(true) => "and carries its edge".to_string(),
+            Ok(false) => "and carries no edge — the car does not read as held by it".to_string(),
+            Err(e) => format!("and its edge was not written ({e:#})"),
+        };
+        format!("{said}, {edge}")
     }
 
     /// Send the hand-back `request` and learn FROM THE RECORD which item it
@@ -23046,6 +23174,202 @@ mod tests {
         let triage = find_step(&job, "triage", "").expect("a triage step");
         assert_eq!(triage["status"], "completed", "{job:#}");
         assert_eq!(triage["metadata"]["cleared_by"], LOST_SWEEP_CLEARED_BY);
+    }
+
+    /// A RELAUNCHED LOST GATE CARRIES THE EDGE (backlog 37111b65 car (a),
+    /// design 689d1f7f), on the REAL jobs router: a car moved into its
+    /// gate by gate-run L, L lost and its hand-back leaving the step READY
+    /// naming L — then the conductor's relaunch R takes the step over
+    /// (judged on L still holding it at its head), and R's metadata
+    /// carries the `fulfils` edge read back off the car, which R's green
+    /// then finishes by edge. The car's review hold is not touched. A
+    /// second relaunch of L finds nothing to take over: R holds it now.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_relaunched_lost_gate_takes_over_the_cars_gate_and_carries_its_edge() {
+        use crate::car_retire::Door as _;
+        const BRANCH: &str = "feat/a-relaunch-inherits-the-edge";
+        const HEAD: &str = "e16708f69bc5b0a0a3f4bd1572f9db6dec76e7c8";
+        let base = crate::car_unland::tests::serve().await;
+        let c = settle_conductor(base.clone());
+        let admin = crate::steps::Wire::at(
+            base,
+            Some(crate::identity::Caller {
+                id: "emp-bootstrap-admin".into(),
+                source: crate::identity::Source::Env,
+            }),
+        )
+        .unwrap();
+        let now = Utc::now();
+        let file = |kind: &'static str, md: Value| {
+            let admin = &admin;
+            async move {
+                let made = admin
+                    .send(
+                        Method::POST,
+                        "/api/jobs",
+                        Some(json!({
+                            "kind": kind, "title": "A relaunch inherits the edge",
+                            "subject": {"subject_kind": "custom", "id": BRANCH},
+                            "owner_id": "emp-bootstrap-admin", "priority": "standard",
+                            "status": "open", "tags": [], "metadata": md,
+                        })),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                made["id"].as_str().unwrap().to_string()
+            }
+        };
+        let car = file("ship-a-change", json!({"branch": BRANCH})).await;
+        let read = |id: String| {
+            let admin = &admin;
+            async move { crate::car_retire::read_via(admin, &id).await.unwrap() }
+        };
+        let step = |job: &Value, slug: &str| {
+            find_step(job, slug, "").unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let scope = step(&read(car.clone()).await, "scope");
+        admin
+            .send(
+                Method::PATCH,
+                &format!("/api/jobs/{car}/steps/{scope}/metadata"),
+                Some(json!({"summary": "s", "excludes": "e"})),
+            )
+            .await
+            .unwrap();
+        admin
+            .send(
+                Method::PUT,
+                &format!("/api/jobs/{car}/steps/{scope}"),
+                Some(json!({"status": "completed"})),
+            )
+            .await
+            .unwrap();
+        // The car's brake, on its review step: a takeover must not move it.
+        let review = step(&read(car.clone()).await, "review");
+        let brake = json!({"hold": "waits for an adversarial review"});
+        admin
+            .send(
+                Method::PATCH,
+                &format!("/api/jobs/{car}/steps/{review}/metadata"),
+                Some(brake.clone()),
+            )
+            .await
+            .unwrap();
+
+        // L holds the gate; L is lost and its hand-back leaves it READY.
+        let lost = file("backlog-item", json!({})).await;
+        let moved = crate::car::into_gate(&admin, BRANCH, &lost, HEAD, "t", None, None, now)
+            .await
+            .unwrap();
+        assert_eq!(moved.as_deref(), Some(car.as_str()));
+        for w in boss_jobs::car::gate_return(&read(car.clone()).await, &lost, "lost") {
+            let method = if w.method == "PUT" {
+                Method::PUT
+            } else {
+                Method::PATCH
+            };
+            admin
+                .send_expecting(method, &w.path, Some(w.body), &w.expect)
+                .await
+                .unwrap();
+        }
+        let handed = read(car.clone()).await;
+        assert_eq!(find_step(&handed, "gate", "").unwrap()["status"], "ready");
+
+        // THE RELAUNCH, as the conductor runs it once R is filed.
+        let relaunch = file("backlog-item", json!({})).await;
+        let cars = vec![handed];
+        let said = c
+            .relaunch_holds_the_gate(&cars, BRANCH, &lost, &relaunch, HEAD, now)
+            .await;
+        assert!(said.contains("took over car"), "{said}");
+        assert!(said.ends_with("and carries its edge"), "{said}");
+        let after = read(car.clone()).await;
+        let gate = find_step(&after, "gate", "").unwrap();
+        assert_eq!(
+            gate["status"], "ready",
+            "the step keeps the status the loss left it in: {said}"
+        );
+        assert_eq!(
+            gate["metadata"][boss_jobs::car::GATE_RUN],
+            relaunch.as_str()
+        );
+        assert_eq!(
+            gate["metadata"][boss_jobs::car::LOST_GATE_RUN],
+            lost.as_str()
+        );
+        assert_eq!(gate["metadata"]["gated_head"], HEAD);
+        let r = read(relaunch.clone()).await;
+        let edge = boss_jobs::fulfils::of(&r["metadata"])
+            .unwrap()
+            .expect("the relaunch carries the edge");
+        assert_eq!(
+            (edge.job.as_str(), edge.step.as_str()),
+            (car.as_str(), gate["id"].as_str().unwrap())
+        );
+        assert!(
+            boss_jobs::fulfils::of(&read(lost.clone()).await["metadata"])
+                .unwrap()
+                .is_none_or(|e| e.job == car),
+            "nothing was copied onto or off the lost run"
+        );
+        let Ok(boss_jobs::car::EdgeGreen::Finish(expect)) =
+            boss_jobs::car::edge_green(&after, &edge, BRANCH, &relaunch, Some(&lost), HEAD)
+        else {
+            panic!("the relaunch's green finishes by its edge: {after:#}");
+        };
+        assert_eq!(
+            find_step(&after, "review", "").unwrap()["metadata"]["hold"],
+            brake["hold"],
+            "the car's hold is untouched"
+        );
+
+        // Relaunching L again takes nothing: R holds the step now.
+        let again = c
+            .relaunch_holds_the_gate(
+                std::slice::from_ref(&after),
+                BRANCH,
+                &lost,
+                "another",
+                HEAD,
+                now,
+            )
+            .await;
+        assert_eq!(again, "", "{again}");
+
+        // R's GREEN, BY EDGE, as the auto-park handler writes it: the
+        // judged gate pair lands on the READY step and the car stands at
+        // review — no scan, no refresh, no second car.
+        let gate_write = boss_jobs::car::StepWrite {
+            step_id: gate["id"].as_str().unwrap().to_string(),
+            title: boss_jobs::car::GATE,
+            metadata: json!({"gates": "auto", "verified": "green"}),
+            status_body: json!({"status": "completed"}),
+        };
+        for w in boss_jobs::car::green_gate_writes(&car, &gate_write, &expect, &relaunch) {
+            let method = if w.method == "PUT" {
+                Method::PUT
+            } else {
+                Method::PATCH
+            };
+            admin
+                .send_expecting(method, &w.path, Some(w.body), &w.expect)
+                .await
+                .unwrap();
+        }
+        let finished = read(car.clone()).await;
+        assert_eq!(
+            find_step(&finished, "gate", "").unwrap()["status"],
+            "completed"
+        );
+        assert_eq!(
+            find_step(&finished, "review", "").unwrap()["status"],
+            "ready"
+        );
     }
 
     /// `reconcile` has no test of its own, so the line that reaches the

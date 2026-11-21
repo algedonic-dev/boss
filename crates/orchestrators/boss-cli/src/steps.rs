@@ -3652,14 +3652,16 @@ mod tests {
     }
 
     fn source_review_run(id: &str) -> Value {
-        json!({"id":id,"kind":"agent-run","status":"open","metadata":{},"steps":[{
+        json!({"id":id,"kind":"agent-run","status":"open","metadata":{"agent":"agent-reviewer"},"steps":[{
             "id":uuid::Uuid::new_v4(),"job_id":id,"spec_slug":"building",
             "title":"Building","status":"active","metadata":{}
         }]})
     }
 
     async fn stub(packets: Vec<Value>) -> Stub {
-        stub_with_protocol(packets, json!({"kind":"ship-a-change","version":7,"status":"active","steps":[{"title":"review"}]})).await
+        // An agents registry that maps no alias: a car's builder is told
+        // from its reviewer by spelling alone (backlog 8e97a4ec).
+        stub_with_protocol(packets, json!({"kind":"ship-a-change","version":7,"status":"active","steps":[{"title":"review"}],"release_actor_rows":[]})).await
     }
 
     async fn stub_with_protocol(packets: Vec<Value>, protocol: Value) -> Stub {
@@ -3860,9 +3862,21 @@ mod tests {
                 .find(|p| p["id"] == ask.review.trim())
                 .cloned()
                 .unwrap_or_else(|| json!({"id": ask.review.trim(), "kind": "missing"}));
-            struct Reader(Value, Vec<boss_jobs::first_record::FirstRecord>);
+            struct Reader(Value, Vec<boss_jobs::first_record::FirstRecord>, Vec<Value>);
             #[async_trait::async_trait]
             impl boss_jobs::car_release::ExecutorRecordReader for Reader {
+                // The registry this stub serves at `GET /api/agents`,
+                // and the packets it holds (backlog 8e97a4ec).
+                async fn release_actor_rows(&self) -> Result<Vec<Value>> {
+                    self.0
+                        .get("release_actor_rows")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .context("agents registry unavailable")
+                }
+                async fn job_packet(&self, id: &str) -> Result<Option<Value>> {
+                    Ok(self.2.iter().find(|p| p["id"] == id).cloned())
+                }
                 async fn protocol_version(&self, _: &str, _: i64) -> Result<Option<Value>> {
                     Ok(Some(self.0.clone()))
                 }
@@ -3886,6 +3900,7 @@ mod tests {
             let reader = Reader(
                 protocol.definition.clone(),
                 protocol.originals.lock().unwrap().clone(),
+                store.lock().unwrap().clone(),
             );
             let judged = boss_jobs::car_release::judge(
                 &reader,
@@ -4907,7 +4922,8 @@ mod tests {
         );
         held["metadata"]["agent_run"] = json!(BUILDER);
         let reviewer = source_review_run(RUN);
-        let builder = json!({"id": BUILDER, "kind": "agent-run", "status": "open", "metadata": {}});
+        let builder = json!({"id": BUILDER, "kind": "agent-run", "status": "open",
+                             "metadata": {"agent": "agent-builder"}});
         let s = stub(vec![held, reviewer, builder]).await;
         let wire = Wire::at(s.base.clone(), named()).unwrap();
         let forge = |head: &str| {
@@ -5011,6 +5027,7 @@ mod tests {
             json!({ "hold": "area policy", boss_jobs::car::HOLD_SHA: source.head }),
         );
         held["metadata"]["agent_run"] = json!(BUILDER);
+        held["metadata"]["built_by"] = json!("builder@login.example");
         let reviewer = source_review_run(RUN);
         let s = stub(vec![held, reviewer]).await;
         let wire = Wire::at(s.base.clone(), named()).unwrap();

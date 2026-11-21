@@ -19,6 +19,7 @@
   // and the one control left asks the verb again — which answers
   // exit 5 (equal) if nothing moved, or the newer answer if it did.
   import WriteGate from '@boss/web-kit/ui/WriteGate.svelte';
+  import { executionLine, executionTone } from '../ops-execution';
   import {
     approveAuthority,
     approveBody,
@@ -100,12 +101,14 @@
         <small>filed {when(latest.opened_at)}{latest.requested_from ? ` from ${latest.requested_from}` : ''}</small>
         {#if latest.status === 'open'}
           <span class="ap-pending">in flight — the runner on {PUBLISH_HOST} polls about once a minute</span>
-        {:else if latest.disposition === 'answered'}
-          <span class={latest.exit_code === '0' ? 'ok' : 'warn'}>
-            answered · exit {latest.exit_code ?? '?'}{latest.runner_host ? ` on ${latest.runner_host}` : ''}
+        {:else if latest.execution}
+          <!-- The classifier's words (design b7bb1625, backlog 50a1578f):
+               a nonzero exit says failed, never "answered · exit 1", and
+               a refusal names the reason it recorded — this said
+               "outside the allowlist" for every refusal. -->
+          <span class={executionTone(latest.execution) === 'ok' ? 'ok' : 'warn'}>
+            {executionLine(latest.execution)}{latest.runner_host ? ` on ${latest.runner_host}` : ''}
           </span>
-        {:else if latest.disposition === 'refused'}
-          <span class="warn">refused by the runner — outside the allowlist</span>
         {:else}
           <span class="warn">closed without an answer on its execute step</span>
         {/if}

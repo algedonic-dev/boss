@@ -367,7 +367,6 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
         axum::middleware::from_fn_with_state(shared.clone(), record_step_write_refusals::<R, B>);
     Router::new()
         .route("/api/claims", get(claims_console::read::<R, B>))
-        .route("/api/claims/cuts", get(claims_console::cuts::<R, B>))
         .route("/api/claims/waiting", get(claims_console::waiting::<R, B>))
         .route(
             "/api/claims/{acquisition}/return",
@@ -436,10 +435,6 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
         // read, so a stalled rule no longer paints like an idle one
         // (backlog 43c4451a).
         .route("/api/yard/rule-firings", get(yard_rule_firings::<R, B>))
-        .route(
-            "/api/yard/rule-firings/{rule}/dead-letters",
-            get(rule_firings::retained_dead_letters::<R, B>),
-        )
         // THE MOVES RECORD (design e765b3fc §3, car M1): every packet
         // whose place on the map changed and the event that moved it,
         // as a page after a seq and as a stream that resumes from one.

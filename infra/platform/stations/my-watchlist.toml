@@ -22,13 +22,25 @@
 # LIVE newest, v3): the station stands in the tree — its stable `id`, its
 # `parent` /algedonic/executive (proposal section 6), its mode. Nothing
 # else changed.
+#
+# Version 6 (car 1 of design 2910ec3d, backlog 878fd1e7; bumped from the
+# LIVE newest, v5): the executive desk dissolved into the company, so
+# this queue stands at the root, `algedonic`, until the person's own
+# station `/me` exists to take it (design 01fa5bdf, backlog 5cb56bb3).
+# It is no department: it declares no `line` and draws the company's.
+# Only `parent` changed; the `id` and the `@me` predicate are the same.
+#
+# Version 7 (design 01fa5bdf step 3, backlog 5cb56bb3; bumped from the
+# LIVE newest, v6): the person's own station `me` exists (me.toml), so
+# this queue stands in it, at /algedonic/me/my-watchlist. Only `parent`
+# changed; it still declares no `line` and draws the company's.
 # ---------------------------------------------------------------------------
 
 [[station]]
 name = "my-watchlist"
-version = 5
+version = 7
 id = "4feca45a-de46-4649-8569-f5a7262b8017"
-parent = "5f922a2a-31f5-4f07-acf1-41dc140687a4"
+parent = "bbfea3e2-d865-42c1-858b-85d45d29f350"
 mode = "standing"
 status = "active"
 title = "My watchlist — packets I filed"

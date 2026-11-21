@@ -2802,23 +2802,7 @@ async fn car_into_gate(
 /// without the edge is exactly a gate-run launched before this car, and
 /// its verdict still finds the car by the scan (the cutover path).
 async fn gate_run_fulfils(door: &crate::steps::Wire, car: &str, packet: &str) {
-    use crate::car_retire::Door as _;
-    let written = async {
-        let read = crate::car_retire::read_via(door, car).await?;
-        let read = read.get("data").cloned().unwrap_or(read);
-        let Some(edge) = boss_jobs::car::gate_edge(&read, packet) else {
-            return Ok::<_, anyhow::Error>(false);
-        };
-        door.send(
-            reqwest::Method::PATCH,
-            &format!("/api/jobs/{packet}/metadata"),
-            Some(edge.patch()),
-        )
-        .await?;
-        Ok(true)
-    }
-    .await;
-    match written {
+    match crate::car::fulfils_from_read_back(door, car, packet).await {
         Ok(true) => println!(
             "boss gate: gate-run {} fulfils car {}'s gate step — its verdict completes or hands \
              back that step",

@@ -21,6 +21,8 @@
   import { manifest, moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
   import { departmentRoster } from '@boss/web-kit/session/departments.svelte';
   import { href } from '../../router';
+  import { treeHref } from '../tree/station-tree';
+  import { safeLinkHref } from '@boss/web-kit/links';
   import type { Remote } from '../../data/remote';
   import {
     listSubjectKinds,
@@ -225,7 +227,7 @@
                 >{departmentCount === null
                   ? 'department count unknown — the departments registry has not answered'
                   : `${departmentCount} department${departmentCount === 1 ? '' : 's'} in the departments registry`}
-                · <a href={href('/it/tree')}>Station tree</a></span
+                · <a href={safeLinkHref(href(treeHref(null)))}>Station tree</a></span
               >
             {/if}
           </div>

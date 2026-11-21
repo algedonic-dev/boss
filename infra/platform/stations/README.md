@@ -57,12 +57,19 @@ is stamped by the seed's clock when the row is written.
 
 **`line`** names the Design token a station's card rail draws
 (`line = "it"` draws `--map-line-it` in `apps/web/src/styles.css`). The
-root and each station directly under it declare one; every station
-below draws the nearest line up its parents, so a child declares none.
+root and each department — a station directly under it — declare one;
+every station below draws the nearest line up its parents, so a child
+declares none. A station the company hosts at the root itself is no
+department and declares none either: `me`, the person's own station
+(design 01fa5bdf step 3, backlog 5cb56bb3), one row for every person
+because the session decides whose it is. Its children `my-watchlist`
+and `q.platform-admin.task` stood at the root between the executive
+desk dissolving (design 2910ec3d car 1, backlog 878fd1e7) and `me`
+existing to take them.
 `every_top_level_station_names_a_line_the_stylesheet_declares`
-(`crates/core/boss-jobs/tests/station_tree.rs`) refuses a top-level row
-with no line, or one naming a token the stylesheet does not declare
-(design c4854fd4, backlog 85cb2103).
+(`crates/core/boss-jobs/tests/station_tree.rs`) names that station and
+refuses any other top-level row with no line, or one naming a token the
+stylesheet does not declare (design c4854fd4, backlog 85cb2103).
 
 **`placement`** is where a station stands on its PARENT's floor:
 `placement = { x = 590, y = 120, w = 230, h = 170 }`, a box in floor

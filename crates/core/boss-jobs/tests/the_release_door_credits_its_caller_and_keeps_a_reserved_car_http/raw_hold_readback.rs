@@ -122,7 +122,7 @@ impl WorkflowRegistry for ReholdRegistry {
 async fn malformed_review_gate_envelope_cannot_hide_a_post_release_rehold_from_readback() {
     let armed = Arc::new(std::sync::Mutex::new(None));
     let (app, jobs) = app_with_readback_rehold(
-        None,
+        Some(super::no_aliases()),
         Arc::new(std::sync::Mutex::new(None)),
         None,
         Some(armed.clone()),

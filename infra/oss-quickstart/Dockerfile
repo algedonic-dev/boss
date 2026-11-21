@@ -140,6 +140,9 @@ COPY infra/step-plugins ./infra/step-plugins
 # declares its route in (design e765b3fc car R2) — so the routes it
 # serves need no file at run time.
 COPY infra/platform/yard/handoffs.toml ./infra/platform/yard/handoffs.toml
+# boss-jobs `include_str!`s the superseded areas admission refuses new
+# backlog items about (backlog f4b0ad41 rule 1).
+COPY infra/platform/superseded-areas.toml ./infra/platform/superseded-areas.toml
 # boss-jobs `include_str!`s the department wire's precedence row — the
 # order a department's region states roll to its factory tile's one
 # wire (conductor_decision_20261104_2022Z on backlog 809872c9).

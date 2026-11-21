@@ -8,15 +8,19 @@
 # design-doc bdc60b65, question probe-user). A recorded probe is shell
 # text a car's builder wrote. Until this file it ran here as `david`
 # (BOSS_PROBE_USER's default in boss-cli prove.rs), in david's own
-# checkout. Review 9a1e289b measured what that is one step from: david
-# reaches root on this host by a passwordless `sudo docker` the tree
-# relies on (cluster-watchdog and disk-floor-sweep run User=david and
-# call it) and by owning the checkout root's converge executes from
-# (forge-converge.service runs /home/david/boss/infra/forge/
+# checkout. Review 9a1e289b measured what that was one step from: david
+# reached root on this host by a passwordless `sudo docker` the tree
+# then relied on (cluster-watchdog and disk-floor-sweep ran User=david
+# and called it) and by owning the checkout root's converge executed
+# from (forge-converge.service ran /home/david/boss/infra/forge/
 # forge-converge.sh as root). Root here holds the admin kubeconfig and
 # the forge's tokens. So probe text, hostile or merely wrong, was one
 # step from the estate, and a root-only token file isolated nothing from
-# the one account that runs text nobody on this host wrote.
+# the one account that runs text nobody on this host wrote. Root runs
+# its own tree now, /var/lib/boss/tree/current (infra/forge/
+# root-tree.sh; backlog a604a35b, 683d7fe9), and no unattended unit
+# uses that sudo; David's own interactive sudo stays (position B on
+# a604a35b, 2026-10-07).
 #
 # WHAT THE ACCOUNT IS. `boss-probe`: a system account with a group of its
 # own and no other, no password (locked), /usr/sbin/nologin for a shell,
@@ -114,12 +118,15 @@
 # there are root's own.
 #
 # WHAT IT DOES NOT DO, and the controls say so rather than hide it:
-#   * It does not take david's `sudo docker` away, nor move root's
-#     converge out of david's checkout. Those are the two roads FROM
-#     david; this closes the road TO david from probe text. (The second
-#     is infra/forge/root-tree.sh's, backlog a604a35b: root's converge,
-#     its other units and the watchdog run from a tree root fetched; the
-#     ops runner's verbs and the cluster converge do not yet.)
+#   * It does not take david's `sudo docker` away: David's own
+#     interactive sudo stays (position B on backlog a604a35b,
+#     2026-10-07), and no unattended unit uses it. That is a road FROM
+#     david; this closes the road TO david from probe text. The other
+#     road from david, root executing his checkout, is closed, and not
+#     by this file: root's converge, the ops runner and every verb, the
+#     watchdog, the cluster converge and the other units run from a tree
+#     root fetched itself (infra/forge/root-tree.sh; backlog a604a35b,
+#     and 683d7fe9 for the cluster converge and the disk sweep).
 #   * Leftovers are reaped per runner TICK, not per probe. Two probes in
 #     one tick share the account. Per-probe needs the door itself
 #     (prove.rs) to run each probe in a scope of its own.

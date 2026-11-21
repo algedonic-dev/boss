@@ -47,7 +47,9 @@ describe('no station row names a route the router does not serve', () => {
     expect(unservedRoutes(shipped)).toEqual(['/system/yard']);
     expect(unservedRoutes('href = "/system/feedback"')).toEqual(['/system/feedback']);
     // A served page passes; a comment is prose, not a link.
-    expect(unservedRoutes('href = "/it/tree/engineering"')).toEqual([]);
+    expect(unservedRoutes('href = "/tree/engineering"')).toEqual([]);
+    // The tree's /it spelling retired with backlog 92bfcb04.
+    expect(unservedRoutes('href = "/it/tree/engineering"')).toEqual(['/it/tree/engineering']);
     expect(unservedRoutes('# the old pointer read "/system/yard"')).toEqual([]);
   });
 

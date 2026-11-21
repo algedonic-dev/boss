@@ -56,11 +56,11 @@ async function mocks(page: Page): Promise<void> {
 
 test('the toggle opens a station\'s resources: units where the claims hold them, seats in their station, pressure in words', async ({ page }) => {
   await mocks(page);
-  await page.goto('/it/tree/engineering');
+  await page.goto('/tree/engineering');
   const toggle = page.locator('[data-station-page="engineering"] [data-view-toggle] a[data-view="resources"]');
-  await expect(toggle).toHaveAttribute('href', '/it/tree/engineering/resources');
+  await expect(toggle).toHaveAttribute('href', '/tree/engineering/resources');
   await toggle.click();
-  await expect(page).toHaveURL(/\/it\/tree\/engineering\/resources$/);
+  await expect(page).toHaveURL(/\/tree\/engineering\/resources$/);
 
   const root = page.locator('[data-resources="engineering"]');
   await expect(root.locator('h1')).toHaveText('engineering');
@@ -91,14 +91,14 @@ test('the toggle opens a station\'s resources: units where the claims hold them,
 
   // And back: Work is the station page.
   await root.locator('[data-view-toggle] a[data-view="work"]').click();
-  await expect(page).toHaveURL(/\/it\/tree\/engineering$/);
+  await expect(page).toHaveURL(/\/tree\/engineering$/);
   await expect(page.locator('[data-station-page="engineering"]')).toBeVisible();
 });
 
 test('a failed claims read draws no unit and says why', async ({ page }) => {
   await mocks(page);
   await page.route(CLAIMS, (r) => r.fulfill({ status: 503, body: 'claims history unavailable' }));
-  await page.goto('/it/tree/engineering/resources');
+  await page.goto('/tree/engineering/resources');
   await expect(page.locator('[data-resources-failed="claims"]')).toContainText('where each unit is held is unknown');
   await expect(page.locator('[data-unit]')).toHaveCount(0);
 });

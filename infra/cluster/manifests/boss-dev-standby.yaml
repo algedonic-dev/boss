@@ -48,14 +48,9 @@
 # read-only ServiceAccount for this pod.
 #
 # WHAT THIS CAR DOES NOT DO YET (the later cars of design 0491591b):
-#   - The Service below is a LoadBalancer the pool assigns an address to.
-#     The address is measured once it is assigned, then pinned, and is
-#     declared as the door `dev-standby-ssh` in infra/estate/doors.toml so
-#     the forge's observer probes it. Pinning an address nobody has read
-#     from the pool would be a guess.
 #   - The public hostname standby.algedonic.dev (Q2), its tunnel origin,
 #     its Cloudflare Access SSH application and that application's CA
-#     Secret, and the login menu option on the dev pod.
+#     Secret. (The LAN door is pinned and watched: the Service below.)
 #   - The `boss` CLI. boss-api, kubectl and git are here. The CLI comes
 #     from the converged image, which this pod does not install yet.
 #   - allocateLoadBalancerNodePorts: false on the Service. Like the dev
@@ -340,15 +335,27 @@ spec:
         - name: machine-token
           secret: {secretName: boss-machine-token, optional: true, defaultMode: 0440}
 ---
-# The standby's ssh door on the LAN. The pool assigns the address. A later
-# car of design 0491591b reads that address, pins it here and declares it
-# in infra/estate/doors.toml as `dev-standby-ssh`. Until then, read the
-# address with `kubectl get svc -n boss-dev boss-dev-standby-ssh`.
+# The standby's ssh door on the LAN, at a PINNED address. Cilium LB-IPAM
+# allocated it with nothing pinned (cilium.io/IPAMRequestSatisfied), and it
+# was read, not guessed, through the forge's read-only ops verb (`boss ops
+# forge read-service-address boss-dev boss-dev-standby-ssh --wait`,
+# ops-request 29dd7af1, 2026-11-21: ingress 10.20.0.37:22). The pin keeps
+# that address across a re-created Service, because infra/estate/doors.toml
+# declares it as the door `dev-standby-ssh`, which the forge's observer
+# probes, and the dev login menu reads it from there.
+# the_door_is_watched_from_outside_the_pod.rs holds the two equal.
+#
+# The annotation is Cilium's, as boss.yaml pins the gateway, because Cilium
+# is the allocator that serves this address. boss-dev-ssh pins 10.20.0.35
+# with MetalLB's annotation and spec.loadBalancerIP; which annotation the
+# estate settles on is a separate question, not this pin's.
 apiVersion: v1
 kind: Service
 metadata:
   name: boss-dev-standby-ssh
   namespace: boss-dev
+  annotations:
+    io.cilium/lb-ipam-ips: "10.20.0.37"
 spec:
   type: LoadBalancer
   selector:

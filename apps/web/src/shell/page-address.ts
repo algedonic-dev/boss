@@ -25,7 +25,7 @@
 // path this module exists to retire.
 
 import type { StationTree } from '../it/tree/station-tree';
-import type { NavItem } from './nav-catalog';
+import { STATION, type NavItem } from './nav-catalog';
 
 /** One station of the tree as a page address needs it. */
 export type StationAt = Readonly<{
@@ -89,6 +89,20 @@ export function pagePath(entry: NavItem, at: StationAddresses): string | null {
   const prefix = stationPrefix(at, entry.host);
   if (prefix === null) return null;
   return entry.slug === '' ? prefix || '/' : `${prefix}/${entry.slug}`;
+}
+
+/** Where a page the company ROOT hosts is, found without the tree: its
+ *  slug alone (/alarms, /tree), because the root's own segment is dropped
+ *  from every address (`addressesOf`) and the root has no parent to move
+ *  under. The pure link builders need it — the alarms board's selections
+ *  (regions.ts) and the station tree's floor and pages (station-tree.ts,
+ *  backlog 92bfcb04) are built where no tree is in hand. Null for an
+ *  entry hosted anywhere else: only the tree can place that, and a guess
+ *  is the hand-typed prefix this module retires. page-address.test.ts
+ *  holds every root-hosted entry to `pagePath` under a read tree. */
+export function rootPagePath(entry: NavItem): string | null {
+  if (entry.host !== STATION.algedonic) return null;
+  return entry.slug === '' ? '/' : `/${entry.slug}`;
 }
 
 /** A pattern with its `:name` segments filled, each value encoded as

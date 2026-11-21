@@ -679,8 +679,11 @@ fn the_registry_read_presents_the_machine_token_and_is_never_stopped_by_it() {
     }
 }
 
-/// Under the unit's `RuntimeDirectory=` the reader's file is made there
-/// and nowhere else, and is gone by the time the request is sent.
+/// Under a `RuntimeDirectory=` the reader's file is made there and
+/// nowhere else, and is gone by the time the request is sent. The forge
+/// unit that declared one, infra/boss-forge-token-audit.service, was in
+/// no role and installed nowhere, and was deleted with its timer
+/// (backlog c440ab8d); the audit runs through the broker (9723009a).
 #[test]
 fn under_a_runtime_directory_the_reader_leaves_nothing_in_tmp() {
     let fixture = format!("{MACHINE_TOKEN}\n");
@@ -693,13 +696,6 @@ fn under_a_runtime_directory_the_reader_leaves_nothing_in_tmp() {
         "{req}"
     );
     assert!(left.is_empty(), "{left:?}");
-    let unit =
-        std::fs::read_to_string(repo_root().join("infra/boss-forge-token-audit.service")).unwrap();
-    assert!(
-        unit.lines()
-            .any(|l| l.trim() == "RuntimeDirectory=boss-forge-token-audit"),
-        "the unit declares the runtime directory a killed reader's file would be removed with"
-    );
 }
 
 /// A REDIRECT IS NOT FOLLOWED. urllib follows a 3xx by default and sends

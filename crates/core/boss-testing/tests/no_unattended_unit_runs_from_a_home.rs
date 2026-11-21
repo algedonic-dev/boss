@@ -82,45 +82,58 @@ const RUNS_AS_AN_ACCOUNT: &[(&str, &str, &str)] = &[
     ),
     // The forge's cluster-deploy-runner and disk-floor-sweep left this
     // roster with backlog 683d7fe9's second car: root, from root's tree.
+    //
+    // The four below are NOT what boss-gcp runs (backlog c440ab8d,
+    // 2026-11-21). Its stage of design c98c79aa is built (db018094): with
+    // root's tree accepted, infra/gcp/install-units.sh installs each
+    // stem's INSTALLED_FROM_ROOTS_TREE twin in the file's place, as root
+    // from /var/lib/boss/gcp-tree/current. The file stays because the
+    // installer finds a stem by its .service beside its .timer (unit_dir)
+    // and installs the timer from here, and its fixture roots, which hold
+    // no accepted generation, install this copy as it stands.
     (
         "infra/boss-codebase-metrics.service",
         "david",
-        "boss-gcp daily, from /opt/boss: the boss-gcp stage of design c98c79aa, after the forge's (follow-up of backlog a604a35b)",
+        "the fixture copy and the timer's pair: boss-gcp installs infra/gcp/root-tree-units/boss-codebase-metrics.service.in in its place, as root from root's tree",
     ),
     (
         "infra/boss-protocol-drift.service",
         "david",
-        "boss-gcp daily, from /opt/boss: the boss-gcp stage of design c98c79aa (follow-up of backlog a604a35b)",
+        "the fixture copy and the timer's pair: boss-gcp installs infra/gcp/root-tree-units/boss-protocol-drift.service.in in its place, as root from root's tree",
     ),
     (
         "infra/boss-surface-usage.service",
         "david",
-        "boss-gcp daily, from /opt/boss: the boss-gcp stage of design c98c79aa (follow-up of backlog a604a35b)",
-    ),
-    (
-        "infra/boss-views-catchup.service",
-        "david",
-        "boss-gcp, from /opt/boss: the boss-gcp stage of design c98c79aa (follow-up of backlog a604a35b)",
-    ),
-    (
-        "infra/boss-search-reindex.service",
-        "david",
-        "boss-gcp, from /opt/boss: the boss-gcp stage of design c98c79aa (follow-up of backlog a604a35b)",
-    ),
-    (
-        "infra/boss-forge-token-audit.service",
-        "david",
-        "in no role of infra/estate/roles.toml and installed nowhere (measured 2026-10-07): retire it or move it with boss-gcp's",
-    ),
-    (
-        "infra/train/boss-train.service",
-        "david",
-        "the host conductor unit, from before the conductor ran in the cluster: retire it or move it with boss-gcp (follow-up of backlog a604a35b)",
+        "the fixture copy and the timer's pair: boss-gcp installs infra/gcp/root-tree-units/boss-surface-usage.service.in in its place, as root from root's tree",
     ),
     (
         "infra/ml/boss-ml-inference-batch.service",
         "boss",
-        "boss-gcp's ML batch, a service account and not a person; listed so the account is a decision and not an accident",
+        "the fixture copy and the timer's pair: boss-gcp installs infra/gcp/root-tree-units/boss-ml-inference-batch.service.in in its place, as root from root's tree",
+    ),
+];
+
+/// Rostered unit files a host no longer installs as they stand, and the
+/// root-tree unit boss-gcp installs in each one's place (backlog
+/// c440ab8d). Every prepared unit in infra/gcp/root-tree-units/ is a row,
+/// and every row's twin runs as root from root's tree — so a row's why
+/// above cannot say "root runs its own tree" about a twin that does not.
+const INSTALLED_FROM_ROOTS_TREE: &[(&str, &str)] = &[
+    (
+        "infra/boss-codebase-metrics.service",
+        "infra/gcp/root-tree-units/boss-codebase-metrics.service.in",
+    ),
+    (
+        "infra/boss-protocol-drift.service",
+        "infra/gcp/root-tree-units/boss-protocol-drift.service.in",
+    ),
+    (
+        "infra/boss-surface-usage.service",
+        "infra/gcp/root-tree-units/boss-surface-usage.service.in",
+    ),
+    (
+        "infra/ml/boss-ml-inference-batch.service",
+        "infra/gcp/root-tree-units/boss-ml-inference-batch.service.in",
     ),
 ];
 
@@ -378,6 +391,72 @@ fn no_unit_runs_as_an_account_but_the_roster() {
     for (unit, why) in EXECUTES_FROM_A_HOME {
         assert!(why.len() > 40, "{unit}: a roster row says why");
     }
+}
+
+/// WHAT boss-gcp INSTALLS IN A ROSTERED FILE'S PLACE (backlog c440ab8d).
+/// The rows above said "the boss-gcp stage of design c98c79aa" for five
+/// weeks after that stage was built, because the walk read no `.in` and
+/// so never saw the units the host actually installs. Each twin is held
+/// here to what the rows now say: root, root's tree, no home.
+#[test]
+fn a_rostered_unit_boss_gcp_replaces_runs_as_root_from_roots_tree() {
+    let root = repo_root();
+    let read =
+        |p: &str| std::fs::read_to_string(root.join(p)).unwrap_or_else(|e| panic!("{p}: {e}"));
+    let mut prepared: Vec<String> = std::fs::read_dir(root.join("infra/gcp/root-tree-units"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| {
+            format!(
+                "infra/gcp/root-tree-units/{}",
+                e.file_name().to_string_lossy()
+            )
+        })
+        .filter(|p| p.ends_with(".service.in"))
+        .collect();
+    prepared.sort();
+    let mut twins: Vec<String> = INSTALLED_FROM_ROOTS_TREE
+        .iter()
+        .map(|(_, t)| t.to_string())
+        .collect();
+    twins.sort();
+    assert_eq!(
+        twins, prepared,
+        "every prepared root-tree unit is a row of INSTALLED_FROM_ROOTS_TREE, and every row's twin exists"
+    );
+    for (file, twin) in INSTALLED_FROM_ROOTS_TREE {
+        let stem = |p: &str| {
+            p.rsplit('/')
+                .next()
+                .unwrap()
+                .trim_end_matches(".in")
+                .to_string()
+        };
+        assert_eq!(stem(file), stem(twin), "{file} and {twin} are one stem");
+        assert!(
+            RUNS_AS_AN_ACCOUNT.iter().any(|(u, _, _)| u == file),
+            "{file}: a twin is recorded only for a rostered file — if it runs as root now, delete both rows"
+        );
+        let text = read(twin);
+        assert_eq!(user(&text), "root", "{twin} runs as root");
+        assert!(
+            home_reaches(&text).is_empty(),
+            "{twin} reaches a home: {:?}",
+            home_reaches(&text)
+        );
+        assert!(
+            logical_lines(&text)
+                .iter()
+                .filter_map(|l| directive(l))
+                .any(|(k, v)| k == "WorkingDirectory" && v == "/var/lib/boss/gcp-tree/current"),
+            "{twin} works in root's tree, /var/lib/boss/gcp-tree/current"
+        );
+    }
+    // And the installer is what puts the twin in the file's place.
+    assert!(
+        read("infra/gcp/install-units.sh").contains("$REPO_ROOT/infra/gcp/root-tree-units/"),
+        "install-units.sh no longer installs from infra/gcp/root-tree-units — re-derive INSTALLED_FROM_ROOTS_TREE"
+    );
 }
 
 #[test]

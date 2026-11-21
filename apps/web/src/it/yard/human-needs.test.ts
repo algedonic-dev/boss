@@ -43,14 +43,16 @@ describe('NEEDS YOU — canonical human-required IT jobs', () => {
     expect(result.count).toEqual({ kind: 'value', text: '2', troubled: false });
     expect(result.lines.map((line) => [line.id, line.href])).toEqual([
       ['rv', HELD_CARS_HREF],
-      ['s1', `/ux/jobs/j2/steps/s1?${new URLSearchParams({ from: '/it', from_label: 'Department Map' })}`],
+      ['s1', `/ux/jobs/j2/steps/s1?${new URLSearchParams({ from: '/alarms', from_label: 'Alarms' })}`],
     ]);
     // The lane lives only in the dock's panel, which `?at=dock` opens.
-    expect(HELD_CARS_HREF).toBe('/it?at=dock#held-cars');
+    // At the alarms board's own address since backlog 92bfcb04: /it was
+    // IT's, and IT retires as a department (design df0ecd8b).
+    expect(HELD_CARS_HREF).toBe('/alarms?at=dock#held-cars');
     expect(() => page([job({ steps: [step({ act: 7 })] })])).toThrow(/missing text/);
   });
   it('one href rule for both boards: release to the held-car row, else the step page', () => {
-    expect(needHref({ id: 'c' }, { id: 'rv', act: 'release' }, '?from=x')).toBe('/it?at=dock#held-cars');
+    expect(needHref({ id: 'c' }, { id: 'rv', act: 'release' }, '?from=x')).toBe('/alarms?at=dock#held-cars');
     expect(needHref({ id: 'j 1' }, { id: 's/1' })).toBe('/ux/jobs/j%201/steps/s%2F1');
     expect(needHref({ id: 'j' }, { id: 's' }, '?from=x')).toBe('/ux/jobs/j/steps/s?from=x');
   });

@@ -13,6 +13,7 @@ import {
   fillPath,
   matchPath,
   pagePath,
+  rootPagePath,
   stationAtPath,
   type StationAddresses,
 } from './page-address';
@@ -56,6 +57,8 @@ const SCHEME: Readonly<Record<string, string>> = {
   'vendor-invoice': '/finance/vendor-invoices/:vendorInvoiceId',
   manual: '/engineering/manual',
   'system-yard': '/alarms',
+  // The station tree floor, the root's since backlog 92bfcb04 (/it/tree).
+  'system-tree': '/tree',
   'system-monitoring': '/operations/audit',
   'system-performance': '/operations/perf',
   workflows: '/engineering/registry',
@@ -242,6 +245,17 @@ describe('a path only the tree can place says so until the tree answers', () => 
     });
     expect(parseRoute('/engineering', '', down)).toEqual({ kind: 'department', code: 'engineering' });
     expect(parseRoute('/engineering/gates', '', down).kind).toBe('notFound');
+    // A root page's address is one bare segment too, and the catalog, not
+    // the registry, names it (backlog 92bfcb04): with the tree unread it
+    // is the page nothing could place, saying why — never "Tree is not a
+    // department on this instance".
+    for (const path of ['/tree', '/alarms', '/watchlist']) {
+      expect(parseRoute(path, '', down)).toEqual({
+        kind: 'notFound',
+        path,
+        why: 'the station tree could not be read: GET /api/stations answered 503',
+      });
+    }
   });
 
   test("a department's landing needs no tree: /finance and /it render with it unread", () => {
@@ -313,5 +327,27 @@ describe('the SPA reads the tree the way the floor does: the rows, then under th
       await readStationAddresses((p) => (p === '/api/stations' ? answer(stationList()) : answer('dark', 503))),
     ).toEqual({ kind: 'failed', why: 'the tree read under the root answered 503' });
     expect((await readStationAddresses(() => Promise.reject(new Error('offline')))).kind).toBe('failed');
+  });
+});
+
+// A PAGE THE ROOT HOSTS NEEDS NO TREE TO BE LINKED (backlog 92bfcb04).
+// The root's own segment is dropped from every address and the root has
+// no parent to move under, so its pages sit at their slugs whatever the
+// tree says: the alarms board's selections and the station tree floor's
+// links are built from the catalog without a read, which the pure link
+// builders (regions.ts, station-tree.ts) need. Held to `pagePath` under a
+// read tree, so the two answers cannot disagree.
+describe('a root-hosted page is at its slug, with or without the tree', () => {
+  test('every root-hosted entry answers what pagePath answers under a read tree', () => {
+    const atRoot = entries.filter(([, e]) => e.host === STATION.algedonic);
+    expect(atRoot.map(([k]) => k)).toEqual(expect.arrayContaining(['system-yard', 'system-tree', 'accounts']));
+    for (const [k, e] of atRoot) expect([k, rootPagePath(e)]).toEqual([k, pagePath(e, AT)]);
+    expect(rootPagePath(ROUTE_CATALOG['system-tree'])).toBe('/tree');
+    expect(rootPagePath(ROUTE_CATALOG['system-yard'])).toBe('/alarms');
+  });
+
+  test('an entry hosted anywhere else has no tree-free address: only the tree can place it', () => {
+    expect(rootPagePath(ROUTE_CATALOG['system-estate'])).toBeNull();
+    expect(rootPagePath(ROUTE_CATALOG.me)).toBeNull();
   });
 });

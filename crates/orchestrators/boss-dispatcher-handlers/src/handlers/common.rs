@@ -2461,9 +2461,12 @@ mod lane_pin {
         // bound, stamped `Telemetry` like the agent-step overdue alarm;
         // twenty-seven since `jobs.factory_idle_watch` (backlog 5627a4e1),
         // no car gate for its bound while declared ready work waits,
-        // stamped `Telemetry` like the unheld-review watch beside it.
+        // stamped `Telemetry` like the unheld-review watch beside it;
+        // twenty-eight since `jobs.changes_repair_watch` (backlog
+        // 205ce78a), a held CHANGES car with no repair gate-run past its
+        // bound, stamped `Telemetry` like the unheld-review watch.
         assert_eq!(
-            filings, 27,
+            filings, 28,
             "the number of machine filing sites changed. That is fine — but check the new \
              one stamps a lane, then update this count, which exists so a filing that \
              DISAPPEARS from the scan (a renamed key, a reshaped body) cannot read as \

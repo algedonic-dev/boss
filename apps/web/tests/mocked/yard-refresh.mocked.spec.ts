@@ -30,7 +30,7 @@ test('consistently slow readings appear while each next poll is still pending', 
     return route.fulfill({ json: { data: trains(call > 1), total: 5 } });
   });
   try {
-    await page.goto('/it?at=track');
+    await page.goto('/alarms?at=track');
     await expect.poll(() => calls).toBe(1);
     await page.clock.runFor(11_000);
     await expect.poll(() => calls).toBe(2);
@@ -72,7 +72,7 @@ test('a failed refresh marks five retained trains with the last successful age, 
     return route.fallback();
   });
   try {
-    await page.goto('/it?at=track');
+    await page.goto('/alarms?at=track');
     await expect(page.locator('.yard-trainname')).toHaveCount(5);
     await expect(holdClock(page, NOW)).rejects.toThrow('holdClock must precede navigation');
     closed = true;
@@ -113,7 +113,7 @@ test('an older slow refresh cannot restore trains after a newer arrival reading'
     if (call === 2) await held;
     return route.fulfill({ json: { data: captured, total: 5 } });
   });
-  await page.goto('/it?at=track');
+  await page.goto('/alarms?at=track');
   await expect(page.locator('.yard-trainname')).toHaveCount(5);
   await page.clock.runFor(10_000);
   await expect.poll(() => calls).toBe(2);

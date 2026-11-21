@@ -3,10 +3,8 @@
 import { safeSitePath } from '@boss/web-kit/links';
 import { readFinanceView, type FinanceView } from './finance/financeQuery';
 import { ROUTE_CATALOG, departmentLanding, type NavItem } from './shell/nav-catalog';
-import { ADDRESSES_LOADING, matchPath, pagePath, stationAtPath, type StationAddresses } from './shell/page-address';
+import { ADDRESSES_LOADING, matchPath, pagePath, rootPagePath, stationAtPath, type StationAddresses } from './shell/page-address';
 import { treeQuery } from './it/tree/station-tree';
-import { stationOfPath } from './it/tree/station-page';
-import { resourcesOfPath } from './it/tree/resources/resources';
 
 // Removed with step 1 of design 01fa5bdf (David, 2026-11-17: "IT
 // disappears, the old map is pulled out, and the /ux business pages are
@@ -84,9 +82,9 @@ export type Route =
   | { kind: 'systemStepPluginDetail'; pluginSlug: string }
   | { kind: 'systemDesign' }
   /** The alarms board and the train yard's controls, at /alarms (and at
-   *  /it, IT's landing) — all that
+   *  /it while the registry keeps IT's row, as IT's landing) — all that
    *  stays of the Department Map (design e765b3fc) after step 1 of
-   *  design 01fa5bdf: the alarms, and under `at` (`/it?at=dock`) the
+   *  design 01fa5bdf: the alarms, and under `at` (`/alarms?at=dock`) the
    *  one board that holds the release and cancel controls, until the
    *  station page takes them (that design's step 4). */
   | { kind: 'systemYard'; at?: string }
@@ -97,17 +95,19 @@ export type Route =
   /** The station tree floor (T7 of design 4b27a65a, backlog 94a9dad4):
    *  one card drawn recursively from the tree read under `under` (an id
    *  or a name; absent, the root), `depth` levels deep, with the
-   *  recorded moves riding it. Additive: the Department Map stays. */
+   *  recorded moves riding it. The root's page, at /tree, since backlog
+   *  92bfcb04 (it was /it/tree). */
   | { kind: 'systemTree'; under?: string; depth?: number }
   /** The station page (design c4854fd4 E2, backlog 72d58e00): what
    *  opening one station shows — its constraints, its parts, In /
-   *  Working / Out — at /it/tree/<name>, and at the station's own
+   *  Working / Out — at /tree/<name> (/it/tree/<name> until backlog
+   *  92bfcb04), and at the station's own
    *  address in the tree where no page is hosted there (backlog
    *  0bc2eb68: /engineering, /engineering/gates). */
   | { kind: 'systemStation'; station: string }
   /** A station's Resources view (backlog 87575d69, car C of the station
    *  visuals): its pools as a rail of units drawn where the claims hold
-   *  them, at /it/tree/<name>/resources — the Work / Resources toggle on
+   *  them, at /tree/<name>/resources — the Work / Resources toggle on
    *  the station page. */
   | { kind: 'systemStationResources'; station: string }
   // 'systemYardFloor' (/it/yard/<region>), 'systemCrew' (/it/crew),
@@ -156,10 +156,6 @@ export function routable(pathname: string): string {
   return pathname.replace(/^\/dashboard/, '').replace(/\/$/, '') || '/';
 }
 
-function underIt(raw: string): boolean {
-  return raw === '/it' || raw.startsWith('/it/');
-}
-
 /// One path segment, decoded — or as it was typed when its escape is
 /// malformed, so a mistyped URL renders a page instead of throwing out
 /// of the router.
@@ -171,9 +167,11 @@ function segment(s: string): string {
   }
 }
 
-/// The one door an unmatched path offers: back to the department it was
-/// under (design ee3a3a2f Q3). No search box and no "did you mean" — a
-/// suggestion is a guess, which is what the not-found page refuses.
+/// The one door an unmatched path offers (design ee3a3a2f Q3). No search
+/// box and no "did you mean" — a suggestion is a guess, which is what the
+/// not-found page refuses. A path under /it led back to the alarms board
+/// until backlog 92bfcb04 retired the prefix with IT (design df0ecd8b):
+/// it is a path like any other now, and leads to My Day.
 ///
 /// `department` is set when the path IS a page, owned by a department
 /// this instance does not have (sections.ts `withRoster`, backlog
@@ -182,16 +180,15 @@ function segment(s: string): string {
 /// instance", with one way back (e543c6fe).
 export function notFoundBack(pathname: string, department?: string): { href: string; label: string } {
   if (department !== undefined) return { href: '/', label: 'Back to Home' };
-  return underIt(routable(pathname))
-    ? { href: '/it', label: 'Back to the alarms board' }
-    : { href: myDayPath(), label: 'Back to My Day' };
+  return { href: myDayPath(), label: 'Back to My Day' };
 }
 
 /// The person's own station's pages (design 01fa5bdf step 3, backlog
 /// 5cb56bb3), each by the catalog entry that places it under /me — the
 /// catalog spells the path, so this table never does. Matched on the
 /// path as asked, before anything reads the station tree: /me is the
-/// signed-in person's, never a position in the company's tree, so an
+/// signed-in person's, never read off the company's tree (whose `me`
+/// row is one station for every person, infra/platform/stations/me.toml), so an
 /// unread or unreadable tree never takes a person's own pages away.
 /// Whose page it is comes from the session (MePage, InboxPage and
 /// MyCalendarPage each read the signed-in user), never from the URL.
@@ -240,6 +237,13 @@ const HOSTED: ReadonlyArray<HostedRoute> = [
   // one board holding the release and cancel controls, until the station
   // page takes them.
   { page: 'system-yard', rest: '', route: (_, search) => yardRoute(search) },
+  // The station tree floor, a station's page by name and its Resources
+  // view: the root's pages since backlog 92bfcb04 (car 3 of design
+  // df0ecd8b), at /it/tree until then. Each takes ONE segment, so a
+  // deeper path is not found rather than a convincing missing station.
+  { page: 'system-tree', rest: '', route: (_, search) => ({ kind: 'systemTree', ...treeQuery(search) }) },
+  { page: 'system-tree', rest: '/:station', route: (p) => ({ kind: 'systemStation', station: p.station! }) },
+  { page: 'system-tree', rest: '/:station/resources', route: (p) => ({ kind: 'systemStationResources', station: p.station! }) },
   // The Churn watchlist, the root's company-wide list (backlog 5cb56bb3).
   { page: 'accounts', rest: '', route: () => ({ kind: 'watchlist' }) },
   // Operate — the audit log and its performance tab.
@@ -337,47 +341,21 @@ export function parseRoute(pathname: string, search = '', at: StationAddresses =
   }
   // '/map' (the flat company map, backlog 759da6bc) and
   // '/it/floor/<code>' (the department floor, 858e62aa) retired 2026-11-09:
-  // the recursive root station view (/it/tree) is the company index;
+  // the recursive root station view (/tree) is the company index;
   // both addresses now fall through to notFound.
 
-  // ===== The IT department — /it/* =====
+  // ===== /it/* — RETIRED with IT as a department =====
   //
-  // What stays under /it is what no catalog entry hosts: IT's own
-  // address, the station tree floor and a station's page by name, and
-  // IT's jobs view. The family pages that sat here — Operate, Registry,
-  // Design, the Codebase, Estate, the KB and the auth door — are hosted
-  // at stations since backlog 0bc2eb68 and answer at their stations'
-  // addresses; their /it spellings fall to not-found with no alias
-  // (David, 2026-09-25: no shims before 1.0.0). /system is GONE —
-  // David's Q1/Q4 verdicts: department-first, and "we don't need to
-  // worry about legacy users. It is just me".
-  if (underIt(raw)) {
-    const p = raw.slice('/it'.length) || '/';
-    // 1. IT's own address: its landing, the alarms board, rendered in
-    //    place — the IT tab links here (`departmentPath`), so this is a
-    //    department's address, not an alias of the board's own /alarms.
-    //    The query rides along: /it?at=dock selects a station on it.
-    if (p === '/') {
-      const landing = departmentLanding('it');
-      const r = landing === undefined ? null : routeOfPage(landing, search, at);
-      return r ?? { kind: 'department', code: 'it' };
-    }
-    if (p === '/tree') return { kind: 'systemTree', ...treeQuery(search) };
-    if (p.startsWith('/tree/')) {
-      const station = stationOfPath(p.slice('/tree/'.length));
-      if (station !== null) return { kind: 'systemStation', station };
-      const resources = resourcesOfPath(p.slice('/tree/'.length));
-      if (resources !== null) return { kind: 'systemStationResources', station: resources };
-    }
-    // 2. The jobs view every department carries (design 8c3e9599 §4,
-    //    car 2). IT's block owns every /it path, so the /<code>/jobs
-    //    branch below never sees this one; the code is IT's own.
-    if (p === '/jobs') return { kind: 'department', code: 'it' };
-    // Unknown /it path: it says so, inside the IT chrome. It returned the
-    // yard until design ee3a3a2f (Q4), so a mistyped IT link landed on the
-    // map and looked like a working one.
-    return { kind: 'notFound', path: pathname };
-  }
+  // IT retires as a department (design df0ecd8b, David 2026-11-10): its
+  // work lives in Engineering, Operations and the company root, and each
+  // page moved to its host station. The family pages went with backlog
+  // 0bc2eb68; the station tree floor, a station's page by name and its
+  // Resources view, the last pages /it held, are the root's at /tree
+  // since backlog 92bfcb04. No path under /it is special any more, and
+  // none has an alias (David, 2026-09-25: no shims before 1.0.0). /it and
+  // /it/jobs are a department's address and jobs view like any other,
+  // answered below for as long as the registry keeps IT's row (car 2 of
+  // that design retires it).
 
   // ===== User Experiences perspective — /ux/* (canonical); bare / is the public alias for the UX home.
   // Unprefixed legacy paths still resolve here (defensive). =====
@@ -501,8 +479,13 @@ export function parseRoute(pathname: string, search = '', at: StationAddresses =
   // A department nobody built a landing for lands on its jobs view, and
   // is not found once the registry says it is no row (sections.ts
   // `withRoster`): the router cannot see the registry, so it cannot tell
-  // a department nobody built a page for from a typo.
-  if (landingM) return { kind: 'department', code: segment(landingM[1]!) };
+  // a department nobody built a page for from a typo. A root page's
+  // address is one bare segment too (/tree, /alarms), and the catalog
+  // names it without the tree (page-address.ts `rootPagePath`): with the
+  // tree unread it is the page nothing could place, said below, never a
+  // department the registry then denies (backlog 92bfcb04).
+  const rootPage = Object.values(ROUTE_CATALOG).some((e) => rootPagePath(e as NavItem) === raw);
+  if (landingM && !(at.kind === 'failed' && rootPage)) return { kind: 'department', code: segment(landingM[1]!) };
 
   // Nothing answers this path, and the page says so, naming it as it was
   // asked for (design ee3a3a2f). This returned the landing page until

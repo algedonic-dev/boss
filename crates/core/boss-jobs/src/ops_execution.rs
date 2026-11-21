@@ -436,6 +436,48 @@ mod tests {
         assert_eq!(classify(&answered(json!("1"))).outcome_kind(), "failed");
     }
 
+    /// THE SHARED MATRIX (backlog 50a1578f, the web reader car): every
+    /// record shape the decided contract names, with the reading it
+    /// gets, in one JSON file the web's classifier
+    /// (apps/web/src/it/ops-execution.ts) is tested against too — so the
+    /// yard, the signals and the approve block cannot read a record the
+    /// way this module does not (CLAUDE.md §9a).
+    #[test]
+    fn the_matrix_is_how_this_classifier_reads() {
+        let matrix: Value = serde_json::from_str(include_str!("ops_execution_matrix.json"))
+            .expect("the matrix is JSON");
+        let cases = matrix["cases"].as_array().expect("cases");
+        assert!(cases.len() >= 19, "the matrix lost cases: {}", cases.len());
+        for case in cases {
+            let name = case["name"].as_str().expect("name");
+            let e = classify(&case["record"]);
+            assert_eq!(e.label(), case["label"], "{name}");
+            assert_eq!(e.outcome_kind(), case["outcome_kind"], "{name}");
+            assert_eq!(e.exit(), case["exit"].as_str(), "{name}");
+            assert_eq!(Value::Bool(e.succeeded()), case["succeeded"], "{name}");
+            assert_eq!(Value::Bool(e.not_yet()), case["not_yet"], "{name}");
+            match &e {
+                Execution::Refused { reason } => {
+                    assert_eq!(reason.as_deref(), case["reason"].as_str(), "{name}");
+                }
+                Execution::Answered { effect } => {
+                    let (word, text) = match effect {
+                        Effect::Shown(t) => ("shown", Some(t.as_str())),
+                        Effect::Unproven(t) => ("unproven", Some(t.as_str())),
+                        Effect::Unread(t) => ("unread", Some(t.as_str())),
+                        Effect::Undeclared => ("undeclared", None),
+                    };
+                    assert_eq!(case["effect"], word, "{name}");
+                    assert_eq!(text, case["effect_text"].as_str(), "{name}");
+                }
+                Execution::Failed { timed_out, .. } => {
+                    assert_eq!(Value::Bool(*timed_out), case["timed_out"], "{name}");
+                }
+                Execution::Indeterminate { .. } => {}
+            }
+        }
+    }
+
     #[test]
     fn a_packet_reads_only_a_completed_execute() {
         let packet = |status: &str| {

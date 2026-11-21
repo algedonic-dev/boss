@@ -395,6 +395,15 @@ fn the_verb_file_offers_exactly_the_scripts_allow_list_and_reads_only() {
             .any(|w| w == "allow-empty-disk-selector-volume"),
         "the setting 46328c3a needs read before any disk is tagged"
     );
+    // Backlog 2b7c78f8: the instance manager on every Longhorn node
+    // requests this percentage of the node's CPU, and on w-1 that is CPU
+    // the capacity record never charged. Its default is a reading too.
+    assert!(
+        offered
+            .iter()
+            .any(|w| w == "guaranteed-instance-manager-cpu"),
+        "the setting 2b7c78f8 needs read to charge w-1 what Longhorn holds"
+    );
 }
 
 #[test]

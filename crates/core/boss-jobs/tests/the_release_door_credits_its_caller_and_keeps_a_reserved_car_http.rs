@@ -313,8 +313,14 @@ fn the_rule() -> String {
     caller(&format!("rule:{RULE}"))
 }
 
+/// An empty agents registry: the door tells the car's builder from its
+/// reviewer by spelling alone (backlog 8e97a4ec), and no alias maps.
 fn app() -> (Router, Arc<InMemoryJobs>) {
-    app_with_actors(None)
+    app_with_actors(Some(no_aliases()))
+}
+
+fn no_aliases() -> Arc<dyn boss_jobs::agents::AgentsRegistry> {
+    Arc::new(boss_jobs::agents::InMemoryAgents::new())
 }
 
 fn app_with_actors(
@@ -500,7 +506,8 @@ async fn held_car(jobs: &InMemoryJobs, n: u128, mark: Value) -> (Uuid, Uuid) {
             "ship-a-change",
             car,
             JobStatus::Open,
-            json!({"branch": format!("feat/car-{n}"), "agent_run": builder.to_string()}),
+            json!({"branch": format!("feat/car-{n}"), "agent_run": builder.to_string(),
+                   "built_by": "builder@login.example"}),
         ),
         t(NOW),
         &[],
@@ -522,7 +529,7 @@ async fn held_car(jobs: &InMemoryJobs, n: u128, mark: Value) -> (Uuid, Uuid) {
             "agent-run",
             run,
             JobStatus::Closed,
-            json!({"review": {
+            json!({"agent": "agent-reviewer", "review": {
                 "car": car.to_string(), "branch": format!("feat/car-{n}"),
                 "reviewed_sha": H1, "verdict": "release", "at": "2026-10-18T11:00:00Z",
                 "findings": "### VERDICT: release\nSAFE TO RELEASE WITHOUT DAVID: yes.",
@@ -769,7 +776,7 @@ async fn a_reservation_changed_after_judgement_refuses_the_write_and_current_own
         (401, json!({})),
     ] {
         let race = Arc::new(std::sync::Mutex::new(None));
-        let (app, jobs) = app_with_race(None, race.clone());
+        let (app, jobs) = app_with_race(Some(no_aliases()), race.clone());
         let (car, run) = held_car(&jobs, n, mark).await;
         let step = jobs
             .list_steps(&JobId::from_uuid(car))

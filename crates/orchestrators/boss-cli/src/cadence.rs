@@ -14,7 +14,9 @@
 //! invariant), evaluates the active rules, claims a deterministic
 //! firing row (`cadence:<name>:<window-stamp>`), and runs the verb
 //! as a child of this same binary. systemd is demoted to what an OS
-//! is for: keeping this process alive (infra/train/boss-train.service).
+//! is for: keeping this process alive — the cluster's conductor
+//! Deployment now (infra/cluster/manifests/boss-conductor.yaml); the
+//! host unit boss-train.service was deleted in backlog c440ab8d.
 //!
 //! ALL OF THAT RIDES `/api/cadence/*` — the jobs API is the loop's
 //! one door for rules, last-firings, claims and outcomes
@@ -1755,7 +1757,7 @@ async fn shut_down(runs: &mut Runs, signal: &str, budget: std::time::Duration) {
 }
 
 /// The `boss train cadence` entry: the supervised loop
-/// (infra/train/boss-train.service) or, with `once`, a single
+/// (infra/cluster/manifests/boss-conductor.yaml) or, with `once`, a single
 /// evaluated tick for an operator or a test.
 pub async fn run(once: bool, dry: bool) -> Result<()> {
     // One address does the loop's whole job — rules, last-firings,

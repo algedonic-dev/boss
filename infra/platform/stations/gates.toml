@@ -74,18 +74,28 @@
 # `placement`, where the gates stand on Engineering's floor, {x, y, w, h}
 # in floor units, as David's Plan artboard draws them (2026-11-19).
 # Nothing else changed.
+#
+# Version 8 (backlog 2b7c78f8; bumped from the LIVE newest, v7, read
+# 2026-11-21 on GET /api/stations/gates/versions): host:w-1 12 -> 13. The
+# scheduler places a gate POD, and its request is the gate container's 4
+# CPU plus the postgres native sidecar's 250m that runs beside it — 4.25,
+# measured on the live gate pods at 16:52Z (and v4's own arithmetic above
+# already used it) — so three seats hold 12.75 of w-1, which this row
+# charged as 12. 13 is 12.75 in the whole vCPU the row counts. Held to
+# the manifest by the_engineering_allocations_are_the_manifests_numbers.
+# Nothing else changed.
 # ---------------------------------------------------------------------------
 
 [[station]]
 name = "gates"
-version = 7
+version = 8
 id = "a426acd5-4c77-4ec9-9686-c96cd59b53d7"
 parent = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5"
 mode = "standing"
 placement = { x = 590, y = 120, w = 230, h = 170 }
 capacity = 3
 machines = ["automation:gate-runner"]
-allocation = { "host:w-1" = 12 }
+allocation = { "host:w-1" = 13 }
 status = "active"
 title = "Gates — branches waiting for a bay or in one"
 kind = "equipment"

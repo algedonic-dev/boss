@@ -642,8 +642,8 @@ describe('every page names the station that hosts it', () => {
   // reaches zero, car 3 of the design makes `host` required and this
   // becomes a pin.
   // A person's page (`person`, at /me) is hosted at the signed-in
-  // person's own station, which is no row of the company tree (backlog
-  // 5cb56bb3), so it is not on the report.
+  // person's own station, whose page the session decides rather than
+  // the tree (backlog 5cb56bb3), so it is not on the report.
   it('the unhosted report lists exactly the catalog entries with no host', () => {
     const report = unhostedPages();
     expect(report.map((e) => e.id)).toEqual(

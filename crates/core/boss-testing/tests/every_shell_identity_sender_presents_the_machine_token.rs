@@ -731,10 +731,16 @@ const NOT_THE_ESTATE: &[Site] = &[
         "GitHub's public API: check-runs and annotations",
     ),
     site(
-        "infra/forge/read-publish-checks.sh",
-        "\"$GITHUB_API$log_path\"",
+        "infra/forge/lib/github-job-log.sh",
+        "\"$GITHUB_API$path\"",
         1,
-        "GitHub's API: a failing check's job log, with the broker's read-only checks token (backlog b7a74610); the estate token must never leave the estate",
+        "GitHub's API: an Actions job log, with the broker's read-only checks token (backlog b7a74610; moved here from read-publish-checks.sh by 8f266452, which both readers source); the estate token must never leave the estate",
+    ),
+    site(
+        "infra/forge/read-github-job-log.sh",
+        "\"$GITHUB_API/repos/$MIRROR_SLUG/$1\"",
+        1,
+        "GitHub's public API: a run's job list and a job's record, anonymously (backlog 8f266452)",
     ),
     site(
         "infra/forge/cluster-deploy-lib.sh",

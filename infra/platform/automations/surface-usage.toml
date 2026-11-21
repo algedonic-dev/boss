@@ -5,5 +5,7 @@
 id = "automation:surface-usage"
 role = "platform-admin"
 description = 'Rolls up which surfaces each operator opened, daily, and files it as a packet (infra/surface-usage.sh).'
-# Host station: executive (backlog 6ecb5480, station-tree.md section 6).
-station = "5f922a2a-31f5-4f07-acf1-41dc140687a4"
+# Host station: the company, algedonic. It was the executive desk
+# (backlog 6ecb5480) until that desk dissolved into the root (design
+# 2910ec3d car 1, backlog 878fd1e7).
+station = "00b04483-90c6-46b9-b911-8e19d2a0b410"

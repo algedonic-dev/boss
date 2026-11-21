@@ -33,7 +33,8 @@ const MANIFEST: &str = "infra/forge/registry-probe.yaml";
 /// --kubeconfig=/kc`. State under $STUB_STATE: `ip-<node>` its
 /// InternalIP, `cp-<node>` a control-plane label, `unsched-<node>`
 /// cordoned, `labels-<node>` extra labels as a JSON object, `taints-<node>`
-/// a JSON array, `pods-<node>` the pods on it (a JSON array; `podsfail`
+/// a JSON array, `alloc-<node>` its status.allocatable as a JSON object
+/// (`{}` for a Node that reports none), `pods-<node>` the pods on it (a JSON array; `podsfail`
 /// makes the list fail), `job.json` the probe Job (made by the create, or
 /// planted), `sent.yaml` what the create was handed, `polls` how often the
 /// made Job was read. STUB_SCENARIO is the probe's life: ok | failed |
@@ -63,8 +64,10 @@ node_json() {
     spec='{}'
     [ -f "$S/unsched-$n" ] && spec='{"unschedulable":true}'
     [ -f "$S/taints-$n" ] && spec=$(printf '%s' "$spec" | jq -c --argjson t "$(cat "$S/taints-$n")" '.taints = $t')
-    jq -n -c --arg n "$n" --argjson l "$labels" --argjson s "$spec" --arg ip "$(cat "$S/ip-$n")" '{kind:"Node",metadata:{name:$n,labels:$l},spec:$s,
-        status:{addresses:[{type:"InternalIP",address:$ip}],
+    alloc='{"cpu":"8","memory":"65240244Ki","pods":"110"}'
+    [ -f "$S/alloc-$n" ] && alloc=$(cat "$S/alloc-$n")
+    jq -n -c --arg n "$n" --argjson l "$labels" --argjson s "$spec" --arg ip "$(cat "$S/ip-$n")" --argjson a "$alloc" '{kind:"Node",metadata:{name:$n,labels:$l},spec:$s,
+        status:{addresses:[{type:"InternalIP",address:$ip}],allocatable:$a,
             conditions:[{type:"Ready",status:"True",reason:"KubeletReady"}],
             nodeInfo:{kubeletVersion:"v1.36.2",osImage:"Talos (v1.13.8)",kernelVersion:"6.18.42-talos",containerRuntimeVersion:"containerd://2.1.4"}}}'
 }
@@ -465,6 +468,120 @@ fn node_pods_never_answers_none_for_a_node_it_could_not_read() {
     let o = c.run(PODS, &["w-3"], &[]);
     assert_eq!(o.status.code(), Some(1), "{}", text(&o));
     assert!(text(&o).contains("not found"), "{}", text(&o));
+}
+
+/// THE ALLOCATED BLOCK (backlog 2b7c78f8). On 2026-11-21 builders were
+/// refused `Insufficient cpu` on w-1 while the record said it had room,
+/// and nothing the pod could reach printed what held the box: node-pods
+/// listed pods with no requests, and `kubectl describe node`'s Allocated
+/// resources block is a read of the Node the dev pod is forbidden. The
+/// pods fixture is the live shapes of that afternoon: a gate pod (the
+/// postgres NATIVE sidecar, restartPolicy Always, beside the gate init
+/// container, then the receipt container), a dev-build worker (worker +
+/// its database, and a non-sidecar init), Longhorn's instance manager, a
+/// DaemonSet pod with no requests, and a Succeeded gate the scheduler no
+/// longer counts.
+#[test]
+fn node_pods_prints_each_pods_effective_request_and_the_nodes_allocated_block() {
+    let c = Cluster::new("pods-requests");
+    c.state(
+        "alloc-w-3",
+        r#"{"cpu":"31800m","memory":"65240244Ki","pods":"110"}"#,
+    );
+    let req = |cpu: &str, mem: &str| json!({"requests": {"cpu": cpu, "memory": mem}});
+    c.state(
+        "pods-w-3",
+        &json!([
+            {"metadata": {"name": "gate-aa", "namespace": "boss-dev"},
+             "spec": {"nodeName": "w-3",
+                "initContainers": [
+                    {"name": "postgres", "image": "pg", "restartPolicy": "Always", "resources": req("250m", "3Gi")},
+                    {"name": "gate", "image": "ci", "resources": req("4", "8Gi")}],
+                "containers": [{"name": "receipt", "image": "ci", "resources": req("100m", "256Mi")}]},
+             "status": {"phase": "Pending"}},
+            {"metadata": {"name": "dev-build-bb", "namespace": "boss-dev"},
+             "spec": {"nodeName": "w-3",
+                "initContainers": [{"name": "seed", "image": "ci", "resources": req("1", "512Mi")}],
+                "containers": [
+                    {"name": "worker", "image": "ci", "resources": req("2", "4Gi")},
+                    {"name": "postgres", "image": "pg", "resources": req("500m", "1Gi")}]},
+             "status": {"phase": "Running"}},
+            {"metadata": {"name": "instance-manager-1", "namespace": "longhorn-system"},
+             "spec": {"nodeName": "w-3",
+                "containers": [{"name": "im", "image": "lh", "resources": {"requests": {"cpu": "3840m"}}}]},
+             "status": {"phase": "Running"}},
+            {"metadata": {"name": "cilium-envoy-1", "namespace": "kube-system"},
+             "spec": {"nodeName": "w-3", "containers": [{"name": "envoy", "image": "envoy"}]},
+             "status": {"phase": "Running"}},
+            {"metadata": {"name": "gate-old", "namespace": "boss-dev"},
+             "spec": {"nodeName": "w-3",
+                "initContainers": [{"name": "gate", "image": "ci", "resources": req("4", "8Gi")}],
+                "containers": [{"name": "receipt", "image": "ci"}]},
+             "status": {"phase": "Succeeded"}}
+        ])
+        .to_string(),
+    );
+    let o = c.run(PODS, &["w-3"], &[]);
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    let requests: Vec<&str> = out.lines().filter(|l| l.starts_with("requests ")).collect();
+    assert_eq!(
+        requests,
+        vec![
+            "requests boss-dev/gate-aa Pending cpu 4.25 memory 11Gi",
+            "requests longhorn-system/instance-manager-1 Running cpu 3.84 memory 0Gi",
+            "requests boss-dev/dev-build-bb Running cpu 2.5 memory 5Gi",
+            "requests kube-system/cilium-envoy-1 Running cpu 0 memory 0Gi",
+        ],
+        "largest CPU first; the Succeeded gate holds nothing: {out}"
+    );
+    let allocated: Vec<&str> = out
+        .lines()
+        .filter(|l| l.starts_with("allocated "))
+        .collect();
+    assert_eq!(
+        allocated,
+        vec![
+            "allocated cpu 10.59 of 31.8 allocatable (33%) on 4 pod(s)",
+            "allocated memory 16Gi of 62.22Gi allocatable (25%)",
+        ],
+        "{out}"
+    );
+    // The closing count stays the last line, as join-a-node reads it.
+    assert!(
+        out.contains("node-pods: w-3 — 5 pod(s): 1 Pending, 3 Running, 1 Succeeded"),
+        "{out}"
+    );
+    assert!(c.writes().is_empty(), "READ-ONLY: {:?}", c.calls());
+}
+
+/// No evidence is not a pass: a Node that reports no allocatable, or a
+/// request the reader cannot parse, is CANNOT ANSWER — never a sum that
+/// silently counted it as nothing.
+#[test]
+fn node_pods_cannot_answer_an_allocation_it_could_not_read() {
+    let c = Cluster::new("pods-noalloc");
+    c.state("alloc-w-3", "{}");
+    let o = c.run(PODS, &["w-3"], &[]);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    assert!(
+        text(&o).contains("CANNOT ANSWER — the Node w-3 reports no allocatable"),
+        "{}",
+        text(&o)
+    );
+    let c = Cluster::new("pods-badqty");
+    c.state(
+        "pods-w-3",
+        &json!([{"metadata": {"name": "odd", "namespace": "x"},
+            "spec": {"nodeName": "w-3", "containers": [{"name": "c", "image": "i",
+                "resources": {"requests": {"cpu": "two"}}}]},
+            "status": {"phase": "Running"}}])
+        .to_string(),
+    );
+    let o = c.run(PODS, &["w-3"], &[]);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    assert!(text(&o).contains("CANNOT ANSWER"), "{}", text(&o));
+    assert!(text(&o).contains("two"), "names the quantity: {}", text(&o));
 }
 
 // --------------------------------------------------------- registry-probe

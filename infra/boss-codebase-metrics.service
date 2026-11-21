@@ -53,11 +53,14 @@ TimeoutStartSec=10min
 # and git refuses to read a repository owned by somebody else — "dubious ownership"
 # — so with no User= this unit, as root, exited 3 on its
 # first-ever firing (2026-09-12 05:14Z), the cadence stayed silent and
-# two landed cars waited on a packet that could not exist. The siblings
-# that run git here (boss-search-reindex, boss-forge-token-audit) say the
-# same. Not `safe.directory`: that is right where a root process must
-# READ a foreign clone and wrong everywhere else (infra/gate.sh says why),
-# and nothing here needs root.
+# two landed cars waited on a packet that could not exist. Not
+# `safe.directory`: that is right where a root process must READ a
+# foreign clone and wrong everywhere else (infra/gate.sh says why).
+# NOT WHAT boss-gcp RUNS (backlog c440ab8d, 2026-11-21): with root's tree
+# accepted, install-units.sh installs infra/gcp/root-tree-units/
+# boss-codebase-metrics.service.in in this file's place — User=root over
+# root's own tree, where no ownership git reads is foreign. This copy is
+# the timer's pair and the fixture roots' unit.
 User=david
 # THE CODE-BRANCH COUNTER, NAMED (backlog c4d60110). Every packet from
 # 2026-09-17 to 2026-09-27 — 11 of 11 — filed code_branches_on_kind

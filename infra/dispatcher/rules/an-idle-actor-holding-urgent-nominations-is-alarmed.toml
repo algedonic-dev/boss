@@ -34,9 +34,22 @@
 #     Old versions without a declared wait bound do not suppress waits.
 #     This is STEP metadata, not
 #     the existing scalar JOB waiting_on edge (backlog 8bc040f6).
+#   - hold_days, 7 (v4, backlog 595e32f6, THE HOLD decided by David
+#     2026-11-17 on f4b0ad41): a recovery does not close the alarm. It is
+#     held OPEN with a RECOVERED note for this many days and drops to
+#     scheduled while held, so the pull does not hand it to an agent to
+#     close; a relapse inside the window is appended to it and restores
+#     its priority, and a window with none withdraws it.
 #
-# DEDUP: by the alarm staying OPEN. Closing it re-arms the watch, so the
-# next idle stretch files again.
+# DEDUP: by the alarm staying OPEN, and the machine clears it. It marks
+# ITSELF RECOVERED when the actor has an open agent-run of its own, its
+# runs moved since the recorded idle start, or its complete queue holds
+# no actionable nominations. A cut queue (truncated, or at the page
+# ceiling) is never read as nominations gone, but run movement still
+# clears it. Only the quiet hold_days window withdraws it; closing it by
+# hand inside the window defeats the hold, which is what the hold note
+# says. A withdrawn or closed alarm re-arms the watch, so the next idle
+# stretch files again.
 #
 # EVERY FIVE MINUTES: the bound is minutes, and an hourly tick would let
 # the stall run up to twice its bound before anything spoke. The steady
@@ -57,14 +70,18 @@ urgent alarm per idle actor, naming the actor, every held nomination,
 its last run and its session's last prompt, owned by the platform
 owner and assigned to nobody — never to the actor that stopped, so the
 alarm does not report through its subject. The open alarm holds the
-next tick; closing it re-arms.
+next tick. The machine recovers it — an own open run, run movement, or
+a complete queue with no actionable nominations — and holds it OPEN
+and RECOVERED, lowered to scheduled, for hold_days; a relapse appends
+to it and restores its priority, and only a quiet window withdraws it.
+Version4 declares hold_days (595e32f6) rather than inheriting it.
 Version3 records the original wait through the existing immutable STEP
 record door and bounds both target kinds from that server observation.
 Changing the declaration cannot renew the bound. The original waiting_on
 field remains the owner's declaration; the watch writes only its own receipt.
 """
-version = 3
+version = 4
 schedule = { cadence = "every-5-minutes", anchor_date = "2026-10-19" }
 [[rule.do]]
 handler = "jobs.idle_actor_watch"
-args = { priorities = "\"urgent,emergency\"", idle_minutes = "30", wait_minutes = "1440" }
+args = { priorities = "\"urgent,emergency\"", idle_minutes = "30", wait_minutes = "1440", hold_days = "7" }

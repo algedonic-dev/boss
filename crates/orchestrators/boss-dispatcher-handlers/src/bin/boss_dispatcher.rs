@@ -39,12 +39,12 @@ use boss_dispatcher_handlers::handlers::{
     inventory_bill_approve::InventoryBillApprove,
     inventory_overhead_absorb::InventoryOverheadAbsorb,
     inventory_parts_consume::InventoryPartsConsume,
-    inventory_parts_produce::InventoryPartsProduce,
     inventory_po_place::InventoryPoPlace,
     inventory_receive::InventoryReceive,
     jobs_age_out_step::JobsAgeOutStep,
     jobs_agent_step_overdue::JobsAgentStepOverdue,
     jobs_auto_park::JobsAutoPark,
+    jobs_changes_repair_watch::JobsChangesRepairWatch,
     jobs_changes_return_the_build::JobsChangesReturnTheBuild,
     jobs_clear_waiting::JobsClearWaiting,
     jobs_complete_linked_step::JobsCompleteLinkedStep,
@@ -726,6 +726,16 @@ async fn main() -> Result<()> {
             // judges the repair at the pull. Inert until the rule on
             // jobs.job.updated names it.
             handlers.register(JobsChangesReturnTheBuild::new(cfg.jobs_api_url.clone()));
+            // The same return judged again every hour, and an alarm per
+            // held CHANGES car with no repair gate-run past the row's
+            // bound (205ce78a): the verdict's own write is the only
+            // trigger above, and a build whose run closed later, or a
+            // return nobody pulled, was never judged again.
+            handlers.register(JobsChangesRepairWatch::new(
+                cfg.jobs_api_url.clone(),
+                cfg.messages_api_url.clone(),
+                platform_owner.clone(),
+            ));
             // The same return for a car the dock stopped re-gating after
             // two reds in a row on one check (backlog 8f3d731a): the
             // item's build back at its station, the failing check
@@ -1012,7 +1022,6 @@ async fn main() -> Result<()> {
                 cfg.jobs_api_url.clone(),
                 cfg.inventory_api_url.clone(),
             ));
-            handlers.register(InventoryPartsProduce::new(cfg.inventory_api_url.clone()));
             // FG cost basis is derived from the brew's real consumed-input
             // cost, not a plug. The drain-actual-wip basis drains exactly
             // what consume capitalized (the ledger's DR-1310 facts), so the

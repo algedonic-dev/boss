@@ -351,6 +351,164 @@ pub fn successor_writes(
     Ok(out)
 }
 
+// -- the second reading: a merge main REVERTED (backlog 7f4694eb) --------
+//
+// WHY. Car 526974b0 merged in train #1784 (d6c3a7037, 2026-11-16 03:48Z),
+// failed every converge, and main REVERTED it in train #1787 (car
+// 6c272983, f325cf542); its intent landed in car bfa6f7be. A revert
+// leaves the merge an ancestor of main, so the lost-merge reading above
+// refused it, and every other terminal records a wrong fact — so the car
+// stood open at `proven` for four days, holding its item open through
+// `item_awaits_its_car`. The same `unlanded` terminal is the truth ("main
+// does not carry this car's change"), read a second way: the merge IS an
+// ancestor, and a revert that main also carries undoes all of it. The
+// successor is NAMED, not opened — it already exists, and usually has
+// already landed.
+
+/// The commit main reverted the merge in — on the job, beside the
+/// terminal, so the packet names it as data rather than prose.
+pub const REVERTED_BY: &str = "reverted_by";
+/// The revert's car, when the revert was named by its car.
+pub const REVERTED_BY_CAR: &str = "reverted_by_car";
+
+fn kind(c: &Value) -> &str {
+    c.get("kind").and_then(Value::as_str).unwrap_or("?")
+}
+
+/// PURE: the merge a REVERT CAR landed as — the commit `--reverted-by
+/// <car>` names. Only a ship-a-change car closed with outcome `merged`:
+/// a revert still in flight has reverted nothing, and git's reading of
+/// that commit is what says whether it reverted THIS merge.
+pub fn revert_car_merge(revert: &Value) -> Result<&str, String> {
+    let id = short(revert);
+    if kind(revert) != "ship-a-change" {
+        return Err(format!(
+            "{id} is a {} packet, not a car — name the revert's car or its merge sha",
+            kind(revert)
+        ));
+    }
+    if revert.get("status").and_then(Value::as_str) != Some("closed")
+        || md(revert, "outcome") != Some("merged")
+    {
+        return Err(format!(
+            "revert car {id} is not closed merged (status {}, outcome {}) — a revert that has \
+             not landed has reverted nothing",
+            revert.get("status").and_then(Value::as_str).unwrap_or("?"),
+            md(revert, "outcome").unwrap_or("none recorded")
+        ));
+    }
+    md(revert, MERGE_REF).ok_or_else(|| {
+        format!("revert car {id} records no `merge_ref`, so nothing says which commit it landed as")
+    })
+}
+
+/// PURE: the evidence that `successor` carries the intent of `car`, whose
+/// merge main reverted — or the refusal. Another ship-a-change car, open
+/// or closed merged, answering the car's own `backlog_item` (as its own
+/// `backlog_item`, or in `also_answers`), and not already superseding a
+/// different car: `supersedes` is one edge, and overwriting it would
+/// erase a recorded fact.
+pub fn reverted_successor(car: &Value, successor: &Value) -> Result<String, String> {
+    let (id, sid) = (short(car), short(successor));
+    if car.get("id") == successor.get("id") {
+        return Err(format!("car {id} cannot be its own successor"));
+    }
+    if kind(successor) != "ship-a-change" {
+        return Err(format!(
+            "{sid} is a {} packet, not a car — a successor is a ship-a-change car",
+            kind(successor)
+        ));
+    }
+    let landed = successor.get("status").and_then(Value::as_str) == Some("closed")
+        && md(successor, "outcome") == Some("merged");
+    if !is_open(successor) && !landed {
+        return Err(format!(
+            "car {sid} is closed without landing (outcome {}) — a spent car carries nothing",
+            md(successor, "outcome").unwrap_or("none recorded")
+        ));
+    }
+    let Some(item) = md(car, BACKLOG_ITEM) else {
+        return Err(format!(
+            "car {id} names no `backlog_item`, so nothing on the record says what its \
+             successor must answer"
+        ));
+    };
+    let also = successor
+        .pointer(&format!("/metadata/{ALSO_ANSWERS}"))
+        .and_then(Value::as_array)
+        .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(item)));
+    let how = if md(successor, BACKLOG_ITEM) == Some(item) {
+        BACKLOG_ITEM
+    } else if also {
+        ALSO_ANSWERS
+    } else {
+        return Err(format!(
+            "car {sid} does not answer item {} (neither its `{BACKLOG_ITEM}` nor in \
+             `{ALSO_ANSWERS}`) — a successor answers the item car {id} answered",
+            &item[..8.min(item.len())]
+        ));
+    };
+    if let Some(other) = md(successor, SUPERSEDES)
+        && Some(other) != car.get("id").and_then(Value::as_str)
+    {
+        return Err(format!(
+            "car {sid} already supersedes car {} — one car replaces one",
+            &other[..8.min(other.len())]
+        ));
+    }
+    Ok(format!(
+        "its intent {} ({}), and it answers the same item {} as its {how}",
+        successor_standing(successor),
+        md(successor, "branch").unwrap_or("?"),
+        &item[..8.min(item.len())]
+    ))
+}
+
+/// PURE: where the named successor's intent stands, as the record says
+/// it. A successor LANDED only on a record of its merge: closed with
+/// outcome `merged`, or still open carrying the conductor's `merged`
+/// marker (a car awaiting proof). Anything else carries the intent and
+/// has not landed it — an open car the verb admits is not a delivery,
+/// and writing "landed" for one is an immutable claim nothing observed
+/// (review b279aa0c, 2026-11-20).
+pub fn successor_standing(successor: &Value) -> String {
+    let sid = short(successor);
+    if is_open(successor) && md(successor, "merged") == Some("true") {
+        return format!(
+            "landed as car {sid} (merged as {}, not yet closed)",
+            md(successor, "merge_ref").unwrap_or("an unrecorded ref")
+        );
+    }
+    if successor.get("status").and_then(Value::as_str) == Some("closed")
+        && md(successor, "outcome") == Some("merged")
+    {
+        return format!("landed as car {sid} (closed merged)");
+    }
+    format!("rides as car {sid}, which has not landed")
+}
+
+/// PURE: the back-edge the named successor is owed — `{supersedes: car}`
+/// — or `None` when it already carries it (a re-run writes nothing).
+pub fn supersedes_patch(car_id: &str, successor: &Value) -> Option<Value> {
+    (md(successor, SUPERSEDES) != Some(car_id)).then(|| json!({ (SUPERSEDES): car_id }))
+}
+
+/// PURE: the job metadata naming the revert, or `None` when a pass
+/// before this one wrote it.
+pub fn reverted_by_patch(car: &Value, revert: &str, revert_car: Option<&str>) -> Option<Value> {
+    let done = md(car, REVERTED_BY) == Some(revert)
+        && revert_car.is_none_or(|c| md(car, REVERTED_BY_CAR) == Some(c));
+    if done {
+        return None;
+    }
+    let mut m = Map::new();
+    m.insert(REVERTED_BY.into(), json!(revert));
+    if let Some(c) = revert_car {
+        m.insert(REVERTED_BY_CAR.into(), json!(c));
+    }
+    Some(Value::Object(m))
+}
+
 /// The successor already opened for `pred_id`, if a pass before this one
 /// got that far — so a re-run finishes the unlanding rather than opening
 /// a second successor. Any status: a successor that has since landed is
@@ -575,5 +733,176 @@ mod tests {
             Some(&json!("s2"))
         );
         assert_eq!(successor_of(&cars, "other"), None);
+    }
+
+    /// Car bfa6f7be's shape on 2026-11-20: closed merged, answering the
+    /// same item as the reverted car, with no `supersedes` yet.
+    fn landed_successor() -> Value {
+        json!({
+            "id": "bfa6f7be-0000-4000-8000-000000000004",
+            "kind": "ship-a-change",
+            "status": "closed",
+            "metadata": {
+                "branch": "fix/pin-postgres-by-purpose",
+                "outcome": "merged",
+                "backlog_item": "11111111-0000-4000-8000-000000000002",
+            },
+        })
+    }
+
+    /// THE NAMED SUCCESSOR (backlog 7f4694eb): open or landed, answering
+    /// the reverted car's item by either key — and owed the back-edge
+    /// only once.
+    #[test]
+    fn a_named_successor_answers_the_same_item_and_is_owed_supersedes_once() {
+        let car = landed_car();
+        let e = reverted_successor(&car, &landed_successor()).unwrap();
+        assert!(e.contains("car bfa6f7be"), "{e}");
+        assert!(e.contains("landed"), "{e}");
+        assert!(e.contains("as its backlog_item"), "{e}");
+
+        let mut also = landed_successor();
+        also["metadata"]["backlog_item"] = json!("33333333-0000-4000-8000-000000000005");
+        also["metadata"]["also_answers"] = json!(["11111111-0000-4000-8000-000000000002"]);
+        assert!(
+            reverted_successor(&car, &also)
+                .unwrap()
+                .contains("as its also_answers")
+        );
+
+        let mut live = landed_successor();
+        live["status"] = json!("open");
+        live["metadata"]["outcome"] = Value::Null;
+        assert!(
+            reverted_successor(&car, &live)
+                .unwrap()
+                .contains("rides as car bfa6f7be, which has not landed")
+        );
+
+        assert_eq!(
+            supersedes_patch(car["id"].as_str().unwrap(), &landed_successor()),
+            Some(json!({"supersedes": "dec3136a-0000-4000-8000-000000000001"}))
+        );
+        let mut linked = landed_successor();
+        linked["metadata"]["supersedes"] = car["id"].clone();
+        assert_eq!(supersedes_patch(car["id"].as_str().unwrap(), &linked), None);
+        assert!(reverted_successor(&car, &linked).is_ok(), "a re-run passes");
+    }
+
+    /// WHERE THE INTENT STANDS (review b279aa0c): a successor is said to
+    /// have LANDED only on a record of its merge — closed `merged`, or the
+    /// conductor's `merged` marker on a car still open awaiting proof. A
+    /// car that is merely open carries the intent; it has not landed it.
+    #[test]
+    fn a_successor_landed_only_when_its_merge_is_on_the_record() {
+        assert_eq!(
+            successor_standing(&landed_successor()),
+            "landed as car bfa6f7be (closed merged)"
+        );
+
+        let mut merged_open = landed_successor();
+        merged_open["status"] = json!("open");
+        merged_open["metadata"]["outcome"] = Value::Null;
+        merged_open["metadata"]["merged"] = json!("true");
+        merged_open["metadata"]["merge_ref"] = json!("eab71518e5aa");
+        assert_eq!(
+            successor_standing(&merged_open),
+            "landed as car bfa6f7be (merged as eab71518e5aa, not yet closed)"
+        );
+
+        let mut fresh = landed_successor();
+        fresh["status"] = json!("open");
+        fresh["metadata"]["outcome"] = Value::Null;
+        assert_eq!(
+            successor_standing(&fresh),
+            "rides as car bfa6f7be, which has not landed"
+        );
+        // A marker that is not "true" is no record of a merge.
+        fresh["metadata"]["merged"] = json!("false");
+        assert!(successor_standing(&fresh).starts_with("rides as"));
+    }
+
+    /// Each successor that is not one is refused, naming why: another
+    /// item, a spent car, a car superseding a different one, itself,
+    /// and not a car at all.
+    #[test]
+    fn a_successor_that_carries_nothing_of_the_car_is_refused_naming_why() {
+        let car = landed_car();
+        let mut other = landed_successor();
+        other["metadata"]["backlog_item"] = json!("33333333-0000-4000-8000-000000000005");
+        let e = reverted_successor(&car, &other).unwrap_err();
+        assert!(e.contains("does not answer item 11111111"), "{e}");
+
+        let mut spent = landed_successor();
+        spent["metadata"]["outcome"] = json!("abandoned");
+        let e = reverted_successor(&car, &spent).unwrap_err();
+        assert!(e.contains("closed without landing"), "{e}");
+
+        let mut taken = landed_successor();
+        taken["metadata"]["supersedes"] = json!("44444444-0000-4000-8000-000000000006");
+        let e = reverted_successor(&car, &taken).unwrap_err();
+        assert!(e.contains("already supersedes car 44444444"), "{e}");
+
+        assert!(
+            reverted_successor(&car, &car)
+                .unwrap_err()
+                .contains("its own successor")
+        );
+
+        let mut item = landed_successor();
+        item["kind"] = json!("backlog-item");
+        assert!(
+            reverted_successor(&car, &item)
+                .unwrap_err()
+                .contains("not a car")
+        );
+
+        let mut no_item = landed_car();
+        no_item["metadata"]["backlog_item"] = Value::Null;
+        assert!(
+            reverted_successor(&no_item, &landed_successor())
+                .unwrap_err()
+                .contains("names no `backlog_item`")
+        );
+    }
+
+    /// `--reverted-by <car>` reads the car's merge — only once it landed.
+    #[test]
+    fn a_revert_car_names_its_merge_only_once_it_landed() {
+        let mut revert = landed_successor();
+        revert["metadata"]["merge_ref"] = json!("f325cf542ee0");
+        assert_eq!(revert_car_merge(&revert), Ok("f325cf542ee0"));
+        let mut riding = revert.clone();
+        riding["status"] = json!("open");
+        let e = revert_car_merge(&riding).unwrap_err();
+        assert!(e.contains("has reverted nothing"), "{e}");
+        let mut unrecorded = revert.clone();
+        unrecorded["metadata"]["merge_ref"] = Value::Null;
+        assert!(
+            revert_car_merge(&unrecorded)
+                .unwrap_err()
+                .contains("no `merge_ref`")
+        );
+    }
+
+    /// The revert is named on the job once — and both keys when its car
+    /// was named.
+    #[test]
+    fn the_revert_is_named_on_the_job_once() {
+        let sha = "f325cf542ee0f325cf542ee0f325cf542ee0f325";
+        let p = reverted_by_patch(&landed_car(), sha, Some("6c272983-x")).unwrap();
+        assert_eq!(
+            p,
+            json!({"reverted_by": sha, "reverted_by_car": "6c272983-x"})
+        );
+        let mut done = landed_car();
+        done["metadata"]["reverted_by"] = json!(sha);
+        done["metadata"]["reverted_by_car"] = json!("6c272983-x");
+        assert_eq!(reverted_by_patch(&done, sha, Some("6c272983-x")), None);
+        assert_eq!(reverted_by_patch(&done, sha, None), None);
+        assert_eq!(
+            reverted_by_patch(&landed_car(), sha, None),
+            Some(json!({"reverted_by": sha}))
+        );
     }
 }

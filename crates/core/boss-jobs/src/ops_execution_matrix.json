@@ -1,0 +1,105 @@
+{
+  "about": "How an ops-request's verb ENDED, one row per execute record shape (design b7bb1625, backlog 50a1578f). Read by BOTH classifiers: boss-jobs ops_execution.rs (the_matrix_is_how_this_classifier_reads) and apps/web/src/it/ops-execution.ts (ops-execution.test.ts), so the web reads every record the way the CLI, the regions and the judges do. A fact that lives twice gets an equality test (CLAUDE.md 9a): this file is that test's one copy of the cases.",
+  "cases": [
+    {
+      "name": "the legacy answered move that exited 1 (ops-request 02035ff0, pinned v17)",
+      "record": { "disposition": "answered", "exit_code": "1", "duration_ms": 1207430, "runner_host": "forge", "output": "move: FAILED after 1204s — new replica r-d1d689a5 still rebuilding\n" },
+      "label": "failed", "outcome_kind": "failed", "exit": "1", "succeeded": false, "not_yet": false, "timed_out": false
+    },
+    {
+      "name": "a refusal ran nothing and keeps its recorded reason",
+      "record": { "disposition": "refused", "reason": "publish-workflow is not in this host's allowlist", "output": "REFUSED\n", "exit_code": null },
+      "label": "refused", "outcome_kind": "aborted", "exit": null, "succeeded": false, "not_yet": false, "reason": "publish-workflow is not in this host's allowlist"
+    },
+    {
+      "name": "a refusal with no reason key keeps its output as the reason",
+      "record": { "disposition": "refused", "output": "plan sha does not match the signed plan" },
+      "label": "refused", "outcome_kind": "aborted", "exit": null, "succeeded": false, "not_yet": false, "reason": "plan sha does not match the signed plan"
+    },
+    {
+      "name": "a refusal that recorded no reason has none, and none is invented",
+      "record": { "disposition": "refused", "reason": "  ", "output": "" },
+      "label": "refused", "outcome_kind": "aborted", "exit": null, "succeeded": false, "not_yet": false, "reason": null
+    },
+    {
+      "name": "a refusal that records an exit contradicts itself",
+      "record": { "disposition": "refused", "exit_code": "1" },
+      "label": "indeterminate", "outcome_kind": "failed", "exit": "1", "succeeded": false, "not_yet": false
+    },
+    {
+      "name": "exit 0 with no effect qualification",
+      "record": { "disposition": "answered", "exit_code": "0", "output": "ran\n" },
+      "label": "answered", "outcome_kind": "completed", "exit": "0", "succeeded": true, "not_yet": false, "effect": "undeclared"
+    },
+    {
+      "name": "exit 0 with its effect shown",
+      "record": { "disposition": "answered", "exit_code": "0", "effect": "acts: OK — deleted 3" },
+      "label": "answered", "outcome_kind": "completed", "exit": "0", "succeeded": true, "not_yet": false, "effect": "shown", "effect_text": "acts: OK — deleted 3"
+    },
+    {
+      "name": "exit 0 whose verb declares no read-back",
+      "record": { "disposition": "answered", "exit_code": "0", "effect_unread": "prints no re-list" },
+      "label": "answered", "outcome_kind": "completed", "exit": "0", "succeeded": true, "not_yet": false, "effect": "unread", "effect_text": "prints no re-list"
+    },
+    {
+      "name": "exit 0 whose effect is unproven is not a success, even beside a matched line",
+      "record": { "disposition": "answered", "exit_code": "0", "effect": "acts: OK", "effect_unproven": "no line matched" },
+      "label": "answered", "outcome_kind": "completed", "exit": "0", "succeeded": false, "not_yet": false, "effect": "unproven", "effect_text": "no line matched"
+    },
+    {
+      "name": "exit 75 is the estate's not yet",
+      "record": { "disposition": "answered", "exit_code": "75", "output": "not yet: a converge is running\n" },
+      "label": "failed", "outcome_kind": "not_yet", "exit": "75", "succeeded": false, "not_yet": true, "timed_out": false
+    },
+    {
+      "name": "a numeric exit reads like its string",
+      "record": { "disposition": "answered", "exit_code": 1 },
+      "label": "failed", "outcome_kind": "failed", "exit": "1", "succeeded": false, "not_yet": false, "timed_out": false
+    },
+    {
+      "name": "124 is a timeout on the wrapper's own kill line",
+      "record": { "disposition": "answered", "exit_code": "124", "output": "reading df\n\n[ops-runner: command killed at 300s timeout]\n" },
+      "label": "failed", "outcome_kind": "failed", "exit": "124", "succeeded": false, "not_yet": false, "timed_out": true
+    },
+    {
+      "name": "124 without the kill line claims no timeout",
+      "record": { "disposition": "answered", "exit_code": "124" },
+      "label": "failed", "outcome_kind": "failed", "exit": "124", "succeeded": false, "not_yet": false, "timed_out": false
+    },
+    {
+      "name": "an invoked verb with a null exit is unknown",
+      "record": { "disposition": "answered", "exit_code": null },
+      "label": "indeterminate", "outcome_kind": "failed", "exit": null, "succeeded": false, "not_yet": false
+    },
+    {
+      "name": "an invoked verb with an empty exit is unknown",
+      "record": { "disposition": "answered", "exit_code": "" },
+      "label": "indeterminate", "outcome_kind": "failed", "exit": null, "succeeded": false, "not_yet": false
+    },
+    {
+      "name": "an invoked verb with no exit key is unknown",
+      "record": { "disposition": "answered", "output": "x" },
+      "label": "indeterminate", "outcome_kind": "failed", "exit": null, "succeeded": false, "not_yet": false
+    },
+    {
+      "name": "a malformed exit is unknown and keeps its raw value",
+      "record": { "disposition": "answered", "exit_code": "abc" },
+      "label": "indeterminate", "outcome_kind": "failed", "exit": "abc", "succeeded": false, "not_yet": false
+    },
+    {
+      "name": "a negative exit is not an exit status",
+      "record": { "disposition": "answered", "exit_code": "-1" },
+      "label": "indeterminate", "outcome_kind": "failed", "exit": "-1", "succeeded": false, "not_yet": false
+    },
+    {
+      "name": "a record with no disposition never reads as nothing ran",
+      "record": { "exit_code": "1" },
+      "label": "indeterminate", "outcome_kind": "failed", "exit": "1", "succeeded": false, "not_yet": false
+    },
+    {
+      "name": "a disposition this reader does not know is unknown",
+      "record": { "disposition": "weird", "exit_code": "0" },
+      "label": "indeterminate", "outcome_kind": "failed", "exit": "0", "succeeded": false, "not_yet": false
+    }
+  ]
+}

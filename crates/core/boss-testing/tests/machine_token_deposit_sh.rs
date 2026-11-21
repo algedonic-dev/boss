@@ -24,18 +24,19 @@
 //! mode bits (`the_tree_is_owner_only`); it was run as root on the dev
 //! pod for the car's receipt.
 //!
-//! WHAT NO TEST HERE CAN HOLD — two roads, both older than this deposit,
-//! by which a shell as david reaches the root-only token on the real host
-//! today (a probe no longer runs as david; backlog dda26693): (1) david holds `sudo -n docker` there
-//! (infra/estate/ops-credentials.sh reads /etc/boss-ops through it),
-//! which reaches any root file; (2) forge-converge.service runs
-//! /home/david/boss/infra/forge/forge-converge.sh AS ROOT out of david's
-//! own checkout, and the deposit and the libraries it sources execute
-//! from there before the converge's checkout -f, so any shell as david
-//! can edit what root runs within ten minutes. The modes this file
-//! holds keep the token from a direct read and from an accident; what
-//! took probe text off both roads is a probe account of its own
-//! (design-doc bdc60b65, question probe-user; car 1386dd64).
+//! WHAT NO TEST HERE CAN HOLD — one road, older than this deposit, by
+//! which a shell as david reaches the root-only token on the real host
+//! (a probe no longer runs as david; backlog dda26693): david holds
+//! `sudo -n docker` there (infra/estate/ops-credentials.sh reads
+//! /etc/boss-ops through it; kept as David's own, position B on backlog
+//! a604a35b), which reaches any root file. The second road this doc
+//! named until backlog b4e41c9b, root running the deposit out of
+//! david's checkout, is closed: forge-converge.service runs it as root
+//! from root's own tree, /var/lib/boss/tree/current (infra/forge/
+//! root-tree.sh; backlog a604a35b). The modes this file holds keep the
+//! token from a direct read and from an accident; what took probe text
+//! off that road is a probe account of its own (design-doc bdc60b65,
+//! question probe-user; car 1386dd64).
 
 use boss_testing::{create_dir, repo_root, scratch_dir, without_proxy, write_exec, write_file};
 use std::io::{BufRead, BufReader, Read, Write};

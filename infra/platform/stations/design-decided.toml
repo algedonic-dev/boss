@@ -36,13 +36,22 @@
 # LIVE newest, v3): the station stands in the tree — its stable `id`, its
 # `parent` /algedonic/executive (proposal section 6), its mode. Nothing
 # else changed.
+#
+# Version 6 (car 1 of design 2910ec3d, backlog 878fd1e7; bumped from the
+# LIVE newest, v5): the executive desk dissolved into the company, and
+# this board left it for engineering's `design` station, beside
+# `design-review` — it is the design station's OUT, the panel its page
+# reads after the queue, and design 01fa5bdf (David, 2026-11-17) places
+# design under engineering/design. Only `parent` changed; the `id`,
+# the predicate and the window are the same, so the board holds the
+# same packets at its new address.
 # ---------------------------------------------------------------------------
 
 [[station]]
 name = "design-decided"
-version = 5
+version = 6
 id = "ebbae18b-5bee-468e-8be7-53aa54a91e87"
-parent = "5f922a2a-31f5-4f07-acf1-41dc140687a4"
+parent = "cc856b32-3667-4e70-b6cd-667f6fe89007"
 mode = "standing"
 status = "active"
 title = "Decided designs — folding and settled"

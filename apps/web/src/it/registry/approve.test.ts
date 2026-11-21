@@ -233,6 +233,22 @@ describe('rowState', () => {
     expect(rowState(kind, latest({ disposition: 'refused', exit_code: null }), measuredAt)).toEqual({ kind: 'adrift' });
   });
 
+  test('an exit 0 whose effect is unproven is not a success, so it supersedes nothing (backlog 50a1578f)', () => {
+    const raw = request({ output: published });
+    const steps = (raw.steps as Array<Record<string, unknown>>).map((s) =>
+      s.spec_slug === 'execute' ? { ...s, metadata: { ...(s.metadata as Record<string, unknown>), effect_unproven: 'no confirmation line' } } : s,
+    );
+    const [unproven] = parsePublishRequests([{ ...raw, steps }]);
+    expect(unproven?.execution).toMatchObject({ kind: 'answered', effect: { kind: 'unproven' } });
+    expect(rowState(kind, unproven ?? null, measuredAt)).toEqual({ kind: 'adrift' });
+  });
+
+  test('the answer is read by the one classifier: a nonzero exit is failed, an open execute has none', () => {
+    expect(latest({ exit_code: '1' })?.execution).toMatchObject({ kind: 'failed', exit: '1' });
+    expect(latest({ disposition: 'refused', exit_code: null })?.execution).toMatchObject({ kind: 'refused' });
+    expect(latest({ status: 'open', disposition: null })?.execution).toBeNull();
+  });
+
   test('a --check that answers 0 wrote nothing, so it supersedes nothing', () => {
     expect(rowState(kind, latest({ args: ['ship-a-change', '--check'], output: 'publish-workflow: --check ok: would publish' }), measuredAt)).toEqual({ kind: 'adrift' });
   });

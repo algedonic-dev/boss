@@ -55,9 +55,13 @@ clean() { LC_ALL=C.UTF-8 sed 's/[[:cntrl:]]//g'; }
 echo "BOSS standby shell on ${HOSTNAME:-this pod}, $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 say "This pod builds nothing. It reads the record and the cluster from inside the LAN."
 
-# DEV POD. kubectl's own --request-timeout bounds the API call, and
-# timeout bounds everything around it.
-pods=$(timeout 15 kubectl get pods -n "$NS" -l app=boss-dev --request-timeout=10s \
+# DEV POD. timeout bounds each kubectl call; kubectl takes NO flag that
+# overrides its config. The standby has no kubeconfig file and reaches the
+# cluster through client-go's in-cluster fallback, which is taken only
+# when no override is set: --request-timeout=10s here made kubectl dial
+# localhost:8080 instead, and the banner read "unavailable" on every login
+# (backlog 41e90111, 2026-11-21).
+pods=$(timeout 15 kubectl get pods -n "$NS" -l app=boss-dev \
     -o jsonpath='{range .items[*]}{.metadata.name} {.status.phase} {.spec.nodeName}{"\n"}{end}' 2>&1)
 rc=$?
 if [ "$rc" -ne 0 ]; then
@@ -74,7 +78,7 @@ else
         # 75a760c9, finding 5), and kubectl leaves null-keyed rows in API
         # order, so the old sort was right only by a naming coincidence.
         events=$(timeout 15 kubectl get events -n "$NS" --field-selector "involvedObject.name=$name" \
-            --sort-by=.metadata.creationTimestamp --request-timeout=10s \
+            --sort-by=.metadata.creationTimestamp \
             -o jsonpath='{range .items[*]}{.reason}: {.message}{"\n"}{end}' 2>&1)
         erc=$?
         last=$(printf '%s\n' "$events" | tail -n 1)

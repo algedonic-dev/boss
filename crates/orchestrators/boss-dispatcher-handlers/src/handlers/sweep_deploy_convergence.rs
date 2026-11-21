@@ -30,7 +30,7 @@ pub(crate) enum Standing {
     /// Converged inside the arm.
     Converged { lag_s: i64 },
     /// Converged, but later than the arm — a lag worth a look even
-    /// though it resolved itself.
+    /// though it resolved itself. Recorded as a finding; routes clear.
     Late { lag_s: i64 },
     /// Open, merged less than the arm ago, converge not yet observed.
     Converging { waited_s: i64 },
@@ -47,6 +47,17 @@ impl Standing {
             self,
             Standing::Late { .. } | Standing::Overdue { .. } | Standing::ClosedUnconverged
         )
+    }
+
+    /// A defect still standing when the sweep reads it, so the sweep
+    /// owes a Remediate step. `Late` is a finding and NOT this: the
+    /// train converged, the 30-min arm raised on it at the time, and
+    /// nothing is left to remediate. Routing it to Remediate opened an
+    /// obligation nobody owed, which sat 3-7 days and held the daily
+    /// cadence shut behind its one-open guard six times (backlog
+    /// ead2898e; a6f8df8a 2026-11-17..21, 449e744c, ab7ce3b1, …).
+    pub(crate) fn is_standing_defect(&self) -> bool {
+        matches!(self, Standing::Overdue { .. } | Standing::ClosedUnconverged)
     }
 }
 
@@ -235,7 +246,7 @@ pub(crate) fn inspect(trains: &[Value], now: DateTime<Utc>, actor: &str) -> Insp
             .collect()
     };
     Inspection {
-        action_needed: !findings.is_empty(),
+        action_needed: rows.iter().any(|r| r.standing.is_standing_defect()),
         findings,
         measured,
         items,
@@ -280,20 +291,74 @@ mod tests {
         assert!(!rows[0].standing.is_finding());
     }
 
+    /// A train that converged past the arm DID converge: the lag is
+    /// history, recorded in the findings and on its item, and the
+    /// 30-min estate arm was its alarm at the time. It owes no
+    /// remediation, so it routes clear — six sweeps routed it to
+    /// Remediate, sat 3-7 days with nothing to do, and each held the
+    /// daily cadence shut behind its own one-open guard (backlog
+    /// ead2898e, a6f8df8a 2026-11-17..21).
     #[test]
-    fn a_converge_past_the_arm_is_late_and_a_finding() {
-        let rows = convergence_rows(
-            &[train(
-                "t1",
-                "closed",
-                Some("2026-09-12T18:00:00Z"),
-                Some("2026-09-12T18:45:00Z"),
-            )],
-            at("2026-09-11T20:00:00Z"),
-            at(NOW),
-        );
+    fn a_converge_past_the_arm_is_late_recorded_and_routes_clear() {
+        let trains = [train(
+            "t1",
+            "closed",
+            Some("2026-09-12T18:00:00Z"),
+            Some("2026-09-12T18:45:00Z"),
+        )];
+        let rows = convergence_rows(&trains, at("2026-09-11T20:00:00Z"), at(NOW));
         assert_eq!(rows[0].standing, Standing::Late { lag_s: 2700 });
         assert!(rows[0].standing.is_finding());
+        assert!(!rows[0].standing.is_standing_defect());
+
+        let insp = inspect(&trains, at(NOW), "automation:test");
+        assert!(!insp.action_needed, "a converged train owes nothing");
+        assert_eq!(insp.findings.len(), 1, "the late episode stays on record");
+        assert!(
+            insp.findings[0].starts_with(
+                "t1: PR train t1 merged 18:00Z → converged +45 min — LATE, past the 30-min arm"
+            ),
+            "{}",
+            insp.findings[0]
+        );
+        assert_eq!(insp.items.len(), 1);
+    }
+
+    #[test]
+    fn an_overdue_train_still_needs_action_beside_a_late_one() {
+        let insp = inspect(
+            &[
+                train(
+                    "late",
+                    "closed",
+                    Some("2026-09-12T15:00:00Z"),
+                    Some("2026-09-12T16:00:00Z"),
+                ),
+                train("t9", "open", Some("2026-09-12T18:00:00Z"), None),
+            ],
+            at(NOW),
+            "automation:test",
+        );
+        assert!(insp.action_needed);
+        assert_eq!(insp.findings.len(), 2);
+    }
+
+    #[test]
+    fn a_closed_unconverged_train_routes_to_remediate() {
+        let insp = inspect(
+            &[train("t8", "closed", Some("2026-09-12T19:00:00Z"), None)],
+            at(NOW),
+            "automation:test",
+        );
+        assert!(insp.action_needed);
+        assert_eq!(insp.findings.len(), 1);
+        assert!(
+            insp.findings[0].starts_with(
+                "t8: PR train t8 merged 19:00Z → closed without the cluster ever observed running it"
+            ),
+            "{}",
+            insp.findings[0]
+        );
     }
 
     #[test]
@@ -316,6 +381,7 @@ mod tests {
         );
         assert_eq!(rows[0].standing, Standing::Overdue { waited_s: 3600 });
         assert!(rows[0].standing.is_finding());
+        assert!(rows[0].standing.is_standing_defect());
     }
 
     #[test]
@@ -327,6 +393,7 @@ mod tests {
         );
         assert_eq!(rows[0].standing, Standing::ClosedUnconverged);
         assert!(rows[0].standing.is_finding());
+        assert!(rows[0].standing.is_standing_defect());
     }
 
     #[test]

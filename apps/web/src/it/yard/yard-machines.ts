@@ -15,7 +15,8 @@
 // in one write, so an `active` step is possible but never seen. The
 // packet therefore distinguishes: requested (open, unanswered),
 // running (claimed, or answered and the unit just started), failed
-// (refused, or a non-zero exit other than the not-yet 75), and idle (the last converge on
+// (refused, a non-zero exit other than the not-yet 75, or an answer the
+// classifier cannot call a success), and idle (the last converge on
 // record). "Done" is not a separate state the packet can tell from
 // idle, so it is not one here.
 //
@@ -24,7 +25,8 @@
 // fetch that fails or answers non-2xx is DARK; that is the reading the
 // 2026-09-05 outage wanted a page to show.
 
-import { exitFailed, type JobLite, type StepLite } from './yard';
+import { executionLine, executionSucceeded, readExecution } from '../ops-execution';
+import { type JobLite, type StepLite } from './yard';
 import { clockText, elapsedText } from './yard-status';
 
 // ---------------------------------------------------------------------
@@ -63,19 +65,24 @@ const ms = (s: string | null): number => {
   return Number.isNaN(n) ? Number.NEGATIVE_INFINITY : n;
 };
 
-/** The reason a converge failed, from the execute step's own record:
- *  a refusal names the allowlist unless the runner wrote a reason; a
- *  non-zero exit carries its code and the first line of output. Exit
- *  75 is NOT a failure (`exitFailed`): the converge verb says "not
- *  yet" when a converge already running took its start, and that run
- *  is the one the shed should show. */
+/** The reason a converge failed, from the execute step's own record,
+ *  read by the one classifier (`readExecution`, design b7bb1625): a
+ *  refusal names the reason the runner recorded, and none it did not —
+ *  this said "outside the allowlist" for every reasonless refusal
+ *  (backlog 50a1578f); a non-zero exit carries its code and the first
+ *  line of output; an answer with no trustworthy exit, or an exit 0
+ *  whose effect is unproven, is trouble rather than idle. Exit 75 is
+ *  NOT a failure: the converge verb says "not yet" when a converge
+ *  already running took its start, and that run is the one the shed
+ *  should show. Only a COMPLETED execute has an answer to read. */
 function failure(execute: StepLite | null): string | null {
-  const m = execute?.metadata ?? {};
+  if (execute?.status !== 'completed') return null;
+  const m = execute.metadata ?? {};
+  const e = readExecution(m);
+  if (executionSucceeded(e) || (e.kind === 'failed' && e.notYet)) return null;
   const output = (str(m.output) ?? '').split('\n')[0]?.trim() ?? '';
-  if (m.disposition === 'refused') return output !== '' ? output : 'refused — outside the allowlist';
-  const code = str(m.exit_code);
-  if (exitFailed(code)) return output !== '' ? `exit ${code} — ${output}` : `exit ${code}`;
-  return null;
+  if (e.kind === 'failed') return output !== '' ? `exit ${e.exit} — ${output}` : `exit ${e.exit}`;
+  return executionLine(e);
 }
 
 /** The shed, from the ops-request rows the page fetched (null before

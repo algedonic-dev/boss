@@ -18,6 +18,7 @@
   // each piece at the stop it reached.
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { href, navigate } from '../router';
+  import { treeHref } from '../it/tree/station-tree';
   import { NO_TRACK, placeOnTrack, type FeedbackPacket, type PacketTrack } from './packetTrack';
 
   type Props = Readonly<{ greeting: string }>;
@@ -82,7 +83,7 @@
   <!-- "Buy some beer" opened /ux/shop, which went with step 1 of design
        01fa5bdf; the work now moves on the station tree, not the map. -->
   <section class="guest-tour">
-    <button type="button" class="guest-tour-card" onclick={() => go('/it/tree')}>
+    <button type="button" class="guest-tour-card" onclick={() => go(treeHref(null))}>
       <span class="guest-tour-h">Watch the work move →</span>
       <span class="guest-tour-p">
         Every order becomes a job packet that walks the same brewhouse,

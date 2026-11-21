@@ -94,16 +94,42 @@ describe('runnerMachine — the deploy-runner shed, from the converge packets', 
     expect(runnerLabel(m, NOW)).toBe('idle · last 02:22 UTC');
   });
 
-  test('a refusal is failed with the reason; an empty output names the allowlist', () => {
-    const refused = ops(
-      'r1',
+  test('a refusal is failed with the reason it recorded, and invents none (backlog 50a1578f)', () => {
+    const refusal = (id: string, md: Record<string, unknown>): JobLite =>
+      ops(
+        id,
+        'closed',
+        { opened_at: '2026-09-08T02:30:00Z', closed_at: '2026-09-08T02:30:40Z', outcome: 'refused' },
+        { status: 'completed', metadata: { disposition: 'refused', runner_host: 'forge', ...md } },
+      );
+    const bare = runnerMachine([refusal('r1', { output: '' })], NOW);
+    expect(bare).toEqual({ kind: 'failed', id: 'r1', at: '2026-09-08T02:30:40Z', reason: 'refused — the runner recorded no reason' });
+    expect(runnerLabel(bare, NOW)).toBe('FAILED · refused — the runner recorded no reason');
+    const named = runnerMachine([refusal('r2', { reason: 'plan sha does not match\nmore', output: 'REFUSED' })], NOW);
+    expect(named).toMatchObject({ kind: 'failed', reason: 'refused — plan sha does not match' });
+  });
+
+  test('an answer the classifier cannot call a success is failed, never idle (design b7bb1625)', () => {
+    const noExit = ops(
+      'u1',
       'closed',
-      { opened_at: '2026-09-08T02:30:00Z', closed_at: '2026-09-08T02:30:40Z', outcome: 'refused' },
-      { status: 'completed', metadata: { disposition: 'refused', output: '', runner_host: 'forge' } },
+      { opened_at: '2026-09-08T02:30:00Z', closed_at: '2026-09-08T02:30:40Z', outcome: 'indeterminate' },
+      { status: 'completed', metadata: { disposition: 'answered', runner_host: 'forge' } },
     );
-    const m = runnerMachine([refused], NOW);
-    expect(m).toEqual({ kind: 'failed', id: 'r1', at: '2026-09-08T02:30:40Z', reason: 'refused — outside the allowlist' });
-    expect(runnerLabel(m, NOW)).toBe('FAILED · refused — outside the allowlist');
+    expect(runnerMachine([noExit], NOW)).toMatchObject({
+      kind: 'failed',
+      reason: 'indeterminate — the verb was invoked and no exit was recorded',
+    });
+    const unproven = ops(
+      'u2',
+      'closed',
+      { opened_at: '2026-09-08T02:30:00Z', closed_at: '2026-09-08T02:30:40Z', outcome: 'answered' },
+      { status: 'completed', metadata: { disposition: 'answered', exit_code: '0', effect_unproven: 'no rollout line', runner_host: 'forge' } },
+    );
+    expect(runnerMachine([unproven], NOW)).toMatchObject({
+      kind: 'failed',
+      reason: 'answered · exit 0 · effect unproven — no rollout line',
+    });
   });
 
   test('a non-zero exit is failed with the exit code and the first line of output', () => {

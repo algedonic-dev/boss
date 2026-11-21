@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { parseStationLoad } from '../marshalling/marshalling';
-import { claimsRead, heldClaim, treeRead } from '../../../tests/fixtures/station-tree';
+import { ADDRESSES, claimsRead, heldClaim, treeRead } from '../../../tests/fixtures/station-tree';
 import { parseRoute } from '../../router';
 import { parseTree, type StationTree } from './station-tree';
 import {
@@ -47,15 +47,25 @@ const page = (name: string, r: PageReads = reads()): StationPageModel => {
 };
 
 describe('the page address', () => {
-  test('a station opens at /it/tree/<name>; the floor keeps /it/tree; a view in the query is ignored', () => {
-    expect(stationHref('engineering')).toBe('/it/tree/engineering');
-    expect(stationHref('q.platform-admin.task')).toBe('/it/tree/q.platform-admin.task');
-    expect(parseRoute('/it/tree/engineering', '')).toEqual({ kind: 'systemStation', station: 'engineering' });
-    expect(parseRoute('/it/tree/gates', '?view=track')).toEqual({ kind: 'systemStation', station: 'gates' });
-    expect(parseRoute('/it/tree/gates', '?view=nowhere')).toEqual({ kind: 'systemStation', station: 'gates' });
-    expect(parseRoute('/it/tree/a%20b', '')).toEqual({ kind: 'systemStation', station: 'a b' });
-    expect(parseRoute('/it/tree', '')).toEqual({ kind: 'systemTree' });
-    expect(parseRoute('/it/tree/a/b', '').kind).toBe('notFound');
+  // A station's page sits below the tree floor, which the company root
+  // hosts since backlog 92bfcb04 (car 3 of design df0ecd8b), so it opens
+  // at /tree/<name> and the /it/tree spelling answers nothing (no shims
+  // before 1.0.0).
+  test('a station opens at /tree/<name>; the floor keeps /tree; a view in the query is ignored', () => {
+    expect(stationHref('engineering')).toBe('/tree/engineering');
+    expect(stationHref('q.platform-admin.task')).toBe('/tree/q.platform-admin.task');
+    expect(parseRoute('/tree/engineering', '', ADDRESSES)).toEqual({ kind: 'systemStation', station: 'engineering' });
+    expect(parseRoute('/tree/gates', '?view=track', ADDRESSES)).toEqual({ kind: 'systemStation', station: 'gates' });
+    expect(parseRoute('/tree/gates', '?view=nowhere', ADDRESSES)).toEqual({ kind: 'systemStation', station: 'gates' });
+    expect(parseRoute('/tree/a%20b', '', ADDRESSES)).toEqual({ kind: 'systemStation', station: 'a b' });
+    expect(parseRoute('/tree', '', ADDRESSES)).toEqual({ kind: 'systemTree' });
+    expect(parseRoute('/tree/a/b', '', ADDRESSES).kind).toBe('notFound');
+  });
+
+  test('the /it/tree spelling of a station page answers nothing', () => {
+    for (const path of ['/it/tree/engineering', '/it/tree/gates', '/it/tree/a%20b']) {
+      expect(parseRoute(path, '', ADDRESSES)).toEqual({ kind: 'notFound', path });
+    }
   });
 });
 
@@ -87,7 +97,7 @@ describe('the breadcrumb is the parent chain, and trouble climbs it', () => {
   test('root first, each a page link, the current station last', () => {
     const crumbs = breadcrumb(tree(), 'gates', { load: { kind: 'ready', data: loadMap() }, claims: { kind: 'loading' } });
     expect(crumbs.map((c) => c.name)).toEqual(['company', 'engineering', 'gates']);
-    expect(crumbs.map((c) => c.href)).toEqual(['/it/tree/company', '/it/tree/engineering', '/it/tree/gates']);
+    expect(crumbs.map((c) => c.href)).toEqual(['/tree/company', '/tree/engineering', '/tree/gates']);
     expect(crumbs.map((c) => c.current)).toEqual([false, false, true]);
   });
 
@@ -102,8 +112,8 @@ describe('the breadcrumb is the parent chain, and trouble climbs it', () => {
 describe('the walk upstream is the parent station page, derived from the tree', () => {
   test('a station walks up to its parent, at a page the router serves', () => {
     const up = upstreamOf(tree(), 'gates');
-    expect(up).toEqual({ name: 'engineering', title: expect.any(String), href: '/it/tree/engineering' });
-    expect(parseRoute(up!.href, '').kind).toBe('systemStation');
+    expect(up).toEqual({ name: 'engineering', title: expect.any(String), href: '/tree/engineering' });
+    expect(parseRoute(up!.href, '', ADDRESSES).kind).toBe('systemStation');
   });
 
   test('the root has no parent, so no walk upstream rather than a guessed one', () => {
@@ -112,7 +122,7 @@ describe('the walk upstream is the parent station page, derived from the tree', 
 
   test('the page model carries it', () => {
     const model = stationPage(tree(), 'gates', reads());
-    expect(model?.upstream?.href).toBe('/it/tree/engineering');
+    expect(model?.upstream?.href).toBe('/tree/engineering');
   });
 });
 

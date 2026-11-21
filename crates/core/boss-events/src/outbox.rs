@@ -1207,8 +1207,9 @@ pub async fn drain_outbox_once(
                 changed.join(", ")
             );
             // Drop only queues SQLx's rollback. Until the pool flushes it,
-            // a retry can SKIP LOCKED our own refused row and report zero.
-            // Finish the refusal before returning it (f9cfb5ed).
+            // a retry's ordered FOR UPDATE claim waits on our own refused
+            // row and fails at lock_timeout instead of seeing the refusal.
+            // Finish the refusal before returning it (f9cfb5ed; b70be50d).
             tx.rollback().await.map_err(|rollback| {
                 format!("{conflict}; rolling back the refused batch failed: {rollback}")
             })?;

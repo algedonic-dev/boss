@@ -295,72 +295,25 @@ pub struct ClaimsReading {
     pub pools: Vec<PoolReading>,
     pub binding: Option<String>,
 }
-/// One answerable cut of the history: an audit sequence a read may take as
-/// `as_of`, with the record time it carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Cut {
-    pub seq: i64,
-    pub at: DateTime<Utc>,
-}
-/// The most cuts one index answer carries, and the default when the caller
-/// names none. Bounded like every read of this lens.
-pub const MAX_CUT_BUCKETS: usize = 1024;
-pub const DEFAULT_CUT_BUCKETS: usize = 256;
-/// The retained cuts, published so a review screen scrubs only cuts the
-/// server can answer (console car 3c, item c46a4e99). Car 3 stated retention
-/// as TIME only; an arbitrary sequence could 400 and a pruned one 410, so no
-/// drag scale or time interpolation was valid. This read states the bounds —
-/// the head and the first retained cut — and an index over `[from, to]`:
-/// every answerable cut in the range when they fit in `buckets`, else the
-/// last cut of each equal time slice with the range's first and last cuts
-/// kept (`complete` says which). Every cut listed is one `read(Some(seq))`
-/// answers: recorded, after the pruned horizon, inside retention, and not
-/// bisecting an original transaction.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CutsReading {
-    pub projection: ProjectionBasis,
-    pub head: Cut,
-    /// The global earliest cut a read still answers. No retained cut inside
-    /// 168 hours is an explicit refusal, never an expired head offered here.
-    pub first_retained: Cut,
-    pub pruned_through: i64,
-    pub retained_from: DateTime<Utc>,
-    pub retention_hours: i64,
-    /// The range as answered: never before `retained_from`, never after now.
-    pub from: DateTime<Utc>,
-    pub to: DateTime<Utc>,
-    pub buckets: usize,
-    pub complete: bool,
-    pub cuts: Vec<Cut>,
-    /// Request-local measurements, not inferred table sizes or server health.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub read_basis: Option<CutsReadBasis>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CutsReadBasis {
-    /// Exact when `range_count_exact`, otherwise a witnessed lower bound
-    /// (buckets+1), sufficient to choose sampled versus whole output.
-    pub range_count: usize,
-    pub range_count_exact: bool,
-    pub query_ms: Vec<CutsQueryTime>,
-}
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CutsQueryTime {
+/// One finished span of a [`ReadTrace`]: the statement and its time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadQueryTime {
     pub query: String,
     pub elapsed_ms: u64,
 }
 /// An explicit, request-owned observer survives cancellation of the read
 /// future. The HTTP deadline can name the query it interrupted, without a
-/// singleton, another read, or extending either existing deadline.
+/// singleton, another read, or extending either existing deadline. Built
+/// for the retired cuts index and kept, renamed, for the head read
+/// (backlog 81f8e468, 4bec011d).
 #[derive(Clone, Default)]
-pub struct CutsTrace(std::sync::Arc<std::sync::Mutex<CutsTraceState>>);
+pub struct ReadTrace(std::sync::Arc<std::sync::Mutex<ReadTraceState>>);
 #[derive(Default)]
-struct CutsTraceState {
+struct ReadTraceState {
     active: Option<(&'static str, tokio::time::Instant)>,
-    finished: Vec<CutsQueryTime>,
+    finished: Vec<ReadQueryTime>,
 }
-impl CutsTrace {
+impl ReadTrace {
     pub fn start(&self, query: &'static str) {
         if let Ok(mut state) = self.0.lock() {
             state.active = Some((query, tokio::time::Instant::now()));
@@ -370,17 +323,11 @@ impl CutsTrace {
         if let Ok(mut state) = self.0.lock()
             && let Some((query, start)) = state.active.take()
         {
-            state.finished.push(CutsQueryTime {
+            state.finished.push(ReadQueryTime {
                 query: query.into(),
                 elapsed_ms: start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
             });
         }
-    }
-    pub fn times(&self) -> Vec<CutsQueryTime> {
-        self.0
-            .lock()
-            .map(|state| state.finished.clone())
-            .unwrap_or_default()
     }
     pub fn describe(&self) -> String {
         self.0
@@ -400,71 +347,6 @@ impl CutsTrace {
             .unwrap_or_else(|_| "query trace unavailable: observer lock poisoned".into())
     }
 }
-/// PURE: the range an index covers, as answered. `from` defaults to the
-/// retention floor and is clamped to it; `to` defaults to `now` and is
-/// clamped to it; an inverted range or a bucket count outside
-/// 1..=MAX_CUT_BUCKETS is refused.
-pub(super) fn cut_range(
-    from: Option<DateTime<Utc>>,
-    to: Option<DateTime<Utc>>,
-    buckets: usize,
-    now: DateTime<Utc>,
-) -> Result<(DateTime<Utc>, DateTime<Utc>), ClaimsError> {
-    if !(1..=MAX_CUT_BUCKETS).contains(&buckets) {
-        return Err(ClaimsError::Invalid(format!(
-            "buckets must be 1..{MAX_CUT_BUCKETS}"
-        )));
-    }
-    let floor = now - chrono::Duration::hours(memory::RETENTION_HOURS);
-    let from = from.unwrap_or(floor).max(floor);
-    let to = to.unwrap_or(now).min(now);
-    if from > to {
-        return Err(ClaimsError::Invalid("cut range is inverted".into()));
-    }
-    Ok((from, to))
-}
-/// PURE: which of `buckets` equal slices of `[from, to]` a time falls in,
-/// 0-based, `to` itself in the last. Integer microseconds and truncating
-/// division, so the Postgres adapter's SQL and this agree to the tick.
-pub(super) fn cut_bucket(
-    at: DateTime<Utc>,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-    buckets: usize,
-) -> usize {
-    let (at, from, to) = (
-        i128::from(at.timestamp_micros()),
-        i128::from(from.timestamp_micros()),
-        i128::from(to.timestamp_micros()),
-    );
-    if to <= from || at >= to {
-        return buckets - 1;
-    }
-    (((at - from).max(0) * buckets as i128) / (to - from)) as usize
-}
-/// PURE: the index over the answerable cuts inside the range, which arrive
-/// oldest first: all of them when they fit, else the last cut of each slice
-/// with the first and last in-range cuts kept, so the scale's ends are cuts.
-pub(super) fn sample_cuts(
-    in_range: &[Cut],
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-    buckets: usize,
-) -> (Vec<Cut>, bool) {
-    if in_range.len() <= buckets {
-        return (in_range.to_vec(), true);
-    }
-    let mut last_per_slice = std::collections::BTreeMap::new();
-    for cut in in_range {
-        last_per_slice.insert(cut_bucket(cut.at, from, to, buckets), *cut);
-    }
-    let mut kept: std::collections::BTreeMap<i64, Cut> =
-        last_per_slice.into_values().map(|c| (c.seq, c)).collect();
-    for end in [in_range[0], in_range[in_range.len() - 1]] {
-        kept.insert(end.seq, end);
-    }
-    (kept.into_values().collect(), false)
-}
 #[derive(Debug, thiserror::Error)]
 pub enum ClaimsError {
     #[error("claims history unavailable: {0}")]
@@ -476,31 +358,16 @@ pub enum ClaimsError {
 }
 #[async_trait]
 pub trait ClaimsHistory: Send + Sync {
-    /// Existing adapters keep their read behavior. The outer deadline still
-    /// names their adapter boundary even if they do not expose SQL stages.
-    async fn cuts_traced(
-        &self,
-        from: Option<DateTime<Utc>>,
-        to: Option<DateTime<Utc>>,
-        buckets: usize,
-        now: DateTime<Utc>,
-        trace: CutsTrace,
-    ) -> Result<CutsReading, ClaimsError> {
-        trace.start("adapter");
-        let result = self.cuts(from, to, buckets, now).await;
-        trace.finish();
-        result
-    }
-    /// The head or historical read with the same request-owned observer
-    /// [`Self::cuts_traced`] takes, so the HTTP deadline names the
-    /// statement it interrupted (backlog 81f8e468). An adapter with no SQL
-    /// stages is one `adapter` span.
+    /// The head or historical read with a request-owned observer, so the
+    /// HTTP deadline names the statement it interrupted (backlog 81f8e468).
+    /// An adapter with no SQL stages keeps its read behavior and is one
+    /// `adapter` span.
     async fn read_traced(
         &self,
         as_of: Option<i64>,
         window_hours: i64,
         now: DateTime<Utc>,
-        trace: CutsTrace,
+        trace: ReadTrace,
     ) -> Result<ClaimsReading, ClaimsError> {
         trace.start("adapter");
         let result = self.read(as_of, window_hours, now).await;
@@ -571,17 +438,5 @@ pub trait ClaimsHistory: Send + Sync {
         _now: DateTime<Utc>,
     ) -> Result<ClaimsReading, ClaimsError> {
         Err(ClaimsError::Unavailable("read not implemented".into()))
-    }
-    /// The retained cuts over `[from, to]`, sampled to `buckets` (car 3c).
-    async fn cuts(
-        &self,
-        _from: Option<DateTime<Utc>>,
-        _to: Option<DateTime<Utc>>,
-        _buckets: usize,
-        _now: DateTime<Utc>,
-    ) -> Result<CutsReading, ClaimsError> {
-        Err(ClaimsError::Unavailable(
-            "retained cuts index not implemented".into(),
-        ))
     }
 }

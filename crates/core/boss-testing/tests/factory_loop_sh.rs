@@ -1326,6 +1326,12 @@ echo "$n" > "$STUB_PULL_COUNT"
 read -r -a pulls <<< "$STUB_PULLS"
 what=${pulls[$((n - 1))]:-empty}
 echo "boss station pull: $who at engineering, request r-$n" >&2
+# STUB_BREAK_PROMPT=1: the turn prompt's place stops being writable
+# after the loop checked it and before it writes the brief there.
+if [ "${STUB_BREAK_PROMPT:-}" = 1 ]; then
+  rm -f "$HOME/factory-loop.log.prompt"
+  mkdir -p "$HOME/factory-loop.log.prompt"
+fi
 case $what in
   brief | reworded)
     jq -nc --arg id "$STUB_RUN" --arg who "$who" --arg holder "agent-${who%%@*}" \
@@ -1409,9 +1415,11 @@ impl Fixture {
         .expect("write seats");
         // The agent's past on the record: one closed run its login
         // signed, which the control read must see before a pull (review
-        // f8cbaa0e B3). `fresh_agent` takes it away.
+        // f8cbaa0e B3). `fresh_agent` takes it away. Its id is a run id
+        // as the record spells one, because the loop keeps it beside the
+        // log and reads anything else there as '?' (review 2d18db68 N11).
         let mut past: serde_json::Value = serde_json::from_str(&run_row(
-            "r-history",
+            "0199aaaa-0000-4000-8000-00000000a11d",
             "completed",
             "codex@algedonic.dev",
             Some("agent-codex"),
@@ -1967,6 +1975,67 @@ fn a_brief_that_cannot_be_kept_is_not_called_the_doors_refusal() {
     assert!(!log.contains("No such file"), "{log}");
 }
 
+/// Review 2d18db68 N10 (backlog a569e6b2): the turn prompt is the third
+/// place a pull writes beside its log, and the only one the pre-check
+/// did not cover, so with it unwritable the pull claimed a step and its
+/// turn was handed nothing — the claimed brief never reached an
+/// executor. Unwritable before the pull, the door is never called.
+#[test]
+fn a_turn_prompt_that_cannot_be_written_pulls_nothing() {
+    let f = Fixture::puller("pull-n10", "next");
+    create_dir(&f.root.join("home/factory-loop.log.prompt"));
+    let (rc, out) = f.pull("brief", 1, &[]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(f.pulls().is_empty(), "{}", f.log());
+    assert!(f.turns().is_empty(), "{}", f.log());
+    assert_eq!(f.pull_outcomes(), ["unknown"], "{}", f.log());
+}
+
+/// Review 2d18db68 N10, the write itself: the turn prompt stops being
+/// writable between the check and the write, after the station door
+/// has claimed the step. The pass runs no turn on an empty prompt; it
+/// says the step is claimed and where its brief is kept, and the run
+/// holds the slot, so the next pass is that run's turn under the seat's
+/// prompt and nothing more is pulled.
+#[test]
+fn a_claimed_brief_the_loop_cannot_write_is_named_and_never_run_empty() {
+    let f = Fixture::puller("pull-n10-write", "next");
+    let (rc, out) = f.pull("brief brief", 2, &[("STUB_BREAK_PROMPT", "1")]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(f.pulls().len(), 1, "{}", f.log());
+    let loop_log = std::fs::read_to_string(f.loop_log()).unwrap_or_default();
+    assert_eq!(f.turns().len(), 1, "only the held pass ran: {loop_log}");
+    assert_eq!(f.stdin(1), "one factory turn\n", "{}", f.log());
+    let reasons = note_reasons(&f);
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.contains(PULLED_RUN) && r.contains("factory-loop.log.pulled")),
+        "the note names the claimed run and the kept brief: {reasons:?}"
+    );
+}
+
+/// Review 2d18db68 N11 (backlog a569e6b2, scenario U2): the kept belief
+/// that a pull was not read back is a file beside the log, and one whose
+/// contents are not a run id was compared as if it were one: it never
+/// matched the control, so the hold dropped and the seat pulled again.
+/// Anything there but a run id is '?', which only a run of the seat's
+/// agent seen building clears.
+#[test]
+fn a_corrupt_unseen_file_keeps_the_seat_holding() {
+    let f = Fixture::puller("pull-n11", "next");
+    create_dir(&f.root.join("home"));
+    std::fs::write(
+        f.root.join("home/factory-loop.log.unseen"),
+        "\u{1}garbled\n",
+    )
+    .expect("write unseen");
+    let (rc, out) = f.pull("brief brief", 2, &[]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(f.pulls().is_empty(), "{}", f.log());
+    assert_eq!(f.pull_outcomes(), ["unknown", "unknown"], "{}", f.log());
+}
+
 /// Review 0d65ef4c B2: a loop started with no seat IS the list's first
 /// row — every column of it, the pull included — so a first row that
 /// says `next` pulls, rather than the loop answering from defaults of
@@ -2016,7 +2085,10 @@ fn a_pull_the_loop_does_not_define_is_refused() {
 
 /// Every seat declares its pull, and none pulls yet: turning one on
 /// changes who claims work unattended (trust boundary, mutating-verb),
-/// so it is a reviewed car that edits the row AND this test.
+/// so it is a reviewed car that edits the row AND this test. The message
+/// names what that car accepts with it (review 2d18db68, backlog
+/// a569e6b2): N1 and N6 below, and N12, the visibility assumption the
+/// loop's header states.
 #[test]
 fn every_seat_declares_its_pull_and_none_pulls_until_a_reviewed_car_turns_it_on() {
     let seats = std::fs::read_to_string(repo_root().join("infra/dev/seats.tsv")).expect("seats");
@@ -2035,7 +2107,11 @@ fn every_seat_declares_its_pull_and_none_pulls_until_a_reviewed_car_turns_it_on(
         );
         assert_eq!(
             r[6], "-",
-            "seat {} pulls before its activation was reviewed",
+            "seat {} pulls before its activation was reviewed; the car that turns it on accepts, \
+             by name: a held seat's turn runs the seat's standing prompt, not the held run's \
+             brief (N1); a run of the same agent opened by any other process holds the slot \
+             (N6); and the unseen hold assumes every agent-run is equally visible to the \
+             seat's reads (N12, factory-loop.sh's header)",
             r[0]
         );
     }

@@ -48,6 +48,8 @@ mod publish_drift_sh;
 mod publish_github_pr_sh;
 #[path = "../read_gate_storage_sh.rs"]
 mod read_gate_storage_sh;
+#[path = "../read_github_job_log_sh.rs"]
+mod read_github_job_log_sh;
 #[path = "../read_publish_checks_sh.rs"]
 mod read_publish_checks_sh;
 #[path = "../the_ci_image_is_named_by_its_recipe.rs"]

@@ -40,6 +40,7 @@
 // API and policy still decide the POST.
 
 import { fetchRemote, type Remote } from '../../data/remote';
+import { executionSucceeded, readExecution, type Execution } from '../ops-execution';
 import type { FieldDrift } from './drift';
 
 export const PUBLISH_VERB = 'publish-workflow';
@@ -96,6 +97,12 @@ export type PublishRequest = Readonly<{
   /** The instant the answer landed: the `execute` step's server-stamped
    *  `completed_at`; null while open or on a step that predates it. */
   answered_at: string | null;
+  /** How the verb ENDED, read by the one classifier (design b7bb1625,
+   *  backlog 50a1578f) off the COMPLETED execute; null while the host
+   *  has not answered. The block prints this, never the bare
+   *  disposition: "answered · exit 1" was the line a failed move closed
+   *  under, and a refusal is named by the reason it recorded. */
+  execution: Execution | null;
 }>;
 
 const rec = (v: unknown): Record<string, unknown> | null =>
@@ -135,6 +142,7 @@ function parseRequest(v: unknown): PublishRequest | null {
     runner_host: str(em.runner_host),
     requested_from: str(meta.requested_from),
     answered_at: execute ? str(execute.completed_at) : null,
+    execution: answered ? readExecution(em) : null,
   };
 }
 
@@ -239,7 +247,12 @@ const instant = (iso: string | null): number | null => {
 
 export function rowState(row: AdriftKind, latest: PublishRequest | null, measuredAt: string): RowState {
   if (latest === null || latest.status !== 'closed' || latest.disposition !== 'answered') return { kind: 'adrift' };
-  if (latest.exit_code !== '0' || latest.mode === 'check') return { kind: 'adrift' };
+  // A success is the classifier's, not a bare exit 0: an exit 0 whose
+  // effect the runner could not show wrote no row anyone saw (backlog
+  // 50a1578f; Rust `Execution::succeeded`).
+  if (latest.exit_code !== '0' || latest.execution === null || !executionSucceeded(latest.execution) || latest.mode === 'check') {
+    return { kind: 'adrift' };
+  }
   const at = latest.answered_at ?? latest.opened_at;
   const answered = instant(at);
   const measured = instant(measuredAt);

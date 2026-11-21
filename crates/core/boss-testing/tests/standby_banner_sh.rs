@@ -21,8 +21,22 @@ use std::process::Command;
 
 const SCRIPT: &str = "infra/dev/standby-banner.sh";
 
+/// The standby has no kubeconfig file; its kubectl reads the cluster only
+/// through the in-cluster fallback, which client-go takes only when no
+/// override is set. `--request-timeout` is an override, so with it kubectl
+/// dials the default localhost:8080 instead (backlog 41e90111, reproduced
+/// with kubectl v1.33.3 on 2026-11-21; David's login read exactly this
+/// line). The stub answers that flag the way the standby's kubectl does,
+/// so the flag cannot come back into the banner green.
 const KUBECTL_STUB: &str = r#"#!/usr/bin/env bash
 echo "kubectl $*" >> "$STUB_LOG"
+for a in "$@"; do
+  case "$a" in
+    --request-timeout*)
+      echo 'The connection to the server localhost:8080 was refused - did you specify the right host or port?' >&2
+      exit 1 ;;
+  esac
+done
 if [ "${STUB_KUBE_DOWN:-}" = 1 ]; then
   echo 'Unable to connect to the server: dial tcp 10.96.0.1:443: i/o timeout' >&2
   exit 1

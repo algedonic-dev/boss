@@ -2044,8 +2044,15 @@ mod tests {
             for spec in seedable_platform_workflows() {
                 kinds.seed(spec).expect("seed platform kind");
             }
+            // One agents registry, served three ways as boss_jobs_api.rs
+            // serves it: the login door, the release door's actor rows, and
+            // `GET /api/agents`, which `boss review` reads to tell a car's
+            // builder from its reviewer (backlog 8e97a4ec).
+            let agents =
+                Arc::new(boss_jobs::agents::InMemoryAgents::new().with_agent(AGENT, [LOGIN]));
             let state = boss_jobs::http::JobsApiState {
                 kind_registry: Some(kinds as Arc<dyn WorkflowRegistry>),
+                release_actors: Some(agents.clone()),
                 ..boss_jobs::http::JobsApiState::minimal(
                     jobs.clone(),
                     bus,
@@ -2054,14 +2061,18 @@ mod tests {
                     Arc::new(boss_clock_client::WallClockClient),
                 )
             };
-            // The login door, layered the way boss_jobs_api.rs mounts it.
-            let agents =
-                Arc::new(boss_jobs::agents::InMemoryAgents::new().with_agent(AGENT, [LOGIN]));
+            let registry =
+                boss_jobs::agents::http::router(boss_jobs::agents::http::AgentsApiState {
+                    registry: agents.clone(),
+                    classes: None,
+                    departments: None,
+                    pools: None,
+                    stations: None,
+                });
             let door = Arc::new(boss_jobs::agents::LoginDoor::new(agents, publisher));
-            let app = boss_jobs::http::router(state).layer(axum::middleware::from_fn_with_state(
-                door,
-                boss_jobs::agents::resolve_login,
-            ));
+            let app = boss_jobs::http::router(state).merge(registry).layer(
+                axum::middleware::from_fn_with_state(door, boss_jobs::agents::resolve_login),
+            );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             tokio::spawn(async move {
@@ -2127,6 +2138,46 @@ mod tests {
             );
         }
 
+        /// SUPERSEDED AREAS REFUSE NEW ITEMS (backlog f4b0ad41 rule 1),
+        /// through the real router: `boss job file --area it-map` is
+        /// refused, nothing lands, and the refusal names reconstruction
+        /// step 2 — the same 422 any other caller of `POST /api/jobs`
+        /// meets, because the rule lives in admission
+        /// (`boss_jobs::superseded_area`), not in this verb. An area the
+        /// list does not name still files.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_backlog_item_about_a_superseded_area_is_refused_naming_its_step() {
+            let (base, jobs) = serve().await;
+            let in_area = |area: &str| Origin {
+                source: None,
+                area: Some(area.into()),
+                defect_class: None,
+            };
+            let err = file_on(&wire(base.clone()), filing(None), in_area("it-map"))
+                .await
+                .expect_err("an item about the v1 map is refused");
+            let err = format!("{err:#}");
+            assert!(err.contains("422"), "{err}");
+            assert!(err.contains("reconstruction step 2"), "{err}");
+            assert!(err.contains("converge the visuals"), "{err}");
+            assert!(stored(&jobs).await.is_empty(), "nothing landed: {err}");
+
+            let err = file_on(&wire(base.clone()), filing(None), in_area("systemd-timers"))
+                .await
+                .expect_err("an item about systemd timers is refused");
+            assert!(
+                format!("{err:#}").contains("reconstruction step 6"),
+                "{err:#}"
+            );
+            assert!(stored(&jobs).await.is_empty(), "nothing landed");
+
+            let report = file_on(&wire(base), filing(None), in_area("station-tree"))
+                .await
+                .expect("an area the list does not name files");
+            assert!(report.contains("boss job: filed"), "{report}");
+            assert_eq!(stored(&jobs).await.len(), 1);
+        }
+
         /// THE OPERATOR'S ROAD, WITH NO AGENT RUNNING (backlog b7b02024,
         /// DR rule 62dac114, re-review D1). A car held for its review
         /// carries `hold_sha`, so only a release naming an agent-run
@@ -2146,7 +2197,7 @@ mod tests {
             let source = crate::review_verdict::ReviewSourceRepo::new();
             let forge = |r: &str| source.forge(r);
             let (base, jobs) = serve().await;
-            a_held_car_at_the_dock(&jobs, BUILDER, &source.head).await;
+            a_held_car_at_the_dock(&jobs, BUILDER, LOGIN, &source.head).await;
             let wire = crate::steps::Wire::at(
                 base,
                 Some(crate::identity::Caller {
@@ -2222,7 +2273,7 @@ mod tests {
             let source = crate::review_verdict::ReviewSourceRepo::new();
             let forge = |r: &str| source.forge(r);
             let (base, jobs) = serve().await;
-            a_held_car_at_the_dock(&jobs, BUILDER, &source.head).await;
+            a_held_car_at_the_dock(&jobs, BUILDER, LOGIN, &source.head).await;
             let wire = crate::steps::Wire::at(
                 base,
                 Some(crate::identity::Caller {
@@ -2290,26 +2341,51 @@ mod tests {
         /// run, and a release from a shell still carrying it is refused
         /// like any builder's — but the refusal names the road, and the
         /// road is the three verbs above with step 3 run from a shell
-        /// without that run: no dead end on the operator's path.
+        /// without that run: no dead end on the operator's path. Since
+        /// backlog 8e97a4ec the REVIEW is another actor's: the car he
+        /// built (`built_by`) is not his to review from any run, so an
+        /// agent reviews it and he releases it on that review.
         #[tokio::test(flavor = "multi_thread")]
         async fn a_human_who_gated_the_car_in_his_own_run_releases_it_from_outside_that_run() {
             const HIS_GATING_RUN: &str = "da71d000-0000-4000-8000-000000000000";
             let source = crate::review_verdict::ReviewSourceRepo::new();
             let forge = |r: &str| source.forge(r);
             let (base, jobs) = serve().await;
-            a_held_car_at_the_dock(&jobs, HIS_GATING_RUN, &source.head).await;
+            a_held_car_at_the_dock(&jobs, HIS_GATING_RUN, HUMAN, &source.head).await;
             let wire = crate::steps::Wire::at(
-                base,
+                base.clone(),
                 Some(crate::identity::Caller {
                     id: HUMAN.into(),
                     source: crate::identity::Source::Env,
                 }),
             )
             .unwrap();
-            let run = a_review_run_filed_by(&wire).await;
-            crate::review_verdict::record_in(
+            let his = a_review_run_filed_by(&wire).await;
+            let why = crate::review_verdict::record_in(
                 source.path(),
                 &wire,
+                "feat/held",
+                "release",
+                "",
+                Some(&his),
+                forge,
+            )
+            .await
+            .expect_err("the builder's own review, from a run other than the gating one");
+            assert!(format!("{why:#}").contains("8e97a4ec"), "{why:#}");
+            // The agent's wire: `wire` here is his, and shadows the helper.
+            let agent = crate::steps::Wire::at(
+                base,
+                Some(crate::identity::Caller {
+                    id: LOGIN.into(),
+                    source: crate::identity::Source::Env,
+                }),
+            )
+            .unwrap();
+            let run = a_review_run_filed_by(&agent).await;
+            crate::review_verdict::record_in(
+                source.path(),
+                &agent,
                 "feat/held",
                 "release",
                 "",
@@ -2317,7 +2393,7 @@ mod tests {
                 forge,
             )
             .await
-            .expect("his review is a run other than the one that gated the car");
+            .expect("another actor reviews the car he built");
 
             // Step 3 from the shell that still exports his gating run.
             let refused = crate::review_verdict::release(
@@ -2357,11 +2433,90 @@ mod tests {
             assert!(crate::train::parked_ready(&after), "unheld: {after}");
         }
 
+        /// A BUILDER'S SECOND RUN REVIEWS NOTHING, AT EITHER DOOR (backlog
+        /// 8e97a4ec, review 5775e4cd). The car is signed by the agent's
+        /// login; the agent files a review run of its own by hand (no
+        /// dispatch, so the review claim door never saw it) naming its
+        /// registered id, the spelling the registry ties to that login.
+        /// `boss review` refuses before it records anything, and a verdict
+        /// merged onto the run by hand is refused at the release door, so
+        /// the car stays held.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_builders_own_review_run_is_refused_at_boss_review_and_at_the_release_door() {
+            const BUILDER: &str = "b0b0b0b0-0000-4000-8000-000000000000";
+            let source = crate::review_verdict::ReviewSourceRepo::new();
+            let forge = |r: &str| source.forge(r);
+            let (base, jobs) = serve().await;
+            a_held_car_at_the_dock(&jobs, BUILDER, LOGIN, &source.head).await;
+            let agent = wire(base.clone());
+            let run = a_run_filed_with(&agent, Some(json!({"agent": AGENT}))).await;
+
+            let why = crate::review_verdict::record_in(
+                source.path(),
+                &agent,
+                "feat/held",
+                "release",
+                "",
+                Some(&run),
+                forge,
+            )
+            .await
+            .expect_err("the builder's own review is refused before it is recorded");
+            let why = format!("{why:#}");
+            for want in ["boss review: REFUSED", "8e97a4ec", AGENT, LOGIN] {
+                assert!(why.contains(want), "{want} in {why}");
+            }
+            let unrecorded = agent.packet(&run).await.expect("the run");
+            assert!(
+                unrecorded.pointer("/metadata/review").is_none(),
+                "nothing recorded: {unrecorded}"
+            );
+
+            // The verdict merged by hand, as `boss review` would write it.
+            agent
+                .patch_job_metadata(
+                    &run,
+                    json!({"review": {"car": CAR, "branch": "feat/held",
+                                      "reviewed_sha": source.head, "verdict": "release",
+                                      "findings": "", "at": "2026-11-21T00:00:00Z"}}),
+                )
+                .await
+                .expect("a hand-merged verdict");
+            let david = crate::steps::Wire::at(
+                base,
+                Some(crate::identity::Caller {
+                    id: HUMAN.into(),
+                    source: crate::identity::Source::Env,
+                }),
+            )
+            .unwrap();
+            let why = crate::review_verdict::release(
+                &david,
+                "feat/held",
+                &run,
+                &crate::review_verdict::Releaser::default(),
+                forge,
+            )
+            .await
+            .expect_err("the release door refuses the builder's review");
+            assert!(format!("{why:#}").contains("8e97a4ec"), "{why:#}");
+            let held = david.packet(CAR).await.expect("the car");
+            assert!(!crate::train::parked_ready(&held), "still held: {held}");
+        }
+
         const HUMAN: &str = "emp-david";
         const CAR: &str = "c0ffee00-0000-4000-8000-00000000ca25";
         /// `boss job file --kind agent-run`, as the wire's signer: the
         /// review run of the human road, its full id read off the report.
         async fn a_review_run_filed_by(wire: &crate::steps::Wire) -> String {
+            a_run_filed_with(wire, None).await
+        }
+
+        /// The same filing, carrying `metadata`.
+        async fn a_run_filed_with(
+            wire: &crate::steps::Wire,
+            metadata: Option<serde_json::Value>,
+        ) -> String {
             let report = file_on(
                 wire,
                 Filing {
@@ -2370,7 +2525,7 @@ mod tests {
                     priority: None,
                     subject_id: None,
                     channel: None,
-                    metadata: None,
+                    metadata,
                 },
                 Origin {
                     source: None,
@@ -2388,9 +2543,15 @@ mod tests {
                 .to_string()
         }
 
-        /// The car at the dock: gated green by `builder`, its review held
+        /// The car at the dock: gated green by the run `builder`, signed
+        /// by `built_by` as `boss car open` records it, its review held
         /// for a finding at HEAD.
-        async fn a_held_car_at_the_dock(jobs: &InMemoryJobs, builder: &str, head: &str) {
+        async fn a_held_car_at_the_dock(
+            jobs: &InMemoryJobs,
+            builder: &str,
+            built_by: &str,
+            head: &str,
+        ) {
             let mut car = boss_core::job::Job::new(
                 "ship-a-change",
                 boss_core::job::Subject::new("custom", "bosspipeline"),
@@ -2401,7 +2562,8 @@ mod tests {
             );
             car.id = serde_json::from_value(json!(CAR)).expect("a car id");
             car.status = boss_core::job::JobStatus::Open;
-            car.metadata = json!({"branch": "feat/held", "agent_run": builder});
+            car.metadata = json!({"branch": "feat/held", "agent_run": builder,
+                                  boss_jobs::car::BUILT_BY: built_by});
             let step = |slug: &str, status: &str, md: serde_json::Value| {
                 serde_json::from_value::<boss_core::job::Step>(json!({
                     "id": uuid::Uuid::new_v4().to_string(), "job_id": CAR,

@@ -76,6 +76,188 @@ def configuration(secret=SECRET):
             f'Password:  {secret}\nSecurity:  STARTTLS\n')
 
 
+# 34d95817: the pinned CLI's `list` answer (internal/frontend/cli/accounts.go at
+# 43b92377): a bold header whose reset code lands on the next line, one
+# '%-2d: %-20s (%-15s, %-15s)' row per vault account, then one empty line.
+LIST_HEADER = '\x1b[1m# : account              (status         , address mode   )\n\x1b[0m'
+
+
+def listing(*states, name='Agent B'):
+    rows = ''.join(f'{index:<2d}: {name:<20s} ({state:<15s}, {"combined":<15s})\n'
+                   for index, state in enumerate(states))
+    return LIST_HEADER + rows + '\n'
+
+
+def fake_bridge(directory, loaded_after):
+    """A synthetic, non-secret stand-in for `proton-bridge --cli` at the pin.
+
+    The vault account reads Locked until its asynchronous load finishes
+    (bridge.GetUserInfo answers Locked for a vault user not yet in
+    bridge.users; loadUsers runs as a task started beside the shell), and
+    `info` then prints no configuration block. That is the window the fixed
+    'info ADDRESS / exit' input of dbe1bf9a was answered in."""
+    child = Path(directory) / 'fake-bridge.py'
+    child.write_text(
+        'import sys, time\n'
+        'start = time.monotonic()\n'
+        f'LOADED_AFTER = {loaded_after!r}\n'
+        f'HEADER = {LIST_HEADER!r}\n'
+        f'CONFIG = {configuration()!r}\n'
+        'def state():\n'
+        "    return 'connected' if time.monotonic() - start >= LOADED_AFTER else 'locked'\n"
+        "sys.stdout.write('Welcome to Proton Mail Bridge interactive shell\\n'); sys.stdout.flush()\n"
+        'for line in sys.stdin:\n'
+        '    words = line.split()\n'
+        "    if words == ['exit']:\n"
+        '        break\n'
+        "    if words == ['list']:\n"
+        "        sys.stdout.write(HEADER + '%-2d: %-20s (%-15s, %-15s)\\n' % (0, 'Agent B', state(), 'combined') + '\\n')\n"
+        "    elif words[:1] == ['info']:\n"
+        "        if state() == 'locked':\n"
+        "            sys.stdout.write('User \\x1b[1mAgent B\\x1b[0m is currently locked. Please wait and try again.\\n')\n"
+        '        else:\n'
+        '            sys.stdout.write(CONFIG)\n'
+        '    sys.stdout.flush()\n')
+    return [sys.executable, str(child)]
+
+
+class BridgeAccountSelection(unittest.TestCase):
+    """34d95817: capture refused 'no connected account' while Bridge listed the
+    one account as connected. The pinned CLI selects the sole account whatever
+    `info`'s argument is, so the address was never the fault: the fixed input
+    asked before the account had finished loading. The capture now reads the
+    account list, waits while it reads locked, and asks `info` by index."""
+
+    def test_the_fixed_input_is_answered_before_the_account_loads(self):
+        # The reproduction, in the shape dbe1bf9a ran: everything on stdin at once.
+        m = module()
+        with tempfile.TemporaryDirectory() as directory:
+            raw = m.private_cli(fake_bridge(directory, 0.6), dict(os.environ), 5,
+                                data=b'info agent-b@algedonic.dev\nexit\n')
+        with self.assertRaises(m.Refused) as refused:
+            m.parse_configuration(raw, ACCOUNT)
+        self.assertEqual(refused.exception.args,
+                         ('no connected account configuration; the owner login is missing or signed out',))
+
+    def test_capture_waits_for_the_loading_account_and_asks_by_index(self):
+        m = module(); seen = []
+        conversation = m.capture_conversation()
+        def respond(raw, now):
+            seen.append(raw)
+            return conversation(raw, now)
+        with tempfile.TemporaryDirectory() as directory, patch.object(m, 'LIST_POLL_SECONDS', 0.2):
+            raw = m.private_cli(fake_bridge(directory, 0.6), dict(os.environ), 5, respond=respond)
+        row = m.parse_configuration(raw, ACCOUNT)
+        self.assertEqual(row['password'], SECRET)
+        self.assertEqual(row['account'], ACCOUNT)
+        # The conversation decides from the account list alone: it is never
+        # handed output that could carry the configuration's password.
+        self.assertTrue(seen)
+        self.assertFalse(any(SECRET.encode() in raw for raw in seen))
+
+    def test_an_account_that_never_loads_refuses_with_its_own_reason(self):
+        m = module()
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(m, 'LIST_POLL_SECONDS', 0.1), patch.object(m, 'ACCOUNT_WAIT_SECONDS', 0.5):
+            with self.assertRaises(m.Refused) as refused:
+                m.private_cli(fake_bridge(directory, 1000), dict(os.environ), 5,
+                              respond=m.capture_conversation())
+        self.assertEqual(refused.exception.args,
+                         ('the Bridge account was still loading or locked at the wait bound; credential unchanged',))
+
+    def test_a_cli_that_exits_before_selection_refuses(self):
+        m = module()
+        with tempfile.TemporaryDirectory() as directory:
+            child = Path(directory) / 'gone.py'; child.write_text('print("bye")\n')
+            with self.assertRaises(m.Refused) as refused:
+                m.private_cli([sys.executable, str(child)], dict(os.environ), 3,
+                              respond=m.capture_conversation())
+        self.assertIn(refused.exception.args[0], {
+            'CLI exited before an account was selected; credential unchanged',
+            'CLI failed; credential unchanged'})
+
+    def test_account_rows_read_the_last_complete_list_answer(self):
+        m = module()
+        banner = b'\x1b[33mWARN\x1b[0m[Nov 20 12:00:00.000] startup\nWelcome to Proton Mail Bridge interactive shell\n'
+        self.assertIsNone(m.account_rows(b''))
+        self.assertIsNone(m.account_rows(banner))
+        self.assertEqual(m.account_rows(banner + listing().encode()), [])
+        self.assertEqual(m.account_rows(listing('locked').encode()), ['locked'])
+        # The newest answer wins over an older one.
+        self.assertEqual(m.account_rows((listing('locked') + listing('connected')).encode()), ['connected'])
+        self.assertEqual(m.account_rows(listing('signed out', 'connected').encode()), ['signed out', 'connected'])
+        # A long username is not padded, and is never what the state is read from.
+        self.assertEqual(m.account_rows(listing('connected', name='x (locked , split )' * 3).encode()), ['connected'])
+        # An answer still arriving, or one an asynchronous line split, reads as none yet.
+        self.assertIsNone(m.account_rows(listing('connected').encode()[:-1]))
+        self.assertIsNone(m.account_rows(listing('connected').encode()[:-2]))
+        split = listing('signed out', 'connected').replace('\n1 ', '\nA sync has begun for Agent B.\n1 ')
+        self.assertIsNone(m.account_rows(split.encode()))
+        self.assertIsNone(m.account_rows(listing('connected').replace('0 :', '1 :').encode()))
+        self.assertIsNone(m.account_rows(listing('connected').replace('connected', 'unknowable').encode()))
+
+    def test_conversation_lists_polls_then_selects_by_index(self):
+        m = module(); say = m.capture_conversation()
+        self.assertEqual(say(b'', 0.0), (b'list\n', False))
+        self.assertEqual(say(b'', 0.5), (None, False))
+        locked = listing('locked').encode()
+        self.assertEqual(say(locked, 0.9), (None, False))
+        self.assertEqual(say(locked, 1.0), (b'list\n', False))
+        self.assertEqual(say(locked + listing('signed out', 'connected').encode(), 1.2), (b'info 1\nexit\n', True))
+        self.assertEqual(m.capture_conversation()(listing('connected').encode(), 0.0), (b'info 0\nexit\n', True))
+
+    def test_conversation_refuses_each_settled_state_with_its_own_reason(self):
+        m = module()
+        cases = (
+            (listing(), 'no Bridge account is configured; the owner login is missing'),
+            (listing('signed out'), 'no connected Bridge account; the owner login is signed out'),
+            (listing('signed out', 'signed out'), 'no connected Bridge account; the owner login is signed out'),
+            (listing('connected', 'connected'),
+             'more than one connected account configuration; a second account must be signed out'),
+        )
+        for raw, reason in cases:
+            with self.subTest(reason=reason):
+                with self.assertRaises(m.Refused) as refused:
+                    m.capture_conversation()(raw.encode(), 0.0)
+                self.assertEqual(refused.exception.args, (reason,))
+                self.assertIn(reason, m.SAFE_REFUSALS)
+                self.assertNotIn('Agent B', reason)
+        # A row still loading may yet connect: wait rather than judge the others.
+        self.assertEqual(m.capture_conversation()(listing('connected', 'locked').encode(), 0.0), (b'list\n', False))
+
+    def test_conversation_wait_bound_names_what_it_was_waiting_for(self):
+        m = module()
+        for raw, reason in (
+            (b'', 'Bridge printed no readable account list before the wait bound; credential unchanged'),
+            (listing('locked').encode(), 'the Bridge account was still loading or locked at the wait bound; credential unchanged'),
+        ):
+            with self.subTest(reason=reason):
+                say = m.capture_conversation()
+                self.assertEqual(say(raw, 0.0)[1], False)
+                with self.assertRaises(m.Refused) as refused:
+                    say(raw, float(m.ACCOUNT_WAIT_SECONDS))
+                self.assertEqual(refused.exception.args, (reason,))
+        self.assertLess(m.ACCOUNT_WAIT_SECONDS, m.CLI_SECONDS, 'info and exit still fit inside the CLI deadline')
+
+    def test_capture_entrypoint_converses_instead_of_fixed_input(self):
+        m = module(); calls = []
+        def private_cli(argv, env, **kwargs):
+            calls.append(kwargs)
+            return configuration().encode()
+        def service(action):
+            return 'inactive/dead/0' if action == 'state' else ''
+        with patch.object(m.os, 'geteuid', return_value=0), patch.object(m, 'singleton', return_value=contextlib.nullcontext()), \
+                patch.object(m, 'service', side_effect=service), patch.object(m, 'private_cli', side_effect=private_cli), \
+                patch.object(m, 'write_credential'), patch.object(m, 'PRIVATE', Path('/nonexistent-fixture')), \
+                patch.object(Path, 'stat', return_value=SimpleNamespace(st_size=1)), \
+                patch.object(sys, 'argv', [str(SCRIPT), 'capture']), contextlib.redirect_stdout(io.StringIO()):
+            m.main()
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn('data', calls[0])
+        self.assertTrue(callable(calls[0].get('respond')))
+        self.assertFalse(hasattr(m, 'INPUT'), 'the fixed info/exit input is retired')
+
+
 class BridgeContract(unittest.TestCase):
     def test_refusal_allowlist_equals_authored_literal_raises(self):
         m = module()
@@ -506,8 +688,10 @@ class BridgeContract(unittest.TestCase):
         m=module()
         with tempfile.TemporaryDirectory() as directory:
             child=Path(directory)/'child.py'
-            child.write_text('import sys\nassert sys.stdin.buffer.read()==b"info agent-b@algedonic.dev\\nexit\\n"\nprint("No active accounts.")\n')
-            raw=m.private_cli([sys.executable,str(child)],dict(os.environ),3)
+            # 34d95817: capture no longer has a fixed input; install's two
+            # fixed inputs still pass whole and then close stdin.
+            child.write_text('import sys\nassert sys.stdin.buffer.read()==b"updates autoupdates disable\\nexit\\n"\nprint("No active accounts.")\n')
+            raw=m.private_cli([sys.executable,str(child)],dict(os.environ),3,data=b'updates autoupdates disable\nexit\n')
             self.assertIn(b'No active accounts.',raw)
             child.write_text('import sys\nsys.stdin.buffer.read()\nsys.stdout.write("x"*131073)\n')
             with self.assertRaises(m.Refused):

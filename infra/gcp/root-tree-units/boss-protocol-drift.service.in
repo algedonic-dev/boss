@@ -1,5 +1,4 @@
-# Dormant replacement: ca356c79 / fe6d1124. Not installed by any caller.
-# Activate only after the root fetch credential and tree handover are proven.
+# Prepared root-tree unit, installed only from an accepted generation.
 [Unit]
 Description=BOSS daily protocol drift against the live workflow registry
 Wants=network-online.target

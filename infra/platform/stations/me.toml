@@ -1,0 +1,40 @@
+# ---------------------------------------------------------------------------
+# me — the person's own station (design 01fa5bdf step 3, David
+# 2026-11-17: "preserve each human executor having a station for
+# themselves, at /me, based on the signed-in user"; backlog 5cb56bb3).
+#
+# ONE ROW SERVES EVERY PERSON. Whose station it is comes from the
+# session, never from the row or the URL: the queues under it read the
+# signed-in actor (`my-watchlist` binds `@me` at read time) or admit by
+# role (`q.platform-admin.task`), and the web answers /me, /me/inbox and
+# /me/calendar from the signed-in user before it reads the tree
+# (apps/web/src/router.ts PERSONAL, car f18f1473). So no roster is
+# needed, exactly as `my-watchlist` needs none.
+#
+# A CONTAINER, NOT A QUEUE: the tagged predicate holds no packet (see
+# algedonic.toml). It is a child of the root and NO DEPARTMENT: it
+# declares no `line` and draws the company's, and the brief's tier-one
+# read skips a lineless child (boss-cli brief.rs `tier_one_stations`).
+# It allocates nothing and carries no placement, so the root's floor
+# draws it on the view's fallback grid, as it drew the two queues it now
+# holds.
+#
+# Its two rows came from the executive desk by way of the root, where
+# car 1 of design 2910ec3d (backlog 878fd1e7) left them "until the
+# person's own station /me exists to take it". To change this station,
+# bump `version`; `id` never changes.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "me"
+version = 1
+status = "active"
+title = "Me — the signed-in person's own station"
+kind = "group"
+discipline = ["priority", "age"]
+id = "bbfea3e2-d865-42c1-858b-85d45d29f350"
+parent = "00b04483-90c6-46b9-b911-8e19d2a0b410"
+mode = "standing"
+
+[station.predicate]
+tags_any = ["station:me"]

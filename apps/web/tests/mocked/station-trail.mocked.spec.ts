@@ -123,7 +123,7 @@ test.describe('an unreadable tree is said, never an empty bar', () => {
     await installSmokeMocks(page);
     await signInWithPolicy(page);
     await page.route(STATIONS_TREE, (r) => r.fulfill({ status: 503, body: '' }));
-    await mountPage(page, '/it/tree');
+    await mountPage(page, '/tree');
     await expect(page.locator('.shell-sidebar [data-sidebar-failed]')).toContainText('GET /api/stations answered 503');
     await expect(page.locator('.shell-sidebar .load-failed')).toHaveCount(0);
     await expect(page.locator('.perspective-tabs .load-failed')).toHaveCount(0);

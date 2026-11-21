@@ -18,6 +18,8 @@
 import type { Remote } from '../../data/remote';
 import { fetchMapReading } from './map-reading';
 import { parseRecordedWaits, type RecordedWait } from './waits';
+import { ROUTE_CATALOG } from '../../shell/nav-catalog';
+import { rootPagePath } from '../../shell/page-address';
 
 // ---------------------------------------------------------------------
 // Wire types — the shape of GET /api/yard/regions. Parsed once, below.
@@ -630,8 +632,15 @@ const YARD_SELECTION: Readonly<Record<string, string>> = {
 
 const isRegion = (name: string): boolean => (REGION_NAMES as ReadonlyArray<string>).includes(name);
 
-/** Where a link to a region leads — its SELECTION on the Department
- *  Map, `/it?at=<name>`, for every region the server serves: the map
+/** The alarms board's own address: the page the company root hosts, from
+ *  the catalog (page-address.ts `rootPagePath`). Every selection rides it
+ *  since backlog 92bfcb04; it rode /it, IT's address, until IT retired as
+ *  a department (design df0ecd8b). regions.test.ts holds it to the root. */
+export const BOARD_HREF = rootPagePath(ROUTE_CATALOG['system-yard'])!;
+
+/** Where a link to a region leads — its SELECTION on the alarms board
+ *  (the Department Map's remains), `/alarms?at=<name>`, for every region
+ *  the server serves: the map
  *  stays on top and the station's detail opens below it (design
  *  e765b3fc, car N1). Until that car it opened the region's own page,
  *  which swapped the map away.
@@ -644,15 +653,15 @@ const isRegion = (name: string): boolean => (REGION_NAMES as ReadonlyArray<strin
  *  or a newer server's eleventh) opens the map with nothing selected:
  *  somewhere, and never another region. */
 export function regionHref(name: string): string {
-  return isRegion(name) ? `/it?at=${encodeURIComponent(name)}` : '/it';
+  return isRegion(name) ? `${BOARD_HREF}?at=${encodeURIComponent(name)}` : BOARD_HREF;
 }
 
 /** The link a SECTION selects itself by (design e765b3fc, car N2) — the
- *  Department Map with the border in the query, `/it?at=dock->track`,
+ *  board with the border in the query, `/alarms?at=dock->track`,
  *  built here beside `regionHref` so the map's links are built in one
  *  place. selection.ts reads it back. */
 export function sectionHref(from: string, to: string): string {
-  return `/it?at=${encodeURIComponent(`${from}->${to}`)}`;
+  return `${BOARD_HREF}?at=${encodeURIComponent(`${from}->${to}`)}`;
 }
 
 // `floorHref` — a region's floor page, `/it/yard/<name>` — retired with

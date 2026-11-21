@@ -76,7 +76,7 @@ describe('sidebar-router consistency', () => {
     expect(parseRoute(routeExample('/unregistered/:code/child/:id'), '', ADDRESSES)).toEqual({
       kind: 'notFound', path: '/unregistered/example/child/example',
     });
-    expect(parseRoute('/it/floor/:code')).toEqual({ kind: 'notFound', path: '/it/floor/:code' });
+    expect(parseRoute('/it/floor/:code', '', ADDRESSES)).toEqual({ kind: 'notFound', path: '/it/floor/:code' });
   });
 
   it('the catch-all itself still works: an unknown path is notFound, naming it', () => {

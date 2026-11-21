@@ -103,8 +103,15 @@ fn app() -> (Router, Arc<InMemoryJobs>) {
     );
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
+    // The registry the release door tells a car's builder from its
+    // reviewer by (backlog 8e97a4ec).
     let state = JobsApiState {
         kind_registry: Some(kinds),
+        release_actors: Some(Arc::new(
+            boss_jobs::agents::InMemoryAgents::new()
+                .with_agent("agent-claude-b", ["claude-b@algedonic.dev"])
+                .with_agent("agent-codex", ["codex@algedonic.dev"]),
+        )),
         ..JobsApiState::minimal(
             jobs.clone(),
             bus,
@@ -174,7 +181,8 @@ async fn held_car(jobs: &InMemoryJobs, n: u128, c: Car) -> (Uuid, Uuid, StepId) 
             "ship-a-change",
             car,
             JobStatus::Open,
-            json!({"branch": format!("feat/car-{n}"), "agent_run": builder.to_string()}),
+            json!({"branch": format!("feat/car-{n}"), "agent_run": builder.to_string(),
+                   "built_by": "claude-b@algedonic.dev"}),
         ),
         t(NOW),
         &[],
@@ -196,7 +204,7 @@ async fn held_car(jobs: &InMemoryJobs, n: u128, c: Car) -> (Uuid, Uuid, StepId) 
             "agent-run",
             run,
             JobStatus::Closed,
-            json!({"review": {
+            json!({"agent": "agent-codex", "review": {
                 "car": car.to_string(), "branch": format!("feat/car-{n}"),
                 "reviewed_sha": c.reviewed_sha, "verdict": c.verdict,
                 "at": "2026-11-20T11:00:00Z",

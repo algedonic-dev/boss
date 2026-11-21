@@ -149,10 +149,9 @@ export function withManifest(route: Route, pathname: string, manifest: ManifestS
 /// that row and the region map that answered for them is gone.
 export function sectionForRoute(route: Route): string {
   // An unmatched path lights the row of the page its one back link
-  // opens, so it renders in the department it was under: /it/<typo> in
-  // the IT chrome, anything else in Home (design ee3a3a2f Q4). The /it
-  // catch-all returned the yard until then, which is how that chrome
-  // came for free.
+  // opens, so it renders where that door leads (design ee3a3a2f Q4):
+  // Home, since backlog 92bfcb04 retired the /it prefix whose typos
+  // rendered in the IT chrome.
   // A path owned by a department this instance does not have lights
   // Home, where its one door leads (`withRoster`).
   if (route.kind === 'notFound' && route.path) {
@@ -227,16 +226,18 @@ const SECTION_FOR_KIND: Readonly<Record<Route['kind'], string>> = {
   systemRegistryDrift: 'system-registry-drift',
   systemAgents: 'system-agents',
   systemCredentials: 'system-credentials',
-  // The alarms board at /it — what stays of the Department Map (design
-  // e765b3fc) after design 01fa5bdf — and every selection on it light
-  // its one row.
+  // The alarms board at /alarms — what stays of the Department Map
+  // (design e765b3fc) after design 01fa5bdf — and every selection on it
+  // light its one row.
   systemYard: 'system-yard',
-  // The station tree floor (T7, backlog 94a9dad4).
-  systemTree: 'system-yard',
+  // The station tree floor (T7, backlog 94a9dad4): the root's page since
+  // backlog 92bfcb04, Home's, so it outlives IT's departments row. It lit
+  // the alarms board's row while both sat under /it.
+  systemTree: 'system-tree',
   // The station page (design c4854fd4 E2) is a station of that floor, opened.
-  systemStation: 'system-yard',
+  systemStation: 'system-tree',
   // Its Resources view (backlog 87575d69) is the same station, opened on its pools.
-  systemStationResources: 'system-yard',
+  systemStationResources: 'system-tree',
   systemEstate: 'system-estate',
   systemKb: 'system-kb',
   systemDesign: 'system-design',

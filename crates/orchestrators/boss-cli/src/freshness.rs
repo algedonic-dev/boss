@@ -1052,28 +1052,36 @@ fn replay_once(repo: &Path, branch: &str) -> anyhow::Result<Replay> {
     // the branch still read 04ca1ae7 — the replayed commit survived as an
     // object no ref pointed at, and the car gated, and parked, one commit
     // behind main. The exit code does not decide what this attempt did;
-    // the re-read does. It doubles as keeping the caller's
-    // remote-tracking ref honest (the local branch, if checked out
-    // somewhere, is theirs to move).
-    let _ = git(&[
-        "fetch",
-        "-q",
-        "origin",
-        &format!("+refs/heads/{branch}:refs/remotes/origin/{branch}"),
-    ]);
-    let observed = git(&["rev-parse", &format!("origin/{branch}")])
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-    if let Some(head) = &observed
-        && head != &new_head
-    {
-        return Ok(Replay::Raced(format!(
-            "{} was pushed {how} {} and accepted, but {branch} on the forge reads {}",
-            short(&new_head),
-            short(&old_head),
-            short(head)
-        )));
+    // the re-read does.
+    //
+    // AND THE RE-READ IS OF THE FORGE, NEVER OF THE REF THE PUSH MOVED
+    // (backlog a907dc50, 2026-09-26). It was a discarded `git fetch`
+    // followed by `rev-parse origin/<branch>` — but a successful push
+    // has ALREADY moved that remote-tracking ref to the pushed head, so
+    // whenever the fetch failed (a contended or locked tracking ref,
+    // eee3bc52; an unwritable FETCH_HEAD) the re-read answered with the
+    // push's own claim. Two of two `--rebase` runs that day printed
+    // "read back: the forge's branch holds it" while `git ls-remote`
+    // showed the old head. `ls-remote` writes nothing locally, so only
+    // the forge can answer it, and an unanswered read is unconfirmed.
+    let observed = forge_branch_head(&git, branch);
+    match &observed {
+        Ok(Some(head)) if head != &new_head => {
+            return Ok(Replay::Raced(format!(
+                "{} was pushed {how} {} and accepted, but {branch} on the forge reads {}",
+                short(&new_head),
+                short(&old_head),
+                short(head)
+            )));
+        }
+        Ok(None) => {
+            return Ok(Replay::Raced(format!(
+                "{} was pushed {how} {} and accepted, but the forge has no {branch} at all",
+                short(&new_head),
+                short(&old_head),
+            )));
+        }
+        _ => {}
     }
     Ok(Replay::Settled(Rebased {
         old_head,
@@ -1082,10 +1090,35 @@ fn replay_once(repo: &Path, branch: &str) -> anyhow::Result<Replay> {
         replayed: total.saturating_sub(dropped.len()),
         dropped,
         merged: merge_forward,
-        // An unreadable branch is not a finding either way: the caller
+        // An unreadable forge is not a finding either way: the caller
         // prints the move without vouching for it.
-        confirmed: observed.is_some(),
+        confirmed: observed.is_ok(),
     }))
+}
+
+/// `branch` as the FORGE holds it, read with `git ls-remote` (backlog
+/// a907dc50): `Ok(Some(sha))` the forge's head, `Ok(None)` the forge
+/// answered and has no such branch, `Err` the forge could not be read.
+/// Nothing local is read or written, so a ref a push has just moved
+/// cannot answer for the forge. The answer is read by
+/// [`crate::receipt::read_lookup`], the one exact-ref reading every
+/// `ls-remote` in this CLI shares (backlog ecb690e9): its exit status
+/// decides readable, and only the line naming the full ref is the head,
+/// because `ls-remote`'s pattern matches by tail and would also list
+/// `x/refs/heads/<branch>`.
+fn forge_branch_head(
+    git: &dyn Fn(&[&str]) -> anyhow::Result<std::process::Output>,
+    branch: &str,
+) -> Result<Option<String>, String> {
+    let full = format!("refs/heads/{branch}");
+    let ran =
+        git(&["ls-remote", "origin", &full]).map_err(|e| std::io::Error::other(format!("{e:#}")));
+    let lookup = crate::receipt::read_lookup(&format!("git ls-remote origin {full}"), &full, ran);
+    if lookup.readable {
+        Ok(lookup.head)
+    } else {
+        Err(lookup.said.unwrap_or_default())
+    }
 }
 
 /// A replay that stopped on a conflict, as [`twin_sentence`] reads it.
@@ -1767,6 +1800,85 @@ mod tests {
         );
         assert!(done.confirmed, "read back from the forge: {done:?}");
         assert_eq!(observe(&f.clone, "car/disjoint").standing, Base::Current);
+    }
+
+    impl Forge {
+        /// A `post-receive` hook that runs `then` — shell text in which
+        /// `$CLONE` names the caller's git directory — on every push,
+        /// AFTER the forge has accepted it, so `git push` exits 0 and
+        /// moves the clone's remote-tracking ref to the pushed head.
+        fn after_a_push(&self, then: &str) {
+            let hooks = self.origin().join(".git").join("hooks");
+            boss_testing::scratch::create_dir(&hooks);
+            boss_testing::scratch::write_exec(
+                &hooks.join("post-receive"),
+                &format!(
+                    "#!/bin/sh\nCLONE='{}'\n{then}\n",
+                    self.clone.join(".git").display()
+                ),
+            );
+        }
+
+        /// The branch as the FORGE at `forge` holds it, read off the
+        /// forge's own repository — never through the clone, whose
+        /// `origin` a hook below may have pointed elsewhere.
+        fn forge_head(forge: &Path, branch: &str) -> String {
+            let out = Forge::git(forge, &["rev-parse", &format!("refs/heads/{branch}")]);
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+    }
+
+    /// A FORGE THAT CANNOT BE RE-READ IS NOT VOUCHED FOR (backlog
+    /// a907dc50). The push lands, then the forge stops answering. The
+    /// read-back used to discard the failed fetch and rev-parse the
+    /// clone's `origin/<branch>` — the ref the successful push had just
+    /// moved to the pushed head — so it "confirmed" a forge it never read.
+    #[test]
+    fn a_push_whose_forge_cannot_be_read_back_is_not_confirmed() {
+        let f = Forge::build("boss-cli-freshness-rebase-unreadable");
+        let forge = f.origin();
+        let gone = f.clone.with_file_name("no-forge-here");
+        f.after_a_push(&format!(
+            "git config --file \"$CLONE/config\" remote.origin.url '{}'",
+            gone.display()
+        ));
+        let done = rebase_onto_main(&f.clone, "car/disjoint").expect("the push was accepted");
+        assert_eq!(
+            Forge::forge_head(&forge, "car/disjoint"),
+            done.new_head,
+            "the push did land: {done:?}"
+        );
+        assert!(
+            !done.confirmed,
+            "nothing read the forge after the push, so nothing confirmed it: {done:?}"
+        );
+    }
+
+    /// THE MEASURED SHAPE OF a907dc50 (runs 7f498e7e and 5b384b36,
+    /// 2026-09-26): `boss gate --rebase` printed "read back: the forge's
+    /// branch holds it" while `git ls-remote origin` showed the OLD head.
+    /// Here the forge undoes the push and the clone's own fetch fails (its
+    /// FETCH_HEAD cannot be written), while the forge itself stays
+    /// readable. The verb must read the forge, see the old head, and
+    /// never report the replayed head as held.
+    #[test]
+    fn a_push_the_forge_undid_is_not_confirmed_when_the_local_fetch_fails() {
+        let f = Forge::build("boss-cli-freshness-rebase-undone-unfetched");
+        let old_head = f.head("origin/car/disjoint");
+        f.after_a_push(
+            "while read -r old new ref; do git update-ref \"$ref\" \"$old\"; done\nrm -f \
+             \"$CLONE/FETCH_HEAD\"\nmkdir -p \"$CLONE/FETCH_HEAD\"",
+        );
+        let got = rebase_onto_main(&f.clone, "car/disjoint");
+        assert_eq!(
+            Forge::forge_head(&f.origin(), "car/disjoint"),
+            old_head,
+            "the forge's branch is where it was"
+        );
+        assert!(
+            !matches!(&got, Ok(done) if done.confirmed),
+            "the forge holds {old_head}, so no move may be confirmed: {got:?}"
+        );
     }
 
     /// A car whose replay conflicts is REFUSED with the files named, the

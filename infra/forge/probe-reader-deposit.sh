@@ -98,13 +98,16 @@
 # docker's json-file log for the life of the `--rm` container, root-only.
 #
 # WHAT THIS HOST'S MODES DO NOT ISOLATE, stated as the estate deposit
-# states it: forge-converge.service runs this script AS ROOT out of
-# /home/david/boss, and david holds passwordless sudo on this host
-# (measured 2026-10-07, ops-request 2ba87619). The 0600 file keeps the
-# reader credential from boss-probe — the account a probe's text runs
-# as, which holds no sudo and cannot read david's checkout — and from an
-# accident. It keeps nothing from david, who is root here by two roads
-# older than this file (design c98c79aa is that question).
+# states it: david holds passwordless sudo on this host (measured
+# 2026-10-07, ops-request 2ba87619; kept as David's own, position B on
+# backlog a604a35b). The 0600 file keeps the reader credential from
+# boss-probe — the account a probe's text runs as, which holds no sudo
+# and cannot read david's checkout — and from an accident. It keeps
+# nothing from david, who is root here by that road. The other road
+# design c98c79aa named is closed: forge-converge.service runs this
+# script AS ROOT from root's own tree, /var/lib/boss/tree/current
+# (infra/forge/root-tree.sh), no longer out of /home/david/boss
+# (backlog a604a35b).
 #
 # NOTHING HERE IS EVER REQUIRED. forge-converge.sh carries this script's
 # exit onto its packet and never into its own, and bounds its time. A

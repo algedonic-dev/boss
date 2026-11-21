@@ -646,7 +646,8 @@ mod tests {
             md[k] = v;
         }
         json!({"id": CAR, "kind": "ship-a-change", "workflow_version": 7,
-               "metadata": {"branch": "feat/x", "agent_run": BUILDER},
+               "metadata": {"branch": "feat/x", "agent_run": BUILDER,
+                            "built_by": "builder@login.example"},
                "steps": [{"id": STEP, "spec_slug": "review",
                           "title": boss_jobs::car::REVIEW, "status": "active",
                           "metadata": md}]})
@@ -666,7 +667,8 @@ mod tests {
 
     fn run(id: &str, sha: &str, verdict: &str) -> Json {
         json!({"id": id, "kind": "agent-run", "status": "open",
-               "metadata": {"review": {"car": CAR, "branch": "feat/x",
+               "metadata": {"agent": "agent-reviewer",
+                   "review": {"car": CAR, "branch": "feat/x",
                    "reviewed_sha": sha, "verdict": verdict, "findings": "",
                    "at": "2026-10-16T19:00:00Z"}}})
     }
@@ -679,6 +681,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl car_release::ExecutorRecordReader for Advisory {
+        // An empty agents registry: the car's builder is told from its
+        // reviewer by spelling alone (backlog 8e97a4ec).
+        async fn release_actor_rows(&self) -> anyhow::Result<Vec<Json>> {
+            Ok(vec![])
+        }
         async fn protocol_version(&self, kind: &str, version: i64) -> anyhow::Result<Option<Json>> {
             Ok(Some(
                 json!({"kind": kind, "version": version, "status": "active",

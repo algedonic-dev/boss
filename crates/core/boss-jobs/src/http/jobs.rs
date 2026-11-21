@@ -1847,6 +1847,18 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
         Err(e) => return persist_error_response(e),
     }
 
+    // NOR IS A BACKLOG ITEM FILED ABOUT A SUPERSEDED AREA (backlog
+    // f4b0ad41 rule 1, design 25511015 Q4): an area a reconstruction
+    // step retires takes no NEW item, and the refusal names the step.
+    // The list is infra/platform/superseded-areas.toml; the rule is in
+    // crate::superseded_area. After the already-admitted answer above,
+    // so a re-send of a packet admitted before an area was listed is
+    // still answered as the packet that exists; judged here, not in the
+    // CLI, so every filer meets it from one place.
+    if let Some(body) = crate::superseded_area::refusal(&job.kind, &job.metadata) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
+    }
+
     // An experiment opened onto a version never published is a publish
     // (backlog ce8b7d66; the reasoning is on the helper).
     if let Some(refusal) =

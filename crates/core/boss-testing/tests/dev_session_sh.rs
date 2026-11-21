@@ -6,7 +6,8 @@
 //! offers six: 1 Claude + Claude Code (`dev`), 2 GPT + Codex (`codex`),
 //! 3 Gemini + Code Assist (`gemini`), 4 Shell (`shell`), 5 Claude B +
 //! Claude Code (`claude-b`, a second account's own login), 6 GPT + Codex
-//! as the supervised factory loop (`codex-factory`, 628dc540). Each joins its
+//! as the supervised factory loop (`codex-factory`, 628dc540) — and 7, an
+//! ssh to the standby shell's door (design 0491591b). Each joins its
 //! session when it runs and creates it when it does not, and Enter or the
 //! timeout is option 1, so anything that relied on landing in `dev` still
 //! lands there. The selector is VERSIONED in the checkout and the
@@ -1858,4 +1859,82 @@ fn claude_b_is_never_started_beside_its_seat() {
         "{out}"
     );
     assert!(!f.log().contains("new-session"), "{}", f.log());
+}
+
+/// An `ssh` stand-in: logs its argv and exits STUB_SSH_EXIT (default 0),
+/// as a session that connected and was left would.
+const SSH_STUB: &str =
+    "#!/usr/bin/env bash\necho \"ssh $*\" >> \"$STUB_LOG\"\nexit \"${STUB_SSH_EXIT:-0}\"\n";
+
+/// The standby door's `lan`, read from infra/estate/doors.toml — the
+/// one place the menu reads it from too (the address's other copy, the
+/// Service pin, is held equal by the_door_is_watched_from_outside_the_pod.rs).
+fn standby_lan() -> String {
+    let toml = std::fs::read_to_string(repo_root().join("infra/estate/doors.toml"))
+        .expect("read doors.toml");
+    toml.split("[[door]]")
+        .find(|b| b.contains("id = \"dev-standby-ssh\""))
+        .and_then(|b| {
+            b.lines()
+                .find_map(|l| l.trim().strip_prefix("lan = \""))
+                .map(|v| v.trim_end_matches('"').to_string())
+        })
+        .expect("doors.toml declares door dev-standby-ssh with a lan half")
+}
+
+/// Option 7 is the standby shell (design 0491591b, backlog 47601829): an
+/// ssh to the standby's LAN door, at the address doors.toml declares, so
+/// the operator reaches it without remembering an address. It starts no
+/// tmux session here — the standby is another pod — and a session that
+/// ended is the login's end, as leaving any option's tmux is.
+#[test]
+fn option_seven_is_an_ssh_to_the_standby_at_its_declared_door() {
+    let f = Fixture::new("opt7", &["claude"]);
+    write_exec(&Path::new(&f.path).join("ssh"), SSH_STUB);
+    let (rc, out) = f.run("dev", "7\n", &[]);
+    assert_eq!(rc, 0, "{out}");
+    let lan = standby_lan();
+    let (addr, port) = lan.rsplit_once(':').expect("lan is address:port");
+    assert!(
+        out.contains("7) Standby shell") && out.contains(&format!("root@{addr}")),
+        "the menu offers the standby and names where it goes: {out}"
+    );
+    assert!(
+        f.log()
+            .contains(&format!("ssh -o ConnectTimeout=10 -p {port} root@{addr}")),
+        "{}",
+        f.log()
+    );
+    assert!(
+        !f.log().contains("new-session"),
+        "the standby is not a tmux session on this pod: {}",
+        f.log()
+    );
+}
+
+/// ssh's own failure (exit 255: no route, refused, no key it will
+/// take) is said with where else the standby is reached from, and goes
+/// back to the menu: a login that chose the standby must never be lost
+/// to a standby that did not answer.
+#[test]
+fn a_standby_that_does_not_answer_is_said_and_returns_to_the_menu() {
+    let f = Fixture::new("opt7-fails", &["claude"]);
+    write_exec(&Path::new(&f.path).join("ssh"), SSH_STUB);
+    let (rc, out) = f.run("dev", "7\n4\n", &[("STUB_SSH_EXIT", "255")]);
+    assert_eq!(rc, 0, "{out}");
+    let lan = standby_lan();
+    let (addr, _) = lan.rsplit_once(':').expect("lan is address:port");
+    assert!(
+        out.contains(&format!("could not reach the standby at {lan}")),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("ssh root@{addr}")),
+        "the refusal names the bastion's way in: {out}"
+    );
+    assert!(
+        f.attached().starts_with("tmux new-session -A -s shell "),
+        "the failure returns to the menu: {}",
+        f.log()
+    );
 }

@@ -17,6 +17,8 @@
 #            only when BOTH answer: a port that accepts and offers no
 #            host key is not a door anyone can use.
 #   public — resolve the public name (getent hosts). Open when it does.
+#            Only for a door that declares one: dev-standby-ssh has a
+#            lan half alone until its hostname car (0e33a4de).
 # A dark half's FIRST dark reading is kept under DOOR_STATE_DIR (one
 # file per door and half, holding the time), and every later reading
 # carries it forward as `dark_since`; an open reading deletes it. The
@@ -113,13 +115,15 @@ doors=$(declared) || refuse "could not be parsed"
 while IFS='|' read -r id lan pub band; do
     [ -n "$id" ] || refuse "a [[door]] table has no id"
     case "$lan" in *:*[0-9]) ;; *) refuse "door $id: lan must be address:port, got '$lan'" ;; esac
-    [ -n "$pub" ] || refuse "door $id: no public name"
+    # No `public` is a door with a lan half alone (dev-standby-ssh until
+    # its hostname car, 0e33a4de), not a refusal: a public half nobody
+    # declared would be an alarm on a name that does not exist.
     case "${band:-empty}" in empty|*[!0-9]*|0) refuse "door $id: dark_band_minutes must be a whole number of minutes above zero, got '$band'" ;; esac
 done <<< "$doors"
 
 if [ "$mode" = declared ]; then
     while IFS='|' read -r id lan pub band; do
-        echo "$id $lan $pub band_s=$(( band * 60 ))"
+        echo "$id $lan ${pub:--} band_s=$(( band * 60 ))"
     done <<< "$doors"
     exit 0
 fi
@@ -185,9 +189,17 @@ say() { if [ "$2" = true ]; then echo "$1 open"; else echo "$1 DARK since $3 ($4
 nodes='[]'
 while IFS='|' read -r id lan pub band; do
     probe_lan "${lan%:*}" "${lan##*:}"
-    probe_public "$pub"
     lan_since=$(dark_since "$id" lan "$lan_open")
-    pub_since=$(dark_since "$id" public "$pub_open")
+    # A door with no public name has no public half: nothing probed,
+    # nothing remembered (a dark-since left from a name since removed is
+    # forgotten), and nothing posted for it.
+    if [ -n "$pub" ]; then
+        probe_public "$pub"
+        pub_since=$(dark_since "$id" public "$pub_open")
+    else
+        pub_open=true pub_addr='' pub_reason='' pub_since=''
+        dark_since "$id" public true
+    fi
     node=$(jq -n \
         --arg id "$id" --argjson band_s "$(( band * 60 ))" \
         --arg lan "$lan" --argjson lan_open "$lan_open" --argjson lan_tcp "$lan_tcp" \
@@ -195,15 +207,17 @@ while IFS='|' read -r id lan pub band; do
         --arg pub "$pub" --argjson pub_open "$pub_open" --arg pub_addr "$pub_addr" \
         --arg pub_reason "$pub_reason" --arg pub_since "$pub_since" \
         'def nz: if . == "" then null else . end;
-         { id: $id, band_s: $band_s, halves: [
+         { id: $id, band_s: $band_s, halves: ([
              { half: "lan", target: $lan, open: $lan_open, tcp: $lan_tcp,
                keyscan: ($lan_key | nz), reason: ($lan_reason | nz),
-               dark_since: ($lan_since | nz) },
+               dark_since: ($lan_since | nz) } ] + (if $pub == "" then [] else [
              { half: "public", target: $pub, open: $pub_open,
                address: ($pub_addr | nz), reason: ($pub_reason | nz),
-               dark_since: ($pub_since | nz) } ] }')
+               dark_since: ($pub_since | nz) } ] end)) }')
     nodes=$(jq -c --argjson n "$node" '. + [$n]' <<< "$nodes")
-    echo "door $id: $(say "lan $lan" "$lan_open" "$lan_since" "$lan_reason") · $(say "public $pub" "$pub_open" "$pub_since" "$pub_reason") — band ${band}m"
+    line="door $id: $(say "lan $lan" "$lan_open" "$lan_since" "$lan_reason")"
+    [ -z "$pub" ] || line="$line · $(say "public $pub" "$pub_open" "$pub_since" "$pub_reason")"
+    echo "$line — band ${band}m"
 done <<< "$doors"
 
 observation=$(jq -cn --arg at "$now" --argjson nodes "$nodes" \

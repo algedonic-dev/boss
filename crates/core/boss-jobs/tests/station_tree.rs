@@ -921,7 +921,7 @@ fn the_platform_stations_make_one_tree_with_every_row_in_it() {
         .map(|s| s.name.as_str())
         .collect();
     assert_eq!(roots, vec![ROOT], "the company is the one root");
-    for name in ["executive", "engineering", "operations"] {
+    for name in ["engineering", "operations", "finance"] {
         assert_eq!(
             address_of(&rows, name),
             Some(format!("/{ROOT}/{name}")),
@@ -967,15 +967,34 @@ fn every_machine_a_station_names_is_an_automation_row() {
 /// code is a Design token, declared once in the web stylesheet, so this
 /// holds the two together (CLAUDE.md §9a): a row naming a code the
 /// stylesheet does not declare would draw night ink and say nothing.
+///
+/// A department is a child of the root WITH a line of its own. Since the
+/// executive desk dissolved into the company (design 2910ec3d car 1,
+/// backlog 878fd1e7) the root also hosts stations of its own that are no
+/// department and draw the company's line (since backlog 5cb56bb3, the
+/// person's own station `me`); they are named in
+/// [`HOSTED_AT_THE_COMPANY`], so a new department that forgets its line
+/// is refused by name rather than read as one of them.
 #[test]
 fn every_top_level_station_names_a_line_the_stylesheet_declares() {
     let rows = stations();
     let root = id_of(&rows, ROOT);
     let css = std::fs::read_to_string(boss_testing::repo_root().join("apps/web/src/styles.css"))
         .expect("read the web stylesheet");
+    let mut lineless: Vec<&str> = rows
+        .iter()
+        .filter(|s| s.parent.as_deref() == Some(root.as_str()) && s.line.is_none())
+        .map(|s| s.name.as_str())
+        .collect();
+    lineless.sort_unstable();
+    assert_eq!(
+        lineless, HOSTED_AT_THE_COMPANY,
+        "a child of the root names a line unless it is a queue the company hosts itself"
+    );
     let top: Vec<&StationSpec> = rows
         .iter()
         .filter(|s| s.parent.is_none() || s.parent.as_deref() == Some(root.as_str()))
+        .filter(|s| !HOSTED_AT_THE_COMPANY.contains(&s.name.as_str()))
         .collect();
     assert!(top.len() >= 4, "the root and its departments: {top:?}");
     let failures: Vec<String> = top
@@ -996,7 +1015,6 @@ fn every_top_level_station_names_a_line_the_stylesheet_declares() {
         // today's IT blue, because IT is retiring (df0ecd8b).
         ("engineering", "engineering"),
         ("operations", "hosting"),
-        ("executive", "executive"),
         // Design c0ae096f (backlog 599fec3e): Finance returns on its own line.
         ("finance", "finance"),
     ] {
@@ -1060,6 +1078,110 @@ fn the_company_and_engineering_floors_place_every_child_where_the_plan_does() {
     );
 }
 
+/// The stations the company station hosts itself, by name, sorted: each
+/// is a child of the root and no department, so it declares no line and
+/// draws the company's. The person's two queues stood here when the
+/// executive desk dissolved (design 2910ec3d car 1, backlog 878fd1e7),
+/// until design 01fa5bdf step 3 gave them `me`, the person's own station
+/// (backlog 5cb56bb3), which is the one row left here.
+const HOSTED_AT_THE_COMPANY: [&str; 1] = ["me"];
+
+/// DESIGN 2910ec3d, car 1 (backlog 878fd1e7; David, 2026-11-10: "the
+/// Executive station is actually the same as the Algedonic station in
+/// theory"), re-checked against design 01fa5bdf (David, 2026-11-17).
+/// The executive desk was allocated nothing and held no executor the root
+/// does not, so its row is gone and nothing stands in it. Its rows MOVED,
+/// they were not rebuilt: each keeps its stable `id`, and a move is a
+/// `parent` edit that gains no capability. The person's queues stood at
+/// the company until `me`, the person's own station, existed to take them
+/// (design 01fa5bdf step 3, backlog 5cb56bb3); the decided-designs board, the OUT of
+/// the design station's page, stands beside `design-review` in
+/// engineering's design station, where 01fa5bdf places design.
+#[test]
+fn the_executive_desk_dissolved_into_the_company_and_its_rows_kept_their_identity() {
+    let rows = stations();
+    assert!(
+        !rows.iter().any(|s| s.name == "executive"),
+        "the executive station row is retired"
+    );
+    // The desk's id, spelled once because it is now history.
+    const DESK: &str = "5f922a2a-31f5-4f07-acf1-41dc140687a4";
+    let in_desk: Vec<&str> = rows
+        .iter()
+        .filter(|s| s.parent.as_deref() == Some(DESK) || s.id.as_deref() == Some(DESK))
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(in_desk.is_empty(), "rows still at the desk: {in_desk:?}");
+    for (name, under, id) in [
+        (
+            "my-watchlist",
+            "/me",
+            "4feca45a-de46-4649-8569-f5a7262b8017",
+        ),
+        (
+            "q.platform-admin.task",
+            "/me",
+            "21bf19d3-94dc-4fcc-ac7c-4a19923c726f",
+        ),
+        (
+            "design-decided",
+            "/engineering/design",
+            "ebbae18b-5bee-468e-8be7-53aa54a91e87",
+        ),
+    ] {
+        assert_eq!(
+            address_of(&rows, name),
+            Some(format!("/{ROOT}{under}/{name}")),
+            "`{name}` left the desk for its new parent"
+        );
+        assert_eq!(
+            named(&rows, name).id.as_deref(),
+            Some(id),
+            "`{name}` kept its id"
+        );
+        assert_eq!(
+            named(&rows, name).mode,
+            Some(boss_jobs::stations::StationMode::Standing),
+            "`{name}` is still a standing station"
+        );
+    }
+    // Their new parent is the person's own station: one row for every
+    // person, at the root, no department (no line of its own) and no
+    // capability, so the second move gained no one a claim either.
+    let me = named(&rows, "me");
+    assert_eq!(address_of(&rows, "me"), Some(format!("/{ROOT}/me")));
+    assert_eq!(
+        me.id.as_deref(),
+        Some("bbfea3e2-d865-42c1-858b-85d45d29f350")
+    );
+    assert!(me.line.is_none(), "`me` is no department: {me:?}");
+    assert!(me.capability.is_none(), "`me` admits no one: {me:?}");
+    // No capability gained in the move: the operator's task station still
+    // admits exactly the one role, and the two views admit no one by role.
+    let task = named(&rows, "q.platform-admin.task")
+        .capability
+        .as_ref()
+        .expect("the operator's task station keeps its capability");
+    assert_eq!(task.roles, vec!["platform-admin".to_string()]);
+    assert!(task.models.is_empty(), "no model admitted: {task:?}");
+    for view in ["my-watchlist", "design-decided"] {
+        assert!(
+            named(&rows, view).capability.is_none(),
+            "`{view}` gained a capability"
+        );
+    }
+    // The automation hosted at the desk is hosted at the company.
+    let automations = boss_jobs::agents::automations::load_automations_dir(Path::new(
+        boss_jobs::agents::automations::platform_automations_path(),
+    ))
+    .expect("the platform automation bundle parses");
+    let usage = automations
+        .iter()
+        .find(|a| a.id == "automation:surface-usage")
+        .expect("the surface-usage automation row");
+    assert_eq!(usage.station, Some(id_of(&rows, ROOT)));
+}
+
 /// CLAUDE.md §9a: a node's vCPUs live in the estate declaration and in its
 /// host pool's capacity, so the two are held equal, both ways, here.
 #[test]
@@ -1099,62 +1221,150 @@ fn every_estate_node_has_its_host_pool_and_no_other() {
     }
 }
 
-/// The one CPU number in the manifest line that `marker` picks out — the
-/// line must be unique, so a second container growing the same shape is a
-/// red here rather than a silent wrong read.
-fn manifest_cpu(path: &str, kind: &str, marker: &str) -> u64 {
+/// A Kubernetes CPU quantity in millicores: `"4"`, `4`, `250m`, `"2.5"`.
+fn cpu_millis(q: &str) -> u64 {
+    let q = q.trim().trim_matches('"');
+    match q.strip_suffix('m') {
+        Some(m) => m
+            .parse()
+            .unwrap_or_else(|_| panic!("a millicore count: {q}")),
+        None => {
+            let cores: f64 = q.parse().unwrap_or_else(|_| panic!("a CPU count: {q}"));
+            // A quantity in tenths or thousandths, never a fraction of a
+            // millicore, so the round is exact.
+            (cores * 1000.0).round() as u64
+        }
+    }
+}
+
+/// Every `<kind>: {cpu: <q>, …}` line in `path` that `marker` picks out,
+/// in millicores. `expect` is how many the caller knows are there, so a
+/// container growing the same shape is a red here rather than a silent
+/// wrong read.
+fn manifest_cpus(path: &str, kind: &str, marker: &str, expect: usize) -> Vec<u64> {
     let text = std::fs::read_to_string(boss_testing::repo_root().join(path)).expect("read");
     let lines: Vec<&str> = text
         .lines()
-        .filter(|l| l.contains(&format!("{kind}: {{cpu: \"")) && l.contains(marker))
+        .filter(|l| l.contains(&format!("{kind}: {{cpu: ")) && l.contains(marker))
         .collect();
     assert_eq!(
         lines.len(),
-        1,
-        "{path}: one `{kind}` line with `{marker}`: {lines:?}"
+        expect,
+        "{path}: {expect} `{kind}` line(s) with `{marker}`: {lines:?}"
     );
-    lines[0]
-        .split("cpu: \"")
-        .nth(1)
-        .and_then(|rest| rest.split('"').next())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| panic!("{path}: a whole-CPU number in {}", lines[0]))
+    lines
+        .iter()
+        .map(|l| {
+            let q = l
+                .split("cpu: ")
+                .nth(1)
+                .and_then(|rest| rest.split([',', '}']).next())
+                .unwrap_or_else(|| panic!("{path}: a CPU quantity in {l}"));
+            cpu_millis(q)
+        })
+        .collect()
 }
 
 /// CLAUDE.md §9a again: the allocations the bundle declares are read off
 /// the manifests that decide them, so they are held to those manifests.
-/// The gates hold their seats times the gate container's CPU request;
-/// Engineering holds that plus the dev pod's CPU limit, where every
-/// builder's workspace runs.
+///
+/// REWRITTEN for backlog 2b7c78f8 (2026-11-21, David: tune resource
+/// allocations for throughput). Its first form held the gates to the gate
+/// CONTAINER's 4 CPU and Engineering to that plus the dev pod's 16-CPU
+/// LIMIT, and both were wrong in the direction that over-admits. The
+/// scheduler places a gate POD, whose effective request is the gate's 4
+/// plus the postgres native sidecar's 250m beside it (4.25, measured on
+/// the live pods 16:52Z); and the dev pod's limit is not what it takes of
+/// w-1 — its REQUEST is (4 + 250m + 50m = 4.3), and since isolation the
+/// builders run in dev-build workers that are pods of their own, billed
+/// 2.5 each at the claim. So the record charged 28 + the dev pod's 4.3
+/// against a 32-vCPU box before Longhorn's guaranteed CPU or a DaemonSet,
+/// and admitted 3 gates + 6 workers when w-1 places 3 gates + 3.
+///
+/// Held here, each from the file that decides it:
+///   * gates = ceil(seats x the gate pod's effective CPU request);
+///   * Engineering's float (its allocation less what the gates reserve) is
+///     a whole number of worker claims at agent-run's billed vCPU — the
+///     number of builders the host:w-1 line admits, so a builder w-1
+///     cannot place waits in that line instead of in the scheduler;
+///   * Engineering plus the dev pod's request fits host:w-1's capacity.
+///     The rest of the box — Longhorn's guaranteed instance-manager CPU,
+///     the DaemonSets, and the playground stack while it stands on w-1 —
+///     is named in engineering.toml as read by node-pods, not pinned: no
+///     manifest in this tree decides it.
 #[test]
 fn the_engineering_allocations_are_the_manifests_numbers() {
     let rows = stations();
     let held = |name: &str| -> u64 {
-        named(&rows, name).allocation["host:w-1"]
+        let n: u64 = named(&rows, name).allocation["host:w-1"]
             .to_string()
             .parse()
-            .expect("a whole vCPU count")
+            .expect("a whole vCPU count");
+        n * 1000
     };
-    let gate = manifest_cpu(
-        "infra/gate-runner/gate-runner.yaml",
-        "requests",
-        "ephemeral-storage",
+    let gate_pod: u64 = [
+        manifest_cpus(
+            "infra/gate-runner/gate-runner.yaml",
+            "requests",
+            "ephemeral-storage",
+            1,
+        ),
+        manifest_cpus(
+            "infra/gate-runner/gate-runner.yaml",
+            "requests",
+            "memory: 3Gi",
+            1,
+        ),
+    ]
+    .concat()
+    .iter()
+    .sum();
+    assert_eq!(
+        gate_pod, 4250,
+        "the gate pod: the gate 4 + the sidecar 250m"
     );
-    let dev = manifest_cpu(
-        "infra/cluster/manifests/boss-dev.yaml",
-        "limits",
-        "memory: 32Gi",
-    );
+    let dev_pod: u64 = manifest_cpus("infra/cluster/manifests/boss-dev.yaml", "requests", "", 3)
+        .iter()
+        .sum();
     let seats = u64::try_from(named(&rows, "gates").capacity.expect("seats")).expect("positive");
     assert_eq!(
         held("gates"),
-        seats * gate,
-        "the gates' share of the build node"
+        (seats * gate_pod).div_ceil(1000) * 1000,
+        "the gates' share of the build node: {seats} gate pods of {gate_pod}m"
     );
-    assert_eq!(
-        held("engineering"),
-        seats * gate + dev,
-        "engineering's share of the build node"
+    let bundle =
+        boss_jobs::seed_loader::load_workflows(boss_jobs::registry::platform_bundle_path())
+            .expect("the platform bundle parses");
+    let worker = bundle
+        .iter()
+        .find(|w| w.kind == "agent-run")
+        .and_then(|w| w.steps.iter().find(|s| s.title == "building"))
+        .and_then(|s| s.resources.as_ref())
+        .and_then(|r| r.vcpu.as_ref())
+        .map(|q| cpu_millis(&q.to_string()))
+        .expect("agent-run's building bills a worker's vCPU");
+    let float = held("engineering")
+        .checked_sub(held("gates"))
+        .expect("engineering holds the gates' share");
+    assert!(
+        float > 0 && float % worker == 0,
+        "engineering's float {float}m is a whole number of {worker}m worker claims"
+    );
+    let box_cpu = pools()
+        .into_iter()
+        .find(|p| p.name == "host:w-1")
+        .and_then(|p| match p.capacity {
+            boss_jobs::pools::PoolCapacity::Configured { amount } => {
+                Some(cpu_millis(&amount.to_string()))
+            }
+            boss_jobs::pools::PoolCapacity::Unknown {} => None,
+        })
+        .expect("host:w-1 has a configured capacity");
+    assert!(
+        held("engineering") + dev_pod <= box_cpu,
+        "engineering's {}m plus the dev pod's {dev_pod}m request is more than w-1's {box_cpu}m: \
+         the record admits work the scheduler cannot place",
+        held("engineering")
     );
 }
 

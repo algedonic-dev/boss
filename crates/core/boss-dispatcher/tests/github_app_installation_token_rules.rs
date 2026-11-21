@@ -74,8 +74,29 @@ const PER_REQUEST_ONLY: &[&str] =
 /// reader, nothing needs the token. Judged by the `a_checks_*` pins.
 const ON_ITS_READERS_FILING: &[&str] =
     &["broker-mints-the-algedonic-dev-checks-token-when-a-checks-read-is-filed"];
-const CHECKS_VERB: &str = "read-publish-checks";
-const CHECKS_SCRIPT: &str = "infra/forge/read-publish-checks.sh";
+/// The verbs whose filing mints the checks token, each with its script and
+/// the args of a run that reads a log. Two since backlog 8f266452 (David
+/// 2026-11-20): read-publish-checks reads only the OPEN publish packet's
+/// failing checks, so a closed packet's failure — PR #261's Gate, job
+/// 135639960947 — or any other run had no door; read-github-job-log reads
+/// one job or one run's failed jobs with the SAME key and the same two
+/// permissions. Both render it through the one sourced definition,
+/// CHECKS_LIB.
+const CHECKS_READERS: &[(&str, &str, &[&str])] = &[
+    (
+        "read-publish-checks",
+        "infra/forge/read-publish-checks.sh",
+        &[],
+    ),
+    (
+        "read-github-job-log",
+        "infra/forge/read-github-job-log.sh",
+        &["job", "135639960947"],
+    ),
+];
+const CHECKS_VERB: &str = CHECKS_READERS[0].0;
+/// Where the rule the readers render from is named, once.
+const CHECKS_LIB: &str = "infra/forge/lib/github-job-log.sh";
 /// The clock that files the reader — the cadence the window must outlast.
 const CHECKS_REREAD_RULE: &str = "reread-publish-pr-every-15-minutes";
 
@@ -220,20 +241,42 @@ fn a_checks_token_is_minted_on_its_readers_filing_into_one_standing_key() {
     );
 
     let reg = Registry::from_raw(rules()).expect("the shipped rules parse together");
-    let filed_run = naming(filed(CHECKS_VERB), None);
+    for (verb, _, args) in CHECKS_READERS {
+        let run_args = if args.is_empty() {
+            None
+        } else {
+            Some(json!(args))
+        };
+        assert!(
+            checks_fires(&reg, "jobs.job.created", &naming(filed(verb), run_args)),
+            "control: the mint fires on a filed `{verb}` run"
+        );
+        assert!(
+            !checks_fires(
+                &reg,
+                "jobs.job.created",
+                &naming(filed(verb), Some(json!(["--check"])))
+            ),
+            "`{verb} --check` holds no token and must not mint one"
+        );
+    }
     assert!(
-        checks_fires(&reg, "jobs.job.created", &filed_run),
-        "control: the mint fires on a filed `{CHECKS_VERB}` run"
-    );
-    assert!(
-        !checks_fires(
+        checks_fires(
             &reg,
             "jobs.job.created",
-            &naming(filed(CHECKS_VERB), Some(json!(["--check"])))
+            &naming(
+                filed(CHECKS_READERS[1].0),
+                Some(json!(["run", "44546952203"]))
+            )
         ),
-        "`{CHECKS_VERB} --check` holds no token and must not mint one"
+        "control: a run read of `{}` mints it too",
+        CHECKS_READERS[1].0
     );
-    for (verb, _, _) in verbs().iter().filter(|(v, _, _)| v != CHECKS_VERB) {
+    let filed_run = naming(filed(CHECKS_VERB), None);
+    for (verb, _, _) in verbs()
+        .iter()
+        .filter(|(v, _, _)| !CHECKS_READERS.iter().any(|(r, _, _)| r == v))
+    {
         assert!(
             !checks_fires(&reg, "jobs.job.created", &filed(verb)),
             "the checks mint fired on a filed `{verb}` request"
@@ -242,11 +285,13 @@ fn a_checks_token_is_minted_on_its_readers_filing_into_one_standing_key() {
     let mut other = filed_run;
     other["kind"] = json!("backlog-item");
     assert!(!checks_fires(&reg, "jobs.job.created", &other));
-    assert!(!checks_fires(
-        &reg,
-        "step.done.sign-off",
-        &approved(CHECKS_VERB, "approved")
-    ));
+    for (verb, _, _) in CHECKS_READERS {
+        assert!(!checks_fires(
+            &reg,
+            "step.done.sign-off",
+            &approved(verb, "approved")
+        ));
+    }
 }
 
 /// READ-ONLY, ON THE MIRROR ALONE. Actions: Read is what a job log needs
@@ -287,12 +332,33 @@ fn a_checks_token_reads_actions_on_the_mirror_and_nothing_else() {
             "the checks key {mine:?} must not be, or look like, a key of {other:?}'s namespace"
         );
     }
-    let script = std::fs::read_to_string(repo_root().join(CHECKS_SCRIPT)).expect("the checks verb");
+    let lib = std::fs::read_to_string(repo_root().join(CHECKS_LIB)).expect("the checks lib");
     let file = format!("{}.toml", ON_ITS_READERS_FILING[0]);
     assert!(
-        script.contains(&format!("dispatcher/rules/{file}")),
-        "{CHECKS_SCRIPT} must render its token from {file}"
+        lib.contains(&format!("dispatcher/rules/{file}")),
+        "{CHECKS_LIB} must render the token from {file}"
     );
+    // Every reader renders through that one definition — sourced, never a
+    // second spelling of the rule, the slot or the render.
+    for (verb, script, _) in CHECKS_READERS {
+        let text = std::fs::read_to_string(repo_root().join(script)).expect("the reader");
+        assert!(
+            text.lines()
+                .any(|l| l.trim_start().starts_with(". ") && l.contains("/lib/github-job-log.sh")),
+            "{script} must source {CHECKS_LIB}"
+        );
+        assert!(
+            !text.contains(&file),
+            "{script} names {file} itself; the rule is named once, in {CHECKS_LIB}"
+        );
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo_root().join(format!("infra/ops/verbs/{verb}.json")))
+                .expect("the reader's verb file"),
+        )
+        .expect("the verb file is JSON");
+        assert_eq!(v["argv"][0], *script, "{verb} runs {script}");
+        assert_eq!(v["hosts"], json!(["forge"]), "{verb}: the forge renders it");
+    }
 }
 
 // ---------------------------------------------------------------------------

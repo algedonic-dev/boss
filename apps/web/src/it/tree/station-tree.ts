@@ -25,6 +25,8 @@
 
 import type { Remote } from '../../data/remote';
 import type { StationLoadRow } from '../marshalling/marshalling';
+import { ROUTE_CATALOG } from '../../shell/nav-catalog';
+import { rootPagePath } from '../../shell/page-address';
 
 /** One station of the subtree as the read serves it. */
 export type TreeNode = Readonly<{
@@ -588,6 +590,13 @@ export function stationCard(tree: StationTree, name: string, reads: CardReads): 
 export const DEPTH_CHOICES = [1, 2, 3] as const;
 export const DEFAULT_DEPTH = 3;
 
+/** The floor's own address: the page the company root hosts (backlog
+ *  92bfcb04, car 3 of design df0ecd8b: "the whole tree is the company's
+ *  view of itself"; it was /it/tree). From the catalog, never typed here;
+ *  the root's pages need no tree read to be linked (page-address.ts
+ *  `rootPagePath`), and station-tree.test.ts holds this one to the root. */
+const FLOOR = rootPagePath(ROUTE_CATALOG['system-tree'])!;
+
 /** The floor under one station (its id, or a name the read accepts), at
  *  a depth; the default depth is left out so the plain link stays plain. */
 export function treeHref(under: string | null, depth: number = DEFAULT_DEPTH): string {
@@ -595,7 +604,7 @@ export function treeHref(under: string | null, depth: number = DEFAULT_DEPTH): s
   if (under !== null) q.set('under', under);
   if (depth !== DEFAULT_DEPTH) q.set('depth', String(depth));
   const s = q.toString();
-  return s === '' ? '/it/tree' : `/it/tree?${s}`;
+  return s === '' ? FLOOR : `${FLOOR}?${s}`;
 }
 
 /** A packet's own page. It lived in station-motion.ts until the live floor

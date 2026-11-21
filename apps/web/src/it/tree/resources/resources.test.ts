@@ -1,11 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import { parseStationLoad, type StationLoadRow } from '../../marshalling/marshalling';
-import { claimsRead, heldClaim, treeRead } from '../../../../tests/fixtures/station-tree';
+import { ADDRESSES, claimsRead, heldClaim, treeRead } from '../../../../tests/fixtures/station-tree';
 import { parseRoute } from '../../../router';
 import { parseTree, type StationTree } from '../station-tree';
 import {
   GEO, UNPLACED, boxOf, drawnPools, floorGeometry, lineStationOf, parsePools, parseUnitClaims, parseWaitingLine, resourceFloor, resourcesHref,
-  resourcesOfPath, seatUnits, unitMoves,
+  seatUnits, unitMoves,
   type FloorReads, type LineRead, type PoolRow, type ResourceFloor, type Seats,
 } from './resources';
 
@@ -76,17 +76,15 @@ const box = (f: ResourceFloor, name: string) => {
 
 describe('the address', () => {
   test('a station\'s Resources view is its page\'s address plus /resources, its own route', () => {
-    expect(resourcesHref('engineering')).toBe('/it/tree/engineering/resources');
-    expect(resourcesHref('a b')).toBe('/it/tree/a%20b/resources');
-    expect(resourcesOfPath('engineering/resources')).toBe('engineering');
-    expect(resourcesOfPath('a%20b/resources')).toBe('a b');
-    expect(resourcesOfPath('engineering')).toBeNull();
-    expect(resourcesOfPath('engineering/other')).toBeNull();
-    expect(resourcesOfPath('/resources')).toBeNull();
-    expect(resourcesOfPath('%E0%A4%A/resources')).toBeNull();
-    expect(parseRoute('/it/tree/engineering/resources', '')).toEqual({ kind: 'systemStationResources', station: 'engineering' });
-    expect(parseRoute('/it/tree/engineering', '')).toEqual({ kind: 'systemStation', station: 'engineering' });
-    expect(parseRoute('/it/tree/engineering/other', '').kind).toBe('notFound');
+    // Below the station's page, which sits below the root's tree floor
+    // since backlog 92bfcb04; the /it/tree spelling answers nothing.
+    expect(resourcesHref('engineering')).toBe('/tree/engineering/resources');
+    expect(resourcesHref('a b')).toBe('/tree/a%20b/resources');
+    expect(parseRoute('/tree/engineering/resources', '', ADDRESSES)).toEqual({ kind: 'systemStationResources', station: 'engineering' });
+    expect(parseRoute('/tree/a%20b/resources', '', ADDRESSES)).toEqual({ kind: 'systemStationResources', station: 'a b' });
+    expect(parseRoute('/tree/engineering', '', ADDRESSES)).toEqual({ kind: 'systemStation', station: 'engineering' });
+    expect(parseRoute('/tree/engineering/other', '', ADDRESSES).kind).toBe('notFound');
+    expect(parseRoute('/it/tree/engineering/resources', '', ADDRESSES).kind).toBe('notFound');
   });
 });
 

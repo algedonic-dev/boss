@@ -38,6 +38,12 @@
 # for the catalog's head, and git refuses a repository owned by
 # somebody else ("dubious ownership") — boss-codebase-metrics exited 3
 # on its first-ever firing for exactly this (2026-09-12 05:14Z).
+#
+# NOT WHAT boss-gcp RUNS (backlog c440ab8d, 2026-11-21): with root's
+# tree accepted, install-units.sh installs infra/gcp/root-tree-units/
+# boss-surface-usage.service.in in this file's place, User=root over
+# root's own tree. This copy is the timer's pair and the fixture roots'
+# unit.
 [Unit]
 Description=BOSS daily surface usage (which surfaces each operator opened; never-opened catalog paths)
 Documentation=file:/opt/boss/infra/surface-usage.sh

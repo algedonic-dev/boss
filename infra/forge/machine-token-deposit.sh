@@ -36,25 +36,24 @@
 # 0700 directory of the CALLER's uid), where a probe running beside it as
 # the same uid reads it. A shared uid is not a boundary a group can make.
 #
-# WHAT ROOT-ONLY DOES NOT CLOSE TODAY — two roads, both older than this
-# file, by which a shell as david still reaches this token (a probe no
-# longer runs as david — boss-probe reaches neither road, as the
+# WHAT ROOT-ONLY DOES NOT CLOSE — one road, older than this file, by
+# which a shell as david still reaches this token (a probe no longer
+# runs as david — boss-probe cannot take it, as the
 # probe-account-controls verb measures on the host; backlog dda26693):
-#   1. david holds `sudo -n docker` on this host (infra/estate/
-#      ops-credentials.sh reads /etc/boss-ops through it; the grant is
-#      host residue, no fragment for it is in this tree), which reaches
-#      any root file and the admin kubeconfig itself.
-#   2. forge-converge.service runs /home/david/boss/infra/forge/
-#      forge-converge.sh AS ROOT out of david's own checkout, and this
-#      script and the libraries it sources are executed from that
-#      checkout before the converge's checkout -f. Any shell as david
-#      can edit what root runs within ten minutes.
-# So on this host today the modes below keep the token from a direct
-# read and from an accident; they isolate it from no shell as david. What
-# took probe text off both roads is a probe account of its own (design-doc
-# bdc60b65, question probe-user, David 2026-10-06; car 1386dd64); the
-# roads themselves are a604a35b's and 683d7fe9's.
-# machine_token_deposit_sh.rs says the same.
+# david holds `sudo -n docker` on this host (infra/estate/
+# ops-credentials.sh reads /etc/boss-ops through it; the grant is host
+# residue, no fragment for it is in this tree, and it stays as David's
+# own, position B on backlog a604a35b, 2026-10-07), which reaches any
+# root file and the admin kubeconfig itself. The second road this header
+# named until backlog b4e41c9b — root executing this script out of
+# david's checkout — is closed: forge-converge.service runs it AS ROOT
+# from root's own tree, /var/lib/boss/tree/current, which root fetched
+# and checked itself (infra/forge/root-tree.sh; backlog a604a35b).
+# So on this host the modes below keep the token from a direct read and
+# from an accident; they isolate it from no shell as david that can
+# sudo. What took probe text off that road is a probe account of its own
+# (design-doc bdc60b65, question probe-user, David 2026-10-06; car
+# 1386dd64). machine_token_deposit_sh.rs says the same.
 #
 # ONE PASS:
 #   1. Read the rule's declaration — secret_namespace, secret_name; the

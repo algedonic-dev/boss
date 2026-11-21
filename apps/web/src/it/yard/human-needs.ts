@@ -2,6 +2,7 @@
 // (David, cef1f661). Only the server reads human_only's two spellings.
 import { fetchRemote, type Remote } from '../../data/remote';
 import { ageDays } from '../receiving/receiving';
+import { BOARD_HREF, regionHref } from './regions';
 
 /** A count as drawn: a value, a zero, a floor (a count cut at its limit,
  *  `N+`, backlog 97b5cf45), or unread with why — never a zero where
@@ -122,11 +123,12 @@ export async function fetchNeedsYou(
 }
 
 /** Where the yard's one Release control lives: the HELD CARS lane of
- *  YardStatusPanel.svelte, which /it draws only inside the dock's panel
- *  (panel.ts STATION_BOARDS, opened by `?at=dock`, router.ts). A bare
- *  `/it#held-cars` opened no panel and showed no held car — measured by
- *  David on 2026-11-20, correcting design 58c72d95 D5. */
-export const HELD_CARS_HREF = '/it?at=dock#held-cars';
+ *  YardStatusPanel.svelte, which the alarms board draws only inside the
+ *  dock's panel (panel.ts STATION_BOARDS, opened by `?at=dock`, router.ts).
+ *  A bare `/it#held-cars` opened no panel and showed no held car —
+ *  measured by David on 2026-11-20, correcting design 58c72d95 D5. The
+ *  board's own address since backlog 92bfcb04 (it was /it, IT's). */
+export const HELD_CARS_HREF = `${regionHref('dock')}#held-cars`;
 
 /** Where a needs-you line opens, for both boards that read the view
  *  (this one and the station rail, station-answer.ts): a reserved
@@ -156,7 +158,7 @@ export function needsYouBoard(needs: Remote<NeedsYou>, now: number): Board<NeedL
   const today = new Date(now).toISOString().slice(0, 10);
   const links = ordered.flatMap((job) => job.steps.filter((step) => step.human_required && ['ready', 'active'].includes(step.status)).map((step): NeedLine => {
     const days = job.opened_on ? ageDays(job.opened_on, today) : null;
-    return { id: step.id, href: needHref(job, step, `?${new URLSearchParams({ from: '/it', from_label: 'Department Map' })}`),
+    return { id: step.id, href: needHref(job, step, `?${new URLSearchParams({ from: BOARD_HREF, from_label: 'Alarms' })}`),
       step: step.kind, protocol: job.kind, title: job.title, stepTitle: step.title,
       priority: job.priority === 'standard' ? null : job.priority,
       age: days === null ? '?' : days === 0 ? 'today' : `${days}d` };

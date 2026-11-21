@@ -361,6 +361,30 @@ pub enum DisciplineKey {
     Recency,
 }
 
+/// The note a CHANGES verdict leaves on the item's build it returns to
+/// its station (`jobs.changes_return_the_build`, backlog c2b21676). One
+/// definition: the dispatcher writes it, the queue reads it.
+pub const RETURNED_FOR_CHANGES: &str = "returned_for_changes";
+
+/// The note the dock's second red on one check leaves on the item's
+/// build it returns (`jobs.dock_red_returns_the_build`, backlog 8f3d731a).
+pub const RETURNED_FOR_RED: &str = "returned_for_red";
+
+/// The notes that mark a step as a RETURNED REPAIR: the build of a car
+/// already built, gated and judged, sent back to its station to be
+/// repaired rather than begun.
+pub const RETURNED_REPAIR_NOTES: [&str; 2] = [RETURNED_FOR_CHANGES, RETURNED_FOR_RED];
+
+/// PURE: is `step` a returned repair WAITING at its station — ready, and
+/// carrying one of [`RETURNED_REPAIR_NOTES`]? A noted step taken again is
+/// a repair in hand, not one waiting.
+pub fn returned_repair(step: &Step) -> bool {
+    step.status == StepStatus::Ready
+        && RETURNED_REPAIR_NOTES
+            .iter()
+            .any(|k| step.metadata.get(k).is_some_and(|v| !v.is_null()))
+}
+
 /// The ratified default: `priority, then age`.
 pub fn default_discipline() -> Vec<DisciplineKey> {
     vec![DisciplineKey::Priority, DisciplineKey::Age]
@@ -386,9 +410,23 @@ fn last_activity(job: &Job) -> NaiveDate {
     job.closed_on.unwrap_or(job.opened_on)
 }
 
-fn compare_by_key(key: DisciplineKey, a: &Job, b: &Job) -> std::cmp::Ordering {
+fn compare_by_key(
+    key: DisciplineKey,
+    a: &Job,
+    b: &Job,
+    returned: &BTreeSet<String>,
+) -> std::cmp::Ordering {
+    // Within one priority a returned repair goes first (backlog
+    // 205ce78a): `false` sorts before `true`, so "not returned" is the
+    // second half of the rank. No level is invented and none is moved.
+    let rank = |j: &Job| {
+        (
+            priority_rank(j.priority),
+            !returned.contains(&j.id.to_string()),
+        )
+    };
     match key {
-        DisciplineKey::Priority => priority_rank(a.priority).cmp(&priority_rank(b.priority)),
+        DisciplineKey::Priority => rank(a).cmp(&rank(b)),
         DisciplineKey::Age => a.opened_on.cmp(&b.opened_on),
         // Descending: newest first.
         DisciplineKey::Recency => last_activity(b).cmp(&last_activity(a)),
@@ -405,6 +443,19 @@ fn compare_by_key(key: DisciplineKey, a: &Job, b: &Job) -> std::cmp::Ordering {
 /// falls back to the ratified default. Deterministic: after every
 /// declared key ties break on the job id's string form.
 pub fn order_by_discipline(discipline: &[DisciplineKey], jobs: &mut [Job]) {
+    order_returns_first(discipline, jobs, &BTreeSet::new());
+}
+
+/// [`order_by_discipline`], where `returned` names the packets (by id)
+/// whose step at this station is a [`returned_repair`]: under the
+/// `priority` key each drains before the fresh work of its own priority.
+/// The queue reader and the station pull both order through here, so the
+/// head a pull takes is the first row the queue shows.
+pub fn order_returns_first(
+    discipline: &[DisciplineKey],
+    jobs: &mut [Job],
+    returned: &BTreeSet<String>,
+) {
     let effective: Vec<DisciplineKey> = if discipline.is_empty() {
         default_discipline()
     } else {
@@ -412,7 +463,7 @@ pub fn order_by_discipline(discipline: &[DisciplineKey], jobs: &mut [Job]) {
     };
     jobs.sort_by(|a, b| {
         for key in &effective {
-            let ord = compare_by_key(*key, a, b);
+            let ord = compare_by_key(*key, a, b, returned);
             if ord != std::cmp::Ordering::Equal {
                 return ord;
             }
@@ -578,8 +629,13 @@ pub fn evaluate_station(
     } else {
         BTreeMap::new()
     };
+    let returned: BTreeSet<String> = kept
+        .iter()
+        .filter(|(_, steps)| steps.iter().any(returned_repair))
+        .map(|(job, _)| job.id.to_string())
+        .collect();
     let mut members: Vec<Job> = kept.into_iter().map(|(job, _)| job).collect();
-    order_by_discipline(&spec.discipline, &mut members);
+    order_returns_first(&spec.discipline, &mut members, &returned);
     let discipline = if spec.discipline.is_empty() {
         default_discipline()
     } else {
@@ -1082,6 +1138,62 @@ mod tests {
         let f: Vec<String> = forward.iter().map(|j| j.id.to_string()).collect();
         let r: Vec<String> = backward.iter().map(|j| j.id.to_string()).collect();
         assert_eq!(f, r, "same set, same order, whatever the input order");
+    }
+
+    /// A RETURNED REPAIR drains before fresh work of its own priority
+    /// (backlog 205ce78a). Measured 2026-11-21: seven items whose build a
+    /// CHANGES verdict had returned to their station stood ready, all
+    /// standard, behind 1365 open items in a `priority, then age` queue —
+    /// 2.1 to 3.5 days, each holding a built, gated car off the train.
+    /// No priority level is invented and none is moved: an urgent fresh
+    /// build still drains first, and only within one priority does the
+    /// repair of a car already built go ahead of a build not yet begun.
+    #[test]
+    fn a_returned_repair_drains_before_fresh_work_of_its_priority() {
+        let ready = |note: Option<&str>| {
+            let mut s = step("build", StepStatus::Ready);
+            if let Some(key) = note {
+                s.metadata = serde_json::json!({ key: {"review": "5eed5eed"} });
+            }
+            s
+        };
+        let fresh = job("backlog-item", Priority::Standard, 1);
+        let changes = job("backlog-item", Priority::Standard, 20);
+        let red = job("backlog-item", Priority::Standard, 21);
+        let urgent = job("backlog-item", Priority::Urgent, 25);
+        let scheduled = job("backlog-item", Priority::Scheduled, 26);
+        // A note on a step taken again is a repair in hand, not one waiting.
+        let taken = job("backlog-item", Priority::Standard, 22);
+        let mut active = ready(Some(RETURNED_FOR_CHANGES));
+        active.status = StepStatus::Active;
+        let packets = vec![
+            (fresh.clone(), vec![ready(None)]),
+            (taken.clone(), vec![active]),
+            (scheduled.clone(), vec![ready(Some(RETURNED_FOR_CHANGES))]),
+            (changes.clone(), vec![ready(Some(RETURNED_FOR_CHANGES))]),
+            (urgent.clone(), vec![ready(None)]),
+            (red.clone(), vec![ready(Some(RETURNED_FOR_RED))]),
+        ];
+        let mut spec = dock_spec();
+        spec.predicate.kind = Some("backlog-item".into());
+        let q = evaluate_station(&spec, packets.clone(), day(28));
+        let order: Vec<_> = q.data.iter().map(|j| j.id).collect();
+        assert_eq!(
+            order,
+            vec![
+                urgent.id,
+                changes.id,
+                red.id,
+                fresh.id,
+                taken.id,
+                scheduled.id
+            ],
+            "urgent first; within standard the two returns, oldest first, then fresh work"
+        );
+        // A discipline that does not rank by priority is not reordered.
+        spec.discipline = vec![DisciplineKey::Age];
+        let q = evaluate_station(&spec, packets, day(28));
+        assert_eq!(q.data[0].id, fresh.id, "age alone: the oldest first");
     }
 
     #[test]

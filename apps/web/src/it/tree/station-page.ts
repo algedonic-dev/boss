@@ -20,7 +20,7 @@
 import type { Remote } from '../../data/remote';
 import type { StationLoadRow } from '../marshalling/marshalling';
 import {
-  parseClaims, quantity, stationCard, subtree,
+  parseClaims, quantity, stationCard, subtree, treeHref,
   type CardReads, type ClaimsRead, type StationCardModel, type StationTree, type TreeNode,
 } from './station-tree';
 
@@ -32,22 +32,12 @@ const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
 // The address.
 // ---------------------------------------------------------------------
 
-/** A station's page: `/it/tree/<name>`. The floor keeps `/it/tree`;
- *  opening a part swaps the page, never zooms. */
+/** A station's page: `/tree/<name>`, below the floor the company root
+ *  hosts (`treeHref`; it was `/it/tree/<name>` until backlog 92bfcb04).
+ *  Opening a part swaps the page, never zooms. The router reads the name
+ *  back as its own segment (router.ts HOSTED), so no parser lives here. */
 export function stationHref(name: string): string {
-  return `/it/tree/${encodeURIComponent(name)}`;
-}
-
-/** The station a path under `/it/tree/` names, or null for none: an
- *  empty name, a deeper path, or one that does not decode. */
-export function stationOfPath(rest: string): string | null {
-  if (rest === '' || rest.includes('/')) return null;
-  try {
-    const name = decodeURIComponent(rest);
-    return name === '' ? null : name;
-  } catch {
-    return null;
-  }
+  return `${treeHref(null)}/${encodeURIComponent(name)}`;
 }
 
 // ---------------------------------------------------------------------

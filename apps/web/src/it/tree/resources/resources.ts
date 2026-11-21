@@ -42,7 +42,7 @@
 
 import type { Remote } from '../../../data/remote';
 import type { StationLoadRow } from '../../marshalling/marshalling';
-import { parseHeldClaims } from '../station-page';
+import { parseHeldClaims, stationHref } from '../station-page';
 import { parseClaims, quantity, subtree, type StationTree } from '../station-tree';
 
 type Obj = Record<string, unknown>;
@@ -56,22 +56,9 @@ const plural = (n: number, one: string, many = `${one}s`): string => `${n} ${n =
 
 const SUFFIX = '/resources';
 
-/** A station's Resources view: its page's address plus `/resources`. */
-export const resourcesHref = (name: string): string => `/it/tree/${encodeURIComponent(name)}${SUFFIX}`;
-
-/** The station a path under `/it/tree/` names as `<name>/resources`, or
- *  null for any other path or one that does not decode. */
-export function resourcesOfPath(rest: string): string | null {
-  if (!rest.endsWith(SUFFIX)) return null;
-  const head = rest.slice(0, -SUFFIX.length);
-  if (head === '' || head.includes('/')) return null;
-  try {
-    const name = decodeURIComponent(head);
-    return name === '' ? null : name;
-  } catch {
-    return null;
-  }
-}
+/** A station's Resources view: its page's address plus `/resources`
+ *  (router.ts HOSTED reads it back). */
+export const resourcesHref = (name: string): string => `${stationHref(name)}${SUFFIX}`;
 
 // ---------------------------------------------------------------------
 // The reads.

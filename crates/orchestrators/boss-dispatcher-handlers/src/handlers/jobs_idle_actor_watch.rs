@@ -613,8 +613,10 @@ impl JobsIdleActorWatch {
 
     /// Read recovery independently of the filing short-circuit: an open
     /// alarm must not prevent the read that would tell it work resumed.
-    /// This car reads agent-run movement; independent claimed-step history
-    /// and the shared priority/end-of-hold policy remain separate work.
+    /// Three witnesses clear it: an open own agent-run, agent-run movement
+    /// since the episode, or a complete queue with no actionable
+    /// nominations. Claimed-step history is not a fourth (decided
+    /// 2026-11-21 on 595e32f6: every alarmed actor has a run record).
     async fn recover_open(
         &self,
         alarm: &Json,
@@ -667,17 +669,25 @@ impl JobsIdleActorWatch {
         } else {
             self.queue(actor, rule).await?
         };
-        if !complete {
-            return Err(HandlerError::Downstream(format!(
-                "{HANDLER}: {} has an incomplete queue; unread nominations are unknown, never recovery",
+        // A cut queue (truncated, or at the QUEUE_LIMIT page) withholds
+        // only the no-nominations witness: its unread rows are unknown, so
+        // it counts as actionable. Run movement needs no queue and is still
+        // read below; only a cut queue with no movement errors (landed
+        // review c2eb4153 F1, 595e32f6 — it used to error before that read,
+        // so such an actor could never recover and the rule erred every tick).
+        let incomplete = || {
+            HandlerError::Downstream(format!(
+                "{HANDLER}: {} has an incomplete queue and no run movement; unread nominations are unknown, never recovery",
                 actor.id
-            )));
-        }
-        let mut actionable = false;
-        for nomination in nominations(&queue, actor, b) {
-            if nomination.packet != id && !self.is_waiting(&nomination, b, now, rule).await {
-                actionable = true;
-                break;
+            ))
+        };
+        let mut actionable = !complete;
+        if complete {
+            for nomination in nominations(&queue, actor, b) {
+                if nomination.packet != id && !self.is_waiting(&nomination, b, now, rule).await {
+                    actionable = true;
+                    break;
+                }
             }
         }
         let evidence = if working {
@@ -703,10 +713,10 @@ impl JobsIdleActorWatch {
                     .filter(|t| *t <= now)
             };
             let Some(since) = since else {
-                return Ok(());
+                return if complete { Ok(()) } else { Err(incomplete()) };
             };
             if !self.moved_since(actor, since, rule).await? {
-                return Ok(());
+                return if complete { Ok(()) } else { Err(incomplete()) };
             }
             format!(
                 "{} has agent-run movement at or after {} in its own run record",
@@ -1628,6 +1638,37 @@ mod tests {
             "a page ceiling is unknown, not nominations gone"
         );
         assert!(stub.sent().iter().all(|(p, _)| p == MESSAGE_SEND));
+    }
+
+    /// Landed review c2eb4153 F1 (595e32f6): a cut queue withholds only
+    /// the no-nominations witness. Run movement needs no queue, so an
+    /// actor whose queue fills the page still recovers through it, and the
+    /// note names the movement, never nominations gone.
+    #[tokio::test]
+    async fn a_cut_queue_still_recovers_through_movement() {
+        let mut record = Record::measured();
+        record.alarms = vec![idle_alarm()];
+        record.queue = (0..QUEUE_LIMIT)
+            .map(|i| queue_row(&format!("standard-{i}"), "standard", "build", "ready", None))
+            .collect();
+        let mut resumed = last_run_row();
+        resumed["steps"][1]["completed_at"] = json!("2026-10-19T14:00:00Z");
+        record.runs = vec![resumed];
+        let sent = tick(&record, "2026-10-19T15:00:00Z").await;
+        assert_eq!(sent.len(), 2, "the hold note and its lowering: {sent:?}");
+        assert_eq!(sent[0].0, "PATCH /api/jobs/idle-alarm/metadata");
+        assert_eq!(sent[0].1["recovered_at"], "2026-10-19T15:00:00+00:00");
+        let recovery = sent[0].1["recovery"].as_str().unwrap();
+        assert!(recovery.contains("agent-run movement"), "{recovery}");
+        assert!(!recovery.contains("no actionable"), "{recovery}");
+        assert_eq!(sent[1].0, "PUT /api/jobs/idle-alarm/priority");
+
+        // The same cut queue, truncated rather than full, recovers too.
+        record.queue.clear();
+        record.queue_truncated = true;
+        let sent = tick(&record, "2026-10-19T15:00:00Z").await;
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[0].0, "PATCH /api/jobs/idle-alarm/metadata");
     }
 
     #[tokio::test]
@@ -2573,6 +2614,15 @@ mod tests {
         );
         assert_eq!(declared.idle_minutes, 30);
         assert_eq!(declared.wait_minutes, Some(1440));
+        // The hold is the row's declaration, not a default it inherits
+        // unread (landed review c2eb4153 F2, 595e32f6).
+        assert!(
+            args.iter()
+                .any(|(k, _)| k == super::super::common::HOLD_DAYS),
+            "{}: declares no hold_days",
+            rule.name
+        );
+        assert_eq!(declared.hold_window, Duration::days(7));
         let cadence = rule.schedule.as_ref().map(|s| s.cadence);
         assert!(
             matches!(

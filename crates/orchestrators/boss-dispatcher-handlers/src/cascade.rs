@@ -468,6 +468,14 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // step, or a step ending, so none wakes; nothing re-enters this
         // handler, whose trigger is a reviewer run's own write.
         ("jobs.changes_return_the_build", vec!["jobs.step.updated"]),
+        // Its hourly twin (205ce78a): the same release and note on the
+        // item's build, plus one alarm per unrepaired car
+        // (`jobs.job.created`) and the owner's direct message, a sink.
+        // A clock rule, so nothing it writes re-enters it.
+        (
+            "jobs.changes_repair_watch",
+            vec!["jobs.step.updated", "jobs.job.created"],
+        ),
         // The dock-red half (8f3d731a): the same release and note on the
         // item's build. Its trigger is a CAR's own write — the conductor's
         // returned red — and nothing here writes a car.

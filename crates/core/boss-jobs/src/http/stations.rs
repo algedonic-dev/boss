@@ -1738,7 +1738,9 @@ mod universe_reads_tests {
 
     fn tree(mut spec: StationSpec) -> StationSpec {
         spec.id = Some("ebbae18b-5bee-468e-8be7-53aa54a91e87".into());
-        spec.parent = Some("5f922a2a-31f5-4f07-acf1-41dc140687a4".into());
+        // Any parent makes it a tree row: engineering's design station,
+        // design-decided's since the executive desk dissolved (878fd1e7).
+        spec.parent = Some("cc856b32-3667-4e70-b6cd-667f6fe89007".into());
         spec
     }
 

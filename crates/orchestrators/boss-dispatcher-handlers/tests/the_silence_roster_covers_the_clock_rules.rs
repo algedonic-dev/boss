@@ -362,6 +362,16 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          doors opened, so no sweep keyed by kind could count it.",
     ),
     (
+        "a-changes-held-car-is-returned-and-alarmed-until-repaired",
+        "runs `jobs.changes_repair_watch` over the open cars (backlog 205ce78a): a held car \
+         standing at a CHANGES verdict has its item's build returned to its station by the \
+         verdict rule's own judgement, and files one urgent backlog-item alarm per car past \
+         the rule's bound with no repair gate-run since the verdict, held while it stays open. \
+         On an hour with no such car it produces NOTHING, and that zero is the healthy \
+         reading; what it files is an alarm keyed by car, not a packet of a kind a sweep could \
+         count. It is itself the watch on a repair no event reports as missing.",
+    ),
+    (
         "work-session-ends-when-silent",
         "runs `jobs.age_out_step`, which completes the `active` step of every open \
          work-session whose heartbeat is older than the bound (design 511fa7d4 car 2b, \

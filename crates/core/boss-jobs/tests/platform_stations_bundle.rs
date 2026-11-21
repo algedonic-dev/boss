@@ -76,7 +76,6 @@ fn the_bundle_is_one_file_per_station() {
             "edge",
             "engineering",
             "estate",
-            "executive",
             "finance",
             "forge",
             "forge-ci",
@@ -84,6 +83,7 @@ fn the_bundle_is_one_file_per_station() {
             "landed-review",
             "loading-dock",
             "maintenance",
+            "me",
             "my-watchlist",
             "operations",
             "probe-shed",
@@ -100,7 +100,9 @@ fn the_bundle_is_one_file_per_station() {
          tree's root, departments and standing rooms (2026-11-06, backlog 3f58c823), \
          the `build` station under engineering (2026-11-09, backlog b5c815e4), \
          `finance` and the stage stations `design`, `review` and `maintenance` \
-         (2026-11-10, design c0ae096f, backlog 599fec3e), and no other"
+         (2026-11-10, design c0ae096f, backlog 599fec3e), less `executive`, \
+         dissolved into the root (design 2910ec3d, backlog 878fd1e7), `me`, the \
+         person's own station (design 01fa5bdf, backlog 5cb56bb3), and no other"
     );
 }
 

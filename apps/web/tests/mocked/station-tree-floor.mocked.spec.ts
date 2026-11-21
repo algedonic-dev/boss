@@ -12,7 +12,6 @@
 import { expect, test, type Page, type Route } from './_test';
 import { claimsRead, idOf, nameOf, stationList, stationLoad, treeRead } from '../fixtures/station-tree';
 import { STATIONS_LOAD, installSmokeMocks } from './_smokeMocks';
-import { FAILURE_MARKER } from './_routes';
 
 const STATIONS = /\/api\/stations(\?|$)/;
 const CLAIMS = /\/api\/claims(\?|$)/;
@@ -54,7 +53,7 @@ const card = (page: Page, name: string) => page.locator(`[data-station="${name}"
 
 test('one card drawn recursively: five rows on every station — rail, plate, pools as cells, parts — and the gaps beside the floor', async ({ page }) => {
   const asked = await mocks(page);
-  await page.goto('/it/tree');
+  await page.goto('/tree');
   // The root is found by the tree's shape, then read by its id.
   await expect(card(page, 'company')).toBeVisible();
   expect(asked).toContain('');
@@ -108,7 +107,7 @@ test('one card drawn recursively: five rows on every station — rail, plate, po
 
 test('a station row edge is drawn ring to ring, and nothing moves on the floor', async ({ page }) => {
   await mocks(page);
-  await page.goto('/it/tree');
+  await page.goto('/tree');
   const edge = page.locator('[data-tree-route="gates→loading-dock"]');
   await expect(edge).toHaveCount(1);
   const ring = page.locator('[data-ring="gates"]');
@@ -120,7 +119,7 @@ test('a station row edge is drawn ring to ring, and nothing moves on the floor',
 
 test('past the depth asked a department collapses, and its parts row counts the stations it holds', async ({ page }) => {
   await mocks(page);
-  await page.goto('/it/tree?depth=1');
+  await page.goto('/tree?depth=1');
   await expect(card(page, 'engineering')).toBeVisible();
   await expect(card(page, 'gates')).toHaveCount(0);
   await expect(card(page, 'engineering').locator('[data-part="sub-stations"]')).toContainText('5');
@@ -130,7 +129,7 @@ test('past the depth asked a department collapses, and its parts row counts the 
 
 test('a claims read that fails turns every rail red and draws no in-use figure, and is said beside the floor', async ({ page }) => {
   await mocks(page, 'ok', 'down');
-  await page.goto('/it/tree');
+  await page.goto('/tree');
   await expect(card(page, 'gates')).toBeVisible();
   await expect(card(page, 'gates')).toHaveAttribute('data-rail', 'failed');
   await expect(card(page, 'gates').locator(':scope > header [data-plate]')).toHaveText('read failed');
@@ -144,7 +143,7 @@ test('a claims read that fails turns every rail red and draws no in-use figure, 
 // chases a missing grant rather than a dead service.
 test('a load read the server refuses is said as refused, with the reason the server gave', async ({ page }) => {
   await mocks(page, 'ok', 'ok', 'refused');
-  await page.goto('/it/tree');
+  await page.goto('/tree');
   await expect(card(page, 'gates')).toBeVisible();
   await expect(card(page, 'gates')).toHaveAttribute('data-rail', 'failed');
   await expect(card(page, 'gates').locator(':scope > header [data-plate]')).toHaveText('read refused');
@@ -155,7 +154,7 @@ test('a load read the server refuses is said as refused, with the reason the ser
 
 test('a subtree is read from its own top, with no list read and the address the read derived', async ({ page }) => {
   const asked = await mocks(page);
-  await page.goto('/it/tree?under=engineering');
+  await page.goto('/tree?under=engineering');
   await expect(card(page, 'engineering')).toBeVisible();
   await expect(card(page, 'company')).toHaveCount(0);
   await expect(page.locator('[data-station]')).toHaveCount(7);
@@ -165,9 +164,13 @@ test('a subtree is read from its own top, with no list read and the address the 
   await expect(page.locator('[data-tree-address]')).toHaveText('/company/engineering');
 });
 
+// The floor is the root's page since backlog 92bfcb04, placed by the tree
+// like every hosted page (backlog 0bc2eb68): unread, the address is said
+// unplaceable with the read that failed, never drawn as an empty company.
 test('a tree read that fails is said, not drawn as an empty company', async ({ page }) => {
   await mocks(page, 'down');
-  await page.goto('/it/tree');
-  await expect(page.locator(FAILURE_MARKER)).toContainText('503');
+  await page.goto('/tree');
+  await expect(page.locator('[data-not-found-why]')).toContainText('the station tree could not be read');
+  await expect(page.locator('[data-not-found-why]')).toContainText('503');
   await expect(page.locator('[data-station]')).toHaveCount(0);
 });

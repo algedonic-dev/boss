@@ -96,10 +96,12 @@ describe('sections resolve in the nav catalog', () => {
   });
 
   test('an unmatched path renders in the department it was under (design ee3a3a2f Q4)', () => {
-    // The /it catch-all returned the yard, so the IT chrome came free;
-    // the not-found that replaced it must keep the reader in IT.
-    expect(appForRoute({ kind: 'notFound', path: '/it/no-such' })).toBe('it');
-    expect(appForRoute({ kind: 'notFound', path: '/dashboard/it/no-such' })).toBe('it');
+    // The /it catch-all returned the yard, so the IT chrome came free,
+    // and the not-found that replaced it kept the reader in IT until
+    // backlog 92bfcb04 retired the /it prefix (IT retires as a
+    // department, design df0ecd8b): a path under it is a path like any.
+    expect(appForRoute({ kind: 'notFound', path: '/it/no-such' })).toBe('home');
+    expect(appForRoute({ kind: 'notFound', path: '/dashboard/it/no-such' })).toBe('home');
     expect(appForRoute({ kind: 'notFound', path: '/ux/no-such' })).toBe('home');
     expect(appForRoute({ kind: 'notFound', path: '/items' })).toBe('home');
   });
@@ -152,15 +154,32 @@ describe('sections resolve in the nav catalog', () => {
     // Marshalling Yard and the Crew Board lost their sidebar rows to the
     // one "Department Map" row, so every selection on the map lights
     // that row. Car N3 retired the floor pages and the crew board, so a
-    // selection is the only way in, and a retired path — not found —
-    // still renders in the IT chrome under the same row. The row is the
-    // alarms board's since design 01fa5bdf step 1.
+    // selection is the only way in. The row is the alarms board's since
+    // design 01fa5bdf step 1; a retired path renders in the Home chrome,
+    // where its one door leads, since backlog 92bfcb04.
     for (const at of ['gates', 'receiving', 'marshalling', 'dock', 'shop-floor']) {
       expect(sectionForRoute({ kind: 'systemYard', at }), at).toBe('system-yard');
       expect(appForRoute({ kind: 'systemYard', at }), at).toBe('it');
     }
-    expect(sectionForRoute({ kind: 'notFound', path: '/it/yard/dock' })).toBe('system-yard');
-    expect(sectionForRoute({ kind: 'notFound', path: '/it/crew' })).toBe('system-yard');
+    expect(sectionForRoute({ kind: 'notFound', path: '/it/yard/dock' })).toBe('me');
+    expect(sectionForRoute({ kind: 'notFound', path: '/it/crew' })).toBe('me');
+  });
+
+  test('the tree floor and every station page light the root\'s tree page, and outlive the IT row', () => {
+    // Backlog 92bfcb04 (car 3 of design df0ecd8b): the tree is the
+    // company root's page ("the whole tree is the company's view of
+    // itself"), not IT's, so it renders in the Home chrome and a roster
+    // without `it` — the departments row car 2 retires — leaves it whole.
+    const noIt = [{ code: 'sales', label: 'Sales' }];
+    for (const route of [
+      { kind: 'systemTree' },
+      { kind: 'systemStation', station: 'gates' },
+      { kind: 'systemStationResources', station: 'gates' },
+    ] as const) {
+      expect(sectionForRoute(route), route.kind).toBe('system-tree');
+      expect(appForRoute(route), route.kind).toBe('home');
+      expect(withRoster(route, '/tree', noIt), route.kind).toEqual(route);
+    }
   });
 
   test('no exception names a section no longer produced', () => {

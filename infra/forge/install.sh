@@ -708,8 +708,9 @@ fi
 
 # THE ACCOUNT A CAR'S RECORDED PROBE RUNS AS (backlog 703358ce; decided
 # by David on design-doc bdc60b65, question probe-user). Until this step
-# probes ran as the checkout's owner, who reaches root on this host by
-# two roads (review 9a1e289b). infra/forge/probe-account.sh `ensure` is
+# probes ran as the checkout's owner, who then reached root on this host
+# by two roads (review 9a1e289b; root running his checkout is closed,
+# a604a35b, and his own sudo stays). infra/forge/probe-account.sh `ensure` is
 # the one definition: it makes `boss-probe` and a root-owned read-only
 # view of this checkout for it to read, verifies both by effect, and
 # writes the drop-in that points the ops runner's probes at them and at

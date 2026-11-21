@@ -42,7 +42,7 @@ test('the flat company map is gone; the root station view is the company index',
   // takes it, and the registry check (sections.ts withRoster) finds no
   // department `map`, so the page renders not-found.
   expect(parse('/map')).toEqual({ kind: 'department', code: 'map' });
-  expect(parse('/it/tree').kind).toBe('systemTree');
+  expect(parse('/tree').kind).toBe('systemTree');
 });
 
 // No window is planted here. parseRoute takes the query string as its
@@ -126,10 +126,13 @@ describe('parseRoute — every specific path matches its specific case', () => {
     // department's address first, so the router answers the department
     // and the registry check makes it the station page where there is no
     // such department (page-address.test.ts pins that); a room inside a
-    // department is its station page here. /it/tree/<name> stays.
+    // department is its station page here. By name, a station's page sits
+    // below the root's tree floor, /tree/<name>, since backlog 92bfcb04.
     ['/engineering', { kind: 'department', code: 'engineering' }],
     ['/engineering/gates', { kind: 'systemStation', station: 'gates' }],
-    ['/it/tree/engineering', { kind: 'systemStation', station: 'engineering' }],
+    ['/tree', { kind: 'systemTree' }],
+    ['/tree/engineering', { kind: 'systemStation', station: 'engineering' }],
+    ['/tree/engineering/resources', { kind: 'systemStationResources', station: 'engineering' }],
     // Calendar / scheduling
     // The launch calendar retired with the second example tenant
     // (design 2ea444f5, backlog a8991c86): /ux/calendar is an unknown
@@ -229,8 +232,11 @@ describe('an unmatched path is notFound, naming the path', () => {
   });
 
   test('the one back link goes to the department the path was under', () => {
-    expect(notFoundBack('/it/no-such')).toEqual({ href: '/it', label: 'Back to the alarms board' });
-    expect(notFoundBack('/dashboard/it/no-such/')).toEqual({ href: '/it', label: 'Back to the alarms board' });
+    // /it is no department's chrome to go back to since backlog 92bfcb04
+    // (IT retires as a department, design df0ecd8b): a path under it is a
+    // path like any other.
+    expect(notFoundBack('/it/no-such')).toEqual({ href: '/me', label: 'Back to My Day' });
+    expect(notFoundBack('/dashboard/it/no-such/')).toEqual({ href: '/me', label: 'Back to My Day' });
     // My Day's own address: the person's station (backlog 5cb56bb3).
     expect(notFoundBack('/ux/no-such')).toEqual({ href: '/me', label: 'Back to My Day' });
     expect(notFoundBack('/items')).toEqual({ href: '/me', label: 'Back to My Day' });
@@ -571,13 +577,11 @@ describe('/it?at= — the Department Map carries its selection in the query', ()
 // The list is the crawl roster's (_routes.ts `RETIRED_ROUTES`), so the
 // mocked spec that opens each page and this pin read one definition.
 // Step 1 of design 01fa5bdf added the map's own leftovers and the /ux
-// business pages: an IT path's door is the alarms board, any other's
-// My Day.
+// business pages. Every door is My Day: an IT path's was the alarms
+// board until backlog 92bfcb04 retired the /it prefix.
 describe('the retired pages are not found', () => {
   for (const path of RETIRED_ROUTES) {
-    const door = path === '/it' || path.startsWith('/it/')
-      ? { href: '/it', label: 'Back to the alarms board' }
-      : { href: '/me', label: 'Back to My Day' };
+    const door = { href: '/me', label: 'Back to My Day' };
     test(`${path} is notFound, and its back link is ${door.href}`, () => {
       expect(parse(path)).toEqual({ kind: 'notFound', path });
       expect(notFoundBack(path)).toEqual(door);

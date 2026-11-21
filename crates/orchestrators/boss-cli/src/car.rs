@@ -717,6 +717,86 @@ pub(crate) async fn into_gate(
     Ok(Some(id))
 }
 
+/// A MACHINE RELAUNCH HOLDS THE GATE ITS LOST RUN HELD (backlog 37111b65
+/// car (a), design 689d1f7f). The conductor's relaunch of a lost car gate
+/// takes the car's `gate` step over — `car::relaunch_takeover`'s judged
+/// stamp, landing only while the lost run still holds the step at its
+/// head and no ending has claimed the car. It claims nothing: the step
+/// keeps the status the loss left it in (see `car::relaunch_takeover`).
+/// The caller then writes the relaunch's R8 edge read back off the car
+/// ([`fulfils_from_read_back`]), so its green finishes the step by edge
+/// instead of by the branch scan. Returns the car taken over.
+///
+/// `cars` is the branch's packets as the caller read them; the stamp's
+/// expectation is the fence, so a car that changed since lands nothing.
+/// `None` when the lost run holds no open gate step on the branch.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn relaunch_into_gate(
+    door: &dyn crate::car_retire::Door,
+    cars: &[Value],
+    branch: &str,
+    lost: &str,
+    relaunch: &str,
+    head: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<String>> {
+    let Some(found) = car::car_held_by(cars, branch, lost) else {
+        return Ok(None);
+    };
+    let id = found
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("the car the lost run holds has no id"))?
+        .to_string();
+    let Some(plan) = car::relaunch_takeover(found, lost, relaunch, head, now)
+        .map_err(|why| anyhow::anyhow!("relaunch {relaunch} took nothing over — {why}"))?
+    else {
+        return Ok(None);
+    };
+    if crate::car_retire::patch_step_metadata_expecting(
+        door,
+        &id,
+        &plan.gate_step,
+        plan.gate_merge.clone(),
+        &plan.fence,
+    )
+    .await?
+        == crate::car_retire::Judged::Moved
+    {
+        bail!(
+            "car {id}'s gate step changed hands after it was read (a newer launch or an ending \
+             holds it), so relaunch {relaunch} took nothing over"
+        );
+    }
+    Ok(Some(id))
+}
+
+/// THE GATE-RUN'S R8 EDGE, READ BACK OFF THE CAR (design 689d1f7f car 2,
+/// backlog a3a367e4): once `car` reads as held by `gate_run`, the
+/// gate-run records the edge to that car's `gate` step
+/// (`boss_jobs::fulfils`) and its verdict follows it. `false` when the
+/// car no longer reads as held by it — a stamp that lost to an ending or
+/// a newer launch writes no edge. One writer for both doors that hold a
+/// gate: `boss gate`'s launch and the conductor's relaunch.
+pub(crate) async fn fulfils_from_read_back(
+    door: &dyn crate::car_retire::Door,
+    car: &str,
+    gate_run: &str,
+) -> Result<bool> {
+    let read = crate::car_retire::read_via(door, car).await?;
+    let read = read.get("data").cloned().unwrap_or(read);
+    let Some(edge) = car::gate_edge(&read, gate_run) else {
+        return Ok(false);
+    };
+    door.send(
+        reqwest::Method::PATCH,
+        &format!("/api/jobs/{gate_run}/metadata"),
+        Some(edge.patch()),
+    )
+    .await?;
+    Ok(true)
+}
+
 /// The refusal a launch gives when the car's ending holds the fence —
 /// after finishing that ending, so the car does not stand claimed and
 /// open on this launch's account. The gate still runs, and its green

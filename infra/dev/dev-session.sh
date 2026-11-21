@@ -4,7 +4,8 @@
 #
 # An interactive ssh login used to exec straight into the one durable
 # tmux session, `dev` — the Remote Control / drain session the boot
-# starts running /work/dev-claude.sh. It now offers six sessions:
+# starts running /work/dev-claude.sh. It now offers six sessions and
+# the standby shell:
 #
 #   1) Claude + Claude Code   tmux `dev`     /work/dev-claude.sh
 #   2) GPT + Codex            tmux `codex`   codex
@@ -18,6 +19,9 @@
 #      model limit (backlog 628dc540). Option 2 stays the interactive
 #      TUI; the two never start beside each other, because two CLIs
 #      signing as one agent would race for one queue.
+#   7) Standby shell          ssh to the standby pod's LAN door, at the
+#      address infra/estate/doors.toml declares (dev-standby-ssh; design
+#      0491591b) — no tmux session here, the standby is another pod.
 #
 # Each JOINS its session when it runs and CREATES it when it does not
 # (`tmux new-session -A`). Enter, or no answer within the timeout, is 1,
@@ -626,6 +630,55 @@ case $detached in
 esac
 [ -z "$detached" ] || exit 1
 
+# Option 7, the standby shell (design 0491591b, backlog 47601829): the
+# small pod boss-dev-standby.yaml keeps off this pod's node, reached by
+# ssh at its LAN door. The address is READ from infra/estate/doors.toml
+# (door dev-standby-ssh, beside this file's tree), the one copy the
+# forge's observer probes and a test holds equal to the Service's pin,
+# so it is not spelled a third time here. Plain bash, like seat_rows:
+# a login assumes nothing else on PATH.
+standby_lan() {
+  local line id='' lan='' v
+  [ -r "$here/../estate/doors.toml" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in
+      '['*)
+        [ "$id" = dev-standby-ssh ] && [ -n "$lan" ] && { echo "$lan"; return 0; }
+        id='' lan=''
+        ;;
+      id\ =* | id=* | lan\ =* | lan=*)
+        v=${line#*\"}
+        v=${v%%\"*}
+        case $line in id*) id=$v ;; *) lan=$v ;; esac
+        ;;
+    esac
+  done <"$here/../estate/doors.toml"
+  [ "$id" = dev-standby-ssh ] && [ -n "$lan" ] && { echo "$lan"; return 0; }
+  return 1
+}
+
+# Not a tmux session: the standby is another pod. A session that
+# connected and ended ends this login, as leaving any option's tmux
+# does. ssh's OWN failure (255: no route, refused, no key it will take
+# — the standby holds David's key, reached from here only through a
+# forwarded agent) says where else the standby is reached from and goes
+# back to the menu, so a login is never lost to a standby that did not
+# answer. Its host key is made per pod and logged at boot, so a changed
+# key is ssh's to refuse and the operator's to check, never accepted
+# here blind.
+start_standby() {
+  local lan rc
+  if ! lan=$(standby_lan); then
+    echo "no standby door: infra/estate/doors.toml declares no dev-standby-ssh lan half"
+    return 1
+  fi
+  ssh -o ConnectTimeout=10 -p "${lan##*:}" "root@${lan%:*}"
+  rc=$?
+  [ "$rc" -eq 255 ] || exit "$rc"
+  echo "could not reach the standby at $lan (ssh exit 255). It takes the key in Secret boss-dev-ssh-authorized-keys: from this pod only through a forwarded agent (ssh -A), and from the WireGuard bastion with ssh root@${lan%:*}. Whether its door is open is the DOOR line of boss orient."
+  return 1
+}
+
 join_dev() {
   if [ -x "$root/dev-claude.sh" ]; then
     join dev "$root/dev-claude.sh"
@@ -636,6 +689,11 @@ join_dev() {
   exec tmux new-session -A -s dev -c "$root/boss"
 }
 
+if standby_target=$(standby_lan); then
+  standby_target="root@${standby_target%:*}"
+else
+  standby_target='no door declared'
+fi
 while :; do
   printf '\nBOSS dev pod - which session? (Enter or %ss = 1)\n' "$timeout"
   printf '  1) %-22s %-8s %s\n' 'Claude + Claude Code' dev "$(status dev)"
@@ -644,6 +702,7 @@ while :; do
   printf '  4) %-22s %-8s %s\n' 'Shell' shell "$(status shell)"
   printf '  5) %-22s %-8s %s\n' 'Claude B + Claude Code' claude-b "$(status claude-b)"
   printf '  6) %-22s %-8s %s\n' 'GPT + Codex, factory' codex-factory "$(status codex-factory)"
+  printf '  7) %-22s %-8s %s\n' 'Standby shell' ssh "$standby_target"
   printf '> '
   choice=''
   if ! read -r -t "$timeout" choice && [ -z "$choice" ]; then
@@ -656,6 +715,7 @@ while :; do
     4) join shell bash -l ;;
     5) start_claude_b ;;
     6) start_factory ;;
+    7) start_standby ;;
     *) echo "no option '$choice'" ;;
   esac
 done

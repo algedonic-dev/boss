@@ -71,14 +71,14 @@ test('a station retries a transient render failure on the next successful region
       original.call(this, name, value);
     };
   });
-  await page.goto('/it?at=dock');
+  await page.goto('/alarms?at=dock');
   const failure = page.locator(`${PANEL} [data-region="dock"].load-failed`);
   await expect(failure).toContainText('one-shot station render fault');
   await expect(page.getByRole('heading', { level: 1 })).toHaveText('Alarms');
   await expect.poll(() => reads).toBeGreaterThan(1);
   await expect(failure).toHaveCount(0);
   await expect(board(page, 'yard-status')).toBeVisible();
-  await expect(page).toHaveURL(/\/it\?at=dock$/);
+  await expect(page).toHaveURL(/\/alarms\?at=dock$/);
 });
 
 test('a successful regions poll preserves a healthy station subtree', async ({ page }) => {
@@ -88,7 +88,7 @@ test('a successful regions poll preserves a healthy station subtree', async ({ p
     reads += 1;
     return json(r, REGIONS);
   });
-  await page.goto('/it?at=dock');
+  await page.goto('/alarms?at=dock');
   const status = board(page, 'yard-status');
   await expect(status).toBeVisible();
   const original = await status.elementHandle();
@@ -116,7 +116,7 @@ test('a persistent station render failure retries once per successful poll', asy
       original.call(this, name, value);
     };
   });
-  await page.goto('/it?at=dock');
+  await page.goto('/alarms?at=dock');
   const failure = page.locator(`${PANEL} [data-region="dock"].load-failed`);
   await expect(failure).toContainText('persistent station render fault');
   await expect(page.locator('html')).toHaveAttribute('data-station-attempts', '1');
@@ -139,13 +139,11 @@ test.describe('the retired pages', () => {
       await expect(page.locator('code', { hasText: path })).toHaveCount(1);
       const link = page.getByRole('link', { name: `← ${door.label}` });
       await expect(link).toHaveAttribute('href', door.href);
-      if (door.href === '/it') {
-        // At the company root, which hosts the alarms board (backlog 474e2c1c).
-        await expect(page.locator('.perspective-tabs [aria-current="page"]')).toHaveAttribute('data-trail-stop', 'company');
-        await link.click();
-        await expect(page).toHaveURL(/\/it$/);
-        await expect(page.getByRole('heading', { level: 1 })).toHaveText('Alarms');
-      }
+      // An /it path's door was the alarms board, in the IT chrome, until
+      // backlog 92bfcb04 retired the prefix: every door is My Day's now,
+      // and the bar stands at the company root (backlog 474e2c1c).
+      expect(door.href).toBe('/me');
+      await expect(page.locator('.perspective-tabs [aria-current="page"]')).toHaveAttribute('data-trail-stop', 'company');
     });
   }
 
@@ -189,7 +187,7 @@ test.describe('the boards that hold the release and cancel controls', () => {
   test('the track carries its deck and the trains in flight and the recent trains', async ({ page }) => {
     await mocks(page);
     await page.route(YARD_STATUS, (r) => json(r, STATUS));
-    await page.goto('/it?at=track');
+    await page.goto('/alarms?at=track');
     await expect(board(page, 'deck').locator('.yard-deck').first()).toBeVisible();
     const status = board(page, 'yard-status');
     await expect(status.locator('.ys-section')).toHaveText(['IN FLIGHT', 'RECENT TRAINS']);
@@ -203,7 +201,7 @@ test.describe('the boards that hold the release and cancel controls', () => {
   test('the dock carries its cars, its boarding sentence and the held cars', async ({ page }) => {
     await mocks(page);
     await page.route(YARD_STATUS, (r) => json(r, STATUS));
-    await page.goto('/it?at=dock');
+    await page.goto('/alarms?at=dock');
     const status = board(page, 'yard-status');
     await expect(status.locator('.ys-section')).toHaveText(['THE DOCK', 'HELD CARS']);
     await expect(status.locator('.ys-boarding')).toHaveText(STATUS.boarding.summary);
@@ -225,9 +223,9 @@ test.describe('the boards that hold the release and cancel controls', () => {
     await expect(status.locator('#held-cars')).toHaveText('HELD CARS');
     await expect(status.locator('#held-cars')).toBeVisible();
     await expect(status).toContainText('fix/held-for-reds');
-    await expect(page).toHaveURL(/\/it\?at=dock#held-cars$/);
+    await expect(page).toHaveURL(/\/alarms\?at=dock#held-cars$/);
     // The href the design first named opens no panel: no lane, no car.
-    await page.goto('/it#held-cars');
+    await page.goto('/alarms#held-cars');
     await expect(page.locator('section[data-map-panel]')).toHaveCount(0);
     await expect(page.locator('#held-cars')).toHaveCount(0);
   });
@@ -235,7 +233,7 @@ test.describe('the boards that hold the release and cancel controls', () => {
   test('the garage carries the stranded and the held greens', async ({ page }) => {
     await mocks(page);
     await page.route(YARD_STATUS, (r) => json(r, STATUS));
-    await page.goto('/it?at=garage');
+    await page.goto('/alarms?at=garage');
     const status = board(page, 'yard-status');
     await expect(status.locator('.ys-section')).toHaveText(['STRANDED GREENS', 'HELD GREENS']);
     await expect(status).toContainText('fix/green-with-no-car');
@@ -245,7 +243,7 @@ test.describe('the boards that hold the release and cancel controls', () => {
   for (const station of ['gates', 'shed', 'arrivals', 'receiving', 'marshalling', 'shop-floor', 'sensors']) {
     test(`${station}'s boards went with the map, and its panel says so`, async ({ page }) => {
       await mocks(page);
-      await page.goto(`/it?at=${station}`);
+      await page.goto(`/alarms?at=${station}`);
       await expect(page.locator(`${PANEL} [data-station-board]`)).toHaveCount(0);
       await expect(page.locator(`${PANEL} [data-no-boards]`)).toBeVisible();
     });

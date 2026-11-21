@@ -9,7 +9,8 @@
 # so the converge — not an operator's kubectl — turns it on and keeps it
 # on (an imperative scale reverts on the next converge; this line does
 # not). The old systemd conductor `boss-train.service` on boss-gcp
-# (infra/train/boss-train.service) may still be running; two conductors
+# (its unit file left the tree in backlog c440ab8d) may still be
+# running; two conductors
 # firing is safe (see CONCURRENCY below), so retiring the boss-gcp unit is
 # cleanup, not a precondition. The cutover was done through the manifest
 # precisely so nobody has to be the operator in the middle of it.
@@ -140,7 +141,8 @@ spec:
 # cadence knobs); the one SECRET (the forge token) is mounted from
 # boss-dev-forge-token, never a literal here (README: secrets never live
 # in this tree). This ConfigMap is the cluster analogue of the boss-gcp
-# unit's drop-ins (infra/train/boss-train.service.d/*.conf).
+# unit's drop-ins (/etc/systemd/system/boss-train.service.d/*.conf; the
+# unit file left the tree in backlog c440ab8d).
 apiVersion: v1
 kind: ConfigMap
 metadata:

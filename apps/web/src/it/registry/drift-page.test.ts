@@ -181,7 +181,10 @@ describe('the drift page approves a publish through the ops-request packet', () 
 
   it('the answer is the packet link plus exit code and the FULL output, never a tail', () => {
     expect(markup).toContain('href={`/jobs/${latest.id}`}');
-    expect(markup).toContain('latest.exit_code');
+    // The exit rides in the classifier's line (design b7bb1625, backlog
+    // 50a1578f): "failed · exit 1", "answered · exit 0", never a bare
+    // "answered · exit N" read off disposition alone.
+    expect(markup).toContain('{executionLine(latest.execution)}');
     expect(markup).toContain('<pre class="ap-output">{latest.output}</pre>');
     expect(control).not.toMatch(/output\.slice\(|output\.split\(/);
   });

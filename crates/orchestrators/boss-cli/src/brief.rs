@@ -397,14 +397,20 @@ pub(crate) fn shell_word_list(src: &str, var: &str) -> Option<String> {
 }
 
 /// The departments as the tree has them TODAY: the station rows whose
-/// `parent` is the root's `id`, by name, sorted. "Departments are just
+/// `parent` is the root's `id` AND that name a `line` of their own, by
+/// name, sorted. "Departments are just
 /// the name now for the tier of stations under the Company station"
 /// (David, 2026-11-08), so the list is read off `parent`, never kept.
 /// Only active rows are read. The root is the one with an `id` and no
 /// `parent`; any other count
 /// is refused, as the platform seed refuses it.
+///
+/// A department names a `line` of its own (design c4854fd4). A row at
+/// the root that names none is a queue the company hosts itself — the
+/// person's queues since the executive desk dissolved into the root
+/// (design 2910ec3d car 1, backlog 878fd1e7) — and no department.
 pub(crate) fn tier_one_stations(repo: &Path) -> Result<Vec<String>> {
-    let mut rows: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+    let mut rows: Vec<(String, Option<String>, Option<String>, bool)> = Vec::new();
     let dir = repo.join(STATION_ROWS);
     for entry in std::fs::read_dir(&dir).with_context(|| format!("read {STATION_ROWS}"))? {
         let path = entry?.path();
@@ -426,13 +432,18 @@ pub(crate) fn tier_one_stations(repo: &Path) -> Result<Vec<String>> {
             if field("status").as_deref() != Some("active") {
                 return None;
             }
-            Some((field("name")?, field("id"), field("parent")))
+            Some((
+                field("name")?,
+                field("id"),
+                field("parent"),
+                field("line").is_some(),
+            ))
         }));
     }
     let roots: Vec<&String> = rows
         .iter()
-        .filter(|(_, id, parent)| id.is_some() && parent.is_none())
-        .filter_map(|(_, id, _)| id.as_ref())
+        .filter(|(_, id, parent, _)| id.is_some() && parent.is_none())
+        .filter_map(|(_, id, _, _)| id.as_ref())
         .collect();
     let [root] = roots.as_slice() else {
         bail!(
@@ -442,8 +453,8 @@ pub(crate) fn tier_one_stations(repo: &Path) -> Result<Vec<String>> {
     };
     let mut tier: Vec<String> = rows
         .iter()
-        .filter(|(_, _, parent)| parent.as_ref() == Some(*root))
-        .map(|(name, _, _)| name.clone())
+        .filter(|(_, _, parent, line)| *line && parent.as_ref() == Some(*root))
+        .map(|(name, _, _, _)| name.clone())
         .collect();
     tier.sort();
     Ok(tier)
@@ -483,7 +494,7 @@ fn paradigm_invariant(repo: &Path) -> Result<Invariant> {
                 "  a workflow row: metadata.{v2_workflow} names its station — not metadata.{v1_workflow}."
             ),
             format!(
-                "A department is a tier-1 station, a direct child of the root: {}.",
+                "A department is a tier-1 station, a direct child of the root with a line of its own: {}.",
                 tier.join(", ")
             ),
             "A department read is a read of that station's row (parent, allocation, line).".into(),
@@ -2059,7 +2070,13 @@ an invariant here in a brief is how the uid fact came to be wrong ten times
 /// the caller is standing in. Asked of git rather than guessed, so a
 /// call from a subdirectory or a worktree lands on the right root.
 pub(crate) fn repo_root() -> Result<PathBuf> {
+    repo_root_at(&std::env::current_dir().context("reading the current directory")?)
+}
+
+pub(crate) fn repo_root_at(cwd: &std::path::Path) -> Result<PathBuf> {
     let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .context("could not run git rev-parse --show-toplevel")?;
@@ -4640,7 +4657,7 @@ tenant_repo = \"acme/no-ref\"
         boss_testing::create_dir(&dir);
         let row = |name: &str, id: &str, parent: Option<&str>, status: &str| {
             let parent = parent
-                .map(|p| format!("parent = \"{p}\"\n"))
+                .map(|p| format!("parent = \"{p}\"\nline = \"{name}\"\n"))
                 .unwrap_or_default();
             boss_testing::write_file(
                 &dir.join(format!("{name}.toml")),
@@ -4656,6 +4673,31 @@ tenant_repo = \"acme/no-ref\"
         // A retired root beside the live one is no second root either.
         row("old-root", "old-root-id", None, "retired");
         assert_eq!(tier_one_stations(&root).expect("read"), vec!["current"]);
+    }
+
+    /// A QUEUE THE COMPANY HOSTS IS NOT A DEPARTMENT (design 2910ec3d car
+    /// 1, backlog 878fd1e7). When the executive desk dissolved, the
+    /// person's queues moved to the root itself, and a department is a
+    /// child of the root with a line of its own: the queue draws the
+    /// company's, so the brief does not call it a department.
+    #[test]
+    fn a_queue_the_company_hosts_is_not_a_department() {
+        let root = boss_testing::scratch_dir("brief-tier-one-hosted");
+        let dir = root.join(STATION_ROWS);
+        boss_testing::create_dir(&dir);
+        boss_testing::write_file(
+            &dir.join("root.toml"),
+            "[[station]]\nname = \"root\"\nid = \"root-id\"\nstatus = \"active\"\nline = \"company\"\n",
+        );
+        boss_testing::write_file(
+            &dir.join("works.toml"),
+            "[[station]]\nname = \"works\"\nid = \"works-id\"\nparent = \"root-id\"\nstatus = \"active\"\nline = \"works\"\n",
+        );
+        boss_testing::write_file(
+            &dir.join("my-queue.toml"),
+            "[[station]]\nname = \"my-queue\"\nid = \"queue-id\"\nparent = \"root-id\"\nstatus = \"active\"\n",
+        );
+        assert_eq!(tier_one_stations(&root).expect("read"), vec!["works"]);
     }
 
     #[test]
